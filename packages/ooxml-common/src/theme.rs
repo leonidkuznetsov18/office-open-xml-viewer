@@ -20,7 +20,7 @@
 
 use crate::ns::is_a_ns;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 type NamespaceDeclarations = Arc<[(Option<String>, Arc<str>)]>;
@@ -30,9 +30,11 @@ type NamespaceDeclarations = Arc<[(Option<String>, Arc<str>)]>;
 /// A theme entry may use namespace prefixes declared only on `<a:theme>`
 /// (including extension namespaces such as `a14`). Keeping only the source
 /// range of `<a:ln>`/`<a:solidFill>` therefore produces an invalid fragment.
-/// This descriptor keeps the entry bytes and every in-scope namespace. Prefixes
-/// can be any valid XML NCName, so scanning the bytes as ASCII would lose valid
-/// declarations. Namespace sets and URIs are shared across entries.
+/// This descriptor keeps the entry bytes and the parent style list's in-scope
+/// namespaces. The entry bytes contain declarations on the entry and its
+/// descendants. Prefixes can be any valid XML NCName, so scanning the bytes
+/// as ASCII would lose valid declarations. Sharing each list's parent scope
+/// keeps retained memory linear even when every entry declares a unique prefix.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StandaloneThemeStyleXml {
     fragment: String,
@@ -43,41 +45,16 @@ impl StandaloneThemeStyleXml {
     fn from_node(
         node: roxmltree::Node<'_, '_>,
         source: &str,
-        namespace_pool: &mut HashMap<String, Arc<str>>,
-        namespace_sets: &mut HashSet<NamespaceDeclarations>,
+        namespaces: &NamespaceDeclarations,
     ) -> Self {
-        let fragment = source[node.range()].to_owned();
-        let intern = |uri: &str, pool: &mut HashMap<String, Arc<str>>| {
-            pool.entry(uri.to_owned())
-                .or_insert_with(|| Arc::<str>::from(uri))
-                .clone()
-        };
-        let namespaces: Vec<_> = node
-            .namespaces()
-            .filter(|namespace| namespace.name() != Some("xml"))
-            .map(|namespace| {
-                (
-                    namespace.name().map(str::to_owned),
-                    intern(namespace.uri(), namespace_pool),
-                )
-            })
-            .collect();
-        let namespaces = if let Some(existing) = namespace_sets.get(namespaces.as_slice()) {
-            Arc::clone(existing)
-        } else {
-            let shared: Arc<[_]> = namespaces.into();
-            namespace_sets.insert(Arc::clone(&shared));
-            shared
-        };
         Self {
-            fragment,
-            namespaces,
+            fragment: source[node.range()].to_owned(),
+            namespaces: Arc::clone(namespaces),
         }
     }
 
-    /// Build a self-contained wrapper on demand. Namespace URIs are interned
-    /// across all entries, and identical in-scope namespace sets are shared.
-    /// The temporary wrapper lives only for the caller's DOM parse.
+    /// Build a self-contained wrapper on demand. The temporary wrapper lives
+    /// only for the caller's DOM parse.
     pub fn to_xml(&self) -> String {
         let mut xml = String::from("<themeStyleRoot");
         for (prefix, uri) in self.namespaces.iter() {
@@ -138,27 +115,31 @@ impl ThemeFormatScheme {
             return Self::default();
         };
 
-        let mut namespace_pool = HashMap::new();
-        let mut namespace_sets = HashSet::new();
-        let mut collect = |list_name: &str| -> Vec<StandaloneThemeStyleXml> {
-            format_scheme
-                .children()
-                .find(|node| {
-                    node.is_element()
-                        && node.tag_name().name() == list_name
-                        && is_a_ns(node.tag_name().namespace())
-                })
-                .into_iter()
-                .flat_map(|list| list.children())
-                .filter(|node| node.is_element() && is_a_ns(node.tag_name().namespace()))
-                .map(|node| {
-                    StandaloneThemeStyleXml::from_node(
-                        node,
-                        xml,
-                        &mut namespace_pool,
-                        &mut namespace_sets,
+        let collect = |list_name: &str| -> Vec<StandaloneThemeStyleXml> {
+            let Some(list) = format_scheme.children().find(|node| {
+                node.is_element()
+                    && node.tag_name().name() == list_name
+                    && is_a_ns(node.tag_name().namespace())
+            }) else {
+                return Vec::new();
+            };
+            // CT_StyleMatrix has four lists. The list's inherited scope is
+            // shared by its entries; declarations on an entry stay in its
+            // source fragment and override this wrapper scope as XML requires.
+            let namespaces: NamespaceDeclarations = list
+                .namespaces()
+                .filter(|namespace| namespace.name() != Some("xml"))
+                .map(|namespace| {
+                    (
+                        namespace.name().map(str::to_owned),
+                        Arc::<str>::from(namespace.uri()),
                     )
                 })
+                .collect::<Vec<_>>()
+                .into();
+            list.children()
+                .filter(|node| node.is_element() && is_a_ns(node.tag_name().namespace()))
+                .map(|node| StandaloneThemeStyleXml::from_node(node, xml, &namespaces))
                 .collect()
         };
 
@@ -961,6 +942,31 @@ mod tests {
             Some("rId1")
         );
         assert!(standalone.contains("xmlns:unused=\"urn:unused\""));
+    }
+
+    #[test]
+    fn format_scheme_keeps_list_scope_and_entry_local_rebinding() {
+        let xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:関係="urn:ancestor">
+          <a:themeElements><a:fmtScheme name="Bindings">
+            <a:fillStyleLst xmlns:érel="urn:list">
+              <a:solidFill xmlns:関係="urn:entry"><a:srgbClr val="123456" 関係:flag="yes" érel:mark="ok"/></a:solidFill>
+            </a:fillStyleLst>
+          </a:fmtScheme></a:themeElements>
+        </a:theme>"#;
+        let scheme = ThemeFormatScheme::parse(xml);
+        let StyleMatrixLookup::Entry(entry) = scheme.lookup_fill_ref(1) else {
+            panic!("fill style should exist");
+        };
+        let standalone = entry.to_xml();
+        let parsed = roxmltree::Document::parse(&standalone).expect("all prefixes remain bound");
+        let color = parsed
+            .descendants()
+            .find(|node| node.tag_name().name() == "srgbClr")
+            .unwrap();
+        assert_eq!(color.attribute(("urn:entry", "flag")), Some("yes"));
+        assert_eq!(color.attribute(("urn:list", "mark")), Some("ok"));
+        assert_eq!(color.attribute(("urn:ancestor", "flag")), None);
     }
 
     #[test]
