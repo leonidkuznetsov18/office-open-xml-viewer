@@ -66,6 +66,8 @@ test('rejects indirect Node require forms even with escaped module names', () =>
     'require?.(name);',
     'module.require(name);',
     "module['require'](name);",
+    "module?.['require'](name);",
+    'module?.require?.(name);',
   ]) {
     assert.ok(rules(code).includes('indirect-require'), code);
   }

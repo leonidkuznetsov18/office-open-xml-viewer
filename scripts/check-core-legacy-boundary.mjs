@@ -173,7 +173,7 @@ export function findViolations(files, { resolveModule } = {}) {
           && (indirectAllowed === undefined || node.local.name !== 'createRequire')) rejectIndirect();
         if (node.type === 'ObjectProperty' && node.key.type === 'Identifier'
           && node.key.name === 'createRequire' && parent?.type === 'ObjectPattern') rejectIndirect();
-        if (node.type === 'MemberExpression' && (
+        if (['MemberExpression', 'OptionalMemberExpression'].includes(node.type) && (
           (node.object.type === 'Identifier' && node.object.name === 'require')
           || (node.property.type === 'Identifier' && node.property.name === 'createRequire')
           || (node.property.type === 'StringLiteral' && node.property.value === 'createRequire')
