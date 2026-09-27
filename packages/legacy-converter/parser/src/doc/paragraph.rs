@@ -157,6 +157,20 @@ impl Properties {
             return Ok(true);
         }
         match code {
+            0xc645 => {
+                // [MS-DOC] 2.6.2 sprmPNumRM / 2.9.159-160: the bounded
+                // no-display class has no prior-number template, placeholder,
+                // format or number value. Word PDFs of fNumRM=0/1 crossed
+                // with fRMPrint=0/1 are identical on every page for this
+                // class. A nonzero display operand remains unsupported;
+                // metadata alone is not an old number to paint.
+                if operand.len() != 129 || operand[0] != 128 || !matches!(operand[1], 0 | 1) {
+                    return Err(unsupported("invalid Word numbering revision operand"));
+                }
+                if operand[9..].iter().any(|byte| *byte != 0) {
+                    return Ok(false);
+                }
+            }
             0x6467 => {
                 // MS-DOC 2.6.2 sprmPRsid is nonvisual revision-session
                 // provenance, not a paragraph revision mark. Viewer policy:
@@ -423,6 +437,24 @@ mod tests {
 
     fn raw_border(value: &serde_json::Value, side: &str) -> serde_json::Value {
         value["__paragraphTypographyAcquisition"]["borders"][side]["val"]["raw"].clone()
+    }
+
+    #[test]
+    fn empty_numbering_revision_has_no_print_marker_but_display_data_stays_gated() {
+        let baseline = projected(&Properties::default());
+        for prior_numbered in [0, 1] {
+            let mut operand = vec![0; 129];
+            operand[0] = 128;
+            operand[1] = prior_numbered;
+            operand[3] = 1; // author metadata is not displayed as a number
+            let mut properties = Properties::default();
+            assert!(properties.apply(0xc645, &operand).unwrap());
+            assert_eq!(projected(&properties), baseline);
+            operand[65] = 1; // nonempty old-number text
+            assert!(!properties.apply(0xc645, &operand).unwrap());
+            operand[0] = 127;
+            assert!(properties.apply(0xc645, &operand).is_err());
+        }
     }
 
     #[test]
