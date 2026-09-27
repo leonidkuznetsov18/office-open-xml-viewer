@@ -208,6 +208,27 @@ describe('date formats (Excel serial; 45292 = 2024-01-01)', () => {
   });
 });
 
+describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () => {
+  it('formats the serial as a clock time instead of echoing the code', () => {
+    expect(fmt(0.29166666666666669, 'h:mm;@')).toBe('7:00');
+    expect(fmt(0.51041666666666663, 'h:mm:ss;@')).toBe('12:15:00');
+    expect(fmt(0.75, 'h:mm AM/PM')).toBe('6:00 PM');
+    expect(fmt(0.5, 's')).toBe('0');
+  });
+
+  it('rounds the float noise of a stored serial instead of truncating it', () => {
+    // 8:00 is stored as 0.33333333333333331, a hair under 28 800 000 ms.
+    expect(fmt(0.33333333333333331, 'h:mm;@')).toBe('8:00');
+    expect(fmt(0.79166666666666663, 'hh:mm')).toBe('19:00');
+  });
+
+  it('keeps escaped, padded and quoted time letters literal in numeric formats', () => {
+    expect(fmt(5, '0\\h')).toBe('5h');
+    expect(fmt(5, '0_h')).toBe('5 ');
+    expect(fmt(5, '0" hrs"')).toBe('5 hrs');
+  });
+});
+
 describe('date formats — 1900 Lotus leap-year-bug compat (§18.17.4.1)', () => {
   // The cell formatter now delegates serial → date to the shared core
   // `excelSerialToUtcDate`, which shifts serials < 60 by +1 day to reproduce

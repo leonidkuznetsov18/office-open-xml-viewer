@@ -396,13 +396,17 @@ function isDateFormatCode(code: string): boolean {
   // Elapsed-time brackets `[h]`, `[m]`, `[s]` (ECMA-376 §18.8.30) are themselves
   // time formats, so detect those *before* stripping bracket content below.
   if (/\[[hms]+\]/i.test(code)) return true;
-  // Strip quoted literals and bracket content, then look for unambiguous date specifiers.
-  // 'y' = year, 'd' = day — both are unambiguous. 'm' alone is ambiguous (month or minutes).
-  const stripped = code.replace(/"[^"]*"/g, '').replace(/\[[^\]]*\]/g, '');
-  // y / d are unambiguous date specifiers. `aaa+` is the Japanese-locale
-  // weekday code and implies a date format even without y/d (e.g. the
-  // bare `aaa` custom format).
-  return /[yd]/i.test(stripped) || /a{3,}/i.test(stripped);
+  // Drop everything that is literal or metadata: quoted strings, `\x`
+  // escapes, `_x` / `*x` padding and fill pairs, and bracket content.
+  const stripped = code
+    .replace(/"[^"]*"/g, '')
+    .replace(/\\.|_.|\*./g, '')
+    .replace(/\[[^\]]*\]/g, '');
+  // What remains is date/time only if it has a date or time specifier:
+  // y / m / d (year, month or minute, day), h / s (hour, second), AM/PM or
+  // A/P, and the Japanese-locale weekday code `aaa+`. A time-only code such
+  // as `h:mm;@` has no y or d but is still a time format.
+  return /[ymdhs]/i.test(stripped) || /a{3,}|am\/pm|a\/p/i.test(stripped);
 }
 
 // Excel's General format does not round-trip the raw IEEE-754 double: the
