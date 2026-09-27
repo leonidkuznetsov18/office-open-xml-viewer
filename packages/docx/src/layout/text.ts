@@ -599,6 +599,16 @@ function requestedFamily(
   return request.fonts.ascii;
 }
 
+/** Upper bound on distinct font routes a text service keeps ordinals for;
+ * reaching it retires the ordinals together with the measurement cache. */
+export const TEXT_ROUTE_ORDINAL_LIMIT = 4096;
+const routeOrdinalTableSizes = new WeakMap<object, () => number>();
+
+/** Internal diagnostic: live route-ordinal entries held by a text service. */
+export function textRouteOrdinalTableSize(service: TextLayoutService): number | undefined {
+  return routeOrdinalTableSizes.get(service)?.();
+}
+
 /**
  * Shape per script span because ECMA-376 §17.3.2.26 selects rFonts slots per
  * Unicode character; choosing one family for an entire mixed-script run loses
@@ -676,14 +686,27 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
   // of three distinct routes. Keys carry a service-scoped ordinal assigned
   // one-to-one to the exact triple instead; the object map only skips
   // re-deriving the ordinal for the shared resolver routes.
-  const routeOrdinals = new Map<string, number>();
-  const routeOrdinalByObject = new WeakMap<object, number>();
+  //
+  // The ordinal table must not outlive the bounded cache it serves: a document
+  // with ever-new routes would otherwise grow it without limit after the
+  // measurement cache had evicted every key that used them. Only measurement
+  // keys carry ordinals, so when the table reaches its bound, the table, the
+  // object map and the measurement cache are dropped together. No key that
+  // uses a retired ordinal survives, so a re-issued ordinal can never alias
+  // two routes; the reset is a memoization miss, never a different result.
+  let routeOrdinals = new Map<string, number>();
+  let routeOrdinalByObject = new WeakMap<object, number>();
   const routeOrdinal = (route: Readonly<CanvasFontRoute>): number => {
     const known = routeOrdinalByObject.get(route);
     if (known !== undefined) return known;
     const identity = JSON.stringify([route.familyList, route.scope, route.fingerprint]);
     let ordinal = routeOrdinals.get(identity);
     if (ordinal === undefined) {
+      if (routeOrdinals.size >= TEXT_ROUTE_ORDINAL_LIMIT) {
+        routeOrdinals = new Map();
+        routeOrdinalByObject = new WeakMap();
+        measurementCache.clear();
+      }
       ordinal = routeOrdinals.size;
       routeOrdinals.set(identity, ordinal);
     }
@@ -723,7 +746,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     request: Readonly<GlyphMeasureRequest>,
   ): number => input.measurer.measure(request).advancePt;
   const shapeCache = new Map<string, TextShapeResult>();
-  return Object.freeze({
+  const service: TextLayoutService = Object.freeze({
     fingerprint,
     fontMetrics,
     localMetrics: fontMetrics,
@@ -909,4 +932,6 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       return result;
     },
   });
+  routeOrdinalTableSizes.set(service, () => routeOrdinals.size);
+  return service;
 }

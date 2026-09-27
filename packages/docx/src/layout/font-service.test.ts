@@ -5,6 +5,8 @@ import {
 } from './font-service.js';
 import {
   createTextLayoutService,
+  TEXT_ROUTE_ORDINAL_LIMIT,
+  textRouteOrdinalTableSize,
   type GlyphMeasureRequest,
   type GlyphMeasurement,
 } from './text.js';
@@ -121,6 +123,50 @@ describe('font layout services', () => {
     expect(measuredOne()).toBe(3);
     route = routeFor('"Other", sans-serif', 'native', 'route-a');
     expect(measuredOne()).toBe(4);
+  });
+
+  it('bounds route ordinals for ever-new routes without aliasing a retired route', () => {
+    const measure = vi.fn((request: Readonly<GlyphMeasureRequest>): GlyphMeasurement => ({
+      advancePt: request.fontRoute.familyList.length, ascentPt: 7, descentPt: 2,
+    }));
+    let family = 'Route 0';
+    const service = createTextLayoutService({
+      fonts: {
+        fingerprint: 'unique-routes-v1',
+        resolve: () => Object.freeze({
+          requestedFamily: family,
+          resolvedFamily: family,
+          route: Object.freeze({
+            familyList: `"${family}", sans-serif`,
+            scope: 'native' as const,
+            fingerprint: `route:${family}`,
+          }),
+          source: 'native' as const,
+          weight: 400,
+          style: 'normal' as const,
+          diagnostics: [],
+          genericFamily: 'sans-serif' as const,
+        }),
+      },
+      measurer: { fingerprint: 'unique-routes-measure-v1', measure },
+    });
+    const advanceFor = (name: string) => {
+      family = name;
+      return service.shape({ text: 'x', fontSizePt: 10, fonts: { ascii: name }, clusterGeometry: false }).advancePt;
+    };
+    const first = advanceFor('Route 0');
+    // Keep introducing new routes well past the table bound: the table stays
+    // bounded instead of retaining every route ever measured.
+    for (let index = 1; index < TEXT_ROUTE_ORDINAL_LIMIT * 2 + 10; index += 1) {
+      advanceFor(`Route ${index}`);
+      expect(textRouteOrdinalTableSize(service)).toBeLessThanOrEqual(TEXT_ROUTE_ORDINAL_LIMIT);
+    }
+    // After the reset, a route that received a re-issued ordinal and a retired
+    // route are measured as themselves, never as each other.
+    const reissued = advanceFor('Route with a much longer family name');
+    expect(reissued).toBe('"Route with a much longer family name", sans-serif'.length);
+    expect(advanceFor('Route 0')).toBe(first);
+    expect(advanceFor('Route with a much longer family name')).toBe(reissued);
   });
 
   it('records embedded, local, Google, substitute, and generic resolution', () => {
