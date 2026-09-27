@@ -424,6 +424,8 @@ export interface TextRunData {
   /** Font size in points */
   fontSize: number | null;
   color: string | null;
+  /** Patterned glyph fill from DrawingML rPr/defRPr (ECMA-376 §21.1.2.3.9). */
+  patternFill?: PatternFill;
   fontFamily: string | null;
   /**
    * East Asian font family from rPr > a:ea (ECMA-376 §21.1.2.3.3),

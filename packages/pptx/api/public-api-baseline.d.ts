@@ -2131,6 +2131,7 @@ export interface TextRunData {
     strikeDouble?: boolean;
     fontSize: number | null;
     color: string | null;
+    patternFill?: PatternFill;
     fontFamily: string | null;
     fontFamilyEa?: string;
     fontFamilySym?: string;

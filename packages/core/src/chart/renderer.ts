@@ -31,7 +31,7 @@ import { withSparseStyleIndexCache } from './sparse-style-index.js';
 
 import { applyPlotVisibleOnly } from './source-visibility.js';
 
-import { resolveFill } from '../shape/paint.js';
+import { resolveFill, withPatternPointScale } from '../shape/paint.js';
 
 import { EMU_PER_PT, PT_TO_PX } from '../units.js';
 
@@ -364,6 +364,9 @@ function renderChartImpl(
   }
 }
 
+/** Paint a chart in the host's user units. `patternOrigin`, when supplied by
+ * the worksheet renderer, phases every chart fill from that drawing object's
+ * anchor without changing chart geometry or non-pattern pixels. */
 export function renderChart(
   ctx: CanvasRenderingContext2D,
   chart: ChartModel,
@@ -374,8 +377,9 @@ export function renderChart(
   regionMap?: ChartRegionMapRenderer,
   imageLookup?: ChartImageLookup,
   chartEx?: ChartExRenderer,
+  patternOrigin?: { x: number; y: number },
 ): void {
-  withChartStyleIndexCache(() => {
+  withPatternPointScale(ctx, ptToPx, () => withChartStyleIndexCache(() => {
     withSparseStyleIndexCache(() => {
       withChartImageLookup(imageLookup, () => {
         const sourceStructureCount = sourceChartStructureCount(chart);
@@ -396,5 +400,5 @@ export function renderChart(
         }, undefined, effectConsumers);
       });
     });
-  });
+  }), patternOrigin);
 }

@@ -4688,6 +4688,45 @@ mod tests {
         assert_eq!(invalid_run.color, None);
     }
 
+    /// ECMA-376 §21.1.2.3.9 permits a:patFill in the text run fill choice.
+    /// A direct solid choice suppresses an inherited patterned defRPr.
+    #[test]
+    fn test_parse_run_preserves_patterned_glyph_fill_and_precedence() {
+        let xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><pattFill prst="horz"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill></rPr><t>text</t></r>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let theme = HashMap::new();
+        let rels = HashMap::new();
+        let run = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(
+            matches!(run.pattern_fill, Some(Fill::Pattern { ref preset, ref fg, ref bg })
+            if preset == "horz" && fg == "D21D54" && bg == "12CED4")
+        );
+
+        let default_xml = r#"<defRPr xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><pattFill prst="dnDiag"/></defRPr>"#;
+        let default_doc = roxmltree::Document::parse(default_xml).unwrap();
+        let inherited = parse_run(
+            doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(
+            matches!(inherited.pattern_fill, Some(Fill::Pattern { ref preset, .. }) if preset == "horz")
+        );
+
+        let solid_xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><solidFill><srgbClr val="000000"/></solidFill></rPr><t>text</t></r>"#;
+        let solid_doc = roxmltree::Document::parse(solid_xml).unwrap();
+        let override_run = parse_run(
+            solid_doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(override_run.pattern_fill.is_none());
+    }
+
     #[test]
     fn test_parse_run_treats_uniform_gradient_text_fill_as_its_exact_color() {
         let uniform = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="353535"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>uniform</t></r>"#;

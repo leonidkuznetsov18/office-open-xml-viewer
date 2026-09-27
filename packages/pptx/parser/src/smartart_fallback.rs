@@ -482,6 +482,7 @@ fn default_run() -> TextRunData {
         strike_double: false,
         font_size: None,
         color: None,
+        pattern_fill: None,
         font_family: None,
         font_family_ea: None,
         font_family_sym: None,

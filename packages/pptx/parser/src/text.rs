@@ -6,7 +6,7 @@
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
 use crate::fill::{parse_color_node, parse_reflection, parse_shadow};
-use crate::theme::resolve_theme_typeface;
+use crate::theme::{resolve_theme_typeface, PptxSchemeResolver};
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
 use ooxml_common::blip::mime_from_ext;
@@ -513,6 +513,26 @@ pub(crate) fn text_property_color(
         }
         _ => None,
     }
+}
+
+fn text_property_pattern_fill(
+    properties: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> Option<Fill> {
+    let choice = text_property_fill(properties)?;
+    if choice.tag_name().name() != "pattFill" {
+        return None;
+    }
+    let pattern = ooxml_common::fill::parse_patt_fill(
+        choice,
+        &PptxSchemeResolver { theme },
+        ooxml_common::color::TintMode::PowerPointLinear,
+    );
+    Some(Fill::Pattern {
+        fg: pattern.fg,
+        bg: pattern.bg,
+        preset: pattern.preset,
+    })
 }
 
 // Carries the resolved master/layout/placeholder inheritance context (theme,
@@ -1139,6 +1159,7 @@ pub(crate) fn parse_paragraph(
                 let r_pr = child(node, "rPr");
                 let font_size = r_pr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
                 let color = r_pr.and_then(|n| text_property_color(n, theme));
+                let pattern_fill = r_pr.and_then(|n| text_property_pattern_fill(n, theme));
                 let bold = r_pr
                     .and_then(|n| attr(&n, "b"))
                     .map(|v| v == "1" || v == "true");
@@ -1165,6 +1186,7 @@ pub(crate) fn parse_paragraph(
                     strike_double: false,
                     font_size,
                     color,
+                    pattern_fill,
                     font_family,
                     font_family_ea: None,
                     font_family_sym: None,
@@ -1497,6 +1519,13 @@ fn parse_run_with_reflection(
     let color = r_pr
         .and_then(|n| text_property_color(n, theme))
         .or_else(|| def_rpr.and_then(|n| text_property_color(n, theme)));
+    // The first authored fill choice wins. A run-local solid/noFill must not
+    // inherit a patterned defRPr; text_property_fill enforces DrawingML order.
+    let pattern_fill = r_pr
+        .and_then(text_property_fill)
+        .or_else(|| def_rpr.and_then(text_property_fill))
+        .filter(|n| n.tag_name().name() == "pattFill")
+        .and_then(|n| text_property_pattern_fill(n.parent()?, theme));
 
     let font_family = r_pr
         .and_then(|n| child(n, "latin"))
@@ -1611,6 +1640,7 @@ fn parse_run_with_reflection(
         strike_double,
         font_size,
         color,
+        pattern_fill,
         font_family,
         font_family_ea,
         font_family_sym,

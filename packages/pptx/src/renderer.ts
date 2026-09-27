@@ -31,6 +31,8 @@ import {
   buildCustomPath as buildCustomPathCore,
   hexToRgba as hexToRgbaCore,
   resolveFill as resolveFillCore,
+  withPatternCoordinateSpace,
+  withInheritedPatternScope,
   applyStroke as applyStrokeCore,
   buildShapePath,
   EMU_PER_PT as PT_TO_EMU,
@@ -613,8 +615,9 @@ export function resolveShapeFill(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
+  patternPtToUserUnits = 4 / 3,
 ): string | CanvasGradient | CanvasPattern | null {
-  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg);
+  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
 }
 
 // ===== Text layout helpers =====
@@ -724,6 +727,7 @@ type LayoutSegment = {
    */
   drawSizePx?: number;
   color: string;
+  patternFill?: Extract<Fill, { fillType: 'pattern' }>;
   underline: boolean;
   /** OOXML rPr @u value when not the default "sng": "dbl"/"dotted"/"wavy"/etc. */
   underlineStyle?: string;
@@ -1465,6 +1469,7 @@ export function layoutParagraph(
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
     const baseStyle: LayoutSegment = {
       text: '', font: baseFont, sizePx, drawSizePx, color,
+      patternFill: run.patternFill,
       underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
@@ -1514,7 +1519,8 @@ export function layoutParagraph(
   }
 
   const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
-    a.font === b.font && a.color === b.color && a.sizePx === b.sizePx
+    a.font === b.font && a.color === b.color && a.patternFill === b.patternFill
+    && a.sizePx === b.sizePx
     && a.drawSizePx === b.drawSizePx && a.underline === b.underline
     && a.underlineStyle === b.underlineStyle
     && a.underlineColor === b.underlineColor
@@ -1732,7 +1738,7 @@ async function prepareBackground(
   }
   return {
     paint: (ctx) => {
-      const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH);
+      const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH, 0, scale * PT_TO_EMU);
       ctx.fillStyle = bg ?? '#FFFFFF';
       ctx.fillRect(0, 0, canvasW, canvasH);
     },
@@ -2903,6 +2909,7 @@ export function cacheDevicePaint(
   liveTransform: EffectTransform,
   bbox: { x: number; y: number; w: number; h: number },
   viewport?: { w: number; h: number },
+  source?: CanvasRenderingContext2D,
 ): EffectPaint {
   const x = Math.floor(bbox.x) - 1;
   const y = Math.floor(bbox.y) - 1;
@@ -2930,7 +2937,8 @@ export function cacheDevicePaint(
     liveTransform.e - x,
     liveTransform.f - y,
   );
-  paint(cache);
+  if (source) withInheritedPatternScope(source, cache, () => paint(cache), { x, y });
+  else paint(cache);
   const identity = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 } as DOMMatrix;
   return (target) => {
     target.save();
@@ -2960,15 +2968,15 @@ function paintWithRasterEffects(
   const applyLiveTransform = (target: CanvasRenderingContext2D) => target.setTransform(liveTransform);
   const body = (target: CanvasRenderingContext2D) => {
     applyLiveTransform(target);
-    paintBody(target);
+    withInheritedPatternScope(ctx, target, () => paintBody(target));
   };
   const mask = (target: CanvasRenderingContext2D) => {
     applyLiveTransform(target);
-    paintMask(target);
+    withInheritedPatternScope(ctx, target, () => paintMask(target));
   };
   const innerMask = (target: CanvasRenderingContext2D) => {
     applyLiveTransform(target);
-    paintInnerMask(target);
+    withInheritedPatternScope(ctx, target, () => paintInnerMask(target));
   };
   let nativeShadowFallback = false;
   if (effects.shadow && haveAux) {
@@ -3216,6 +3224,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           w: (ctx.canvas as { width: number }).width || 0,
           h: (ctx.canvas as { height: number }).height || 0,
         },
+        ctx,
       );
       // A declined cache is still a valid projection path: the compositor will
       // replay rawPaint. Check success only AFTER that first paint so an
@@ -3257,7 +3266,9 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   }
 
   const geom = el.geometry.toLowerCase();
-  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation);
+  // The slide may render at any requested width. Convert the PDF-measured
+  // one-point pattern cell through this render's EMU-to-canvas scale.
+  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
   const imageFill = el.fill?.fillType === 'image' && shapeImageFillModeIsPaintable(el.fill)
     ? el.fill
     : null;
@@ -3331,7 +3342,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     const tFill = silhouette ??
       (target === ctx && bx === x && by === y && bw === w && bh === h
         ? fillStyle
-        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation));
+        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU));
     const tStroke = silhouette
       ? null
       : el.stroke
@@ -3515,7 +3526,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   const flatBevelEdgePadCss = (el.stroke ? (el.stroke.width * scale) / 2 : 0) + 2;
   const paintLineDecorations = (target: CanvasRenderingContext2D): void => {
     const effectivePaint = el.stroke?.fill
-      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation) ?? undefined
+      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation, scale * PT_TO_EMU) ?? undefined
       : undefined;
     if (el.stroke && (CONNECTOR_GEOMS.has(geom) || CALLOUT_GEOMS.has(geom))) {
       // The preset body deliberately suppresses retractable leader strokes. Paint
@@ -4886,7 +4897,9 @@ export function renderTextBody(
         continue;
       }
       ctx.font = seg.font;
-      ctx.fillStyle = seg.color;
+      ctx.fillStyle = seg.patternFill
+        ? resolveFillCore(seg.patternFill, ctx, penX, baseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
+        : seg.color;
       const drawSizePx = seg.drawSizePx ?? seg.sizePx;
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
@@ -5931,7 +5944,7 @@ function paintResolvedPicture(
       // visible through transparent pixels. Image fills need their own decode
       // and are not painted here.
       const backing = el.fill && el.fill.fillType !== 'none' && el.fill.fillType !== 'image'
-        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation)
+        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU)
         : null;
       if (backing) {
         target.save();
@@ -6312,6 +6325,7 @@ function drawCompoundLine(
         Math.max(1, Math.abs(end.x - start.x)),
         Math.max(1, Math.abs(end.y - start.y)),
         shapeRotationDeg,
+        scale * PT_TO_EMU,
       )
     : null;
   ctx.strokeStyle = strokePaint ?? hexToRgba(stroke.color);
@@ -6345,6 +6359,7 @@ export function applyStroke(
       bounds.w,
       bounds.h,
       shapeRotationDeg,
+      scale * PT_TO_EMU,
     );
     if (paint) ctx.strokeStyle = paint;
   }
@@ -6601,6 +6616,7 @@ export function renderTable(
       cellW,
       cellH,
       el.rotation,
+      scale * PT_TO_EMU,
     );
     if (fillPaint) {
       ctx.fillStyle = fillPaint;
@@ -7570,7 +7586,9 @@ async function renderSlideLeased(
     step.paint(ctx);
     if (step.failure) throw step.failure.error;
   }
-
+  // renderSlide installed only this device scale on the root context. Keep it
+  // as the slide frame while each element adds local rotations or reflections.
+  const slidePatternFrame = { a: effectiveDpr, d: effectiveDpr };
   for (const [elementIndex, el] of slide.elements.entries()) {
     // A text-run callback may start a newer render of this canvas; stop so we
     // don't paint this (now stale) slide over the newer one.
@@ -7583,11 +7601,12 @@ async function renderSlideLeased(
             origin: slide.elementSources?.[elementIndex]?.origin ?? 'slide',
           })
         : undefined;
-      renderShape(ctx, el, scale, themeDefaultColor, slideNumber, rc, elementTextRun, opts.fetchImage);
+      withPatternCoordinateSpace(ctx, slidePatternFrame, () =>
+        renderShape(ctx, el, scale, themeDefaultColor, slideNumber, rc, elementTextRun, opts.fetchImage));
     } else if (el.type === 'picture' || el.type === 'media') {
       const step = elementSteps[elementIndex];
       if (step) {
-        step.paint(ctx);
+        withPatternCoordinateSpace(ctx, slidePatternFrame, () => step.paint(ctx));
         if (step.failure) throw step.failure.error;
       }
     } else if (el.type === 'table') {
@@ -7598,34 +7617,37 @@ async function renderSlideLeased(
             origin: slide.elementSources?.[elementIndex]?.origin ?? 'slide',
           })
         : undefined;
-      renderTable(ctx, el, scale, slideNumber, rc, elementTextRun);
+      withPatternCoordinateSpace(ctx, slidePatternFrame, () =>
+        renderTable(ctx, el, scale, slideNumber, rc, elementTextRun));
     } else if (el.type === 'chart') {
       // OOXML: 1pt = 12700 EMU. The slide renderer's `scale` is px-per-EMU,
       // so PT_TO_EMU * scale gives pixels-per-point at the current display size.
       const chartPtToPx = PT_TO_EMU * scale;
       // `el.chart` is already the canonical ChartModel emitted by the Rust
       // parser (`ooxml_common::chart::ChartModel`) — no per-field adapter.
-      ctx.save();
-      applyFrameTransform(ctx, el, scale);
-      renderChart(
-        ctx,
-        el.chart,
-        {
-          x: emuToPx(el.x, scale),
-          y: emuToPx(el.y, scale),
-          w: emuToPx(el.width, scale),
-          h: emuToPx(el.height, scale),
-        },
-        chartPtToPx,
-        el.rotation,
-        opts.threeD,
-        opts.regionMap,
-        fill => chartMarkerImages.get(
-          chartImageFillKey(fill),
-        ),
-        opts.chartEx,
-      );
-      ctx.restore();
+      withPatternCoordinateSpace(ctx, slidePatternFrame, () => {
+        ctx.save();
+        applyFrameTransform(ctx, el, scale);
+        renderChart(
+          ctx,
+          el.chart,
+          {
+            x: emuToPx(el.x, scale),
+            y: emuToPx(el.y, scale),
+            w: emuToPx(el.width, scale),
+            h: emuToPx(el.height, scale),
+          },
+          chartPtToPx,
+          el.rotation,
+          opts.threeD,
+          opts.regionMap,
+          fill => chartMarkerImages.get(
+            chartImageFillKey(fill),
+          ),
+          opts.chartEx,
+        );
+        ctx.restore();
+      });
     }
   }
 
