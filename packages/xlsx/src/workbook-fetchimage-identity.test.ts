@@ -24,6 +24,8 @@ describe('XlsxWorkbook.renderViewport() fetchImage identity', () => {
     instance._mode = 'main';
     instance.parsedWorkbook = { styles: {} };
     instance.sheetCache = new Map([[0, minimalWorksheet]]);
+    instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance.imageCache = new Map();
     instance._fetchImage = stableClosure;
 
@@ -53,6 +55,8 @@ describe('XlsxWorkbook.renderViewport() fetchImage identity', () => {
     instance._mode = 'main';
     instance.parsedWorkbook = { styles: {} };
     instance.sheetCache = new Map([[0, {} as Worksheet]]);
+    instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance._fetchImage = vi.fn(async () => new Blob());
     const popupRoutes = { popup: true };
     const mainRoutes = { main: true };

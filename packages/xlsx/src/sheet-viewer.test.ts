@@ -1540,6 +1540,9 @@ describe('XlsxSheetViewer canvas mount', () => {
       sheetNames: ['Sheet1', 'Sheet2'],
       tabColors: {} as Record<number, string>,
       getWorksheet,
+      acquireWorksheetLease: async (index: number) => ({
+        worksheet: await getWorksheet(index), release: () => undefined,
+      }),
       isHidden: () => false,
       destroy,
     } as unknown as XlsxWorkbook;
@@ -1594,6 +1597,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       sheetNames: ['Shared'],
       tabColors: {} as Record<number, string>,
       getWorksheet: vi.fn().mockResolvedValue(source),
+      acquireWorksheetLease: async () => ({ worksheet: source, release: () => undefined }),
       isHidden: () => false,
       destroy: vi.fn(),
     } as unknown as XlsxWorkbook;

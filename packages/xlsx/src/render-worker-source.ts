@@ -50,6 +50,7 @@ import {
 } from './worksheet-resource-limits.js';
 import type { ParsedWorkbook, Worksheet } from './types.js';
 import { WorksheetViewProjectionCache } from './worker-protocol.js';
+import { evictWorkerWorksheets } from './internal/worksheet-cache.js';
 import { readXlsxArchiveBootstrap, type XlsxArchiveBootstrap } from './internal/archive-bootstrap-source.js';
 import type { RenderWorkerRequest, RenderWorkerResponse } from './worker-protocol.js';
 import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-source-worker.js';
@@ -199,6 +200,17 @@ self.onmessage = async (e: MessageEvent<
   }
   if (req.type === 'releaseViewProjection') {
     viewProjectionCache.release(req.projectionId);
+    return;
+  }
+  if (req.type === 'evictWorksheets') {
+    try {
+      retainedSheetUsage = evictWorkerWorksheets(
+        req.sheetIndices, sheetCache, sheetCacheUsage, retainedSheetUsage, viewProjectionCache,
+      );
+      post({ type: 'worksheetsEvicted', id: req.id });
+    } catch (error) {
+      post({ type: 'error', id: req.id, ...serializeWorkerError(error) });
+    }
     return;
   }
   const id = req.id;
