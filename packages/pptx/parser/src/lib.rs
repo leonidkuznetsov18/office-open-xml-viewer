@@ -10564,6 +10564,34 @@ mod tests {
         buf
     }
 
+    #[test]
+    fn group_chain_at_parse_depth_limit_fits_default_test_stack() {
+        // ECMA-376 Part 4 CT_GroupShape permits another grpSp child. Exercise
+        // the full slide parser at the existing 64-level resource-policy limit.
+        let group = concat!(
+            r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="2" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>"#,
+            r#"<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/>"#,
+            r#"<a:chOff x="0" y="0"/><a:chExt cx="914400" cy="914400"/></a:xfrm></p:grpSpPr>"#,
+        );
+        let leaf = concat!(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="99" name="Leaf"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>"#,
+            r#"<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="457200" cy="457200"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:sp>"#,
+        );
+        let slide = format!(
+            r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{}{leaf}{}</p:spTree></p:cSld></p:sld>"#,
+            group.repeat(64),
+            "</p:grpSp>".repeat(64),
+        );
+        let deck = build_three_slide_deck(0, &slide);
+        let presentation = parse_presentation_from_bytes(&deck).expect("nested slide parses");
+        assert_eq!(presentation.slides[0].elements.len(), 1);
+        assert!(matches!(
+            presentation.slides[0].elements[0],
+            SlideElement::Shape(_)
+        ));
+    }
+
     /// OPC permits a presentation relationship to point at a slide outside the
     /// conventional `ppt/slides/` folder. Every relationship part name and
     /// relative Target below is therefore rooted at the actual source part
