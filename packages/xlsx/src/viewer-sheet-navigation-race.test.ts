@@ -40,6 +40,10 @@ function buildViewer(onSheetChange = vi.fn()) {
     sheetNames: ['A', 'B'],
     sheetCount: 2,
     getWorksheet: vi.fn((index: number) => requests[index].promise),
+    acquireWorksheetLease: vi.fn(async (index: number) => ({
+      worksheet: await requests[index].promise,
+      release: vi.fn(),
+    })),
     destroy: vi.fn(),
   };
   const engine = viewer as unknown as Record<string, unknown> & {
@@ -59,6 +63,27 @@ function buildViewer(onSheetChange = vi.fn()) {
 }
 
 describe('XlsxViewer sheet acquisition generation', () => {
+  it('releases the outgoing active model so a one-sheet cache can navigate', async () => {
+    const { viewer, engine, workbook } = buildViewer();
+    let held: number | null = null;
+    workbook.acquireWorksheetLease.mockImplementation(async (index: number) => {
+      if (held !== null && held !== index) throw new Error('outgoing sheet still leased');
+      held = index;
+      return {
+        worksheet: worksheet(index === 0 ? 'A' : 'B'),
+        release: vi.fn(() => { if (held === index) held = null; }),
+      };
+    });
+
+    await engine.showSheet(0);
+    await engine.showSheet(1);
+
+    expect(engine.currentSheet).toBe(1);
+    expect(held).toBe(1);
+    viewer.destroy();
+    expect(held).toBeNull();
+  });
+
   it('commits the newest worksheet and index atomically when an older request resolves late', async () => {
     const { viewer, engine, requests, onSheetChange } = buildViewer();
     const a = worksheet('A');

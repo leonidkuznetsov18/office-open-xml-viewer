@@ -1,5 +1,6 @@
 import {
   XlsxWorkbook,
+  acquireXlsxWorksheet,
   loadXlsxSheetSource,
   prepareXlsxViewerRowHeights,
   releaseXlsxViewerProjection,
@@ -715,6 +716,7 @@ class XlsxViewerEngine implements ZoomableViewer {
   private fontBinding: Readonly<{ workbook: XlsxWorkbook; release: () => void }> | null = null;
   private _hiddenSheetMode: HiddenSheetMode;
   private currentWorksheet: Worksheet | null = null;
+  private releaseCurrentWorksheet: (() => void) | null = null;
   /** Authored comments for the selected sheet. Presentation filtering must not
    * erase the application-owned data and selection-context contracts. */
   private currentSourceComments: readonly XlsxComment[] = [];
@@ -1179,15 +1181,20 @@ class XlsxViewerEngine implements ZoomableViewer {
   private async _collectSheetCells(sheet: number): Promise<FindCell[]> {
     const wb = this.wb;
     if (!wb) return [];
-    const ws = await wb.getWorksheet(sheet);
-    const cells: FindCell[] = [];
-    for (const row of ws.rows) {
-      for (const cell of row.cells) {
-        const text = wb.cellText(ws, cell);
-        if (text !== '') cells.push({ row: cell.row, col: cell.col, text });
+    const lease = await acquireXlsxWorksheet(wb, sheet);
+    try {
+      const ws = lease.worksheet;
+      const cells: FindCell[] = [];
+      for (const row of ws.rows) {
+        for (const cell of row.cells) {
+          const text = wb.cellText(ws, cell);
+          if (text !== '') cells.push({ row: cell.row, col: cell.col, text });
+        }
       }
+      return cells;
+    } finally {
+      lease.release();
     }
-    return cells;
   }
 
   /**
@@ -1324,9 +1331,27 @@ class XlsxViewerEngine implements ZoomableViewer {
     const workbook = this.workbook;
     let worksheet: Worksheet;
     let sourceWorksheet: Worksheet;
+    let releaseNewWorksheet: (() => void) | undefined;
     try {
       if (!await this.ensureHostFonts(workbook)) return;
-      sourceWorksheet = await workbook.getWorksheet(index);
+      if (!this.isCurrentSheetRequest(generation, workbook)) return;
+      if (index !== this.currentSheet && this.currentWorksheet) {
+        // Navigation ends the outgoing sheet's active lease before admitting
+        // its replacement. Otherwise a one-sheet cache cannot switch sheets.
+        this.releaseCurrentWorksheet?.();
+        this.releaseCurrentWorksheet = null;
+        this.currentWorksheet = null;
+        this.sheetViews.clear();
+        this.currentSourceComments = [];
+        this.sourceCommentMap.clear();
+        this.commentMap.clear();
+        this.hyperlinkMap.clear();
+        this.setElementContext(null);
+        this.pendingElementClick = null;
+      }
+      const lease = await acquireXlsxWorksheet(workbook, index);
+      sourceWorksheet = lease.worksheet;
+      releaseNewWorksheet = lease.release;
       worksheet = this.sheetViews.get(index) ?? this.createVisibleSheetView(sourceWorksheet);
       const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
       if (typeof prepareRowHeights === 'function') {
@@ -1335,13 +1360,22 @@ class XlsxViewerEngine implements ZoomableViewer {
         if (measureCtx) prepareRowHeights.call(workbook, worksheet, measureCtx);
       }
       this.syncAutomaticRowOverrides(index, worksheet);
-      this.sheetViews.set(index, worksheet);
     } catch (error) {
+      releaseNewWorksheet?.();
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
       throw error;
     }
-    if (!this.isCurrentSheetRequest(generation, workbook)) return;
+    if (!this.isCurrentSheetRequest(generation, workbook)) {
+      releaseNewWorksheet?.();
+      return;
+    }
 
+    this.releaseCurrentWorksheet?.();
+    this.releaseCurrentWorksheet = releaseNewWorksheet ?? null;
+    // Viewer projections share the full cell graph. Keeping inactive entries
+    // would defeat workbook eviction even after its cache drops the model.
+    this.sheetViews.clear();
+    this.sheetViews.set(index, worksheet);
     this.currentSheet = index;
     this.currentWorksheet = worksheet;
     this.currentSourceComments = sourceWorksheet.comments ?? [];
@@ -5088,6 +5122,9 @@ class XlsxViewerEngine implements ZoomableViewer {
       releaseProjection.call(this.wb, this.projectionId);
     }
     this.currentWorksheet = null;
+    this.releaseCurrentWorksheet?.();
+    this.releaseCurrentWorksheet = null;
+    this.sheetViews.clear();
     this.currentSourceComments = [];
     this.sourceCommentMap.clear();
     this.elementContext = null;
