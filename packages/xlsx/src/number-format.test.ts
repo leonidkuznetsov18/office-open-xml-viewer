@@ -239,6 +239,17 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(formatCellValueWithColor(numCell(0.5), styles('[Red]h:mm'))).toEqual({ text: '12:00', color: '#FF0000' });
   });
 
+  it('never formats a number with the text section', () => {
+    expect(fmt(-5, '0.00;@')).toBe('-5.00');
+    expect(fmt(45292, '[<1]yyyy;[>9999999]yyyy;@')).toBe('#');
+    expect(fmt(45292, '"@"0')).toBe('@45292');
+  });
+
+  it('keeps pad and fill operands out of section and bracket parsing', () => {
+    expect(formatCellValueWithColor(numCell(45292), styles('yyyy_";0'))).toEqual({ text: '2024' });
+    expect(formatCellValueWithColor(numCell(45292), styles('yyyy_""[Red]"'))).toEqual({ text: '2024[Red]' });
+  });
+
   it('carries elapsed-time totals from the same rounded duration', () => {
     // 45292.33333333333 is a hair under 1 087 016 hours.
     expect(fmt(45292.33333333333, '[h]:mm')).toBe('1087016:00');

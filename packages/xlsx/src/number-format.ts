@@ -96,16 +96,10 @@ export function formatCellValueWithColor(
  */
 function applyTextSection(text: string, formatCode: string): string {
   const sections = splitSections(formatCode);
-  let section: string;
-  if (sections.length >= 4) {
-    section = sections[3];
-  } else {
-    const last = sections[sections.length - 1];
-    // A text section is one that contains an `@` placeholder. Without one, the
-    // format has no text section and text is unaffected.
-    if (!last.includes('@')) return text;
-    section = last;
-  }
+  const textIndex = textSectionIndex(sections);
+  // Without a text section, text is unaffected by the format.
+  if (textIndex < 0) return text;
+  const section = sections[textIndex];
   if (section === '') return '';
   let out = '';
   let i = 0;
@@ -600,6 +594,32 @@ interface ParsedSection {
  * so a stray one inside those never splits the section (defensive; matches how
  * Excel lexes).
  */
+/** Index of the text section (§18.8.30), or -1: the fourth section when
+ *  there are four, otherwise the last section when it holds an `@`
+ *  placeholder outside quotes, escapes and pad / fill pairs. */
+function textSectionIndex(sections: string[]): number {
+  if (sections.length >= 4) return 3;
+  const last = sections[sections.length - 1];
+  let i = 0;
+  while (i < last.length) {
+    const ch = last[i];
+    if (ch === '\\' || ch === '_' || ch === '*') {
+      i += 2;
+    } else if (ch === '"') {
+      const end = last.indexOf('"', i + 1);
+      i = end < 0 ? last.length : end + 1;
+    } else if (ch === '[') {
+      const end = last.indexOf(']', i);
+      i = end < 0 ? last.length : end + 1;
+    } else if (ch === '@') {
+      return sections.length - 1;
+    } else {
+      i++;
+    }
+  }
+  return -1;
+}
+
 function splitSections(code: string): string[] {
   const out: string[] = [];
   let cur = '';
@@ -610,7 +630,8 @@ function splitSections(code: string): string[] {
       cur += ch; i++;
       while (i < code.length && code[i] !== '"') cur += code[i++];
       if (i < code.length) cur += code[i++];
-    } else if (ch === '\\') {
+    } else if (ch === '\\' || ch === '_' || ch === '*') {
+      // An escape or a pad / fill pair: its operand is never a delimiter.
       cur += ch;
       if (i + 1 < code.length) cur += code[i + 1];
       i += 2;
@@ -643,7 +664,8 @@ function parseSection(section: string): ParsedSection {
       body += ch; i++;
       while (i < section.length && section[i] !== '"') body += section[i++];
       if (i < section.length) body += section[i++];
-    } else if (ch === '\\') {
+    } else if (ch === '\\' || ch === '_' || ch === '*') {
+      // An escape or a pad / fill pair: its operand is never a delimiter.
       body += ch;
       if (i + 1 < section.length) body += section[i + 1];
       i += 2;
@@ -1098,7 +1120,11 @@ function assembleFixed(lex: LexedSection, intText: string, fracText: string, exp
  */
 function applyFormatCode(num: number, formatCode: string, date1904 = false): FormattedCell {
   const rawSections = splitSections(formatCode);
-  const parsed = rawSections.map(parseSection);
+  // The text section never formats a number (§18.8.30): leave it out of the
+  // positional and conditional selection below.
+  const textIndex = textSectionIndex(rawSections);
+  const parsed = rawSections.filter((_, i) => i !== textIndex).map(parseSection);
+  if (parsed.length === 0) return { text: formatGeneralNumber(num) };
 
   // Conditional sections (§18.8.30 "Specify conditions"): if any section
   // carries a `[cond]`, section selection is condition-driven — the first
