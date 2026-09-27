@@ -13,15 +13,8 @@ interface NavigationHooks<Slot extends NavigationSlot> {
   presentation(): PptxPresentation | null;
   destroyed(): boolean;
   slots(): ReadonlyMap<number, Slot>;
-  scrollHost(): HTMLDivElement;
-  spacer(): HTMLDivElement;
   scale(): number;
-  width(): number;
-  padLeft(): number;
-  marginOrigin(): number;
-  totalHeight(): number;
-  slideOffset(slide: number): number;
-  mountVisible(): void;
+  scrollPoint(slide: number, x: number, y: number, options?: Options): void;
   scrollToSlide(slide: number, options?: Options): void;
   select(commentId: string, slide: number): void;
   ownBackground<T>(operation: () => Promise<T>): Promise<T>;
@@ -119,30 +112,9 @@ export class PptxScrollCommentNavigation<Slot extends NavigationSlot> {
     const y = anchored
       ? anchored.y + (hasPosition ? comment.y as number : 0)
       : comment.y as number;
-    const host = this.hooks.scrollHost();
-    const width = this.hooks.width();
-    const slideLeft = Math.max(this.hooks.padLeft(), (host.clientWidth - width) / 2) +
-      this.hooks.marginOrigin();
-    const maxTop = Math.max(0, this.hooks.totalHeight() - host.clientHeight);
-    const spacer = this.hooks.spacer();
-    const spacerWidth = spacer.offsetWidth || Number.parseFloat(spacer.style.width) || 0;
-    const maxLeft = Math.max(0, spacerWidth - host.clientWidth);
     const targetX = x / EMU_PER_PX * this.hooks.scale();
     const targetY = y / EMU_PER_PX * this.hooks.scale();
-    const top = Math.min(maxTop, Math.max(0,
-      this.hooks.slideOffset(slide) + targetY - host.clientHeight / 2));
-    const left = Math.min(maxLeft, Math.max(0,
-      slideLeft + targetX - host.clientWidth / 2));
-    const scrollHost = host as HTMLDivElement & {
-      scrollTo?: (options: { top: number; left: number; behavior?: 'auto' | 'smooth' }) => void;
-    };
-    if (typeof scrollHost.scrollTo === 'function') {
-      scrollHost.scrollTo({ top, left, behavior: options?.behavior ?? 'auto' });
-    } else {
-      host.scrollTop = top;
-      host.scrollLeft = left;
-    }
-    this.hooks.mountVisible();
+    this.hooks.scrollPoint(slide, targetX, targetY, options);
     return true;
   }
 

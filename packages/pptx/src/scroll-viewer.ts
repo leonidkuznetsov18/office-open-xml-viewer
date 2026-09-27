@@ -17,6 +17,7 @@ import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight
 import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
+import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -306,15 +307,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     presentation: () => this._pres,
     destroyed: () => this._destroyed,
     slots: () => this._slots,
-    scrollHost: () => this._scrollHost,
-    spacer: () => this._spacer,
     scale: () => this._scale,
-    width: () => this._slideWidthPx(),
-    padLeft: () => this._padH().left,
-    marginOrigin: () => this._commentMargin.originPx,
-    totalHeight: () => this._rangeAt(0, this._overscan()).totalHeight,
-    slideOffset: (slide) => this._slideOffset(slide),
-    mountVisible: () => this._mountVisible(),
+    scrollPoint: (slide, x, y, options) => this._navigation.scrollToPoint(slide, x, y, options),
     scrollToSlide: (slide, options) => this.scrollToSlide(slide, options),
     select: (commentId, slide) => {
       this._activeCommentId = commentId;
@@ -324,6 +318,20 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._selection.emitChange();
     },
     ownBackground: (operation) => this._errorRouter.ownBackgroundLifecycle(operation),
+  });
+  private readonly _navigation = new ScrollNavigationController({
+    host: () => this._scrollHost,
+    spacer: () => this._spacer,
+    count: () => this.slideCount,
+    established: () => this._scaleEstablished,
+    offset: (slide) => this._slideOffset(slide),
+    height: () => this._uniformSlideHeight,
+    indexAt: (y) => this._slideIndexAtOffset(y),
+    totalHeight: () => this._rangeAt(0, this._overscan()).totalHeight,
+    width: () => this._slideWidthPx(),
+    padLeft: () => this._padH().left,
+    marginOrigin: () => this._commentMargin.originPx,
+    mount: () => this._mountVisible(),
   });
   private readonly _selection = new SelectionContextController<PptxSelectionContext, PptxElementContext, PptxPresentation, SlideSlot>({
     wrapper: () => this._wrapper,
@@ -1274,43 +1282,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._main.settle(i, slot, widthPx, dpr);
   }
 
-  /**
-   * Scroll so slide `index`'s top edge sits at the viewport top. Clamps `index` to
-   * `[0, slideCount-1]` (the pager convention) and the resulting scrollTop to
-   * `[0, totalHeight − viewportHeight]` so the last slides don't scroll past the
-   * end. Fractional item-start targets are rounded forward to a whole CSS pixel
-   * so an integer-quantizing scroll surface cannot land on the preceding slide.
-   * A no-op when nothing is loaded or the deck is empty.
-   *
-   * `opts.behavior` ('auto' | 'smooth', default 'auto') is honoured via
-   * `scrollHost.scrollTo({ top, behavior })` when the host supports it (a real
-   * browser); the stub-DOM has no `scrollTo`, so the fallback sets `scrollTop`
-   * directly (which is what the tests assert). We then call `_mountVisible` once.
-   *
-   * MOUNTING CAVEAT: synchronous mounting of the target slide is guaranteed only on
-   * the DEFAULT/'auto' path — there `scrollTop` has already jumped to `top`, so the
-   * `_mountVisible` call reads the final scroll position and the target slide's slots
-   * exist immediately. With `behavior: 'smooth'` the scroll animates ASYNCHRONOUSLY:
-   * `scrollTop` is still near the old position when `_mountVisible` runs, so the
-   * target slide mounts lazily via the animation's subsequent `scroll` events, not
-   * from this call.
-   */
   scrollToSlide(index: number, opts?: { behavior?: 'auto' | 'smooth' }): void {
-    if (!this._pres || this._pres.slideCount === 0 || !this._scaleEstablished) return;
-    const clamped = Math.max(0, Math.min(index, this._pres.slideCount - 1));
-    const r = this._rangeAt(0, this._overscan());
-    const target = this._slideOffset(clamped);
-    const maxTop = Math.max(0, r.totalHeight - this._scrollHost.clientHeight);
-    const top = resolveItemStartScrollTop(target, maxTop);
-    const host = this._scrollHost as HTMLDivElement & {
-      scrollTo?: (opts: { top: number; behavior?: 'auto' | 'smooth' }) => void;
-    };
-    if (typeof host.scrollTo === 'function') {
-      host.scrollTo({ top, behavior: opts?.behavior ?? 'auto' });
-    } else {
-      this._scrollHost.scrollTop = top;
-    }
-    this._mountVisible();
+    this._navigation.scrollToUnit(index, opts);
   }
 
   /** Reveal an authored occurrence through the PPTX comment navigation adapter. */
@@ -1577,19 +1550,12 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  capture "what is under the cursor" before a zoom and re-query its on-screen
    *  y afterwards to assert the pointer-anchored invariant. */
   contentAtViewportYForTest(y: number): { slide: number; frac: number } {
-    const contentY = this._scrollHost.scrollTop + y;
-    const slide = this._slideIndexAtOffset(contentY);
-    const h = this._uniformSlideHeight;
-    const frac = h > 0 ? Math.min(1, Math.max(0, (contentY - this._slideOffset(slide)) / h)) : 0;
-    return { slide, frac };
+    const point = this._navigation.contentAtViewportY(y);
+    return { slide: point.unit, frac: point.frac };
   }
 
-  /** @internal test hook: inverse of {@link contentAtViewportYForTest} — the
-   *  current viewport-y (px from the scroll host top) of the content point at
-   *  (`slide`, intra-slide `frac`). */
   viewportYOfForTest(slide: number, frac: number): number {
-    const contentY = this._slideOffset(slide) + frac * this._uniformSlideHeight;
-    return contentY - this._scrollHost.scrollTop;
+    return this._navigation.viewportYOf(slide, frac);
   }
 
   /** Return the owning engine's latest content-free package-usage snapshot. */

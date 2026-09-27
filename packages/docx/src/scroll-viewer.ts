@@ -21,6 +21,7 @@ import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight
 import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
+import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -270,6 +271,20 @@ export class DocxScrollViewer implements ZoomableViewer {
     },
     shadow: () => this._pageShadow,
     reportError: (error) => this._reportRenderError(error),
+  });
+  private readonly _navigation = new ScrollNavigationController({
+    host: () => this._scrollHost,
+    spacer: () => this._spacer,
+    count: () => this.pageCount,
+    established: () => this._scaleEstablished,
+    offset: (page) => this._scrollGeometry.offsets[page] ?? 0,
+    height: (page) => this._heights[page] || 0,
+    indexAt: (y) => this._pageIndexAtOffset(this._range(), y),
+    totalHeight: () => this._scrollGeometry.totalHeight,
+    width: (page) => this._pageWidthPx(page),
+    padLeft: () => this._padH().left,
+    marginOrigin: () => this._commentMargin.originPx,
+    mount: () => this._mountVisible(),
   });
   private readonly _selection = new SelectionContextController<DocxSelectionContext, DocxElementContext, DocxDocument, PageSlot>({
     wrapper: () => this._wrapper,
@@ -1378,93 +1393,15 @@ export class DocxScrollViewer implements ZoomableViewer {
     });
   }
 
-  /**
-   * Scroll so page `index`'s top edge sits at the viewport top. Clamps `index` to
-   * `[0, pageCount-1]` (the pager convention) and the resulting scrollTop to
-   * `[0, totalHeight − viewportHeight]` so the last pages don't scroll past the
-   * end. Fractional item-start targets are rounded forward to a whole CSS pixel
-   * so an integer-quantizing scroll surface cannot land on the preceding page.
-   * A no-op when nothing is loaded or the document is empty.
-   *
-   * `opts.behavior` ('auto' | 'smooth', default 'auto') is honoured via
-   * `scrollHost.scrollTo({ top, behavior })` when the host supports it (a real
-   * browser); the stub-DOM has no `scrollTo`, so the fallback sets `scrollTop`
-   * directly (which is what the tests assert). We then call `_mountVisible` once.
-   *
-   * MOUNTING CAVEAT: synchronous mounting of the target page is guaranteed only on
-   * the DEFAULT/'auto' path — there `scrollTop` has already jumped to `top`, so the
-   * `_mountVisible` call reads the final scroll position and the target page's slots
-   * exist immediately. With `behavior: 'smooth'` the scroll animates ASYNCHRONOUSLY:
-   * `scrollTop` is still near the old position when `_mountVisible` runs, so the
-   * target page mounts lazily via the animation's subsequent `scroll` events, not
-   * from this call.
-   */
   scrollToPage(index: number, opts?: { behavior?: 'auto' | 'smooth' }): void {
-    if (!this._doc || this._doc.pageCount === 0 || !this._scaleEstablished) return;
-    const clamped = Math.max(0, Math.min(index, this._doc.pageCount - 1));
-    // Recompute offsets from the current heights (independent of scrollTop).
-    const r = computeVisibleWindow(
-      this._scrollGeometry,
-      0,
-      this._scrollHost.clientHeight,
-      this._overscan(),
-    );
-    const target = r.offsets[clamped] ?? 0;
-    const maxTop = Math.max(0, r.totalHeight - this._scrollHost.clientHeight);
-    const top = resolveItemStartScrollTop(target, maxTop);
-    const host = this._scrollHost as HTMLDivElement & {
-      scrollTo?: (opts: { top: number; behavior?: 'auto' | 'smooth' }) => void;
-    };
-    if (typeof host.scrollTo === 'function') {
-      host.scrollTo({ top, behavior: opts?.behavior ?? 'auto' });
-    } else {
-      this._scrollHost.scrollTop = top;
-    }
-    this._mountVisible();
+    this._navigation.scrollToUnit(index, opts);
   }
 
-  private _scrollToPageTarget(
-    page: number,
+  private _scrollToPageTarget(page: number,
     target: Readonly<{ x: number; y: number; w: number; h: number }>,
-    opts?: { behavior?: 'auto' | 'smooth' },
-  ): void {
-    const range = computeVisibleWindow(
-      this._scrollGeometry,
-      0,
-      this._scrollHost.clientHeight,
-      this._overscan(),
-    );
-    const pageWidth = this._pageWidthPx(page);
-    const { left: paddingLeft } = this._padH();
-    const pageLeft = Math.max(
-      paddingLeft,
-      (this._scrollHost.clientWidth - pageWidth) / 2,
-    ) + this._commentMargin.originPx;
-    const maxTop = Math.max(0, range.totalHeight - this._scrollHost.clientHeight);
-    const spacerWidth = this._spacer.offsetWidth || Number.parseFloat(this._spacer.style.width) || 0;
-    const maxLeft = Math.max(0, spacerWidth - this._scrollHost.clientWidth);
-    const top = Math.min(maxTop, Math.max(
-      0,
-      (range.offsets[page] ?? 0) + target.y + target.h / 2 - this._scrollHost.clientHeight / 2,
-    ));
-    const left = Math.min(maxLeft, Math.max(
-      0,
-      pageLeft + target.x + target.w / 2 - this._scrollHost.clientWidth / 2,
-    ));
-    const host = this._scrollHost as HTMLDivElement & {
-      scrollTo?: (options: {
-        top: number;
-        left: number;
-        behavior?: 'auto' | 'smooth';
-      }) => void;
-    };
-    if (typeof host.scrollTo === 'function') {
-      host.scrollTo({ top, left, behavior: opts?.behavior ?? 'auto' });
-    } else {
-      this._scrollHost.scrollTop = top;
-      this._scrollHost.scrollLeft = left;
-    }
-    this._mountVisible();
+    opts?: { behavior?: 'auto' | 'smooth' }): void {
+    this._navigation.scrollToPoint(page, target.x + target.w / 2,
+      target.y + target.h / 2, opts);
   }
 
   /** Reveal an authored comment through the DOCX anchor navigation adapter. */
@@ -1660,21 +1597,12 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  capture "what is under the cursor" before a zoom and re-query its on-screen
    *  y afterwards to assert the pointer-anchored invariant. */
   contentAtViewportYForTest(y: number): { page: number; frac: number } {
-    const r = this._range();
-    const contentY = this._scrollHost.scrollTop + y;
-    const page = this._pageIndexAtOffset(r, contentY);
-    const h = this._heights[page] || 0;
-    const frac = h > 0 ? Math.min(1, Math.max(0, (contentY - r.offsets[page]) / h)) : 0;
-    return { page, frac };
+    const point = this._navigation.contentAtViewportY(y);
+    return { page: point.unit, frac: point.frac };
   }
 
-  /** @internal test hook: inverse of {@link contentAtViewportYForTest} — the
-   *  current viewport-y (px from the scroll host top) of the content point at
-   *  (`page`, intra-page `frac`). */
   viewportYOfForTest(page: number, frac: number): number {
-    const r = this._range();
-    const contentY = (r.offsets[page] ?? 0) + frac * (this._heights[page] || 0);
-    return contentY - this._scrollHost.scrollTop;
+    return this._navigation.viewportYOf(page, frac);
   }
 
   /** Return the owning engine's latest content-free package-usage snapshot. */
