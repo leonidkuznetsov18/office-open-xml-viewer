@@ -13,6 +13,7 @@ import {
   TerminalResourceOwner,
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
+import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -475,7 +476,19 @@ export class PptxScrollViewer implements ZoomableViewer {
   );
   private _findGeneration = 0;
   private _findActive = false;
-  private _findMeasureCtx: CanvasRenderingContext2D | null | undefined;
+  private readonly _highlights = new HighlightLayerController<SlideSlot, PptxTextRunInfo, PptxMatchLocation>({
+    slots: () => this._slots,
+    active: () => this._findActive,
+    runs: (unit) => this._find.slideRuns(unit),
+    setRuns: (unit, runs) => this._find.setSlideRuns(unit, runs),
+    paint: (unit, slot, runs, measure) => buildPptxHighlightLayer(
+      slot.highlightLayer, runs, this._find.slideHighlights(unit),
+      this._slideWidthPx(), this._slideHeightPx(),
+      measure, this._opts.findHighlightColors,
+    ),
+    reveal: (unit) => this.scrollToSlide(unit),
+    unitOf: (location) => location.slide,
+  });
 
   /**
    * Create a Scroll Viewer that borrows an already-loaded presentation.
@@ -1160,9 +1173,9 @@ export class PptxScrollViewer implements ZoomableViewer {
           // current scale (rounded).
           buildPptxTextLayer(slot.textLayer, runs, Math.round(widthPx), Math.round(this._slideHeightPx()), this._hyperlinkHandler(), i);
         }
-        if (wantRuns) this._refreshFindRuns(i, runs);
+        if (wantRuns) this._highlights.refreshRuns(i, runs);
         this._commitSlotComments(i, slot);
-        this._redrawSlotHighlights(i, slot);
+        this._highlights.redrawSlot(i, slot);
       })
       .catch((err: unknown) => {
         const isCurrent =
@@ -1364,9 +1377,9 @@ export class PptxScrollViewer implements ZoomableViewer {
             i,
           );
         }
-        if (wantRuns) this._refreshFindRuns(i, runs);
+        if (wantRuns) this._highlights.refreshRuns(i, runs);
         this._commitSlotComments(i, slot);
-        this._redrawSlotHighlights(i, slot);
+        this._highlights.redrawSlot(i, slot);
       })
       .catch((err: unknown) => {
         if (generation !== slot.presentationGeneration) return;
@@ -1531,9 +1544,9 @@ export class PptxScrollViewer implements ZoomableViewer {
           );
         }
       }
-      if (wantRuns) this._refreshFindRuns(i, runs);
+      if (wantRuns) this._highlights.refreshRuns(i, runs);
       this._commitSlotComments(i, slot);
-      this._redrawSlotHighlights(i, slot);
+      this._highlights.redrawSlot(i, slot);
       painted = true;
     } catch (err) {
       const isCurrent =
@@ -1759,9 +1772,9 @@ export class PptxScrollViewer implements ZoomableViewer {
             buildPptxTextLayer(slot.textLayer, runs, Math.round(widthPx), Math.round(this._slideHeightPx()), this._hyperlinkHandler(), i);
           }
         }
-        if (wantRuns) this._refreshFindRuns(i, runs);
+        if (wantRuns) this._highlights.refreshRuns(i, runs);
         this._commitSlotComments(i, slot);
-        this._redrawSlotHighlights(i, slot);
+        this._highlights.redrawSlot(i, slot);
       })
       .catch((err: unknown) => {
         if (
@@ -1843,9 +1856,9 @@ export class PptxScrollViewer implements ZoomableViewer {
             );
           }
         }
-        if (wantRuns) this._refreshFindRuns(i, runs);
+        if (wantRuns) this._highlights.refreshRuns(i, runs);
         this._commitSlotComments(i, slot);
-        this._redrawSlotHighlights(i, slot);
+        this._highlights.redrawSlot(i, slot);
       })
       .catch((err: unknown) => {
         if (generation === slot.presentationGeneration) this._reportRenderError(err);
@@ -2049,7 +2062,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       // A progressive deck must clear existing highlights without waiting for
       // slides that have not finished preparing. DOCX retains its layout wait.
       this._find.invalidate();
-      this._redrawHighlights();
+      this._highlights.redrawAll();
       return [];
     }
     if (!presentation.layoutComplete) {
@@ -2060,25 +2073,25 @@ export class PptxScrollViewer implements ZoomableViewer {
     if (this._destroyed || generation !== this._findGeneration || presentation !== this._pres) return [];
     const matches = await this._errorRouter.ownAwaitable(() => this._find.find(query, opts));
     if (this._destroyed || generation !== this._findGeneration || presentation !== this._pres) return [];
-    this._redrawHighlights();
+    this._highlights.redrawAll();
     return matches;
   }
 
   /** Activate and reveal the next match, wrapping at the end. */
   async findNext(): Promise<FindMatch<PptxMatchLocation> | null> {
-    return this._activateMatch(this._find.next());
+    return this._highlights.activate(this._find.next());
   }
 
   /** Activate and reveal the previous match, wrapping at the beginning. */
   async findPrev(): Promise<FindMatch<PptxMatchLocation> | null> {
-    return this._activateMatch(this._find.prev());
+    return this._highlights.activate(this._find.prev());
   }
 
   /** Clear the current query and every mounted highlight. */
   clearFind(): void {
     this._findActive = false;
     this._invalidateFind();
-    this._redrawHighlights();
+    this._highlights.redrawAll();
   }
 
   private _invalidateFind(): void {
@@ -2086,25 +2099,9 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._find.invalidate();
   }
 
-  private async _activateMatch(
-    match: FindMatch<PptxMatchLocation> | null,
-  ): Promise<FindMatch<PptxMatchLocation> | null> {
-    if (match) this.scrollToSlide(match.location.slide);
-    this._redrawHighlights();
-    return match;
-  }
-
   private async _collectSlideRuns(slide: number): Promise<PptxTextRunInfo[]> {
     if (!this._pres) return [];
     return this._pres.collectSlideRuns(slide, this._slideWidthPx());
-  }
-
-  private _redrawHighlights(): void {
-    for (const [slide, slot] of this._slots) this._redrawSlotHighlights(slide, slot);
-  }
-
-  private _refreshFindRuns(slide: number, runs: PptxTextRunInfo[]): void {
-    if (this._findActive) this._find.setSlideRuns(slide, runs);
   }
 
   private _redrawSlotComments(slide: number, slot: SlideSlot): void {
@@ -2190,38 +2187,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     });
   }
 
-
-  private _redrawSlotHighlights(slide: number, slot: SlideSlot): void {
-    if (!this._findActive) {
-      slot.highlightLayer.innerHTML = '';
-      return;
-    }
-    const runs = this._find.slideRuns(slide);
-    if (!runs) {
-      slot.highlightLayer.innerHTML = '';
-      return;
-    }
-    buildPptxHighlightLayer(
-      slot.highlightLayer,
-      runs,
-      this._find.slideHighlights(slide),
-      this._slideWidthPx(),
-      this._slideHeightPx(),
-      (font) => this._measureForFind(font),
-      this._opts.findHighlightColors,
-    );
-  }
-
-  private _measureForFind(font: string): (text: string) => number {
-    if (this._findMeasureCtx === undefined) {
-      const canvas = document.createElement('canvas');
-      this._findMeasureCtx = canvas.getContext('2d');
-    }
-    const ctx = this._findMeasureCtx;
-    if (!ctx || typeof ctx.measureText !== 'function') return (text) => text.length;
-    ctx.font = font;
-    return (text) => ctx.measureText(text).width;
-  }
 
   /**
    * IX1 hyperlink click dispatch (mirrors {@link PptxViewer._onHyperlinkClick}).
@@ -2408,6 +2373,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._findActive = false;
     this._unbindLayoutPresentation();
     this._selection.destroy();
+    this._highlights.destroy();
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
     // Cancel a pending settle so no re-render is dispatched after teardown

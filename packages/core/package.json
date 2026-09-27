@@ -56,6 +56,7 @@
     "./internal/selection-context-controller": "./src/viewer/selection-context-controller.ts",
     "./internal/comment-overlay-controller": "./src/viewer/comment-overlay-controller.ts",
     "./internal/scroll-viewer-shell": "./src/viewer/scroll-viewer-shell.ts",
+    "./internal/highlight-layer-controller": "./src/viewer/highlight-layer-controller.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"

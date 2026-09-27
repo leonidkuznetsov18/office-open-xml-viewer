@@ -17,6 +17,7 @@ import {
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/read-only-comment-contract';
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
+import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -468,7 +469,6 @@ export class DocxScrollViewer implements ZoomableViewer {
   /** Throwaway 2D context reused to measure text for the §17.3.2.10 縦中横 overlay
    *  clamp (#836). Lazily created; `null` when canvas metrics are unavailable
    *  (headless), in which case the overlay degrades to the un-clamped span. */
-  private _measureCtx: CanvasRenderingContext2D | null | undefined;
   /** Worker mode: page indices whose bitmap render is currently dispatched to the
    *  engine. Coalesces a scroll storm — we never dispatch a second render for a
    *  page whose first is still in flight — and lets us drop pages that scrolled
@@ -508,6 +508,19 @@ export class DocxScrollViewer implements ZoomableViewer {
     (page) => this._collectPageRuns(page),
   );
   private _findActive = false;
+  private readonly _highlights = new HighlightLayerController<PageSlot, DocxTextRunInfo, DocxMatchLocation>({
+    slots: () => this._slots,
+    active: () => this._findActive,
+    runs: (unit) => this._find.pageRuns(unit),
+    setRuns: (unit, runs) => this._find.setPageRuns(unit, runs),
+    paint: (unit, slot, runs, measure) => buildDocxHighlightLayer(
+      slot.highlightLayer, runs, this._find.pageHighlights(unit),
+      this._pageWidthPx(unit), this._pageHeightPx(unit),
+      measure, this._opts.findHighlightColors,
+    ),
+    reveal: (unit) => this.scrollToPage(unit),
+    unitOf: (location) => location.page,
+  });
   /** Covers the pre-search progressive wait before DocxFindController.find()
    * can establish its own cancellation generation. */
   private _findRequestGeneration = 0;
@@ -1328,13 +1341,13 @@ export class DocxScrollViewer implements ZoomableViewer {
             width,
             height,
             this._hyperlinkHandler(),
-            (font) => this._measureForFont(font),
+            (font) => this._highlights.measure(font),
             i,
           );
         }
-        if (wantRuns) this._refreshFindRuns(i, runs);
+        if (wantRuns) this._highlights.refreshRuns(i, runs);
         this._commitCommentRuns(i, slot, runs);
-        this._redrawSlotHighlights(i, slot);
+        this._highlights.redrawSlot(i, slot);
       })
       .catch((err: unknown) => {
         const isCurrent =
@@ -1393,22 +1406,6 @@ export class DocxScrollViewer implements ZoomableViewer {
     }
     const page = doc.getBookmarkPage(ref);
     if (page !== undefined) this.scrollToPage(page);
-  }
-
-  /** A width-measurer primed with a run's `font` — used ONLY to clamp a §17.3.2.10
-   *  縦中横 selection span to its drawn one-em cell (#836). Mirrors DocxViewer's
-   *  `_measureForFont`. Returns a length-based fallback when canvas metrics are
-   *  unavailable so the caller still gets a callable (the overlay then sees scale
-   *  1 and leaves the span un-clamped). */
-  private _measureForFont(font: string): (s: string) => number {
-    if (this._measureCtx === undefined) {
-      const c = document.createElement('canvas');
-      this._measureCtx = c.getContext('2d');
-    }
-    const ctx = this._measureCtx;
-    if (!ctx || typeof ctx.measureText !== 'function') return (s) => s.length;
-    ctx.font = font;
-    return (s) => ctx.measureText(s).width;
   }
 
   /** A canvas's intended CSS box in px (the % denominators the overlay builders
@@ -1525,14 +1522,14 @@ export class DocxScrollViewer implements ZoomableViewer {
             width,
             height,
             this._hyperlinkHandler(),
-            (font) => this._measureForFont(font),
+            (font) => this._highlights.measure(font),
             i,
           );
         }
       }
-      if (wantRuns) this._refreshFindRuns(i, runs);
+      if (wantRuns) this._highlights.refreshRuns(i, runs);
       this._commitCommentRuns(i, slot, runs);
-      this._redrawSlotHighlights(i, slot);
+      this._highlights.redrawSlot(i, slot);
       painted = true;
     } catch (err) {
       const isCurrent =
@@ -1749,14 +1746,14 @@ export class DocxScrollViewer implements ZoomableViewer {
               width,
               height,
               this._hyperlinkHandler(),
-              (font) => this._measureForFont(font),
+              (font) => this._highlights.measure(font),
               i,
             );
           }
         }
-        if (wantRuns) this._refreshFindRuns(i, runs);
+        if (wantRuns) this._highlights.refreshRuns(i, runs);
         this._commitCommentRuns(i, slot, runs);
-        this._redrawSlotHighlights(i, slot);
+        this._highlights.redrawSlot(i, slot);
       })
       .catch((err: unknown) => {
         if (
@@ -2083,18 +2080,18 @@ export class DocxScrollViewer implements ZoomableViewer {
     const matches = await this._errorRouter.ownAwaitable(
       () => this._find.find(query, opts),
     );
-    this._redrawHighlights();
+    this._highlights.redrawAll();
     return matches;
   }
 
   /** Activate and reveal the next match, wrapping at the end. */
   async findNext(): Promise<FindMatch<DocxMatchLocation> | null> {
-    return this._activateMatch(this._find.next());
+    return this._highlights.activate(this._find.next());
   }
 
   /** Activate and reveal the previous match, wrapping at the beginning. */
   async findPrev(): Promise<FindMatch<DocxMatchLocation> | null> {
-    return this._activateMatch(this._find.prev());
+    return this._highlights.activate(this._find.prev());
   }
 
   /** Clear the current query and every mounted highlight. */
@@ -2102,15 +2099,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._findRequestGeneration++;
     this._findActive = false;
     this._find.invalidate();
-    this._redrawHighlights();
-  }
-
-  private async _activateMatch(
-    match: FindMatch<DocxMatchLocation> | null,
-  ): Promise<FindMatch<DocxMatchLocation> | null> {
-    if (match) this.scrollToPage(match.location.page);
-    this._redrawHighlights();
-    return match;
+    this._highlights.redrawAll();
   }
 
   private async _collectPageRuns(page: number): Promise<DocxTextRunInfo[]> {
@@ -2120,14 +2109,6 @@ export class DocxScrollViewer implements ZoomableViewer {
       currentDate: this._currentDate,
       ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
     });
-  }
-
-  private _redrawHighlights(): void {
-    for (const [page, slot] of this._slots) this._redrawSlotHighlights(page, slot);
-  }
-
-  private _refreshFindRuns(page: number, runs: DocxTextRunInfo[]): void {
-    if (this._findActive) this._find.setPageRuns(page, runs);
   }
 
   private _commitCommentRuns(
@@ -2202,27 +2183,6 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
 
-
-  private _redrawSlotHighlights(page: number, slot: PageSlot): void {
-    if (!this._findActive) {
-      slot.highlightLayer.innerHTML = '';
-      return;
-    }
-    const runs = this._find.pageRuns(page);
-    if (!runs) {
-      slot.highlightLayer.innerHTML = '';
-      return;
-    }
-    buildDocxHighlightLayer(
-      slot.highlightLayer,
-      runs,
-      this._find.pageHighlights(page),
-      this._pageWidthPx(page),
-      this._pageHeightPx(page),
-      (font) => this._measureForFont(font),
-      this._opts.findHighlightColors,
-    );
-  }
 
   /**
    * Re-fit the base scale on a container resize while PRESERVING the current zoom
@@ -2351,6 +2311,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._find.invalidate();
     this._findActive = false;
     this._selection.destroy();
+    this._highlights.destroy();
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
     // Cancel a pending settle so no re-render is dispatched after teardown
