@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-// The optional model-source implementation must stay outside every ordinary
-// OOXML entry and worker. Resolve workspace package exports with TypeScript,
-// then inspect the emitted static JS graph and decoded inline worker payloads.
-// This guards accidental eager coupling by maintainers or agents; it is not a
-// security boundary against deliberately adversarial JavaScript.
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+// Runtime smoke proves ordinary loads do not request optional source code.
+// This companion guard checks eager source and emitted graphs, inline workers,
+// sidecars, markers, and the differential build cost of selected-source code.
+// It guards accidental coupling; it is not a security boundary.
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { resolve, dirname, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 import { execFileSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
+import { tmpdir } from 'node:os';
 import { createTypeScriptResolver } from './check-core-legacy-boundary.mjs';
 
 const resolveModule = createTypeScriptResolver();
@@ -34,60 +35,17 @@ export const SOURCE_DISPATCH = new Map([
   ]),
 ]);
 
-// These are the small presence branches retained in ordinary browser and Node
-// entries. Optional source owners and worker-source sidecars are separate chunks,
-// so their implementation bytes are never part of this dispatch budget.
-const EAGER_DISPATCH = new Map([
-  ['packages/docx/src/document.ts', 1],
-  ['packages/xlsx/src/workbook.ts', 1],
-  ['packages/pptx/src/presentation.ts', 1],
-  ['packages/node/src/docx.ts', 2],
-  ['packages/node/src/xlsx.ts', 1],
-  ['packages/node/src/pptx.ts', 1],
-]);
-const DISPATCH_SHIM_BUDGET = 512;
-const EMITTED_DISPATCH_BUDGET = 256;
-
-export function checkDispatchShimBudget(files) {
-  for (const { path, text } of files) {
-    const expected = EAGER_DISPATCH.get(path);
-    if (expected === undefined) throw new Error(`Unknown eager dispatch owner ${path}`);
-    const ast = parse(text, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
-    const branches = [];
-    function walk(node) {
-      if (!node || typeof node !== 'object' || !node.type) return;
-      if (node.type === 'IfStatement' && text.slice(node.test.start, node.test.end).includes('modelSources')) {
-        branches.push(node);
-      }
-      for (const value of Object.values(node)) {
-        if (Array.isArray(value)) value.forEach(walk);
-        else if (value && typeof value === 'object' && value.type) walk(value);
-      }
-    }
-    walk(ast);
-    if (branches.length !== expected) {
-      throw new Error(`${path} expected ${expected} modelSources dispatch branches, found ${branches.length}`);
-    }
-    for (const branch of branches) {
-      const shim = text.slice(branch.start, branch.consequent.end);
-      if (!/import\([^)]*model-source/.test(shim)) {
-        throw new Error(`${path} modelSources dispatch has no selected-source import`);
-      }
-      const bytes = Buffer.byteLength(shim);
-      if (bytes > DISPATCH_SHIM_BUDGET) {
-        throw new Error(`${path} dispatch shim exceeds ${DISPATCH_SHIM_BUDGET}-byte budget: ${bytes}`);
-      }
-      console.log(`${path} dispatch shim: ${bytes}/${DISPATCH_SHIM_BUDGET} source bytes`);
-    }
-  }
-}
+// A feature budget, not a historical whole-entry baseline. It includes every
+// eagerly retained byte that disappears when selected-source dispatch is
+// compiled out, even if preparation was moved into another static module.
+const DISPATCH_COST_BUDGET = Object.freeze({ docx: 2_500, xlsx: 3_000, pptx: 2_500, node: 4_500 });
 
 export function checkSourceDispatchImports(files) {
   for (const { path, text } of files) {
     if (/\.(?:test|spec|stories|probe)\.[cm]?[jt]sx?$/.test(path)) continue;
     const ast = parse(text, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
     const allowed = SOURCE_DISPATCH.get(path) ?? [];
-    function walk(node, functionName, presenceGuard = false) {
+    function walk(node, functionName) {
       if (!node || typeof node !== 'object' || !node.type) return;
       let current = functionName;
       if (node.type === 'FunctionDeclaration') current = node.id?.name;
@@ -95,13 +53,6 @@ export function checkSourceDispatchImports(files) {
       if (['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type)) {
         // Preserve the containing named dispatch for its local callback/IIFE.
         current = functionName;
-      }
-      if (node.type === 'IfStatement') {
-        walk(node.test, current, presenceGuard);
-        walk(node.consequent, current,
-          presenceGuard || text.slice(node.test.start, node.test.end).includes('modelSources'));
-        walk(node.alternate, current, presenceGuard);
-        return;
       }
       if ((node.type === 'CallExpression' && node.callee.type === 'Import')
         || node.type === 'ImportExpression') {
@@ -114,19 +65,16 @@ export function checkSourceDispatchImports(files) {
         if (sourceImport && !allowed.includes(current)) {
           throw new Error(`${path}:${node.loc?.start.line} model-source import outside an allowed dispatch function (${current ?? 'top level'})`);
         }
-        if (sourceImport && EAGER_DISPATCH.has(path) && !presenceGuard) {
-          throw new Error(`${path}:${node.loc?.start.line} model-source import outside modelSources presence dispatch`);
-        }
       }
       // Assignment to self.onmessage is a named worker dispatch boundary.
       if (node.type === 'AssignmentExpression' && node.left.type === 'MemberExpression'
         && node.left.object.name === 'self' && node.left.property.name === 'onmessage') {
-        walk(node.right, 'self.onmessage', presenceGuard);
+        walk(node.right, 'self.onmessage');
         return;
       }
       for (const value of Object.values(node)) {
-        if (Array.isArray(value)) value.forEach((child) => walk(child, current, presenceGuard));
-        else if (value && typeof value === 'object' && value.type) walk(value, current, presenceGuard);
+        if (Array.isArray(value)) value.forEach((child) => walk(child, current));
+        else if (value && typeof value === 'object' && value.type) walk(value, current);
       }
     }
     walk(ast, undefined);
@@ -247,34 +195,32 @@ function inlineWorkers(code) {
   return outputs;
 }
 
-// Measure the emitted presence branch, including Vite's dynamic import
-// factoring. Unrelated OOXML code in the same chunk never enters this count.
-export function checkBuiltDispatchBudget(codes, expected, label) {
-  const shims = [];
-  for (const code of codes) {
-    const ast = parse(code, { sourceType: 'module' });
-    function walk(node) {
-      if (!node || typeof node !== 'object' || !node.type) return;
-      if (node.type === 'IfStatement'
-        && code.slice(node.test.start, node.test.end).includes('modelSources')) {
-        const shim = code.slice(node.start, node.consequent.end);
-        if (/import\([^)]*model-source/.test(shim)) shims.push(Buffer.byteLength(shim));
-      }
-      for (const value of Object.values(node)) {
-        if (Array.isArray(value)) value.forEach(walk);
-        else if (value && typeof value === 'object' && value.type) walk(value);
-      }
-    }
-    walk(ast);
+export function assertDispatchCost(enabledEntry, disabledEntry, budget, label, enabledGraph) {
+  const enabled = enabledGraph ?? bundleGraph(enabledEntry);
+  const disabled = bundleGraph(disabledEntry);
+  assertNoSourceRuntime(disabled.joined, `${label} feature-disabled graph`);
+  const bytes = enabled.bytes - disabled.bytes;
+  if (bytes < 0 || bytes > budget) {
+    throw new Error(`${label} model-source dispatch cost exceeds ${budget}-byte budget: ${bytes}`);
   }
-  if (shims.length !== expected) {
-    throw new Error(`${label} expected ${expected} emitted modelSources dispatch shims, found ${shims.length}`);
-  }
-  for (const bytes of shims) {
-    if (bytes > EMITTED_DISPATCH_BUDGET) {
-      throw new Error(`${label} emitted dispatch shim exceeds ${EMITTED_DISPATCH_BUDGET}-byte budget: ${bytes}`);
-    }
-    console.log(`${label} emitted dispatch shim: ${bytes}/${EMITTED_DISPATCH_BUDGET} bytes`);
+  console.log(`${label} dispatch cost: ${bytes}/${budget} bytes (${enabled.files} vs ${disabled.files} static chunks)`);
+  return bytes;
+}
+
+function withDisabledBuild(check) {
+  const disabledDist = mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(), 'ooxml-source-off-'));
+  const started = performance.now();
+  try {
+    execFileSync(process.execPath, [
+      'node_modules/vite/bin/vite.js', 'build', '--mode', 'model-sources-off',
+      '--outDir', disabledDist, '--emptyOutDir',
+    ], { encoding: 'utf8', timeout: 180_000, maxBuffer: 10 * 1024 * 1024 });
+    console.log(`model-source-disabled build: ${((performance.now() - started) / 1000).toFixed(2)}s`);
+    check(disabledDist);
+  } finally {
+    // This unique directory is created by this invocation and contains only
+    // its generated comparison build. rmSync does not follow symlink targets.
+    rmSync(disabledDist, { recursive: true, force: true });
   }
 }
 
@@ -284,11 +230,12 @@ export function assertNoSourceRuntime(code, name) {
   }
 }
 
-export function checkBuiltBundles(dist = 'dist', { packages = false } = {}) {
+export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDist } = {}) {
+  const entryGraphs = new Map();
   for (const format of ['docx', 'xlsx', 'pptx', 'node']) {
     const graph = bundleGraph(join(dist, `${format}.mjs`));
+    entryGraphs.set(format, graph);
     assertNoSourceRuntime(graph.joined, `${format} static entry graph`);
-    checkBuiltDispatchBudget(graph.codes, format === 'node' ? 4 : 1, format);
     console.log(`${format} static JS: ${graph.bytes} bytes across ${graph.files} files`);
     if (format !== 'node') {
       for (const payload of graph.codes.flatMap(inlineWorkers)) {
@@ -326,6 +273,12 @@ export function checkBuiltBundles(dist = 'dist', { packages = false } = {}) {
   if (ordinaryWorkers !== 3) {
     throw new Error(`Expected 3 ordinary render workers, found ${ordinaryWorkers}`);
   }
+  if (disabledDist) {
+    for (const [format, budget] of Object.entries(DISPATCH_COST_BUDGET)) {
+      assertDispatchCost(join(dist, `${format}.mjs`), join(disabledDist, `${format}.mjs`),
+        budget, format, entryGraphs.get(format));
+    }
+  }
 }
 
 export function assertEagerSourceEntries(entries, forbidden = []) {
@@ -343,7 +296,6 @@ export function assertEagerSourceEntries(entries, forbidden = []) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   checkSourceDispatchImports(trackedSourceFiles());
-  checkDispatchShimBudget([...EAGER_DISPATCH.keys()].map((path) => ({ path, text: readFileSync(path, 'utf8') })));
   const forbidden = [
     'packages/core/src/source/model-source.ts',
     ...['docx', 'xlsx', 'pptx'].map((format) => `packages/${format}/src/internal/worker-${format === 'docx' ? 'document' : format === 'xlsx' ? 'worksheet' : 'presentation'}-source.ts`),
@@ -370,6 +322,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     ]),
     'packages/node/src/index.ts',
   ], forbidden);
-  if (existsSync('dist/docx.mjs')) checkBuiltBundles('dist', { packages: process.argv.includes('--packages') });
+  if (existsSync('dist/docx.mjs')) {
+    withDisabledBuild((disabledDist) => checkBuiltBundles('dist', {
+      packages: process.argv.includes('--packages'), disabledDist,
+    }));
+  }
   console.log('OOXML entries and workers keep model-source runtime behind dynamic loads.');
 }

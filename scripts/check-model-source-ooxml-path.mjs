@@ -76,7 +76,9 @@ function ooxmlAwaits(node, code) {
     }
     if (current.type === 'IfStatement') {
       const test = code.slice(current.test.start, current.test.end).replace(/\s+/g, '');
-      if (/^(?:opts|options)\.modelSources!==undefined$/.test(test)) {
+      // The internal comparison-build flag can only narrow the existing
+      // selected-source branch; the ordinary OOXML await path is unchanged.
+      if (/^(?:__OOXML_MODEL_SOURCES__&&)?(?:opts|options)\.modelSources!==undefined$/.test(test)) {
         if (current.alternate) walk(current.alternate);
         return;
       }

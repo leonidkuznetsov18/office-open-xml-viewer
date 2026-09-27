@@ -340,7 +340,7 @@ export class PptxPresentation {
     source: string | ArrayBuffer,
     opts: LoadOptions = {},
   ): Promise<PptxPresentation> {
-    if (opts.modelSources !== undefined) {
+    if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
       const { loadPptxModelSource } = await import('./internal/presentation-model-source.js');
       return loadPptxModelSource(source, opts);
     }
@@ -1517,3 +1517,4 @@ export class PptxPresentation {
     dropSvgImageCache(this._fetchImage);
   }
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

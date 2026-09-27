@@ -458,7 +458,7 @@ export class DocxDocument {
       if (signal?.aborted) throw new PaginationAbortError();
     };
     checkAbort();
-    if (opts.modelSources !== undefined) {
+    if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
       const { loadDocxModelSource } = await import('./internal/document-model-source.js');
       const modelDocument = await loadDocxModelSource(source, opts, control);
       if (signal?.aborted) {
@@ -1908,3 +1908,4 @@ export class DocxDocument {
     });
   }
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;
