@@ -2418,8 +2418,10 @@ function renderQuadrant(
     // Colour precedence (as the main path): hyperlink theme colour >
     // conditional-formatting font colour > number-format section colour
     // ([Red] etc., §18.8.30) > table / PivotTable style colour > the cell's
-    // own font colour.
-    const tableFontColor = tableFontDxfFor(tableStyle, styles)?.font?.color ?? pivotFormat?.fontColor ?? null;
+    // own font colour (a cell's own colour beats the table's; see
+    // tableStyleFontColor).
+    const tableFontColor = tableStyleFontColor(tableFontDxfFor(tableStyle, styles), xf)
+      ?? pivotFormat?.fontColor ?? null;
     const textColor = hyperlinkUrl
       ? '#0563C1'
       : (cf.fontColor ?? formatted.color ?? tableFontColor ?? font.color);
@@ -2866,10 +2868,12 @@ function renderQuadrant(
       const hyperlinkUrl = rc.hyperlinkMap.get(key);
       // Table-style element dxfs can override font color (ECMA-376 §18.8.83),
       // following the same element hierarchy as the fill/bold above.
-      const tableFontColor = tableFontDxf?.font?.color ?? pivotFormat?.fontColor ?? null;
+      const tableFontColor = tableStyleFontColor(tableFontDxf, xf)
+        ?? pivotFormat?.fontColor ?? null;
       // Colour precedence: hyperlink > conditional-formatting font colour >
       // number-format section colour ([Red] etc., §18.8.30) > table-style dxf
-      // colour > the cell's own font colour.
+      // colour > the cell's own font colour (a cell's own colour beats the
+      // table's; see tableStyleFontColor).
       const textColor = hyperlinkUrl
         ? '#0563C1'
         : (cf.fontColor ?? formatted.color ?? tableFontColor ?? font.color);
@@ -3469,6 +3473,13 @@ function tableFontDxfFor(tableStyle: TableCellStyle | undefined, styles: Styles)
           : tableStyle.stripeDxf != null
             ? dxfList[tableStyle.stripeDxf]
             : dxfList[tableStyle.wholeTableDxf ?? -1];
+}
+
+/** A table-element dxf's font color, unless the cell's font color is its own
+ *  formatting (`ownFontColor`, resolved by the parser against the Normal
+ *  style): Excel draws that color over the table style's. */
+function tableStyleFontColor(tableFontDxf: Dxf | undefined, xf: CellXf): string | null {
+  return xf.ownFontColor ? null : tableFontDxf?.font?.color ?? null;
 }
 
 /** The cell font with its bold/italic/underline/strike composed from every

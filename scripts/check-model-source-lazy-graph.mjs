@@ -208,28 +208,43 @@ function assertNoSourceRuntime(code, name) {
 // graph at aec306b6 to 2,533,239 DOCX, 2,579,716 Node, and 2,047,181 worker
 // bytes (+200, -20, and -54 respectively versus the #1557 guard values).
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  // DOCX and the Node entry include the explicit-state line-breaker and body
-  // table modules from #1566. Against aec306b6, the DOCX static graph grows
-  // 18,002 bytes (2,533,239 → 2,551,241) in the same 36 chunks: the moved
-  // line-breaker contributes 18,953 rendered module bytes and table measurement
-  // 2,501, offset by minification. The old implementations are absent and the
-  // explicit state and named call boundaries remain. The allowance is unchanged.
-  docx: { entry: 2_551_241, inline: 31_624, budget: 2_800 },
-  // XLSX adds viewport preview eligibility and pull orchestration. The
-  // measured static entry at #1559 is 1,857,222 bytes (+13,040), and its
-  // ordinary inline pull worker is 40,879 decoded bytes (+977). The optional
-  // model-source runtime remains outside both eager graphs.
-  xlsx: { entry: 1_857_222, inline: 40_879, budget: 2_500 },
-  // PPTX measures identically on aec306b6 and this merge. Re-pin the older
-  // guard value to the measured graph without changing its allowance.
-  pptx: { entry: 1_826_158, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_597_718, budget: 3_600 },
+  // #1566 adds explicit-state line breaking and body-table measurement to
+  // DOCX and Node. Before this merge, the #1559 branch measured DOCX at
+  // 2,551,241 bytes and Node at 2,597,718 bytes. The DOCX change is
+  // +18,002 bytes against aec306b6 in 36 chunks (18,953 and 2,501 rendered
+  // module bytes, offset by minification). #1586 and #1590 contribute sliced
+  // layout and projection consolidation. #1561 moves scroll/find behavior
+  // into core collaborators: +11,595 static bytes against 036ddd31, with
+  // 44,570 bytes added in shared/adapter modules and 28,748 removed from old
+  // viewer/find modules. The merged graph measures 2,562,860 bytes in 36
+  // chunks (24 above origin/main in the combined #1559/#1561 build); the dispatch
+  // allowance is unchanged.
+  docx: { entry: 2_562_860, inline: 31_624, budget: 2_800 },
+  // #1558 adds worksheet LRU/leases and view-state restoration (+8,512 entry
+  // bytes against 776237df). #1559 adds viewport preview eligibility and pull
+  // orchestration (+13,040 static and +977 inline bytes on its pre-merge base).
+  // The merged graph measures 1,857,727 static bytes in 36 chunks and 40,879
+  // decoded inline worker bytes. The optional source runtime remains lazy.
+  xlsx: { entry: 1_857_727, inline: 40_879, budget: 2_500 },
+  // The #1559 branch matched aec306b6 at 1,826,158 PPTX bytes. #1561 adds
+  // 13,299 PPTX static bytes against 036ddd31: 48,632 in shared
+  // and adapter modules offset by 30,988 removed viewer/find bytes. The merged
+  // graph measures 1,839,481 bytes (24 above origin/main in the combined
+  // #1559/#1561 build). The 38 static chunks and dispatch
+  // allowance are unchanged.
+  pptx: { entry: 1_839_481, inline: 59_554, budget: 2_100 },
+  // The merged Node graph includes #1559's XLSX preview wiring and measures
+  // 2,599,004 bytes (+1,286 against origin/main); its allowance is unchanged.
+  node: { entry: 2_599_004, budget: 3_600 },
 });
-// The XLSX render worker measures 1,418,200 bytes (+1,252) after viewport
-// preview and pull orchestration. The DOCX worker includes PRs #1586 and #1590
-// plus the #1566 line-breaker split (+19,183 bytes against aec306b6). Workers
-// retain zero allowance.
-const OOXML_RENDER_WORKERS = [1_418_200, 1_458_524, 2_066_364];
+// #1559's XLSX render worker adds viewport preview and pull orchestration
+// (+1,252 bytes before this merge). #1558 adds explicit worksheet eviction
+// (+536); table-style font color precedence adds 51; #1593's rounded serials
+// and section-aware formats add 24 to each worker and 618 to the XLSX worker.
+// The DOCX worker includes #1586 and #1590 plus #1566's line-breaker split
+// (+19,183 bytes against aec306b6). The merged ordinary workers measure
+// 1,418,893, 1,458,548, and 2,066,388 bytes. Workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_418_893, 1_458_548, 2_066_388];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
