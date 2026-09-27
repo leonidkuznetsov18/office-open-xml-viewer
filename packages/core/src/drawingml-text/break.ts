@@ -25,6 +25,11 @@ export interface DrawingMlBrokenLine<T> {
    * the font size) still take part in the line's metrics.
    */
   hiddenRuns?: number[];
+  /**
+   * For an empty line opened by a line feed inside a text run, that run's
+   * input index. PowerPoint sizes such a line by the run (controls L07, L08).
+   */
+  lineFeedRun?: number;
 }
 
 export interface DrawingMlBreakOptions<T> {
@@ -44,17 +49,14 @@ export interface DrawingMlBreakOptions<T> {
   /** Pen position relative to the leading inset; includes paragraph margin. */
   tabStartPen?(lineIndex: number): number;
   /**
-   * `a:pPr@eaLnBrk` (ECMA-376 §21.1.2.2.7, default true). When false, an East
-   * Asian word — a whitespace-delimited token of one authored run containing
-   * CJK — is never split: its CJK, SEA and ZWSP opportunities are withdrawn
-   * and an overwide word overflows instead of taking an emergency break.
+   * `a:pPr@eaLnBrk` (ECMA-376 §21.1.2.2.7, default true). PowerPoint controls
+   * E00–E12 show that `eaLnBrk="0"` does not keep an East Asian word whole:
+   * ideographs still break per character. It lifts the East Asian line-start
+   * and line-end rules instead: a CJK bracket may end a line (E01, E03) and
+   * a break is allowed after an opening bracket before Latin text (E08, E10,
+   * E12), where `eaLnBrk="1"` keeps the bracket with that text (E09).
    */
   eastAsianLineBreak?: boolean;
-  /**
-   * Whether two input runs come from one authored run (an adapter may split a
-   * run where only its font changes). Defaults to identity of the input run.
-   */
-  sameSourceRun?(left: T, right: T): boolean;
   /**
    * Negative tracking can make a longer prefix narrower. Every prefix is then
    * a fit candidate; widths are accumulated from segment heads and
@@ -97,11 +99,14 @@ export function breakDrawingMlText<T>(
   const regions: Atom<T>[][] = [[]];
   /** Region in which each input run starts. */
   const runRegion: number[] = [];
+  /** Input run whose line feed opened each region, else -1. */
+  const regionLineFeedRun: number[] = [-1];
   let runIndex = 0;
   for (const run of runs) {
     runRegion.push(regions.length - 1);
     if (run.type === 'break') {
       regions.push([]);
+      regionLineFeedRun.push(-1);
       runIndex++;
       continue;
     }
@@ -109,16 +114,25 @@ export function breakDrawingMlText<T>(
       // ECMA-376 §22.1 m:oMathPara is display math. It occupies its own visual
       // line: break after preceding text and before following text. An authored
       // hard break already supplies the first edge.
-      if (run.display && regions.at(-1)!.length > 0) regions.push([]);
+      if (run.display && regions.at(-1)!.length > 0) {
+        regions.push([]);
+        regionLineFeedRun.push(-1);
+      }
       regions.at(-1)!.push({ type: 'object', style: run.style, run: runIndex, width: run.width, payload: run.payload });
-      if (run.display) regions.push([]);
+      if (run.display) {
+        regions.push([]);
+        regionLineFeedRun.push(-1);
+      }
       runIndex++;
       continue;
     }
     const offsets = [0, ...graphemeClusterOffsets(run.text), run.text.length];
     for (let i = 0; i + 1 < offsets.length; i++) {
       const text = run.text.slice(offsets[i], offsets[i + 1]);
-      if (text === '\n') regions.push([]);
+      if (text === '\n') {
+        regions.push([]);
+        regionLineFeedRun.push(runIndex);
+      }
       else if (text === '\t') regions.at(-1)!.push({ type: 'tab', style: run.style, run: runIndex });
       else if (text !== '\r') regions.at(-1)!.push({ type: 'text', text, style: run.style, run: runIndex });
     }
@@ -155,35 +169,12 @@ export function breakDrawingMlText<T>(
       for (let i = 1; i < atomOffsets.length; i++) if (offsets.has(atomOffsets[i])) seaBreaks.add(i);
     }
 
-    // eaLnBrk=false: mark seams inside an East Asian word of one authored run.
-    const keepEastAsianWords = options.eastAsianLineBreak === false;
-    const inEastAsianWord = new Uint8Array(end + 1);
-    // A seam between authored runs before such a word stays an opportunity:
-    // the word moves whole to the next line when it does not fit.
-    const beforeEastAsianWord = new Uint8Array(end + 1);
-    /** End of the East Asian word containing each atom, else -1. */
-    const eastAsianWordEnd = new Int32Array(end).fill(-1);
-    if (keepEastAsianWords) {
-      const delimits = (atom: Atom<T>): boolean => atom.type !== 'text' || /^\s+$/u.test(atom.text);
-      let from = 0;
-      for (let i = 0; i <= end; i++) {
-        const boundary = i === end || delimits(atoms[i]) || (i > from && atoms[i].run !== atoms[i - 1].run
-          && !(options.sameSourceRun?.(atoms[i - 1].style, atoms[i].style) ?? false));
-        if (!boundary) continue;
-        let hasCjk = false;
-        for (let k = from; k < i; k++) if (isCjk(atoms[k])) { hasCjk = true; break; }
-        if (hasCjk) {
-          for (let k = from + 1; k < i; k++) inEastAsianWord[k] = 1;
-          for (let k = from; k < i; k++) eastAsianWordEnd[k] = i;
-          if (from > 0 && !delimits(atoms[from - 1])) beforeEastAsianWord[from] = 1;
-        }
-        from = i < end && delimits(atoms[i]) ? i + 1 : i;
-      }
-    }
+    const eastAsianRules = options.eastAsianLineBreak !== false;
+    // Line-break-prohibited adjacency that eaLnBrk="0" keeps (not a CJK rule).
+    const gluedCodePoint = (cp: number): boolean => cp === 0xa0 || cp === 0x202f || cp === 0x2060 || cp === 0xfeff;
 
     const mayBreakAt = (index: number): boolean => {
       if (index <= 0 || index >= end) return false;
-      const eastAsianWord = inEastAsianWord[index] === 1;
       const prev = atoms[index - 1];
       const next = atoms[index];
       // A tab is a break-before opportunity, not break-after: C11 carries
@@ -191,20 +182,21 @@ export function breakDrawingMlText<T>(
       if (next.type === 'tab') return true;
       if (prev.type === 'tab') return false;
       if (isSpace(prev) || isSpace(next)) return true;
-      if (beforeEastAsianWord[index]) return true;
-      if (!eastAsianWord && seaBreaks.has(index)) return true;
+      if (seaBreaks.has(index)) return true;
       if (prev.type === 'object' || next.type === 'object') return true;
       const prevCp = [...prev.text].at(-1)?.codePointAt(0);
       const nextCp = next.text.codePointAt(0);
       if (prevCp === undefined || nextCp === undefined) return false;
-      if (!eastAsianWord && prevCp === 0x200b) return true;
+      if (prevCp === 0x200b) return true;
       // Observed PowerPoint table controls T00–T08: NBSP binds the adjacent
       // words. At a narrow width Office moves the whole "and NBSP Partner"
       // group after the preceding ordinary space; once that group fits, it
       // stays on the first line. The matching Arial controls bound the rule
       // independently of Segoe UI's host-only font metrics.
+      if (!eastAsianRules && (isCjk(prev) || isCjk(next))
+          && !gluedCodePoint(prevCp) && !gluedCodePoint(nextCp)) return true;
       if (isUax14NoBreakPair(prevCp, nextCp)) return false;
-      if (!eastAsianWord && (isCjk(prev) || isCjk(next))) return true;
+      if (isCjk(prev) || isCjk(next)) return true;
       if (index > 1 && (lineBreakClass(prevCp) === 'HY' || lineBreakClass(prevCp) === 'HH')) {
         const before = atoms[index - 2];
         if (before.type === 'text' && latin.test([...before.text].at(-1) ?? '')
@@ -214,24 +206,10 @@ export function breakDrawingMlText<T>(
     };
 
     // A continuation of an overwide word can begin at every grapheme. Cache
-    // these paragraph-local predicates once; searching the whole remaining
-    // word on every continuation made a narrow box quadratic in word length.
+    // the paragraph-local predicate once; searching the whole remaining word
+    // on every continuation made a narrow box quadratic in word length.
     const breakAt = new Uint8Array(end + 1);
-    const nextBreak = new Int32Array(end + 1);
-    const nonTextOrCjk = new Int32Array(end + 1);
-    const styleSeams = new Int32Array(end + 1);
     for (let i = 1; i < end; i++) breakAt[i] = mayBreakAt(i) ? 1 : 0;
-    nextBreak[end] = end;
-    for (let i = end - 1; i >= 0; i--) nextBreak[i] = breakAt[i + 1] ? i + 1 : nextBreak[i + 1];
-    for (let i = 0; i < end; i++) {
-      const atom = atoms[i];
-      const validWordAtom = atom.type === 'text' && !isCjk(atom);
-      nonTextOrCjk[i + 1] = nonTextOrCjk[i] + (validWordAtom ? 0 : 1);
-      styleSeams[i + 1] = styleSeams[i] + (
-        i > 0 && validWordAtom && atoms[i - 1].type === 'text'
-          && !isCjk(atoms[i - 1]) && !sameStyle(atoms[i - 1].style, atom.style) ? 1 : 0
-      );
-    }
 
     // Most DrawingML paragraphs use one resolved paint style and no tabs or
     // objects. Build UTF-16 offsets once so every fit probe measures exactly
@@ -670,7 +648,11 @@ export function breakDrawingMlText<T>(
     };
     let start = 0;
     if (end === 0) {
-      lines.push({ segments: [], width: 0, ...(regionIndex + 1 < regions.length ? { endsWithBreak: true } : {}) });
+      lines.push({
+        segments: [], width: 0,
+        ...(regionIndex + 1 < regions.length ? { endsWithBreak: true } : {}),
+        ...(regionLineFeedRun[regionIndex] >= 0 ? { lineFeedRun: regionLineFeedRun[regionIndex] } : {}),
+      });
       continue;
     }
     while (start < end) {
@@ -747,24 +729,18 @@ export function breakDrawingMlText<T>(
             while (split < end && !breakAt[split]) split++;
           }
         } else {
-          split = Math.max(start + 1, fit); // overwide word: grapheme-safe emergency break
-          // A mixed-font/style Latin word has no shaping-preserving emergency
-          // break: retaining the old overflow avoids inventing a run seam as a
-          // break. The matched C01 control has identical styles and does split.
-          const nextOpportunity = nextBreak[start];
-          if (nonTextOrCjk[nextOpportunity] === nonTextOrCjk[start]
-              && styleSeams[nextOpportunity] > styleSeams[start + 1]) {
-            split = nextOpportunity;
-          }
-          // eaLnBrk=false: an overwide East Asian word overflows whole.
-          if (keepEastAsianWords && eastAsianWordEnd[start] >= 0) split = nextOpportunity;
+          // Overwide word: grapheme-safe emergency break. PowerPoint control
+          // E06 also splits a Latin word that spans a font seam (C01 splits
+          // one with identical styles), so no style seam keeps it whole.
+          split = Math.max(start + 1, fit);
         }
       }
 
       // Kinsoku (§17.15.1.58–.60) adjusts an in-run CJK boundary. The Office
       // C08 control is a counterexample at an authored run seam, so leave that
       // boundary intact instead of inferring a cross-run retraction rule.
-      if (split < end && atoms[split - 1].run === atoms[split].run
+      // eaLnBrk="0" lifts the East Asian line-start/line-end rules (E01).
+      if (eastAsianRules && split < end && atoms[split - 1].run === atoms[split].run
           && (isCjk(atoms[split - 1]) || isCjk(atoms[split]))) {
         const left = atoms.slice(start, split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
         const right = atoms.slice(split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);

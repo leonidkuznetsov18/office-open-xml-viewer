@@ -1505,10 +1505,14 @@ export function layoutParagraph(
       ? marRPx : marLPx + (lineIndex === 0 ? firstLineIndentPx : 0),
     nonMonotoneMeasure: input.some((item) => item.type === 'text' && (item.style.letterSpacingPx ?? 0) < 0),
     eastAsianLineBreak: para.eaLnBrk !== false,
-    sameSourceRun: (left, right) => left.sourceRunId === right.sourceRunId,
   });
   return broken.map((line) => ({
-    segments: line.segments.map((part, index): LayoutSegment => {
+    // Office L07/L08: an empty line opened by a line feed inside a run keeps
+    // that run's size; a zero-width segment carries it to the line metrics.
+    segments: line.segments.length === 0 && line.lineFeedRun !== undefined
+      && input[line.lineFeedRun]?.type === 'text'
+      ? [{ ...(input[line.lineFeedRun] as { style: LayoutSegment }).style, text: '' }]
+      : line.segments.map((part, index): LayoutSegment => {
       if (part.type === 'text') {
         const previous = line.segments[index - 1];
         const leadingLetterSpacingPx = previous?.type === 'text'

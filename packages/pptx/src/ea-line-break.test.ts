@@ -3,9 +3,11 @@ import type { TextRunData } from '@silurus/ooxml-core';
 import { layoutParagraph, renderTable, type PptxTextRunInfo } from './renderer.js';
 import type { Paragraph, TableCell, TableElement, TextBody } from './types.js';
 
-// ECMA-376 §21.1.2.2.7 a:pPr@eaLnBrk: false forbids breaking an East Asian
-// word; the word moves whole to the next line and overflows when wider than
-// the box. Every glyph measures 10 px in these probes.
+// ECMA-376 §21.1.2.2.7 a:pPr@eaLnBrk. PowerPoint controls E00–E12 (issue
+// #1562) show that eaLnBrk="0" still breaks ideographs per character; it lifts
+// the East Asian line-start/line-end rules, so a CJK bracket may end a line
+// and a break may follow an opening bracket before Latin text. Every glyph
+// measures 10 px in these probes.
 function measuringContext(): CanvasRenderingContext2D {
   let font = '';
   return {
@@ -51,20 +53,24 @@ function lines(runs: TextRunData[], width: number, eaLnBrk: boolean): string[] {
 }
 
 describe('pptx eaLnBrk (§21.1.2.2.7)', () => {
-  it('keeps an overwide East Asian word whole when eaLnBrk is false', () => {
-    expect(lines([run('日本語')], 10, false)).toEqual(['日本語']);
-    expect(lines([run('日本語')], 10, true)).toEqual(['日', '本', '語']);
+  it('still breaks ideographs per character when eaLnBrk is false (control E00)', () => {
+    expect(lines([run('日本語')], 10, false)).toEqual(['日', '本', '語']);
   });
 
-  it('moves the whole East Asian word after a space instead of splitting it', () => {
-    expect(lines([run('ab 日本語です')], 60, false)).toEqual(['ab ', '日本語です']);
-    expect(lines([run('ab 日本語です')], 60, true)).toEqual(['ab 日本語', 'です']);
+  it('lets a CJK opening bracket end a line only when eaLnBrk is false (E01)', () => {
+    expect(lines([run('日本語「'), run('日本語')], 20, false)).toEqual(['日本', '語「', '日本', '語']);
+    expect(lines([run('日本語「'), run('日本語')], 20, true)).toEqual(['日本', '語', '「日', '本語']);
+  });
+
+  it('breaks after an opening bracket before Latin text only when eaLnBrk is false (E08, E09)', () => {
+    expect(lines([run('「'), run('abc')], 30, false)).toEqual(['「', 'abc']);
+    expect(lines([run('「'), run('abc')], 30, true)).toEqual(['「ab', 'c']);
   });
 
   it('honours eaLnBrk in table cell text', () => {
     const EMU = 12_700;
     const body = (eaLnBrk: boolean) => ({
-      verticalAnchor: 't', paragraphs: [{ ...paragraph([run('日本語')], eaLnBrk) }],
+      verticalAnchor: 't', paragraphs: [{ ...paragraph([run('「'), run('abc')], eaLnBrk) }],
       defaultFontSize: null, defaultBold: null, defaultItalic: null,
       lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'square', vert: 'horz', autoFit: 'none',
     }) as unknown as TextBody;
@@ -76,16 +82,36 @@ describe('pptx eaLnBrk (§21.1.2.2.7)', () => {
         gridSpan: 1, rowSpan: 1, hMerge: false, vMerge: false,
       } as TableCell;
       const table: TableElement = {
-        type: 'table', x: 0, y: 0, width: 12 * EMU, height: 90 * EMU,
+        type: 'table', x: 0, y: 0, width: 30 * EMU, height: 90 * EMU,
         rotation: 0, flipH: false, flipV: false,
-        cols: [12 * EMU], rows: [{ height: 90 * EMU, cells: [cell] }],
+        cols: [30 * EMU], rows: [{ height: 90 * EMU, cells: [cell] }],
       };
       const runs: PptxTextRunInfo[] = [];
       renderTable(measuringContext(), table, 1 / EMU, undefined,
         { themeMajorFont: null, themeMinorFont: null, dpr: 1 }, (info) => runs.push(info));
-      return runs.map((info) => info.text);
+      // Group the emitted runs into visual lines by their vertical position.
+      const byLine = new Map<number, string>();
+      for (const info of runs) byLine.set(info.inShapeY, (byLine.get(info.inShapeY) ?? '') + info.text);
+      return [...byLine.values()];
     };
-    expect(cellTexts(false)).toEqual(['日本語']);
-    expect(cellTexts(true)).toEqual(['日', '本', '語']);
+    expect(cellTexts(false)).toEqual(['「', 'abc']);
+    expect(cellTexts(true)).toEqual(['「ab', 'c']);
+  });
+});
+
+describe('pptx line feed inside a:t (controls L00–L08)', () => {
+  it('breaks at the line feed; the next line takes the containing run size (L00)', () => {
+    const laid = layoutParagraph(measuringContext(), paragraph([
+      { ...run('Ab\nCd'), fontSize: 40 }, { ...run('Ef'), fontSize: 14 },
+    ], true), 1000, 20, '000000', 1, 0);
+    expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['Ab', 'CdEf']);
+    expect(Math.max(...laid[1].segments.map((segment) => segment.sizePx))).toBe(40 * 12_700);
+  });
+
+  it('sizes an empty line opened by a line feed by that run (L07, L08)', () => {
+    const laid = layoutParagraph(measuringContext(), paragraph([{ ...run('Ab\n\nCd'), fontSize: 40 }], true),
+      1000, 20, '000000', 1, 0);
+    expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['Ab', '', 'Cd']);
+    expect(laid[1].segments.map((segment) => segment.sizePx)).toEqual([40 * 12_700]);
   });
 });
