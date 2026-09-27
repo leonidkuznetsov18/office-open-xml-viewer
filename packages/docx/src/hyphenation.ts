@@ -1,3 +1,4 @@
+/// <reference path="./hyphen.d.ts" />
 import french from 'hyphen/fr/index.js';
 
 /** ECMA-376 §17.15.1.10 requests automatic hyphenation but does not define a
