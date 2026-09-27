@@ -218,6 +218,9 @@ describe('layoutParagraph', () => {
     expect(second.bookmarkStarts).toBeUndefined();
     expect(Object.isFrozen(whole)).toBe(true);
     expect(Object.isFrozen(whole.lines)).toBe(true);
+    expect(Object.isFrozen(second)).toBe(true);
+    expect(Object.isFrozen(second.lines[0])).toBe(true);
+    expect(Object.isFrozen(second.lines[0]?.placements[0])).toBe(true);
   });
 
   it('charges the initial jump and only intra-slice inter-line jumps', () => {
