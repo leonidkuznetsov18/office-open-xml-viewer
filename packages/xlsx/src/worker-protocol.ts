@@ -144,6 +144,13 @@ export class WorksheetViewProjectionCache {
     }
   }
 
+  evictSheet(sheetIndex: number): void {
+    const suffix = `:${sheetIndex}`;
+    for (const key of this.entries.keys()) {
+      if (key.endsWith(suffix)) this.entries.delete(key);
+    }
+  }
+
   clear(): void {
     this.entries.clear();
     this.releasedProjectionIds.clear();
@@ -242,6 +249,7 @@ export type RenderWorkerRequest =
       viewProjection?: WireViewProjection;
     }
   | { type: 'releaseViewProjection'; projectionId: number }
+  | { type: 'evictWorksheets'; id: number; sheetIndices: number[] }
   // Worker render mode decodes images in-worker via a getImage closure; this arm
   // exists only for protocol parity with worker.ts (so a stray extractImage
   // never hangs). The render worker reads bytes straight from its retained
@@ -266,4 +274,5 @@ export type RenderWorkerResponse =
     }
   | DelimitedTextParseResponse
   | { type: 'viewportRendered'; id: number; bitmap: ImageBitmap }
+  | { type: 'worksheetsEvicted'; id: number }
   | ({ type: 'sheetSessionOpened'; id: number } & PullSessionIdentity<number>);

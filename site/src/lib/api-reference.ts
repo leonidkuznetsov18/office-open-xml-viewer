@@ -144,8 +144,8 @@ const DOCX_LAYOUT_VIEW_OPTIONS: readonly ApiOption[] = [
 const DOCX_SLICE_LAYOUT: ApiOption = {
   name: 'sliceLayout',
   type: 'boolean',
-  def: 'false',
-  desc: 'In main mode, yield to the browser between pagination slices while load() still waits for the complete document. Worker mode already keeps pagination off the UI thread; without progressiveLayout this option has no additional effect there. Use progressiveLayout when opening pages should become available before full pagination finishes.',
+  def: 'true in main mode',
+  desc: 'Main-mode layout yields to the browser between pagination slices by default while load() waits for the complete document. Pass false to run it synchronously. Worker mode already keeps pagination off the UI thread; without progressiveLayout this option has no additional effect there. Use progressiveLayout when opening pages should become available before full pagination finishes.',
   detailsHref: '/docx#progressive-layout',
   detailsLabel: 'Progressive layout guide',
 };
