@@ -516,7 +516,10 @@ name = "ooxml-mcp-server"
 version = "0.88.0"
 dependencies = [
  "anyhow",
+ "docx-model",
  "docx-parser",
+ "ooxml-common",
+ "pptx-model",
  "pptx-parser",
  "rmcp",
  "schemars",
@@ -525,7 +528,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xlsx-model",
  "xlsx-parser",
+ "zip",
 ]
 
 [[package]]

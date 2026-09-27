@@ -139,6 +139,11 @@ export class XlsxWorkbook {
   private delimitedTextBacked = false;
   private parsedWorkbook: ParsedWorkbook | null = null;
   private sheetCache = new Map<number, Worksheet>();
+  /** Cache insertion order is the workbook session's LRU order. A lease pins a
+   * model while an operation or a viewer is using its content graph. */
+  private sheetCacheUsage = new Map<number, WorksheetCacheUsage>();
+  private sheetLeases = new Map<number, number>();
+  private evictingSheets = new Map<number, { done: Promise<void>; complete: () => void }>();
   /** One materialization per sheet at a time. This becomes the ownership seam
    * for the bounded worksheet cursor: concurrent callers share one cursor and
    * one eventual mutable compatibility object instead of doubling peak work. */
@@ -419,6 +424,9 @@ export class XlsxWorkbook {
     this.resourceFailure = null;
     this.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
     this.sheetCache.clear();
+    this.sheetCacheUsage.clear();
+    this.sheetLeases.clear();
+    this.completePendingEvictions();
     await this.worksheetPullClient?.cancelAll('closed');
     this.worksheetPullClient = null;
     this.generation = (this.generation ?? 0) + 1;
@@ -576,6 +584,7 @@ export class XlsxWorkbook {
     this.parsedWorkbook = response.workbook;
     this.cjkFallback = xlsxCjkFallback(response.workbook, this.cjkFallback);
     this.sheetCache.set(0, worksheet);
+    this.sheetCacheUsage.set(0, measured);
     this.retainedSheetUsage = measured;
 
     this.officeFontRequests = xlsxOfficeFontRequests(response.workbook);
@@ -712,9 +721,26 @@ export class XlsxWorkbook {
   }
 
   async getWorksheet(sheetIndex: number): Promise<Worksheet> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.getWorksheet(sheetIndex);
+    }
+    const release = this.pinWorksheet(sheetIndex);
+    try {
+      return await this.getOrLoadWorksheet(sheetIndex);
+    } finally {
+      release();
+    }
+  }
+
+  private async getOrLoadWorksheet(sheetIndex: number): Promise<Worksheet> {
     this.assertResourceHealthy();
     const cached = this.sheetCache.get(sheetIndex);
-    if (cached) return cached;
+    if (cached) {
+      this.touchWorksheet(sheetIndex, cached);
+      return cached;
+    }
     const active = this.sheetLoads.get(sheetIndex);
     if (active) return active;
     const load = this.loadWorksheet(sheetIndex);
@@ -726,11 +752,57 @@ export class XlsxWorkbook {
     }
   }
 
+  private touchWorksheet(sheetIndex: number, worksheet: Worksheet): void {
+    this.sheetCache.delete(sheetIndex);
+    this.sheetCache.set(sheetIndex, worksheet);
+  }
+
+  private pinWorksheet(sheetIndex: number): () => void {
+    this.sheetLeases.set(sheetIndex, (this.sheetLeases.get(sheetIndex) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = this.sheetLeases.get(sheetIndex) ?? 0;
+      if (count <= 1) this.sheetLeases.delete(sheetIndex);
+      else this.sheetLeases.set(sheetIndex, count - 1);
+    };
+  }
+
+  private completePendingEvictions(): void {
+    for (const pending of this.evictingSheets.values()) pending.complete();
+    this.evictingSheets.clear();
+  }
+
+  /** The lease begins before an asynchronous pull so another admission cannot
+   * discard a sheet just as the waiting caller receives it. */
+  private async acquireWorksheetLease(sheetIndex: number): Promise<{
+    worksheet: Worksheet;
+    release: () => void;
+  }> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.acquireWorksheetLease(sheetIndex);
+    }
+    const release = this.pinWorksheet(sheetIndex);
+    try {
+      return { worksheet: await this.getWorksheet(sheetIndex), release };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   /** Detached comments for one worksheet, in authored order. Worksheet models
    * are materialized lazily, so this accessor is asynchronous. */
   async getComments(sheetIndex: number): Promise<readonly Readonly<XlsxComment>[]> {
-    const worksheet = await this.getWorksheet(sheetIndex);
-    return structuredClone(worksheet.comments ?? []);
+    const lease = await this.acquireWorksheetLease(sheetIndex);
+    try {
+      return structuredClone(lease.worksheet.comments ?? []);
+    } finally {
+      lease.release();
+    }
   }
 
   /** Return a fresh content-free metrics snapshot, including lazy worksheet and
@@ -771,6 +843,8 @@ export class XlsxWorkbook {
     let modelUsage: WorksheetModelUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0 };
     let terminal: Worksheet | undefined;
     let nextCacheUsage: WorksheetCacheUsage | undefined;
+    let terminalUsage: WorksheetCacheUsage | undefined;
+    let terminalAcknowledged = false;
     // The compatibility adapter knows the workbook sheet index/name but not
     // the resolved OPC relationship target. Omit `part` rather than fabricate
     // a package address; Rust-originated violations carry the real xl/... path.
@@ -811,33 +885,102 @@ export class XlsxWorkbook {
           part,
           unit.usage,
         );
-        const retainedUsage = this.retainedSheetUsage ?? {
-          rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
-        };
-        const nextCache = addWorksheetCacheUsage(retainedUsage, measured);
-        assertWorksheetCacheUsage(
-          nextCache,
-          'get-worksheet',
-          part,
-          unit.usage,
-        );
+        // Resource governance is a library policy, not an OOXML rule. Plan the
+        // complete eviction before changing either realm. The worker receives
+        // the same victims before terminal ACK, so it cannot retain a stale
+        // model or reject a sheet that fits after eviction.
+        let remaining = this.retainedSheetUsage;
+        let nextCache = addWorksheetCacheUsage(remaining, measured);
+        const victims: number[] = [];
+        for (const [candidate] of this.sheetCache) {
+          try {
+            assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage);
+            break;
+          } catch (error) {
+            if (!(error instanceof OoxmlResourceLimitError)) throw error;
+          }
+          if ((this.sheetLeases.get(candidate) ?? 0) > 0) continue;
+          const previous = this.sheetCacheUsage.get(candidate);
+          if (!previous) continue;
+          // Subtract from the unsaturated retained total, then add the incoming
+          // sheet again. addWorksheetCacheUsage caps an over-budget candidate
+          // at limit + 1, so subtracting from that candidate loses exact usage.
+          remaining = addWorksheetCacheUsage(remaining, {
+            rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
+          }, previous);
+          nextCache = addWorksheetCacheUsage(remaining, measured);
+          victims.push(candidate);
+        }
+        assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage);
+        let pendingEviction: { done: Promise<void>; complete: () => void } | undefined;
+        if (victims.length && this._mode === 'worker') {
+          let complete!: () => void;
+          const done = new Promise<void>((resolve) => { complete = resolve; });
+          pendingEviction = { done, complete };
+          for (const candidate of victims) this.evictingSheets.set(candidate, pendingEviction);
+        }
+        try {
+          if (pendingEviction) {
+            await this.requireBridge().request(
+              (id) => ({ type: 'evictWorksheets', id, sheetIndices: victims }) satisfies RenderWorkerRequest,
+            );
+            if (!this.parsedWorkbook) throw new Error('Workbook not loaded');
+          }
+          for (const candidate of victims) {
+            if ((this.sheetLeases.get(candidate) ?? 0) > 0) {
+              throw new Error(`Cannot evict leased worksheet ${candidate}`);
+            }
+          }
+          for (const candidate of victims) {
+            this.sheetCache.delete(candidate);
+            this.sheetCacheUsage.delete(candidate);
+          }
+          // The terminal can still be canceled or fail its ACK. Eviction has
+          // already happened in both realms, so its accounting commits now.
+          this.retainedSheetUsage = remaining;
+        } catch (error) {
+          if (pendingEviction) {
+            // A lost reply or divergent lease cannot prove the worker state.
+            // Close both caches rather than let either realm serve a stale copy.
+            this.destroy();
+          }
+          throw error;
+        } finally {
+          if (pendingEviction) {
+            for (const candidate of victims) {
+              if (this.evictingSheets.get(candidate) === pendingEviction) {
+                this.evictingSheets.delete(candidate);
+              }
+            }
+            pendingEviction.complete();
+          }
+        }
         terminal = worksheet;
+        terminalUsage = measured;
         nextCacheUsage = nextCache;
       }
-      if (!terminal || !nextCacheUsage) {
+      terminalAcknowledged = true;
+      if (!terminal || !nextCacheUsage || !terminalUsage) {
         throw new Error(`XLSX worksheet ${sheetIndex} did not produce a terminal model`);
       }
       // The coordinator has ACKed the accepted terminal before it completes.
       // Only now commit Browser-retained cache ownership/accounting.
       this.retainedSheetUsage = nextCacheUsage;
-      await this.retainWorksheetOfficeFonts(terminal);
       this.sheetCache.set(sheetIndex, terminal);
+      this.sheetCacheUsage.set(sheetIndex, terminalUsage);
+      // Both realms now retain the same model even if an optional font load
+      // rejects; a later operation can still acquire the cached worksheet.
+      await this.retainWorksheetOfficeFonts(terminal);
       const mainOffice = typeof document !== 'undefined'
         ? this.retainedFontSets.get(document.fonts)?.loaded?.office : undefined;
       bindXlsxWorksheetOfficeFontRoutes(terminal, mainOffice?.routes, this.googleSubstitutes);
       return terminal;
     } catch (error) {
-      if (error instanceof OoxmlResourceLimitError) this.resourceFailure ??= error;
+      // Terminal ACK may have committed on the worker even when its reply was
+      // lost. The main cache has not admitted that model; terminate the worker
+      // and discard all local models before another operation can read it.
+      if (this._mode === 'worker' && terminal && !terminalAcknowledged) this.destroy();
+      this.latchFatalResourceFailure(error);
       throw error;
     }
   }
@@ -867,7 +1010,7 @@ export class XlsxWorkbook {
       try {
         return await operation();
       } catch (error) {
-        if (error instanceof OoxmlResourceLimitError) this.resourceFailure ??= error;
+        this.latchFatalResourceFailure(error);
         throw error;
       }
     };
@@ -985,20 +1128,25 @@ export class XlsxWorkbook {
       targetIndex = found;
     }
 
-    const ws = await this.getWorksheet(targetIndex);
-    const styles = this.parsedWorkbook.styles;
-    // Index the target sheet's cells by "row:col" for O(1) lookup during the
-    // row-major walk in resolveListValues.
-    const byRC = new Map<string, Cell>();
-    for (const r of ws.rows) {
-      for (const c of r.cells) byRC.set(`${c.row}:${c.col}`, c);
-    }
+    const lease = await this.acquireWorksheetLease(targetIndex);
+    try {
+      const ws = lease.worksheet;
+      const styles = this.parsedWorkbook.styles;
+      // Index the target sheet's cells by "row:col" for O(1) lookup during the
+      // row-major walk in resolveListValues.
+      const byRC = new Map<string, Cell>();
+      for (const r of ws.rows) {
+        for (const c of r.cells) byRC.set(`${c.row}:${c.col}`, c);
+      }
 
-    return resolveListValues(parsed, (row, col) => {
-      const cell = byRC.get(`${row}:${col}`);
-      if (!cell) return null;
-      return formatCellValue(cell, styles, null, ws.date1904);
-    });
+      return resolveListValues(parsed, (row, col) => {
+        const cell = byRC.get(`${row}:${col}`);
+        if (!cell) return null;
+        return formatCellValue(cell, styles, null, ws.date1904);
+      });
+    } finally {
+      lease.release();
+    }
   }
 
   /**
@@ -1124,18 +1272,42 @@ export class XlsxWorkbook {
 
   /** @internal Drop projections owned by a destroyed viewer. */
   [releaseXlsxViewerProjection](projectionId: number): void {
-    if (this._mode !== 'worker') return;
-    this.requireBridge().post(
+    if (this._mode !== 'worker' || !this.bridge) return;
+    this.bridge.post(
       { type: 'releaseViewProjection', projectionId } satisfies RenderWorkerRequest,
     );
+  }
+
+  /** The viewer may keep displaying a model after its cache entry is evicted.
+   * Restore its active lease without materializing or changing that model. */
+  private async retainWorksheetReference(sheetIndex: number): Promise<() => void> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.retainWorksheetReference(sheetIndex);
+    }
+    return this.parsedWorkbook ? this.pinWorksheet(sheetIndex) : () => undefined;
   }
 
   private withWorksheetArchiveOperation<T>(
     sheetIndex: number,
     operation: (worksheet: Worksheet) => Promise<T>,
   ): Promise<T> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) return pending.done.then(() => this.withWorksheetArchiveOperation(sheetIndex, operation));
+    const release = this.pinWorksheet(sheetIndex);
+    return this.withPinnedWorksheetArchiveOperation(sheetIndex, operation).finally(release);
+  }
+
+  private withPinnedWorksheetArchiveOperation<T>(
+    sheetIndex: number,
+    operation: (worksheet: Worksheet) => Promise<T>,
+  ): Promise<T> {
     const cached = this.sheetCache.get(sheetIndex);
-    if (cached) return this.runArchiveOperation(() => operation(cached));
+    if (cached) {
+      this.touchWorksheet(sheetIndex, cached);
+      return this.runArchiveOperation(() => operation(cached));
+    }
     const active = this.sheetLoads.get(sheetIndex);
     if (active) {
       return this.runArchiveOperation(async () => operation(await active));
@@ -1180,6 +1352,10 @@ export class XlsxWorkbook {
     this.bridge = null;
     this.parsedWorkbook = null;
     this.sheetCache.clear();
+    this.sheetCacheUsage.clear();
+    this.sheetLeases.clear();
+    this.completePendingEvictions();
+    this.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
     this.sheetLoads.clear();
     this.fontsDestroyed = true;
     for (const retained of this.retainedFontSets.values()) {
@@ -1206,6 +1382,15 @@ export class XlsxWorkbook {
     if (this.resourceFailure) throw this.resourceFailure;
   }
 
+  private latchFatalResourceFailure(error: unknown): void {
+    // Aggregate cache capacity can change when a lease ends. Preserve the
+    // document-level poison boundary for hard model/package limits only.
+    if (
+      error instanceof OoxmlResourceLimitError &&
+      error.details.violation.resource !== 'worksheet-cache'
+    ) this.resourceFailure ??= error;
+  }
+
   private requireBridge(): WorkbookBridge {
     if (!this.bridge) {
       throw new Error('This operation requires an active workbook worker');
@@ -1219,4 +1404,23 @@ export class XlsxWorkbook {
     }
     return this.bridge;
   }
+}
+
+/** @internal Viewer-owned operations retain a model until their content reads
+ * finish. This adapter stays out of the package entry's public API. */
+export function acquireXlsxWorksheet(workbook: XlsxWorkbook, sheetIndex: number): Promise<{
+  worksheet: Worksheet;
+  release: () => void;
+}> {
+  return workbook['acquireWorksheetLease'](sheetIndex);
+}
+
+/** @internal Restore the active viewer lease for a displayed worksheet even
+ * when its workbook cache entry has already been evicted. */
+export function retainXlsxWorksheetReference(workbook: XlsxWorkbook, sheetIndex: number): Promise<() => void> {
+  const retain = workbook['retainWorksheetReference'];
+  // Structural viewer test doubles may not implement this cache-only hook.
+  return typeof retain === 'function'
+    ? retain.call(workbook, sheetIndex)
+    : Promise.resolve(() => undefined);
 }

@@ -204,14 +204,18 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   // 16,921 bytes and a 2,992-byte boundary chunk is absorbed. File count stays
   // at 36; the optional model-source runtime remains outside the graph.
   docx: { entry: 2_537_512, inline: 31_624, budget: 2_800 },
-  xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
+  // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
+  // viewer state restoration. The optional model-source runtime stays lazy.
+  xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
   // PPTX shares that controller chunk; its entry shrinks by 15,276 bytes and
   // the same 2,992-byte boundary chunk is absorbed. Net growth is 13,511
   // bytes with 38 files and no optional model-source runtime in the graph.
   pptx: { entry: 1_837_773, inline: 59_554, budget: 2_100 },
   node: { entry: 2_575_997, budget: 3_600 },
 });
-const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction;
+// DOCX and PPTX worker payloads are unchanged.
+const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_046_946];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
