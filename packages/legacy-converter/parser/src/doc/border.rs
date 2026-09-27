@@ -133,6 +133,16 @@ impl Border {
             25 => "threeDEngrave",
             26 => "outset",
             27 => "inset",
+            0xff if !old && b[3] == 0xff => {
+                // [MS-DOC] 2.9.22 leaves 0xFF undefined by the spec; Word
+                // prints it as a single border when cv is automatic. Native
+                // controls at widths 1, 8, 24 and 255 eighth-points match
+                // otherwise identical single borders, including the original
+                // non-Nil e0/ff flag bytes. Explicit black and red cv controls
+                // change table geometry versus single: that counterexample
+                // remains gated, rather than extending the inference.
+                "single"
+            }
             // MS-DOC 2.9.22: image (art) borders 0x40..=0xE3 are valid only
             // for page borders; 0x02, 0x04 and every other value is undefined.
             // A Brc is a NilBrc only when its last four bytes are 0xFFFFFFFF
@@ -342,12 +352,34 @@ mod tests {
     }
     #[test]
     fn undefined_and_page_only_border_types_are_rejected_precisely() {
-        // A near-Nil Brc: cv and type 0xFF but flag bytes that are not the
-        // NilBrc sentinel. brcType 0xFF is not a BrcType.
-        let error = Border::read(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0xff], false)
+        for width in [1, 8, 24, 255] {
+            let actual = Border::read(&[255, 255, 255, 255, width, 255, 0, 0], false)
+                .unwrap()
+                .direct_spec();
+            let single = Border::read(&[255, 255, 255, 255, width, 1, 0, 0], false)
+                .unwrap()
+                .direct_spec();
+            assert_eq!(
+                (actual.style, actual.width, actual.color),
+                (single.style, single.width, single.color)
+            );
+        }
+        assert_eq!(
+            Border::read(&[255, 255, 255, 255, 255, 255, 0xe0, 255], false)
+                .unwrap()
+                .direct_spec()
+                .style,
+            "single"
+        );
+        for color in [[0, 0, 0, 0], [255, 0, 0, 0]] {
+            let error = Border::read(
+                &[color[0], color[1], color[2], color[3], 8, 255, 0, 0],
+                false,
+            )
             .err()
             .unwrap();
-        assert!(error.contains("undefined Word border type 0xFF"), "{error}");
+            assert!(error.contains("undefined Word border type 0xFF"), "{error}");
+        }
         for (kind, expected) in [
             (0x02, "undefined Word border type 0x02"),
             (0x04, "undefined Word border type 0x04"),
