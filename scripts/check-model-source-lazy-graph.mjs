@@ -208,19 +208,24 @@ function assertNoSourceRuntime(code, name) {
 // graph at aec306b6 to 2,533,239 DOCX, 2,579,716 Node, and 2,047,181 worker
 // bytes (+200, -20, and -54 respectively versus the #1557 guard values).
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  // DOCX and the Node entry include the explicit-state line-breaker and body
-  // table modules from #1566. Against aec306b6, the DOCX static graph grows
-  // 18,002 bytes (2,533,239 → 2,551,241) in the same 36 chunks: the moved
-  // line-breaker contributes 18,953 rendered module bytes and table measurement
-  // 2,501, offset by minification. The old implementations are absent and the
-  // explicit state and named call boundaries remain. The allowance is unchanged.
-  docx: { entry: 2_551_241, inline: 31_624, budget: 2_800 },
+  // #1566's explicit-state line-breaker and table measurement add 18,002
+  // DOCX bytes against aec306b6 (2,533,239 -> 2,551,241) in 36 chunks:
+  // 18,953 and 2,501 rendered module bytes respectively, offset by minification.
+  // That main (036ddd31) also includes #1586 sliced layout and #1590 projection
+  // consolidation. #1561 adds another 11,595
+  // static bytes after moving scroll/find behavior into core collaborators:
+  // 44,570 bytes in new shared/adapter modules offset 28,748 removed bytes
+  // from the old viewer/find modules; other graph changes account for the rest.
+  // The static chunk count remains 36 and the dispatch allowance is unchanged.
+  docx: { entry: 2_562_836, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
   xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
-  // PPTX measures identically on aec306b6 and this merge. Re-pin the older
-  // guard value to the measured graph without changing its allowance.
-  pptx: { entry: 1_826_158, inline: 59_554, budget: 2_100 },
+  // PPTX #1561 adds 13,299 static bytes against main (036ddd31): 48,632
+  // bytes in shared/adapter modules offset 30,988 removed viewer/find bytes,
+  // with the remaining graph changes preserving the 38 static chunks.
+  // The dispatch allowance is unchanged.
+  pptx: { entry: 1_839_457, inline: 59_554, budget: 2_100 },
   node: { entry: 2_597_718, budget: 3_600 },
 });
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
