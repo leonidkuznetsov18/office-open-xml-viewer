@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::rc::Rc;
 
 #[cfg(test)]
@@ -50,10 +50,10 @@ pub(super) struct WorksheetCursorTail {
 }
 
 /// Facts that the viewer needs before accepting an exact provisional frame.
-/// The scan observes the MCE-processed infoset and keeps no cell values.
+/// The first inflation retains only the row-free shell and row geometry; the
+/// ordinary cursor opens the compressed entry again for bounded row pulls.
 pub(super) struct WorksheetCursorPreview {
     pub(super) tail: Option<WorksheetCursorTail>,
-    pub(super) raw: Rc<[u8]>,
     pub(super) max_row: u32,
     pub(super) max_col: u32,
     pub(super) has_row_outline: bool,
@@ -96,29 +96,6 @@ impl WorksheetCursor {
         let reporter = entry.limit_reporter()?;
         let projector = WorksheetRowProjector::from_owned_reader(
             Box::new(entry),
-            part.to_string(),
-            reporter,
-            shared_strings,
-            theme_colors,
-        );
-        Ok(Self {
-            projector: Some(projector),
-            pending_row: None,
-            pending_tail: None,
-            state: WorksheetCursorState::Open,
-        })
-    }
-
-    fn open_from_buffer_under_active_operation(
-        archive: &mut XlsxZip,
-        part: &str,
-        raw: Rc<[u8]>,
-        shared_strings: Rc<[SharedString]>,
-        theme_colors: Rc<[String]>,
-    ) -> Result<Self, String> {
-        let reporter = archive.active_operation()?.limit_reporter()?;
-        let projector = WorksheetRowProjector::from_owned_reader(
-            Box::new(Cursor::new(raw)),
             part.to_string(),
             reporter,
             shared_strings,
@@ -253,19 +230,13 @@ impl XlsxZip {
         shared_strings: Rc<[SharedString]>,
         theme_colors: Rc<[String]>,
     ) -> Result<WorksheetCursorPreview, String> {
-        let mut entry = self.active_operation()?.open_entry(part)?;
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        let raw: Rc<[u8]> = bytes.into();
-        let scanned = lexical_scan_worksheet_preview(Rc::clone(&raw));
+        let entry = self.active_operation()?.open_entry(part)?;
+        let scanned = lexical_scan_worksheet_preview(entry);
         let mut preview = match scanned {
             Ok(preview) => preview,
             Err(_) => {
                 return Ok(WorksheetCursorPreview {
                     tail: None,
-                    raw,
                     max_row: 0,
                     max_col: 0,
                     has_row_outline: false,
@@ -273,10 +244,11 @@ impl XlsxZip {
                 })
             }
         };
-        if let Some(tail) = preview.tail.as_mut().filter(|_| {
-            raw.windows(MCE_NS.len())
-                .any(|window| window == MCE_NS.as_bytes())
-        }) {
+        if let Some(tail) = preview
+            .tail
+            .as_mut()
+            .filter(|tail| tail.shell_xml.contains(MCE_NS))
+        {
             // The shell may carry MCE attributes. Apply the same projection as
             // the terminal cursor, but only to the small, row-free shell.
             let shell = tail.shell_xml.as_bytes().to_vec();
@@ -312,22 +284,6 @@ impl XlsxZip {
     ) -> Result<WorksheetCursor, String> {
         WorksheetCursor::open_under_active_operation(self, part, shared_strings, theme_colors)
     }
-
-    pub(super) fn open_buffered_worksheet_cursor(
-        &mut self,
-        part: &str,
-        raw: Rc<[u8]>,
-        shared_strings: Rc<[SharedString]>,
-        theme_colors: Rc<[String]>,
-    ) -> Result<WorksheetCursor, String> {
-        WorksheetCursor::open_from_buffer_under_active_operation(
-            self,
-            part,
-            raw,
-            shared_strings,
-            theme_colors,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -345,7 +301,7 @@ fn numeric_attribute(start: &BytesStart<'_>, name: &[u8]) -> Result<Option<Strin
 }
 
 /// Read the tail and row coordinates without projecting cell bodies. The
-/// ordinary cursor later validates and projects the same retained bytes. MCE
+/// ordinary cursor later validates and projects the entry a second time. MCE
 /// worksheets stay on that cursor's complete, MCE-aware path.
 #[cfg(test)]
 fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, String> {
@@ -466,7 +422,6 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
             shell_xml,
             row_heights,
         }),
-        raw,
         max_row,
         max_col,
         has_row_outline,
@@ -474,29 +429,102 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
     })
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+const PREVIEW_TAG_BYTES: usize = 1024 * 1024;
+const PREVIEW_SHELL_BYTES: usize = 16 * 1024 * 1024;
+
+fn append_shell(shell: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > PREVIEW_SHELL_BYTES.saturating_sub(shell.len()) {
+        return Err("worksheet preview shell exceeds retained limit".to_string());
+    }
+    shell.extend_from_slice(bytes);
+    Ok(())
 }
 
-fn tag_end(bytes: &[u8], start: usize) -> Result<usize, String> {
+/// Skip text in buffered slices and retain only one XML tag at a time. Quoted
+/// `>` is not a terminator. Special row markup is rejected below, so CDATA or
+/// comments containing a fake sheetData boundary can never authorize paint.
+fn next_markup<R: Read>(
+    reader: &mut BufReader<R>,
+    mut shell: Option<&mut Vec<u8>>,
+    tag: &mut Vec<u8>,
+) -> Result<bool, String> {
+    tag.clear();
+    loop {
+        let available = reader.fill_buf().map_err(|error| error.to_string())?;
+        if available.is_empty() {
+            return Ok(false);
+        }
+        let available_len = available.len();
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'<')
+            .unwrap_or(available_len);
+        if let Some(shell) = shell.as_deref_mut() {
+            append_shell(shell, &available[..count])?;
+        }
+        reader.consume(count);
+        if count == available_len {
+            continue;
+        }
+        break;
+    }
     let mut quote = 0;
-    for (offset, byte) in bytes[start..].iter().enumerate() {
-        if offset > 1024 * 1024 {
+    loop {
+        let available = reader.fill_buf().map_err(|error| error.to_string())?;
+        if available.is_empty() {
+            return Err("worksheet preview tag is unclosed".to_string());
+        }
+        let mut end = available.len();
+        for (index, byte) in available.iter().enumerate() {
+            if quote == 0 {
+                match byte {
+                    b'\'' | b'"' => quote = *byte,
+                    b'>' => {
+                        end = index + 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            } else if *byte == quote {
+                quote = 0;
+            }
+        }
+        if end > PREVIEW_TAG_BYTES.saturating_sub(tag.len()) {
             return Err("worksheet preview tag exceeds event limit".to_string());
         }
-        if quote == 0 {
-            match byte {
-                b'\'' | b'"' => quote = *byte,
-                b'>' => return Ok(start + offset + 1),
-                _ => {}
-            }
-        } else if *byte == quote {
-            quote = 0;
+        tag.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if tag.last() == Some(&b'>') && quote == 0 {
+            return Ok(true);
         }
     }
-    Err("worksheet preview tag is unclosed".to_string())
+}
+
+fn drain_entry<R: Read>(reader: &mut R) -> Result<(), String> {
+    std::io::copy(reader, &mut std::io::sink())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn append_remaining<R: Read>(reader: &mut R, shell: &mut Vec<u8>) -> Result<(), String> {
+    let mut buffer = [0; 32 * 1024];
+    let mut overflow = false;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        if !overflow {
+            overflow = append_shell(shell, &buffer[..count]).is_err();
+        }
+    }
+    if overflow {
+        Err("worksheet preview shell exceeds retained limit".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn tag_attribute<'a>(tag: &'a [u8], name: &[u8]) -> Result<Option<Cow<'a, str>>, String> {
@@ -564,36 +592,44 @@ fn tag_attribute<'a>(tag: &'a [u8], name: &[u8]) -> Result<Option<Cow<'a, str>>,
     Ok(None)
 }
 
-fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, String> {
-    // The fast path is restricted to ordinary unprefixed SpreadsheetML rows.
-    // Comments, CDATA and MCE row replacement use the complete projector.
-    let Some(open) = find_bytes(&raw, b"<sheetData") else {
-        return Err("worksheet has no unprefixed sheetData".to_string());
-    };
-    if raw
-        .get(open + b"<sheetData".len())
-        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>')
-    {
-        return Err("worksheet sheetData tag is ambiguous".to_string());
+fn lexical_scan_worksheet_preview<R: Read>(source: R) -> Result<WorksheetCursorPreview, String> {
+    let mut reader = BufReader::with_capacity(32 * 1024, source);
+    let result = lexical_scan_worksheet_preview_inner(&mut reader);
+    if result.is_err() {
+        // Complete the first inflation even for an ineligible sheet. This
+        // validates the entry CRC and charges actual work to the operation.
+        drain_entry(&mut reader)?;
     }
-    let start = tag_end(&raw, open)?;
-    let self_closing = raw[open..start].ends_with(b"/>");
-    let end = if self_closing {
-        start
-    } else {
-        let close = find_bytes(&raw[start..], b"</sheetData>")
-            .ok_or_else(|| "worksheet has no closing sheetData".to_string())?;
-        start + close
+    result
+}
+
+fn lexical_scan_worksheet_preview_inner<R: Read>(
+    reader: &mut BufReader<R>,
+) -> Result<WorksheetCursorPreview, String> {
+    let mut shell = Vec::new();
+    let mut tag = Vec::with_capacity(128);
+    let self_closing = loop {
+        if !next_markup(reader, Some(&mut shell), &mut tag)? {
+            return Err("worksheet has no unprefixed sheetData".to_string());
+        }
+        if tag.starts_with(b"<!") || (tag.starts_with(b"<?") && !tag.starts_with(b"<?xml ")) {
+            return Err("worksheet preview has special markup".to_string());
+        }
+        if tag
+            .windows(b"ProcessContent".len())
+            .any(|part| part == b"ProcessContent")
+        {
+            return Err("worksheet requires the complete XML projector".to_string());
+        }
+        append_shell(&mut shell, &tag)?;
+        if tag.starts_with(b"<sheetData")
+            && tag
+                .get(b"<sheetData".len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'/' || *byte == b'>')
+        {
+            break tag.ends_with(b"/>");
+        }
     };
-    let body = &raw[start..end];
-    if find_bytes(&raw, b"<!--").is_some()
-        || find_bytes(&raw, b"<![CDATA[").is_some()
-        || find_bytes(body, b"<?").is_some()
-        || find_bytes(body, b"AlternateContent").is_some()
-        || find_bytes(&raw, b"ProcessContent").is_some()
-    {
-        return Err("worksheet requires the complete XML projector".to_string());
-    }
     let mut previous_row = 0;
     let mut previous_col = 0;
     let mut max_row = 0;
@@ -601,82 +637,91 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
     let mut has_row_outline = false;
     let mut ordered_rows = true;
     let mut row_heights = BTreeMap::new();
-    let mut offset = 0;
-    while let Some(found) = body[offset..].iter().position(|byte| *byte == b'<') {
-        let begin = offset + found;
-        let after = begin + 1;
-        if after >= body.len() {
-            return Err("worksheet preview ends in a tag".to_string());
-        }
-        let close = tag_end(body, begin)?;
-        offset = close;
-        if body[after] == b'/' {
-            continue;
-        }
-        if body[after] == b'!' || body[after] == b'?' {
-            return Err("worksheet preview has special row markup".to_string());
-        }
-        let mut name_end = after;
-        while name_end < close
-            && !body[name_end].is_ascii_whitespace()
-            && body[name_end] != b'/'
-            && body[name_end] != b'>'
-        {
-            name_end += 1;
-        }
-        let name = &body[after..name_end];
-        if name.contains(&b':') {
-            return Err("worksheet preview has prefixed row markup".to_string());
-        }
-        let tag = &body[begin..close];
-        if name == b"row" {
-            let explicit = tag_attribute(tag, b"r")?
-                .map(|value| value.parse::<u32>().map_err(|error| error.to_string()))
-                .transpose()?;
-            let prior = previous_row;
-            let row =
-                resolve_implicit_ordinal(explicit, &mut previous_row, SpreadsheetOrdinal::Row)?;
-            ordered_rows &= row > prior;
-            max_row = max_row.max(row);
-            previous_col = 0;
-            let hidden = matches!(tag_attribute(tag, b"hidden")?, Some(value) if value == "1" || value == "true");
-            let height = if hidden {
-                Some(0.0)
-            } else {
-                tag_attribute(tag, b"ht")?
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .filter(|value| value.is_finite() && *value >= 0.0)
-            };
-            if let Some(height) = height {
-                row_heights.insert(row, height);
+    if !self_closing {
+        loop {
+            if !next_markup(reader, None, &mut tag)? {
+                return Err("worksheet has no closing sheetData".to_string());
             }
-            let outline = tag_attribute(tag, b"outlineLevel")?
-                .and_then(|value| value.parse::<u8>().ok())
-                .unwrap_or(0);
-            let collapsed = matches!(tag_attribute(tag, b"collapsed")?, Some(value) if value == "1" || value == "true");
-            has_row_outline |= outline != 0 || collapsed;
-        } else if name == b"c" {
-            let explicit = tag_attribute(tag, b"r")?
-                .map(|reference| parse_cell_ref_checked(&reference).map(|(col, _)| col))
-                .transpose()?;
-            let col =
-                resolve_implicit_ordinal(explicit, &mut previous_col, SpreadsheetOrdinal::Column)?;
-            max_col = max_col.max(col);
+            if tag == b"</sheetData>" {
+                append_shell(&mut shell, &tag)?;
+                break;
+            }
+            if tag.get(1).is_some_and(|byte| *byte == b'/') {
+                continue;
+            }
+            if tag
+                .get(1)
+                .is_some_and(|byte| *byte == b'!' || *byte == b'?')
+            {
+                return Err("worksheet preview has special row markup".to_string());
+            }
+            if tag
+                .windows(b"AlternateContent".len())
+                .any(|part| part == b"AlternateContent")
+                || tag
+                    .windows(b"ProcessContent".len())
+                    .any(|part| part == b"ProcessContent")
+            {
+                return Err("worksheet row MCE requires the complete projector".to_string());
+            }
+            let mut name_end = 1;
+            while name_end < tag.len()
+                && !tag[name_end].is_ascii_whitespace()
+                && tag[name_end] != b'/'
+                && tag[name_end] != b'>'
+            {
+                name_end += 1;
+            }
+            let name = &tag[1..name_end];
+            if name.contains(&b':') {
+                return Err("worksheet preview has prefixed row markup".to_string());
+            }
+            if name == b"row" {
+                let explicit = tag_attribute(&tag, b"r")?
+                    .map(|value| value.parse::<u32>().map_err(|error| error.to_string()))
+                    .transpose()?;
+                let prior = previous_row;
+                let row =
+                    resolve_implicit_ordinal(explicit, &mut previous_row, SpreadsheetOrdinal::Row)?;
+                ordered_rows &= row > prior;
+                max_row = max_row.max(row);
+                previous_col = 0;
+                let hidden = matches!(tag_attribute(&tag, b"hidden")?, Some(value) if value == "1" || value == "true");
+                let height = if hidden {
+                    Some(0.0)
+                } else {
+                    tag_attribute(&tag, b"ht")?
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                };
+                if let Some(height) = height {
+                    row_heights.insert(row, height);
+                }
+                let outline = tag_attribute(&tag, b"outlineLevel")?
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .unwrap_or(0);
+                let collapsed = matches!(tag_attribute(&tag, b"collapsed")?, Some(value) if value == "1" || value == "true");
+                has_row_outline |= outline != 0 || collapsed;
+            } else if name == b"c" {
+                let explicit = tag_attribute(&tag, b"r")?
+                    .map(|reference| parse_cell_ref_checked(&reference).map(|(col, _)| col))
+                    .transpose()?;
+                let col = resolve_implicit_ordinal(
+                    explicit,
+                    &mut previous_col,
+                    SpreadsheetOrdinal::Column,
+                )?;
+                max_col = max_col.max(col);
+            }
         }
     }
-    let mut shell = Vec::with_capacity(raw.len() - (end - start));
-    shell.extend_from_slice(&raw[..start]);
-    shell.extend_from_slice(&raw[end..]);
-    if shell.len() > 16 * 1024 * 1024 {
-        return Err("worksheet preview shell exceeds retained limit".to_string());
-    }
+    append_remaining(reader, &mut shell)?;
     let shell_xml = String::from_utf8(shell).map_err(|error| error.to_string())?;
     Ok(WorksheetCursorPreview {
         tail: Some(WorksheetCursorTail {
             shell_xml,
             row_heights,
         }),
-        raw,
         max_row,
         max_col,
         has_row_outline,
@@ -744,7 +789,7 @@ mod tests {
     fn lexical_tail_scan_matches_xml_scan_for_implicit_and_explicit_coordinates() {
         let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="2" ht="21"><c r="B2"><v>1</v></c><c><v>2</v></c></row><row hidden="1"><c r="D3"/></row><row r="8" outlineLevel="2"><c r="AA8"><v>3</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="B2:C2"/></mergeCells></worksheet>"#;
         let raw: Rc<[u8]> = xml.as_bytes().into();
-        let lexical = lexical_scan_worksheet_preview(Rc::clone(&raw)).unwrap();
+        let lexical = lexical_scan_worksheet_preview(Cursor::new(Rc::clone(&raw))).unwrap();
         let parsed = fast_scan_worksheet_preview(raw).unwrap();
         assert_eq!(lexical.max_row, parsed.max_row);
         assert_eq!(lexical.max_col, parsed.max_col);
@@ -759,7 +804,7 @@ mod tests {
     #[test]
     fn lexical_scan_decodes_row_attributes_like_the_terminal_xml_parser() {
         let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="&#50;" ht="&#51;0"><c r="B&#50;"><v>1</v></c></row><row r="3" ht="3&amp;0"><c r="C3"><v>2</v></c></row></sheetData></worksheet>"#;
-        let preview = lexical_scan_worksheet_preview(xml.as_bytes().into()).unwrap();
+        let preview = lexical_scan_worksheet_preview(xml.as_bytes()).unwrap();
         assert_eq!(preview.max_row, 3);
         assert_eq!(preview.max_col, 3);
         assert_eq!(
@@ -779,7 +824,84 @@ mod tests {
         assert_eq!(rows[1].attribute("ht"), Some("3&0"));
 
         let unsupported = xml.replace("3&amp;0", "3&unknown;0");
-        assert!(lexical_scan_worksheet_preview(unsupported.as_bytes().into()).is_err());
+        assert!(lexical_scan_worksheet_preview(unsupported.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn special_row_markup_cannot_forge_the_tail_boundary() {
+        let xml = r#"<worksheet><sheetData><row r="1"/><![CDATA[</sheetData><mergeCells/>]]><row r="2"/></sheetData></worksheet>"#;
+        assert!(lexical_scan_worksheet_preview(xml.as_bytes()).is_err());
+
+        let xml = r#"<?pi <sheetData><row r="1"/></sheetData> ?><worksheet><sheetData><row r="2"/></sheetData></worksheet>"#;
+        assert!(lexical_scan_worksheet_preview(xml.as_bytes()).is_err());
+
+        let xml = r#"<worksheet><sheetData><row r="1" ht="&#51;0"/></sheetData><mergeCells count="0"/></worksheet>"#;
+        let reader = xml
+            .as_bytes()
+            .chunks(3)
+            .flat_map(|chunk| chunk.iter().copied());
+        // A short-read source exercises boundaries in the XML tag and entity.
+        struct ShortRead<I>(I);
+        impl<I: Iterator<Item = u8>> Read for ShortRead<I> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(byte) = self.0.next() {
+                    buf[0] = byte;
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        let preview = lexical_scan_worksheet_preview(ShortRead(reader)).unwrap();
+        assert_eq!(preview.tail.unwrap().row_heights.get(&1), Some(&30.0));
+    }
+
+    #[test]
+    fn preview_and_cursor_charge_both_inflations_without_double_counting_distinct_bytes() {
+        let xml = worksheet(70_000, "</sheetData></worksheet>");
+        let bytes = xml.len() as u64;
+        let mut archive = crate::open_zip_with_limits(package(&xml), Some(bytes), Some(bytes))
+            .expect("one inflated entry fits both configured limits");
+        archive.begin_operation("parse-sheet").unwrap();
+        let preview = archive
+            .scan_worksheet_preview(PART, Rc::from([]), Rc::from([]))
+            .unwrap();
+        assert_eq!(preview.max_row, 70_000);
+        assert!(preview.tail.is_some());
+        assert_eq!(archive.usage().distinct_inflated_bytes, bytes);
+        assert_eq!(
+            archive
+                .operation
+                .active()
+                .unwrap()
+                .usage()
+                .unwrap()
+                .operation_inflated_bytes,
+            bytes
+        );
+        let mut cursor = archive
+            .open_worksheet_cursor(PART, Rc::from([]), Rc::from([]))
+            .unwrap();
+        let mut rows = 0;
+        while let WorksheetCursorPull::Rows { rows: batch, .. } = cursor
+            .pull(128, WORKSHEET_CURSOR_TARGET_PROJECTED_BYTES)
+            .unwrap()
+        {
+            rows += batch.len();
+        }
+        assert_eq!(rows, 70_000);
+        assert_eq!(archive.usage().distinct_inflated_bytes, bytes);
+        assert_eq!(
+            archive
+                .operation
+                .active()
+                .unwrap()
+                .usage()
+                .unwrap()
+                .operation_inflated_bytes,
+            bytes * 2
+        );
+        archive.finish_operation().unwrap();
     }
 
     #[test]

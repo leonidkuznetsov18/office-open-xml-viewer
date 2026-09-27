@@ -3557,7 +3557,7 @@ fn build_cursor_preview(
     name: &str,
     sheet_path: &str,
     part: &str,
-) -> Result<(Vec<u8>, Rc<[u8]>), String> {
+) -> Result<Vec<u8>, String> {
     let scanned = zip.scan_worksheet_preview(
         part,
         Rc::clone(&shared.shared_strings),
@@ -3565,18 +3565,15 @@ fn build_cursor_preview(
     )?;
     let max_row = scanned.max_row;
     let max_col = scanned.max_col;
-    let raw = scanned.raw;
     let has_row_outline = scanned.has_row_outline;
     let ordered_rows = scanned.ordered_rows;
     let reporter = zip.active_operation()?.limit_reporter()?;
     let Some(tail) = scanned.tail else {
-        return serialize_cursor_preview(None, Some("metadata-unavailable"), 0, 0, &reporter, part)
-            .map(|preview| (preview, raw));
+        return serialize_cursor_preview(None, Some("metadata-unavailable"), 0, 0, &reporter, part);
     };
     let parsed = parse_projected_worksheet_tail(tail, shared.theme_colors.as_ref(), name)?;
     if let Some(reason) = cursor_preview_blocker(has_row_outline, ordered_rows, &parsed.0)? {
-        return serialize_cursor_preview(None, Some(reason), max_row, max_col, &reporter, part)
-            .map(|preview| (preview, raw));
+        return serialize_cursor_preview(None, Some(reason), max_row, max_col, &reporter, part);
     }
     let worksheet = finalize_projected_sheet(
         zip,
@@ -3588,7 +3585,6 @@ fn build_cursor_preview(
         CurrentSheetLookup::Seed(None),
     )?;
     serialize_cursor_preview(Some(&worksheet), None, max_row, max_col, &reporter, part)
-        .map(|preview| (preview, raw))
 }
 
 enum ActiveWorksheetSource {
@@ -3777,11 +3773,9 @@ impl XlsxArchive {
                 SheetPartKind::Worksheet => {
                     let preview_result =
                         build_cursor_preview(zip, shared, sheet_index, name, &sheet_path, &part);
-                    let mut buffered_xml = None;
                     match preview_result {
-                        Ok((bytes, raw)) => {
+                        Ok(bytes) => {
                             preview = Some(bytes);
-                            buffered_xml = Some(raw);
                         }
                         Err(_) if zip.assert_healthy().is_ok() => {
                             let reporter = zip.active_operation()?.limit_reporter()?;
@@ -3799,20 +3793,11 @@ impl XlsxArchive {
                     if let Err(resource_error) = zip.assert_healthy() {
                         ActiveWorksheetSource::Poisoned(resource_error)
                     } else {
-                        let cursor_result = if let Some(raw) = buffered_xml {
-                            zip.open_buffered_worksheet_cursor(
-                                &part,
-                                raw,
-                                Rc::clone(&shared.shared_strings),
-                                Rc::clone(&shared.theme_colors),
-                            )
-                        } else {
-                            zip.open_worksheet_cursor(
-                                &part,
-                                Rc::clone(&shared.shared_strings),
-                                Rc::clone(&shared.theme_colors),
-                            )
-                        };
+                        let cursor_result = zip.open_worksheet_cursor(
+                            &part,
+                            Rc::clone(&shared.shared_strings),
+                            Rc::clone(&shared.theme_colors),
+                        );
                         match cursor_result {
                             Ok(cursor) => ActiveWorksheetSource::Streaming(Box::new(cursor)),
                             Err(error) => {
