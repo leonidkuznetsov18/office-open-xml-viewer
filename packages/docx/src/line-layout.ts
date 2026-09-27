@@ -176,6 +176,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
   fontSize: number;  // pt
   color: string | null;
   fontFamily: string | null;
+  /** Family requested by the run before a registered canvas face replaces it. */
+  authoredFontFamily?: string | null;
   fontRoute?: CanvasFontRoute;
   /** Selected-route line ratio. It may come from parsed font bytes or a bounded
    * Canvas measurement; the latter does not reveal OpenType table identity. */
@@ -350,6 +352,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Whether shifted ink contributes to this retained segment's line extent.
    * False only for the fixed-line-count drop-cap compatibility projection. */
   positionExtendsLineBox?: boolean;
+  /** Word-observed leading square/text line: width and paint stay on this
+   * glyph while the following text face supplies the line box. */
+  leadingSymbolUsesTextLineMetrics?: boolean;
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
    *  font size ≥ the threshold. Absent at every style level disables kerning
@@ -3145,10 +3150,14 @@ export function buildSegments(
     ): T | undefined => value?.status === 'valid' && value.value !== null
       ? value.value
       : fallback;
-    const effectiveVertAlign = acquiredValue(
+    const acquiredVertAlign = acquiredValue(
       acquiredTypography?.verticalAlign,
       vertAlign ?? undefined,
-    ) ?? null;
+    );
+    // ECMA-376 §17.3.2.42 `baseline` cancels inherited super/subscript.
+    const effectiveVertAlign = acquiredVertAlign === 'super' || acquiredVertAlign === 'sub'
+      ? acquiredVertAlign
+      : null;
     const effectivePosition = acquiredValue(
       acquiredTypography?.positionPt,
       r.position,
@@ -3570,6 +3579,7 @@ export function buildSegments(
         fontSize: cs ? csFontSize : base.fontSize,
         color: base.color,
         fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
+        authoredFontFamily: fontFamily,
         fontRoute: resolvedSpan?.fontRoute,
         resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
         ...(resourceFamilyLineMetric?.lineHeightRatio != null
@@ -5027,6 +5037,10 @@ export function layoutLines(
       materializeLatinSpaceCompression();
       latinLineHomogeneous = false;
     }
+    if ('text' in s && s.leadingSymbolUsesTextLineMetrics) {
+      // Keep the committed glyph width and paint; following text owns height.
+      return;
+    }
     if (h > lineHeight) lineHeight = h;
     if ('imagePath' in s && s.inlinePicture === true) {
       lineHasInlinePicture = true;
@@ -5519,6 +5533,42 @@ export function layoutLines(
       scale,
     );
     s.snapGridNaturalWidthPx = width;
+
+    // Word-observed mixed lines with a leading open Segoe square or filled
+    // text-presentation Emoji square use the following text face for line
+    // height, but retain the square's advance and paint. A standalone square,
+    // trailing square, color-presentation emoji, and active character grid
+    // do not take this path. The next visible glyph must fit the same line.
+    s.leadingSymbolUsesTextLineMetrics = false;
+    const requestedFamily = s.authoredFontFamily ?? s.fontFamily;
+    if (
+      currentLine.length === 0 &&
+      ((requestedFamily === 'Segoe UI Symbol' && s.text === '❑') ||
+        (requestedFamily === 'Apple Color Emoji' && s.text === '◼︎')) &&
+      characterGrid?.type == null &&
+      !s.ruby && !s.vertAlign && !s.verticalRun &&
+      s.fitTextRegionIndex === undefined
+    ) {
+      let followingWidth = 0;
+      for (const queued of queue.slice(0, 2)) {
+        if (!('text' in queued) ||
+          (queued.authoredFontFamily ?? queued.fontFamily) === requestedFamily ||
+          queued.position !== s.position || queued.ruby || queued.vertAlign ||
+          queued.verticalRun || queued.fitTextRegionIndex !== undefined) break;
+        const firstVisible = /\S/u.exec(queued.text)?.[0];
+        const probe = firstVisible == null
+          ? queued.text
+          : queued.text.slice(0, queued.text.indexOf(firstVisible) + firstVisible.length);
+        followingWidth += strAdvance(queued, probe);
+        if (firstVisible != null) {
+          s.leadingSymbolUsesTextLineMetrics = currentWidth + width + followingWidth <= availW();
+          break;
+        }
+      }
+    }
+    if (s.leadingSymbolUsesTextLineMetrics) {
+      return { width, height: 0, ascent: 0, descent: 0 };
+    }
 
     const fullPx = s.fontSize * scale;
     let metricMeasurement = measured;

@@ -1189,10 +1189,10 @@ pub(crate) fn apply_run(dst: &mut RunFmt, src: &RunFmt) {
     if src.background.is_some() {
         dst.background = src.background.clone();
     }
-    if src.vert_align.is_some() {
-        dst.vert_align = src.vert_align.clone();
-    }
     if src.vertical_align_typography.is_some() {
+        // ECMA-376 §17.3.2.42: an explicit `baseline` clears an inherited
+        // superscript/subscript even though its paint value is `None`.
+        dst.vert_align = src.vert_align.clone();
         dst.vertical_align_typography = src.vertical_align_typography.clone();
     }
     if src.all_caps.is_some() {
@@ -2104,7 +2104,7 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
         fmt.background = shading_fill(shd);
     }
 
-    // Vertical alignment (superscript / subscript)
+    // ECMA-376 §17.3.2.42: baseline is an explicit inherited-style reset.
     if let Some(va) = child_w(rpr, "vertAlign") {
         let raw = attr_w(va, "val");
         let value = raw.as_deref().and_then(|value| match value {
@@ -2113,7 +2113,12 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
             _ => None,
         });
         fmt.vert_align = value.clone();
-        fmt.vertical_align_typography = Some(typography_value(raw, value));
+        let acquisition = if raw.as_deref() == Some("baseline") {
+            Some("baseline".to_string())
+        } else {
+            value
+        };
+        fmt.vertical_align_typography = Some(typography_value(raw, acquisition));
     }
 
     // All caps / small caps
@@ -3831,5 +3836,21 @@ mod tests {
             base.fit_text.and_then(|fit_text| fit_text.id),
             Some("-20".to_string())
         );
+    }
+
+    #[test]
+    fn baseline_run_clears_inherited_superscript() {
+        // ECMA-376 §17.3.2.42 includes baseline as a valid run-level reset.
+        let mut base = run_fmt_from(r#"<w:vertAlign w:val="superscript"/>"#);
+        let direct = run_fmt_from(r#"<w:vertAlign w:val="baseline"/>"#);
+        apply_run(&mut base, &direct);
+        assert_eq!(base.vert_align, None);
+        let acquisition = base.vertical_align_typography.expect("explicit baseline");
+        assert_eq!(
+            acquisition.status,
+            crate::types::TypographyValueStatusWire::Valid
+        );
+        assert_eq!(acquisition.raw.as_deref(), Some("baseline"));
+        assert_eq!(acquisition.value.as_deref(), Some("baseline"));
     }
 }
