@@ -53,6 +53,7 @@ import {
   type PptxLayoutPublication,
 } from './presentation-layout-events';
 import { createPptxLoadingLayer } from './loading-indicator';
+import { PptxScrollMediaController } from './scroll-media-controller';
 
 /**
  * Debounce window (ms) after the last `setScale` in a zoom burst before the
@@ -205,7 +206,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     // PPTX keeps media handles only near the viewport. Mounted static slides
     // retain their canvas and can upgrade when the media window reaches them.
     onNewSlot: (index, slot) => this._redrawSlotComments(index, slot),
-    afterMount: () => { if (this._opts.enableMediaPlayback) this._syncMediaPlayback(); },
+    afterMount: () => { if (this._opts.enableMediaPlayback) this._media.sync(); },
     awaitInitialRender: (index) => index < this.availableSlideCount,
     shouldSettle: (index) => !this._opts.enableMediaPlayback || this._rangeContains(this._mediaRange(), index),
   });
@@ -276,6 +277,28 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._highlights.redrawSlot(slide, slot);
     },
     shadow: () => this._pageShadow,
+    reportError: (error) => this._reportRenderError(error),
+  });
+  private readonly _media = new PptxScrollMediaController<SlideSlot>({
+    presentation: () => this._pres,
+    slots: () => this._slots,
+    epoch: () => this._renderEpoch,
+    scale: () => this._scale,
+    dpr: () => this._dpr(),
+    width: () => this._slideWidthPx(),
+    height: () => this._slideHeightPx(),
+    imageResources: () => this._opts.imageResources,
+    textSelection: () => this._opts.enableTextSelection === true,
+    findActive: () => this._findActive,
+    mediaEnabled: () => this._opts.enableMediaPlayback === true,
+    mediaRange: () => this._mediaRange(),
+    rangeContains: (range, slide) => this._rangeContains(range, slide),
+    shadow: () => this._pageShadow,
+    hyperlinkHandler: () => this._hyperlinkHandler(),
+    refreshFindRuns: (slide, runs) => this._highlights.refreshRuns(slide, runs),
+    redrawHighlights: (slide, slot) => this._highlights.redrawSlot(slide, slot),
+    commitComments: (slide, slot) => this._commitSlotComments(slide, slot),
+    clearTextPreview: (layer) => this._clearTextLayerPreview(layer),
     reportError: (error) => this._reportRenderError(error),
   });
   private readonly _selection = new SelectionContextController<PptxSelectionContext, PptxElementContext, PptxPresentation, SlideSlot>({
@@ -999,7 +1022,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         i,
         slot,
         renderGeneration,
-        this._renderInteractiveSlot(i, slot, widthPx, dpr, scale, epoch, reportErrors),
+        this._media.renderInteractive(i, slot, widthPx, dpr, scale, epoch, reportErrors),
       );
     }
     slot.mediaInteractive = false;
@@ -1162,103 +1185,6 @@ export class PptxScrollViewer implements ZoomableViewer {
    * interactive video on a main-thread 2D canvas. The slot generation closes the
    * same-index recycle/reload hole that a viewer-wide render epoch cannot detect.
    */
-  private _renderInteractiveSlot(
-    i: number,
-    slot: SlideSlot,
-    widthPx: number,
-    dpr: number,
-    scale: number,
-    epoch: number,
-    reportErrors = true,
-  ): Promise<void> {
-    if (!this._pres) return Promise.resolve();
-    const generation = ++slot.presentationGeneration;
-    slot.presentationHandle?.destroy();
-    slot.presentationHandle = null;
-    const runs: PptxTextRunInfo[] = [];
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive;
-    const onTextRun = wantRuns ? (r: PptxTextRunInfo) => runs.push(r) : undefined;
-
-    return this._pres
-      .presentSlide(slot.canvas, i, {
-        width: widthPx,
-        dpr,
-        imageResources: this._opts.imageResources,
-        onTextRun,
-        onError: (error) => {
-          if (generation === slot.presentationGeneration) this._reportRenderError(error);
-        },
-      })
-      .then((handle) => {
-        if (
-          generation !== slot.presentationGeneration ||
-          !slot.mediaInteractive ||
-          epoch !== this._renderEpoch ||
-          this._slots.get(i) !== slot ||
-          slot.renderedSlide !== i
-        ) {
-          handle.destroy();
-          return;
-        }
-        slot.presentationHandle = handle;
-        slot.renderedScale = scale;
-        if (wantOverlay && slot.textLayer) {
-          buildPptxTextLayer(
-            slot.textLayer,
-            runs,
-            Math.round(widthPx),
-            Math.round(this._slideHeightPx()),
-            this._hyperlinkHandler(),
-            i,
-          );
-        }
-        if (wantRuns) this._highlights.refreshRuns(i, runs);
-        this._commitSlotComments(i, slot);
-        this._highlights.redrawSlot(i, slot);
-      })
-      .catch((err: unknown) => {
-        if (generation !== slot.presentationGeneration) return;
-        if (reportErrors) this._reportRenderError(err);
-        else throw err;
-      });
-  }
-
-  /**
-   * Reconcile stateful media handles against the small media lifecycle range,
-   * independently from the (potentially whole-deck) mounted text range.
-   */
-  private _syncMediaPlayback(mediaRange = this._mediaRange()): void {
-    if (!this._opts.enableMediaPlayback) return;
-    for (const [i, slot] of this._slots) {
-      const shouldBeInteractive = this._rangeContains(mediaRange, i);
-      if (shouldBeInteractive === slot.mediaInteractive) continue;
-      if (shouldBeInteractive) {
-        slot.mediaInteractive = true;
-        // Render onto a spare canvas. A statically-rendered worker slot already
-        // owns a bitmaprenderer context, which cannot be changed to the 2D
-        // context presentSlide() needs.
-        this._settleInteractiveSlot(
-          i,
-          slot,
-          this._slideWidthPx(),
-          this._dpr(),
-          this._scale,
-          this._renderEpoch,
-        );
-      } else {
-        // Stop playback/RAF and invalidate a pending presentSlide immediately.
-        // Keep the last painted canvas and text overlay as the static offscreen
-        // representation; if it becomes active again, the spare-canvas upgrade
-        // redraws it at the current scale.
-        slot.mediaInteractive = false;
-        slot.presentationGeneration++;
-        slot.presentationHandle?.destroy();
-        slot.presentationHandle = null;
-      }
-    }
-  }
-
   /** Route an async render failure to `onError`, or `console.error` when none is
    *  set (so failures are never fully silent), and never after teardown. */
   private _reportRenderError(err: unknown): void {
@@ -1351,7 +1277,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     const epoch = this._renderEpoch;
 
     if (this._opts.enableMediaPlayback && slot.mediaInteractive) {
-      this._settleInteractiveSlot(i, slot, widthPx, dpr, scale, epoch);
+      this._media.settleInteractive(i, slot, widthPx, dpr, scale, epoch);
       return;
     }
     if (this._opts.enableMediaPlayback) return;
@@ -1362,83 +1288,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     }
 
     this._main.settle(i, slot, widthPx, dpr);
-  }
-
-  /**
-   * Settle an interactive slide onto a spare 2D canvas, then atomically swap it
-   * in and destroy the handle tied to the retired canvas. Pending handles from a
-   * superseded zoom/recycle are destroyed as soon as they resolve.
-   */
-  private _settleInteractiveSlot(
-    i: number,
-    slot: SlideSlot,
-    widthPx: number,
-    dpr: number,
-    scale: number,
-    epoch: number,
-  ): void {
-    if (!this._pres) return;
-    const generation = ++slot.presentationGeneration;
-    const spare = document.createElement('canvas');
-    spare.style.cssText = 'display:block;background:#fff;';
-    this._applyPageShadow(spare);
-    const runs: PptxTextRunInfo[] = [];
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive;
-    const onTextRun = wantRuns ? (r: PptxTextRunInfo) => runs.push(r) : undefined;
-
-    this._pres
-      .presentSlide(spare, i, {
-        width: widthPx,
-        dpr,
-        onTextRun,
-        onError: (error) => {
-          if (generation === slot.presentationGeneration) this._reportRenderError(error);
-        },
-      })
-      .then((handle) => {
-        if (
-          generation !== slot.presentationGeneration ||
-          !slot.mediaInteractive ||
-          epoch !== this._renderEpoch ||
-          this._slots.get(i) !== slot ||
-          slot.renderedSlide !== i
-        ) {
-          handle.destroy();
-          return;
-        }
-
-        const oldCanvas = slot.canvas;
-        const oldHandle = slot.presentationHandle;
-        slot.dispatcher.destroy();
-        slot.wrapper.insertBefore(spare, oldCanvas);
-        oldCanvas.remove();
-        slot.canvas = spare;
-        slot.dispatcher = new StaticCanvasRenderDispatcher(spare, false);
-        slot.presentationHandle = handle;
-        slot.renderedScale = scale;
-        oldHandle?.destroy();
-
-        if (slot.textLayer) {
-          this._clearTextLayerPreview(slot.textLayer);
-          if (wantOverlay) {
-            buildPptxTextLayer(
-              slot.textLayer,
-              runs,
-              Math.round(widthPx),
-              Math.round(this._slideHeightPx()),
-              this._hyperlinkHandler(),
-              i,
-            );
-          }
-        }
-        if (wantRuns) this._highlights.refreshRuns(i, runs);
-        this._commitSlotComments(i, slot);
-        this._highlights.redrawSlot(i, slot);
-      })
-      .catch((err: unknown) => {
-        if (generation === slot.presentationGeneration) this._reportRenderError(err);
-      });
   }
 
   /**
@@ -1949,6 +1798,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._findActive = false;
     this._unbindLayoutPresentation();
     this._selection.destroy();
+    this._media.destroy();
     this._highlights.destroy();
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
