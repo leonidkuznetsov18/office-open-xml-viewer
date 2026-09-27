@@ -11,22 +11,21 @@ use ooxml_common::ns::is_x_ns;
 /// (ECMA-376 §18.3.1.13).
 pub(crate) type DefaultFont = (Option<String>, Option<f64>, bool, bool);
 
-fn parse_default_font(doc: &roxmltree::Document) -> DefaultFont {
-    let mut font_id: usize = 0;
-    for n in doc.descendants() {
-        if n.tag_name().name() == "cellStyleXfs" && is_x_ns(n.tag_name().namespace()) {
-            if let Some(xf) = n
-                .children()
+/// `<cellStyleXfs>[0].fontId` (ECMA-376 §18.8.9) — the Normal style's font.
+fn normal_font_id(doc: &roxmltree::Document) -> usize {
+    doc.descendants()
+        .find(|n| n.tag_name().name() == "cellStyleXfs" && is_x_ns(n.tag_name().namespace()))
+        .and_then(|n| {
+            n.children()
                 .find(|c| c.is_element() && c.tag_name().name() == "xf")
-            {
-                font_id = xf
-                    .attribute("fontId")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-            }
-            break;
-        }
-    }
+        })
+        .and_then(|xf| xf.attribute("fontId"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_default_font(doc: &roxmltree::Document) -> DefaultFont {
+    let font_id = normal_font_id(doc);
     for fonts_node in doc.descendants() {
         if fonts_node.tag_name().name() != "fonts" || !is_x_ns(fonts_node.tag_name().namespace()) {
             continue;
@@ -91,6 +90,7 @@ pub(crate) fn parse_styles(
             cell_xfs,
             num_fmts,
             dxfs,
+            normal_font_id: u32::try_from(normal_font_id(&doc)).ok(),
         },
         default_font,
         chart_number_formats,
@@ -639,6 +639,7 @@ mod strict_namespace_tests {
             parse_default_font(&doc),
             (Some("Arial".into()), Some(12.0), true, true)
         );
+        assert_eq!(normal_font_id(&doc), 1);
     }
 
     #[test]

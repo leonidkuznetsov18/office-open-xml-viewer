@@ -1029,6 +1029,9 @@ export interface Styles {
   cellXfs: CellXf[];
   numFmts: NumFmt[];
   dxfs: Dxf[];
+  /** `fonts` index of the Normal cell style's font (`<cellStyleXfs>[0].fontId`,
+   *  ECMA-376 §18.8.9). Omitted means 0. */
+  normalFontId?: number;
 }
 
 export interface Dxf {

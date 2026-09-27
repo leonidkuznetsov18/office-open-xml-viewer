@@ -1756,6 +1756,12 @@ pub struct Styles {
     pub cell_xfs: Vec<CellXf>,
     pub num_fmts: Vec<NumFmt>,
     pub dxfs: Vec<Dxf>,
+    /// `<fonts>` index of the Normal cell style's font
+    /// (`<cellStyleXfs>[0].fontId`, ECMA-376 §18.8.9). A cell font whose
+    /// color differs from this font's color carries cell-level formatting
+    /// that Excel draws over a table style's font color.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal_font_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
