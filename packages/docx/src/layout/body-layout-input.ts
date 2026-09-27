@@ -234,15 +234,17 @@ export function projectBodyLayoutInput(acquired: BodyLayoutAcquisitionInput): Bo
   const initialOccurrence = acquired.sectionIndex.occurrences[0];
   if (!initialOccurrence) throw new Error('DOCX body requires a final section owner');
   const initialSection = sections.get(initialOccurrence.sectionOccurrenceId)!;
-  const resolved: BodyLayoutSequenceEntry[] = acquired.sequence.map((entry) => {
-    if (entry.kind !== 'begin-section') return entry;
-    const section = sections.get(entry.section.sectionOccurrenceId);
-    if (!section) throw new Error(`Missing body section owner: ${entry.section.sectionOccurrenceId}`);
-    return Object.freeze({ ...entry, section });
-  });
-  const sequence: BodyLayoutSequenceEntry[] = resolved.map((entry, index) => {
+  // The spacing role depends only on the authored section start type, already
+  // present in the acquisition sequence. Resolve section owners and roles in
+  // one pass so no second body-sized sequence is retained transiently.
+  const sequence: BodyLayoutSequenceEntry[] = acquired.sequence.map((entry, index) => {
+    if (entry.kind === 'begin-section') {
+      const section = sections.get(entry.section.sectionOccurrenceId);
+      if (!section) throw new Error(`Missing body section owner: ${entry.section.sectionOccurrenceId}`);
+      return Object.freeze({ ...entry, section });
+    }
     if (entry.kind !== 'body-block' || entry.block.kind !== 'paragraph') return entry;
-    const continuousSectionRole = wordContinuousSectionRole(resolved, index);
+    const continuousSectionRole = wordContinuousSectionRole(acquired.sequence, index);
     if (continuousSectionRole === undefined) return entry;
     return Object.freeze({
       ...entry,
