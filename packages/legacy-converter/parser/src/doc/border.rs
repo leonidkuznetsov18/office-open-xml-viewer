@@ -146,15 +146,17 @@ impl Border {
                 // distinction is not represented here.
                 "nil"
             }
-            0xff if !old && b[3] == 0 && b[6] == 0 && b[7] == 0 => {
-                // Word-save controls d16-w8-ff-{black,red,green,white} instead
-                // write `w:val="none"`, retaining width and color. Red widths
-                // 1/8/24/255 (d16-w1-ff-red and d16-w255-ff-red included)
-                // preserve that result; a
-                // valid single-red border visibly prints, so FF is not a
-                // color-independent alias of single or nil. Other ColorRef
-                // forms and trailing flag combinations remain gated.
-                "none"
+            0xff if !old && b[3] == 0 && matches!(b[4], 1 | 8 | 24) && b[6] == 0 && b[7] == 0 => {
+                // Word's direct-DOC PDFs of d16-w8-ff-{black,red,green,white}
+                // print a single rule in the explicit RGB color. Red widths
+                // 1/8/24 print a progressively wider rule. At width 255 Word
+                // draws a band outside the table, while the current generic
+                // cell painter clips it; that counterexample stays gated.
+                // Word saves these same DOCs to DOCX with
+                // `w:val="none"`; that lossy save is a counterexample to using
+                // DOCX round trips as the display oracle. Other ColorRef forms
+                // and trailing flag combinations remain gated.
+                "single"
             }
             // MS-DOC 2.9.22: image (art) borders 0x40..=0xE3 are valid only
             // for page borders; 0x02, 0x04 and every other value is undefined.
@@ -386,12 +388,12 @@ mod tests {
             ([0, 255, 0], "00FF00"),
             ([255, 255, 255], "FFFFFF"),
         ] {
-            for width in [1, 8, 24, 255] {
+            for width in [1, 8, 24] {
                 let actual =
                     Border::read(&[color[0], color[1], color[2], 0, width, 255, 0, 0], false)
                         .unwrap()
                         .direct_spec();
-                assert_eq!(actual.style, "none");
+                assert_eq!(actual.style, "single");
                 assert_eq!(
                     actual.color.as_deref(),
                     Some(expected.to_ascii_lowercase().as_str())
@@ -402,6 +404,7 @@ mod tests {
             [0, 0, 0, 1, 8, 255, 0, 0],
             [0, 0, 0, 0, 8, 255, 0xe0, 0xff],
             [255, 255, 255, 255, 8, 255, 1, 0],
+            [255, 0, 0, 0, 255, 255, 0, 0],
         ] {
             let error = Border::read(&bytes, false).err().unwrap();
             assert!(error.contains("undefined Word border type 0xFF"), "{error}");
