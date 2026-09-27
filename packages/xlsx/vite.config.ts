@@ -11,6 +11,7 @@ const dirname =
     : path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  define: { __OOXML_MODEL_SOURCES__: 'true' },
   plugins: [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
   root: dirname,
   resolve: {

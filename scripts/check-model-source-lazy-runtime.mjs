@@ -12,7 +12,7 @@ export function runSourceRequestProbe({
   script = './scripts/model-source-runtime-probe.mjs',
   cwd = process.cwd(),
 } = {}) {
-  const temp = mkdtempSync(join(tmpdir(), 'ooxml-source-requests-'));
+  const temp = mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(), 'ooxml-source-requests-'));
   const log = join(temp, 'requests.log');
   try {
     writeFileSync(log, '');
