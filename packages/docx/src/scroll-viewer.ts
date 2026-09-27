@@ -28,13 +28,11 @@ import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-ma
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
 import { CommentOverlayController } from '@silurus/ooxml-core/internal/comment-overlay-controller';
-import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { DocxDocument } from './document';
 import type { LoadOptions } from './document';
 import {
   activeDocxLayoutViewOf,
   selectDocxLayoutView,
-  type DocxLayoutViewPublication,
 } from './document-layout-view.js';
 import type { DocxTextRunInfo } from './renderer';
 import type { DocxScrollSlot as PageSlot } from './scroll-slot';
@@ -471,13 +469,7 @@ export class DocxScrollViewer implements ZoomableViewer {
   private set _renderEpoch(value: number) { this._scroller.renderEpoch = value; }
   private get _prevBase(): number { return this._zoom.prevBase; }
   private set _prevBase(value: number) { this._zoom.prevBase = value; }
-  /** Resolved page-canvas `box-shadow` (design: the recipe drop shadow by
-   *  default). Resolved ONCE with `??` — NOT `||` — so `pageShadow: false`
-   *  survives as the "no shadow" sentinel (a `||` would treat `false` as absent
-   *  and wrongly re-apply the default). Applied by `_applyPageShadow` at EVERY
-   *  canvas-creation site (`_acquireSlot` and the double-buffer spare in
-   *  `_refreshSlotAtomically`) so a recycled/re-mounted slot and a swapped spare all
-   *  carry it. */
+  /** Resolved once so explicit `false` disables the shared slot/spare shadow. */
   private readonly _pageShadow: string | false;
   private readonly _find = new DocxFindController(
     () => this.pageCount,
@@ -840,16 +832,6 @@ export class DocxScrollViewer implements ZoomableViewer {
 
   private _emitVisiblePageChange(range: VisibleRange): void {
     if (this._doc) this._visibleEvents.publish(range, this._doc.pageCount, this.layoutComplete);
-  }
-
-  /** Apply the resolved page-canvas shadow (design: recipe drop shadow by
-   *  default, `false` ⇒ none). Single source so `_acquireSlot` and the
-   *  double-buffer spare in `_refreshSlotAtomically` stay in lock-step — a spare
-   *  that missed this would lose the shadow on the settle swap. `box-shadow`
-   *  never affects layout, so this is safe to (re)set on a live/pooled canvas
-   *  without shifting any offset. */
-  private _applyPageShadow(canvas: HTMLCanvasElement): void {
-    if (this._pageShadow !== false) canvas.style.boxShadow = this._pageShadow;
   }
 
   private _createSlot(): PageSlot {

@@ -24,7 +24,6 @@ import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-ma
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
 import { CommentOverlayController } from '@silurus/ooxml-core/internal/comment-overlay-controller';
-import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { PptxPresentation, type LoadOptions, type RenderSlideOptions } from './presentation';
 import type { PptxScrollSlot as SlideSlot } from './scroll-slot';
 import type { PptxTextRunInfo } from './renderer';
@@ -36,7 +35,6 @@ import {
   readPptxTextSelectionContext,
 } from './selection-context';
 import type {
-  PptxElementBounds,
   PptxElementContext,
   PptxSelectionContext,
   PptxSelectionContextOptions,
@@ -463,13 +461,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  build; the engine's per-canvas token already discards the stale pixels. */
   private get _renderEpoch(): number { return this._scroller.renderEpoch; }
   private set _renderEpoch(value: number) { this._scroller.renderEpoch = value; }
-  /** Resolved slide-canvas `box-shadow` (design: the recipe drop shadow by
-   *  default). Resolved ONCE with `??` — NOT `||` — so `pageShadow: false`
-   *  survives as the "no shadow" sentinel (a `||` would treat `false` as absent
-   *  and wrongly re-apply the default). Applied by `_applyPageShadow` at EVERY
-   *  canvas-creation site (`_acquireSlot` and the double-buffer spare in
-   *  `_settleSlot`) so a recycled/re-mounted slot and a settle-swapped spare all
-   *  carry it. */
+  /** Resolved once so explicit `false` disables the shared slot/spare shadow. */
   private readonly _pageShadow: string | false;
   private readonly _find = new PptxFindController(
     () => this.slideCount,
@@ -769,16 +761,6 @@ export class PptxScrollViewer implements ZoomableViewer {
   /** Mount/recycle slots for the current visible window. */
   private _mountVisible(initialRenders?: Promise<void>[], repositionExisting = true): void {
     this._scroller.mount(initialRenders, repositionExisting);
-  }
-
-  /** Apply the resolved slide-canvas shadow (design: recipe drop shadow by
-   *  default, `false` ⇒ none). Single source so `_acquireSlot` and the
-   *  double-buffer spare in `_settleSlot` stay in lock-step — a spare that missed
-   *  this would lose the shadow on the settle swap. `box-shadow` never affects
-   *  layout, so this is safe to (re)set on a live/pooled canvas without shifting
-   *  any offset. */
-  private _applyPageShadow(canvas: HTMLCanvasElement): void {
-    if (this._pageShadow !== false) canvas.style.boxShadow = this._pageShadow;
   }
 
   private _createSlot(): SlideSlot {
