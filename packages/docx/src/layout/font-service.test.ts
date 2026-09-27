@@ -19,6 +19,38 @@ const faces: readonly FontInventoryFace[] = [
 ];
 
 describe('font layout services', () => {
+  it('recomputes an evicted shape with identical geometry and keeps service-scoped font invalidation', () => {
+    const measure = vi.fn((request: Readonly<GlyphMeasureRequest>): GlyphMeasurement => ({
+      advancePt: request.text.length * 2,
+      ascentPt: 7,
+      descentPt: 2,
+    }));
+    const service = createTextLayoutService({
+      fonts: createFontResolver(faces),
+      measurer: { fingerprint: 'cache-measure-v1', measure },
+    });
+    const shape = (text: string) => service.shape({ text, fontSizePt: 10, fonts: { ascii: 'Calibri' } });
+    const first = shape('cached seed');
+    const afterFirst = measure.mock.calls.length;
+    expect(shape('cached seed')).toBe(first);
+    expect(measure).toHaveBeenCalledTimes(afterFirst);
+
+    for (let index = 0; index < 81922; index += 1) shape(`unique ${index}`);
+    const beforeRevisit = measure.mock.calls.length;
+    expect(shape('cached seed')).toEqual(first);
+    expect(measure.mock.calls.length).toBeGreaterThan(beforeRevisit);
+
+    const changed = createTextLayoutService({
+      fonts: createFontResolver(faces),
+      measurer: { fingerprint: 'cache-measure-v2', measure: (request) => ({
+        advancePt: request.text.length * 3, ascentPt: 7, descentPt: 2,
+      }) },
+    });
+    expect(changed.fingerprint).not.toBe(service.fingerprint);
+    expect(changed.shape({ text: 'cached seed', fontSizePt: 10, fonts: { ascii: 'Calibri' } }).advancePt)
+      .not.toBe(first.advancePt);
+  }, 30_000);
+
   it('snapshots regional routes and includes their contents in the font fingerprint', () => {
     const routes = { sc: { Calibri: 'Carlito, "Noto Sans SC", sans-serif' } };
     const resolver = createFontResolver(faces, { regionalFamilyLists: routes });

@@ -203,7 +203,9 @@ function assertNoSourceRuntime(code, name) {
 // DOCX bytes; shared layout validation/freezing adds 398 Node bytes. The
 // optional model-source runtime remains outside both eager entry graphs.
 // The ordinary DOCX render worker grows by 289 bytes from those same layout
-// changes; its exact zero-allowance baseline is rebased with the entries.
+// changes. Issue #1591's lazy validation, root-only freeze branding,
+// occurrence sharing, and bounded text caches grow the clean aec306b6 worker
+// from 2,047,181 to 2,047,720 bytes; keep its exact zero-allowance baseline.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
   docx: { entry: 2_533_039, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
@@ -213,7 +215,7 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   node: { entry: 2_579_736, budget: 3_600 },
 });
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_047_235];
+const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_047_720];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
