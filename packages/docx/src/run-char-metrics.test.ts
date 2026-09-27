@@ -36,6 +36,19 @@ describe('WD4 run character-metric width helpers', () => {
     expect(charScaleFactor(seg({ charScale: 2 }))).toBe(2);
   });
 
+  it('uses measured synthetic bold advances only for native Sakkal Majalla complex-script text', () => {
+    const arabic = seg({ script: 'complexScript', bold: true, fontSize: 14, fontFamily: 'Sakkal Majalla' });
+    expect(charScaleFactor(arabic)).toBeCloseTo(1.048, 10);
+    expect(charScaleFactor({ ...arabic, charScale: 0.98 })).toBeCloseTo(1.02704, 10);
+    expect(charScaleFactor({ ...arabic, bold: false })).toBe(1);
+    expect(charScaleFactor({ ...arabic, fontFamily: 'Arial' })).toBe(1);
+    expect(charScaleFactor({ ...arabic, script: 'highAnsi' })).toBe(1);
+    expect(charScaleFactor({ ...arabic, fontSize: 12 })).toBe(1);
+    expect(charScaleFactor({ ...arabic, fontRoute: {
+      scope: 'registered',
+    } as LayoutTextSeg['fontRoute'] })).toBe(1);
+  });
+
   it('charSpacingDeltaPx is the authored points scaled to px per glyph', () => {
     // 0 when the run declares no w:spacing.
     expect(charSpacingDeltaPx(seg({}), 2)).toBe(0);
