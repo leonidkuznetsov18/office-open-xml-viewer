@@ -627,6 +627,16 @@ impl Row {
                         .zip(b[1..].chunks_exact(10))
                     {
                         cell.compatibility_shading = match Shading::read(bytes, false)? {
+                            Some(value) if value.direct_facts().pattern == "nil" => {
+                                // [MS-DOC] 2.9.247: the authored ShdNil and
+                                // ipatNil both supply no RGB fill. The modern
+                                // compatibility array is ignored by style-
+                                // aware readers (2.6.3); current Word's
+                                // observed fallback only needs clear RGB.
+                                // Neither nil form can replace a Raw ShdNil's
+                                // table-style shading.
+                                None
+                            }
                             Some(value) if value.is_clear_rgb_background() => {
                                 Some(PreparedCellShading::Explicit(value))
                             }
@@ -1739,6 +1749,31 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_nil_patterns_defer_to_style_instead_of_poisoning_raw_nil() {
+        let raw_nil = [255, 255, 255, 255, 255, 255, 255, 255, 0, 0];
+        for compatibility_nil in [raw_nil, [255; 10]] {
+            let mut row = Row::default();
+            row.apply(0x7621, &[0, 1, 1, 0]).unwrap();
+            row.apply(0x563a, &1u16.to_le_bytes()).unwrap();
+            assert_eq!(
+                row.apply_style_aware_shading(
+                    0xd612,
+                    &raw_array(compatibility_nil, 1),
+                    style_aware_policy()
+                )
+                .unwrap(),
+                StyleAwareShadingApply::Handled
+            );
+            row.apply_style_aware_shading(0xd670, &raw_array(raw_nil, 1), style_aware_policy())
+                .unwrap();
+            assert!(matches!(
+                row.cells[0].prepared_shading,
+                Some(PreparedCellShading::StyleDeferred)
+            ));
+        }
+    }
+
+    #[test]
     fn modern_compatibility_shading_replaces_segments_and_raw_values_override_it() {
         let new_row = || {
             let mut row = Row::default();
@@ -1896,8 +1931,12 @@ mod tests {
                 style_aware_policy(),
             )
             .unwrap(),
-            StyleAwareShadingApply::HandledUnsupported
+            StyleAwareShadingApply::Handled
         );
+        assert!(matches!(
+            row.cells[0].prepared_shading,
+            Some(PreparedCellShading::StyleDeferred)
+        ));
     }
 
     #[test]

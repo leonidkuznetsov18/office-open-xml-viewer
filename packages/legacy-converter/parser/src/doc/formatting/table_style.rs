@@ -66,6 +66,8 @@ pub(super) struct Profile {
     condition_presence: u16,
     bands: Bands,
     pub(super) paragraph_alignment: Option<paragraph::AlignmentPatch>,
+    pub(super) paragraph_before: Option<u16>,
+    pub(super) paragraph_after: Option<u16>,
     table_shading: Option<TableStyleShading>,
     table_default_margins: table::MarginPatch,
     table_style_margins: table::MarginPatch,
@@ -92,6 +94,8 @@ impl Default for Profile {
             condition_presence: 0,
             bands: Bands::default(),
             paragraph_alignment: None,
+            paragraph_before: None,
+            paragraph_after: None,
             table_shading: None,
             table_default_margins: table::MarginPatch::default(),
             table_style_margins: table::MarginPatch::default(),
@@ -563,7 +567,10 @@ impl Formatting<'_> {
             let mut chpx = Sprms::new(sets.chpx);
             while let Some((code, operand)) = chpx.next(&mut self.budget)? {
                 match code {
-                    0x2a42 | 0x4a43 | 0x4a4f | 0x4a51 | 0x6870 => {
+                    0x2a42 | 0x4a43 | 0x4a4f | 0x4a51 | 0x485f | 0x6870 => {
+                        // [MS-DOC] 2.6.1 sprmCLidBi is a CHPX language axis;
+                        // table-style CHPX precedes direct run CHPX, just as
+                        // the other inherited character properties do.
                         let baseline = profile.unconditional.clone();
                         profile.unconditional.apply(code, operand, &baseline)?;
                     }
@@ -597,8 +604,20 @@ impl Formatting<'_> {
                             let _ = paragraph::AlignmentPatch::from_sprm(code, operand)?;
                             // Office 16.112.4 table-style controls ignore
                             // physical PJc80. Keep direct paragraph PJc80
-                            // behavior independent and retain admission gating.
-                            profile.unsupported_paragraph = true;
+                            // behavior independent. The bounded control only
+                            // establishes the unconditional table-style case.
+                        } else if matches!(code, 0xa413 | 0xa414) {
+                            // [MS-DOC] 2.6.2: table-style PAPX spacing is
+                            // inherited base to child, then paragraph style
+                            // and direct PAPX can replace the same property.
+                            let mut validated = paragraph::Properties::default();
+                            validated.apply(code, operand)?;
+                            let value = u16_at(operand, 0)?;
+                            if code == 0xa413 {
+                                profile.paragraph_before = Some(value);
+                            } else {
+                                profile.paragraph_after = Some(value);
+                            }
                         } else if code == 0xc666 {
                             parse_conditional_paragraph(&mut profile, operand, budget)?;
                         } else {

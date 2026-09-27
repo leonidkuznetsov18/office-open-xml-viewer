@@ -404,6 +404,12 @@ impl<'a> Formatting<'a> {
             self.unsupported_table_properties = true;
             return Ok(false);
         }
+        if let Some(before) = profile.paragraph_before {
+            props.apply(0xa413, &before.to_le_bytes())?;
+        }
+        if let Some(after) = profile.paragraph_after {
+            props.apply(0xa414, &after.to_le_bytes())?;
+        }
         let mut alignment = profile.paragraph_alignment;
         for condition in table_style.matches.into_iter().flatten() {
             if let Some(patch) = profile.conditional_paragraph_alignment.get(&condition) {
@@ -1249,6 +1255,38 @@ mod tests {
             .table_style_selector_profile(Some(0))
             .unwrap();
         assert!(complex_script.unsupported_character_properties);
+    }
+
+    #[test]
+    fn table_chpx_complex_script_language_reaches_run_and_direct_override_wins() {
+        let mut formatting = observed_table_style_formatting();
+        formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = &[0x5f, 0x48, 0x01, 0x04];
+
+        let styled = formatting
+            .direct_text_run(7, table_key(0), 0, 0, &[], "x".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(styled.lang_bidi.as_deref(), Some("ar-sa"));
+
+        let direct = formatting
+            .direct_text_run(
+                7,
+                table_key(0),
+                0,
+                1,
+                &[&[0x5f, 0x48, 0x0d, 0x04]],
+                "x".into(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.lang_bidi.as_deref(), Some("he-il"));
+        assert!(!formatting.unsupported_character_properties);
     }
 
     #[test]
@@ -2351,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn table_style_pjc80_is_gated_and_does_not_create_condition_presence() {
+    fn table_style_pjc80_is_ignored_without_creating_condition_presence() {
         let mut unconditional = observed_table_style_formatting();
         unconditional.styles[0]
             .as_mut()
@@ -2364,7 +2402,7 @@ mod tests {
             .resolve_paragraph_with_table(7, table_key(0), 0, 0, &[])
             .unwrap();
         assert_eq!(resolved_alignment(&resolved), "left");
-        assert!(unconditional.unsupported_paragraph_properties);
+        assert!(!unconditional.unsupported_paragraph_properties);
 
         let mut conditional = observed_table_style_formatting();
         conditional.styles[0]
@@ -2385,6 +2423,41 @@ mod tests {
             0
         );
         assert!(conditional.unsupported_paragraph_properties);
+    }
+
+    #[test]
+    fn table_papx_spacing_is_inherited_and_direct_spacing_wins() {
+        let mut formatting = observed_table_style_formatting();
+        formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .papx = &[0, 0, 0x13, 0xa4, 240, 0, 0x14, 0xa4, 120, 0];
+        formatting.styles[1]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .papx = &[1, 0, 0x14, 0xa4, 180, 0];
+
+        let inherited = formatting
+            .direct_paragraph(7, table_key(1), 0, 0, &[])
+            .unwrap()
+            .paragraph;
+        assert_eq!((inherited.space_before, inherited.space_after), (12.0, 9.0));
+
+        let overridden = formatting
+            .direct_paragraph(7, table_key(1), 0, 1, &[&[0x13, 0xa4, 0, 0]])
+            .unwrap()
+            .paragraph;
+        assert_eq!(
+            (overridden.space_before, overridden.space_after),
+            (0.0, 9.0)
+        );
+        assert!(!formatting.unsupported_paragraph_properties);
     }
 
     #[test]
