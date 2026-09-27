@@ -50,10 +50,7 @@ import type { PptxScrollViewerOptions } from './scroll-viewer-options';
 import { pptxCommentOccurrenceKey } from './comment-occurrence';
 import type { PptxComment } from './types';
 import { renderPptxFocusedSlide } from './focused-view-runtime';
-import {
-  subscribePptxLayout,
-  type PptxLayoutPublication,
-} from './presentation-layout-events';
+import { PptxScrollLayoutController } from './scroll-layout-controller';
 import { createPptxLoadingLayer } from './loading-indicator';
 import { PptxScrollMediaController } from './scroll-media-controller';
 import { PptxScrollCommentNavigation } from './scroll-comment-navigation';
@@ -155,6 +152,29 @@ export class PptxScrollViewer implements ZoomableViewer {
     shouldSettle: (index) => !this._opts.enableMediaPlayback || this._rangeContains(this._mediaRange(), index),
   });
   private readonly _slots = this._scroller.slots;
+  private readonly _layout = new PptxScrollLayoutController({
+    current: () => this._pres,
+    destroyed: () => this._destroyed,
+    report: (error) => this._reportRenderError(error),
+    reportBackground: (error) => this._errorRouter.reportBackground(
+      error, this._opts.onLayoutComplete !== undefined),
+    wakeComments: () => this._commentNavigation.wake(),
+    resetComments: () => this._commentNavigation.resetLayout(),
+    failComments: () => this._commentNavigation.failLayout(),
+    scanComments: (pres) => this._scanAvailableComments(pres, true),
+    renderAvailable: (pres) => {
+      const mediaRange = this._opts.enableMediaPlayback ? this._mediaRange() : null;
+      for (const [slideIndex, slot] of this._slots) {
+        if (slideIndex >= pres.availableSlideCount || slot.renderedSlide === slideIndex) continue;
+        void this._renderSlot(slideIndex, slot,
+          !!mediaRange && this._rangeContains(mediaRange, slideIndex));
+      }
+    },
+    emitVisible: () => {
+      if (this._scroller.lastRange) this._emitVisibleSlideChange(this._scroller.lastRange);
+    },
+  });
+
   private readonly _bitmap = new BitmapSlotRenderer<SlideSlot, PptxTextRunInfo>({
     slots: () => this._slots,
     inFlight: () => this._scroller.inFlight,
@@ -353,7 +373,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._hasComments = false;
       this._commentScanFrontier = 0;
       this._commentNavigation.begin();
-      this._unbindLayoutPresentation();
+      this._layout.unbind();
       if (previous) {
         for (const [index, slot] of [...this._slots]) this._recycleSlot(index, slot);
         this._visibleEvents.resetIndex();
@@ -367,7 +387,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._hasComments = false;
       this._commentScanFrontier = 0;
       this._scanAvailableComments(pres, false);
-      this._bindLayoutPresentation(pres);
+      this._layout.bind(pres);
     },
     mountOpeningWindow: async () => {
       const initialRenders: Promise<void>[] = [];
@@ -376,7 +396,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     },
     selectionChanged: () => this._selection.emitChange(),
   });
-  private _layoutUnsubscribe: (() => void) | null = null;
   private _activeCommentId: string | null = null;
   private _activeCommentSlide: number | null = null;
   private _commentUi: PptxCommentUiRuntime | null = null;
@@ -551,7 +570,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._zoom.bind(this._container, this._scrollHost, this._opts.enableZoom !== false);
 
     if (this._borrowed) {
-      this._bindLayoutPresentation(borrowedPresentation!);
+      this._layout.bind(borrowedPresentation!);
       // A borrowed engine is already loaded, so lay out + mount the first
       // window immediately. relayout() is idempotent and defers under a
       // zero-width container (the resize path re-runs it once width appears).
@@ -939,74 +958,10 @@ export class PptxScrollViewer implements ZoomableViewer {
     }
   }
 
-  private _bindLayoutPresentation(presentation: PptxPresentation): void {
-    this._unbindLayoutPresentation();
-    let initial = true;
-    this._layoutUnsubscribe = subscribePptxLayout(
-      presentation,
-      () => ({
-        availableSlides: presentation.availableSlideCount,
-        slideCount: presentation.slideCount,
-        exact: presentation.layoutComplete,
-        complete: presentation.layoutComplete,
-      }),
-      (publication) => {
-        if (initial) {
-          initial = false;
-          return;
-        }
-        this._onLayoutPublication(presentation, publication);
-      },
-      (error) => this._reportRenderError(error),
-    );
-  }
-
-  private _unbindLayoutPresentation(): void {
-    this._layoutUnsubscribe?.();
-    this._layoutUnsubscribe = null;
-    this._commentNavigation.resetLayout();
-    this._commentNavigation.wake();
-  }
-
-  private _onLayoutPublication(
-    presentation: PptxPresentation,
-    publication: PptxLayoutPublication,
-  ): void {
-    if (this._destroyed || presentation !== this._pres) return;
-    this._commentNavigation.wake();
-    if (publication.error !== undefined) {
-      this._commentNavigation.failLayout();
-      this._errorRouter.reportBackground(
-        publication.error,
-        this._opts.onLayoutComplete !== undefined,
-      );
-      return;
-    }
-    this._scanAvailableComments(presentation, true);
-    const mediaRange = this._opts.enableMediaPlayback ? this._mediaRange() : null;
-    for (const [slideIndex, slot] of this._slots) {
-      if (slideIndex >= presentation.availableSlideCount || slot.renderedSlide === slideIndex) continue;
-      void this._renderSlot(
-        slideIndex,
-        slot,
-        !!mediaRange && this._rangeContains(mediaRange, slideIndex),
-      );
-    }
-    if (this._scroller.lastRange) this._emitVisibleSlideChange(this._scroller.lastRange);
-  }
-
   private _emitVisibleSlideChange(range: VisibleWindow): void {
     if (this._pres) this._visibleEvents.publish(range, this._pres.slideCount, this.layoutComplete);
   }
 
-  /**
-   * Render one mounted slot through the stateful media presentation API.
-   *
-   * This path intentionally bypasses bitmaprenderer even for worker-backed
-   * presentations: presentSlide() renders the base off-thread and composites
-   * interactive video on a main-thread 2D canvas. The slot generation closes the
-   * same-index recycle/reload hole that a viewer-wide render epoch cannot detect.
-   */
   /** Route an async render failure to `onError`, or `console.error` when none is
    *  set (so failures are never fully silent), and never after teardown. */
   private _reportRenderError(err: unknown): void {
@@ -1369,7 +1324,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._errorRouter.close();
     this._invalidateFind();
     this._findActive = false;
-    this._unbindLayoutPresentation();
+    this._layout.unbind();
     this._selection.destroy();
     this._media.destroy();
     this._commentNavigation.destroy();

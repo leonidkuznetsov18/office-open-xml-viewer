@@ -34,7 +34,6 @@ import type { LoadOptions } from './document';
 import {
   activeDocxLayoutViewOf,
   selectDocxLayoutView,
-  subscribeDocxLayoutView,
   type DocxLayoutViewPublication,
 } from './document-layout-view.js';
 import type { DocxTextRunInfo } from './renderer';
@@ -58,10 +57,8 @@ import type { DocxCommentsOptions } from './comment-margin';
 import type { DocxScrollViewerOptions } from './scroll-viewer-options';
 import { DocxScrollCommentNavigation } from './scroll-comment-navigation';
 import { renderDocxFocusedPage } from './focused-view-runtime';
-import {
-  subscribeDocxLayout,
-  type DocxLayoutPublication,
-} from './document-layout-events.js';
+import type { DocxLayoutPublication } from './document-layout-events.js';
+import { DocxScrollLayoutController } from './scroll-layout-controller';
 
 const COMMENT_MARGIN_GAP_PX = 12;
 const COMMENT_MARGIN_FONT_SIZE_PX = 13;
@@ -154,6 +151,31 @@ export class DocxScrollViewer implements ZoomableViewer {
     onExistingSlot: (index, slot, reportErrors) => this._renderSlot(index, slot, reportErrors),
   });
   private readonly _slots = this._scroller.slots;
+  private readonly _layout = new DocxScrollLayoutController({
+    current: () => this._doc,
+    destroyed: () => this._destroyed,
+    report: (error) => this._reportRenderError(error),
+    reportBackground: (error) => this._errorRouter.reportBackground(
+      error, this._opts.onLayoutComplete !== undefined),
+    invalidateFind: () => this._find.invalidate(),
+    refreshComments: () => this._refreshCommentSurface(),
+    adoptView: (publication) => {
+      if (publication.requester === this) return;
+      this._layoutViewGeneration++;
+      this._showTrackedChanges = publication.view.showTrackedChanges;
+      this._currentDate = publication.view.currentDate;
+      this._find.invalidate();
+      this._layout.apply({
+        pageCount: this._doc!.pageCount, exact: true, complete: this._doc!.layoutComplete,
+      });
+    },
+    relayout: () => this.relayout(),
+    invalidateRender: () => { this._renderEpoch++; },
+    mounted: () => this._slots,
+    stillMounted: (page, slot) => this._slots.get(page) === slot,
+    refreshSlot: (page, slot) => this._refreshSlotAtomically(page, slot as PageSlot),
+  });
+
   private readonly _bitmap = new BitmapSlotRenderer<PageSlot, DocxTextRunInfo>({
     slots: () => this._slots,
     inFlight: () => this._scroller.inFlight,
@@ -333,7 +355,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._activeCommentId = null;
       this._activeCommentPage = null;
       this._commentNavigation.reset();
-      this._unbindLayoutDocument();
+      this._layout.unbind();
       if (previous) {
         for (const [index, slot] of [...this._slots]) this._recycleSlot(index, slot);
         this._visibleEvents.reset();
@@ -343,7 +365,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       if (this._opts.modelSources !== undefined) {
         this._showTrackedChanges = activeDocxLayoutViewOf(doc).showTrackedChanges;
       }
-      this._bindLayoutDocument(doc);
+      this._layout.bind(doc);
       this._find.invalidate();
       this._findActive = false;
       this._activeCommentId = null;
@@ -492,7 +514,6 @@ export class DocxScrollViewer implements ZoomableViewer {
    * change either axis after construction. */
   private _currentDate: Date | number | undefined;
   private _layoutViewGeneration = 0;
-  private _layoutViewPublicationGeneration = 0;
 
   /**
    * Create a Scroll Viewer that borrows an already-loaded document.
@@ -576,7 +597,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._zoom.bind(this._container, this._scrollHost, this._opts.enableZoom !== false);
 
     if (this._borrowed) {
-      this._bindLayoutDocument(borrowedDocument!);
+      this._layout.bind(borrowedDocument!);
       // A borrowed engine is already loaded, so lay out + mount the first
       // window immediately. relayout() is idempotent and defers under a
       // zero-width container (the resize path re-runs it once width appears).
@@ -619,106 +640,11 @@ export class DocxScrollViewer implements ZoomableViewer {
     });
   }
 
-  private _bindLayoutDocument(doc: DocxDocument): void {
-    this._unbindLayoutDocument();
-    this._layoutViewPublicationGeneration = 0;
-    this._presentedPageCount = doc.pageCount;
-    const unsubscribeView = subscribeDocxLayoutView(
-      doc,
-      (publication) => this._onLayoutViewPublication(doc, publication),
-      (error) => this._reportRenderError(error),
-    );
-    let initial = true;
-    const unsubscribeLayout = subscribeDocxLayout(
-      doc,
-      () => ({
-        pageCount: doc.pageCount,
-        exact: doc.layoutComplete,
-        complete: doc.layoutComplete,
-      }),
-      (publication) => {
-        if (initial) {
-          initial = false;
-          return;
-        }
-        this._onLayoutPublication(doc, publication);
-      },
-      (error) => this._reportRenderError(error),
-    );
-    this._layoutUnsubscribe = () => {
-      unsubscribeLayout();
-      unsubscribeView();
-    };
-  }
-
-  private _unbindLayoutDocument(): void {
-    this._layoutUnsubscribe?.();
-    this._layoutUnsubscribe = null;
-    this._presentedPageCount = 0;
-  }
-
-  private _onLayoutPublication(doc: DocxDocument, publication: DocxLayoutPublication): void {
-    if (this._destroyed || doc !== this._doc) return;
-    if (publication.error !== undefined) {
-      this._errorRouter.reportBackground(
-        publication.error,
-        this._opts.onLayoutComplete !== undefined,
-      );
-      return;
-    }
-    this._find.invalidate();
-    this._refreshCommentSurface();
-    // Publish every paintable prefix immediately. Atomic canvas replacement
-    // below prevents blank frames while an existing page refreshes, so there is
-    // no need to hide scroll growth until the reader reaches the old tail.
-    this._applyLayoutPublication(publication);
-  }
-
-  private _onLayoutViewPublication(
-    doc: DocxDocument,
-    publication: DocxLayoutViewPublication,
-  ): void {
-    if (
-      this._destroyed
-      || doc !== this._doc
-      || publication.generation <= this._layoutViewPublicationGeneration
-    ) return;
-    this._layoutViewPublicationGeneration = publication.generation;
-    if (publication.requester === this) return;
-    this._layoutViewGeneration++;
-    this._showTrackedChanges = publication.view.showTrackedChanges;
-    this._currentDate = publication.view.currentDate;
-    this._find.invalidate();
-    this._applyLayoutPublication({
-      pageCount: doc.pageCount,
-      exact: true,
-      complete: doc.layoutComplete,
-    });
-  }
-
-  /** Refresh only the empty review layers created with each comment-enabled
-   * slot. Progressive anchor discovery never detaches a painted page canvas. */
+  /** Refresh only review layers; a layout publication never detaches a painted canvas. */
   private _refreshCommentSurface(): void {
     if (!this._commentsEnabled() || this._slots.size === 0) return;
     this._syncSpacerWidth();
     for (const [page, slot] of this._slots) this._redrawSlotComments(page, slot);
-  }
-
-  /** Admit one layout publication to scroll geometry and refresh every mounted
-   * page atomically. The old canvas remains visible while main mode paints an
-   * off-DOM replacement; worker mode already commits ImageBitmap pixels in one
-   * synchronous transfer. */
-  private _applyLayoutPublication(publication: DocxLayoutPublication): void {
-    const mounted = [...this._slots];
-    this._presentedPageCount = publication.pageCount;
-    // Supersede spares/bitmaps dispatched for an earlier publication. The
-    // newest layout is the only one allowed to swap into a live slot.
-    this._renderEpoch++;
-    this.relayout();
-    for (const [page, slot] of mounted) {
-      if (page >= this._presentedPageCount || this._slots.get(page) !== slot) continue;
-      this._refreshSlotAtomically(page, slot);
-    }
   }
 
   /** CSS px width of page `i` at the current scale. */
@@ -765,7 +691,7 @@ export class DocxScrollViewer implements ZoomableViewer {
   private _widestPageWidthPt(): number {
     if (!this._doc) return 0;
     let widthPt = 0;
-    const pageCount = this._presentedPageCount || this._doc.pageCount;
+    const pageCount = this._layout.presentedPageCount || this._doc.pageCount;
     for (let i = 0; i < pageCount; i++) {
       const pageWidthPt = this._doc.pageSize(i).widthPt;
       if (pageWidthPt > widthPt) widthPt = pageWidthPt;
@@ -809,7 +735,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     // Keep the historical relayout escape hatch able to observe an injected
     // engine whose final page count changed between calls.
     if (this._doc.layoutComplete !== false) {
-      this._presentedPageCount = this._doc.pageCount;
+      this._layout.presentedPageCount = this._doc.pageCount;
     }
     if (!this._scaleEstablished) {
       if (!this._zoom.establishBase()) return;
@@ -844,7 +770,7 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
   private _recomputeHeights(): void {
-    const n = Math.min(this._presentedPageCount, this._doc!.pageCount);
+    const n = Math.min(this._layout.presentedPageCount, this._doc!.pageCount);
     const h = new Array<number>(n);
     for (let i = 0; i < n; i++) h[i] = this._pageHeightPx(i);
     this._heights = h;
@@ -1163,7 +1089,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     // spacer and mount window all follow the new page count, and a shrinking
     // document must recycle slots that are now out of range rather than ask for
     // pages that no longer exist.
-    this._applyLayoutPublication({
+    this._layout.apply({
       pageCount: doc?.pageCount ?? 0,
       exact: true,
       complete: doc?.layoutComplete !== false,
@@ -1397,7 +1323,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._destroyed = true;
     this._findRequestGeneration++;
     this._errorRouter.close();
-    this._unbindLayoutDocument();
+    this._layout.unbind();
     this._layoutViewGeneration++;
     this._commentNavigation.reset();
     this._find.invalidate();
