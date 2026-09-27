@@ -22,6 +22,7 @@ import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-ren
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
+import { ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -143,6 +144,11 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  loading, `opts.mode` decides and `load()` passes it to `DocxDocument.load`. */
   private _mode: 'main' | 'worker';
 
+  private readonly _viewport = new ScrollViewportPolicy({
+    options: () => this._opts,
+    container: () => this._container,
+    scrollHost: () => this._scrollHost,
+  });
   private readonly _zoom = new ScrollZoomController({
     scrollHost: () => this._scrollHost,
     spacer: () => this._spacer,
@@ -150,7 +156,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     zoomMin: () => this._opts.zoomMin ?? 0.1,
     zoomMax: () => this._opts.zoomMax ?? 4,
     baseScale: () => this._baseScale(),
-    fitWidthPx: () => this._fitWidthPx(),
+    fitWidthPx: () => this._viewport.fitWidth(),
     fitContentSize: (mode) => {
       if (!this._doc) return null;
       const size = this._doc.pageSize(0);
@@ -165,7 +171,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     totalHeight: () => this._scrollGeometry.totalHeight,
     recomputeHeights: () => this._recomputeHeights(),
     syncSpacerWidth: () => this._syncSpacerWidth(),
-    padLeft: () => this._padH().left,
+    padLeft: () => this._viewport.horizontalPadding().left,
     invalidateRender: () => { this._renderEpoch++; },
     preview: () => this._previewVisible(),
     scheduleSettle: () => this._scheduleSettle(),
@@ -203,7 +209,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     destroyed: () => this._destroyed,
     scale: () => this._scale,
     width: (page) => this._pageWidthPx(page),
-    dpr: () => this._dpr(),
+    dpr: () => this._viewport.dpr(),
     slotIndex: (slot) => slot.renderedPage,
     token: () => 0,
     nextToken: () => 0,
@@ -282,7 +288,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     indexAt: (y) => this._pageIndexAtOffset(this._range(), y),
     totalHeight: () => this._scrollGeometry.totalHeight,
     width: (page) => this._pageWidthPx(page),
-    padLeft: () => this._padH().left,
+    padLeft: () => this._viewport.horizontalPadding().left,
     marginOrigin: () => this._commentMargin.originPx,
     mount: () => this._mountVisible(),
   });
@@ -811,29 +817,6 @@ export class DocxScrollViewer implements ZoomableViewer {
     return this._doc!.pageSize(i).heightPt * PT_TO_PX * this._scale;
   }
 
-  /** The fit width (px), deferring when the container is unlaid-out. An EXPLICIT
-   *  `opts.width` is the page's CSS-width contract and is returned UNCHANGED (the
-   *  gutters still apply around placement, not to the width). The container-derived
-   *  default instead targets `containerWidth − padL − padR` so a page sits INSIDE
-   *  the horizontal gutters at 100%. A non-positive result (gutters wider than the
-   *  container) is treated as unlaid-out — the same deferral as a zero-width box. */
-  private _fitWidthPx(): number {
-    if (this._opts.width && this._opts.width > 0) return this._opts.width;
-    // Fit to the real scrollport, not its outer container: a non-overlay vertical
-    // scrollbar reduces scrollHost.clientWidth but leaves container.clientWidth
-    // unchanged. The container is only a fallback for synthetic / not-yet-laid-
-    // out hosts where the absolutely positioned scrollport still reports zero.
-    const cw = this._scrollHost.clientWidth || this._container.clientWidth;
-    if (cw <= 0) return 0; // 0 ⇒ defer (design §11 zero-width deferral)
-    const { left, right } = this._padH();
-    const available = cw - left - right;
-    if (available <= 0) return 0;
-    // Fit the authored page itself. Review cards are an adjacent horizontal
-    // surface, so their late discovery never changes page scale or vertical
-    // scroll extent.
-    return available;
-  }
-
   private _hasDisplayableComments(): boolean {
     if (!this._commentsEnabled()) return false;
     const doc = this._doc;
@@ -880,7 +863,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  container has no width yet (deferral). */
   private _baseScale(): number {
     if (!this._doc || this._doc.pageCount === 0) return 0;
-    const w = this._fitWidthPx();
+    const w = this._viewport.fitWidth();
     if (w <= 0) return 0;
     const widestWpt = this._widestPageWidthPt();
     if (widestWpt <= 0) return 0;
@@ -951,34 +934,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     const h = new Array<number>(n);
     for (let i = 0; i < n; i++) h[i] = this._pageHeightPx(i);
     this._heights = h;
-    this._scrollGeometry = createVirtualScrollGeometry(h, this._gap(), this._pad());
-  }
-
-  private _gap(): number {
-    return this._opts.gap ?? 16;
-  }
-
-  private _overscan(): number {
-    return this._opts.overscan ?? 1;
-  }
-
-  /** Desk padding fed to `computeVisibleRange`: `paddingTop`/`paddingBottom`,
-   *  each defaulting to `gap` (uniform rhythm). Resolved here (not stored) to
-   *  mirror `_gap()`/`_overscan()`, and consumed at EVERY `computeVisibleRange`
-   *  call site so the padded offsets are the single source of geometry. */
-  private _pad(): { leading: number; trailing: number } {
-    const gap = this._gap();
-    return { leading: this._opts.paddingTop ?? gap, trailing: this._opts.paddingBottom ?? gap };
-  }
-
-  /** Horizontal desk gutters: `paddingLeft`/`paddingRight`, each defaulting to
-   *  `gap` (uniform rhythm — the horizontal gutters match the vertical padding).
-   *  Consumed by `_fitWidthPx` (to shrink the container-derived fit), by
-   *  `_positionSlot` (the flush-left floor), and by `_syncSpacer` (the spacer
-   *  width). Resolved here (not stored) to mirror `_gap()`/`_pad()`. */
-  private _padH(): { left: number; right: number } {
-    const gap = this._gap();
-    return { left: this._opts.paddingLeft ?? gap, right: this._opts.paddingRight ?? gap };
+    this._scrollGeometry = createVirtualScrollGeometry(h, this._viewport.gap(), this._viewport.verticalPadding());
   }
 
   /** Index of the page whose slot spans content-offset `y` (largest `i` with
@@ -1008,7 +964,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._scrollGeometry,
       this._scrollHost.scrollTop,
       this._scrollHost.clientHeight,
-      this._overscan(),
+      this._viewport.overscan(),
     );
   }
 
@@ -1023,7 +979,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  `_syncSpacer` and after every scale change (zoom / resize re-fit) so the
    *  extent tracks the current page px width. */
   private _syncSpacerWidth(): void {
-    const { left, right } = this._padH();
+    const { left, right } = this._viewport.horizontalPadding();
     let maxW = 0;
     for (let i = 0; i < this._heights.length; i++) {
       const w = this._pageWidthPx(i);
@@ -1132,12 +1088,7 @@ export class DocxScrollViewer implements ZoomableViewer {
 
   private _positionSlot(slot: PageSlot, i: number, r: VisibleRange): void {
     this._layers.position(i, slot, r.offsets[i], this._pageWidthPx(i), this._pageHeightPx(i),
-      this._scrollHost.clientWidth, this._padH().left);
-  }
-
-  /** Device-pixel ratio for a render (opts override → window → 1). */
-  private _dpr(): number {
-    return this._opts.dpr ?? (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+      this._scrollHost.clientWidth, this._viewport.horizontalPadding().left);
   }
 
   /**
@@ -1168,7 +1119,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     if (slot.renderedPage === i) return null;
     slot.renderedPage = i;
 
-    const dpr = this._dpr();
+    const dpr = this._viewport.dpr();
     const widthPx = this._pageWidthPx(i);
     const epoch = this._renderEpoch;
     const scale = this._scale;
@@ -1333,7 +1284,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    */
   private _refreshSlotAtomically(i: number, slot: PageSlot): void {
     if (!this._doc) return;
-    const dpr = this._dpr();
+    const dpr = this._viewport.dpr();
     const widthPx = this._pageWidthPx(i);
     const scale = this._scale;
     const epoch = this._renderEpoch;

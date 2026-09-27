@@ -18,6 +18,7 @@ import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-ren
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
+import { ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -157,6 +158,11 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  loading, `opts.mode` decides and `load()` passes it to `PptxPresentation.load`. */
   private _mode: 'main' | 'worker';
 
+  private readonly _viewport = new ScrollViewportPolicy({
+    options: () => this._opts,
+    container: () => this._container,
+    scrollHost: () => this._scrollHost,
+  });
   private readonly _zoom = new ScrollZoomController({
     scrollHost: () => this._scrollHost,
     spacer: () => this._spacer,
@@ -164,7 +170,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     zoomMin: () => this._opts.zoomMin ?? 0.1,
     zoomMax: () => this._opts.zoomMax ?? 4,
     baseScale: () => this._baseScale(),
-    fitWidthPx: () => this._fitWidthPx(),
+    fitWidthPx: () => this._viewport.fitWidth(),
     fitContentSize: () => this._pres ? {
       width: this._pres.slideWidth / EMU_PER_PX,
       height: this._pres.slideHeight / EMU_PER_PX,
@@ -172,10 +178,10 @@ export class PptxScrollViewer implements ZoomableViewer {
     indexAt: (y) => this._slideIndexAtOffset(y),
     offset: (index) => this._slideOffset(index),
     height: () => this._uniformSlideHeight,
-    totalHeight: () => this._rangeAt(0, this._overscan()).totalHeight,
+    totalHeight: () => this._rangeAt(0, this._viewport.overscan()).totalHeight,
     recomputeHeights: () => this._recomputeHeights(),
     syncSpacerWidth: () => this._syncSpacerWidth(),
-    padLeft: () => this._padH().left,
+    padLeft: () => this._viewport.horizontalPadding().left,
     invalidateRender: () => { this._renderEpoch++; },
     preview: () => this._previewVisible(),
     scheduleSettle: () => this._scheduleSettle(),
@@ -220,7 +226,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     destroyed: () => this._destroyed,
     scale: () => this._scale,
     width: () => this._slideWidthPx(),
-    dpr: () => this._dpr(),
+    dpr: () => this._viewport.dpr(),
     slotIndex: (slot) => slot.renderedSlide,
     token: (slot) => slot.renderGeneration,
     nextToken: (slot) => ++slot.renderGeneration,
@@ -286,7 +292,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     slots: () => this._slots,
     epoch: () => this._renderEpoch,
     scale: () => this._scale,
-    dpr: () => this._dpr(),
+    dpr: () => this._viewport.dpr(),
     width: () => this._slideWidthPx(),
     height: () => this._slideHeightPx(),
     imageResources: () => this._opts.imageResources,
@@ -327,9 +333,9 @@ export class PptxScrollViewer implements ZoomableViewer {
     offset: (slide) => this._slideOffset(slide),
     height: () => this._uniformSlideHeight,
     indexAt: (y) => this._slideIndexAtOffset(y),
-    totalHeight: () => this._rangeAt(0, this._overscan()).totalHeight,
+    totalHeight: () => this._rangeAt(0, this._viewport.overscan()).totalHeight,
     width: () => this._slideWidthPx(),
-    padLeft: () => this._padH().left,
+    padLeft: () => this._viewport.horizontalPadding().left,
     marginOrigin: () => this._commentMargin.originPx,
     mount: () => this._mountVisible(),
   });
@@ -677,31 +683,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     return (this._pres!.slideHeight / EMU_PER_PX) * this._scale;
   }
 
-  /** The fit width (px), deferring when the container is unlaid-out. An EXPLICIT
-   *  `opts.width` is the slide's CSS-width contract and is returned UNCHANGED (the
-   *  gutters still apply around placement, not to the width). The container-derived
-   *  default instead targets `containerWidth − padL − padR` so a slide sits INSIDE
-   *  the horizontal gutters at 100%. A non-positive result (gutters wider than the
-   *  container) is treated as unlaid-out — the same deferral as a zero-width box. */
-  private _fitWidthPx(): number {
-    if (this._opts.width && this._opts.width > 0) return this._opts.width;
-    // Fit to the real scrollport, not its outer container: a non-overlay vertical
-    // scrollbar reduces scrollHost.clientWidth but leaves container.clientWidth
-    // unchanged. The container is only a fallback for synthetic / not-yet-laid-
-    // out hosts where the absolutely positioned scrollport still reports zero.
-    const cw = this._scrollHost.clientWidth || this._container.clientWidth;
-    if (cw <= 0) return 0; // 0 ⇒ defer (design §11 zero-width deferral)
-    const { left, right } = this._padH();
-    const available = cw - left - right;
-    if (available <= 0) return 0;
-    // Fit the authored slide itself. Review cards are an adjacent horizontal
-    // surface and may extend the horizontal scroll range, but must never change
-    // slide scale or vertical scroll geometry when progressive metadata reveals
-    // a later comment.
-    return available;
-  }
-
-
   private _commentsEnabled(): boolean {
     return this._opts.comments === true || typeof this._opts.comments === 'object';
   }
@@ -747,7 +728,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  PT_TO_PX)`). Returns 0 when the container has no width yet (deferral). */
   private _baseScale(): number {
     if (!this._pres || this._pres.slideCount === 0) return 0;
-    const w = this._fitWidthPx();
+    const w = this._viewport.fitWidth();
     const naturalW = this._pres.slideWidth / EMU_PER_PX;
     if (w <= 0 || naturalW <= 0) return 0;
     return w / naturalW; // dimensionless multiplier over the natural width
@@ -787,40 +768,13 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._uniformSlideHeight = this._slideHeightPx();
   }
 
-  private _gap(): number {
-    return this._opts.gap ?? 16;
-  }
-
-  private _overscan(): number {
-    return this._opts.overscan ?? 1;
-  }
-
   /** Media lifecycle window, deliberately independent from text/canvas overscan. */
   private _mediaOverscan(): number {
     return this._opts.mediaOverscan ?? 1;
   }
 
-  /** Desk padding fed to `computeVisibleRange`: `paddingTop`/`paddingBottom`,
-   *  each defaulting to `gap` (uniform rhythm). Resolved here (not stored) to
-   *  mirror `_gap()`/`_overscan()`, and consumed at EVERY `computeVisibleRange`
-   *  call site so the padded offsets are the single source of geometry. */
-  private _pad(): { leading: number; trailing: number } {
-    const gap = this._gap();
-    return { leading: this._opts.paddingTop ?? gap, trailing: this._opts.paddingBottom ?? gap };
-  }
-
-  /** Horizontal desk gutters: `paddingLeft`/`paddingRight`, each defaulting to
-   *  `gap` (uniform rhythm — the horizontal gutters match the vertical padding).
-   *  Consumed by `_fitWidthPx` (to shrink the container-derived fit), by
-   *  `_positionSlot` (the flush-left floor), and by `_syncSpacerWidth` (the spacer
-   *  width). Resolved here (not stored) to mirror `_gap()`/`_pad()`. */
-  private _padH(): { left: number; right: number } {
-    const gap = this._gap();
-    return { left: this._opts.paddingLeft ?? gap, right: this._opts.paddingRight ?? gap };
-  }
-
   private _slideOffset(index: number): number {
-    return this._pad().leading + index * (this._uniformSlideHeight + this._gap());
+    return this._viewport.verticalPadding().leading + index * (this._uniformSlideHeight + this._viewport.gap());
   }
 
   /** Index of the slide spanning content-offset `y`, preserving the historical
@@ -829,11 +783,11 @@ export class PptxScrollViewer implements ZoomableViewer {
     return computeUniformVisibleWindow(
       this._pres?.slideCount ?? 0,
       this._uniformSlideHeight,
-      this._gap(),
+      this._viewport.gap(),
       y,
       0,
       0,
-      this._pad(),
+      this._viewport.verticalPadding(),
     ).topIndex;
   }
 
@@ -841,16 +795,16 @@ export class PptxScrollViewer implements ZoomableViewer {
     return computeUniformVisibleWindow(
       this._pres?.slideCount ?? 0,
       this._uniformSlideHeight,
-      this._gap(),
+      this._viewport.gap(),
       scrollTop,
       this._scrollHost.clientHeight,
       overscan,
-      this._pad(),
+      this._viewport.verticalPadding(),
     );
   }
 
   private _range(): VisibleWindow {
-    return this._rangeAt(this._scrollHost.scrollTop, this._overscan());
+    return this._rangeAt(this._scrollHost.scrollTop, this._viewport.overscan());
   }
 
   private _mediaRange(): VisibleWindow {
@@ -871,7 +825,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  and after every scale change (zoom / resize re-fit) so the extent tracks the
    *  current slide px width. */
   private _syncSpacerWidth(): void {
-    const { left, right } = this._padH();
+    const { left, right } = this._viewport.horizontalPadding();
     this._commentMargin.syncSpacerWidth(this._slideWidthPx(), left, right);
   }
 
@@ -983,12 +937,7 @@ export class PptxScrollViewer implements ZoomableViewer {
   private _positionSlot(slot: SlideSlot, i: number, _r: VisibleWindow): void {
     slot.wrapper.dataset.slideIndex = String(i);
     this._layers.position(i, slot, this._slideOffset(i), this._slideWidthPx(), this._slideHeightPx(),
-      this._scrollHost.clientWidth, this._padH().left);
-  }
-
-  /** Device-pixel ratio for a render (opts override → window → 1). */
-  private _dpr(): number {
-    return this._opts.dpr ?? (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+      this._scrollHost.clientWidth, this._viewport.horizontalPadding().left);
   }
 
   /**
@@ -1038,7 +987,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     slot.loadingLayer.style.display =
       i >= this.availableSlideCount && !this.layoutComplete ? 'flex' : 'none';
 
-    const dpr = this._dpr();
+    const dpr = this._viewport.dpr();
     const widthPx = this._slideWidthPx();
     const epoch = this._renderEpoch;
     const scale = this._scale;
@@ -1263,7 +1212,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    */
   private _settleSlot(i: number, slot: SlideSlot): void {
     if (!this._pres) return;
-    const dpr = this._dpr();
+    const dpr = this._viewport.dpr();
     const widthPx = this._slideWidthPx();
     const scale = this._scale;
     const epoch = this._renderEpoch;
