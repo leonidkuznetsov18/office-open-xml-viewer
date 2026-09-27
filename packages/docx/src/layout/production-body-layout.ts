@@ -1,21 +1,49 @@
 import type { CjkLang } from '@silurus/ooxml-core';
-import type { BodyElement, DocParagraph, DocTable, DocTableCell, DocRun, ImageRun, ChartRun, ShapeRun, SectionProps } from '../types';
+import type {
+  BodyElement,
+  DocParagraph,
+  DocTableCell,
+  ImageRun,
+  ChartRun,
+  ShapeRun,
+  SectionProps,
+} from '../types';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
-import { type FloatRect, FLOAT_OVERLAP_EPS, isWrapFloat } from '../float-layout.js';
+import { type FloatRect, isWrapFloat } from '../float-layout.js';
 import { type FrameBox, computeFrameBox, frameXContainer, pushFloatRect, registerFrameFloat } from '../frame-geometry.js';
 import { resolveFloatingTableBoxPt } from '../float-table-geometry.js';
 import { xContainer, yContainer, resolveAnchorX, resolveAnchorY } from '../anchor-geometry.js';
 import { resolveParagraphLayoutContext, resolveSectionLayoutContext, type DocumentLayoutSettings, type SectionLayoutContext } from '../layout-context.js';
-import type { BlockLayoutAlgorithms, BodyFlowRegistryDeltaPt, BodyFlowRegistrySnapshotPt, DeepReadonly, DrawingMLCollisionRegistrySnapshotPt, LayoutServices, FloatRegistryEntryPt, FloatRegistrySnapshotPt, FloatingTablePlacementLayout, DrawingMLCollisionEntryPt, NoteLayout, ParagraphLayout, SourceRef, StoryBlockInput, StoryLayout, TableLayout, TableLayoutInput } from './types.js';
-import { beginFloatingTablePlacementTransaction, floatingTableRegistryDelta, resolveFloatingTablePlacementInTransaction, validateFloatingTableRegistryDelta } from './floating-table-transaction.js';
-import { floatRegistryParticipant, resolveBlockFlowAdmission, resolvePageAnchoredTableDeferral } from './floats.js';
-import { ExactConvergenceError, convergeExactState } from './convergence.js';
-import { LayoutInvariantError } from './diagnostics.js';
+import type {
+  BlockLayoutAlgorithms,
+  DeepReadonly,
+  DrawingMLCollisionRegistrySnapshotPt,
+  LayoutServices,
+  FloatRegistryEntryPt,
+  FloatRegistrySnapshotPt,
+  DrawingMLCollisionEntryPt,
+  NoteLayout,
+  ParagraphLayout,
+  SourceRef,
+  StoryBlockInput,
+  StoryLayout,
+  TableLayout,
+  TableLayoutInput,
+} from './types.js';
+import {
+  floatingTableRegistryDelta,
+  validateFloatingTableRegistryDelta,
+} from './floating-table-transaction.js';
 import type { LayoutOptions } from './options.js';
 import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
 import { attachStoryBlockLayoutAlgorithms, layoutStory as layoutSharedStory } from './stories.js';
 import { buildNoteNumberMap, footnoteIdsInRetainedLines, footnoteIdsInRetainedSlice, indexNotes, noteReferenceIdsInDocumentOrder } from './note-reference-ownership.js';
-import type { BodyAcquisitionLocation, BodyLayoutKernel, BodyLayoutSession, PageAnchorPrescanInput, BodyParagraphAcquisitionInput, BodyTableAcquisitionInput } from './body-layout-kernel.js';
+import type {
+  BodyAcquisitionLocation,
+  BodyLayoutKernel,
+  BodyLayoutSession,
+  BodyParagraphAcquisitionInput,
+} from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
 import { FlowCapacityExceededError } from './flow.js';
 import { projectBodyOccurrence } from './occurrence-projection.js';
@@ -37,10 +65,13 @@ import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from
 import { buildFont, fontClassesWithPitches, getDefaultFontSize, paragraphMarkLineHeight } from '../line-layout.js';
 import type { DocGridCtx } from '../line-layout.js';
 import { measureParagraph } from '../paragraph-measure.js';
-import { acquireRetainedTable, retainedTableAcquisitionIsReusableAcrossPages, type RetainedTableAcquisition } from './table-acquisition.js';
+import {
+  acquireRetainedTable,
+  retainedTableAcquisitionIsReusableAcrossPages,
+} from './table-acquisition.js';
 import { combineAdjacentTableLayoutInputs } from './adjacent-table-layout-input.js';
 import { layoutTable as layoutRetainedTableInput } from './table.js';
-import { startTableFragmentCursor, takeTableFragment, type PageDependentTableBlockRequest } from './table-pagination.js';
+import { type PageDependentTableBlockRequest } from './table-pagination.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import { bottomBorderExtentPt, resolveParagraphBorderEdges, topBorderExtentPt, type ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import { acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
@@ -50,7 +81,6 @@ import type { AnchorFloatRegistrationState, BodyAcquisitionState, BodyMeasuremen
 import { ownedParagraphAnchorCollisions, inheritedParagraphAuthorityForReacquisition, TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX } from './paragraph-wrap-registry.js';
 import { acquireRegisteredParagraph } from './registered-paragraph-acquisition.js';
 import { paragraphAnchorCollisions, paragraphWrapExclusions } from './paragraph-float-authority.js';
-import { bodyRootFloatingTablePlacementKey } from './source-key.js';
 import { applyDrawingMLCollisionRegistryDelta, createDrawingMLCollisionRegistry, drawingMLCollisionRegistryDelta, validateDrawingMLCollisionRegistryDelta } from './drawingml-collision-registry.js';
 import { resolveAnchorFrame } from './anchor-frame.js';
 import { isPageLevelWrapFloat } from './anchor-classification.js';
@@ -63,7 +93,7 @@ import type {
   LayoutStoryBlock,
   LayoutTableBlock,
 } from './layout-source-store.js';
-import type { ParagraphChartRun, ParagraphImageRun, ParagraphLayoutSource, ParagraphShapeRun } from './text.js';
+import type { ParagraphLayoutSource } from './text.js';
 import type { TableLayoutSource } from './table-source-acquisition.js';
 import { collectBodyFrameGroups, prepareBodyFrameMetadata } from './frame.js';
 import {
