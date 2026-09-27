@@ -108,6 +108,15 @@ describe('pptx line feed inside a:t (controls L00–L08)', () => {
     expect(Math.max(...laid[1].segments.map((segment) => segment.sizePx))).toBe(40 * 12_700);
   });
 
+  it('does not size the next line by a run that ends at the line feed (L02)', () => {
+    // Office L02: 40 pt `Ab⏎` then 14 pt `Cd`; the second line is a 14 pt line.
+    const laid = layoutParagraph(measuringContext(), paragraph([
+      { ...run('Ab\n'), fontSize: 40 }, { ...run('Cd'), fontSize: 14 },
+    ], true), 1000, 20, '000000', 1, 0);
+    expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['Ab', 'Cd']);
+    expect(laid[1].segments.map((segment) => segment.sizePx)).toEqual([14 * 12_700]);
+  });
+
   it('sizes an empty line opened by a line feed by that run (L07, L08)', () => {
     const laid = layoutParagraph(measuringContext(), paragraph([{ ...run('Ab\n\nCd'), fontSize: 40 }], true),
       1000, 20, '000000', 1, 0);

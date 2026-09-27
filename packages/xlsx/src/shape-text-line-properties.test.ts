@@ -115,4 +115,23 @@ describe('xlsx shape text line properties (parity with the pre-shared renderer)'
     // Line 1 is empty at the 11pt default; 'ab' is centred in the 30pt line.
     expect(texts.find(([value]) => value === 'ab')![1]).toBeCloseTo(11 * PT * 1.2 + (30 * PT * 1.2) / 2, 5);
   });
+
+  it('sizes the line after a line feed by the runs that still have text on it (L00, L02)', () => {
+    // Excel controls L00 and L02 (issue #1562): the run containing the LF sizes
+    // the next line only when it has text after the LF.
+    const pitch = (runs: [string, number][]): number => {
+      const text: ShapeText = {
+        anchor: 't', wrap: 'square', lIns: 0, tIns: 0, rIns: 0, bIns: 0,
+        paragraphs: [{ align: 'l', runs: runs.map(([value, size]) =>
+          ({ type: 'text', text: value, bold: false, italic: false, size })) }],
+      } as ShapeText;
+      const { ctx, texts } = recordingContext();
+      drawShapeText(ctx, text, 300, 300, 1);
+      return texts[texts.length - 1][1] - texts[0][1];
+    };
+    // L02: a 40 pt run ending at the LF, then 14 pt text: the second line is 14 pt.
+    expect(pitch([['Ab\n', 40], ['Cd', 14]])).toBeCloseTo((40 * PT * 1.2) / 2 + (14 * PT * 1.2) / 2, 5);
+    // L00: text after the LF in the 40 pt run keeps the second line at 40 pt.
+    expect(pitch([['Ab\nCd', 40], ['Ef', 14]])).toBeCloseTo(40 * PT * 1.2, 5);
+  });
 });
