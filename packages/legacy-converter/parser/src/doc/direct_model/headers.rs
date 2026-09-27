@@ -122,6 +122,7 @@ impl<'a, 'h> Resolver<'a, 'h> {
             formatting,
             &mut numbering,
             pictures,
+            None,
             // Header anchors address the header document (PlcSpaHdr).
             Some((drawings, floating::Part::Header)),
             budget,

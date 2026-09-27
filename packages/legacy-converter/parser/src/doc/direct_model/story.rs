@@ -8,8 +8,8 @@ use super::{
     ModelBudget, ParaPiece,
 };
 use crate::doc::{
-    floating, formatting, numbering, pictures, table, table_context, table_style_condition,
-    unsupported, Paragraph, Story, Token,
+    floating, formatting, numbering, picture_bullets, pictures, table, table_context,
+    table_style_condition, unsupported, Paragraph, Story, Token,
 };
 use docx_model::paragraph_breaks::visit_para_on_page_breaks;
 use docx_model::{BodyElement, BreakType, DocRun, ImageRun};
@@ -25,6 +25,10 @@ pub(super) fn project(
     formatting: &mut formatting::Formatting<'_>,
     numbering: &mut numbering::direct::Store,
     pictures: &mut pictures::Store<'_>,
+    picture_bullet_source: Option<(
+        &Story<'_>,
+        &Result<Option<picture_bullets::Document>, String>,
+    )>,
     mut floating: Option<(&mut floating::Store<'_>, floating::Part)>,
     budget: &mut ModelBudget,
     body: &mut Vec<BodyElement>,
@@ -163,10 +167,69 @@ pub(super) fn project(
             _ if direct.frame_gap => formatting.unsupported_paragraph_properties = true,
             _ => {}
         }
+        let mut auto_picture_bullet = None;
         if let Some((reference, marker)) = direct.numbering {
-            paragraph.numbering = Some(Box::new(
-                formatting.direct_numbering(numbering, reference, &marker, &paragraph)?,
-            ));
+            let bullet = marker.direct_picture_bullet()?;
+            let mut info =
+                formatting.direct_numbering(numbering, reference, &marker, &paragraph)?;
+            if let Some((relative_cp, auto_size)) = bullet {
+                if !auto_size {
+                    // Word's measured fNoAutoSize control differs from the
+                    // automatically sized bullet, even when its saved VML
+                    // width and height agree. The fixed-size source rule is
+                    // not yet identified, so only the automatic form is
+                    // admitted.
+                    return Err(unsupported("fixed-size Word picture bullet"));
+                }
+                if info.format != "bullet" {
+                    return Err(unsupported(
+                        "Word picture bullet on a non-bullet list level",
+                    ));
+                }
+                let (main, source) = picture_bullet_source.ok_or_else(|| {
+                    unsupported("Word picture bullet outside supported main story")
+                })?;
+                let hidden = source
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .ok_or_else(|| unsupported("Word picture bullet bookmark is absent"))?;
+                let cp = hidden.cp(relative_cp)?;
+                let (_, fc, piece) = main
+                    .position(cp)
+                    .ok_or_else(|| unsupported("Word picture bullet outside main piece table"))?;
+                let picture_style = formatting.paragraph_style(fc)?;
+                let facts = formatting.direct_inline_picture_facts(
+                    picture_style,
+                    None,
+                    fc,
+                    piece.prm,
+                    &main.prcs,
+                )?;
+                let offset = facts.location.ok_or_else(|| {
+                    unsupported("Word picture bullet has no inline picture location")
+                })?;
+                let image = pictures
+                    .direct_inline(offset, &mut budget.remaining_bytes)?
+                    .ok_or_else(|| unsupported("Word picture bullet image is absent"))?;
+                if image.crop.is_some() || image.rotation != 0.0 || image.flip_h || image.flip_v {
+                    return Err(unsupported("transformed Word picture bullet"));
+                }
+                info.pic_bullet_image_path = Some(image.resource_key);
+                info.pic_bullet_mime_type = Some(image.mime_type.to_string());
+                if image.width_pt <= 0.0 || image.height_pt <= 0.0 {
+                    return Err(unsupported("Word picture bullet has no positive extent"));
+                }
+                // [MS-DOC] 2.9.176 fNoAutoSize=0 sizes the picture to the
+                // text following the bullet. Defer until the text runs have
+                // been resolved. Word's controlled 12-pt text uses a 12-pt
+                // square although its PICF extent is 9 pt; fNoAutoSize=1
+                // paints differently. Preserve the source aspect ratio.
+                auto_picture_bullet = Some((
+                    image.width_pt / image.height_pt,
+                    marker.direct_font_size_pt()?,
+                ));
+            }
+            paragraph.numbering = Some(Box::new(info));
         }
         budget.paragraph(&paragraph)?;
 
@@ -449,6 +512,26 @@ pub(super) fn project(
                     budget.push(&mut paragraph.runs, DocRun::Field(Box::new(run)))?;
                 }
             }
+        }
+
+        if let Some((aspect, marker_size)) = auto_picture_bullet {
+            let text_size = paragraph.runs.iter().find_map(|run| match run {
+                DocRun::Text(run) if !run.text.is_empty() => Some(run.font_size),
+                DocRun::Field(run) if !run.fallback_text.is_empty() => Some(run.font_size),
+                _ => None,
+            });
+            let target_height = text_size.unwrap_or(marker_size);
+            if !target_height.is_finite() || target_height <= 0.0 {
+                return Err(unsupported(
+                    "Word picture bullet text has no positive font size",
+                ));
+            }
+            let info = paragraph
+                .numbering
+                .as_mut()
+                .expect("picture bullet belongs to a numbered paragraph");
+            info.pic_bullet_width_pt = Some(aspect * target_height);
+            info.pic_bullet_height_pt = Some(target_height);
         }
 
         let mut blocks = Blocks::default();
@@ -898,6 +981,7 @@ fn textbox_content(
         formatting,
         &mut numbering,
         pictures,
+        None,
         None,
         budget,
         &mut body,
@@ -1656,6 +1740,7 @@ mod tests {
                 &mut facts.formatting,
                 &mut numbering,
                 &mut facts.pictures,
+                None,
                 Some((&mut facts.floating, floating::Part::Main)),
                 &mut budget,
                 &mut body,

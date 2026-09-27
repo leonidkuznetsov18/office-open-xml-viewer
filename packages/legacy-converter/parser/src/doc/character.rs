@@ -62,6 +62,11 @@ pub struct Properties {
     /// MS-DOC 2.6.1 insertion revision mark: sprmCFRMarkIns, sprmCIbstRMark
     /// and sprmCDttmRMark. All three survive sprmCPlain and sprmCIstd.
     insertion: InsertionMark,
+    /// [MS-DOC] 2.6.1: CP relative to the hidden `_PictureBullets` bookmark
+    /// and PbiGrfOperand on a list paragraph mark. These are resolved only
+    /// when the numbered paragraph is projected.
+    picture_bullet_cp: Option<u32>,
+    picture_bullet_flags: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -197,11 +202,28 @@ impl Default for Properties {
             symbol: None,
             field_vanish: None,
             insertion: InsertionMark::default(),
+            picture_bullet_cp: None,
+            picture_bullet_flags: None,
         }
     }
 }
 
 impl Properties {
+    /// The CP is relative to the Bullet Pictures document, not an FC in the
+    /// Data stream. A picture bullet without its companion CP is malformed.
+    pub(in crate::doc) fn direct_picture_bullet(&self) -> Result<Option<(usize, bool)>, String> {
+        let Some(flags) = self.picture_bullet_flags else {
+            return Ok(None);
+        };
+        if flags & 1 == 0 {
+            return Ok(None);
+        }
+        let cp = self
+            .picture_bullet_cp
+            .ok_or_else(|| unsupported("Word picture bullet lacks its position"))?;
+        Ok(Some((cp as usize, flags & 2 == 0)))
+    }
+
     /// A resolved style patch, without injecting the document's default size.
     /// Used when list-linked styles are layered onto a paragraph mark.
     pub fn sparse() -> Self {
@@ -220,6 +242,8 @@ impl Properties {
             symbol: None,
             field_vanish: None,
             insertion: InsertionMark::default(),
+            picture_bullet_cp: None,
+            picture_bullet_flags: None,
         }
     }
 
@@ -270,6 +294,12 @@ impl Properties {
         }
         if patch.symbol.is_some() {
             self.symbol = patch.symbol;
+        }
+        if patch.picture_bullet_cp.is_some() {
+            self.picture_bullet_cp = patch.picture_bullet_cp;
+        }
+        if patch.picture_bullet_flags.is_some() {
+            self.picture_bullet_flags = patch.picture_bullet_flags;
         }
         // Object/special flags are not visual run formatting and must not
         // turn numbering text into a picture or an executable object.
@@ -540,17 +570,19 @@ impl Properties {
                 if operand.len() != 4 || (u32_at(operand, 0)? as i32) < 0 {
                     return Err(unsupported("invalid Word picture bullet position"));
                 }
+                self.picture_bullet_cp = Some(u32_at(operand, 0)?);
                 return Ok(true);
             }
             0x4888 => {
                 // MS-DOC 2.9.176 PbiGrfOperand: fPicBullet (bit 0) states
                 // whether the bullet is a picture. A clear bit leaves the text
-                // bullet in place, so only an enabled picture bullet, whose
-                // image acquisition is not implemented, stays unsupported.
+                // bullet in place. Bit 1 controls automatic sizing; the
+                // remaining fourteen bits are undefined and ignored.
                 if operand.len() != 2 {
                     return Err(unsupported("invalid Word picture bullet flags"));
                 }
-                return Ok(operand[0] & 1 == 0);
+                self.picture_bullet_flags = Some(u16_at(operand, 0)?);
+                return Ok(true);
             }
             0x0811 => {
                 // MS-DOC 2.6.1 sprmCFWebHidden (ToggleOperand): text hidden
@@ -974,14 +1006,20 @@ mod tests {
     }
 
     #[test]
-    fn disabled_picture_bullets_have_no_effect_and_enabled_ones_stay_unsupported() {
+    fn picture_bullet_marker_keeps_relative_cp_and_sizing_flag() {
         let base = Properties::default();
         let mut value = base.clone();
         assert!(value.apply(0x6887, &[0, 0, 0, 0], &base).unwrap());
         assert!(value.apply(0x4888, &[0, 0], &base).unwrap());
         assert!(value.apply(0x4888, &[0xfe, 0xff], &base).unwrap());
-        assert_eq!(value, base);
-        assert!(!value.apply(0x4888, &[1, 0], &base).unwrap());
+        assert_eq!(value.direct_picture_bullet().unwrap(), None);
+        assert!(value.apply(0x4888, &[1, 0], &base).unwrap());
+        assert_eq!(value.direct_picture_bullet().unwrap(), Some((0, true)));
+        assert!(value.apply(0x4888, &[3, 0], &base).unwrap());
+        assert_eq!(value.direct_picture_bullet().unwrap(), Some((0, false)));
+        let mut missing_cp = base.clone();
+        missing_cp.apply(0x4888, &[1, 0], &base).unwrap();
+        assert!(missing_cp.direct_picture_bullet().is_err());
         assert!(base.clone().apply(0x6887, &[0, 0, 0, 0x80], &base).is_err());
         assert!(base.clone().apply(0x6887, &[0, 0, 0], &base).is_err());
         assert!(base.clone().apply(0x4888, &[0], &base).is_err());

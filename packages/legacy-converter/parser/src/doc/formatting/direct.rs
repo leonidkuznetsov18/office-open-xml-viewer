@@ -83,6 +83,11 @@ impl Formatting<'_> {
             Some(mark) => mark,
             None => self.run_properties_with_table(style, table_style, fc, prm, prcs)?,
         };
+        if resolved.numbering.is_none() && mark.direct_picture_bullet()?.is_some() {
+            return Err(super::super::unsupported(
+                "Word picture bullet on a paragraph without numbering",
+            ));
+        }
         let mut paragraph = resolved.properties.direct_paragraph();
         paragraph.outline_level = resolved.properties.direct_outline_level(style);
         // ECMA-376 17.3.1.9 compares paragraph styles; the DOCX renderer does
@@ -127,6 +132,11 @@ impl Formatting<'_> {
     ) -> Result<Option<TextRun>, String> {
         let properties =
             self.run_properties_with_table(paragraph_style, table_style, fc, prm, prcs)?;
+        if properties.direct_picture_bullet()?.is_some() {
+            return Err(super::super::unsupported(
+                "Word picture bullet property on text instead of a paragraph mark",
+            ));
+        }
         let Some(mut run) = properties.direct_text_run(text, &self.fonts)? else {
             return Ok(None);
         };

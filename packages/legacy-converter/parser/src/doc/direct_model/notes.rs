@@ -296,6 +296,7 @@ pub(super) fn project(
             &mut numbering,
             pictures,
             None,
+            None,
             budget,
             &mut content,
             None,

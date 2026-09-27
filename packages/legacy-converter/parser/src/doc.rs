@@ -24,6 +24,7 @@ mod notes;
 mod number_format;
 mod numbering;
 mod paragraph;
+mod picture_bullets;
 mod pictures;
 mod sections;
 mod settings;
@@ -68,6 +69,7 @@ struct AcquiredDoc<'a> {
     /// properties (MS-DOC 2.7.2).
     effective_nfib: u16,
     note_references: notes::References,
+    picture_bullets: Result<Option<picture_bullets::Document>, String>,
     pictures: pictures::Store<'a>,
     floating: floating::Store<'a>,
 }
@@ -168,6 +170,7 @@ fn with_acquired_doc<T>(
     let mut formatting = formatting::Formatting::read(&word, &table, &data)?;
     formatting.configure_table_styles(effective_nfib, true);
     let note_references = notes::References::read(&note_stories, &story, &mut formatting)?;
+    let picture_bullets = picture_bullets::read(&word, &table);
     let pictures = pictures::Store::new(&data);
     let floating = floating::Store::read_stories(&word, &table, clx, ccp_text)?;
     let main_fields = header_fields::Table::read_at(&word, &table, 0x11a, ccp_text);
@@ -186,6 +189,7 @@ fn with_acquired_doc<T>(
         note_fields,
         effective_nfib,
         note_references,
+        picture_bullets,
         pictures,
         floating,
     })
