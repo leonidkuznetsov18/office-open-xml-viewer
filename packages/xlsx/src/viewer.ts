@@ -10,7 +10,7 @@ import {
 import type { LoadOptions } from './workbook.js';
 import type { Cell, Row, ViewportRange, Worksheet, XlsxChromeColors, XlsxComment } from './types.js';
 import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
-import { nextVisibleIndex, resolveVisibleIndex, countVisible, zoomStepScale, anchoredZoomOffset, openExternalHyperlink, nextZoomStep, prevZoomStep, fitScale } from '@silurus/ooxml-core';
+import { nextVisibleIndex, resolveVisibleIndex, countVisible, anchoredZoomOffset, openExternalHyperlink, nextZoomStep, prevZoomStep, fitScale } from '@silurus/ooxml-core';
 import {
   CallerCanvasMount,
   resolveCanvasViewerMode,
@@ -19,14 +19,12 @@ import {
 import {
   HEADER_W,
   HEADER_H,
-  pxToColWidth,
-  pxToRowHeight,
   invalidateAutoRowHeights,
   invalidateSheetRenderCache,
   getGridGeometryForWorksheet,
   rtlMirrorX,
 } from './renderer.js';
-import { formatA1, parseA1 } from './a1.js';
+import { parseA1 } from './a1.js';
 import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
 import { viewportPreviewBlocker, type ViewportPreviewBlocker } from './internal/worksheet-preview-eligibility.js';
 import type {
@@ -48,7 +46,6 @@ import {
 import {
   MAX_SELECTION_CONTEXT_CELLS,
   MAX_SELECTION_CONTEXT_TEXT_CHARACTERS,
-  areaContainsCell,
   normalizeSelectionState,
   selectionCoordinateCountUpperBound,
   selectionStateFromReference,
@@ -66,6 +63,7 @@ import { ValidationPanel } from './internal/viewer/validation-panel.js';
 import { HyperlinkDispatcher } from './internal/viewer/hyperlink-dispatcher.js';
 import { FindAdapter } from './internal/viewer/find-adapter.js';
 import { CopyController } from './internal/viewer/copy-controller.js';
+import { SelectionInput } from './internal/viewer/selection-input.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -88,7 +86,6 @@ import {
 } from './internal/sheet-viewer-runtime.js';
 import { CanvasSurface, SheetOverlayHost } from './internal/sheet-surface.js';
 import { withXlsxRenderCommitGuard } from './render-orchestrator.js';
-import { selectionAutoScrollVelocity } from './selection-auto-scroll.js';
 import { worksheetContentBounds } from './internal/worksheet-content-bounds.js';
 import type { XlsxSheetLoadOptions } from './delimited-text.js';
 
@@ -399,11 +396,6 @@ function orderedBy<T>(items: readonly T[], key: (item: T) => number): readonly T
  *  option is supplied. */
 const DEFAULT_SELECTION_COLOR = '#1a73e8';
 
-/** Half-width (CSS px) of the grab zone around a header border for
- *  drag-to-resize (issue #567), and the minimum size a column/row can be
- *  dragged to (logical px) so a collapsed band keeps a grabbable border. */
-const RESIZE_GRAB_PX = 4;
-const RESIZE_MIN_PX = 5;
 const DEFAULT_SELECTION_CONTEXT_TEXT_CHARACTERS = 1 * 1_024 * 1_024;
 const DEFAULT_SELECTION_CONTEXT_NOTIFICATION_TEXT_CHARACTERS = 65_536;
 const MAX_SELECTION_CONTEXT_FIELD_CHARACTERS = 65_536;
@@ -419,35 +411,7 @@ function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
   return value.slice(0, end);
 }
 
-/**
- * Pure hit predicate for drag-to-resize (issue #567): given a pointer
- * coordinate `pt` (in the header-strip's CSS-px axis — already RTL-un-mirrored
- * by the caller) and the candidate band trailing edges `edges`, return the band
- * index whose edge is within `grabPx` of `pt`, or `null` if none qualifies.
- *
- * `edges` is the candidate list the caller builds — for the band the pointer is
- * over (`hit`) Excel lets you resize the band whose *trailing* border you grab,
- * so the caller passes both `hit - 1` and `hit` (the neighbour-to-the-far-side
- * and the band itself); the first edge within the grab zone wins, in the order
- * given. An edge that sits at or under the header strip (`edge <= headerExtent`,
- * i.e. scrolled behind the frozen corner) is rejected — you can't grab a border
- * hidden under the header. Kept pure (no DOM, no `this`) so the off-by-one
- * geometry — exact-on-edge, within-grab, just-outside, `[hit-1, hit]` neighbour
- * selection, header rejection — is unit-testable. {@link XlsxViewer.getResizeTarget}
- * does the DOM/geometry and calls this.
- */
-export function resizeHitIndex(
-  pt: number,
-  edges: { index: number; edge: number }[],
-  grabPx: number,
-  headerExtent: number,
-): number | null {
-  for (const { index, edge } of edges) {
-    if (edge <= headerExtent) continue; // scrolled behind the header strip
-    if (Math.abs(pt - edge) <= grabPx) return index;
-  }
-  return null;
-}
+export { resizeHitIndex } from './internal/viewer/selection-input.js';
 
 /**
  * Derive the selection rectangle's `border` and `background` CSS from a single
@@ -640,32 +604,12 @@ class XlsxViewerEngine implements ZoomableViewer {
    *  engine prevents a programmatic scroll followed by the browser's native
    *  scroll event from producing duplicate notifications. */
   private _lastViewportNotification: XlsxViewportOffset | null = null;
-  private get anchorCell(): CellAddress | null {
-    return this.selectionController.anchor;
-  }
-
   private get activeCell(): CellAddress | null {
     return this.selectionController.active;
   }
 
   private get selectionMode(): SheetSelectionMode {
     return this.selectionController.mode;
-  }
-
-  private get isSelecting(): boolean {
-    return this.selectionController.dragging;
-  }
-
-  private get selectionPointerId(): number | null {
-    return this.selectionController.draggingPointerId;
-  }
-
-  /** Claim drag-selection ownership and discard deferred gestures from any
-   * other pointer that began before this drag. */
-  private beginSelectionDrag(pointerId: number): void {
-    if (this.pendingTap?.pointerId !== pointerId) this.pendingTap = null;
-    if (this.pendingClick?.pointerId !== pointerId) this.pendingClick = null;
-    this.selectionController.beginDrag(pointerId);
   }
 
   /** Gesture-only pointer anchor for the NEXT `setScale`, in canvasArea-viewport
@@ -704,37 +648,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     workbook: () => this.wb,
     clipboard: () => this.hostWindow.navigator.clipboard,
   });
-  private keydownHandler: ((e: KeyboardEvent) => void) | null = null;
-  // Deferred selection press: committed on pointerup only if the pointer
-  // neither moved beyond the tap threshold nor caused a scroll. Used for
-  // touch/pen (swipe-to-scroll must not change the cell) and for mouse
-  // presses inside the overlay-scrollbar band (a thumb drag must not select
-  // the cell underneath).
-  private pendingTap:
-    | { x: number; y: number; shiftKey: boolean; additiveKey: boolean; pointerId: number }
-    | null = null;
-  // IX1 — mouse press bookkeeping for hyperlink activation: the down position and
-  // the cell under it. On pointerup, if the pointer did not move beyond the tap
-  // slop (a genuine click, not a drag-select), a hyperlink on that cell is
-  // dispatched. Touch/pen activate through the pendingTap path instead.
-  private pendingClick: { x: number; y: number; pointerId: number; cell: CellAddress } | null = null;
-  private pendingElementClick:
-    | { x: number; y: number; pointerId: number; context: XlsxElementContext }
-    | null = null;
-  // In-flight column/row resize drag (issue #567). `originScaled` is the fixed
-  // LTR edge the resized band grows from (left edge for a column, top for a row)
-  // in canvasArea CSS px; `mdw` is captured once so the live px→model-unit
-  // conversion is stable across the drag. A resize is a *view-only* adjustment:
-  // it mutates the in-memory worksheet's colWidths/rowHeights, never the file.
-  private resizeDrag:
-    | { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number; pointerId: number }
-    | null = null;
-  /** Last captured drag-selection pointer, retained while edge scrolling runs. */
-  private selectionAutoScrollPointer:
-    | { clientX: number; clientY: number; pointerId: number }
-    | null = null;
-  private selectionAutoScrollFrame: number | null = null;
-  private selectionAutoScrollLastTime: number | null = null;
+  /** Viewport pointer/wheel/focus/keyboard input: selection, auto-scroll,
+   *  drag-to-resize and the activation gestures. */
+  private selectionInput!: SelectionInput;
 
   /** Excel-style hover note for the displayed sheet's comments. */
   private readonly comments: CommentPopup;
@@ -909,8 +825,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       // Any scroll cancels a deferred tap: the press that started it was a
       // scrollbar-thumb drag (overlay scrollbars) or a touch swipe, not a
       // cell click.
-      this.pendingTap = null;
-      this.pendingElementClick = null;
+      this.selectionInput.cancelDeferredPress();
       // A comment popup is anchored to a cell's on-screen rect, which moves
       // under the cursor while scrolling — hide it (Excel does the same).
       this.hideCommentPopup();
@@ -962,7 +877,54 @@ class XlsxViewerEngine implements ZoomableViewer {
     resizeObserver.observe(this.gridRegion);
     this.resizeObserver = resizeObserver;
 
-    this.setupSelectionEvents();
+    this.selectionInput = new SelectionInput({
+      surface: this.surface,
+      scrollHost: this.scrollHost,
+      canvasArea: this.canvasArea,
+      hostWindow: this.hostWindow,
+      nativeScrollbars: this._nativeScrollbars,
+      selection: this.selectionController,
+      comments: this.comments,
+      hyperlinks: this.hyperlinks,
+      validation: this.validation,
+      options: () => this.opts,
+      worksheet: () => this.currentWorksheet,
+      hasWorkbook: () => this.wb !== null,
+      scale: () => this.viewport.scale,
+      isRtl: () => this.isRtl,
+      isDestroyed: () => this._destroyed,
+      cellAt: (clientX, clientY) => this.getCellAt(clientX, clientY),
+      cellRect: (row, col) => this._cellRect(row, col),
+      screenX: (x, w) => this.screenX(x, w),
+      scrollLeft: () => this.effectiveScrollLeft,
+      scrollTop: () => this.viewportTop,
+      setScrollLeft: (value) => this.setViewportLeft(value),
+      setScrollTop: (value) => { this.viewportTop = value; },
+      scrollCellIntoView: (row, col) => this._scrollCellIntoView(row, col),
+      zoomAt: (anchor, scale) => {
+        this._pendingZoomAnchor = anchor;
+        this.setScale(scale);
+      },
+      elementContextAt: (clientX, clientY) => this.elementContextAt(clientX, clientY),
+      setElementContext: (context) => this.setElementContext(context),
+      selectionState: () => this.selectionState,
+      setSelection: (ref) => this.setSelection(ref),
+      getSelectionContext: () => this.getSelectionContext(),
+      copySelection: () => this.copySelection(),
+      updateSelectionOverlay: () => this.updateSelectionOverlay(),
+      updateFindOverlay: () => this.updateFindOverlay(),
+      scheduleRender: () => this.scheduleRender(),
+      renderCurrentSheet: () => this.renderCurrentSheet(),
+      emitSelectionChange: () => this.emitSelectionChange(),
+      emitViewportChange: () => this.emitViewportChange(),
+      hideCommentPopup: () => this.hideCommentPopup(),
+      hideValidationPanel: () => this.hideValidationPanel(),
+      recordSizeOverride: (axis, index) => this.recordSizeOverride(axis, index),
+      updateSpacerSize: (ws) => this.updateSpacerSize(ws),
+      refitAutoRowsAfterColumnResize: () => this.refitAutoRowsAfterColumnResize(),
+      reportError: (error) => this._reportRenderError(error),
+    });
+    this.selectionInput.install();
 
     this.finder = new FindAdapter({
       ownerDocument: this.hostDocument,
@@ -1346,7 +1308,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     }
     this.sourceCommentMap = createCommentMap(this.currentSourceComments);
     this.setElementContext(null);
-    this.pendingElementClick = null;
+    this.selectionInput.clearPendingElementClick();
     this.updateFooterDirection();
     this.viewportTop = 0;
     this.selectionController.reset();
@@ -2156,148 +2118,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.selectionNotificationCount = 0;
   }
 
-  /**
-   * Returns what the header area contains at the given client coordinates.
-   * Returns null when the point is in the cell grid (not a header).
-   */
-  private getHeaderHit(
-    clientX: number,
-    clientY: number,
-  ): { kind: 'corner' } | { kind: 'row'; row: number } | { kind: 'col'; col: number } | null {
-    const ws = this.currentWorksheet;
-    if (!ws) return null;
-    const cs = this.viewport.scale;
-    const rect = this.canvasArea.getBoundingClientRect();
-    // Same RTL un-mirror as getCellAt: map the screen x back to the logical-LTR
-    // layout (row header on the left) before the header math below.
-    const lx = this.screenX(clientX - rect.left, 0);
-    const ly = clientY - rect.top;
-
-    const headerW = Math.round(HEADER_W * cs);
-    const headerH = Math.round(HEADER_H * cs);
-    const inRowHeader = lx < headerW;
-    const inColHeader = ly < headerH;
-    if (!inRowHeader && !inColHeader) return null;
-    if (inRowHeader && inColHeader) return { kind: 'corner' };
-
-    const geometry = getGridGeometryForWorksheet(ws);
-
-    if (inRowHeader) {
-      // Determine which row was clicked
-      const innerY = ly - headerH;
-      if (innerY < 0) return { kind: 'corner' };
-      const r = geometry.rowAt(innerY, this.viewportTop, cs);
-      return r === null ? null : { kind: 'row', row: r };
-    }
-
-    // inColHeader
-    const innerX = lx - headerW;
-    if (innerX < 0) return { kind: 'corner' };
-    const c = geometry.colAt(innerX, this.effectiveScrollLeft, cs);
-    return c === null ? null : { kind: 'col', col: c };
-  }
-
-  /**
-   * If the pointer sits on a column/row-header border (within {@link
-   * RESIZE_GRAB_PX}), return the resize target: which index to resize and the
-   * fixed LTR edge it grows from (in canvasArea CSS px). Excel resizes the band
-   * whose *trailing* border you grab — the column to the left of a vertical
-   * border, the row above a horizontal one — so both that band and its
-   * neighbour-to-the-far-side are checked. Geometry comes straight from {@link
-   * getCellRect}, so the grab line always coincides with the drawn border at any
-   * scroll offset / zoom / RTL. Returns null off the header borders.
-   */
-  private getResizeTarget(
-    clientX: number,
-    clientY: number,
-  ): { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number } | null {
-    const ws = this.currentWorksheet;
-    if (!ws) return null;
-    const cs = this.viewport.scale;
-    const rect = this.canvasArea.getBoundingClientRect();
-    // Un-mirror the screen x to the logical-LTR space getCellRect draws in (the
-    // same transform getHeaderHit uses), so the comparison holds for RTL sheets.
-    const ptX = this.screenX(clientX - rect.left, 0);
-    const ptY = clientY - rect.top;
-    const headerW = Math.round(HEADER_W * cs);
-    const headerH = Math.round(HEADER_H * cs);
-    const mdw = getGridGeometryForWorksheet(ws).maximumDigitWidth;
-
-    // Column borders live in the column-header strip, right of the corner.
-    if (ptY <= headerH && ptX > headerW) {
-      const hit = this.getHeaderHit(clientX, clientY);
-      if (hit?.kind !== 'col') return null;
-      const origins = new Map<number, number>(); // index -> fixed LTR origin edge
-      const edges: { index: number; edge: number }[] = [];
-      for (const c of [hit.col - 1, hit.col]) {
-        if (c < 1) continue;
-        const r = this._cellRect(1, c); // x is independent of the row
-        if (!r) continue;
-        origins.set(c, r.x);
-        edges.push({ index: c, edge: r.x + r.w }); // trailing (right) border
-      }
-      const index = resizeHitIndex(ptX, edges, RESIZE_GRAB_PX, headerW);
-      if (index === null) return null;
-      return { kind: 'col', index, originScaled: origins.get(index) as number, mdw };
-    }
-
-    // Row borders live in the row-header strip, below the corner.
-    if (ptX <= headerW && ptY > headerH) {
-      const hit = this.getHeaderHit(clientX, clientY);
-      if (hit?.kind !== 'row') return null;
-      const origins = new Map<number, number>(); // index -> fixed LTR origin edge
-      const edges: { index: number; edge: number }[] = [];
-      for (const rIdx of [hit.row - 1, hit.row]) {
-        if (rIdx < 1) continue;
-        const r = this._cellRect(rIdx, 1); // y is independent of the column
-        if (!r) continue;
-        origins.set(rIdx, r.y);
-        edges.push({ index: rIdx, edge: r.y + r.h }); // trailing (bottom) border
-      }
-      const index = resizeHitIndex(ptY, edges, RESIZE_GRAB_PX, headerH);
-      if (index === null) return null;
-      return { kind: 'row', index, originScaled: origins.get(index) as number, mdw };
-    }
-
-    return null;
-  }
-
-  /**
-   * Apply a live resize drag: size the band from its fixed origin edge to the
-   * current pointer, clamp to {@link RESIZE_MIN_PX}, and write the result back
-   * into the in-memory worksheet model in its native unit (Excel column widths /
-   * points). This is a *view-only* mutation — the file is never written. The
-   * memoized axis cache for this sheet is invalidated so every geometry read
-   * (spacer, hit-test, overlay, renderer) sees the new size on the next frame.
-   */
-  private applyResize(clientX: number, clientY: number): void {
-    const drag = this.resizeDrag;
-    const ws = this.currentWorksheet;
-    if (!drag || !ws) return;
-    const cs = this.viewport.scale;
-    const rect = this.canvasArea.getBoundingClientRect();
-
-    if (drag.kind === 'col') {
-      const ptX = this.screenX(clientX - rect.left, 0);
-      const sizePx = Math.max(RESIZE_MIN_PX, Math.round((ptX - drag.originScaled) / cs));
-      ws.colWidths[drag.index] = pxToColWidth(sizePx, drag.mdw);
-      this.recordSizeOverride('col', drag.index);
-    } else {
-      const ptY = clientY - rect.top;
-      const sizePx = Math.max(RESIZE_MIN_PX, Math.round((ptY - drag.originScaled) / cs));
-      ws.rowHeights[drag.index] = pxToRowHeight(sizePx);
-      this.recordSizeOverride('row', drag.index);
-    }
-
-    GridGeometry.invalidate(ws); // sizes changed → rebuild the cumulative-offset axes
-    this.updateSpacerSize(ws);
-    this.updateSelectionOverlay();
-    // Live resize drag fires per pointermove; coalesce the canvas repaint into
-    // one frame. The spacer (scrollbar extent) and overlay updates are cheap DOM
-    // writes that must track the drag immediately, so they stay synchronous.
-    this.scheduleRender();
-  }
-
   /** Refit automatic rows once after a column-resize gesture. Doing this on
    * every pointermove would turn a drag into O(sheet cells × pointer events),
    * while Excel's observable result only needs to be committed at release. */
@@ -2731,664 +2551,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.comments.hide();
   }
 
-  private applyPointerSelection(
-    clientX: number,
-    clientY: number,
-    shiftKey: boolean,
-    additiveKey: boolean,
-    pointerId: number,
-    allowDrag: boolean,
-  ): void {
-    const headerHit = this.getHeaderHit(clientX, clientY);
-
-    if (headerHit) {
-      if (headerHit.kind === 'corner') {
-        // Select all — no drag extension needed
-        this.selectionController.select({ row: 1, col: 1 }, 'all');
-        this.selectionController.endDrag();
-      } else if (headerHit.kind === 'row') {
-        if (shiftKey && this.anchorCell && this.selectionMode === 'rows') {
-          this.selectionController.extend({ row: headerHit.row, col: 1 });
-        } else {
-          const selected = additiveKey
-            ? this.selectionController.add({ row: headerHit.row, col: 1 }, 'rows')
-            : (this.selectionController.select({ row: headerHit.row, col: 1 }, 'rows'), true);
-          if (allowDrag && selected) {
-            this.beginSelectionDrag(pointerId);
-            this.scrollHost.setPointerCapture(pointerId);
-          }
-        }
-      } else {
-        if (shiftKey && this.anchorCell && this.selectionMode === 'cols') {
-          this.selectionController.extend({ row: 1, col: headerHit.col });
-        } else {
-          const selected = additiveKey
-            ? this.selectionController.add({ row: 1, col: headerHit.col }, 'cols')
-            : (this.selectionController.select({ row: 1, col: headerHit.col }, 'cols'), true);
-          if (allowDrag && selected) {
-            this.beginSelectionDrag(pointerId);
-            this.scrollHost.setPointerCapture(pointerId);
-          }
-        }
-      }
-      this.updateSelectionOverlay();
-      void this.renderCurrentSheet().catch((error) => this._reportRenderError(error));
-      this.emitSelectionChange();
-      return;
-    }
-
-    const cell = this.getCellAt(clientX, clientY);
-    if (!cell) return;
-
-    let selected = true;
-    if (shiftKey && this.anchorCell && this.selectionMode === 'cells') {
-      this.selectionController.extend(cell);
-    } else {
-      selected = additiveKey
-        ? this.selectionController.add(cell, 'cells')
-        : (this.selectionController.select(cell, 'cells'), true);
-    }
-    if (allowDrag && selected) {
-      this.beginSelectionDrag(pointerId);
-      this.scrollHost.setPointerCapture(pointerId);
-    }
-    this.updateSelectionOverlay();
-    if (this.wb) {
-      this.renderCurrentSheet().catch((error) => this._reportRenderError(error));
-    }
-    this.emitSelectionChange();
-  }
-
-  /** Browser-visible input box, excluding classic native scrollbar gutters. */
-  private viewportInputBounds(): { left: number; top: number; width: number; height: number } {
-    const rect = this.canvasArea.getBoundingClientRect();
-    const left = rect.left + this.scrollHost.clientLeft;
-    const top = rect.top + this.scrollHost.clientTop;
-    const availableWidth = Math.max(0, rect.width - this.scrollHost.clientLeft);
-    const availableHeight = Math.max(0, rect.height - this.scrollHost.clientTop);
-    return {
-      left,
-      top,
-      width: Math.min(availableWidth, this.scrollHost.clientWidth || availableWidth),
-      height: Math.min(availableHeight, this.scrollHost.clientHeight || availableHeight),
-    };
-  }
-
-  /** Extend the active drag selection to the pointer's cell. Captured pointers
-   * outside the canvas and auto-scroll ticks clamp to the visible data edge so
-   * selection never jumps ahead of the viewport. */
-  private extendDragSelection(
-    clientX: number,
-    clientY: number,
-    clampToViewport: boolean,
-  ): boolean {
-    let pointerX = clientX;
-    let pointerY = clientY;
-    const bounds = this.viewportInputBounds();
-    const outsideViewport = clientX < bounds.left || clientX >= bounds.left + bounds.width ||
-      clientY < bounds.top || clientY >= bounds.top + bounds.height;
-    if (clampToViewport || outsideViewport) {
-      const cs = this.viewport.scale;
-      const headerW = Math.round(HEADER_W * cs);
-      const headerH = Math.round(HEADER_H * cs);
-      const dataLeft = bounds.left + (this.isRtl ? 0 : headerW);
-      const dataRight = bounds.left + bounds.width - (this.isRtl ? headerW : 0);
-      pointerX = Math.min(dataRight - 1, Math.max(dataLeft + 1, pointerX));
-      pointerY = Math.min(
-        bounds.top + bounds.height - 1,
-        Math.max(bounds.top + headerH + 1, pointerY),
-      );
-    }
-
-    if (this.selectionMode === 'rows') {
-      const hit = clampToViewport ? null : this.getHeaderHit(pointerX, pointerY);
-      const row = hit?.kind === 'row'
-        ? hit.row
-        : this.getCellAt(pointerX, pointerY)?.row;
-      if (!row || row === this.activeCell?.row) return false;
-      this.selectionController.extend({ row, col: 1 });
-      return true;
-    }
-
-    if (this.selectionMode === 'cols') {
-      const hit = clampToViewport ? null : this.getHeaderHit(pointerX, pointerY);
-      const col = hit?.kind === 'col'
-        ? hit.col
-        : this.getCellAt(pointerX, pointerY)?.col;
-      if (!col || col === this.activeCell?.col) return false;
-      this.selectionController.extend({ row: 1, col });
-      return true;
-    }
-
-    const cell = this.getCellAt(pointerX, pointerY);
-    if (!cell || (cell.row === this.activeCell?.row && cell.col === this.activeCell?.col)) {
-      return false;
-    }
-    this.selectionController.extend(cell);
-    return true;
-  }
-
-  private selectionAutoScrollSpeed(): { x: number; y: number } {
-    const pointer = this.selectionAutoScrollPointer;
-    if (!pointer) return { x: 0, y: 0 };
-    const bounds = this.viewportInputBounds();
-    return selectionAutoScrollVelocity(
-      { x: pointer.clientX - bounds.left, y: pointer.clientY - bounds.top },
-      { width: bounds.width, height: bounds.height },
-      this.isRtl,
-      this.selectionMode,
-    );
-  }
-
-  private trackSelectionAutoScroll(e: PointerEvent): void {
-    if (e.pointerId !== this.selectionPointerId) return;
-    this.selectionAutoScrollPointer = {
-      clientX: e.clientX,
-      clientY: e.clientY,
-      pointerId: e.pointerId,
-    };
-    const speed = this.selectionAutoScrollSpeed();
-    if (speed.x === 0 && speed.y === 0) {
-      this.stopSelectionAutoScroll();
-      return;
-    }
-    if (this.selectionAutoScrollFrame !== null) return;
-    this.selectionAutoScrollLastTime = null;
-    this.selectionAutoScrollFrame = this.hostWindow.requestAnimationFrame(
-      (time) => this.runSelectionAutoScroll(time),
-    );
-  }
-
-  private runSelectionAutoScroll(time: number): void {
-    this.selectionAutoScrollFrame = null;
-    const pointer = this.selectionAutoScrollPointer;
-    if (
-      !pointer ||
-      pointer.pointerId !== this.selectionPointerId ||
-      !this.isSelecting ||
-      this._destroyed
-    ) {
-      this.stopSelectionAutoScroll();
-      return;
-    }
-
-    const speed = this.selectionAutoScrollSpeed();
-    if (speed.x === 0 && speed.y === 0) {
-      this.stopSelectionAutoScroll();
-      return;
-    }
-
-    const previousTime = this.selectionAutoScrollLastTime;
-    const elapsedSeconds = previousTime === null
-      ? 1 / 60
-      : Math.min(0.05, Math.max(0, time - previousTime) / 1000);
-    this.selectionAutoScrollLastTime = time;
-
-    const beforeX = this.effectiveScrollLeft;
-    const beforeY = this.viewportTop;
-    this.setViewportLeft(beforeX + speed.x * elapsedSeconds);
-    this.viewportTop = beforeY + speed.y * elapsedSeconds;
-    const moved = this.effectiveScrollLeft !== beforeX || this.viewportTop !== beforeY;
-    const extended = moved && this.extendDragSelection(pointer.clientX, pointer.clientY, true);
-
-    if (moved) {
-      this.updateSelectionOverlay();
-      this.updateFindOverlay();
-      this.scheduleRender();
-      this.emitViewportChange();
-      if (extended) this.emitSelectionChange();
-    }
-
-    if (!moved) {
-      this.stopSelectionAutoScroll();
-      return;
-    }
-    this.selectionAutoScrollFrame = this.hostWindow.requestAnimationFrame(
-      (nextTime) => this.runSelectionAutoScroll(nextTime),
-    );
-  }
-
-  private stopSelectionAutoScroll(): void {
-    if (this.selectionAutoScrollFrame !== null) {
-      this.hostWindow.cancelAnimationFrame(this.selectionAutoScrollFrame);
-      this.selectionAutoScrollFrame = null;
-    }
-    this.selectionAutoScrollPointer = null;
-    this.selectionAutoScrollLastTime = null;
-  }
-
-  private contextMenuTargetIsSelected(clientX: number, clientY: number): boolean {
-    const selection = this.selectionState;
-    if (!selection) return false;
-    const header = this.getHeaderHit(clientX, clientY);
-    if (header?.kind === 'corner') {
-      return selection.areas.some((area) => area.kind === 'sheet');
-    }
-    if (header?.kind === 'row') {
-      return selection.areas.some((area) => area.kind === 'sheet' ||
-        (area.kind === 'rows' && header.row >= area.firstRow && header.row <= area.lastRow));
-    }
-    if (header?.kind === 'col') {
-      return selection.areas.some((area) => area.kind === 'sheet' ||
-        (area.kind === 'columns' &&
-          header.col >= area.firstColumn && header.col <= area.lastColumn));
-    }
-    const cell = this.getCellAt(clientX, clientY);
-    return cell !== null && selection.areas.some((area) => areaContainsCell(area, cell));
-  }
-
-  private resolveContextMenuContext(event: MouseEvent): Promise<XlsxSelectionContext | null> {
-    if (this._destroyed) return Promise.resolve(null);
-    const element = this.elementContextAt(event.clientX, event.clientY);
-    if (element) {
-      this.setElementContext(element);
-    } else {
-      this.setElementContext(null);
-      if (!this.contextMenuTargetIsSelected(event.clientX, event.clientY)) {
-        this.applyPointerSelection(event.clientX, event.clientY, false, false, -1, false);
-      }
-    }
-    const context = this.getSelectionContext();
-    return Promise.resolve(context ? structuredClone(context) : null);
-  }
-
-  private setupSelectionEvents(): void {
-    // Distance (CSS px) beyond which a touch/pen pointerdown→pointerup is treated as a swipe (scroll), not a tap.
-    const TAP_SLOP = 8;
-
-    if (this.opts.onContextMenu) {
-      this.surface.on('contextmenu', (event: MouseEvent) => {
-        let context: Promise<XlsxSelectionContext | null> | undefined;
-        this.opts.onContextMenu?.({
-          originalEvent: event,
-          getContext: () => context ??= this.resolveContextMenuContext(event),
-        });
-      });
-    }
-
-    this.surface.on('pointerdown', (e: PointerEvent) => {
-      this.scrollHost.focus?.({ preventScroll: true });
-      if (e.button !== 0) return;
-      if (this.isSelecting && e.pointerId !== this.selectionPointerId) return;
-
-      // Drag-to-resize a column/row from its header border (issue #567). Checked
-      // before selection so grabbing the border never moves the cell selection.
-      // Gated by the `resizable` option (default true); when off, a header-border
-      // press falls through to normal selection behavior.
-      const resize = (this.opts.resizable ?? true)
-        ? this.getResizeTarget(e.clientX, e.clientY)
-        : null;
-      if (resize) {
-        e.preventDefault();
-        this.resizeDrag = { ...resize, pointerId: e.pointerId };
-        this.scrollHost.setPointerCapture(e.pointerId);
-        this.hideCommentPopup();
-        return;
-      }
-
-      // List-validation dropdown arrow: if the press lands on the (display-only)
-      // arrow button drawn on the active cell, toggle the value panel instead of
-      // re-selecting the cell. The arrow's rect is in canvasArea space, so map
-      // the client point through canvasArea's box.
-      if (this.validation.hitsArrow(e.clientX, e.clientY)) {
-        e.preventDefault();
-        this.validation.toggle();
-        return;
-      }
-
-      // A pointerdown on the native scrollbar must not move the cell
-      // selection — dragging the thumb would otherwise select whatever cell
-      // sits underneath it. Two scrollbar styles need different handling:
-      // classic scrollbars reserve layout space, so the press lands in the
-      // band between the content box (clientWidth/Height) and the border-box
-      // edge and can be rejected exactly; OS overlay scrollbars (macOS
-      // "show when scrolling") float over the content without affecting
-      // client sizes, so a press near a scrollable edge is geometrically
-      // indistinguishable from a cell click. For that case we defer the
-      // selection to pointerup via the pendingTap path and cancel it when a
-      // scroll event arrives first (the press was a thumb drag). A plain
-      // click in the band still selects the cell on release.
-      const hostRect = this.scrollHost.getBoundingClientRect();
-      const localX = e.clientX - hostRect.left - this.scrollHost.clientLeft;
-      const localY = e.clientY - hostRect.top - this.scrollHost.clientTop;
-      if (localX >= this.scrollHost.clientWidth || localY >= this.scrollHost.clientHeight) {
-        return; // classic scrollbar gutter
-      }
-      // Overlay scrollbar hit band (~15 CSS px on macOS / Windows 11).
-      const OVERLAY_SCROLLBAR_BAND = 16;
-      const inOverlayBand = this._nativeScrollbars && (
-        (this.scrollHost.scrollWidth > this.scrollHost.clientWidth &&
-          this.scrollHost.clientHeight - localY <= OVERLAY_SCROLLBAR_BAND) ||
-        (this.scrollHost.scrollHeight > this.scrollHost.clientHeight &&
-          this.scrollHost.clientWidth - localX <= OVERLAY_SCROLLBAR_BAND));
-
-      const elementContext = this.elementContextAt(e.clientX, e.clientY);
-      if (elementContext) {
-        this.pendingTap = null;
-        this.pendingClick = null;
-        this.pendingElementClick = {
-          x: e.clientX,
-          y: e.clientY,
-          pointerId: e.pointerId,
-          context: elementContext,
-        };
-        return;
-      }
-      // A cell/header/empty-space press leaves object focus and returns the
-      // authoritative context to the existing cell-selection state.
-      this.setElementContext(null);
-
-      // Touch / pen: defer selection until pointerup so swipe-to-scroll doesn't change the cell.
-      // Mouse: select immediately to preserve drag-to-extend behavior.
-      if (e.pointerType !== 'mouse' || inOverlayBand) {
-        this.pendingTap = {
-          x: e.clientX,
-          y: e.clientY,
-          shiftKey: e.shiftKey,
-          additiveKey: e.ctrlKey || e.metaKey,
-          pointerId: e.pointerId,
-        };
-        return;
-      }
-
-      // IX1 — remember the cell under a mouse press so a click (no drag) can
-      // activate its hyperlink on release. Recorded before selection so a
-      // shift-click extend still tracks the destination cell.
-      const downCell = this.getCellAt(e.clientX, e.clientY);
-      this.pendingClick = downCell
-        ? { x: e.clientX, y: e.clientY, pointerId: e.pointerId, cell: downCell }
-        : null;
-
-      this.applyPointerSelection(
-        e.clientX,
-        e.clientY,
-        e.shiftKey,
-        e.ctrlKey || e.metaKey,
-        e.pointerId,
-        true,
-      );
-    });
-
-    this.surface.on('pointermove', (e: PointerEvent) => {
-      // Live column/row resize takes priority over every other pointer behavior.
-      if (this.resizeDrag && this.resizeDrag.pointerId === e.pointerId) {
-        e.preventDefault();
-        this.applyResize(e.clientX, e.clientY);
-        return;
-      }
-
-      // Resize-handle affordance: show the col/row-resize cursor when hovering a
-      // header border (mouse only — touch/pen have no hover). Skipped mid-select
-      // and when the `resizable` option (default true) is off, so no resize
-      // cursor is shown when drag-resize is disabled.
-      if (e.pointerType === 'mouse' && !this.isSelecting && (this.opts.resizable ?? true)) {
-        const rt = this.getResizeTarget(e.clientX, e.clientY);
-        this.scrollHost.style.cursor = rt ? (rt.kind === 'col' ? 'col-resize' : 'row-resize') : '';
-        if (rt) {
-          this.hideCommentPopup();
-          return;
-        }
-      }
-
-      // Cancel a pending tap once the pointer moves beyond the slop — the user is scrolling.
-      if (this.pendingTap && this.pendingTap.pointerId === e.pointerId) {
-        const dx = e.clientX - this.pendingTap.x;
-        const dy = e.clientY - this.pendingTap.y;
-        if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) {
-          this.pendingTap = null;
-        }
-      }
-
-      // IX1 — a mouse press that turns into a drag (beyond the slop) is a
-      // selection, not a hyperlink click: drop the pending activation.
-      if (this.pendingClick && this.pendingClick.pointerId === e.pointerId) {
-        const dx = e.clientX - this.pendingClick.x;
-        const dy = e.clientY - this.pendingClick.y;
-        if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) {
-          this.pendingClick = null;
-        }
-      }
-      if (this.pendingElementClick?.pointerId === e.pointerId) {
-        const dx = e.clientX - this.pendingElementClick.x;
-        const dy = e.clientY - this.pendingElementClick.y;
-        if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) this.pendingElementClick = null;
-      }
-
-      // Comment hover popup (mouse only — touch/pen have no hover, so they get
-      // the popup on selection instead, below). Suppressed while drag-selecting
-      // so the popup doesn't fight the selection rect. A header hover hides it.
-      if (e.pointerType === 'mouse' && !this.isSelecting) {
-        const hovered = this.getCellAt(e.clientX, e.clientY);
-        if (hovered) this.comments.scheduleForCell(hovered);
-        else this.hideCommentPopup();
-        // IX1 — pointer cursor over a hyperlinked cell. Reached only when the
-        // pointer is NOT over a resize border (that path returns above), so the
-        // resize cursor is never clobbered. Otherwise clear back to default.
-        this.scrollHost.style.cursor =
-          hovered && this.hyperlinks.at(hovered) ? 'pointer' : '';
-      }
-
-      if (!this.isSelecting || e.pointerId !== this.selectionPointerId) return;
-
-      this.trackSelectionAutoScroll(e);
-      if (!this.extendDragSelection(e.clientX, e.clientY, false)) return;
-
-      this.updateSelectionOverlay();
-      // Drag-select fires per pointermove; coalesce the canvas repaint (the
-      // header-highlight bands the renderer draws) into one frame. The overlay
-      // rect and the selection-change callback stay synchronous.
-      this.scheduleRender();
-      this.emitSelectionChange();
-    });
-
-    this.surface.on('pointerup', (e: PointerEvent) => {
-      if (this.resizeDrag && this.resizeDrag.pointerId === e.pointerId) {
-        if (this.resizeDrag.kind === 'col') this.refitAutoRowsAfterColumnResize();
-        this.scrollHost.releasePointerCapture(e.pointerId);
-        this.resizeDrag = null;
-        return;
-      }
-      if (this.pendingElementClick?.pointerId === e.pointerId) {
-        const pending = this.pendingElementClick;
-        this.pendingElementClick = null;
-        const dx = e.clientX - pending.x;
-        const dy = e.clientY - pending.y;
-        const current = dx * dx + dy * dy <= TAP_SLOP * TAP_SLOP
-          ? this.elementContextAt(e.clientX, e.clientY)
-          : null;
-        if (
-          current &&
-          current.sheetIndex === pending.context.sheetIndex &&
-          current.elementType === pending.context.elementType &&
-          current.elementIndex === pending.context.elementIndex &&
-          current.shapeIndex === pending.context.shapeIndex
-        ) this.setElementContext(current);
-        return;
-      }
-      if (this.pendingTap && this.pendingTap.pointerId === e.pointerId) {
-        const dx = e.clientX - this.pendingTap.x;
-        const dy = e.clientY - this.pendingTap.y;
-        if (dx * dx + dy * dy <= TAP_SLOP * TAP_SLOP) {
-          this.applyPointerSelection(
-            e.clientX,
-            e.clientY,
-            this.pendingTap.shiftKey,
-            this.pendingTap.additiveKey,
-            e.pointerId,
-            false,
-          );
-          // Touch / pen have no hover, so surface the comment popup on a tap
-          // (the active cell after the selection commit). Mouse uses hover.
-          if (e.pointerType !== 'mouse' && this.activeCell) {
-            const comment = this.comments.commentAt(this.activeCell);
-            if (comment) {
-              this.hideCommentPopup();
-              void this.comments.show(this.activeCell, comment)
-                .catch((error) => this._reportRenderError(error));
-            } else {
-              this.hideCommentPopup();
-            }
-          }
-          // IX1 — a touch/pen tap on a hyperlinked cell activates it.
-          if (this.activeCell) this.hyperlinks.dispatch(this.activeCell);
-        }
-        this.pendingTap = null;
-      }
-      const endsSelectionDrag = e.pointerId === this.selectionPointerId;
-      if (endsSelectionDrag) this.stopSelectionAutoScroll();
-      // IX1 — a mouse click (press+release without a drag) on a hyperlinked cell
-      // activates it. The release must still land on the same cell the press did.
-      if (this.pendingClick && this.pendingClick.pointerId === e.pointerId) {
-        const dx = e.clientX - this.pendingClick.x;
-        const dy = e.clientY - this.pendingClick.y;
-        const upCell = this.getCellAt(e.clientX, e.clientY);
-        if (
-          dx * dx + dy * dy <= TAP_SLOP * TAP_SLOP &&
-          upCell &&
-          upCell.row === this.pendingClick.cell.row &&
-          upCell.col === this.pendingClick.cell.col
-        ) {
-          this.hyperlinks.dispatch(this.pendingClick.cell);
-        }
-        this.pendingClick = null;
-      }
-      if (endsSelectionDrag) this.selectionController.endDrag(e.pointerId);
-    });
-
-    this.surface.on('pointercancel', (e: PointerEvent) => {
-      if (this.resizeDrag && this.resizeDrag.pointerId === e.pointerId) {
-        if (this.resizeDrag.kind === 'col') this.refitAutoRowsAfterColumnResize();
-        this.resizeDrag = null;
-      }
-      if (this.pendingTap && this.pendingTap.pointerId === e.pointerId) {
-        this.pendingTap = null;
-      }
-      if (this.pendingClick && this.pendingClick.pointerId === e.pointerId) {
-        this.pendingClick = null;
-      }
-      if (this.pendingElementClick?.pointerId === e.pointerId) {
-        this.pendingElementClick = null;
-      }
-      if (e.pointerId === this.selectionPointerId) {
-        this.stopSelectionAutoScroll();
-        this.selectionController.endDrag(e.pointerId);
-      }
-    });
-
-    // Ctrl/⌘ + mouse wheel (and trackpad pinch, which the browser reports as a
-    // ctrl-wheel) zooms the grid, matching Excel. preventDefault stops the
-    // browser's own page zoom. A plain wheel still scrolls the grid natively.
-    // The step is exponential in mode-normalized wheel distance (see
-    // zoomStepScale), so a trackpad pinch — a high-frequency stream of
-    // small-deltaY events — does not zoom away; the total zoom tracks the gesture
-    // distance, not the event count, while a mouse wheel remains a gentle 10%.
-    this.surface.on(
-      'wheel',
-      (e: WheelEvent) => {
-        if (!(e.ctrlKey || e.metaKey)) {
-          if (!this._nativeScrollbars) {
-            e.preventDefault();
-            const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE
-              ? 16
-              : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
-                ? Math.max(1, this.scrollHost.clientHeight)
-                : 1;
-            const horizontal = (e.shiftKey ? e.deltaY : e.deltaX) * unit;
-            const vertical = (e.shiftKey ? 0 : e.deltaY) * unit;
-            this.setViewportLeft(this.effectiveScrollLeft + horizontal);
-            this.viewportTop += vertical;
-            this.scheduleRender();
-            this.updateSelectionOverlay();
-            this.updateFindOverlay();
-            this.emitViewportChange();
-          }
-          return;
-        }
-        e.preventDefault();
-        if (e.deltaY === 0) return;
-        // Pointer-anchored zoom: pivot on the cursor, not the top-left corner.
-        // Record the pointer relative to the grid's top-left (canvasArea rect,
-        // which the scrollHost overlays with inset:0) so `setScale` keeps the
-        // cell under the cursor fixed. `scrollHost` and `canvasArea` share a rect.
-        // A malformed event (no clientX/Y) yields a non-finite anchor; drop it so
-        // `setScale` falls back to the historical START-anchored preservation.
-        const { x: ax, y: ay } = this.surface.localPoint(e.clientX, e.clientY);
-        this._pendingZoomAnchor =
-          Number.isFinite(ax) && Number.isFinite(ay) ? { x: ax, y: ay } : null;
-        this.setScale(zoomStepScale(this.viewport.scale, e.deltaY, e.deltaMode));
-      },
-      { passive: false },
-    );
-
-    this.surface.on('pointerleave', (event: PointerEvent) => {
-      const next = event.relatedTarget as Node | null;
-      if (next && this.comments.contains(next)) return;
-      this.hideCommentPopup();
-    });
-
-    // A canvas-backed sheet has no native focused cell. Establish the ordinary
-    // A1 selection when its viewport receives keyboard focus, then reuse the
-    // public selection contract for Arrow-key movement below.
-    this.surface.on('focus', () => {
-      if (this.currentWorksheet && !this.activeCell) this.setSelection('A1');
-    });
-
-    this.keydownHandler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
-        if (e.defaultPrevented || e.isComposing) return;
-        const target = e.target as HTMLElement | null;
-        const tag = target?.tagName;
-        if (target?.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-        e.preventDefault();
-        void this.copySelection();
-      } else if (
-        !e.defaultPrevented && !e.isComposing &&
-        !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey &&
-        (e.key === 'ArrowUp' || e.key === 'ArrowDown' ||
-          e.key === 'ArrowLeft' || e.key === 'ArrowRight')
-      ) {
-        const current = this.activeCell;
-        const rowDelta = e.key === 'ArrowUp' ? -1 : e.key === 'ArrowDown' ? 1 : 0;
-        const colDelta = e.key === 'ArrowLeft'
-          ? (this.isRtl ? 1 : -1)
-          : e.key === 'ArrowRight'
-            ? (this.isRtl ? -1 : 1)
-            : 0;
-        const next = current ? {
-          row: Math.max(1, Math.min(MAX_WORKSHEET_ROW, current.row + rowDelta)),
-          col: Math.max(1, Math.min(MAX_WORKSHEET_COL, current.col + colDelta)),
-        } : { row: 1, col: 1 };
-        e.preventDefault();
-        this.hideCommentPopup();
-        const ref = formatA1(next.row, next.col);
-        this.setSelection(ref);
-        // Selection already schedules the paint. Reuse the ordinary viewport
-        // geometry without starting a second immediate render for every key.
-        this._scrollCellIntoView(next.row, next.col);
-        this.updateSelectionOverlay();
-        this.updateFindOverlay();
-        this.emitViewportChange();
-      } else if (e.key === 'Escape' && this.validation.isOpen()) {
-        this.hideValidationPanel();
-      } else if (e.key === 'Escape' && this.comments.isOpen()) {
-        this.hideCommentPopup();
-      } else if (
-        e.key === 'Enter' && this.activeCell &&
-        !e.defaultPrevented && !e.isComposing &&
-        !e.ctrlKey && !e.metaKey && !e.altKey
-      ) {
-        const comment = this.comments.commentAt(this.activeCell);
-        if (comment) {
-          e.preventDefault();
-          this.hideCommentPopup();
-          void this.comments.show(this.activeCell, comment)
-            .catch((error) => this._reportRenderError(error));
-        }
-      }
-    };
-    this.surface.on('keydown', this.keydownHandler);
-  }
-
   private buildTabs(): void {
     if (!this.sheetTabs) return;
     this.sheetTabs.build(this.workbook.sheetNames, this.workbook.tabColors);
@@ -3771,7 +2933,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       this.selectionContextNotificationFrame = null;
     }
     this.selectionContextNotificationMicrotask = false;
-    this.stopSelectionAutoScroll();
+    this.selectionInput.destroy();
     this.sheetRequestGeneration++;
     this.resizeObserver?.disconnect();
     this.chromeStyleObserver?.disconnect();
@@ -3807,7 +2969,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.preparedWorkbook = null;
     this.outlineGutter.destroy();
     this.elementContext = null;
-    this.pendingElementClick = null;
     this.selectionController.reset();
     this.lastNotifiedSelectionState = null;
     this.finishSelectionNotificationChain();

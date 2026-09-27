@@ -85,9 +85,11 @@ interface ViewerPriv {
     applyGroupToggle(group: OutlineLayout['groups'][number], axis: 'row' | 'col'): void;
   };
   scrollOutlineSummaryToStart(axis: 'row' | 'col', summary: number): void;
-  resizeDrag: { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number } | null;
+  selectionInput: {
+    resizeDrag: { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number } | null;
+    applyResize(clientX: number, clientY: number): void;
+  };
   buildOutline(ws: Worksheet): void;
-  applyResize(clientX: number, clientY: number): void;
   renderCurrentSheet(): Promise<void>;
 }
 
@@ -194,8 +196,8 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
 describe('worker-mode drag-to-resize reaches the grid bitmap (#567 hole)', () => {
   it('a column resize sends the new width as a col override', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    priv.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
-    priv.applyResize(100, 0); // drag column B's right border to x=100
+    priv.selectionInput.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
+    priv.selectionInput.applyResize(100, 0); // drag column B's right border to x=100
 
     const o = lastOverrides(renderViewportToBitmap);
     const newWidth = priv.currentWorksheet.colWidths[2];
@@ -209,8 +211,8 @@ describe('worker-mode drag-to-resize reaches the grid bitmap (#567 hole)', () =>
 
   it('a row resize sends the new height as a row override', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    priv.resizeDrag = { kind: 'row', index: 9, originScaled: 0, mdw: 7 };
-    priv.applyResize(0, 60);
+    priv.selectionInput.resizeDrag = { kind: 'row', index: 9, originScaled: 0, mdw: 7 };
+    priv.selectionInput.applyResize(0, 60);
 
     const o = lastOverrides(renderViewportToBitmap);
     const newHeight = priv.currentWorksheet.rowHeights[9];

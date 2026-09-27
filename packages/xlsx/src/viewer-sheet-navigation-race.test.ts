@@ -372,8 +372,12 @@ describe('XlsxViewer sheet acquisition generation', () => {
     requests[1].resolve(worksheet('B'));
     await engine.showSheet(0);
     engine.scheduleRender = vi.fn();
-    engine.resizeDrag = { kind: 'row', index: 1, originScaled: 0, mdw: 7 };
-    (engine.applyResize as (x: number, y: number) => void)(0, 120);
+    const input = engine.selectionInput as {
+      resizeDrag: unknown;
+      applyResize(x: number, y: number): void;
+    };
+    input.resizeDrag = { kind: 'row', index: 1, originScaled: 0, mdw: 7 };
+    input.applyResize(0, 120);
     const resized = (engine.currentWorksheet as Worksheet).rowHeights[1];
     expect(resized).toBeGreaterThan(20);
 
@@ -391,8 +395,12 @@ describe('XlsxViewer sheet acquisition generation', () => {
     requests[1].resolve(worksheet('B'));
     await engine.showSheet(0);
     engine.scheduleRender = vi.fn();
-    engine.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
-    (engine.applyResize as (x: number, y: number) => void)(120, 0);
+    const input = engine.selectionInput as {
+      resizeDrag: unknown;
+      applyResize(x: number, y: number): void;
+    };
+    input.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
+    input.applyResize(120, 0);
     const resized = (engine.currentWorksheet as Worksheet).colWidths[2];
     expect(resized).toBeGreaterThan(0);
 
