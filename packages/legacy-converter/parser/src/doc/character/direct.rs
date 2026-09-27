@@ -38,6 +38,7 @@ impl Properties {
         let languages = self.resolved_languages()?;
         let lang_east_asia = languages.east_asia.map(str::to_ascii_lowercase);
         let lang_bidi = languages.bidi.map(str::to_ascii_lowercase);
+        let lang_val = languages.default.map(str::to_ascii_lowercase);
         if self.bool_value("vanish").unwrap_or(false) {
             return Ok(None);
         }
@@ -110,6 +111,7 @@ impl Properties {
             bold_cs: self.bool_value("bCs"),
             italic_cs: self.bool_value("iCs"),
             lang_bidi: lang_bidi.clone(),
+            lang_val,
             lang_east_asia: lang_east_asia.clone(),
             char_spacing,
             char_scale,
@@ -204,6 +206,7 @@ impl Properties {
         let languages = self.resolved_languages()?;
         let lang_east_asia = languages.east_asia.map(str::to_ascii_lowercase);
         let lang_bidi = languages.bidi.map(str::to_ascii_lowercase);
+        let lang_val = languages.default.map(str::to_ascii_lowercase);
         Ok(RunFontFacts {
             font_family: axes[0].clone().or_else(|| axes[1].clone()),
             font_family_high_ansi: axes[2].clone(),
@@ -220,6 +223,7 @@ impl Properties {
             bold_cs: self.bool_value("bCs"),
             italic_cs: self.bool_value("iCs"),
             lang_bidi,
+            lang_val,
             lang_east_asia,
             kerning: self.half_points("kern")?,
         })

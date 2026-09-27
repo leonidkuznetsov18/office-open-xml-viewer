@@ -129,6 +129,7 @@ pub(super) fn text_run(run: &TextRun) -> Result<usize, String> {
         &run.emphasis_mark,
         &run.font_family_cs,
         &run.lang_bidi,
+        &run.lang_val,
         &run.lang_east_asia,
         &run.fit_text_id,
         &run.east_asian_combine_brackets,
@@ -168,6 +169,7 @@ pub(super) fn field_run(run: &docx_model::FieldRun) -> Result<usize, String> {
         &run.font_hint,
         &run.font_family_cs,
         &run.lang_bidi,
+        &run.lang_val,
         &run.lang_east_asia,
         &run.background,
         &run.vert_align,
@@ -405,6 +407,7 @@ impl Total {
             &facts.font_hint,
             &facts.font_family_cs,
             &facts.lang_bidi,
+            &facts.lang_val,
             &facts.lang_east_asia,
         ] {
             self.option_string(value)?;

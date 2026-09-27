@@ -56,6 +56,8 @@ pub(super) fn build(
         .as_ref()
         .map(|settings| DocumentSettings {
             default_tab_stop: Some(f64::from(settings.default_tab_twips) / 20.0),
+            auto_hyphenation: Some(settings.auto_hyphenation),
+            hyphenation_zone: Some(f64::from(settings.hyphenation_zone_twips) / 20.0),
             // Current Word emits w:useFELayout when saving binary DOC as DOCX.
             // Word-save controls with Dop2000 fDontAdjustLineHeightInTable
             // both set and cleared retain useFELayout, while only the latter

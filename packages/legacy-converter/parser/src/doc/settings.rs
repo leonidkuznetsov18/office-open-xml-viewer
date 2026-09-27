@@ -5,6 +5,9 @@ use super::{u16_at, u32_at, unsupported};
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Properties {
     pub default_tab_twips: u16,
+    /// MS-DOC 2.7.2 DopBase.fAutoHyphen / dxaHotZ, ECMA-376 §17.15.1.10/.53.
+    pub auto_hyphenation: bool,
+    pub hyphenation_zone_twips: u16,
     pub even_and_odd_headers: bool,
     pub notes: NoteProperties,
     /// ECMA-376 Part 1 17.15.3.1 adjustLineHeightInTable, the inverse of
@@ -121,6 +124,10 @@ pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, Stri
     // DopBase second flag word (offset 4): h = fRMView (bit 27), i = fRMPrint
     // (bit 28), counting from the least significant bit as for fpc above.
     let flags = u32_at(dop, 4)?;
+    // DopBase bit S is bit 12 in the second flag word; bit R (11) governs
+    // capitalized words independently. dxaHotZ follows cpgWebOpt at byte 14.
+    let auto_hyphenation = flags & (1 << 12) != 0;
+    let hyphenation_zone_twips = u16_at(dop, 14)?;
     let revision_markup = RevisionMarkup {
         on_screen: flags & (1 << 27) != 0,
         in_print: flags & (1 << 28) != 0,
@@ -130,6 +137,8 @@ pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, Stri
     Ok(Some(Properties {
         revision_markup,
         default_tab_twips: interval,
+        auto_hyphenation,
+        hyphenation_zone_twips,
         even_and_odd_headers: dop[0] & 1 != 0,
         notes,
         adjust_line_height_in_table,
@@ -187,6 +196,24 @@ mod tests {
                 (on_screen, in_print),
                 "{flags:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn dopbase_hyphenation_switch_and_zone_are_independent_of_neighbor_flags() {
+        for (flags, expected) in [
+            (0, false),
+            (1 << 11, false),
+            (1 << 12, true),
+            (1 << 13, false),
+            ((1 << 11) | (1 << 12), true),
+        ] {
+            let (word, mut table) = fixture(84, 720);
+            table[7 + 4..7 + 8].copy_from_slice(&(flags as u32).to_le_bytes());
+            table[7 + 14..7 + 16].copy_from_slice(&432u16.to_le_bytes());
+            let settings = read(&word, &table).unwrap().unwrap();
+            assert_eq!(settings.auto_hyphenation, expected);
+            assert_eq!(settings.hyphenation_zone_twips, 432);
         }
     }
 

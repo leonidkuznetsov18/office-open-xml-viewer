@@ -3353,8 +3353,6 @@ export function buildSegments(
         complexScript: cs,
         fontHint: r.fontHint,
         eastAsiaLanguage: r.langEastAsia,
-        hyphenationLanguage: environment.autoHyphenation === true ? r.langVal : undefined,
-        hyphenationZonePt: environment.hyphenationZonePt,
         kerning: effectiveKerningThreshold != null
           && (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
         measure: false,
@@ -3681,6 +3679,8 @@ export function buildSegments(
         charSpacing: effectiveCharacterSpacing,
         punctuationCompressions,
         eastAsiaLanguage: r.langEastAsia,
+        hyphenationLanguage: environment.autoHyphenation === true ? r.langVal : undefined,
+        hyphenationZonePt: environment.hyphenationZonePt,
         overflowPunctuationEastAsianRun,
         overflowPunctuationBidiLanguage: r.langBidi,
         charScale: effectiveCharacterScale,
