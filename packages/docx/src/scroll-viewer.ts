@@ -38,6 +38,7 @@ import {
   type DocxLayoutViewPublication,
 } from './document-layout-view.js';
 import type { DocxTextRunInfo } from './renderer';
+import type { DocxScrollSlot as PageSlot } from './scroll-slot';
 import { buildDocxTextLayer } from './text-layer';
 import { DocxFindController, type DocxMatchLocation } from './find';
 import { buildDocxHighlightLayer } from './find-highlight-layer';
@@ -75,33 +76,6 @@ function loadDocxCommentUiRuntime(): Promise<DocxCommentUiRuntime> {
 type InternalDocxScrollViewerOptions = DocxScrollViewerOptions & {
   [borrowedDocumentOption]?: DocxDocument;
 };
-
-/** One mounted page. `canvas` is the drawn page; `textLayer` the optional
- *  per-page selection overlay (both render modes — IX6 ships the worker's run
- *  geometry back beside the bitmap). `renderedPage` guards against
- *  re-rendering a recycled slot for a page whose render is still in flight. */
-interface PageSlot {
-  wrapper: HTMLDivElement;
-  canvas: HTMLCanvasElement;
-  textLayer: HTMLDivElement | null;
-  highlightLayer: HTMLDivElement;
-  elementLayer: HTMLDivElement | null;
-  commentTintLayer: HTMLDivElement | null;
-  commentMargin: HTMLDivElement | null;
-  commentDecorationLayer: HTMLDivElement | null;
-  commentRuns: readonly Readonly<DocxTextRunInfo>[];
-  commentGeometry: ReadOnlyCommentMarginGeometry | null;
-  /** page index this slot is currently rendering / has rendered, or -1 when free. */
-  renderedPage: number;
-  /** The `_scale` at which this slot's on-screen canvas bitmap (and text overlay)
-   *  were last rendered, or -1 when unrendered. The flicker-free CSS preview
-   *  (design §7) stretches that bitmap to the new layout size on `setScale` and
-   *  scales the text overlay by `newScale / renderedScale`; the debounced settle
-   *  re-render then repaints at the new scale and updates this to match. */
-  renderedScale: number;
-  /** Shared single-canvas generation and worker-bitmap ownership primitive. */
-  dispatcher: StaticCanvasRenderDispatcher;
-}
 
 export type { DocxScrollViewerOptions } from './scroll-viewer-options';
 
