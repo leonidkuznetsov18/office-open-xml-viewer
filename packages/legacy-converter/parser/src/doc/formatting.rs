@@ -73,6 +73,7 @@ impl StyleLanguageCompatibility {
 struct DirectParagraphProperties {
     bidi: Option<bool>,
     alignment: Option<(u16, u8)>,
+    space_before_twips: Option<u16>,
     absolute_indents: [Option<(u16, i16)>; 6],
 }
 
@@ -324,6 +325,15 @@ impl<'a> Formatting<'a> {
             for (code, value) in direct_properties.absolute_indents.into_iter().flatten() {
                 props.apply(code, &value.to_le_bytes())?;
             }
+            // [MS-DOC] 2.4.6.3 says to apply list-level PAPX last, but
+            // current Word preserves an explicitly direct sprmPDyaBefore
+            // when it saves a numbered paragraph to OOXML. A heading with
+            // direct 120 twips and list/style 40 prints at 120; headings
+            // without a direct write retain their inherited value. Replay
+            // only the authored direct operand, not a style/default value.
+            if let Some(value) = direct_properties.space_before_twips {
+                props.apply(0xa413, &value.to_le_bytes())?;
+            }
             if reference.preserve_indent {
                 props.preserve_list_indent(&original);
             }
@@ -490,6 +500,8 @@ impl<'a> Formatting<'a> {
                 } else if matches!(code, 0x840e | 0x840f | 0x845d | 0x845e | 0x8411 | 0x8460) {
                     // Properties::apply validated the signed XAS operand above.
                     direct_properties.push_absolute_indent((code, u16_at(operand, 0)? as i16));
+                } else if code == 0xa413 {
+                    direct_properties.space_before_twips = Some(u16_at(operand, 0)?);
                 }
                 Ok(())
             },
@@ -3088,6 +3100,23 @@ mod tests {
             .direct_paragraph(0, None, 100, 1, &[piece])
             .unwrap()
             .paragraph
+    }
+
+    #[test]
+    fn numbered_paragraph_retains_authored_direct_space_before() {
+        let mut direct = with_direct_paragraph(&[0, 0, 0x13, 0xa4, 120, 0]);
+        direct.numbering = level_paragraph_formatting(vec![0x13, 0xa4, 40, 0]);
+        assert_eq!(
+            listed_paragraph(&mut direct, &list_piece(1)).space_before,
+            6.0
+        );
+
+        let mut inherited = with_direct_paragraph(&[0, 0]);
+        inherited.numbering = level_paragraph_formatting(vec![0x13, 0xa4, 40, 0]);
+        assert_eq!(
+            listed_paragraph(&mut inherited, &list_piece(1)).space_before,
+            2.0
+        );
     }
 
     #[test]
