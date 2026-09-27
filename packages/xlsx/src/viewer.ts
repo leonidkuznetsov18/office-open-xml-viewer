@@ -2260,11 +2260,11 @@ class XlsxViewerEngine implements ZoomableViewer {
    *
    * The caller's container is returned to the state it had before construction
    * (empty): the entire wrapper subtree the constructor appended is removed.
-   * All document-level listeners are detached — the keydown handler here, and
-   * the validation-panel outside-click handler via {@link hideValidationPanel}.
-   * Listeners on elements inside the wrapper (scrollHost, tabs, …) need no
-   * explicit removal: removing the subtree makes them unreachable and eligible
-   * for GC. Safe to call more than once.
+   * Every listener, observer and frame is released: each collaborator detaches
+   * the listeners it registered (viewport input, outline gutters, tab strip,
+   * zoom control, validation panel and its document-level outside-click
+   * handler, overlay host), and the chrome theme and comment popup disconnect
+   * their observers. Safe to call more than once.
    *
    * NOTE: the shared `<style>` in the owning document is intentionally NOT removed —
    * it is a class constant that any still-live viewer may depend on, and one
@@ -2283,6 +2283,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.chromeTheme.destroy();
     this.renderDispatcher.destroy();
     this.surface.destroy();
+    this.overlayHost.destroy();
     this.sheetTabs?.destroy();
     this.zoomControl?.destroy();
     this.comments.destroy();
@@ -2309,9 +2310,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.elementContext = null;
     this.selectionController.reset();
     this.acquisition.destroy();
-    // Remove the whole UI subtree so the container is empty again. This also
-    // detaches every listener bound to elements within it (scrollHost pointer/
-    // wheel handlers, tab clicks, zoom slider) without per-element cleanup.
+    // Remove the whole UI subtree so the container is empty again.
     this.wrapper.remove();
   }
 
