@@ -4199,6 +4199,8 @@ function paragraphAcquisitionKey(
       environment.balanceSingleByteDoubleByteWidth ?? null,
       environment.characterSpacingControl ?? null,
       environment.lineWrapLikeWord6 ?? null,
+      environment.autoHyphenation ?? null,
+      environment.hyphenationZonePt ?? null,
       environment.resolvedLocalFonts
         ? cache.objectIdentity(environment.resolvedLocalFonts)
         : null,

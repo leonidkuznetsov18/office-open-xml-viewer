@@ -19,6 +19,7 @@ import type {
   DocParagraph, DocRun, DocxTextRun, FieldRun,
   LineSpacing, TabStop, DocxRunBorder, DocSettings, EmphasisMark,
 } from './types';
+import { frenchHyphenationOffsets } from './hyphenation.js';
 import type { CanvasFontRoute, KinsokuRules, HyperlinkTarget, NumberFormat, Duotone, ResolvedFontMetric } from '@silurus/ooxml-core';
 import {
   classifyCjkFont,
@@ -227,6 +228,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
    *  not start a new line before a glued segment; it retracts the whole glued
    *  group instead, so a small-caps word never splits across lines. */
   joinPrev?: boolean;
+  /** §17.15.1.10/.43: dictionary lookup follows the Latin language of the run. */
+  hyphenationLanguage?: string;
+  hyphenationZonePt?: number;
   /** Non-negotiable CT_R/noBreakHyphen seam. Unlike kinsoku/UAX glue, this
    * remains atomic even when either side otherwise exposes CJK/SEA breaks. */
   hardJoinPrev?: true;
@@ -744,6 +748,9 @@ export interface LineLayoutEnvironment {
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   /** ECMA-376 §17.15.1.18 document-wide full-width character compression. */
   readonly characterSpacingControl?: string;
+  /** ECMA-376 §17.15.1.10/.43 document settings. */
+  readonly autoHyphenation?: boolean;
+  readonly hyphenationZonePt?: number;
   /** §17.15.3.31: use full character width when deciding line fit. */
   readonly lineWrapLikeWord6?: boolean;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
@@ -3346,6 +3353,8 @@ export function buildSegments(
         complexScript: cs,
         fontHint: r.fontHint,
         eastAsiaLanguage: r.langEastAsia,
+        hyphenationLanguage: environment.autoHyphenation === true ? r.langVal : undefined,
+        hyphenationZonePt: environment.hyphenationZonePt,
         kerning: effectiveKerningThreshold != null
           && (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
         measure: false,
@@ -6522,7 +6531,36 @@ export function layoutLines(
         currentWidth + fitWidthFor(groupW, groupTrail, queue[groupEnd])
         > availW()
       ) {
-        flush(undefined, false, s.src);
+        // A Word run seam inside a French word is not a lexical boundary.
+        // Preserve a dictionary-proven seam that fits the current line; its
+        // overflowing follower emits the displayed hyphen below.
+        const language = s.hyphenationLanguage;
+        const remaining = availW() - currentWidth;
+        let canHyphenateAtSeam = false;
+        if (groupEnd > 0 && groupEnd <= 128
+          && language?.split('-')[0]?.toLowerCase() === 'fr'
+          && remaining > (s.hyphenationZonePt ?? 0)) {
+          const pieces = [s, ...queue.slice(0, groupEnd)];
+          if (pieces.every((part) => 'text' in part
+            && part.hyphenationLanguage === language && part.text.length <= 128)) {
+            const typedPieces = pieces as LayoutTextSeg[];
+            const word = typedPieces.map((part) => /^\p{L}+/u.exec(part.text)?.[0] ?? '').join('');
+            if (word.length <= 128) {
+              const candidates = frenchHyphenationOffsets(word, language);
+              let offset = 0;
+              let prefixWidth = 0;
+              canHyphenateAtSeam = typedPieces.some((part, index) => {
+                const letters = /^\p{L}+/u.exec(part.text)?.[0] ?? '';
+                if (!letters) return false;
+                offset += letters.length;
+                prefixWidth += strAdvance(part, letters);
+                return index < typedPieces.length - 1 && candidates.includes(offset)
+                  && prefixWidth + strAdvance(part, '-') <= remaining;
+              });
+            }
+          }
+        }
+        if (!canHyphenateAtSeam) flush(undefined, false, s.src);
       }
     }
 
@@ -6925,6 +6963,80 @@ export function layoutLines(
         queueEmergencyTail(s, split);
       }
     } else {
+      // Word can hyphenate at a source-run seam inside one French word. The
+      // bounded reconstruction uses adjacent visible letters and a shared run
+      // language; authored hard joins remain indivisible.
+      if (s.src && s.hardJoinPrev !== true
+        && s.hyphenationLanguage?.split('-')[0]?.toLowerCase() === 'fr'
+        && /^\p{L}/u.test(s.text)) {
+        let before = '';
+        let beforeWidth = 0;
+        let lastPiece: LayoutTextSeg | undefined;
+        for (let i = currentLine.length - 1; i >= 0; i -= 1) {
+          const part = currentLine[i]!;
+          if (!('text' in part) || part.hyphenationLanguage !== s.hyphenationLanguage) break;
+          const tail = /\p{L}+$/u.exec(part.text)?.[0];
+          if (!tail) break;
+          before = tail + before;
+          if (before.length > 128) break;
+          beforeWidth += strNaturalAdvance(part, tail);
+          lastPiece ??= part;
+          if (tail.length !== part.text.length) break;
+        }
+        if (lastPiece && before.length > 1 && before.length < 128) {
+          let after = /^\p{L}+/u.exec(s.text)?.[0] ?? '';
+          if (after.length === s.text.length) {
+            for (const queued of queue) {
+              if (!('text' in queued) || queued.hyphenationLanguage !== s.hyphenationLanguage) break;
+              const head = /^\p{L}+/u.exec(queued.text)?.[0] ?? '';
+              after += head;
+              if (head.length !== queued.text.length || before.length + after.length > 128) break;
+            }
+          }
+          const remainingAtSeam = availW() - currentWidth;
+          const hyphenWidth = strNaturalAdvance(lastPiece, '-');
+          if (before.length + after.length <= 128
+            && frenchHyphenationOffsets(before + after, s.hyphenationLanguage).includes(before.length)
+            && remainingAtSeam >= hyphenWidth
+            && remainingAtSeam + beforeWidth > (s.hyphenationZonePt ?? 0)) {
+            addToLine({
+              ...lastPiece, ...RESET_SLICED_TEXT_MEASUREMENT, text: '-',
+              measuredWidth: hyphenWidth, hyphenationLanguage: undefined,
+              punctuationCompressions: undefined, noBreakRanges: undefined,
+              externalLinkBreakOffsets: undefined, src: s.src,
+            }, hyphenWidth, h, asc, desc);
+            flush(undefined, false, s.src);
+            queue.unshift(s);
+            continue;
+          }
+        }
+      }
+      const remaining = availW() - currentWidth;
+      if (!s.joinPrev && !s.hardJoinPrev && remaining > (s.hyphenationZonePt ?? 0)) {
+        const candidates = frenchHyphenationOffsets(s.text, s.hyphenationLanguage);
+        const hyphenWidth = strNaturalAdvance(s, '-');
+        const split = candidates.reverse().find((at) =>
+          strNaturalAdvance(s, s.text.slice(0, at)) + hyphenWidth <= remaining,
+        );
+        if (split !== undefined && s.src) {
+          const prefix = s.text.slice(0, split);
+          const prefixWidth = strNaturalAdvance(s, prefix);
+          addToLine({
+            ...s, ...RESET_SLICED_TEXT_MEASUREMENT, text: prefix,
+            measuredWidth: prefixWidth, ...slicedTextMetadata(s, 0, split),
+          }, prefixWidth, h, asc, desc);
+          addToLine({
+            ...s, ...RESET_SLICED_TEXT_MEASUREMENT, text: '-',
+            measuredWidth: hyphenWidth, hyphenationLanguage: undefined,
+            punctuationCompressions: undefined, noBreakRanges: undefined,
+            externalLinkBreakOffsets: undefined,
+            src: { segIndex: s.src.segIndex, charOffset: s.src.charOffset + split },
+          }, hyphenWidth, h, asc, desc);
+          queueEmergencyTail(s, split);
+          flush(undefined, false, { segIndex: s.src.segIndex, charOffset: s.src.charOffset + split });
+          continue;
+        }
+      }
       const semanticSplit = externalLinkSyntaxSplit(
         s,
         availW() - currentWidth,

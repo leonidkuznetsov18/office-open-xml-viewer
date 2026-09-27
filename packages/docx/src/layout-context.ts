@@ -33,6 +33,8 @@ export interface DocumentLayoutSettings {
   readonly kinsoku: KinsokuRules;
   readonly defaultTabPt: number;
   readonly characterSpacingControl?: string;
+  readonly autoHyphenation: boolean;
+  readonly hyphenationZonePt?: number;
   readonly mathDefJc?: string;
   readonly documentHasEastAsianText: boolean;
   /** ECMA-376 §17.6.5 base pitch from the resolved Normal style. */
@@ -187,6 +189,8 @@ export function resolveDocumentLayoutSettings(
     kinsoku: resolveKinsokuRules(document.settings),
     defaultTabPt: resolveDefaultTabPt(document.settings),
     characterSpacingControl: document.settings?.characterSpacingControl,
+    autoHyphenation: document.settings?.autoHyphenation === true,
+    hyphenationZonePt: document.settings?.hyphenationZone,
     mathDefJc: document.settings?.mathDefJc,
     documentHasEastAsianText: documentHasEastAsianText(document.body),
     normalStyleFontSizePt: typography.normalStyleFontSizePt,
