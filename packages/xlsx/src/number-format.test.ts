@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { formatCellValue } from './number-format.js';
+import { formatCellValue, formatCellValueWithColor } from './number-format.js';
 import type { Cell, Styles } from './types.js';
 
 const FMT_ID = 164; // first free custom id
@@ -205,6 +205,55 @@ describe('date formats (Excel serial; 45292 = 2024-01-01)', () => {
       formatter.mockRestore();
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () => {
+  it('formats the serial as a clock time instead of echoing the code', () => {
+    expect(fmt(0.29166666666666669, 'h:mm;@')).toBe('7:00');
+    expect(fmt(0.51041666666666663, 'h:mm:ss;@')).toBe('12:15:00');
+    expect(fmt(0.75, 'h:mm AM/PM')).toBe('6:00 PM');
+    expect(fmt(0.5, 's')).toBe('0');
+  });
+
+  it('rounds the float noise of a stored serial instead of truncating it', () => {
+    // 8:00 is stored as 0.33333333333333331, a hair under 28 800 000 ms.
+    expect(fmt(0.33333333333333331, 'h:mm;@')).toBe('8:00');
+    expect(fmt(0.79166666666666663, 'hh:mm')).toBe('19:00');
+  });
+
+  it('keeps escaped, padded and quoted time letters literal in numeric formats', () => {
+    expect(fmt(5, '0\\h')).toBe('5h');
+    expect(fmt(5, '0_h')).toBe('5 ');
+    expect(fmt(5, '0" hrs"')).toBe('5 hrs');
+    // An escaped or padded quote is not a string delimiter.
+    expect(fmt(5, '0\\""hours"\\"')).toBe('5"hours"');
+    expect(fmt(5, '0_""hours"')).toBe('5 hours');
+  });
+
+  it('decides number vs time from the section the value selects', () => {
+    expect(fmt(5, '0.00;h:mm')).toBe('5.00');
+    expect(fmt(-0.5, '0.00;h:mm')).toBe('12:00');
+    expect(fmt(100, '[>=1]0.00;h:mm')).toBe('100.00');
+    expect(fmt(0, 'h:mm;h:mm;"zero"')).toBe('zero');
+    expect(formatCellValueWithColor(numCell(0.5), styles('[Red]h:mm'))).toEqual({ text: '12:00', color: '#FF0000' });
+  });
+
+  it('never formats a number with the text section', () => {
+    expect(fmt(-5, '0.00;@')).toBe('-5.00');
+    expect(fmt(45292, '[<1]yyyy;[>9999999]yyyy;@')).toBe('#');
+    expect(fmt(45292, '"@"0')).toBe('@45292');
+  });
+
+  it('keeps pad and fill operands out of section and bracket parsing', () => {
+    expect(formatCellValueWithColor(numCell(45292), styles('yyyy_";0'))).toEqual({ text: '2024' });
+    expect(formatCellValueWithColor(numCell(45292), styles('yyyy_""[Red]"'))).toEqual({ text: '2024[Red]' });
+  });
+
+  it('carries elapsed-time totals from the same rounded duration', () => {
+    // 45292.33333333333 is a hair under 1 087 016 hours.
+    expect(fmt(45292.33333333333, '[h]:mm')).toBe('1087016:00');
+    expect(fmt(45292.33333333333, '[m]:ss')).toBe('65220960:00');
   });
 });
 

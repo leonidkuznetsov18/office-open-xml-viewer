@@ -110,6 +110,7 @@ export interface CellXf {
     textRotation?: number;
     shrinkToFit?: boolean;
     readingOrder?: number;
+    ownFontColor?: boolean;
 }
 export interface CfIcon {
     iconSet: string;

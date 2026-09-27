@@ -93,6 +93,11 @@ export default defineConfig({
         '@silurus/ooxml-core/internal/script-preload-accumulator': fileURLToPath(
           new URL('../packages/core/src/internal/script-preload-accumulator.ts', import.meta.url),
         ),
+        // Viewer collaborators have matching source and declaration shims in
+        // core/src/internal; resolve them before the bare core entry alias.
+        '@silurus/ooxml-core/internal/': fileURLToPath(
+          new URL('../packages/core/src/internal/', import.meta.url),
+        ),
         '@silurus/ooxml-core/worker': fileURLToPath(
           new URL('../packages/core/src/worker/index.ts', import.meta.url),
         ),

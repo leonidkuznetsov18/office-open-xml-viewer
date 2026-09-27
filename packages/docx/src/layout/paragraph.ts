@@ -61,7 +61,7 @@ import {
   resolveNumberingMarkerGeometry,
   shapeNumberingMarkerText,
 } from './numbering-marker.js';
-import { deepFreezePlainData } from './plain-data.js';
+import { deepFreezePlainData, deepFreezePlainDataWithFrozenAliases } from './plain-data.js';
 import { retainedBorderTreatment } from './border-treatment.js';
 import type { ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import {
@@ -1090,7 +1090,7 @@ function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
  * Finalizes the parser-independent paragraph acquisition snapshot. All coordinates
  * are scale-1 points; subsequent Canvas paint is a pure viewport transform.
  */
-export function layoutParagraph(input: AcquiredParagraphLayoutInput): ParagraphLayout {
+export function layoutParagraph(input: AcquiredParagraphLayoutInput, frozenSource?: ParagraphLayout): ParagraphLayout {
   const lineStart = input.continuation?.lineStart ?? 0;
   const lineEnd = input.continuation?.lineEnd ?? input.lines.length;
   const lines = input.lines.slice(lineStart, lineEnd);
@@ -1132,6 +1132,12 @@ export function layoutParagraph(input: AcquiredParagraphLayoutInput): ParagraphL
     ...(input.paragraphMark ? { paragraphMark: input.paragraphMark } : {}),
     ...(input.continuation ? { continuation: input.continuation } : {}),
   };
+  if (frozenSource) {
+    // Continuation metadata is the only retained object supplied by this call
+    // rather than inherited from the already sealed acquired paragraph.
+    if (input.continuation) deepFreezePlainData(input.continuation);
+    return deepFreezePlainDataWithFrozenAliases(node, frozenSource);
+  }
   return deepFreezePlainData(node);
 }
 
@@ -5366,5 +5372,5 @@ export function sliceParagraphLayout(
           } }
         : {}),
     continuation,
-  });
+  }, acquired);
 }
