@@ -134,14 +134,17 @@ impl Border {
             26 => "outset",
             27 => "inset",
             0xff if !old && b[3] == 0xff => {
-                // [MS-DOC] 2.9.22 leaves 0xFF undefined by the spec; Word
-                // prints it as a single border when cv is automatic. Native
-                // controls at widths 1, 8, 24 and 255 eighth-points match
-                // otherwise identical single borders, including the original
-                // non-Nil e0/ff flag bytes. Explicit black and red cv controls
-                // change table geometry versus single: that counterexample
-                // remains gated, rather than extending the inference.
-                "single"
+                // [MS-DOC] 2.9.22 leaves 0xFF undefined by the spec. Word
+                // writes `w:val="nil"` for this automatic-color cell border
+                // at widths 1, 8, 24 and 255, with both 00/00 and E0/FF
+                // trailing bytes (d16 and brc Word-save controls). On the
+                // original table it draws no cell strokes; mapping to single
+                // paints 31.875-point black slabs across its contents.
+                // Explicit black/red color controls do not follow this rule
+                // and remain gated. Word's FF versus true NilBrc controls do
+                // reflow later pages, despite saving both as `nil`; that
+                // native-only layout distinction is not represented here.
+                "nil"
             }
             // MS-DOC 2.9.22: image (art) borders 0x40..=0xE3 are valid only
             // for page borders; 0x02, 0x04 and every other value is undefined.
@@ -356,20 +359,16 @@ mod tests {
             let actual = Border::read(&[255, 255, 255, 255, width, 255, 0, 0], false)
                 .unwrap()
                 .direct_spec();
-            let single = Border::read(&[255, 255, 255, 255, width, 1, 0, 0], false)
-                .unwrap()
-                .direct_spec();
-            assert_eq!(
-                (actual.style, actual.width, actual.color),
-                (single.style, single.width, single.color)
-            );
+            assert_eq!(actual.style, "nil");
+            assert_eq!(actual.width, f64::from(width.max(2)) / 8.0);
+            assert_eq!(actual.color, None);
         }
         assert_eq!(
             Border::read(&[255, 255, 255, 255, 255, 255, 0xe0, 255], false)
                 .unwrap()
                 .direct_spec()
                 .style,
-            "single"
+            "nil"
         );
         for color in [[0, 0, 0, 0], [255, 0, 0, 0]] {
             let error = Border::read(
