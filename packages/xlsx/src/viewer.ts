@@ -1,6 +1,5 @@
 import {
   XlsxWorkbook,
-  acquireXlsxWorksheet,
   acquireXlsxWorksheetPreview,
   retainXlsxWorksheetReference,
   loadXlsxSheetSource,
@@ -56,7 +55,7 @@ import {
   selectionStatesEqual,
 } from './selection.js';
 export type { CellAddress } from './selection.js';
-import { XlsxFindController, type FindCell, type XlsxMatchLocation } from './find.js';
+import type { XlsxMatchLocation } from './find.js';
 import type { XlsxCommentsOptions } from './comment-card.js';
 import { withViewerRenderContext } from './worker-protocol.js';
 import { SheetViewEdits } from './internal/viewer/sheet-view-edits.js';
@@ -65,6 +64,7 @@ import { SheetTabBar } from './internal/viewer/sheet-tab-bar.js';
 import { ZoomControl } from './internal/viewer/zoom-control.js';
 import { ValidationPanel } from './internal/viewer/validation-panel.js';
 import { HyperlinkDispatcher } from './internal/viewer/hyperlink-dispatcher.js';
+import { FindAdapter } from './internal/viewer/find-adapter.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -561,19 +561,7 @@ function selectionBoundaryPath(rects: readonly SelectionOverlayRect[]): string {
 
 let selectionMaskSequence = 0;
 
-const DEFAULT_FIND_HIGHLIGHT = 'color-mix(in srgb, #ffb300 8%, transparent)';
-const DEFAULT_FIND_ACTIVE_HIGHLIGHT = 'color-mix(in srgb, #fb8c00 8%, transparent)';
-
-/** Resolve an XLSX find box without altering a caller-provided CSS background. */
-export function findHighlightOverlayStyle(
-  active: boolean,
-  colors: FindHighlightColors = {},
-): { border: string; background: string } {
-  const accent = active ? '#fb8c00' : '#ffb300';
-  const custom = active ? colors.active : colors.match;
-  const background = custom ?? (active ? DEFAULT_FIND_ACTIVE_HIGHLIGHT : DEFAULT_FIND_HIGHLIGHT);
-  return { border: `2px solid ${custom ?? accent}`, background };
-}
+export { findHighlightOverlayStyle } from './internal/viewer/find-adapter.js';
 
 type XlsxViewerMount =
   | { readonly kind: 'composite' }
@@ -727,10 +715,8 @@ class XlsxViewerEngine implements ZoomableViewer {
   private readonly selectionContextCells = new WeakMap<Row, readonly Cell[]>();
   private elementContext: XlsxElementContext | null = null;
   private selectionOverlay: HTMLDivElement;
-  /** IX2 — find-highlight overlay (matched-cell boxes). */
-  private findOverlay!: HTMLDivElement;
-  /** IX2 — find state (matches + active cursor). */
-  private _find!: XlsxFindController;
+  /** IX2 — whole-workbook find and its highlight overlay. */
+  private readonly finder: FindAdapter;
   private keydownHandler: ((e: KeyboardEvent) => void) | null = null;
   // Deferred selection press: committed on pointerup only if the pointer
   // neither moved beyond the tap threshold nor caused a scroll. Used for
@@ -841,7 +827,6 @@ class XlsxViewerEngine implements ZoomableViewer {
       validationMaxHeight: VALIDATION_PANEL_MAX_H,
     });
     this.selectionOverlay = this.overlayHost.selection;
-    this.findOverlay = this.overlayHost.find;
     this.comments = new CommentPopup({
       ownerDocument: this.hostDocument,
       canvasArea: this.canvasArea,
@@ -992,11 +977,20 @@ class XlsxViewerEngine implements ZoomableViewer {
 
     this.setupSelectionEvents();
 
-    this._find = new XlsxFindController(
-      () => this.sheetCount,
-      (sheet) => this.wb?.sheetNames[sheet] ?? '',
-      (sheet) => this._collectSheetCells(sheet),
-    );
+    this.finder = new FindAdapter({
+      ownerDocument: this.hostDocument,
+      overlayHost: this.overlayHost,
+      workbook: () => this.wb,
+      sheetCount: () => this.sheetCount,
+      worksheet: () => this.currentWorksheet,
+      currentSheet: () => this.currentSheet,
+      scale: () => this.viewport.scale,
+      highlightColors: () => this.opts.findHighlightColors,
+      cellRect: (row, col) => this._cellRect(row, col),
+      screenX: (x, w) => this.screenX(x, w),
+      goToSheet: (index) => this.goToSheet(index),
+      scrollCellIntoView: (row, col) => this._scrollCellIntoView(row, col),
+    });
 
     if (borrowedWorkbook) {
       this.acquisition.install(borrowedWorkbook, false);
@@ -1054,28 +1048,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     }
   }
 
-  /** Every non-empty cell of a sheet with its rendered display text (IX2 find
-   *  source). Reads the parsed worksheet model directly — no render — so search
-   *  covers the whole sheet, not just the on-screen viewport. */
-  private async _collectSheetCells(sheet: number): Promise<FindCell[]> {
-    const wb = this.wb;
-    if (!wb) return [];
-    const lease = await acquireXlsxWorksheet(wb, sheet);
-    try {
-      const ws = lease.worksheet;
-      const cells: FindCell[] = [];
-      for (const row of ws.rows) {
-        for (const cell of row.cells) {
-          const text = wb.cellText(ws, cell);
-          if (text !== '') cells.push({ row: cell.row, col: cell.col, text });
-        }
-      }
-      return cells;
-    } finally {
-      lease.release();
-    }
-  }
-
   /**
    * Load an XLSX from URL or ArrayBuffer and render the first sheet.
    *
@@ -1124,7 +1096,7 @@ class XlsxViewerEngine implements ZoomableViewer {
           // completion, not errors belonging to the new workbook.
           this.sheetRequestGeneration++;
           this.renderDispatcher.begin();
-          this._find.invalidate();
+          this.finder.invalidate();
           this.hideValidationPanel();
           this.releaseHostFonts();
         });
@@ -1178,7 +1150,7 @@ class XlsxViewerEngine implements ZoomableViewer {
   private prepareWorkbook(workbook: XlsxWorkbook): boolean {
     if (this._destroyed || this.wb !== workbook) return false;
     if (this.preparedWorkbook === workbook) return true;
-    this._find.invalidate();
+    this.finder.invalidate();
     this.viewEdits.clear();
     this.sheetViews.clear();
     this.buildTabs();
@@ -2725,56 +2697,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.overlayHost.appendSelection(clip);
   }
 
-  // ─── IX2 find-highlight overlay ──────────────────────────────────────────
-
-  /**
-   * Redraw the find-highlight overlay: one translucent box per matched cell on
-   * the current sheet, the active match in a stronger colour. Uses the SAME
-   * `getCellRect` + `screenX` + header/frozen clamp the selection overlay uses,
-   * so a box lands exactly on the drawn cell at any scroll offset / zoom / RTL.
-   * Rebuilt on every render and scroll (cheap DOM geometry, no canvas paint).
-   */
+  /** Redraw the find-highlight boxes for the displayed sheet. */
   private updateFindOverlay(): void {
-    this.overlayHost.clearFind();
-    const ws = this.currentWorksheet;
-    if (!ws) return;
-    const cs = this.viewport.scale;
-    const sp = (px: number) => Math.round(px * cs);
-    const headerW = sp(HEADER_W);
-    const headerH = sp(HEADER_H);
-    const freezeRows = ws.freezeRows ?? 0;
-    const freezeCols = ws.freezeCols ?? 0;
-    const frozen = getGridGeometryForWorksheet(ws).roundedFrozenExtent(cs);
-    const frozenBoundX = headerW + frozen.width;
-    const frozenBoundY = headerH + frozen.height;
-
-    // A match accent: same single-color → border + translucent fill derivation
-    // the selection overlay uses. The active match uses a warm accent so it is
-    // distinguishable from other hits and from the (blue) selection box.
-    const other = findHighlightOverlayStyle(false, this.opts.findHighlightColors);
-    const active = findHighlightOverlayStyle(true, this.opts.findHighlightColors);
-
-    for (const hl of this._find.sheetHighlights(this.currentSheet)) {
-      const rect = this._cellRect(hl.row, hl.col);
-      if (!rect) continue;
-      let { x, y, w, h } = rect;
-      // Clamp against headers + the frozen-pane boundary (scrollable cells that
-      // scrolled behind the frozen area are clipped there), mirroring the
-      // selection overlay so a highlight never spills over fixed regions.
-      if (x < headerW) { w -= headerW - x; x = headerW; }
-      if (y < headerH) { h -= headerH - y; y = headerH; }
-      if (hl.col > freezeCols && x < frozenBoundX) { w -= frozenBoundX - x; x = frozenBoundX; }
-      if (hl.row > freezeRows && y < frozenBoundY) { h -= frozenBoundY - y; y = frozenBoundY; }
-      if (w <= 0 || h <= 0) continue;
-      const screenLeft = this.screenX(x, w);
-      const { border, background } = hl.active ? active : other;
-      const box = this.hostDocument.createElement('div');
-      box.style.cssText =
-        `position:absolute;` +
-        `left:${screenLeft}px;top:${y}px;width:${w}px;height:${h}px;` +
-        `box-sizing:border-box;border:${border};background:${background};pointer-events:none;`;
-      this.overlayHost.appendFind(box);
-    }
+    this.finder.updateOverlay();
   }
 
   /**
@@ -2791,10 +2716,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     query: string,
     opts: FindMatchesOptions = {},
   ): Promise<FindMatch<XlsxMatchLocation>[]> {
-    if (!this.wb) return [];
-    const matches = await this._find.find(query, opts);
-    this.updateFindOverlay();
-    return matches;
+    return this.finder.find(query, opts);
   }
 
   /**
@@ -2804,39 +2726,17 @@ class XlsxViewerEngine implements ZoomableViewer {
    * {@link findText} first.
    */
   async findNext(): Promise<FindMatch<XlsxMatchLocation> | null> {
-    return this._activateMatch(this._find.next());
+    return this.finder.next();
   }
 
   /** IX2 — move to the previous match (wrap-around). */
   async findPrev(): Promise<FindMatch<XlsxMatchLocation> | null> {
-    return this._activateMatch(this._find.prev());
+    return this.finder.prev();
   }
 
   /** IX2 — clear all highlights and reset the find state. */
   clearFind(): void {
-    this._find.invalidate();
-    this.updateFindOverlay();
-  }
-
-  private async _activateMatch(
-    match: FindMatch<XlsxMatchLocation> | null,
-  ): Promise<FindMatch<XlsxMatchLocation> | null> {
-    if (!match) {
-      this.updateFindOverlay();
-      return null;
-    }
-    const { sheet, row, col } = match.location;
-    if (sheet !== this.currentSheet) {
-      // showSheet resets scroll/selection and re-renders; the find state (and so
-      // the highlights) survive because they live on the controller, not the
-      // sheet. updateFindOverlay runs after the sheet switch below.
-      await this.goToSheet(sheet);
-    }
-    this._scrollCellIntoView(row, col);
-    // Scrolling schedules a coalesced render; draw the highlights now so the
-    // active box is visible immediately without waiting a frame.
-    this.updateFindOverlay();
-    return match;
+    this.finder.clear();
   }
 
   /**
@@ -3982,7 +3882,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     // IX2 — drop the find state (matches + cursor) so a stale
     // findNext()/findPrev() after teardown returns null instead of a match
     // pointing into a dead viewer (same fix as DocxViewer/PptxViewer.destroy).
-    this._find.invalidate();
+    this.finder.destroy();
     this.releaseHostFonts();
     const releaseProjection = this.wb?.[releaseXlsxViewerProjection];
     if (typeof releaseProjection === 'function') {
