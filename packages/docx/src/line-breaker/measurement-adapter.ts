@@ -1,6 +1,7 @@
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
 import { calcEffectiveFontPx } from '../layout/text.js';
+import { verticalRunInkExtra } from './vertical-text.js';
 
 /** Owns the Canvas state used by one line-breaking pass. The state recorded here
  * describes only assignments made by this adapter; a future advance cache must
@@ -133,7 +134,7 @@ export class LineMeasurementAdapter {
     this.selectSegmentFont(segment);
     const previous = this.selectSegmentKerning(segment);
     try {
-      return this.verticalGlyphMeasurement.measureRunInkExtra(text);
+      return verticalRunInkExtra(text, true, this.verticalGlyphMeasurement);
     } finally {
       this.restoreKerning(previous);
     }
