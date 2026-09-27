@@ -124,7 +124,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   // An elapsed-time section (`[h]:mm`, `[mm]:ss`) reads its clock fields as
   // remainders of the same absolute, millisecond-rounded duration as its
   // elapsed total, so a negative duration keeps consistent minutes.
-  const elapsedSection = /\[(h+|m+|s+)\]/i.test(section);
+  const elapsedSection = hasElapsedBracket(section);
   const absMs = Math.round(Math.abs(serial) * 86_400_000);
   const hr = elapsedSection ? Math.floor(absMs / 3_600_000) % 24 : date.getUTCHours();
   const mi = elapsedSection ? Math.floor(absMs / 60_000) % 60 : date.getUTCMinutes();
@@ -260,11 +260,13 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'r' || ch === 'R') {
-      // Some Japanese Excel variants expose `r` / `rr` as era-year aliases.
+      // ja-JP locale codes (§18.8.30 International Considerations):
+      // `r` becomes `ee` (two-digit era year), `rr` becomes `gggee` (full
+      // era name and two-digit era year).
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'r') { n++; i++; }
-      const y = getEra().year;
-      result += n >= 2 ? String(y).padStart(2, '0') : String(y);
+      const e = getEra();
+      result += (n >= 2 ? e.long : '') + String(e.year).padStart(2, '0');
       prevWasHour = false;
 
     } else if (ch === 'A' || ch === 'a') {
@@ -298,16 +300,41 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   return result;
 }
 
+/** Whether a section holds an elapsed-time bracket `[h]` / `[mm]` / `[ss]`
+ *  outside quotes, escapes and pad / fill pairs. */
+function hasElapsedBracket(section: string): boolean {
+  let i = 0;
+  while (i < section.length) {
+    const ch = section[i];
+    if (ch === '\\' || ch === '_' || ch === '*') {
+      i += 2;
+    } else if (ch === '"') {
+      const end = section.indexOf('"', i + 1);
+      i = end < 0 ? section.length : end + 1;
+    } else if (ch === '[') {
+      const end = section.indexOf(']', i);
+      if (end < 0) return false;
+      if (/^([hms])\1*$/i.test(section.slice(i + 1, end))) return true;
+      i = end + 1;
+    } else {
+      i++;
+    }
+  }
+  return false;
+}
+
 /** Whether one format section (§18.8.30) is a date/time format. The body is
  *  scanned left to right so each token is read in context: `\x` escapes,
  *  `_x` padding and `*x` fill pairs (whose operand may itself be `"`), quoted
  *  literals and bracket content are skipped; what remains is date/time when
  *  it holds y / m / d / h / s, AM/PM or A/P, the Japanese weekday code
- *  `aaa+`, the Japanese era `g` / era year `e` (an `E+` / `E-` is scientific
- *  notation, and `General` is the General keyword), or an elapsed-time
- *  bracket `[h]` / `[mm]` / `[ss]`. */
+ *  `aaa+`, the Japanese era `g`, era year `e` and locale codes `r` / `rr`,
+ *  or an elapsed-time bracket `[h]` / `[mm]` / `[ss]`. An `e` after a numeric
+ *  placeholder (`0` `#` `?`) or before `+` / `-` / a placeholder is the
+ *  scientific exponent, and `General` is the General keyword. */
 export function isDateFormatSection(body: string): boolean {
   let i = 0;
+  let afterPlaceholder = false;
   while (i < body.length) {
     const ch = body[i];
     if (ch === '\\' || ch === '_' || ch === '*') {
@@ -322,10 +349,14 @@ export function isDateFormatSection(body: string): boolean {
       i = end + 1;
     } else if (/^general/i.test(body.slice(i))) {
       i += 'general'.length;
-    } else if (/[ymdhsg]/i.test(ch)) {
+    } else if (/[ymdhsgr]/i.test(ch)) {
       return true;
-    } else if ((ch === 'e' || ch === 'E') && body[i + 1] !== '+' && body[i + 1] !== '-') {
-      return true;
+    } else if (ch === 'e' || ch === 'E') {
+      if (!afterPlaceholder && !/[-+0#?]/.test(body[i + 1] ?? '')) return true;
+      i++;
+    } else if (ch === '0' || ch === '#' || ch === '?') {
+      afterPlaceholder = true;
+      i++;
     } else if (/^(am\/pm|a\/p|a{3,})/i.test(body.slice(i))) {
       return true;
     } else {

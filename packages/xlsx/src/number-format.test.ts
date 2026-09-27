@@ -231,9 +231,18 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(fmt(5, '0_""hours"')).toBe('5 hours');
   });
 
-  it('reads Japanese era codes as dates, scientific E+ as a number', () => {
+  it('reads Japanese era codes as dates, scientific exponents as numbers', () => {
     expect(fmt(45292, '[$-411]ggge')).toBe('令和6');
+    // ja-JP locale codes (§18.8.30): r → ee, rr → gggee.
+    expect(fmt(45292, '[$-411]r')).toBe('06');
+    expect(fmt(45292, '[$-411]rr')).toBe('令和06');
     expect(fmt(1234, '0.00E+00')).toBe('1.23E+03');
+    // An E after a numeric placeholder stays on the numeric path, as before.
+    expect(fmt(1234, '0.0E0')).toBe('1234.0E0');
+  });
+
+  it('ignores a quoted elapsed bracket', () => {
+    expect(fmt(-0.25, 'h:mm "[h]"')).toBe('18:00 [h]');
   });
 
   it('decides number vs time from the section the value selects', () => {
