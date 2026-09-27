@@ -1,5 +1,7 @@
 import {
   XlsxWorkbook,
+  acquireXlsxWorksheet,
+  retainXlsxWorksheetReference,
   loadXlsxSheetSource,
   prepareXlsxViewerRowHeights,
   releaseXlsxViewerProjection,
@@ -663,11 +665,19 @@ class XlsxViewerEngine implements ZoomableViewer {
   private colOutline: OutlineLayout | null = null;
   private rowOutlineBands: BandOutline[] = [];
   private colOutlineBands: BandOutline[] = [];
-  /** Original row heights / column widths stashed the first time a band is
-   *  collapsed, so expanding restores a custom size rather than the default.
-   *  Keyed by band index; per current worksheet (cleared on sheet switch). */
+  /** Original sizes stashed while the active sheet has collapsed bands. The
+   * maps belong to outlineStateStore and survive projection eviction. */
   private stashedRowHeights = new Map<number, number | undefined>();
   private stashedColWidths = new Map<number, number | undefined>();
+  /** Only user-mutated outline flags and pre-collapse sizes survive a sheet
+   * switch. The parser's filters and frozen panes are read-only here; selection
+   * and scroll are viewer viewport state, reset by navigation as before. */
+  private outlineStateStore = new Map<number, {
+    rowCollapsed: Map<number, boolean>;
+    colCollapsed: Map<number, boolean>;
+    stashedRowHeights: Map<number, number | undefined>;
+    stashedColWidths: Map<number, number | undefined>;
+  }>();
   /**
    * Per-sheet cumulative record of every view-only size mutation (outline
    * collapse/expand, drag-to-resize #567), keyed by sheet index. Value = the
@@ -714,7 +724,11 @@ class XlsxViewerEngine implements ZoomableViewer {
   private fontBindingGeneration = 0;
   private fontBinding: Readonly<{ workbook: XlsxWorkbook; release: () => void }> | null = null;
   private _hiddenSheetMode: HiddenSheetMode;
+  /** During navigation the outgoing graph stays live for interaction while
+   * its lease is released. It can briefly coexist with the incoming graph,
+   * so viewer memory can peak at two worksheet models until the swap. */
   private currentWorksheet: Worksheet | null = null;
+  private releaseCurrentWorksheet: (() => void) | null = null;
   /** Authored comments for the selected sheet. Presentation filtering must not
    * erase the application-owned data and selection-context contracts. */
   private currentSourceComments: readonly XlsxComment[] = [];
@@ -1179,15 +1193,20 @@ class XlsxViewerEngine implements ZoomableViewer {
   private async _collectSheetCells(sheet: number): Promise<FindCell[]> {
     const wb = this.wb;
     if (!wb) return [];
-    const ws = await wb.getWorksheet(sheet);
-    const cells: FindCell[] = [];
-    for (const row of ws.rows) {
-      for (const cell of row.cells) {
-        const text = wb.cellText(ws, cell);
-        if (text !== '') cells.push({ row: cell.row, col: cell.col, text });
+    const lease = await acquireXlsxWorksheet(wb, sheet);
+    try {
+      const ws = lease.worksheet;
+      const cells: FindCell[] = [];
+      for (const row of ws.rows) {
+        for (const cell of row.cells) {
+          const text = wb.cellText(ws, cell);
+          if (text !== '') cells.push({ row: cell.row, col: cell.col, text });
+        }
       }
+      return cells;
+    } finally {
+      lease.release();
     }
-    return cells;
   }
 
   /**
@@ -1294,6 +1313,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (this.preparedWorkbook === workbook) return true;
     this._find.invalidate();
     this.sizeOverrideStore.clear();
+    this.outlineStateStore.clear();
     this.sheetViews.clear();
     this.buildTabs();
     this.preparedWorkbook = workbook;
@@ -1324,10 +1344,22 @@ class XlsxViewerEngine implements ZoomableViewer {
     const workbook = this.workbook;
     let worksheet: Worksheet;
     let sourceWorksheet: Worksheet;
+    let releaseNewWorksheet: (() => void) | undefined;
     try {
       if (!await this.ensureHostFonts(workbook)) return;
-      sourceWorksheet = await workbook.getWorksheet(index);
-      worksheet = this.sheetViews.get(index) ?? this.createVisibleSheetView(sourceWorksheet);
+      if (!this.isCurrentSheetRequest(generation, workbook)) return;
+      if (index !== this.currentSheet && this.currentWorksheet) {
+        // Permit cache eviction, but keep the displayed worksheet and every
+        // interaction map intact until a replacement is ready to commit.
+        this.releaseCurrentWorksheet?.();
+        this.releaseCurrentWorksheet = null;
+      }
+      const lease = await acquireXlsxWorksheet(workbook, index);
+      sourceWorksheet = lease.worksheet;
+      releaseNewWorksheet = lease.release;
+      const cachedView = this.sheetViews.get(index);
+      worksheet = cachedView ?? this.createVisibleSheetView(sourceWorksheet);
+      if (!cachedView) this.restoreSheetViewState(index, worksheet);
       const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
       if (typeof prepareRowHeights === 'function') {
         const measureCanvas = this.hostDocument.createElement('canvas');
@@ -1335,13 +1367,23 @@ class XlsxViewerEngine implements ZoomableViewer {
         if (measureCtx) prepareRowHeights.call(workbook, worksheet, measureCtx);
       }
       this.syncAutomaticRowOverrides(index, worksheet);
-      this.sheetViews.set(index, worksheet);
     } catch (error) {
+      releaseNewWorksheet?.();
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
+      await this.restoreDisplayedWorksheetLease(workbook, generation);
       throw error;
     }
-    if (!this.isCurrentSheetRequest(generation, workbook)) return;
+    if (!this.isCurrentSheetRequest(generation, workbook)) {
+      releaseNewWorksheet?.();
+      return;
+    }
 
+    this.releaseCurrentWorksheet?.();
+    this.releaseCurrentWorksheet = releaseNewWorksheet ?? null;
+    // Viewer projections share the full cell graph. Keeping inactive entries
+    // would defeat workbook eviction even after its cache drops the model.
+    this.sheetViews.clear();
+    this.sheetViews.set(index, worksheet);
     this.currentSheet = index;
     this.currentWorksheet = worksheet;
     this.currentSourceComments = sourceWorksheet.comments ?? [];
@@ -1386,14 +1428,32 @@ class XlsxViewerEngine implements ZoomableViewer {
     return !this._destroyed && generation === this.sheetRequestGeneration && this.wb === workbook;
   }
 
+  private async restoreDisplayedWorksheetLease(workbook: XlsxWorkbook, generation: number): Promise<void> {
+    if (!this.currentWorksheet || this.releaseCurrentWorksheet) return;
+    const release = await retainXlsxWorksheetReference(workbook, this.currentSheet);
+    if (this.isCurrentSheetRequest(generation, workbook) && this.currentWorksheet && !this.releaseCurrentWorksheet) {
+      this.releaseCurrentWorksheet = release;
+    } else {
+      release();
+    }
+  }
+
   // ─── Outline gutter (XL4: row/column grouping) ────────────────────────────
 
   /** Recompute the per-axis outline layout for `ws` and cache the band lists.
    *  Both axes are `null` (gutters collapse to 0) when the sheet has no
    *  outlining, so an outline-free sheet is untouched. */
   private buildOutline(ws: Worksheet): void {
-    this.stashedRowHeights.clear();
-    this.stashedColWidths.clear();
+    let state = this.outlineStateStore.get(this.currentSheet);
+    if (!state) {
+      state = {
+        rowCollapsed: new Map(), colCollapsed: new Map(),
+        stashedRowHeights: new Map(), stashedColWidths: new Map(),
+      };
+      this.outlineStateStore.set(this.currentSheet, state);
+    }
+    this.stashedRowHeights = state.stashedRowHeights;
+    this.stashedColWidths = state.stashedColWidths;
     this.rowOutlineBands = rowBands(ws);
     this.colOutlineBands = colBands(ws);
     const rowLayout = buildOutlineLayout(this.rowOutlineBands, summaryAfterFor(ws, 'row'));
@@ -1938,6 +1998,8 @@ class XlsxViewerEngine implements ZoomableViewer {
   private setBandCollapsed(axis: OutlineAxis, index: number, collapsed: boolean): void {
     const ws = this.currentWorksheet;
     if (!ws) return;
+    const state = this.outlineStateStore.get(this.currentSheet);
+    (axis === 'row' ? state?.rowCollapsed : state?.colCollapsed)?.set(index, collapsed);
     if (axis === 'row') {
       const row = ws.rows.find((r) => r.index === index);
       if (row) row.collapsed = collapsed;
@@ -1945,6 +2007,37 @@ class XlsxViewerEngine implements ZoomableViewer {
       ws.colCollapsed = ws.colCollapsed ?? {};
       if (collapsed) ws.colCollapsed[index] = true;
       else delete ws.colCollapsed[index];
+    }
+  }
+
+  /** Rebuild only the mutable projection fields. The large row/cell graph is
+   * reacquired from the workbook cache and may have been evicted meanwhile. */
+  private restoreSheetViewState(sheetIndex: number, worksheet: Worksheet): void {
+    const sizes = this.sizeOverrideStore.get(sheetIndex);
+    if (sizes) {
+      for (const [index, size] of sizes.rows) {
+        if (size === null) delete worksheet.rowHeights[index];
+        else worksheet.rowHeights[index] = size;
+      }
+      for (const [index, size] of sizes.cols) {
+        if (size === null) delete worksheet.colWidths[index];
+        else worksheet.colWidths[index] = size;
+      }
+    }
+    const outline = this.outlineStateStore.get(sheetIndex);
+    if (!outline) return;
+    if (outline.rowCollapsed.size > 0) {
+      for (const row of worksheet.rows) {
+        const collapsed = outline.rowCollapsed.get(row.index);
+        if (collapsed !== undefined) row.collapsed = collapsed;
+      }
+    }
+    if (outline.colCollapsed.size > 0) {
+      worksheet.colCollapsed = worksheet.colCollapsed ?? {};
+      for (const [index, collapsed] of outline.colCollapsed) {
+        if (collapsed) worksheet.colCollapsed[index] = true;
+        else delete worksheet.colCollapsed[index];
+      }
     }
   }
 
@@ -5088,8 +5181,22 @@ class XlsxViewerEngine implements ZoomableViewer {
       releaseProjection.call(this.wb, this.projectionId);
     }
     this.currentWorksheet = null;
+    this.releaseCurrentWorksheet?.();
+    this.releaseCurrentWorksheet = null;
+    this.sheetViews.clear();
+    this.outlineStateStore.clear();
+    this.stashedRowHeights.clear();
+    this.stashedColWidths.clear();
     this.currentSourceComments = [];
     this.sourceCommentMap.clear();
+    this.commentMap.clear();
+    this.hyperlinkMap.clear();
+    this.preparedWorkbook = null;
+    this.rowOutlineBands = [];
+    this.colOutlineBands = [];
+    this.rowOutline = null;
+    this.colOutline = null;
+    this.sizeOverrideStore.clear();
     this.elementContext = null;
     this.pendingElementClick = null;
     this.selectionController.reset();

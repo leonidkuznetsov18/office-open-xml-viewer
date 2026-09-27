@@ -206,11 +206,14 @@ function assertNoSourceRuntime(code, name) {
 // changes; its exact zero-allowance baseline is rebased with the entries.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
   docx: { entry: 2_533_039, inline: 31_624, budget: 2_800 },
-  xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
+  // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
+  // viewer state restoration. The optional model-source runtime stays lazy.
+  xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
   pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
   node: { entry: 2_579_736, budget: 3_600 },
 });
-const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_047_235];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction.
+const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_047_235];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

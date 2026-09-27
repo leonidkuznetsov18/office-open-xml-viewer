@@ -217,8 +217,13 @@ pub fn pptx_to_markdown(
 
 /// Native equivalent of `parse_pptx` for use from the MCP server.
 pub fn parse_pptx_native(data: &[u8]) -> Result<String, String> {
-    let presentation = parse_presentation_from_bytes(data).map_err(|e| e.to_string())?;
+    let presentation = parse_pptx_model_native(data)?;
     serde_json::to_string(&presentation).map_err(|e| e.to_string())
+}
+
+/// Native typed equivalent of `parse_pptx_native` with identical limits.
+pub fn parse_pptx_model_native(data: &[u8]) -> Result<pptx_model::Presentation, String> {
+    parse_presentation_from_bytes(data).map_err(|e| e.to_string())
 }
 
 /// Parse a pptx and produce a best-effort, text-focused GitHub-flavoured
