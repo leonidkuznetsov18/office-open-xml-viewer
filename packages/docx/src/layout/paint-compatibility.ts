@@ -1,5 +1,29 @@
 import { defineCompatibilityRule } from './compatibility.js';
 
+export const WORD_DRAWINGML_HEADER_PATTERN_PAGE_GRID = defineCompatibilityRule({
+  id: 'word-drawingml-header-pattern-page-grid',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'header-drawingml-pattern-phase-controls',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'Header-anchored DrawingML pct50 and dnDiag fills use a 64×64 image tile at 8pt, with 1pt cells on the page-origin 8pt grid. Unrotated, 315-degree rotated, and page-sized controls preserve page axes and cell size. Chart and VML hosts are outside this rule.',
+});
+
+export const WORD_VML_TEXTPATH_IMAGE_PATTERN_SOLID = defineCompatibilityRule({
+  id: 'word-vml-textpath-image-pattern-solid',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'rotated-vml-textpath-image-pattern',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'A rotated v:textpath watermark with v:fill type="pattern" and a valid image relationship exports as solid foreground ink without a PDF tiling-pattern resource. Non-textpath VML shape hosts remain unmeasured.',
+});
+
 export const WORD_CLASSIC_CHART_SPACE_FRAME = defineCompatibilityRule({
   id: 'word-classic-chart-space-frame',
   evidence: {

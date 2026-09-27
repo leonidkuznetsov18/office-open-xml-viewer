@@ -294,12 +294,10 @@ export function paintLayoutPageContent(
   page: LayoutPage,
   context: CanvasPaintContext,
 ): void {
-  // Word's PDF export of header-anchored DrawingML watermarks (pct50 and
-  // dnDiag, unrotated, 315-degree rotated, and page-sized) uses the same
-  // 8-point tile on page axes, with phase at the page's top-left 8-point grid.
-  // Capture the page frame before region, anchor, or shape transforms. The
-  // DrawingML shape painter uses it to cancel only host-local transforms;
-  // chart and VML hosts retain their separate fill-coordinate policies.
+  // word-drawingml-header-pattern-page-grid: capture the page frame before
+  // region, anchor, or shape transforms so the 8pt tile keeps page axes and
+  // phase. Only DrawingML shapes consume this frame; chart and VML hosts keep
+  // their separate fill-coordinate policies.
   const canvas = context.ctx as CanvasRenderingContext2D;
   const pageToDevice = canvas.getTransform?.() ?? {
     a: context.scale * context.dpr, d: context.scale * context.dpr,
