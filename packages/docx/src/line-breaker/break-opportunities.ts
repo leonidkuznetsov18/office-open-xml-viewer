@@ -1,7 +1,4 @@
 import { justifiedCandidateFitWidth } from './justify-fit.js';
-import { LineMeasurementAdapter } from './measurement-adapter.js';
-import type { TabStop } from '../types';
-import type { KinsokuRules } from '@silurus/ooxml-core';
 import {
   DEFAULT_KINSOKU_RULES,
   kinsokuAdjustedSplit,
@@ -10,26 +7,18 @@ import {
   fitSeaWordPrefix,
   graphemeClusterOffsets,
 } from '@silurus/ooxml-core';
-import type {
-  MeasurementTextContext,
-  VerticalGlyphMeasurementService,
-} from '../layout/measurement-capabilities.js';
 import { EAST_ASIAN_RE, nextTabStop } from '../layout/text.js';
 import {
   wordIsOverflowPunctuation,
   wordIdeographicSpaceLineEndAllowanceCount,
 } from '../layout/line-compatibility.js';
-import { createLineBreakerState } from './break-queue.js';
 import {
-  type DocGridCtx,
   type LayoutImageSeg,
   type LayoutMathSeg,
   type LayoutSeg,
   type LayoutTabSeg,
   type LayoutTextSeg,
-  type LineBoundary,
 } from './model.js';
-import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import {
   RESET_SLICED_TEXT_MEASUREMENT,
   charScaleFactor,
@@ -49,75 +38,53 @@ import {
   rebaseSeaBreaks,
 } from './text-runs.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
+import type { PassOperationState } from './pass-operations.js';
 
-export interface BreakOpportunityIteratorContext {
-  readonly breakerState: ReturnType<typeof createLineBreakerState>;
-  readonly flush: (forceHeight?: number, brTerminated?: boolean, nextStart?: LineBoundary) => void;
-  readonly baseRtl: boolean;
-  readonly addToLine: (
-    segment: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg,
-    width: number,
-    height: number,
-    ascent: number,
-    descent: number,
-  ) => void;
-  readonly scale: number;
-  readonly firstIndent: number;
-  readonly tabOriginPx: number;
-  readonly maxWidth: number;
-  readonly marginRightPx: number;
-  readonly tabFollowWidth: (segment: LayoutSeg) => number;
-  readonly measureText: (segment: LayoutTextSeg, clusterGeometry?: boolean) => TextMetrics;
-  readonly verticalInkExtra: (segment: LayoutTextSeg, text: string) => number;
-  readonly characterGrid: DocGridCtx | undefined;
-  readonly tabStops: TabStop[];
-  readonly defaultTabPt: number;
-  readonly tabFollowingMetrics: () => Readonly<{ totalWidth: number; decimalPrefixWidth?: number }>;
-  readonly availW: () => number;
-  readonly setMeasureFont: (font: string) => void;
-  readonly fontFamilyClasses: Record<string, string>;
-  readonly measurement: LineMeasurementAdapter;
-  readonly textSegmentBox: (
-    segment: LayoutTextSeg,
-  ) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
-  readonly prospectiveSnapAdvance: (segment: LayoutTextSeg, naturalWidth: number) => number;
-  readonly segAdvance: (segment: LayoutTextSeg) => number;
-  readonly strAdvance: (
-    segment: LayoutTextSeg,
-    text: string,
-    retainTrailingPunctuationCompression?: boolean,
-  ) => number;
-  readonly isJustified: boolean;
-  readonly stretchLastLine: boolean;
-  readonly overflowPunct: boolean;
-  readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
-  readonly fitsMeasuredWidth: (used: number, available: number) => boolean;
-  readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
-  readonly appendQueuedIdeographicSpaceSegment: (source: LayoutTextSeg) => void;
-  readonly emergencyTextSplit: (
-    segment: LayoutTextSeg,
-    available: number,
-    forceAtLeastOne?: boolean,
-  ) => number;
-  readonly effectiveFontPx: (segment: LayoutTextSeg) => number;
-  readonly ctx: MeasurementTextContext;
-  readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
-  readonly kinsoku: KinsokuRules;
-  readonly strNaturalAdvance: (
-    segment: LayoutTextSeg,
-    text: string,
-    retainTrailingPunctuationCompression?: boolean,
-  ) => number;
-  readonly retractCurrentLineForLeadingKinsoku: (next: LayoutTextSeg) => CrossRunKinsokuRetraction;
-  readonly keepLeadingKinsokuWithCurrentLine: (
-    segment: LayoutTextSeg,
-    height: number,
-    ascent: number,
-    descent: number,
-  ) => boolean;
-  readonly externalLinkSyntaxSplit: (segment: LayoutTextSeg, available: number) => number;
-  readonly queueEmergencyTail: (segment: LayoutTextSeg, split: number) => void;
-}
+/** The iterator reads only its declared slice of the explicit pass state. */
+export type BreakOpportunityIteratorContext = Pick<
+  PassOperationState,
+  | 'breakerState'
+  | 'flush'
+  | 'baseRtl'
+  | 'addToLine'
+  | 'scale'
+  | 'firstIndent'
+  | 'tabOriginPx'
+  | 'maxWidth'
+  | 'marginRightPx'
+  | 'tabFollowWidth'
+  | 'measureText'
+  | 'verticalInkExtra'
+  | 'characterGrid'
+  | 'tabStops'
+  | 'defaultTabPt'
+  | 'tabFollowingMetrics'
+  | 'availW'
+  | 'setMeasureFont'
+  | 'fontFamilyClasses'
+  | 'measurement'
+  | 'textSegmentBox'
+  | 'prospectiveSnapAdvance'
+  | 'segAdvance'
+  | 'strAdvance'
+  | 'isJustified'
+  | 'stretchLastLine'
+  | 'overflowPunct'
+  | 'sameLatinSpaceFace'
+  | 'fitsMeasuredWidth'
+  | 'fitHomogeneousLatinSpaces'
+  | 'appendQueuedIdeographicSpaceSegment'
+  | 'emergencyTextSplit'
+  | 'effectiveFontPx'
+  | 'ctx'
+  | 'verticalGlyphMeasurement'
+  | 'kinsoku'
+  | 'strNaturalAdvance'
+  | 'retractCurrentLineForLeadingKinsoku'
+  | 'keepLeadingKinsokuWithCurrentLine'
+  | 'externalLinkSyntaxSplit'
+  | 'queueEmergencyTail'
+>;
 
 /** Consume one prepared queue in source order, applying all legal break paths. */
 export function iterateBreakOpportunities(context: BreakOpportunityIteratorContext): void {

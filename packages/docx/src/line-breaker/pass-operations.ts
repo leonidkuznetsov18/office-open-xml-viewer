@@ -1,18 +1,11 @@
 import { LineMeasurementAdapter } from './measurement-adapter.js';
-import type { TabStop } from '../types';
-import type { KinsokuRules } from '@silurus/ooxml-core';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import {
   MIN_LINE_GAP,
   prepareFloatWrap,
   computePreparedLineFloatWindow,
-  wordMinLineStartPx,
   type PreparedFloatWrap,
 } from '../float-layout.js';
-import type {
-  MeasurementTextContext,
-  VerticalGlyphMeasurementService,
-} from '../layout/measurement-capabilities.js';
 import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
 import {
   wordSnapToCharsEastAsianCellCount,
@@ -20,17 +13,14 @@ import {
   wordUniformRunPositionPaintPt,
 } from '../layout/line-compatibility.js';
 import {
-  type DocGridCtx,
   type LayoutImageSeg,
-  type LayoutLine,
   type LayoutMathSeg,
   type LayoutSeg,
   type LayoutTabSeg,
   type LayoutTextSeg,
   type LineBoundary,
-  type WrapLayoutCtx,
 } from './model.js';
-import { createLineBreakerState, prepareBreakQueue } from './break-queue.js';
+import { createLineBreakerState } from './break-queue.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -140,7 +130,6 @@ export interface PassOperationState extends LineBreakerPassInput {
 }
 
 export function performSameLatinSpaceFace(
-  operationState: PassOperationState,
   candidate: LayoutTextSeg,
   reference: LayoutTextSeg,
 ): boolean {
@@ -175,11 +164,6 @@ export function performMaterializeLatinSpaceCompression(operationState: PassOper
   }
   breakerState.latinAppliedGapCount = 0;
   breakerState.latinAppliedPerGap = 0;
-}
-
-export function performMinLineStartWidth(operationState: PassOperationState): number {
-  const { scale } = operationState;
-  return wordMinLineStartPx(scale);
 }
 
 export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
@@ -686,37 +670,6 @@ export function performAddToLine(
     breakerState.lineGridCountSingle = segGridCount;
 }
 
-export function performEffectiveFontPx(
-  operationState: PassOperationState,
-  s: LayoutTextSeg,
-): number {
-  const { scale } = operationState;
-  return calcEffectiveFontPx(s, scale);
-}
-
-export function performMeasureText(
-  operationState: PassOperationState,
-  s: LayoutTextSeg,
-  clusterGeometry = false,
-): TextMetrics {
-  const { measurement } = operationState;
-  return measurement.measureSegment(s, clusterGeometry);
-}
-
-export function performVerticalInkExtra(
-  operationState: PassOperationState,
-  s: LayoutTextSeg,
-  text: string,
-): number {
-  const { measurement } = operationState;
-  return measurement.verticalInkExtra(s, text);
-}
-
-export function performSetMeasureFont(operationState: PassOperationState, font: string): void {
-  const { measurement } = operationState;
-  return measurement.setFont(font);
-}
-
 export function performSegNaturalAdvance(
   operationState: PassOperationState,
   s: LayoutTextSeg,
@@ -1093,7 +1046,6 @@ export function performTabFollowWidth(operationState: PassOperationState, q: Lay
 }
 
 export function performDecimalAlignmentPoint(
-  operationState: PassOperationState,
   segments: readonly LayoutSeg[],
 ): Readonly<{ segmentIndex: number; charOffset: number }> | null {
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {

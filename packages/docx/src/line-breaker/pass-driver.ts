@@ -1,24 +1,12 @@
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { TabStop } from '../types';
 import type { KinsokuRules } from '@silurus/ooxml-core';
-import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import {
-  MIN_LINE_GAP,
-  prepareFloatWrap,
-  computePreparedLineFloatWindow,
-  wordMinLineStartPx,
-  type PreparedFloatWrap,
-} from '../float-layout.js';
+import { wordMinLineStartPx, type PreparedFloatWrap } from '../float-layout.js';
 import type {
   MeasurementTextContext,
   VerticalGlyphMeasurementService,
 } from '../layout/measurement-capabilities.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
-import {
-  wordSnapToCharsEastAsianCellCount,
-  wordIdeographicSpaceLineEndAllowanceCount,
-  wordUniformRunPositionPaintPt,
-} from '../layout/line-compatibility.js';
+import { calcEffectiveFontPx } from '../layout/text.js';
 import {
   type DocGridCtx,
   type LayoutImageSeg,
@@ -31,53 +19,19 @@ import {
   type WrapLayoutCtx,
 } from './model.js';
 import { createLineBreakerState, prepareBreakQueue } from './break-queue.js';
-import { applyBidiTabPostPass } from './tabs.js';
-import {
-  eastAsianGridCountSinglePx,
-  measuredLineMetrics,
-  nativeCanvasLineRatio,
-} from './line-metrics.js';
-import {
-  RESET_SLICED_TEXT_MEASUREMENT,
-  charScaleFactor,
-  charSpacingDeltaPx,
-  protectedNoBreakOffsets,
-  segAdvanceWidth,
-  segmentCharacterGridDeltaPx,
-  slicedPunctuationCompressions,
-  slicedTextMetadata,
-  snapToCharsAllocatedWidthPx,
-  snapToCharsClass,
-} from './advance.js';
-import {
-  buildFont,
-  segmentEastAsiaFloorSingleLinePx,
-  segmentIntendedSingleLinePx,
-} from './font-routes.js';
-import { rubyAscentReservePx } from './ruby-metrics.js';
-import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import { rebaseSeaBreaks } from './text-runs.js';
-import {
-  keepLeadingKinsoku,
-  retractLeadingKinsoku,
-  type CrossRunKinsokuRetraction,
-} from './kinsoku.js';
+import { buildFont } from './font-routes.js';
+import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
 import {
   performSameLatinSpaceFace,
   performMaterializeLatinSpaceCompression,
-  performMinLineStartWidth,
   performStartLine,
   performAvailW,
   performFitsMeasuredWidth,
   performFlush,
   performProspectiveSnapAdvance,
   performAddToLine,
-  performEffectiveFontPx,
-  performMeasureText,
-  performVerticalInkExtra,
-  performSetMeasureFont,
   performSegNaturalAdvance,
   performStandaloneSnapAdvance,
   performSegAdvance,
@@ -161,8 +115,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const breakerState = createLineBreakerState(maxWidth, wrapCtx);
 
   let operationState: PassOperationState;
-  const sameLatinSpaceFace = (candidate: LayoutTextSeg, reference: LayoutTextSeg): boolean =>
-    performSameLatinSpaceFace(operationState, candidate, reference);
+  const sameLatinSpaceFace = performSameLatinSpaceFace;
 
   const materializeLatinSpaceCompression = (): void =>
     performMaterializeLatinSpaceCompression(operationState);
@@ -195,7 +148,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   // content (including a content paragraph's trailing-break final line) keeps
   // the square-only 1-inch rule. Tight/through are governed by their polygon
   // openings (§20.4.2.18/.19), for which there is no corresponding evidence.
-  const minLineStartWidth = (): number => performMinLineStartWidth(operationState);
+  const minLineStartWidth = (): number => wordMinLineStartPx(scale);
   const isParagraphMarkOnlyFlow =
     segs.length > 0 &&
     segs.every(
@@ -266,12 +219,12 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
       ),
     verticalGlyphMeasurement,
   );
-  const effectiveFontPx = (s: LayoutTextSeg): number => performEffectiveFontPx(operationState, s);
+  const effectiveFontPx = (s: LayoutTextSeg): number => calcEffectiveFontPx(s, scale);
   const measureText = (s: LayoutTextSeg, clusterGeometry = false): TextMetrics =>
-    performMeasureText(operationState, s, clusterGeometry);
+    measurement.measureSegment(s, clusterGeometry);
   const verticalInkExtra = (s: LayoutTextSeg, text: string): number =>
-    performVerticalInkExtra(operationState, s, text);
-  const setMeasureFont = (font: string): void => performSetMeasureFont(operationState, font);
+    measurement.verticalInkExtra(s, text);
+  const setMeasureFont = (font: string): void => measurement.setFont(font);
 
   const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
   breakerState.queue = prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement);
@@ -348,10 +301,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
 
   /** Resolve the registered decimal alignment point independently of run/style
    * seams so both LTR and mirrored bidi tab paths consume one source boundary. */
-  const decimalAlignmentPoint = (
-    segments: readonly LayoutSeg[],
-  ): Readonly<{ segmentIndex: number; charOffset: number }> | null =>
-    performDecimalAlignmentPoint(operationState, segments);
+  const decimalAlignmentPoint = performDecimalAlignmentPoint;
 
   const decimalAlignmentPrefixWidth = (segments: readonly LayoutSeg[]): number | undefined =>
     performDecimalAlignmentPrefixWidth(operationState, segments);
@@ -464,49 +414,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
       : minLineStartWidth(),
   );
 
-  iterateBreakOpportunities({
-    breakerState,
-    flush,
-    baseRtl,
-    addToLine,
-    scale,
-    firstIndent,
-    tabOriginPx,
-    maxWidth,
-    marginRightPx,
-    tabFollowWidth,
-    measureText,
-    verticalInkExtra,
-    characterGrid,
-    tabStops,
-    defaultTabPt,
-    tabFollowingMetrics,
-    availW,
-    setMeasureFont,
-    fontFamilyClasses,
-    measurement,
-    textSegmentBox,
-    prospectiveSnapAdvance,
-    segAdvance,
-    strAdvance,
-    isJustified,
-    stretchLastLine,
-    overflowPunct,
-    sameLatinSpaceFace,
-    fitsMeasuredWidth,
-    fitHomogeneousLatinSpaces,
-    appendQueuedIdeographicSpaceSegment,
-    emergencyTextSplit,
-    effectiveFontPx,
-    ctx,
-    verticalGlyphMeasurement,
-    kinsoku,
-    strNaturalAdvance,
-    retractCurrentLineForLeadingKinsoku,
-    keepLeadingKinsokuWithCurrentLine,
-    externalLinkSyntaxSplit,
-    queueEmergencyTail,
-  });
+  iterateBreakOpportunities(operationState);
 
   if (breakerState.currentLine.length > 0) flush();
   // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
