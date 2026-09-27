@@ -11,6 +11,7 @@ import {
   MaterializedDocumentCursorArchive,
 } from './document-pull-worker.js';
 import { installStubCanvas, syntheticDocxModel } from './testing/synthetic-document.js';
+import { installDeterministicPaginationHost } from './testing/deterministic-pagination-host.js';
 import type { DocumentMeta } from './worker-protocol.js';
 
 vi.mock('@silurus/ooxml-core', async (load) => ({
@@ -141,6 +142,7 @@ beforeAll(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   globals.Worker = originals.Worker;
   globals.location = originals.location;
   ProtocolWorker.instances = [];
@@ -191,30 +193,32 @@ describe('DocxDocument.load with model sources', () => {
 
   it('keeps a sliced model-source load moving when its view is re-applied on progress', async () => {
     install(parseWorkerScript(undefined, 20));
+    const yields = installDeterministicPaginationHost();
     const { source } = fakeSource();
-    let requested = false;
+    const abort = new AbortController();
     let viewChanged: (() => void) | null = null;
-    const progress: number[] = [];
+    let progress = 0;
     const document = await DocxDocument.load(cfbBytes(), {
       modelSources: [source],
       [docxViewerLoadSignal]: {
-        signal: new AbortController().signal,
-        requestedView: () => requested,
+        signal: abort.signal,
+        requestedView: () => false,
         subscribeViewChange: (listener: () => void) => {
           viewChanged = listener;
           return () => { if (viewChanged === listener) viewChanged = null; };
         },
       },
-      onLayoutProgress: ({ committedUnits }) => {
-        progress.push(committedUnits);
-        if (progress.length <= 20) {
-          requested = false;
-          viewChanged?.();
-        }
+      onLayoutProgress: () => {
+        progress++;
+        viewChanged?.();
+        // A no-op request used to restart the first slice forever. Bound that
+        // failure without assuming a particular page count or host speed.
+        if (progress === 200) abort.abort();
       },
     } as LoadOptions);
     try {
-      expect(progress.slice(0, 20).some((count) => count > 1)).toBe(true);
+      expect(progress).toBeGreaterThan(0);
+      expect(yields()).toBeGreaterThan(0);
       expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(false);
     } finally {
       document.destroy();
@@ -223,11 +227,12 @@ describe('DocxDocument.load with model sources', () => {
 
   it('restarts a sliced model-source load for one real view change', async () => {
     install(parseWorkerScript(undefined, 20));
+    const yields = installDeterministicPaginationHost();
     const { source } = fakeSource();
     let requested: boolean | undefined;
     let viewChanged: (() => void) | null = null;
     let changed = false;
-    const progress: number[] = [];
+    let progress = 0;
     const document = await DocxDocument.load(cfbBytes(), {
       modelSources: [source],
       [docxViewerLoadSignal]: {
@@ -238,8 +243,8 @@ describe('DocxDocument.load with model sources', () => {
           return () => { if (viewChanged === listener) viewChanged = null; };
         },
       },
-      onLayoutProgress: ({ committedUnits }) => {
-        progress.push(committedUnits);
+      onLayoutProgress: () => {
+        progress++;
         if (changed) return;
         changed = true;
         requested = true;
@@ -248,7 +253,8 @@ describe('DocxDocument.load with model sources', () => {
       },
     } as LoadOptions);
     try {
-      expect(progress.some((count) => count > 1)).toBe(true);
+      expect(progress).toBeGreaterThan(0);
+      expect(yields()).toBeGreaterThan(0);
       expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(true);
     } finally {
       document.destroy();

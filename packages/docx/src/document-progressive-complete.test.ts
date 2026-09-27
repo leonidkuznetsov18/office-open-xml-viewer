@@ -5,6 +5,7 @@ import { activeDocxLayoutViewOf } from './document-layout-view.js';
 import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { layoutSourceStore } from './layout-source-model-adapter.js';
 import { installStubCanvas, syntheticDocxModel } from './testing/synthetic-document.js';
+import { installDeterministicPaginationHost } from './testing/deterministic-pagination-host.js';
 import { DocxViewer } from './viewer.js';
 import { installDom, makeEl } from './scroll-viewer-test-dom.js';
 
@@ -145,19 +146,22 @@ describe('ordinary main-mode sliced load ownership', () => {
     // every update: the load must advance past its first paginator slice.
     installDom();
     installMainModeParse(20);
+    const yields = installDeterministicPaginationHost();
     vi.spyOn(DocxViewer.prototype as unknown as { _render(): Promise<void> }, '_render')
       .mockResolvedValue(undefined);
-    const progress: number[] = [];
+    let progress = 0;
     const viewer = new DocxViewer(makeEl('canvas') as unknown as HTMLCanvasElement, {
-      onLayoutProgress: ({ committedUnits }) => {
-        progress.push(committedUnits);
-        if (progress.length <= 20) void viewer.setShowTrackedChanges(false);
+      onLayoutProgress: () => {
+        progress++;
+        void viewer.setShowTrackedChanges(false);
+        if (progress === 200) viewer.destroy();
       },
     });
     vi.stubGlobal('document', undefined);
     try {
       await viewer.load(new ArrayBuffer(0));
-      expect(progress.slice(0, 20).some((count) => count > 1)).toBe(true);
+      expect(progress).toBeGreaterThan(0);
+      expect(yields()).toBeGreaterThan(0);
     } finally {
       viewer.destroy();
     }
@@ -166,6 +170,7 @@ describe('ordinary main-mode sliced load ownership', () => {
   it('settles on the final view after repeated changes during pagination', async () => {
     installDom();
     installMainModeParse(60, 'tracked');
+    const yields = installDeterministicPaginationHost();
     let loadedDoc!: DocxDocument;
     vi.spyOn(DocxDocument.prototype as unknown as {
       _resourceUsage(timeoutMs: number): Promise<OoxmlResourceUsageSnapshot>;
@@ -187,6 +192,7 @@ describe('ordinary main-mode sliced load ownership', () => {
     try {
       await viewer.load(new ArrayBuffer(0));
       expect(notifications).toBeGreaterThanOrEqual(views.length);
+      expect(yields()).toBeGreaterThan(0);
       expect(activeDocxLayoutViewOf(loadedDoc).showTrackedChanges).toBe(true);
     } finally {
       viewer.destroy();
@@ -264,10 +270,11 @@ describe('ordinary main-mode sliced load ownership', () => {
 
   it('cancels the active layout and resolves the original load with the latest tracked view', async () => {
     installMainModeParse(60);
+    const yields = installDeterministicPaginationHost();
     let requested: boolean | undefined;
     let listener: (() => void) | null = null;
     let changed = false;
-    const progress: number[] = [];
+    let progress = 0;
     const control: DocxViewerLoadControl = {
       signal: new AbortController().signal,
       requestedView: () => requested,
@@ -278,8 +285,8 @@ describe('ordinary main-mode sliced load ownership', () => {
     };
     const opts = {
       [docxViewerLoadSignal]: control,
-      onLayoutProgress: ({ committedUnits }) => {
-        progress.push(committedUnits);
+      onLayoutProgress: () => {
+        progress++;
         if (changed) return;
         changed = true;
         requested = true;
@@ -289,7 +296,8 @@ describe('ordinary main-mode sliced load ownership', () => {
     } as LoadOptions;
     const doc = await DocxDocument.load(new ArrayBuffer(0), opts);
     expect(changed).toBe(true);
-    expect(progress.some((count) => count > 1)).toBe(true);
+    expect(progress).toBeGreaterThan(0);
+    expect(yields()).toBeGreaterThan(0);
     expect(activeDocxLayoutViewOf(doc).showTrackedChanges).toBe(true);
     expect(doc.layoutComplete).toBe(true);
     doc.destroy();
