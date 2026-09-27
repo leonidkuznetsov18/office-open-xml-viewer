@@ -59,6 +59,7 @@
     "./internal/highlight-layer-controller": "./src/viewer/highlight-layer-controller.ts",
     "./internal/bitmap-slot-renderer": "./src/viewer/bitmap-slot-renderer.ts",
     "./internal/main-slot-renderer": "./src/viewer/main-slot-renderer.ts",
+    "./internal/slot-layer-controller": "./src/viewer/slot-layer-controller.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"

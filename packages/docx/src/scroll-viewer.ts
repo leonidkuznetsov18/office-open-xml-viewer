@@ -20,6 +20,7 @@ import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-sh
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
 import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
+import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -358,6 +359,26 @@ export class DocxScrollViewer implements ZoomableViewer {
     gapPx: COMMENT_MARGIN_GAP_PX,
     widthPx: READ_ONLY_COMMENT_MARGIN_WIDTH_PX,
     fontSizePx: COMMENT_MARGIN_FONT_SIZE_PX,
+  });
+  private readonly _layers = new SlotLayerController<PageSlot>({
+    markerLayer: (slot) => slot.commentTintLayer,
+    syncMargin: (margin) => this._commentMargin.syncMargin(margin),
+    marginSide: () => this._commentMargin.side(),
+    marginExtent: () => this._commentMargin.extent(),
+    commentsEnabled: () => this._commentsEnabled(),
+    previewMargin: (margin, ratio) => this._commentUi?.previewReadOnlyCommentMargin(margin, ratio),
+    disposeMargin: (margin) => {
+      this._commentUi?.disposeReadOnlyCommentMargin(margin);
+      if (!this._commentUi) margin.replaceChildren();
+    },
+    disposeDecoration: (layer) => {
+      this._commentUi?.disposeReadOnlyCommentDecoration(layer);
+      if (!this._commentUi) layer.replaceChildren();
+    },
+    redrawOutline: (unit, slot) => this._selection.redrawOutlineForSlot(unit, slot),
+    markerRatio: (ratio) => ratio,
+    resetMarkerTransform: () => true,
+    resetDecorationVisibility: () => false,
   });
   private readonly _commentOverlay = new CommentOverlayController<PageSlot>({
     slots: () => this._slots,
@@ -1082,58 +1103,17 @@ export class DocxScrollViewer implements ZoomableViewer {
     if (!this._destroyed) {
       slot.dispatcher = new StaticCanvasRenderDispatcher(slot.canvas, this._mode === 'worker');
     }
-    resetSlotHost(slot);
-    if (slot.commentTintLayer) {
-      slot.commentTintLayer.replaceChildren();
-      slot.commentTintLayer.style.transform = '';
-      slot.commentTintLayer.style.transformOrigin = '';
-      slot.commentTintLayer.style.visibility = '';
-    }
-    if (slot.commentMargin) {
-      this._commentUi?.disposeReadOnlyCommentMargin(slot.commentMargin);
-      if (!this._commentUi) slot.commentMargin.replaceChildren();
-      slot.commentMargin.style.visibility = '';
-    }
-    if (slot.commentDecorationLayer) {
-      this._commentUi?.disposeReadOnlyCommentDecoration(slot.commentDecorationLayer);
-      if (!this._commentUi) slot.commentDecorationLayer.replaceChildren();
-    }
+    this._layers.reset(slot);
     slot.commentRuns = Object.freeze([]);
     slot.commentGeometry = null;
-    renderCanvasElementOutline(slot.elementLayer, null);
     slot.renderedPage = -1;
     slot.renderedScale = -1;
     slot.wrapper.remove();
   }
 
   private _positionSlot(slot: PageSlot, i: number, r: VisibleRange): void {
-    slot.wrapper.style.top = `${r.offsets[i]}px`;
-    const wpx = this._pageWidthPx(i);
-    const hpx = this._pageHeightPx(i);
-    slot.wrapper.style.width = `${wpx}px`;
-    slot.wrapper.style.height = `${hpx}px`;
-    this._commentMargin.syncMargin(slot.commentMargin);
-    if (slot.commentDecorationLayer) {
-      const marginExtent = this._commentMargin.extent();
-      slot.commentDecorationLayer.style.left = this._commentMargin.side() === 'left'
-        ? `${-marginExtent}px`
-        : '0px';
-      slot.commentDecorationLayer.style.width = `${wpx + marginExtent}px`;
-      slot.commentDecorationLayer.style.height = `${hpx}px`;
-    }
-    this._selection.redrawOutlineForSlot(i, slot);
-    // Horizontal placement (replaces the old CSS `left:0;right:0;margin:0 auto`
-    // auto-centering, which cannot honour a left gutter). Centre the page in the
-    // scroll viewport, but never let its left edge cross the left gutter: when the
-    // page is narrower than the viewport it is centred (`(cw − pw)/2 > padL`); once
-    // zoomed wider than the viewport the centre would go negative, so the floor
-    // pins it at `padL` and the overflow scrolls right. Formula deliberately
-    // duplicated per viewer (one line; not hoisted to core).
-    const { left: padL } = this._padH();
-    const authoredLeft = Math.max(padL, (this._scrollHost.clientWidth - wpx) / 2);
-    slot.wrapper.style.left = this._commentMargin.side() === 'left' && this._commentsEnabled()
-      ? `calc(${authoredLeft}px + var(--ooxml-review-origin-x, 0px))`
-      : `${authoredLeft}px`;
+    this._layers.position(i, slot, r.offsets[i], this._pageWidthPx(i), this._pageHeightPx(i),
+      this._scrollHost.clientWidth, this._padH().left);
   }
 
   /** Device-pixel ratio for a render (opts override → window → 1). */
@@ -1292,23 +1272,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    */
   private _previewSlot(slot: PageSlot, i: number, r: VisibleRange): void {
     this._positionSlot(slot, i, r);
-    const ratio = previewSlotHost(slot, this._pageWidthPx(i), this._pageHeightPx(i), this._scale);
-    if (ratio !== null) {
-      if (slot.commentMargin) this._commentUi?.previewReadOnlyCommentMargin(slot.commentMargin, ratio);
-      for (const marker of slot.commentTintLayer?.children ?? []) {
-        if ((marker as HTMLElement).dataset.ooxmlCommentMarker === undefined) continue;
-        (marker as HTMLElement).style.transform = `translate(-50%,-50%) scale(${ratio})`;
-      }
-      if (slot.commentTintLayer) slot.commentTintLayer.style.visibility = '';
-      if (slot.commentMargin) slot.commentMargin.style.visibility = '';
-      if (slot.commentDecorationLayer) slot.commentDecorationLayer.style.visibility = '';
-      return;
-    }
-    // No committed geometry exists during the first render, so there is nothing
-    // trustworthy to preview yet.
-    if (slot.commentTintLayer) slot.commentTintLayer.style.visibility = 'hidden';
-    if (slot.commentMargin) slot.commentMargin.style.visibility = 'hidden';
-    if (slot.commentDecorationLayer) slot.commentDecorationLayer.style.visibility = 'hidden';
+    this._layers.preview(slot, this._pageWidthPx(i), this._pageHeightPx(i), this._scale);
   }
 
   /** Restore a text overlay after its transient CSS zoom preview. */
