@@ -650,10 +650,26 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       style: request.style,
     });
   };
-  // Pagination convergence reacquires equal paragraphs under equal service
-  // fingerprints. Native Canvas metrics are pure for this complete request
-  // tuple, so retain one immutable document-scoped result across those passes.
+  // Pagination convergence and later view variants revisit text under the same
+  // service fingerprint. Keep recent pure results for those passes, but cap
+  // document lifetime retention after long documents finish paginating.
+  // The 295-page relayout probe used 33,024 distinct measurements and 73,436
+  // shapes; a smaller cap caused sequential variant layouts to thrash.
+  const measurementCacheLimit = 40960;
+  const shapeCacheLimit = 81920;
   const measurementCache = new Map<string, Readonly<GlyphMeasurement>>();
+  const cached = <T>(cache: Map<string, T>, key: string): T | undefined => {
+    const value = cache.get(key);
+    if (value !== undefined) {
+      cache.delete(key);
+      cache.set(key, value);
+    }
+    return value;
+  };
+  const retain = <T>(cache: Map<string, T>, key: string, value: T, limit: number): void => {
+    cache.set(key, value);
+    if (cache.size > limit) cache.delete(cache.keys().next().value as string);
+  };
   const measureGlyph = (request: Readonly<GlyphMeasureRequest>): Readonly<GlyphMeasurement> => {
     const key = JSON.stringify([
       request.text,
@@ -666,7 +682,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       request.letterSpacingPt,
       request.kerning ?? null,
     ]);
-    const retained = measurementCache.get(key);
+    const retained = cached(measurementCache, key);
     if (retained) return retained;
     const measured = input.measurer.measure(request);
     const snapshot = Object.freeze({
@@ -675,7 +691,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         inkBounds: Object.freeze({ ...measured.inkBounds }),
       } : {}),
     });
-    measurementCache.set(key, snapshot);
+    retain(measurementCache, key, snapshot, measurementCacheLimit);
     return snapshot;
   };
   // Contextual cluster geometry measures every grapheme prefix of a script
@@ -729,7 +745,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.measure ?? null,
         request.clusterGeometry ?? null,
       ]);
-      const retainedShape = shapeCache.get(shapeKey);
+      const retainedShape = cached(shapeCache, shapeKey);
       if (retainedShape) return retainedShape;
       const grouped: {
         text: string; start: number; end: number; script: FontScriptSlot; breakBefore: boolean;
@@ -869,7 +885,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         ...(clusters ? { clusters } : {}),
         diagnostics: Object.freeze(diagnostics),
       });
-      shapeCache.set(shapeKey, result);
+      retain(shapeCache, shapeKey, result, shapeCacheLimit);
       return result;
     },
   });

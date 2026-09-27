@@ -342,7 +342,7 @@ export class XlsxWorkbook {
 
   /** Parse an XLSX from a URL or ArrayBuffer. */
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<XlsxWorkbook> {
-    if (opts.modelSources !== undefined) {
+    if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
       const { loadXlsxModelSource } = await import('./internal/workbook-model-source.js');
       return loadXlsxModelSource(source, opts);
     }
@@ -1543,3 +1543,4 @@ export function retainXlsxWorksheetReference(workbook: XlsxWorkbook, sheetIndex:
     ? retain.call(workbook, sheetIndex)
     : Promise.resolve(() => undefined);
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

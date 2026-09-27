@@ -96,7 +96,7 @@ export async function openXlsxWorkbook(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenXlsxWorkbookOptions = {},
 ): Promise<XlsxWorkbookSession> {
-  if (options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
     const { openXlsxSource } = await import('./xlsx-model-source.ts');
     return openXlsxSource(buffer, options, getXlsxWasmModule);
   }
@@ -449,3 +449,4 @@ function decodeUsage(bytes: Uint8Array): OoxmlResourceUsageSnapshot | undefined 
 function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
   return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

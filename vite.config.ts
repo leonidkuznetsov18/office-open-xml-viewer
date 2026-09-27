@@ -120,6 +120,9 @@ export function legacyBundleBoundary(): Plugin {
 }
 
 export default defineConfig(({ command, mode }) => ({
+  // The private comparison build removes selected-source dispatch and code
+  // reachable only through it. Published and dev builds always use true.
+  define: { __OOXML_MODEL_SOURCES__: mode === 'model-sources-off' ? 'false' : 'true' },
   // Published library assets must resolve from the imported module URL, not
   // from the hosting page's origin root. This is especially important for the
   // standalone module workers and sibling assets when consumers serve the
@@ -132,7 +135,7 @@ export default defineConfig(({ command, mode }) => ({
     // Storybook loads the root Vite config in serve mode. The declaration
     // plugins are build-only: their Rolldown buildStart hooks expect library
     // inputs and fail against Storybook's dev-server graph.
-    ...(command === 'build' && mode !== 'runtime'
+    ...(command === 'build' && mode !== 'runtime' && mode !== 'model-sources-off'
       ? dts({
           // TypeScript 7 is the repository's sole compiler. Its native tsgo
           // declaration generator avoids the removed JavaScript Compiler API.
@@ -148,6 +151,8 @@ export default defineConfig(({ command, mode }) => ({
   },
   build: {
     lib: {
+      // Keep both comparison builds on the same entry set: changing the set
+      // would also change shared-chunk factoring and distort the byte delta.
       entry: {
         index: resolve(__dirname, 'src/index.ts'),
         pptx:  resolve(__dirname, 'src/pptx.ts'),

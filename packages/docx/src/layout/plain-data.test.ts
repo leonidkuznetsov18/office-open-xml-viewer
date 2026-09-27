@@ -1,7 +1,35 @@
 import { describe, expect, it } from 'vitest';
-import { deepFreezePlainData, sealPlainData, snapshotPlainData } from './plain-data.js';
+import {
+  deepFreezePlainData,
+  deepFreezePlainDataWithFrozenAliases,
+  sealPlainData,
+  snapshotPlainData,
+} from './plain-data.js';
 
 describe('plain layout data snapshots', () => {
+  it('freezes mutable descendants of an already frozen wrapper', () => {
+    const child = { value: 1 };
+    const wrapper = Object.freeze({ child });
+    deepFreezePlainData(wrapper);
+
+    expect(Object.isFrozen(child)).toBe(true);
+  });
+
+  it('freezes new occurrence values beside a deeply frozen source alias', () => {
+    const source = deepFreezePlainData({ shared: { values: [1, 2] } });
+    const projected = deepFreezePlainDataWithFrozenAliases({
+      shared: source.shared,
+      occurrence: { id: 'second', bounds: { xPt: 10 } },
+    }, source);
+
+    expect(projected.shared).toBe(source.shared);
+    expect(Object.isFrozen(projected.occurrence)).toBe(true);
+    expect(Object.isFrozen(projected.occurrence.bounds)).toBe(true);
+    expect(structuredClone(projected)).toEqual({
+      shared: { values: [1, 2] }, occurrence: { id: 'second', bounds: { xPt: 10 } },
+    });
+  });
+
   it('preserves signed unbounded finite DrawingML source-rectangle percentages exactly', () => {
     const authored = { l: -0.25, t: 1.25, r: 1.5, b: -0.75 };
     const source = { srcRect: { ...authored } };
@@ -103,9 +131,13 @@ describe('plain layout data snapshots', () => {
   });
 
   it('treats sealed builder-owned data as already processed', () => {
-    const sealed = sealPlainData({ nested: { value: 1 } }, 'layout payload');
+    const child = { value: 1 };
+    const sealed = sealPlainData({ first: child, second: child }, 'layout payload');
 
     expect(snapshotPlainData(sealed, 'layout payload')).toBe(sealed);
+    expect(sealed.first).toBe(sealed.second);
+    expect(Object.isFrozen(sealed.first)).toBe(true);
+    expect(structuredClone(sealed)).toEqual({ first: { value: 1 }, second: { value: 1 } });
   });
 
   it('preserves an own enumerable __proto__ data property like structuredClone', () => {

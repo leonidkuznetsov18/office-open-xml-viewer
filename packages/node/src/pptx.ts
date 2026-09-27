@@ -86,7 +86,7 @@ async function openPptxPresentationImpl(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenPptxPresentationOptions = {},
 ): Promise<PptxPresentationSessionImpl> {
-  if (options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
     const { openPptxSource } = await import('./pptx-model-source.ts');
     return openPptxSource(buffer, options, getPptxWasmModule);
   }
@@ -355,3 +355,4 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   error.name = 'AbortError';
   throw error;
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

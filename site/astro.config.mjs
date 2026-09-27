@@ -12,6 +12,8 @@ export default defineConfig({
   base: SITE_BASE,
   trailingSlash: 'ignore',
   vite: {
+    // Site demos compile the workspace package sources directly.
+    define: { __OOXML_MODEL_SOURCES__: 'true' },
     // Keep native module evaluation ordering for the WASM-backed Viewer
     // graph. Transforming top-level await into exported `__tla` promises can
     // leave Astro's separately emitted page scripts using Viewer exports before
