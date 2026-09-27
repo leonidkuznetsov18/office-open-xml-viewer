@@ -231,6 +231,11 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(fmt(5, '0_""hours"')).toBe('5 hours');
   });
 
+  it('reads Japanese era codes as dates, scientific E+ as a number', () => {
+    expect(fmt(45292, '[$-411]ggge')).toBe('令和6');
+    expect(fmt(1234, '0.00E+00')).toBe('1.23E+03');
+  });
+
   it('decides number vs time from the section the value selects', () => {
     expect(fmt(5, '0.00;h:mm')).toBe('5.00');
     expect(fmt(-0.5, '0.00;h:mm')).toBe('12:00');

@@ -121,9 +121,14 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   const mo = date.getUTCMonth() + 1;   // 1-12
   const dy = date.getUTCDate();
   const wd = date.getUTCDay();          // 0=Sun
-  const hr = date.getUTCHours();
-  const mi = date.getUTCMinutes();
-  const sc = date.getUTCSeconds();
+  // An elapsed-time section (`[h]:mm`, `[mm]:ss`) reads its clock fields as
+  // remainders of the same absolute, millisecond-rounded duration as its
+  // elapsed total, so a negative duration keeps consistent minutes.
+  const elapsedSection = /\[(h+|m+|s+)\]/i.test(section);
+  const absMs = Math.round(Math.abs(serial) * 86_400_000);
+  const hr = elapsedSection ? Math.floor(absMs / 3_600_000) % 24 : date.getUTCHours();
+  const mi = elapsedSection ? Math.floor(absMs / 60_000) % 60 : date.getUTCMinutes();
+  const sc = elapsedSection ? Math.floor(absMs / 1_000) % 60 : date.getUTCSeconds();
 
   // Take the first section (positive / no-sign section)
   const hasAmPm = /am\/pm|a\/p/i.test(section);
@@ -157,7 +162,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
         const sign = serial < 0 ? '-' : '';
         // Whole seconds of the millisecond-rounded duration, the same
         // rounding the clock fields above get from excelSerialToUtcDate.
-        const absSec = Math.floor(Math.round(Math.abs(serial) * 86_400_000) / 1000);
+        const absSec = Math.floor(absMs / 1000);
         let v: number;
         if      (kind === 'h') v = Math.floor(absSec / 3600);
         else if (kind === 'm') v = Math.floor(absSec / 60);
@@ -178,9 +183,14 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       i += 2; // * followed by fill character — skip both
 
     } else if (ch === '\\') {
-      if (i + 1 < section.length) result += section[i + 1];
+      const escaped = section[i + 1];
+      if (escaped !== undefined) result += escaped;
       i += 2;
-      prevWasHour = false;
+      // An escaped time separator (`h\:mm`) keeps the hour context, like the
+      // bare separators below.
+      if (escaped !== ':' && escaped !== '/' && escaped !== '-' && escaped !== '.' && escaped !== ' ') {
+        prevWasHour = false;
+      }
 
     } else if (ch === 'y' || ch === 'Y') {
       let n = 0;
@@ -293,7 +303,9 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
  *  `_x` padding and `*x` fill pairs (whose operand may itself be `"`), quoted
  *  literals and bracket content are skipped; what remains is date/time when
  *  it holds y / m / d / h / s, AM/PM or A/P, the Japanese weekday code
- *  `aaa+`, or an elapsed-time bracket `[h]` / `[mm]` / `[ss]`. */
+ *  `aaa+`, the Japanese era `g` / era year `e` (an `E+` / `E-` is scientific
+ *  notation, and `General` is the General keyword), or an elapsed-time
+ *  bracket `[h]` / `[mm]` / `[ss]`. */
 export function isDateFormatSection(body: string): boolean {
   let i = 0;
   while (i < body.length) {
@@ -308,7 +320,11 @@ export function isDateFormatSection(body: string): boolean {
       if (end < 0) return false;
       if (/^([hms])\1*$/i.test(body.slice(i + 1, end))) return true;
       i = end + 1;
-    } else if (/[ymdhs]/i.test(ch)) {
+    } else if (/^general/i.test(body.slice(i))) {
+      i += 'general'.length;
+    } else if (/[ymdhsg]/i.test(ch)) {
+      return true;
+    } else if ((ch === 'e' || ch === 'E') && body[i + 1] !== '+' && body[i + 1] !== '-') {
       return true;
     } else if (/^(am\/pm|a\/p|a{3,})/i.test(body.slice(i))) {
       return true;
@@ -318,4 +334,3 @@ export function isDateFormatSection(body: string): boolean {
   }
   return false;
 }
-

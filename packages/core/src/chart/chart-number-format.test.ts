@@ -88,6 +88,15 @@ describe('chart time fields (§18.17.4.2 time fraction)', () => {
     expect(formatChartValWithCode(45292.33333333333, 'hh:mm')).toBe('08:00');
     expect(formatChartValWithCode(0.33333333333333331, 'h:mm:ss')).toBe('8:00:00');
   });
+  it('keeps minutes after an escaped time separator', () => {
+    expect(formatChartValWithCode(45292.34375, 'h\\:mm')).toBe('8:15');
+  });
+  it('reads a negative elapsed duration from one absolute duration', () => {
+    expect(formatChartValWithCode(-1.5104166666666667, '[h]:mm', true)).toBe('-36:15');
+  });
+  it('treats an era-only code as a date', () => {
+    expect(formatCategoryLabel('45292', '[$-411]ggge')).toBe('令和6');
+  });
   it('carries a rounded midnight into the next day', () => {
     // 1 ms short of 2024-01-02 00:00 rounds up to it.
     const serial = 45293 - 0.4 / 86_400_000;
