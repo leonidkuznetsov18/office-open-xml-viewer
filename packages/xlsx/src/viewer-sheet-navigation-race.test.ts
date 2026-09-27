@@ -79,7 +79,7 @@ describe('XlsxViewer sheet acquisition generation', () => {
     progress.preview(model, null, 1_000, 1);
     progress.append(Array.from({ length: 128 }, (_, i) => ({ index: i + 1, height: null, cells: [] })));
     const completion = deferred<Worksheet>();
-    const sizes = engine.sizeOverrideStore as Map<number, unknown>;
+    const sizes = (engine.viewEdits as { sizeOverrideStore: Map<number, unknown> }).sizeOverrideStore;
     sizes.set(0, {
       rows: new Map(Array.from({ length: 200 }, (_, i) => [i + 1, 0])),
       automaticRows: new Map(), cols: new Map(), revision: 1,
