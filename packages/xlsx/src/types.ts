@@ -631,6 +631,10 @@ export interface ShapeParagraph {
   /** `<a:pPr@indent>` — first-line indent in EMU (negative = hanging),
    *  ECMA-376 §21.1.2.2.7. Omitted (undefined) when unset. */
   indent?: number;
+  /** `<a:pPr@defTabSz>` — default tab interval in EMU; omitted when unset. */
+  defTabSz?: number;
+  /** Authored `<a:pPr>/<a:tabLst>/<a:tab>` stops, in EMU. */
+  tabStops?: { pos: number; algn: string }[];
   /** `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5). Direct-only;
    *  omitted when unset. */
   spaceLine?: SpaceLine | null;

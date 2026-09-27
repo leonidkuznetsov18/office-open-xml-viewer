@@ -138,6 +138,19 @@ describe('shape-text line spacing (§21.1.2.2.5 <a:lnSpc>) + normAutofit lnSpcRe
   });
 });
 
+it('wraps through an authored shape run seam (Office control C01)', () => {
+  const { ctx, calls } = makeRecordingCtx();
+  const px = 20 * PT_TO_PX;
+  drawShapeText(ctx, {
+    anchor: 't', wrap: 'square', autoFit: 'none',
+    lIns: 0, rIns: 0, tIns: 0, bIns: 0,
+    paragraphs: [{ align: 'l', runs: [textRun('abc'), textRun('def')] }],
+  }, px * 4.5, 200, 1);
+  const byLine = new Map<number, string>();
+  for (const call of calls) byLine.set(call.y, (byLine.get(call.y) ?? '') + call.text);
+  expect([...byLine.values()]).toEqual(['abcd', 'ef']);
+});
+
 // Names alone cannot establish the selected font's bytes or line geometry.
 // With identical Canvas measurements, all font slots keep the same line height.
 describe('shape-text font slot identity', () => {

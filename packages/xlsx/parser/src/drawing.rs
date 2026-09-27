@@ -928,6 +928,8 @@ pub(crate) fn parse_tx_body(
                 let mut mar_l: Option<i64> = None;
                 let mut mar_r: Option<i64> = None;
                 let mut indent: Option<i64> = None;
+                let mut def_tab_sz: Option<i64> = None;
+                let mut tab_stops: Vec<ShapeTabStop> = Vec::new();
                 let mut space_line: Option<SpaceLine> = None;
                 let mut runs: Vec<ShapeTextRun> = Vec::new();
                 for pc in c.children().filter(|n| n.is_element()) {
@@ -949,6 +951,24 @@ pub(crate) fn parse_tx_body(
                             mar_l = pc.attribute("marL").and_then(|v| v.parse().ok());
                             mar_r = pc.attribute("marR").and_then(|v| v.parse().ok());
                             indent = pc.attribute("indent").and_then(|v| v.parse().ok());
+                            def_tab_sz = pc.attribute("defTabSz").and_then(|v| v.parse().ok());
+                            tab_stops = pc
+                                .children()
+                                .find(|n| n.is_element() && n.tag_name().name() == "tabLst")
+                                .into_iter()
+                                .flat_map(|list| {
+                                    list.children()
+                                        .filter(|n| n.is_element() && n.tag_name().name() == "tab")
+                                })
+                                .filter_map(|tab| {
+                                    tab.attribute("pos")?.parse::<i64>().ok().map(|pos| {
+                                        ShapeTabStop {
+                                            pos,
+                                            algn: tab.attribute("algn").unwrap_or("l").to_string(),
+                                        }
+                                    })
+                                })
+                                .collect();
                             // ECMA-376 §21.1.2.2.5 `<a:lnSpc>`: spcPct is a
                             // percentage of the natural single line; spcPts is an
                             // absolute per-line height (raw @val is hundredths of
@@ -1047,6 +1067,8 @@ pub(crate) fn parse_tx_body(
                         mar_l,
                         mar_r,
                         indent,
+                        def_tab_sz,
+                        tab_stops,
                         space_line,
                         runs,
                     });
@@ -2493,6 +2515,27 @@ mod math_tests {
             Some(-228600),
             "indent parses (negative = hanging)"
         );
+    }
+
+    /// CT_TextParagraphProperties carries explicit tab geometry to the shared
+    /// DrawingML line breaker. A dropped stop would fall back to the 1-inch grid.
+    #[test]
+    fn parses_shape_paragraph_tab_geometry() {
+        let xml = format!(
+            r#"<xdr:txBody {NS}>
+              <a:p>
+                <a:pPr defTabSz="457200"><a:tabLst><a:tab pos="3200400" algn="l"/></a:tabLst></a:pPr>
+                <a:r><a:t>Label&#9;Value</a:t></a:r>
+              </a:p>
+            </xdr:txBody>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let text = parse_tx_body(&doc.root_element(), &[]).expect("txBody parses");
+        let p = &text.paragraphs[0];
+        assert_eq!(p.def_tab_sz, Some(457200));
+        assert_eq!(p.tab_stops.len(), 1);
+        assert_eq!(p.tab_stops[0].pos, 3200400);
+        assert_eq!(p.tab_stops[0].algn, "l");
     }
 
     /// Absent indent attributes (or absent `<a:pPr>` entirely) leave all three

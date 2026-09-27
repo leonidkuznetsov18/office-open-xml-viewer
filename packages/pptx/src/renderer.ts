@@ -156,6 +156,16 @@ import { resolveTableBorderConflict } from './table-border-conflict.js';
 import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-fallback-contrast';
 import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
 import { drawEaVertRun } from './vertical-text.js';
+import {
+  breakDrawingMlText,
+  measureDrawingMlAdvance,
+  drawingMlLineHeight,
+  drawingMlLineX,
+  drawingMlLineShouldJustify,
+  drawingMlBlockTop,
+  drawingMlTextRect,
+  type DrawingMlInputRun,
+} from '@silurus/ooxml-core/internal/drawingml-text';
 
 /** Theme font context threaded through the render call chain. */
 export interface RenderContext {
@@ -1361,6 +1371,12 @@ function measureTextAdvance(
   return ctx.measureText(text).width + letterSpacingPx * internalBoundaries;
 }
 
+/**
+ * PowerPoint adapter for the shared DrawingML text phases. It resolves the
+ * presentation theme, run formatting, fields, symbols, and equation rasters;
+ * the core owns all soft break decisions. The resulting LayoutLine retains
+ * PowerPoint's paint metadata for renderTextBody.
+ */
 export function layoutParagraph(
   ctx: CanvasRenderingContext2D,
   para: Paragraph,
@@ -1376,783 +1392,139 @@ export function layoutParagraph(
   rc: RenderContext = { themeMajorFont: null, themeMinorFont: null, dpr: 1 },
   firstLineIndentPx: number = 0,
 ): LayoutLine[] {
-  const lines: LayoutLine[] = [];
-  // PowerPoint does not give paragraph-terminal whitespace any advance. In
-  // particular, a trailing space that lands exactly beyond the wrap boundary
-  // must not create a visually empty continuation line. Trim the terminal
-  // suffix across formatting-run boundaries without touching interior spaces
-  // or explicit line-break runs.
-  const terminalText = new Map<TextRun, string>();
-  let scanningTerminalWhitespace = true;
-  for (let i = para.runs.length - 1; i >= 0 && scanningTerminalWhitespace; i--) {
-    const run = para.runs[i];
-    if (run.type === 'break') continue;
-    if (run.type === 'math') break;
-    // Only ordinary U+0020 spaces participate in the observed PowerPoint
-    // terminal-space compatibility rule. Non-breaking spaces remain visible.
-    const trimmed = run.text.replace(/ +$/u, '');
-    if (trimmed !== run.text) terminalText.set(run, trimmed);
-    if (trimmed.length > 0 || run.fieldType != null) scanningTerminalWhitespace = false;
-  }
-  // The first line's wrap budget subtracts its signed indent: positive narrows
-  // the region, negative extends it left of marL. Continuations use full width.
-  // `lines.length === 0` ⇒ still filling the first line (newLine() pushes to it).
-  const lineMaxW = () => maxWidthPx - (lines.length === 0 ? firstLineIndentPx : 0);
-  let currentLine: LayoutLine = { segments: [] };
-  let lineW = 0; // current line's accumulated width
-  // ECMA-376 §17.18.93 ST_TextWrappingType "square" is whitespace-aware: a
-  // non-whitespace token is never broken away from the preceding non-whitespace
-  // content. We only allow a wrap before a token if at least one whitespace
-  // run has appeared on the current line — otherwise the line overflows the
-  // shape (PowerPoint's actual behavior, e.g. "YoY+11.9%" mixed-size runs in
-  // sample-2 slide-7 stay on one line even though the bbox is tight).
-  let hasWhitespaceOnLine = false;
-
-  // ── Wrap-aware tab context (issue #1006) ──────────────────────────────────
-  // A tab is a horizontal pen JUMP to its stop within the visual line where it
-  // occurs; content overflowing the line's right edge wraps normally and every
-  // CONTINUATION line re-anchors at the leading text-inset edge (text-left).
-  // The wrap budget must ACCOUNT for the tab jump, so a tabbed line measures its
-  // NATURAL extent with the SAME resolver the paint pass uses (`resolveTabWidths`
-  // with an infinite limit — the #835 clamp must not hide overflow). Tab-free
-  // lines keep the fast additive `lineW` path unchanged (byte-identical).
-  const baseRtl = para.rtl === true;
-  const marRPxL = emuToPx(para.marR, scale);
-  const stopsPxL: TabStopPx[] = (para.tabStops ?? []).map((s) => ({
-    pos: emuToPx(s.pos, scale),
-    algn: s.algn,
-  }));
-  // Effective default tab grid (§21.1.2.2.7): explicit pPr value, else the
-  // PowerPoint universal 1-inch default so a `\t` never collapses to a space.
-  const defTabSzPxL = emuToPx(para.defTabSz ?? 914400, scale);
-  // A tab contributes nothing to the additive `lineW` (its gap is resolved), so
-  // track "the line carries a tab" explicitly rather than via lineW.
-  let lineHasTab = false;
-  // Logical-order items for the current line (content advances + tab markers),
-  // mirroring the paint-side items so layout and paint resolve identically.
-  let lineItems: TabItem[] = [];
-  // Space width for the (now unused when defTabSz>0) no-stop fallback; captured
-  // from the first tab's font, matching the paint pass.
-  let tabSpaceW = 0;
-
-  /** Leading pen for the current line in the reading frame, matching the paint
-   *  pass's `leadingIndentPx`: RTL right-anchors at marR (no first-line indent);
-   *  LTR starts at marL plus the first line's signed indent. */
-  const lineStartPen = (): number =>
-    baseRtl ? marRPxL : marLPx + (lines.length === 0 ? firstLineIndentPx : 0);
-
-  /** Natural extent (px advance from the line's leading pen) of the current
-   *  line's committed items plus an optional trailing content advance, resolved
-   *  against the tab grid with NO trailing clamp. */
-  const tabAwareExtent = (extraW = 0): number => {
-    const items = extraW > 0 ? [...lineItems, { isTab: false, width: extraW }] : lineItems;
-    const widths = resolveTabWidths(items, stopsPxL, lineStartPen(), Infinity, tabSpaceW, defTabSzPxL);
-    let sum = 0;
-    for (const w of widths) sum += w;
-    return sum;
-  };
-
-  /** Whether a content advance of `w` still fits the current line's budget.
-   *  Tab-free lines use the fast additive path (byte-identical); a tabbed line
-   *  resolves the WHOLE hypothetical line (candidate-aware) so a right/centre
-   *  tab — whose gap SHRINKS as its cell grows — is placed correctly rather than
-   *  via `lineW + w`. An infinite budget (wrap="none" / spAutoFit measured on
-   *  one line) never wraps, so short-circuit before the O(items) resolve. */
-  const fitsW = (w: number): boolean => {
-    const budget = lineMaxW();
-    if (!Number.isFinite(budget)) return true;
-    return lineHasTab ? tabAwareExtent(w) <= budget : lineW + w <= budget;
-  };
-
-  /** Max additional content advance the current line can accept before its
-   *  natural extent exceeds the budget. Tab-free ⇒ the additive remainder; a
-   *  tabbed line ⇒ the exact monotone threshold of `tabAwareExtent` (correct for
-   *  left / right / centre tabs, so a fitting right-tab cell is never wrapped
-   *  early). Used by the CJK / SEA prefix-fit, which take a scalar budget. */
-  const availW = (): number => {
-    const budget = lineMaxW();
-    if (!lineHasTab) return budget - lineW;
-    if (!Number.isFinite(budget)) return Infinity;
-    if (tabAwareExtent(0) >= budget) return 0;
-    let lo = 0;
-    let hi = budget;
-    for (let i = 0; i < 40; i++) {
-      const mid = (lo + hi) / 2;
-      if (tabAwareExtent(mid) <= budget) lo = mid;
-      else hi = mid;
-    }
-    return lo;
-  };
-
-  const newLine = (endsWithBreak = false) => {
-    if (endsWithBreak) currentLine.endsWithBreak = true;
-    lines.push(currentLine);
-    currentLine = { segments: [] };
-    lineW = 0;
-    lineHasTab = false;
-    lineItems = [];
-    hasWhitespaceOnLine = false;
-  };
-
-  /** Width contributed if `text` is appended now. OOXML spacing is present at
-   * a fragment seam only when both fragments came from the same authored run. */
-  const incomingTextAdvance = (
-    text: string,
-    font: string,
-    letterSpacingPx: number,
-    sourceRunId: number,
-  ): number => {
-    ctx.font = font;
-    const own = measureTextAdvance(ctx, text, letterSpacingPx);
-    const last = currentLine.segments.at(-1);
-    if (
-      !last || last.isTab || last.math || last.sourceRunId !== sourceRunId
-    ) return own;
-    if (last.font === font && (last.letterSpacingPx ?? 0) === letterSpacingPx) {
-      return measureTextAdvance(ctx, last.text + text, letterSpacingPx)
-        - measureTextAdvance(ctx, last.text, letterSpacingPx);
-    }
-    return own + letterSpacingPx;
-  };
-
-  const push = (
-    text: string,
-    font: string,
-    sizePx: number,
-    color: string,
-    underline: boolean,
-    strikethrough: boolean,
-    baseline?: number,
-    extras?: {
-      strikeDouble?: boolean;
-      letterSpacingPx?: number;
-      underlineStyle?: string;
-      underlineColor?: string;
-      shadow?: import('@silurus/ooxml-core').Shadow;
-      reflection?: import('@silurus/ooxml-core').Reflection;
-      outline?: import('@silurus/ooxml-core').TextOutline;
-      highlight?: string;
-      /** Resolved hyperlink target (IX1) — passed through to the overlay span. */
-      hyperlink?: HyperlinkTarget;
-      sourceRunId?: number;
-      drawSizePx?: number;
-    },
-  ) => {
-    if (!text) return;
-    ctx.font = font;
-    const lsPx = extras?.letterSpacingPx ?? 0;
-    // Measure with the same native Canvas tracking state used by paint so wrap,
-    // tabs, alignment, combining sequences, and emoji clusters stay consistent.
-    // The value comes from DrawingML rPr@spc (§21.1.2.3.9; ST_TextPoint
-    // §20.1.10.74).
-    const sourceRunId = extras?.sourceRunId;
-    const strikeDouble = extras?.strikeDouble;
-    const underlineStyle = extras?.underlineStyle;
-    const underlineColor = extras?.underlineColor;
-    const shadow = extras?.shadow;
-    const reflection = extras?.reflection;
-    const outline = extras?.outline;
-    const highlight = extras?.highlight;
-    const hyperlink = extras?.hyperlink;
-    const drawSizePx = extras?.drawSizePx ?? sizePx;
-    // Shadow / outline use object identity for merging — adjacent runs share
-    // the same object since the run is parsed once. Different objects (or
-    // one set / one missing) force a new segment.
-    const sameMeta = (a: LayoutSegment) =>
-      !a.math &&
-      !a.isTab &&
-      a.font === font &&
-      a.color === color &&
-      a.underline === underline &&
-      (a.underlineStyle ?? '') === (underlineStyle ?? '') &&
-      (a.underlineColor ?? '') === (underlineColor ?? '') &&
-      a.strikethrough === strikethrough &&
-      (a.strikeDouble ?? false) === (strikeDouble ?? false) &&
-      (a.letterSpacingPx ?? 0) === lsPx &&
-      a.baseline === baseline &&
-      a.shadow === shadow &&
-      a.reflection === reflection &&
-      a.outline === outline &&
-      (a.highlight ?? '') === (highlight ?? '') &&
-      (a.drawSizePx ?? a.sizePx) === drawSizePx &&
-      hyperlinkKey(a.hyperlink) === hyperlinkKey(hyperlink) &&
-      (lsPx === 0 || a.sourceRunId === sourceRunId);
-    const last = currentLine.segments.at(-1);
-    let w = measureTextAdvance(ctx, text, lsPx);
-    if (last && sameMeta(last)) {
-      // Token/CJK/SEA splitting is a layout concern, not an authored run
-      // boundary. Re-measure the merged string so contextual shaping and the
-      // single spacing boundary between the fragments are retained exactly.
-      w = measureTextAdvance(ctx, last.text + text, lsPx)
-        - measureTextAdvance(ctx, last.text, lsPx);
-    } else if (
-      last && !last.isTab && !last.math
-      && sourceRunId != null && last.sourceRunId === sourceRunId
-    ) {
-      // A font/style split inside one authored run still has one character
-      // boundary between its adjacent fragments.
-      w += lsPx;
-    }
-    lineW += w;
-    // Mirror the paint-side item sequence so a tabbed line's wrap budget resolves
-    // identically (issue #1006). One item per push call; consecutive content
-    // items simply sum inside resolveTabWidths.
-    lineItems.push({ isTab: false, width: w });
-    if (last && sameMeta(last)) {
-      last.text += text;
-    } else {
-      const leadingLetterSpacingPx = last && !last.isTab && !last.math
-        && sourceRunId != null && last.sourceRunId === sourceRunId
-        ? lsPx
-        : 0;
-      currentLine.segments.push({ text, font, sizePx, drawSizePx, color, underline, underlineStyle, underlineColor, strikethrough, strikeDouble, letterSpacingPx: lsPx || undefined, sourceRunId, leadingLetterSpacingPx: leadingLetterSpacingPx || undefined, baseline, shadow, reflection, outline, highlight, hyperlink });
-    }
-  };
-
-  // UAX#14 LB13 (行頭禁則): pull the trailing word of the current line down onto a
-  // fresh line so a glued non-starter (comma, period, … in a SEPARATE run, no
-  // whitespace between) does not orphan at the next line's head nor tear the word.
-  // Re-pushes the word — with its run formatting — to lead the new line; the
-  // caller then appends the non-starter. The trailing word normally lives in the
-  // last (same-meta-merged) segment and is split at its last whitespace; when a
-  // formatting change split the word across segments, the last segment has no
-  // internal whitespace, so the whole tail segment moves down instead (the word
-  // splits at the format seam, but the comma is still never orphaned — matching
-  // docx/xlsx). Returns false (changing nothing) only when that tail segment IS
-  // the whole line (no preceding content / nowhere to retract to). Mirrors the
-  // docx/xlsx fixes; the ASCII non-starters live in
-  // DEFAULT_KINSOKU_RULES.lineStartForbidden.
-  const retractTrailingWord = (): boolean => {
-    const seg = currentLine.segments.at(-1);
-    if (!seg || seg.math) return false;
-    const m = /^(.*\s)(\S+)$/s.exec(seg.text);
-    let word: string;
-    if (m) {
-      seg.text = m[1]; // close the current line on the whitespace boundary
-      word = m[2];
-    } else if (currentLine.segments.length > 1) {
-      currentLine.segments.pop(); // tail segment of a format-split word moves whole
-      word = seg.text;
-    } else {
-      return false; // the segment is the whole line — cannot retract without emptying it
-    }
-    newLine();
-    // Re-push the word (with its run formatting) so it leads the fresh line.
-    push(word, seg.font, seg.sizePx, seg.color, seg.underline, seg.strikethrough, seg.baseline, {
-      strikeDouble: seg.strikeDouble,
-      letterSpacingPx: seg.letterSpacingPx,
-      underlineStyle: seg.underlineStyle,
-      underlineColor: seg.underlineColor,
-      shadow: seg.shadow,
-      reflection: seg.reflection,
-      outline: seg.outline,
-      highlight: seg.highlight,
-      sourceRunId: seg.sourceRunId,
-      drawSizePx: seg.drawSizePx,
-    });
-    return true;
-  };
-
+  const input: DrawingMlInputRun<LayoutSegment>[] = [];
   for (const [sourceRunId, run] of para.runs.entries()) {
     if (run.type === 'break') {
-      // The line being closed ends at a MANUAL break (§21.1.2.2.1) — mark it so
-      // a `just` paragraph left-aligns it like its last line (§20.1.10.59).
-      newLine(true);
+      input.push({ type: 'break' });
       continue;
     }
-
-    // ── OMML equation ─────────────────────────────────────────────────────
     if (run.type === 'math') {
       const render = mathRenders.get(run.nodes);
-      // Equation font size: explicit run size (pt→px) else paragraph default.
       const emPx = run.fontSize != null
-        ? run.fontSize * PT_TO_EMU * scale * fontScale
-        : defaultFontSizePx;
+        ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
       const width = render ? render.widthEm * emPx : 0;
-      const ascent = render ? render.ascentEm * emPx : 0;
-      const descent = render ? render.descentEm * emPx : 0;
-      // Block (display) math gets its own line; the draw pass centres it.
-      if (run.display && lineW > 0) newLine();
-      else if (!fitsW(width) && lineW > 0) newLine();
-      lineItems.push({ isTab: false, width });
-      currentLine.segments.push({
-        text: '',
-        font: `${emPx}px sans-serif`,
-        sizePx: emPx,
-        // Equations follow their own run colour (e.g. a purple title); the
-        // draw pass tints the glyph image to this colour. Fall back to the
-        // paragraph/body default when the run carries no explicit colour.
+      const style: LayoutSegment = {
+        text: '', font: `${emPx}px sans-serif`, sizePx: emPx,
         color: run.color ? hexToRgba(run.color) : defaultColor,
-        underline: false,
-        strikethrough: false,
-        math: { nodes: run.nodes, display: run.display, width, ascent, descent },
-      });
-      lineW += width;
-      if (run.display) newLine();
+        underline: false, strikethrough: false,
+        math: {
+          nodes: run.nodes, display: run.display, width,
+          ascent: render ? render.ascentEm * emPx : 0,
+          descent: render ? render.descentEm * emPx : 0,
+        },
+      };
+      input.push({ type: 'object', width, style, display: run.display });
       continue;
     }
 
-    const sizePx = run.fontSize != null ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
-    // ECMA-376 Part 1 §21.1.2.3.9 defines rPr@baseline as a percentage of
-    // the authored font size but does not specify glyph scaling. PowerPoint PDF
-    // boundary samples show the Office compatibility rule: every non-zero
-    // baseline (positive superscript or negative subscript) paints at ~65%,
-    // independent of the offset magnitude. Keep `sizePx` for line height and
-    // offset calculation; use the reduced size only for glyph width and paint.
-    // This matches the existing DOCX/XLSX vertical-alignment treatment.
+    const sizePx = run.fontSize != null
+      ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
     const drawSizePx = baselineDrawSizePx(sizePx, run.baseline ?? undefined);
-    // Font family cascade: run → paragraph defFontFamily → theme minor font → 'sans-serif'
     const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
-    // East Asian font (rPr > ea) — used for CJK glyphs when set; otherwise
-    // CJK characters reuse the latin font. ECMA-376 §21.1.2.3.7.
-    const familyEa = run.fontFamilyEa
-      ? normalizeFontFamily(run.fontFamilyEa, rc)
-      : null;
-    // Symbol font (rPr > a:sym) — used for Private-Use symbol glyphs (U+F0xx).
-    const familySym = run.fontFamilySym
-      ? normalizeFontFamily(run.fontFamilySym, rc)
-      : null;
-    // Hyperlink runs without an explicit colour pick up the theme hlink colour
-    // (ECMA-376 §20.1.2.3.5 — hyperlinks inherit theme hyperlink slot).
-    let color: string;
-    if (run.color) {
-      color = hexToRgba(run.color);
-    } else if (run.hyperlink && rc.themeHlinkColor) {
-      color = hexToRgba(rc.themeHlinkColor);
-    } else {
-      color = defaultColor;
-    }
-    // Cascade: run → paragraph defRPr → body/layout default → false
-    const isBold   = run.bold   ?? para.defBold   ?? defaultBold;
-    const isItalic = run.italic ?? para.defItalic ?? defaultItalic;
-    const font   = buildFont(isBold, isItalic, drawSizePx, family, rc, run.text,
+    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : null;
+    const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
+    const bold = run.bold ?? para.defBold ?? defaultBold;
+    const italic = run.italic ?? para.defItalic ?? defaultItalic;
+    let rawText = run.fieldType === 'slidenum' && slideNumber !== undefined
+      ? String(slideNumber) : run.text;
+    if (run.caps === 'all' || run.caps === 'small') rawText = rawText.toUpperCase();
+    const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
-    const fontEa = familyEa
-      ? buildFont(isBold, isItalic, drawSizePx, familyEa, rc, run.text)
-      : font;
-    ctx.font = font;
-
-    // ECMA-376 §21.1.2.3.9; ST_TextCapsType §20.1.10.64 — caps transforms
-    // the rendered glyphs without
-    // changing the underlying text. "small" emulated as upper-case glyphs at
-    // ~80% size is the long-established Office fallback when the font lacks
-    // smcp; we just upper-case for now and rely on the configured size.
-    const caps = run.caps;
-    let baseText = terminalText.get(run) ?? run.text;
-    if (caps === 'all' || caps === 'small') baseText = baseText.toUpperCase();
-
-    // Resolve field values (e.g. slidenum → actual slide number)
-    const runText = (run.fieldType === 'slidenum' && slideNumber !== undefined)
-      ? String(slideNumber)
-      : baseText;
-
-    // Hyperlink runs render underlined unless an explicit u attribute already
-    // says otherwise. Spec: ECMA-376 §20.1.2.3.5 (hyperlinks default to the
-    // hlink character style, which underlines).
-    const segUnderline = run.underline || (run.hyperlink !== undefined);
-    const segStrikeDouble = run.strikeDouble === true;
-    // letterSpacing arrives in points; convert to canvas px using the same
-    // EMU→px scale the renderer applies to font sizes.
-    const lsPx = run.letterSpacing != null ? run.letterSpacing * PT_TO_EMU * scale : 0;
-    const segExtras = {
-      strikeDouble: segStrikeDouble,
-      letterSpacingPx: lsPx,
+    const eaFont = familyEa
+      ? buildFont(bold, italic, drawSizePx, familyEa, rc, rawText) : baseFont;
+    const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
+    const color = run.color ? hexToRgba(run.color)
+      : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
+    const baseStyle: LayoutSegment = {
+      text: '', font: baseFont, sizePx, drawSizePx, color,
+      underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
+      strikethrough: run.strikethrough,
+      strikeDouble: run.strikeDouble === true,
+      letterSpacingPx: letterSpacingPx || undefined,
+      sourceRunId,
+      baseline: run.baseline ?? undefined,
       shadow: run.shadow,
       reflection: run.reflection,
       outline: run.outline,
-      // §21.1.2.3.4 — highlight is a resolved hex (6-char opaque or 8-char
-      // RRGGBBAA); hexToRgba handles both, matching how text/underline colours
-      // are converted for canvas.
       highlight: run.highlight ? hexToRgba(run.highlight) : undefined,
-      // IX1 — classify the resolved hyperlink target string into the shared
-      // HyperlinkTarget shape (external URL vs internal slide jump). The core
-      // TextRun type carries only `hyperlink` (no action field), so the string
-      // alone drives classification: a ppaction://… or a scheme-less internal
-      // part name is treated as internal. Overlay-only; does not affect glyphs.
       hyperlink: classifyPptxHyperlink(run.hyperlink),
-      sourceRunId,
-      drawSizePx,
     };
-
-    // Split on whitespace boundaries, keeping the whitespace tokens. Within a
-    // non-whitespace Latin token, retain authored compound hyphens as UAX #14
-    // soft-wrap seams (`non-managed` -> `non-` | `managed`).
-    const tokens = runText.split(/(\s+)/).flatMap((token) => {
-      if (!token) return [];
-      if (/^\s+$/u.test(token)) return [{ text: token, breakBefore: false }];
-      // Authored hyphens are soft-wrap seams only. WordArt deliberately lays
-      // text out at infinite width before mapping it to a curve, so fragmenting
-      // a compound there adds repeated prefix measurement without changing a
-      // possible line break.
-      return Number.isFinite(maxWidthPx)
-        ? splitLatinCompoundToken(token)
-        : [{ text: token, breakBefore: false }];
-    });
-
-    for (const tokenPart of tokens) {
-      const token = tokenPart.text;
-      if (!token) continue;
-
-      // ── Tab character ────────────────────────────────────────────────────
-      if (/^\t+$/.test(token)) {
-        // §21.1.2.1.x: retain every tab inline. Gap resolution is deferred until
-        // paint, when every cell width is known; UAX#9 S then reorders cells.
-        // The wrap pass measures the tab jump via `tabAwareExtent` (#1006) so the
-        // line breaks at the correct point, and a continuation line (which never
-        // carries the tab) re-anchors at text-left.
-        if (!lineHasTab) {
-          ctx.font = font;
-          tabSpaceW = ctx.measureText(' ').width;
-        }
-        for (const _ of token) {
-          currentLine.segments.push({
-            text: '',
-            isTab: true,
-            font,
-            sizePx,
-            color,
-            underline: false,
-            strikethrough: false,
-          });
-          lineItems.push({ isTab: true, width: 0 });
-        }
-        lineHasTab = true;
-        continue;
+    // rPr/ea and rPr/sym are presentation-only font slots. Split solely where
+    // the selected font changes, leaving run seams and break policy to core.
+    let group = '';
+    let groupFont = '';
+    const emitGroup = () => {
+      if (group) input.push({ type: 'text', text: group, style: { ...baseStyle, font: groupFont } });
+      group = '';
+    };
+    for (const ch of rawText) {
+      let glyph = ch;
+      let font = familyEa && isCjkBreakChar(ch.codePointAt(0) ?? 0) ? eaFont : baseFont;
+      if (/[-]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
+        const symbolFamily = familySym ?? family;
+        glyph = symbolFontToUnicode(ch, symbolFamily);
+        font = buildFont(bold, italic, drawSizePx,
+          glyph === ch ? symbolFamily : 'sans-serif', rc, glyph);
       }
-
-      ctx.font = font;
-      let tokW = incomingTextAdvance(token, font, lsPx, sourceRunId);
-      const isWhitespace = /^\s+$/.test(token);
-
-      // ── Symbol-font characters (Wingdings/Webdings/Symbol) ───────────────
-      // PowerPoint stores symbol glyphs as Private-Use codepoints U+F020–U+F0FF
-      // and picks the font via rPr > a:sym (ECMA-376 §21.1.2.3.10). Map the
-      // known ones to Unicode equivalents so they render reliably regardless of
-      // whether the symbol font is installed; fall back to the real symbol font
-      // for unmapped glyphs.
-      const SYMBOL_PUA_RE = /[-]/;
-      // Gate on core's isSymbolFontFamily (exact "symbol" / any "wingdings";
-      // shared with docx). A familySym (a:sym, §21.1.2.3.10) explicitly names
-      // the run's symbol typeface, so its presence also opens the path.
-      // (Webdings / "SymbolMT" no longer match the family branch — both already
-      // passthrough unchanged since core gates "symbol" exactly and has no
-      // Webdings table, so this is behaviour-preserving.)
-      if (SYMBOL_PUA_RE.test(token) && (familySym != null || isSymbolFontFamily(family))) {
-        const symName = familySym ?? family;
-        for (const ch of token) {
-          let drawCh = ch;
-          let chFont = font;
-          if (SYMBOL_PUA_RE.test(ch)) {
-            const mapped = symbolFontToUnicode(ch, symName);
-            if (mapped !== ch) {
-              drawCh = mapped;
-              chFont = buildFont(isBold, isItalic, drawSizePx, 'sans-serif', rc, drawCh);
-            } else {
-              chFont = buildFont(isBold, isItalic, drawSizePx, symName, rc, drawCh);
-            }
-          }
-          ctx.font = chFont;
-          const chW = incomingTextAdvance(drawCh, chFont, lsPx, sourceRunId);
-          if (!fitsW(chW) && lineW > 0) newLine();
-          push(drawCh, chFont, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-        }
-        continue;
-      }
-
-      // CJK characters allow line-breaking at any character boundary (no whitespace
-      // needed). When a token contains CJK, wrap character-by-character so that CJK
-      // text flows onto the same line as preceding Latin text (e.g. "EC市場で…").
-      // Per-character font dispatch picks `fontEa` for CJK glyphs when the run
-      // declared an explicit East Asian typeface (rPr > ea); other characters
-      // keep the Latin font so the latin/ea boundary mid-token stays clean.
-      const hasCJK = tokenHasCjk(token);
-      // Issue #960 — a token that mixes CJK with SEA (Thai/Lao/Khmer) must NOT
-      // take the CJK-only path (which tears the SEA interior at arbitrary
-      // character boundaries): route it to the unified SEA branch below, whose
-      // offset set merges the CJK per-character opportunities with the SEA
-      // dictionary/transition ones so each script keeps its own break rule. The
-      // exception is `eaLnBrk=false` (§21.1.2.2.7), which forbids breaking the
-      // East Asian word at all — keep that on the CJK path so the token stays
-      // whole. A CJK token with no SEA is unchanged.
-      const routeCjk = hasCJK && (!containsSeaScript(token) || para.eaLnBrk === false);
-      if (routeCjk) {
-        // Measure each CJK grapheme with its EA font, but keep every contiguous
-        // non-CJK span as ONE word unit. A mixed run such as `日本語Power`
-        // may wrap at the CJK/Latin boundary, never between the Latin letters.
-        // This is the same word-vs-CJK distinction used by the XLSX wrapper;
-        // previously this path treated every Latin letter as a CJK break unit.
-        // Place the resulting units according to a:pPr@eaLnBrk (ECMA-376
-        // §21.1.2.2.7, "East Asian Line Break"):
-        //   • eaLnBrk=true (default) → East Asian text MAY break at character
-        //     boundaries, so we wrap char-by-char with kinsoku (§17.15.1.58–.60):
-        //     forbidden leaders never start a line and forbidden followers never
-        //     end one. fitCjkLine reuses core's kinsokuAdjustedSplit.
-        //   • eaLnBrk=false → an East Asian word must NOT be split mid-character.
-        //     The whole token moves to a fresh line if it doesn't fit, but is
-        //     never torn; when wider than the line it overflows and the shape's
-        //     existing clipping handles it.
-        //
-        // DEFAULT_KINSOKU_RULES is correct for pptx: PresentationML has no custom
-        // forbidden-set element (w:noLineBreaksBefore/After are WordprocessingML-only).
-        // docx's analogous CJK path (renderer.ts, fitCJKPrefix) is intentionally
-        // separate: substring binary-search fit + cross-run 追い出し. Do not unify them.
-        const measured: (MeasuredChar & { font: string })[] = [];
-        let westernWord = '';
-        const flushWesternWord = (): void => {
-          if (westernWord === '') return;
-          ctx.font = font;
-          measured.push({
-            ch: westernWord,
-            w: measureTextAdvance(ctx, westernWord, lsPx),
-            font,
-          });
-          westernWord = '';
-        };
-        for (const ch of token) {
-          const isCjk = isCjkBreakChar(ch.codePointAt(0) ?? 0);
-          if (!isCjk) {
-            westernWord += ch;
-            continue;
-          }
-          flushWesternWord();
-          const chFont = familyEa != null ? fontEa : font;
-          ctx.font = chFont;
-          measured.push({ ch, w: measureTextAdvance(ctx, ch, 0), font: chFont });
-        }
-        flushWesternWord();
-        if (para.eaLnBrk === false) {
-          // Keep the East Asian word whole. If the current line already has
-          // content and the token would overflow, wrap once before placing it;
-          // never break mid-token (an over-wide token simply overflows).
-          const previous = currentLine.segments.at(-1);
-          const leadingBoundary = !!previous
-            && !previous.isTab && !previous.math
-            && previous.sourceRunId === sourceRunId;
-          const tokenW = measured.reduce((acc, m) => acc + m.w, 0)
-            + Math.max(0, measured.length - 1) * lsPx
-            + (leadingBoundary && measured.length > 0 ? lsPx : 0);
-          if (lineW > 0 && !fitsW(tokenW)) newLine();
-          for (const m of measured) {
-            push(m.ch, m.font, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-          }
-          continue;
-        }
-        let rest = measured;
-        while (rest.length > 0) {
-          // Effective start pen so the fit sees the line's true remaining width:
-          // budget − availW = the additive pen (tab-free / left tab) or the
-          // slack-adjusted pen (right / centre tab). Equivalent to lineW when no
-          // tab, so tab-free CJK is byte-identical.
-          const cjkPen = Number.isFinite(lineMaxW()) ? lineMaxW() - availW() : lineW;
-          const previous = currentLine.segments.at(-1);
-          const leadingBoundary = !!previous
-            && !previous.isTab && !previous.math
-            && previous.sourceRunId === sourceRunId;
-          let n = fitCjkLine(
-            rest,
-            cjkPen,
-            lineMaxW(),
-            DEFAULT_KINSOKU_RULES,
-            lsPx,
-            leadingBoundary,
-          );
-          if (n === 0) {
-            // A non-empty line can't take the run head → break and retry empty.
-            // But a line holding ONLY a tab (lineW===0, tab jump consumed the
-            // width) must NOT be finalised as a tab-only line — place one glyph
-            // so it overflows, mirroring the Latin "no break opportunity" rule.
-            if (lineW > 0) { newLine(); continue; }
-            n = 1;
-          }
-          for (let i = 0; i < n; i++) {
-            const m = rest[i];
-            push(m.ch, m.font, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-          }
-          rest = rest.slice(n);
-          if (rest.length > 0) newLine();
-        }
-        continue;
-      }
-
-      // SEA (Thai/Lao/Khmer) line breaking (issue #797 / #960). These scripts have
-      // no inter-word spaces, so `token` is a whole run; break it only at a member
-      // of `seaBreaks` — the UNION of dictionary word boundaries, the no-space
-      // SEA↔non-SEA script transitions, and (for a mixed CJK+SEA token routed here
-      // from above) the CJK per-character opportunities, kinsoku-filtered. A SEA
-      // token with no boundary (single over-long word / Segmenter unavailable)
-      // still routes here so its emergency split stays grapheme-safe.
-      if (containsSeaScript(token)) {
-        const seaBreaks = seaMixedBreakOffsets(token, { cjk: true, kinsoku: DEFAULT_KINSOKU_RULES });
-        // A line-piece may mix a Thai run (Latin/Thai `font`) with a CJK run
-        // (`fontEa` when an East Asian typeface is declared). Measure each maximal
-        // same-font sub-run WHOLE — per-char measurement would break Thai shaping —
-        // and push each with its own font so CJK glyphs get `fontEa`. For a
-        // pure-SEA piece (or `familyEa` absent / resolving to the SAME font) this
-        // is one run with `font`: whole-string measure + single push, i.e.
-        // byte-identical to the pre-#960 path. The split is taken ONLY when the
-        // EA font actually differs — otherwise measuring per-run and re-merging
-        // identical-font pushes could disagree on cross-boundary shaping.
-        const eaDiffers = familyEa != null && fontEa !== font;
-        const isEaCh = (ch: string): boolean => eaDiffers && isCjkBreakChar(ch.codePointAt(0) ?? 0);
-        const measureSub = (sub: string): number => {
-          let w = 0;
-          const previous = currentLine.segments.at(-1);
-          let hasBoundary = !!previous
-            && !previous.isTab && !previous.math
-            && previous.sourceRunId === sourceRunId;
-          let runText = '';
-          let runEa: boolean | null = null;
-          const flush = (): void => {
-            if (runText === '') return;
-            ctx.font = runEa ? (fontEa as string) : font;
-            w += measureTextAdvance(ctx, runText, lsPx);
-            if (hasBoundary) w += lsPx;
-            hasBoundary = true;
-            runText = '';
-          };
-          for (const ch of sub) {
-            const ea = isEaCh(ch);
-            if (runEa === null || ea === runEa) { runText += ch; runEa = ea; }
-            else { flush(); runText = ch; runEa = ea; }
-          }
-          flush();
-          return w;
-        };
-        const pushPiece = (piece: string): void => {
-          let runText = '';
-          let runEa: boolean | null = null;
-          const flush = (): void => {
-            if (runText === '') return;
-            const pFont = runEa ? (fontEa as string) : font;
-            push(runText, pFont, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-            runText = '';
-          };
-          for (const ch of piece) {
-            const ea = isEaCh(ch);
-            if (runEa === null || ea === runEa) { runText += ch; runEa = ea; }
-            else { flush(); runText = ch; runEa = ea; }
-          }
-          flush();
-        };
-        // Grapheme-fill runs (Myanmar/Tibetan, #961) have dense per-cluster offsets:
-        // use the O(log n) monotone binary-search fit. Dictionary runs keep the
-        // negative-spacing-safe full scan.
-        const monotone = isGraphemeFillText(token);
-        const N = token.length;
-        let start = 0;
-        while (start < N) {
-          const avail = availW();
-          let end = fitSeaWordPrefix(token, seaBreaks, start, avail, measureSub, monotone);
-          if (end <= start) {
-            if (lineW > 0) { newLine(); continue; } // wrap first, retry empty line
-            // Empty line, first word wider than the shape: grapheme-safe split.
-            const firstWordEnd = seaBreaks.find((b) => b > start) ?? N;
-            const firstWord = token.slice(start, firstWordEnd);
-            const graphemes = graphemeClusterOffsets(firstWord);
-            let g = fitSeaWordPrefix(firstWord, graphemes, 0, avail, measureSub, monotone);
-            if (g <= 0) g = graphemes.length > 0 ? graphemes[0] : firstWord.length;
-            end = start + g;
-          }
-          pushPiece(token.slice(start, end));
-          start = end;
-          if (start < N) newLine();
-        }
-        continue;
-      }
-
-      // A formatting-run boundary must not erase an authored hyphen break. The
-      // token splitter above covers an in-run compound; this seam check covers
-      // `non-` and `managed` stored in adjacent runs. Break only when the
-      // combined text no longer fits, preserving greedy single-line layout.
-      if (!fitsW(tokW) && (lineW > 0 || lineHasTab)) {
-        let hyphenBreakBefore = tokenPart.breakBefore;
-        if (!hyphenBreakBefore) {
-          const currentTail = trailingTextScalars(currentLine);
-          const nextHead = [...token][0];
-          hyphenBreakBefore = currentTail.length === 2 && nextHead !== undefined
-            && isLatinCompoundHyphenBoundary(currentTail[0], currentTail[1], nextHead);
-        }
-        if (hyphenBreakBefore) {
-          newLine();
-          tokW = incomingTextAdvance(token, font, lsPx, sourceRunId);
-        }
-      }
-
-      if (fitsW(tokW)) {
-        push(token, font, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-        if (isWhitespace) hasWhitespaceOnLine = true;
-      } else if (isWhitespace) {
-        if (lineW > 0) newLine();
-      } else if (tokW > lineMaxW()) {
-        if (lineW > 0) newLine();
-        for (const ch of token) {
-          ctx.font = font;
-          const chW = incomingTextAdvance(ch, font, lsPx, sourceRunId);
-          if (!fitsW(chW) && lineW > 0) newLine();
-          push(ch, font, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-        }
-      } else if (!hasWhitespaceOnLine) {
-        // No whitespace yet on this line — wrapping here would tear an
-        // unbroken sequence of non-whitespace text (e.g. "YoY+11.9%" split
-        // across mixed-size runs). Office never breaks mid-sequence in that
-        // case; it lets the shape overflow and relies on spAutoFit / lIns to
-        // size the bbox correctly. A CJK/Latin script boundary is different:
-        // it is a real soft-wrap opportunity even without ASCII whitespace, so
-        // move the incoming Latin word intact rather than overflowing it.
-        const previousText = currentLine.segments.at(-1)?.text ?? '';
-        const previousCp = [...previousText].at(-1)?.codePointAt(0);
-        const firstCp = token.codePointAt(0);
-        const cjkBoundary = previousCp !== undefined
-          && firstCp !== undefined
-          && isCjkBreakChar(previousCp) !== isCjkBreakChar(firstCp)
-          && !isUax14NoBreakPair(previousCp, firstCp);
-        if (cjkBoundary && lineW > 0) newLine();
-        push(token, font, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-      } else {
-        // UAX #14 segment-boundary glue: LB13 keeps a non-starter with the word
-        // before it; the shared no-break pair predicate (LB14/LB23/LB23a/LB24/
-        // LB25/LB28/LB30) keeps proven no-break seams together across a
-        // formatting run seam. CJK and SEA tokens have already taken their
-        // dedicated paths. Move the trailing word down to the previous real
-        // opportunity.
-        const previousText = currentLine.segments.at(-1)?.text ?? '';
-        const firstCp = token.codePointAt(0);
-        const previousChar = [...previousText].at(-1);
-        const prevCp = previousChar?.codePointAt(0);
-        const immediateBoundary =
-          /\S$/u.test(previousText) &&
-          /^\S/u.test(token) &&
-          prevCp !== 0x200b &&
-          firstCp !== 0x200b;
-        const lb13Glued =
-          firstCp !== undefined &&
-          DEFAULT_KINSOKU_RULES.lineStartForbidden.has(firstCp) &&
-          immediateBoundary;
-        // SEA (Thai/Lao/Khmer) tailoring wins over the LB1 SA→AL default on
-        // BOTH sides: a preceding SEA segment exposes a dictionary boundary
-        // that the pair predicate must not suppress (mirror the DOCX
-        // buildSegments guard, which checks prev AND cur). A SEA `token`
-        // already took the dedicated SEA branch above.
-        const uax14Glued =
-          prevCp !== undefined &&
-          firstCp !== undefined &&
-          immediateBoundary &&
-          !containsSeaScript(previousText) &&
-          !containsSeaScript(token) &&
-          isUax14NoBreakPair(prevCp, firstCp);
-        const glued = lb13Glued || uax14Glued;
-        if (!(glued && retractTrailingWord())) newLine();
-        push(token, font, sizePx, color, segUnderline, run.strikethrough, run.baseline ?? undefined, segExtras);
-      }
+      if (group && font !== groupFont) emitGroup();
+      group += glyph;
+      groupFont = font;
     }
+    emitGroup();
   }
 
-  // Always emit the last (possibly empty) line
-  lines.push(currentLine);
-
-  return lines;
+  const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
+    a.font === b.font && a.color === b.color && a.sizePx === b.sizePx
+    && a.drawSizePx === b.drawSizePx && a.underline === b.underline
+    && a.underlineStyle === b.underlineStyle
+    && a.underlineColor === b.underlineColor
+    && a.strikethrough === b.strikethrough && a.strikeDouble === b.strikeDouble
+    && a.letterSpacingPx === b.letterSpacingPx && a.baseline === b.baseline
+    && a.shadow === b.shadow && a.reflection === b.reflection
+    && a.outline === b.outline && a.highlight === b.highlight
+    && hyperlinkKey(a.hyperlink) === hyperlinkKey(b.hyperlink)
+    && (!a.letterSpacingPx || a.sourceRunId === b.sourceRunId);
+  const marRPx = emuToPx(para.marR, scale);
+  const broken = breakDrawingMlText(input, {
+    maxWidth: maxWidthPx,
+    firstLineIndent: firstLineIndentPx,
+    measureText(text, style) {
+      ctx.font = style.font;
+      return measureDrawingMlAdvance(ctx, text, style.letterSpacingPx ?? 0);
+    },
+    sameStyle,
+    boundaryAdvance: (left, right) => left.sourceRunId === right.sourceRunId
+      ? right.letterSpacingPx ?? 0 : 0,
+    tabStops: (para.tabStops ?? []).map((stop) => ({
+      pos: emuToPx(stop.pos, scale), algn: stop.algn,
+    })),
+    defaultTabSize: emuToPx(para.defTabSz ?? 914400, scale),
+    tabStartPen: (lineIndex) => para.rtl
+      ? marRPx : marLPx + (lineIndex === 0 ? firstLineIndentPx : 0),
+    nonMonotoneMeasure: input.some((item) => item.type === 'text' && (item.style.letterSpacingPx ?? 0) < 0),
+    eastAsianLineBreak: para.eaLnBrk !== false,
+  });
+  return broken.map((line) => ({
+    // Office L07/L08: an empty line opened by a line feed inside a run keeps
+    // that run's size; a zero-width segment carries it to the line metrics.
+    segments: line.segments.length === 0 && line.lineFeedRun !== undefined
+      && input[line.lineFeedRun]?.type === 'text'
+      ? [{ ...(input[line.lineFeedRun] as { style: LayoutSegment }).style, text: '' }]
+      : line.segments.map((part, index): LayoutSegment => {
+      if (part.type === 'text') {
+        const previous = line.segments[index - 1];
+        const leadingLetterSpacingPx = previous?.type === 'text'
+          && previous.style.sourceRunId === part.style.sourceRunId
+          ? part.style.letterSpacingPx : undefined;
+        return { ...part.style, text: part.text, leadingLetterSpacingPx };
+      }
+      if (part.type === 'tab') return { ...part.style, text: '', isTab: true, tabWidthPx: part.width };
+      return { ...part.style, text: '' };
+    }),
+    ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
+  }));
 }
 
 // ===== Element renderers =====
@@ -4491,7 +3863,10 @@ export function renderTextBody(
     return;
   }
 
-  const lPad = emuToPx(body.lIns, scale);
+  const textRect = drawingMlTextRect(bw, bh, {
+    lIns: body.lIns, rIns: body.rIns, tIns: body.tIns, bIns: body.bIns,
+  }, scale);
+  const lPad = textRect.left;
   const rPad = emuToPx(body.rIns, scale);
   const tPad = emuToPx(body.tIns, scale);
   const bPad = emuToPx(body.bIns, scale);
@@ -4806,16 +4181,9 @@ export function renderTextBody(
       // itself evidence that PowerPoint grows the authored minimum. An explicit
       // percentage, however, is part of the authored content extent, and every
       // line in a multi-line body consumes the painted line box.
-      let paintedLineHeight: number;
-      if (para.spaceLine) {
-        if (para.spaceLine.type === 'pct') {
-          paintedLineHeight = naturalSingle * (para.spaceLine.val / 100000);
-        } else {
-          paintedLineHeight = para.spaceLine.val * PT_TO_EMU * scale;
-        }
-      } else {
-        paintedLineHeight = implicitSingle;
-      }
+      const paintedLineHeight = drawingMlLineHeight(
+        implicitSingle, para.spaceLine, PT_TO_EMU * scale,
+      );
       let lineHeight = paintedLineHeight;
       if (measureOnly && !isSpAutoFit && !measureNaturalLineSpacing) {
         if (!para.spaceLine) {
@@ -4956,7 +4324,9 @@ export function renderTextBody(
   let cursorY: number;
   const contentH = Math.max(0, effectiveBh - tPad - bPad);
   if (anchor === 'ctr') {
-    cursorY = effectiveBy + tPad + (contentH - requiredHeight) / 2;
+    cursorY = effectiveBy + drawingMlBlockTop('ctr', {
+      left: lPad, top: tPad, width: bw - lPad - rPad, height: contentH,
+    }, requiredHeight);
   } else if (anchor === 'b') {
     cursorY = effectiveBy + effectiveBh - bPad - requiredHeight;
   } else {
@@ -5236,13 +4606,15 @@ export function renderTextBody(
         : effectiveTextX;
     } else {
       if (alignment === 'ctr') {
-        penX = effectiveTextX + (textMaxW - textXOffset - lineWidth) / 2;
+        penX = drawingMlLineX('ctr', effectiveTextX,
+          textMaxW - textXOffset, lineWidth, false, true);
       } else if (alignment === 'r') {
         // Reading-frame (#930): an RTL marker leads at the right edge, so the text
         // right-aligns to `leadingEdge − markerAdvance` (contiguous with the
         // marker). `rtlMarkerReservePx` is 0 for non-list / marker-less lines, so
         // plain RTL paragraphs keep `leadingEdge − lineWidth` (byte-identical).
-        penX = textX + textMaxW - rtlMarkerReservePx - lineWidth;
+        penX = drawingMlLineX('r', textX - rtlMarkerReservePx,
+          textMaxW, lineWidth, false, true);
       } else {
         penX = effectiveTextX;
       }
@@ -5267,6 +4639,7 @@ export function renderTextBody(
     // (justifyLine only suppresses the last line for `just`).
     const endsLogicalLine = isLastLine || (line.endsWithBreak ?? false);
     const drawSegs = justifyMode && !paraNeedsBidi && !hasTab
+      && drawingMlLineShouldJustify(alignment, isLastLine, line.endsWithBreak ?? false)
       ? justifyLine(line.segments, textMaxW - textXOffset, lineWidth, justifyMode, endsLogicalLine)
       : null;
     const segs: (LayoutSegment & Partial<Justified>)[] = drawSegs ?? line.segments;
