@@ -54,6 +54,7 @@ import {
 } from './presentation-layout-events';
 import { createPptxLoadingLayer } from './loading-indicator';
 import { PptxScrollMediaController } from './scroll-media-controller';
+import { PptxScrollCommentNavigation } from './scroll-comment-navigation';
 
 /**
  * Debounce window (ms) after the last `setScale` in a zoom burst before the
@@ -301,6 +302,29 @@ export class PptxScrollViewer implements ZoomableViewer {
     clearTextPreview: (layer) => this._clearTextLayerPreview(layer),
     reportError: (error) => this._reportRenderError(error),
   });
+  private readonly _commentNavigation = new PptxScrollCommentNavigation<SlideSlot>({
+    presentation: () => this._pres,
+    destroyed: () => this._destroyed,
+    slots: () => this._slots,
+    scrollHost: () => this._scrollHost,
+    spacer: () => this._spacer,
+    scale: () => this._scale,
+    width: () => this._slideWidthPx(),
+    padLeft: () => this._padH().left,
+    marginOrigin: () => this._commentMargin.originPx,
+    totalHeight: () => this._rangeAt(0, this._overscan()).totalHeight,
+    slideOffset: (slide) => this._slideOffset(slide),
+    mountVisible: () => this._mountVisible(),
+    scrollToSlide: (slide, options) => this.scrollToSlide(slide, options),
+    select: (commentId, slide) => {
+      this._activeCommentId = commentId;
+      this._activeCommentSlide = slide;
+      this._selection.clearElementContext();
+      for (const [mountedSlide, slot] of this._slots) this._redrawSlotComments(mountedSlide, slot);
+      this._selection.emitChange();
+    },
+    ownBackground: (operation) => this._errorRouter.ownBackgroundLifecycle(operation),
+  });
   private readonly _selection = new SelectionContextController<PptxSelectionContext, PptxElementContext, PptxPresentation, SlideSlot>({
     wrapper: () => this._wrapper,
     scrollHost: () => this._scrollHost,
@@ -344,7 +368,6 @@ export class PptxScrollViewer implements ZoomableViewer {
   private _layoutUnsubscribe: (() => void) | null = null;
   private _activeCommentId: string | null = null;
   private _activeCommentSlide: number | null = null;
-  private _commentNavigationGeneration = 0;
   private _commentUi: PptxCommentUiRuntime | null = null;
   private _hasComments = false;
   private readonly _commentMargin = new CommentMarginController({
@@ -397,8 +420,6 @@ export class PptxScrollViewer implements ZoomableViewer {
    * presentations make metadata authoritative one slide at a time, so a
    * negative scan is provisional until this frontier reaches slideCount. */
   private _commentScanFrontier = 0;
-  private readonly _layoutWaiters = new Set<() => void>();
-  private _layoutFailed = false;
   private readonly _elementHitTolerance: number;
   /** Set by `destroy()`. Async render callbacks (main + worker) check it before
    *  reporting an error so a rejection that lands after teardown is swallowed
@@ -580,7 +601,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         this._activeCommentSlide = null;
         this._hasComments = false;
         this._commentScanFrontier = 0;
-        this._beginCommentNavigation();
+        this._commentNavigation.begin();
         this._unbindLayoutPresentation();
         if (ownedPresentation) {
           for (const [idx, slot] of [...this._slots]) this._recycleSlot(idx, slot);
@@ -1094,8 +1115,8 @@ export class PptxScrollViewer implements ZoomableViewer {
   private _unbindLayoutPresentation(): void {
     this._layoutUnsubscribe?.();
     this._layoutUnsubscribe = null;
-    this._layoutFailed = false;
-    this._wakeLayoutWaiters();
+    this._commentNavigation.resetLayout();
+    this._commentNavigation.wake();
   }
 
   private _onLayoutPublication(
@@ -1103,9 +1124,9 @@ export class PptxScrollViewer implements ZoomableViewer {
     publication: PptxLayoutPublication,
   ): void {
     if (this._destroyed || presentation !== this._pres) return;
-    this._wakeLayoutWaiters();
+    this._commentNavigation.wake();
     if (publication.error !== undefined) {
-      this._layoutFailed = true;
+      this._commentNavigation.failLayout();
       this._errorRouter.reportBackground(
         publication.error,
         this._opts.onLayoutComplete !== undefined,
@@ -1123,43 +1144,6 @@ export class PptxScrollViewer implements ZoomableViewer {
       );
     }
     if (this._scroller.lastRange) this._emitVisibleSlideChange(this._scroller.lastRange);
-  }
-
-  private _wakeLayoutWaiters(): void {
-    for (const resolve of this._layoutWaiters) resolve();
-    this._layoutWaiters.clear();
-  }
-
-  /** Supersede pending comment navigation and release availability waits now. */
-  private _beginCommentNavigation(): number {
-    const generation = ++this._commentNavigationGeneration;
-    this._wakeLayoutWaiters();
-    return generation;
-  }
-
-  private async _waitForSlideMetadata(
-    presentation: PptxPresentation,
-    slideIndex: number,
-    generation: number,
-  ): Promise<boolean> {
-    return await this._errorRouter.ownBackgroundLifecycle(async () => {
-      while (
-        !this._destroyed &&
-        generation === this._commentNavigationGeneration &&
-        presentation === this._pres &&
-        slideIndex >= presentation.availableSlideCount &&
-        !presentation.layoutComplete &&
-        !this._layoutFailed
-      ) {
-        await new Promise<void>((resolve) => this._layoutWaiters.add(resolve));
-      }
-      if (this._destroyed || presentation !== this._pres) return false;
-      if (presentation.layoutComplete || this._layoutFailed) {
-        await presentation.waitUntilLayoutComplete?.();
-      }
-      if (generation !== this._commentNavigationGeneration) return false;
-      return slideIndex < presentation.availableSlideCount;
-    });
   }
 
   private _emitVisibleSlideChange(range: VisibleWindow): void {
@@ -1329,148 +1313,12 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._mountVisible();
   }
 
-  private _scrollToSlideCommentTarget(
-    slide: number,
-    comment: Readonly<PptxComment>,
-    opts?: { behavior?: 'auto' | 'smooth' },
-    resolvedBounds?: Readonly<{ x: number; y: number; width: number; height: number }>,
-  ): boolean {
-    if (!this._pres) return false;
-    const slot = this._slots.get(slide);
-    const boundsById = new Map(
-      (slot?.commentElementBounds ?? []).map((entry) => [entry.elementId, entry.bounds]),
-    );
-    const anchored = resolvedBounds ?? (comment.anchors ?? []).flatMap((anchor) => {
-      if ((anchor.type !== 'drawingElement' && anchor.type !== 'textRange') || !anchor.elementId) {
-        return [];
-      }
-      const bounds = boundsById.get(anchor.elementId);
-      return bounds ? [bounds] : [];
-    })[0];
-    const anchors = comment.anchors ?? [];
-    const hasPosition = Number.isFinite(comment.x) && Number.isFinite(comment.y) && (
-      anchors.length === 0 || anchors.some((anchor) => anchor.type === 'slide')
-    );
-    if (!anchored && !hasPosition) return false;
-    const x = anchored
-      ? anchored.x + (hasPosition ? comment.x as number : anchored.width)
-      : comment.x as number;
-    const y = anchored
-      ? anchored.y + (hasPosition ? comment.y as number : 0)
-      : comment.y as number;
-    const width = this._slideWidthPx();
-    const { left: paddingLeft } = this._padH();
-    const slideLeft = Math.max(
-      paddingLeft,
-      (this._scrollHost.clientWidth - width) / 2,
-    ) + this._commentMargin.originPx;
-    const range = this._rangeAt(0, this._overscan());
-    const maxTop = Math.max(0, range.totalHeight - this._scrollHost.clientHeight);
-    const spacerWidth = this._spacer.offsetWidth || Number.parseFloat(this._spacer.style.width) || 0;
-    const maxLeft = Math.max(0, spacerWidth - this._scrollHost.clientWidth);
-    const targetX = x / EMU_PER_PX * this._scale;
-    const targetY = y / EMU_PER_PX * this._scale;
-    const top = Math.min(maxTop, Math.max(
-      0,
-      this._slideOffset(slide) + targetY - this._scrollHost.clientHeight / 2,
-    ));
-    const left = Math.min(maxLeft, Math.max(
-      0,
-      slideLeft + targetX - this._scrollHost.clientWidth / 2,
-    ));
-    const host = this._scrollHost as HTMLDivElement & {
-      scrollTo?: (options: {
-        top: number;
-        left: number;
-        behavior?: 'auto' | 'smooth';
-      }) => void;
-    };
-    if (typeof host.scrollTo === 'function') {
-      host.scrollTo({ top, left, behavior: opts?.behavior ?? 'auto' });
-    } else {
-      this._scrollHost.scrollTop = top;
-      this._scrollHost.scrollLeft = left;
-    }
-    this._mountVisible();
-    return true;
-  }
-
-  private async _resolveSlideCommentElementBounds(
-    slide: number,
-    comment: Readonly<PptxComment>,
-  ): Promise<Readonly<{ x: number; y: number; width: number; height: number }> | undefined> {
-    const presentation = this._pres;
-    if (!presentation) return undefined;
-    const elementIds = (comment.anchors ?? []).flatMap((anchor) =>
-      (anchor.type === 'drawingElement' || anchor.type === 'textRange') && anchor.elementId
-        ? [anchor.elementId]
-        : []);
-    if (elementIds.length === 0) return undefined;
-    const cached = new Map(
-      (this._slots.get(slide)?.commentElementBounds ?? [])
-        .map((entry) => [entry.elementId, entry.bounds]),
-    );
-    const cachedTarget = elementIds.flatMap((elementId) => {
-      const bounds = cached.get(elementId);
-      return bounds ? [bounds] : [];
-    })[0];
-    if (cachedTarget) return cachedTarget;
-    const bounds = await presentation.getElementBoundsByIds(slide, elementIds);
-    return elementIds.flatMap((elementId) => {
-      const entry = bounds.find((candidate) => candidate.elementId === elementId);
-      return entry ? [entry.bounds] : [];
-    })[0];
-  }
-
-  /**
-   * Reveal one authored comment occurrence from an application-owned list and
-   * scroll its anchored element or authored slide point into view.
-   * `commentIndex` is its index in `presentation.getComments(slideIndex)`.
-   * Returns `false` when either index does not identify a comment.
-   */
+  /** Reveal an authored occurrence through the PPTX comment navigation adapter. */
   async goToComment(
-    slideIndex: number,
-    commentIndex: number,
+    slideIndex: number, commentIndex: number,
     opts?: { behavior?: 'auto' | 'smooth' },
   ): Promise<boolean> {
-    if (this._destroyed) throw new Error('PptxScrollViewer is destroyed');
-    const presentation = this._pres;
-    if (!presentation || !Number.isInteger(slideIndex) || !Number.isInteger(commentIndex)) {
-      return false;
-    }
-    if (slideIndex < 0 || slideIndex >= presentation.slideCount || commentIndex < 0) return false;
-    const generation = this._beginCommentNavigation();
-    if (slideIndex >= presentation.availableSlideCount && !presentation.layoutComplete) {
-      const available = await this._waitForSlideMetadata(presentation, slideIndex, generation);
-      if (!available) return false;
-    }
-    if (this._destroyed) throw new Error('PptxScrollViewer is destroyed');
-    if (generation !== this._commentNavigationGeneration || presentation !== this._pres) {
-      return false;
-    }
-    const comment = presentation.getComments(slideIndex)[commentIndex];
-    if (!comment) return false;
-
-    const bounds = await this._resolveSlideCommentElementBounds(slideIndex, comment);
-    if (this._destroyed) throw new Error('PptxScrollViewer is destroyed');
-    if (generation !== this._commentNavigationGeneration || presentation !== this._pres) {
-      return false;
-    }
-    const anchors = comment.anchors ?? [];
-    const hasSlidePoint = Number.isFinite(comment.x) && Number.isFinite(comment.y) && (
-      anchors.length === 0 || anchors.some((anchor) => anchor.type === 'slide')
-    );
-    if (!bounds && !hasSlidePoint) return false;
-    this.scrollToSlide(slideIndex, opts);
-    if (!this._scrollToSlideCommentTarget(slideIndex, comment, opts, bounds)) return false;
-    this._activeCommentId = pptxCommentOccurrenceKey(comment, commentIndex, slideIndex);
-    this._activeCommentSlide = slideIndex;
-    this._selection.clearElementContext();
-    for (const [mountedSlide, slot] of this._slots) {
-      this._redrawSlotComments(mountedSlide, slot);
-    }
-    this._selection.emitChange();
-    return true;
+    return this._commentNavigation.goToComment(slideIndex, commentIndex, opts);
   }
 
   /** Search the complete presentation, including slides outside the
@@ -1604,7 +1452,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._redrawSlotComments(slide, slot);
       const active = presentation.getComments(slide).find((comment, index) =>
         pptxCommentOccurrenceKey(comment, index, slide) === this._activeCommentId);
-      if (active) this._scrollToSlideCommentTarget(slide, active);
+      if (active) this._commentNavigation.scrollToTarget(slide, active);
     }).catch((error: unknown) => {
       if (!this._destroyed && generation === slot.commentAnchorGeneration) {
         this._reportRenderError(error);
@@ -1792,13 +1640,14 @@ export class PptxScrollViewer implements ZoomableViewer {
   destroy(): void {
     if (this._destroyed) return;
     this._destroyed = true;
-    this._beginCommentNavigation();
+    this._commentNavigation.begin();
     this._errorRouter.close();
     this._invalidateFind();
     this._findActive = false;
     this._unbindLayoutPresentation();
     this._selection.destroy();
     this._media.destroy();
+    this._commentNavigation.destroy();
     this._highlights.destroy();
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
