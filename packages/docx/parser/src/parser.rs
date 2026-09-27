@@ -37,7 +37,9 @@ use crate::styles::{
 };
 use crate::types::*;
 use crate::xml_util::*;
-use docx_model::paragraph_breaks::{split_para_on_page_breaks, ParaPiece};
+#[cfg(test)]
+use docx_model::paragraph_breaks::split_para_on_page_breaks;
+use docx_model::paragraph_breaks::{split_para_on_page_breaks_with_trailing_mark, ParaPiece};
 
 #[cfg(test)]
 #[path = "parser/relationship_target_tests.rs"]
@@ -54,6 +56,68 @@ const DEFAULT_FONT_SIZE: f64 = 10.0; // pt fallback
 pub(crate) struct Zip {
     session: PackageSessionHandle,
     operation: RetainedPackageOperation,
+}
+
+#[cfg(test)]
+mod split_page_break_package_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    fn package_with_setting(setting: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            write_test_content_types(&mut archive);
+            let options = zip::write::SimpleFileOptions::default();
+            archive.start_file("word/document.xml", options).unwrap();
+            archive.write_all(format!(
+                r#"<w:document xmlns:w="{W_NS}"><w:body><w:p><w:r><w:t>before</w:t></w:r></w:p><w:p><w:r><w:br w:type="page"/></w:r></w:p><w:p><w:r><w:t>after</w:t></w:r></w:p></w:body></w:document>"#
+            ).as_bytes()).unwrap();
+            archive.start_file("word/settings.xml", options).unwrap();
+            archive.write_all(format!(
+                r#"<w:settings xmlns:w="{W_NS}"><w:compat>{setting}</w:compat></w:settings>"#
+            ).as_bytes()).unwrap();
+            archive.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn authored_page_break_keeps_its_mark_only_when_compatibility_is_enabled() {
+        let enabled_bytes = package_with_setting("<w:splitPgBreakAndParaMark/>");
+        let disabled_bytes = package_with_setting("<w:splitPgBreakAndParaMark w:val=\"0\"/>");
+        let parse_bytes = |bytes: Vec<u8>, parser: fn(&mut Zip) -> Result<Document, String>| {
+            let mut zip = open_zip(bytes).unwrap();
+            zip.run_operation("split-page-break", parser).unwrap()
+        };
+        let enabled = parse_bytes(enabled_bytes.clone(), parse);
+        let disabled = parse_bytes(disabled_bytes, parse);
+        let streamed = parse_bytes(enabled_bytes, parse_streamed);
+        assert_eq!(
+            serde_json::to_value(&enabled).unwrap(),
+            serde_json::to_value(streamed).unwrap(),
+            "materialized and pull parsers must place the same paragraph mark"
+        );
+        assert_eq!(
+            enabled
+                .settings
+                .as_ref()
+                .and_then(|s| s.split_pg_break_and_para_mark),
+            Some(true)
+        );
+        assert_eq!(
+            disabled
+                .settings
+                .as_ref()
+                .and_then(|s| s.split_pg_break_and_para_mark),
+            Some(false)
+        );
+        assert_eq!(enabled.body.len(), 4);
+        assert_eq!(disabled.body.len(), 3);
+        assert!(matches!(&enabled.body[1], BodyElement::PageBreak { .. }));
+        assert!(matches!(&enabled.body[2], BodyElement::Paragraph(p) if p.runs.is_empty()));
+        assert!(matches!(&enabled.body[3], BodyElement::Paragraph(_)));
+    }
 }
 
 impl Zip {
@@ -1272,6 +1336,11 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
         rel_map,
         theme,
         &section_hf,
+        environment
+            .document_settings
+            .as_ref()
+            .and_then(|settings| settings.split_pg_break_and_para_mark)
+            .unwrap_or(false),
     );
     let final_section_ordinal = body
         .iter()
@@ -1413,6 +1482,11 @@ impl DocxBodyCursor {
                 error,
                 theme: Box::new(degraded_theme.clone()),
             })?;
+        let split_pg_break_and_para_mark = environment
+            .document_settings
+            .as_ref()
+            .and_then(|settings| settings.split_pg_break_and_para_mark)
+            .unwrap_or(false);
         Ok(Self {
             environment: Some(environment),
             plan: preflight.plan,
@@ -1425,6 +1499,7 @@ impl DocxBodyCursor {
             projector,
             semantic: BodyParseCursor {
                 ref_leading_breaks: preflight.ref_leading_breaks,
+                split_pg_break_and_para_mark,
                 ..BodyParseCursor::default()
             },
             diagnostics: Vec::new(),
@@ -1720,6 +1795,11 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
+                environment
+                    .document_settings
+                    .as_ref()
+                    .and_then(|settings| settings.split_pg_break_and_para_mark)
+                    .unwrap_or(false),
             )
         })
         .unwrap_or_default();
@@ -1735,6 +1815,11 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
+                environment
+                    .document_settings
+                    .as_ref()
+                    .and_then(|settings| settings.split_pg_break_and_para_mark)
+                    .unwrap_or(false),
             )
         })
         .unwrap_or_default();
@@ -2044,6 +2129,7 @@ fn parse_notes(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
+    split_pg_break_and_para_mark: bool,
 ) -> Vec<crate::types::DocxNote> {
     let Ok(xml) = read_zip_string(zip, path) else {
         return Vec::new();
@@ -2089,6 +2175,7 @@ fn parse_notes(
             theme,
             &HashMap::new(),
             TablePositioningContext::IgnoredStory,
+            split_pg_break_and_para_mark,
             None,
         );
         out.push(crate::types::DocxNote { id, content });
@@ -2633,6 +2720,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
     let use_fe_layout = compat_bool("useFELayout");
     let balance_single_byte_double_byte_width = compat_bool("balanceSingleByteDoubleByteWidth");
     let adjust_line_height_in_table = compat_bool("adjustLineHeightInTable");
+    let split_pg_break_and_para_mark = compat_bool("splitPgBreakAndParaMark");
 
     // ECMA-376 §22.1.2.30 `m:mathPr/m:defJc@m:val` — document-wide default math
     // justification (math namespace, bare `val` fallback).
@@ -2658,6 +2746,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
         && adjust_line_height_in_table.is_none()
+        && split_pg_break_and_para_mark.is_none()
     {
         return None;
     }
@@ -2673,6 +2762,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         use_fe_layout,
         balance_single_byte_double_byte_width,
         adjust_line_height_in_table,
+        split_pg_break_and_para_mark,
     })
 }
 
@@ -3200,6 +3290,7 @@ fn parse_body_elements(
         theme,
         section_hf,
         TablePositioningContext::Normal,
+        false,
         None,
     )
 }
@@ -3214,6 +3305,7 @@ fn parse_body_elements_with_diagnostics(
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
+    split_pg_break_and_para_mark: bool,
 ) -> (Vec<BodyElement>, Vec<ParseDiagnostic>) {
     let mut diagnostics = Vec::new();
     let body = parse_body_elements_in_story(
@@ -3226,6 +3318,7 @@ fn parse_body_elements_with_diagnostics(
         theme,
         section_hf,
         TablePositioningContext::Normal,
+        split_pg_break_and_para_mark,
         Some(&mut diagnostics),
     );
     (body, diagnostics)
@@ -3406,6 +3499,7 @@ struct BodyParseCursor {
     field: FieldState,
     section_ordinal: usize,
     ref_leading_breaks: HashMap<String, String>,
+    split_pg_break_and_para_mark: bool,
 }
 
 impl BodyParseCursor {
@@ -3491,6 +3585,13 @@ impl BodyParseCursor {
                                 parity: None,
                                 same_paragraph_as_previous: None,
                             });
+                            if self.split_pg_break_and_para_mark {
+                                // The break is the only run, so the remaining
+                                // paragraph mark occupies a line on the next
+                                // page with this paragraph's own formatting.
+                                result.runs.clear();
+                                output.push(BodyElement::Paragraph(Box::new(result)));
+                            }
                         }
                         push_section_break(&mut output);
                     }
@@ -3499,7 +3600,10 @@ impl BodyParseCursor {
                         push_section_break(&mut output);
                     }
                     _ => {
-                        for piece in split_para_on_page_breaks(result) {
+                        for piece in split_para_on_page_breaks_with_trailing_mark(
+                            result,
+                            self.split_pg_break_and_para_mark,
+                        ) {
                             match piece {
                                 ParaPiece::Para(paragraph) => {
                                     output.push(BodyElement::Paragraph(Box::new(paragraph)))
@@ -3570,10 +3674,14 @@ fn parse_body_elements_in_story(
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
     table_positioning_context: TablePositioningContext,
+    split_pg_break_and_para_mark: bool,
     mut diagnostics: Option<&mut Vec<ParseDiagnostic>>,
 ) -> Vec<BodyElement> {
     let mut body: Vec<BodyElement> = Vec::new();
-    let mut cursor = BodyParseCursor::default();
+    let mut cursor = BodyParseCursor {
+        split_pg_break_and_para_mark,
+        ..BodyParseCursor::default()
+    };
     // The body-level sectPr (the last element) defines the final section and
     // is not a page break. Mid-body sectPrs (nested in pPr) DO imply a page break.
     // The walk also flags the end of any "Cover Pages" building block so the
@@ -17433,6 +17541,24 @@ mod math_jc_tests {
         );
         let settings = parse_document_settings(&xml).expect("compat setting");
         assert_eq!(settings.adjust_line_height_in_table, Some(false));
+    }
+
+    #[test]
+    fn settings_split_page_break_and_paragraph_mark_respects_on_off() {
+        for (element, expected) in [
+            ("<w:splitPgBreakAndParaMark/>", Some(true)),
+            ("<w:splitPgBreakAndParaMark w:val=\"0\"/>", Some(false)),
+        ] {
+            let xml = format!(
+                r#"<w:settings xmlns:w="{W_NS}"><w:compat>{element}</w:compat></w:settings>"#
+            );
+            assert_eq!(
+                parse_document_settings(&xml)
+                    .expect("compat setting")
+                    .split_pg_break_and_para_mark,
+                expected
+            );
+        }
     }
 
     // ECMA-376 §22.1.2.88 + §17.3.1.13 `w:jc` — a display-math paragraph with no

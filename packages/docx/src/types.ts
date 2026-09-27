@@ -124,6 +124,9 @@ export interface DocSettings {
   /** §17.15.3.1 `w:compat/w:adjustLineHeightInTable` — apply the section
    *  document-grid line pitch to text in table cells. */
   adjustLineHeightInTable?: boolean;
+  /** ECMA-376 Part 4 §14.8.3.38: place a paragraph mark following a hard
+   * page break on the next page, where its line box affects following flow. */
+  splitPgBreakAndParaMark?: boolean;
 }
 
 export interface DocRevision {
