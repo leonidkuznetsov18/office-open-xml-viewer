@@ -1,6 +1,7 @@
 import {
   XlsxWorkbook,
   acquireXlsxWorksheet,
+  retainXlsxWorksheetReference,
   loadXlsxSheetSource,
   prepareXlsxViewerRowHeights,
   releaseXlsxViewerProjection,
@@ -715,6 +716,9 @@ class XlsxViewerEngine implements ZoomableViewer {
   private fontBindingGeneration = 0;
   private fontBinding: Readonly<{ workbook: XlsxWorkbook; release: () => void }> | null = null;
   private _hiddenSheetMode: HiddenSheetMode;
+  /** During navigation the outgoing graph stays live for interaction while
+   * its lease is released. It can briefly coexist with the incoming graph,
+   * so viewer memory can peak at two worksheet models until the swap. */
   private currentWorksheet: Worksheet | null = null;
   private releaseCurrentWorksheet: (() => void) | null = null;
   /** Authored comments for the selected sheet. Presentation filtering must not
@@ -1336,18 +1340,10 @@ class XlsxViewerEngine implements ZoomableViewer {
       if (!await this.ensureHostFonts(workbook)) return;
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
       if (index !== this.currentSheet && this.currentWorksheet) {
-        // Navigation ends the outgoing sheet's active lease before admitting
-        // its replacement. Otherwise a one-sheet cache cannot switch sheets.
+        // Permit cache eviction, but keep the displayed worksheet and every
+        // interaction map intact until a replacement is ready to commit.
         this.releaseCurrentWorksheet?.();
         this.releaseCurrentWorksheet = null;
-        this.currentWorksheet = null;
-        this.sheetViews.clear();
-        this.currentSourceComments = [];
-        this.sourceCommentMap.clear();
-        this.commentMap.clear();
-        this.hyperlinkMap.clear();
-        this.setElementContext(null);
-        this.pendingElementClick = null;
       }
       const lease = await acquireXlsxWorksheet(workbook, index);
       sourceWorksheet = lease.worksheet;
@@ -1363,6 +1359,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     } catch (error) {
       releaseNewWorksheet?.();
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
+      await this.restoreDisplayedWorksheetLease(workbook, generation);
       throw error;
     }
     if (!this.isCurrentSheetRequest(generation, workbook)) {
@@ -1418,6 +1415,16 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   private isCurrentSheetRequest(generation: number, workbook: XlsxWorkbook): boolean {
     return !this._destroyed && generation === this.sheetRequestGeneration && this.wb === workbook;
+  }
+
+  private async restoreDisplayedWorksheetLease(workbook: XlsxWorkbook, generation: number): Promise<void> {
+    if (!this.currentWorksheet || this.releaseCurrentWorksheet) return;
+    const release = await retainXlsxWorksheetReference(workbook, this.currentSheet);
+    if (this.isCurrentSheetRequest(generation, workbook) && this.currentWorksheet && !this.releaseCurrentWorksheet) {
+      this.releaseCurrentWorksheet = release;
+    } else {
+      release();
+    }
   }
 
   // ─── Outline gutter (XL4: row/column grouping) ────────────────────────────
@@ -5127,6 +5134,14 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.sheetViews.clear();
     this.currentSourceComments = [];
     this.sourceCommentMap.clear();
+    this.commentMap.clear();
+    this.hyperlinkMap.clear();
+    this.preparedWorkbook = null;
+    this.rowOutlineBands = [];
+    this.colOutlineBands = [];
+    this.rowOutline = null;
+    this.colOutline = null;
+    this.sizeOverrideStore.clear();
     this.elementContext = null;
     this.pendingElementClick = null;
     this.selectionController.reset();

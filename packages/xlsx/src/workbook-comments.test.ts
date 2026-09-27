@@ -10,6 +10,7 @@ describe('XlsxWorkbook.getComments', () => {
     } as Worksheet;
     workbook.getWorksheet = vi.fn(async () => worksheet);
     (workbook as unknown as { sheetLeases: Map<number, number> }).sheetLeases = new Map();
+    (workbook as unknown as { evictingSheets: Map<number, unknown> }).evictingSheets = new Map();
 
     const comments = await workbook.getComments(3);
 
@@ -23,6 +24,7 @@ describe('XlsxWorkbook.getComments', () => {
     const workbook = Object.create(XlsxWorkbook.prototype) as XlsxWorkbook;
     workbook.getWorksheet = vi.fn(async () => ({ comments: undefined }) as Worksheet);
     (workbook as unknown as { sheetLeases: Map<number, number> }).sheetLeases = new Map();
+    (workbook as unknown as { evictingSheets: Map<number, unknown> }).evictingSheets = new Map();
 
     await expect(workbook.getComments(0)).resolves.toEqual([]);
   });

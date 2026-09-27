@@ -68,6 +68,7 @@ function makeWorkbook(
   instance.sheetCache = new Map();
   instance.sheetCacheUsage = new Map();
   instance.sheetLeases = new Map();
+  instance.evictingSheets = new Map();
   instance.sheetLoads = new Map();
   instance.bridge = bridge;
   instance.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
@@ -171,7 +172,7 @@ describe('XlsxWorkbook.getWorksheet compatibility materializer', () => {
     expect(reacquired).not.toBe(first);
   });
 
-  it('keeps a leased sheet and fails closed when nothing else can fit', async () => {
+  it('keeps a leased sheet and retries admission after its lease ends', async () => {
     const { workbook, request } = makeWorkbook('main', async (message) => {
       if ('type' in message) return { type: 'sheetSessionOpened', id: 'id' in message ? message.id : 0 };
       if (message.kind === 'pull') {
@@ -190,12 +191,17 @@ describe('XlsxWorkbook.getWorksheet compatibility materializer', () => {
     state.parsedWorkbook.workbook.sheets.push({ name: 'Sheet2' } as ParsedWorkbook['workbook']['sheets'][number]);
     state.retainedSheetUsage = { rows: 199_999, cells: 499_999, ownedUtf8Bytes: 0, jsonBytes: 0 };
     const lease = await acquireXlsxWorksheet(workbook as unknown as XlsxWorkbook, 0);
-    await expect(workbook.getWorksheet(1)).rejects.toBeInstanceOf(OoxmlResourceLimitError);
+    await expect(workbook.getWorksheet(1)).rejects.toMatchObject({
+      code: 'ooxml-resource-limit',
+      details: { violation: { resource: 'worksheet-cache' } },
+    });
     expect(request.mock.calls.some(([build]) => {
       const message = build(0);
       return 'kind' in message && message.kind === 'ack' && message.sessionId === 2 && message.sequence === 1;
     })).toBe(false);
     lease.release();
+    await expect(workbook.getWorksheet(0)).resolves.toBe(lease.worksheet);
+    await expect(workbook.getWorksheet(1)).resolves.toBeDefined();
   });
 
   it('keeps eviction accounting exact when the incoming terminal ACK fails', async () => {
@@ -280,6 +286,77 @@ describe('XlsxWorkbook.getWorksheet compatibility materializer', () => {
     expect([...state.sheetCache.keys()]).toEqual([0, 2]);
     expect(state.retainedSheetUsage.rows).toBe(200_000);
     expect([...workerSheets].sort()).toEqual([0, 2]);
+  });
+
+  it('waits for a pending worker eviction before leasing or rendering its victim', async () => {
+    let completeEviction!: () => void;
+    let evictionStarted!: () => void;
+    const blockedEviction = new Promise<void>((resolve) => { completeEviction = resolve; });
+    const evictionPending = new Promise<void>((resolve) => { evictionStarted = resolve; });
+    const opened = new Map<number, number>();
+    const events: string[] = [];
+    const bitmap = {} as ImageBitmap;
+    const { workbook } = makeWorkbook('worker', async (message) => {
+      if ('type' in message) {
+        if (message.type === 'evictWorksheets') {
+          events.push('evict-start');
+          evictionStarted();
+          await blockedEviction;
+          events.push('evict-done');
+          return { type: 'worksheetsEvicted', id: message.id };
+        }
+        if (message.type === 'openSheetSession') {
+          opened.set(message.sessionId, message.sheetIndex);
+          events.push(`open:${message.sheetIndex}`);
+          return { type: 'sheetSessionOpened', id: message.id };
+        }
+        if (message.type === 'renderViewport') {
+          events.push(`render:${message.sheetIndex}`);
+          return { type: 'viewportRendered', id: message.id, bitmap };
+        }
+        throw new Error('unexpected worker request');
+      }
+      if (message.kind === 'pull') {
+        const sheet = opened.get(message.sessionId) ?? 0;
+        const payload = new TextEncoder().encode(JSON.stringify(message.sequence === 0
+          ? { kind: 'rows', rows: WORKSHEET.rows }
+          : { kind: 'finished', worksheet: { ...WORKSHEET, name: `Sheet${sheet + 1}`, rows: [] } })).buffer;
+        return { ...message, kind: 'chunk', byteLength: payload.byteLength,
+          done: message.sequence === 1, payload };
+      }
+      return { ...message, kind: 'accepted', command: message.kind };
+    });
+    const state = workbook as unknown as {
+      parsedWorkbook: ParsedWorkbook;
+      retainedSheetUsage: { rows: number; cells: number; ownedUtf8Bytes: number; jsonBytes: number };
+    };
+    state.parsedWorkbook.workbook.sheets.push({ name: 'Sheet2' } as ParsedWorkbook['workbook']['sheets'][number]);
+    state.retainedSheetUsage = { rows: 199_999, cells: 499_999, ownedUtf8Bytes: 0, jsonBytes: 0 };
+    const first = await workbook.getWorksheet(0);
+    const incoming = workbook.getWorksheet(1);
+    await evictionPending;
+
+    let acquired = false;
+    const reacquiring = acquireXlsxWorksheet(workbook as unknown as XlsxWorkbook, 0).then((lease) => {
+      acquired = true;
+      return lease;
+    });
+    const rendering = workbook.renderViewportToBitmap(
+      0, { startRow: 1, endRow: 1, startCol: 1, endCol: 1 }, { width: 100, height: 80 },
+    );
+    await Promise.resolve();
+    expect(acquired).toBe(false);
+    expect(events).not.toContain('render:0');
+
+    completeEviction();
+    await incoming;
+    const lease = await reacquiring;
+    expect(lease.worksheet).toEqual(first);
+    expect(lease.worksheet).not.toBe(first);
+    await expect(rendering).resolves.toBe(bitmap);
+    expect(events.indexOf('evict-done')).toBeLessThan(events.lastIndexOf('open:0'));
+    expect(events.indexOf('evict-done')).toBeLessThan(events.indexOf('render:0'));
+    lease.release();
   });
 
   it('closes both caches when a worker eviction reply is lost', async () => {

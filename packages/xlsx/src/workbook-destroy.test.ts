@@ -100,6 +100,7 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     instance.sheetCache = new Map();
     instance.sheetCacheUsage = new Map();
     instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
     instance.googleFontNames = [];
@@ -307,6 +308,7 @@ describe('XlsxWorkbook.destroy() — drops the shared image caches (GPU-leak gua
     instance.sheetCache = new Map();
     instance.sheetCacheUsage = new Map();
     instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
     instance.googleFontNames = [];

@@ -11,6 +11,7 @@ describe('XlsxWorkbook resource-policy wiring', () => {
     instance.sheetCache = new Map();
     instance.sheetCacheUsage = new Map();
     instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.imageCache = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
