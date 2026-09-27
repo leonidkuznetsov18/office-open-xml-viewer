@@ -23,6 +23,7 @@ const TEXT_RUN_PROJECTION_ADAPTER = `${DOCX_SOURCE}/text-run-projection.ts`;
 const LAYOUT_RUNTIME_ADAPTER = `${DOCX_SOURCE}/layout-runtime.ts`;
 const ACQUISITION_CONTEXT = `${LAYOUT_SOURCE}/acquisition-context.ts`;
 const PRODUCTION_BODY_LAYOUT = `${LAYOUT_SOURCE}/production-body-layout.ts`;
+const BODY_TABLE_MEASUREMENT = `${LAYOUT_SOURCE}/body-table-measurement.ts`;
 const ACQUISITION_STATE = `${LAYOUT_SOURCE}/acquisition-state.ts`;
 const ACQUISITION_INPUT_PROJECTIONS = `${LAYOUT_SOURCE}/acquisition-input-projections.ts`;
 const ANCHOR_CLASSIFICATION = `${LAYOUT_SOURCE}/anchor-classification.ts`;
@@ -352,6 +353,25 @@ const ACQUISITION_CONTEXT_CONSUMERS = [
   `${DOCX_SOURCE}/float-table-geometry.ts`,
   `${DOCX_SOURCE}/frame-geometry.ts`,
   `${DOCX_SOURCE}/line-layout.ts`,
+  `${DOCX_SOURCE}/line-breaker/advance.ts`,
+  `${DOCX_SOURCE}/line-breaker/break-opportunities.ts`,
+  `${DOCX_SOURCE}/line-breaker/break-queue.ts`,
+  `${DOCX_SOURCE}/line-breaker/fit-search.ts`,
+  `${DOCX_SOURCE}/line-breaker/font-metrics.ts`,
+  `${DOCX_SOURCE}/line-breaker/font-routes.ts`,
+  `${DOCX_SOURCE}/line-breaker/justify-fit.ts`,
+  `${DOCX_SOURCE}/line-breaker/kinsoku.ts`,
+  `${DOCX_SOURCE}/line-breaker/line-finalize.ts`,
+  `${DOCX_SOURCE}/line-breaker/line-metrics.ts`,
+  `${DOCX_SOURCE}/line-breaker/model.ts`,
+  `${DOCX_SOURCE}/line-breaker/pass-driver.ts`,
+  `${DOCX_SOURCE}/line-breaker/pass-operations.ts`,
+  `${DOCX_SOURCE}/line-breaker/ruby-metrics.ts`,
+  `${DOCX_SOURCE}/line-breaker/segment-builder.ts`,
+  `${DOCX_SOURCE}/line-breaker/tabs.ts`,
+  `${DOCX_SOURCE}/line-breaker/text-runs.ts`,
+  `${DOCX_SOURCE}/line-breaker/vertical-text.ts`,
+  BODY_TABLE_MEASUREMENT,
   `${DOCX_SOURCE}/paragraph-measure.ts`,
 ];
 
@@ -542,23 +562,26 @@ function assertProductionBodyAcquisitionAuthority(root) {
       'resolveTableRowContentHeights',
     ])],
   ]);
-  for (const edge of moduleEdges(path)) {
-    if (!edge.literal || !edge.specifier.startsWith('.')) continue;
-    const resolvedTarget = resolveLocalImport(path, edge.specifier);
-    const fallbackTarget = resolve(dirname(path), edge.specifier)
-      .replace(/\.(?:[cm]?js)$/u, '.ts');
-    const target = posixPath(relative(root, resolvedTarget ?? fallbackTarget));
-    const forbidden = forbiddenImportsByTarget.get(target);
-    if (!forbidden) continue;
-    const importedNames = edge.importedNames ?? [];
-    if (edge.kind !== 'import'
-      || importedNames.includes('*')
-      || importedNames.includes('default')
-      || importedNames.some((name) => forbidden.has(name))) {
-      fail(
-        'PRODUCTION_ACQUISITION_AUTHORITY',
-        `${PRODUCTION_BODY_LAYOUT} imports fallback measurement from ${target}`,
-      );
+  for (const file of [PRODUCTION_BODY_LAYOUT, BODY_TABLE_MEASUREMENT]) {
+    const inspectedPath = resolve(root, file);
+    for (const edge of moduleEdges(inspectedPath)) {
+      if (!edge.literal || !edge.specifier.startsWith('.')) continue;
+      const resolvedTarget = resolveLocalImport(inspectedPath, edge.specifier);
+      const fallbackTarget = resolve(dirname(inspectedPath), edge.specifier)
+        .replace(/\.(?:[cm]?js)$/u, '.ts');
+      const target = posixPath(relative(root, resolvedTarget ?? fallbackTarget));
+      const forbidden = forbiddenImportsByTarget.get(target);
+      if (!forbidden) continue;
+      const importedNames = edge.importedNames ?? [];
+      if (edge.kind !== 'import'
+        || importedNames.includes('*')
+        || importedNames.includes('default')
+        || importedNames.some((name) => forbidden.has(name))) {
+        fail(
+          'PRODUCTION_ACQUISITION_AUTHORITY',
+          `${file} imports fallback measurement from ${target}`,
+        );
+      }
     }
   }
   const functions = [];
