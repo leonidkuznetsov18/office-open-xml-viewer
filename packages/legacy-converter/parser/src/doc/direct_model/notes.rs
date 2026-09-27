@@ -161,8 +161,14 @@ pub(super) fn validate(
             continue;
         }
         let separator = headers.separator_text(base);
+        let continuation = headers.separator_text(base + 1);
+        // [MS-DOC] 2.3.3 permits empty separator stories. A Word DOC→DOCX
+        // control with both slots empty emits two bare reserved paragraphs;
+        // its PDF has no rule, so the existing generic `none` presentation
+        // represents this bounded pair without losing note text or spacing.
         if !matches!(separator, "" | "\u{3}\r\r")
-            || !matches!(headers.separator_text(base + 1), "\u{3}\r\r" | "\u{4}\r\r")
+            || !(matches!(continuation, "\u{3}\r\r" | "\u{4}\r\r")
+                || (separator.is_empty() && continuation.is_empty()))
             || !matches!(headers.separator_text(base + 2), "" | "\r\r")
         {
             return Err(unsupported("custom Word note separators are not supported"));
@@ -436,7 +442,7 @@ mod tests {
         assert!(reject(missing, "A\u{2}\r").contains("note properties"));
         for separators in [
             ["\u{3}\r\r\r", "\u{3}\r\r", "", "", "", ""],
-            ["", "", "", "", "", ""],
+            ["\u{3}\r\r", "", "", "", "", ""],
             ["\u{3}\r\r", "x\r\r", "", "", "", ""],
             ["\u{3}\r\r", "\u{3}\r\r", "x\r\r", "", "", ""],
         ] {
@@ -452,6 +458,24 @@ mod tests {
         let references = [(1, true)];
         let mut properties = fixture(&notes, &references);
         properties.separators[0] = "";
+        let document = document("A\u{2}\r", &properties).unwrap();
+        assert_eq!(document.footnotes.len(), 1);
+        assert_eq!(
+            document
+                .note_layout_settings
+                .unwrap()
+                .footnote_separator
+                .as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn paired_empty_separator_stories_suppress_the_rule() {
+        let notes = ["\u{2} one\r"];
+        let references = [(1, true)];
+        let mut properties = fixture(&notes, &references);
+        properties.separators = ["", "", "", "", "", ""];
         let document = document("A\u{2}\r", &properties).unwrap();
         assert_eq!(document.footnotes.len(), 1);
         assert_eq!(
