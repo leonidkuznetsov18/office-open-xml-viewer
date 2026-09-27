@@ -16,7 +16,6 @@ import {
   dropSvgImageCache,
   resolveOoxmlContainer,
   toArrayBuffer,
-  type AdmittedModelSourceLoad,
   type LoadOptions as CoreLoadOptions,
   type MathRenderer,
   type ChartThreeDRenderer,
@@ -78,7 +77,7 @@ import {
   isXlsxWorksheetPullResponse,
   XlsxWorksheetPullClient,
 } from './worksheet-pull-client.js';
-import { applyAutoRowHeights, bindXlsxOfficeFontRoutes, bindXlsxWorksheetOfficeFontRoutes, computeMdw, inheritSheetRenderCache, getGridGeometryForWorksheet, pinXlsxGridGeometry } from './renderer.js';
+import { applyAutoRowHeights, bindXlsxOfficeFontRoutes, bindXlsxWorksheetOfficeFontRoutes, inheritSheetRenderCache, getGridGeometryForWorksheet } from './renderer.js';
 import {
   assertDelimitedTextSourceBytes,
   resolveDelimitedTextOptions,
@@ -116,19 +115,6 @@ interface RetainedFontSet {
 /** Options for {@link XlsxWorkbook.load}. Extends the shared load-options type
  *  from `@silurus/ooxml-core` (`useGoogleFonts`, `resourceLimits`, the
  *  deprecated `maxZipEntryBytes` alias, and `math`) with worker rendering. */
-/** Parse-request fields for an application-selected model source. */
-function modelSourceFields(
-  load: AdmittedModelSourceLoad,
-): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
-  const sourceOwnerUrl = new URL(
-    import.meta.env.DEV ? './internal/worker-worksheet-source.ts' : './xlsx-source-worker.mjs',
-    import.meta.url,
-  ).href;
-  return load.transfer.length > 0
-    ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
-    : { source: load.module, sourceOwnerUrl };
-}
-
 export interface LoadOptions extends CoreLoadOptions {
   /**
    * 'main' (default): parse in a worker, render on the main thread (current
@@ -214,11 +200,6 @@ export class XlsxWorkbook {
     mode: 'main' | 'worker',
     wasmUrlOverride?: string | URL,
     initializeWasm = true,
-    sourceHostLayout?: (
-      post: (message: unknown) => void,
-      message: unknown,
-      measure: (font: { readonly family: string; readonly sizePt: number; readonly bold: boolean; readonly italic: boolean }) => number | undefined,
-    ) => boolean,
   ) {
     this._mode = mode;
     if (!worker) return;
@@ -237,20 +218,6 @@ export class XlsxWorkbook {
       toError: (res) =>
         'type' in res && res.type === 'error' ? deserializeWorkerError(res) : undefined,
       onUnsolicited: (res) => {
-        // A model source's parse worker asks the page, which owns the
-        // renderer in this mode, to measure its Normal font (host-layout.ts).
-        if (sourceHostLayout?.(
-          (message) => worker.postMessage(message),
-          res,
-          (font) => computeMdw(
-            font.family,
-            font.sizePt,
-            undefined,
-            this.googleSubstitutes,
-            font.bold ? 700 : 400,
-            font.italic ? 'italic' : 'normal',
-          ),
-        )) return;
         respondToWorkerSvgDecodeRequest(
           (message, transfer) => (
             worker.postMessage as (value: unknown, transfer?: Transferable[]) => void
@@ -367,6 +334,10 @@ export class XlsxWorkbook {
 
   /** Parse an XLSX from a URL or ArrayBuffer. */
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<XlsxWorkbook> {
+    if (opts.modelSources !== undefined) {
+      const { loadXlsxModelSource } = await import('./internal/workbook-model-source.js');
+      return loadXlsxModelSource(source, opts);
+    }
     opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const mode = opts.mode ?? 'main';
@@ -398,17 +369,7 @@ export class XlsxWorkbook {
     } else {
       buffer = source;
     }
-    // An application-supplied model source claims its input from the raw bytes
-    // before OOXML container resolution; without `modelSources` nothing here
-    // runs and the OOXML path is unchanged.
-    let sourceLoad: AdmittedModelSourceLoad | undefined;
-    if (opts.modelSources !== undefined) {
-      const { selectModelSource, beginModelSourceLoad } = await import('@silurus/ooxml-core/internal/model-source');
-      const selected = selectModelSource(opts.modelSources, 'xlsx', new Uint8Array(buffer));
-      if (selected) sourceLoad = beginModelSourceLoad(selected, 'xlsx');
-    }
-    try {
-    if (!sourceLoad) buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
+    buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
     const preserveCallerBuffer = buffer === callerBuffer;
     metrics.setSourceBytes(buffer.byteLength);
     metrics.checkpoint('container ready');
@@ -420,10 +381,7 @@ export class XlsxWorkbook {
         : new InlineWorker();
     let wb: XlsxWorkbook | undefined;
     try {
-      const sourceHostLayout = sourceLoad && mode === 'main'
-        ? (await import('./internal/host-layout.js')).respondToHostLayoutRequest
-        : undefined;
-      wb = new XlsxWorkbook(worker, mode, opts.wasmUrl, sourceLoad === undefined, sourceHostLayout);
+      wb = new XlsxWorkbook(worker, mode, opts.wasmUrl);
       wb.metrics = metrics;
       await wb._load(
         buffer,
@@ -431,19 +389,14 @@ export class XlsxWorkbook {
         resourceOptions.policy,
         (usage) => metrics.observeUsage(usage),
         preserveCallerBuffer,
-        sourceLoad,
       );
       metrics.checkpoint('workbook index ready');
       metrics.succeed({ sheets: wb.sheetCount });
-      sourceLoad?.release();
       return wb;
     } catch (error) {
       const rejectedWorkbook = wb;
       disposeRejectedLoad(worker, rejectedWorkbook ? () => rejectedWorkbook.destroy() : undefined);
       throw error;
-    }
-    } finally {
-      sourceLoad?.release();
     }
     } catch (error) {
       metrics.fail(error);
@@ -461,7 +414,6 @@ export class XlsxWorkbook {
     resourcePolicy: NormalizedOoxmlResourcePolicy = normalizeResourcePolicy(opts),
     onUsage?: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     preserveCallerBuffer = false,
-    sourceLoad?: AdmittedModelSourceLoad,
   ): Promise<void> {
     const bridge = this.requireBridge();
     this.resourceFailure = null;
@@ -525,16 +477,14 @@ export class XlsxWorkbook {
               useGoogleFonts: !!opts.useGoogleFonts,
               cjkFallback: this.cjkFallback,
               renderers: rendererDescriptors,
-              ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined),
             } satisfies RenderWorkerRequest)
           : ({
               type: 'parse',
               id,
               data: workerData,
               resourcePolicy,
-              ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined),
             } satisfies WorkerRequest),
-      sourceLoad ? [workerData, ...sourceLoad.transfer] : [workerData],
+      [workerData],
       { timeoutMs: opts.workerTimeoutMs },
     );
     // Both modes carry the light, workbook-level ParsedWorkbook back, so
@@ -545,13 +495,11 @@ export class XlsxWorkbook {
       this.parsedWorkbook = response.workbook;
       if (response.usage) onUsage?.(response.usage);
     } else {
-      const { workbookJson, usage, layoutMetrics } = parsed as Extract<WorkerResponse, { type: 'parsed' }>;
+      const { workbookJson, usage } = parsed as Extract<WorkerResponse, { type: 'parsed' }>;
       if (usage) onUsage?.(usage);
-      const decoded = JSON.parse(
+      this.parsedWorkbook = JSON.parse(
         new TextDecoder().decode(new Uint8Array(workbookJson)),
       ) as ParsedWorkbook;
-      if (layoutMetrics) decoded.layoutMetrics = { maximumDigitWidth: layoutMetrics.maximumDigitWidth };
-      this.parsedWorkbook = decoded;
     }
     const parsedWorkbook = this.parsedWorkbook;
     if (!parsedWorkbook) throw new Error('XLSX worker returned no workbook metadata');
@@ -887,11 +835,6 @@ export class XlsxWorkbook {
       const mainOffice = typeof document !== 'undefined'
         ? this.retainedFontSets.get(document.fonts)?.loaded?.office : undefined;
       bindXlsxWorksheetOfficeFontRoutes(terminal, mainOffice?.routes, this.googleSubstitutes);
-      // A model source's host layout fixed the Normal-font width before
-      // parsing; pin it after the font-route bind, which may invalidate
-      // geometry, so the grid keeps the width its anchors were resolved with.
-      const hostLayoutMdw = this.parsedWorkbook?.layoutMetrics?.maximumDigitWidth;
-      if (hostLayoutMdw !== undefined) pinXlsxGridGeometry(terminal, hostLayoutMdw);
       return terminal;
     } catch (error) {
       if (error instanceof OoxmlResourceLimitError) this.resourceFailure ??= error;
@@ -1121,8 +1064,7 @@ export class XlsxWorkbook {
         // withWorksheetArchiveOperation, avoiding a nested FIFO acquisition.
         {
           ...renderOpts,
-          authoritativeMdw: extracted.layoutMetrics?.maximumDigitWidth
-            ?? this.parsedWorkbook?.layoutMetrics?.maximumDigitWidth,
+          authoritativeMdw: extracted.layoutMetrics?.maximumDigitWidth,
           officeFontRoutes: targetFontSet
             ? this.retainedFontSets.get(targetFontSet)?.loaded?.office.routes
             : undefined,
@@ -1169,8 +1111,7 @@ export class XlsxWorkbook {
             sheetIndex,
             viewport,
             opts: wireOpts,
-            layoutMetrics: extracted.layoutMetrics
-              ?? this.parsedWorkbook?.layoutMetrics,
+            layoutMetrics: extracted.layoutMetrics,
             viewProjection: extracted.projection,
           }) satisfies RenderWorkerRequest,
         ));

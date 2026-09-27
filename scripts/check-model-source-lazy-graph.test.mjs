@@ -16,7 +16,7 @@ test('a static owner import in the worker graph fails, while a selected-source i
     writeFileSync(worker, "if (source) await import('./internal/worker-document-source.js');\n");
     assert.doesNotThrow(() => assertLazySourceOwner(worker, owner));
     writeFileSync(worker, "import { Owner } from './internal/worker-document-source.js';\nif (source) await import('./internal/worker-document-source.js');\n");
-    assert.throws(() => assertLazySourceOwner(worker, owner), /statically imports/);
+    assert.throws(() => assertLazySourceOwner(worker, owner), /statically reaches/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

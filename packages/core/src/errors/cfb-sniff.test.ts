@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { cfbDirectoryNames, sniffCfb } from './cfb-sniff';
+import { sniffCfb } from './cfb-sniff';
+import { cfbDirectoryNames } from '../source/cfb-directory-names';
 import { buildCfbFixture } from '../testing/cfb-fixture';
 
 /**

@@ -9,7 +9,6 @@ import { parse } from '@babel/parser';
 import { createTypeScriptResolver } from './check-core-legacy-boundary.mjs';
 
 const resolveModule = createTypeScriptResolver();
-const parsedSource = new Map();
 
 function staticSpecifiers(ast) {
   return ast.program.body.flatMap((node) =>
@@ -29,17 +28,23 @@ export function eagerModules(entry) {
     if (visited.has(file)) continue;
     visited.add(file);
     if (file.includes('/src/wasm/') || !/\.[cm]?[jt]sx?$/.test(file)) continue;
-    let imports = parsedSource.get(file);
-    if (!imports) {
-      const ast = parse(readFileSync(file, 'utf8'), { sourceType: 'module', plugins: ['typescript', 'jsx'] });
-      imports = staticSpecifiers(ast);
-      parsedSource.set(file, imports);
-    }
+    // Reparse on each audit. A test or editor can change a file between two
+    // calls in one process; a path-only cache would silently preserve its old
+    // import graph.
+    const ast = parse(readFileSync(file, 'utf8'), { sourceType: 'module', plugins: ['typescript', 'jsx'] });
+    const imports = staticSpecifiers(ast);
     const importer = relative(process.cwd(), file).replaceAll('\\', '/');
     for (const specifier of imports) {
       if (specifier.includes('?')) continue;
-      const target = resolveModule(importer, specifier);
-      if (target && target.startsWith(process.cwd())) pending.push(resolve(target));
+      let target;
+      if (specifier.startsWith('.')) {
+        const stem = resolve(dirname(file), specifier).replace(/\.js$/, '');
+        target = [stem + '.ts', stem + '.tsx', stem + '.js', stem + '.mjs']
+          .find((candidate) => existsSync(candidate));
+      } else if (file.startsWith(process.cwd())) {
+        target = resolveModule(importer, specifier);
+      }
+      if (target) pending.push(resolve(target));
     }
   }
   return visited;
@@ -96,30 +101,52 @@ function assertNoSourceRuntime(code, name) {
   }
 }
 
-export function checkBuiltBundles(dist = 'dist') {
+// Baseline: the pre-feature OOXML production build at dcbae03b. The small
+// entry allowance covers the modelSources presence dispatch and its Vite
+// dynamic-chunk factoring; ordinary worker payloads have no allowance.
+const OOXML_BUNDLE_BASELINE = Object.freeze({
+  docx: { entry: 2_524_314, inline: 31_624, budget: 2_200 },
+  xlsx: { entry: 1_834_338, inline: 39_902, budget: 2_500 },
+  pptx: { entry: 1_822_930, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_574_665, budget: 3_600 },
+});
+const OOXML_RENDER_WORKERS = [1_414_520, 1_456_632, 2_045_054];
+
+function assertBudget(actual, baseline, budget, label) {
+  if (actual > baseline + budget) {
+    throw new Error(`${label} exceeds OOXML dispatch budget: ${actual} > ${baseline} + ${budget}`);
+  }
+}
+
+export function checkBuiltBundles(dist = 'dist', { packages = false } = {}) {
   for (const format of ['docx', 'xlsx', 'pptx', 'node']) {
     const graph = bundleGraph(join(dist, `${format}.mjs`));
+    const baseline = OOXML_BUNDLE_BASELINE[format];
+    assertBudget(graph.bytes, baseline.entry, baseline.budget, `${format} static entry`);
     assertNoSourceRuntime(graph.joined, `${format} static entry graph`);
-    console.log(`${format} static JS: ${graph.bytes} bytes across ${graph.files} files`);
+    console.log(`${format} static JS: ${graph.bytes} bytes (${graph.bytes - baseline.entry} over main; budget ${baseline.budget}) across ${graph.files} files`);
     if (format !== 'node') {
       for (const payload of graph.codes.flatMap(inlineWorkers)) {
         assertNoSourceRuntime(payload, `${format} inline worker`);
-        console.log(`${format} inline worker: ${Buffer.byteLength(payload)} decoded bytes`);
+        const bytes = Buffer.byteLength(payload);
+        assertBudget(bytes, baseline.inline, 0, `${format} inline worker`);
+        console.log(`${format} inline worker: ${bytes} decoded bytes`);
       }
       const sidecar = join(dist, `${format}-source-worker.mjs`);
       if (!existsSync(sidecar)) throw new Error(`Missing optional source sidecar ${sidecar}`);
       const sidecarImports = staticSpecifiers(parse(readFileSync(sidecar, 'utf8'), { sourceType: 'module' }));
       if (sidecarImports.length > 0) throw new Error(`${sidecar} is not self-contained`);
       const packageSidecar = join('packages', format, 'dist', `${format}-source-worker.mjs`);
-      if (existsSync(join('packages', format, 'dist')) && !existsSync(packageSidecar)) {
+      if (packages && !existsSync(packageSidecar)) {
         throw new Error(`Missing optional package source sidecar ${packageSidecar}`);
       }
-      if (existsSync(packageSidecar)
+      if (packages && existsSync(packageSidecar)
         && staticSpecifiers(parse(readFileSync(packageSidecar, 'utf8'), { sourceType: 'module' })).length > 0) {
         throw new Error(`${packageSidecar} is not self-contained`);
       }
       const packageEntry = join('packages', format, 'dist', 'index.mjs');
-      if (existsSync(packageEntry)) {
+      if (packages) {
+        if (!existsSync(packageEntry)) throw new Error(`Missing package entry ${packageEntry}`);
         const packageGraph = bundleGraph(packageEntry);
         assertNoSourceRuntime(packageGraph.joined, `${format} package static entry graph`);
         for (const payload of packageGraph.codes.flatMap(inlineWorkers)) {
@@ -128,9 +155,19 @@ export function checkBuiltBundles(dist = 'dist') {
       }
     }
   }
+  const ordinaryWorkers = [];
   for (const file of readdirSync(join(dist, 'assets')).filter((name) => /^render-worker-.*\.js$/.test(name))) {
+    if (!file.startsWith('render-worker-source-')) {
+      ordinaryWorkers.push(Buffer.byteLength(readFileSync(join(dist, 'assets', file))));
+    }
     assertNoSourceRuntime(readFileSync(join(dist, 'assets', file), 'utf8'), file);
   }
+  if (ordinaryWorkers.length !== OOXML_RENDER_WORKERS.length) {
+    throw new Error(`Expected ${OOXML_RENDER_WORKERS.length} ordinary render workers, found ${ordinaryWorkers.length}`);
+  }
+  ordinaryWorkers.sort((a, b) => a - b);
+  OOXML_RENDER_WORKERS.forEach((baseline, index) =>
+    assertBudget(ordinaryWorkers[index], baseline, 0, `ordinary render worker ${index}`));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -142,6 +179,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     ...['docx', 'xlsx', 'pptx'].map((format) => `packages/${format}/src/internal/model-source-session.ts`),
     'packages/xlsx/src/internal/host-layout-measure.ts',
     'packages/node/src/model-source.ts',
+    ...['docx', 'xlsx', 'pptx'].map((format) => `packages/node/src/${format}-model-source.ts`),
+    'packages/docx/src/internal/document-model-source.ts',
+    'packages/xlsx/src/internal/workbook-model-source.ts',
+    'packages/pptx/src/internal/presentation-model-source.ts',
+    ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
+      `packages/${format}/src/worker-source.ts`,
+      `packages/${format}/src/render-worker-source.ts`,
+    ]),
   ];
   for (const entry of [
     'packages/core/src/index.ts',
@@ -157,6 +202,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       if (graph.has(resolve(module))) throw new Error(`${entry} statically reaches ${module}`);
     }
   }
-  if (existsSync('dist/docx.mjs')) checkBuiltBundles();
+  if (existsSync('dist/docx.mjs')) checkBuiltBundles('dist', { packages: process.argv.includes('--packages') });
   console.log('OOXML entries and workers keep model-source runtime behind dynamic loads.');
 }

@@ -91,8 +91,8 @@ export function legacyBundleBoundary(): Plugin {
     name: 'legacy-bundle-boundary',
     generateBundle(_options, bundle) {
       // Optional legacy-* entries are allowed to contain the reader. Follow
-      // only static imports from ordinary entries and workers, so a shared
-      // chunk cannot silently bring the reader into an OOXML load.
+      // static and dynamic edges from ordinary entries and workers; a relay
+      // outside the guarded source roots cannot hide the reader in a chunk.
       const entries = Object.values(bundle).filter((output) =>
         output.type === 'chunk' && output.isEntry
         && !output.fileName.startsWith('.types-work/')
@@ -110,7 +110,7 @@ export function legacyBundleBoundary(): Plugin {
             this.error(`${output.fileName} contains forbidden legacy module ${moduleId}`);
           }
         }
-        for (const imported of output.imports) {
+        for (const imported of [...output.imports, ...(output.dynamicImports ?? [])]) {
           const child = bundle[imported];
           if (child?.type === 'chunk') pending.push(child);
         }

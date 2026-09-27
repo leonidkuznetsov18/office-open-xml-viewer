@@ -132,7 +132,7 @@ describe('XLSX workers with a model source', () => {
   it('keeps the OOXML parse on the eager worker graph without loading the source owner', async () => {
     const { scope, posted } = workerScope(7);
     vi.stubGlobal('self', scope);
-    await import('./worker.js');
+    await import('./worker-source.js');
     expect(state.ownerImports).toBe(0);
     const dispatch = scope.onmessage!;
     await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/xlsx.wasm' } } as MessageEvent);
@@ -152,7 +152,7 @@ describe('XLSX workers with a model source', () => {
     archive.parse.mockReturnValue(wrappedJson.subarray(1, -1));
     archive.extract_image.mockReturnValue(new Uint8Array([91, 5, 92]).subarray(1, 2));
     state.openSource.mockResolvedValue({ archive, viewDefaults: {}, close: vi.fn() });
-    await import('./worker.js');
+    await import('./worker-source.js');
     const dispatch = scope.onmessage!;
     await dispatch({ data: { type: 'parse', id: 30, data: new ArrayBuffer(3), resourcePolicy, source: descriptor, sourceOwnerUrl: './internal/worker-worksheet-source.js' } } as MessageEvent);
     const parsed = ofType(posted, 'parsed')[0]!;
@@ -172,7 +172,7 @@ describe('XLSX workers with a model source', () => {
     state.openSource
       .mockResolvedValueOnce({ archive: first, viewDefaults: {}, close: firstClose })
       .mockResolvedValueOnce({ archive: second, viewDefaults: {}, close: secondClose });
-    await import('./worker.js');
+    await import('./worker-source.js');
     const dispatch = scope.onmessage!;
 
     await dispatch({ data: { type: 'parse', id: 1, data: new ArrayBuffer(3), resourcePolicy, source: descriptor, sourceOwnerUrl: './internal/worker-worksheet-source.js' } } as MessageEvent);
@@ -224,7 +224,7 @@ describe('XLSX workers with a model source', () => {
     state.openSource
       .mockResolvedValueOnce({ archive: first, viewDefaults: {}, close: firstClose })
       .mockResolvedValueOnce({ archive: second, viewDefaults: {}, close: secondClose });
-    await import('./render-worker.js');
+    await import('./render-worker-source.js');
     const dispatch = scope.onmessage!;
 
     await dispatch({ data: {

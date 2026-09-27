@@ -84,7 +84,7 @@ async function loadWorker(): Promise<{ dispatch: Dispatch; posts: ReturnType<typ
   vi.resetModules();
   const posts = vi.fn();
   Object.assign(globalThis, { self: { postMessage: posts, onmessage: null } });
-  await import('./render-worker.js');
+  await import('./render-worker-source.js');
   const dispatch = (globalThis.self as unknown as { onmessage: Dispatch }).onmessage;
   return { dispatch, posts };
 }

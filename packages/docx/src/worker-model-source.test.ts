@@ -67,7 +67,7 @@ describe('DOCX parse worker with a model source', () => {
       .mockRejectedValueOnce(new Error('source open failed'));
     const harness = workerHarness();
     vi.stubGlobal('self', harness.scope);
-    await import('./worker.js');
+    await import('./worker-source.js');
     const dispatch = harness.scope.onmessage!;
     const policy = { maxArchiveEntryBytes: 1, maxTotalInflatedBytes: 1, maxArchiveEntries: 1 };
     const parse = (id: number, extra: object = { source, sourceOwnerUrl: './internal/worker-document-source.js' }) => dispatch({

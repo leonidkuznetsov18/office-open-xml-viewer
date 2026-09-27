@@ -5,6 +5,7 @@
 // all behaviour switches through the descriptor config.
 import initDocx, { DocxArchive } from '/packages/docx/src/wasm/docx_parser.js';
 import initXlsx, { XlsxArchive } from '/packages/xlsx/src/wasm/xlsx_parser.js';
+import initPptx, { PptxArchive } from '/packages/pptx/src/wasm/pptx_parser.js';
 
 const DOCX_REQUIRED = [
   'open_document_cursor', 'pull_document_chunk', 'document_chunk_done',
@@ -18,9 +19,16 @@ const XLSX_REQUIRED = [
   'close_sheet_cursor', 'assert_healthy', 'parse', 'extract_image',
 ];
 const XLSX_OPTIONAL = ['resource_usage', 'to_markdown'];
+const PPTX_REQUIRED = [
+  'pull_slide', 'slide_cursor_resource_usage', 'acknowledge_slide',
+  'cancel_slide', 'close_presentation_session', 'assert_healthy',
+  'presentation_bootstrap', 'extract_image',
+];
+const PPTX_OPTIONAL = ['extract_media', 'extract_font', 'resource_usage', 'to_markdown'];
 
 let docxReady;
 let xlsxReady;
+let pptxReady;
 
 function delegate(archive, methods) {
   const wrapper = {};
@@ -56,6 +64,17 @@ export async function openModelSource(bytes, config) {
       wrapper.configure_host_layout = () => undefined;
     }
     return { archive: wrapper, close: () => archive.free() };
+  }
+  if (config.format === 'pptx') {
+    pptxReady ??= initPptx({
+      module_or_path: new URL('/packages/pptx/src/wasm/pptx_parser_bg.wasm', import.meta.url),
+    });
+    await pptxReady;
+    const archive = new PptxArchive(bytes);
+    return {
+      archive: delegate(archive, config.minimal ? PPTX_REQUIRED : [...PPTX_REQUIRED, ...PPTX_OPTIONAL]),
+      close: () => archive.free(),
+    };
   }
   throw new TypeError('unsupported fake model source format');
 }

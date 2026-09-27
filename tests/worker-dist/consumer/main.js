@@ -119,6 +119,7 @@ try {
   await runModelSourceStages({
     DocxDocument,
     XlsxWorkbook,
+    PptxPresentation,
     bytes,
   });
 

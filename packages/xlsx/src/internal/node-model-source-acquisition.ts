@@ -1,7 +1,7 @@
 import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import { normalizeLoadResourceOptions, OoxmlResourceMetricsSession, parseTypedParserError } from '@silurus/ooxml-core/worker';
 import type { ParsedWorkbook } from '../types.js';
-import { readXlsxArchiveBootstrap } from './archive-bootstrap.js';
+import { readXlsxArchiveBootstrap } from './archive-bootstrap-source.js';
 import type { XlsxNodeAcquisition, XlsxNodeAcquisitionOptions, XlsxNodeSessionArchive } from './node-acquisition.js';
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

@@ -118,7 +118,7 @@ export {
 // CFB (OLE2) container sniffer: the `load()` factories call this on the raw
 // bytes before touching the parser worker, so a password-protected or legacy
 // .doc/.xls/.ppt file becomes a typed OoxmlError instead of an opaque zip error.
-export { cfbDirectoryNames, sniffCfb, type CfbKind } from './errors/cfb-sniff';
+export { sniffCfb, type CfbKind } from './errors/cfb-sniff';
 // Shared load() guard: throws the right OoxmlError when the bytes are a CFB
 // container (encrypted / legacy-binary / other) instead of an OOXML ZIP.
 // `resolveOoxmlContainer` is the decrypt-aware superset the load() factories

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PULL_SESSION_PROTOCOL, type PullSessionCommand, type PullSessionResponse } from '@silurus/ooxml-core/worker';
 import { WorksheetPullWorker } from './worksheet-pull-worker.js';
+import { WorksheetPullWorker as SourceWorksheetPullWorker } from './worksheet-pull-source-worker.js';
 import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import type { Worksheet } from './types.js';
 
@@ -13,7 +14,7 @@ const usageBytes = new TextEncoder().encode(JSON.stringify({
 }));
 
 async function openWorker(
-  worker: WorksheetPullWorker,
+  worker: Pick<WorksheetPullWorker, 'reserveOpen' | 'open'>,
   value: { sessionId: number; operationId: number; generation: number } = identity,
 ): Promise<void> {
   worker.reserveOpen(value);
@@ -220,7 +221,7 @@ describe('WorksheetPullWorker', () => {
       close_sheet_cursor: vi.fn(),
     });
     const pullOnce = async (archive: ReturnType<typeof makeArchive>, sessionId: number) => {
-      const worker = new WorksheetPullWorker(() => archive);
+      const worker = new SourceWorksheetPullWorker(() => archive);
       const replies: PullSessionResponse<ArrayBuffer, number>[] = [];
       await openWorker(worker, { ...identity, sessionId });
       await worker.dispatch(

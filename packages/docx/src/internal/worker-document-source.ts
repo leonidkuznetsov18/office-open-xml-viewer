@@ -79,6 +79,7 @@ const openDocxModelSource: OpenModelSource = (descriptor, bytes, transfer) =>
 
 interface OwnedModelSource {
   readonly archive: DocxModelSourceArchive;
+  readonly transferArchive: DocxModelSourceArchive;
   readonly viewDefaults: DocxModelSourceViewDefaults;
   close(): void;
 }
@@ -133,7 +134,19 @@ export class WorkerDocumentSourceOwner<TArchive extends OoxmlWorkerDocumentArchi
         try { opened.close(); } catch {}
         throw error;
       }
-      this.modelSource = { archive: opened.archive, viewDefaults, close: opened.close };
+      // Normalize at the source boundary. The ordinary pull coordinator can
+      // keep its original transfer path and never inspect source ownership.
+      const archive = new Proxy(opened.archive, {
+        get(target, key) {
+          if (key === 'pull_document_chunk') {
+            return (...args: Parameters<DocxModelSourceArchive['pull_document_chunk']>) =>
+              new Uint8Array(copyModelSourceBytes(target.pull_document_chunk(...args)));
+          }
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      this.modelSource = { archive: opened.archive, transferArchive: archive, viewDefaults, close: opened.close };
       return viewDefaults;
     } finally {
       if (this.pending === token) this.pending = undefined;
@@ -156,7 +169,7 @@ export class WorkerDocumentSourceOwner<TArchive extends OoxmlWorkerDocumentArchi
       return this.ooxmlHost.run(() => operation(archive));
     }
     try {
-      return operation(source.archive);
+      return operation(source.transferArchive);
     } catch (error) {
       if (isWasmTrap(error) && this.modelSource === source) {
         try { this.closeModelSource(); } catch {}

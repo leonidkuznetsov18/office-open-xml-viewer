@@ -71,6 +71,7 @@ const openPptxModelSource: OpenModelSource = (descriptor, bytes, transfer) =>
 
 interface OwnedModelSource {
   readonly archive: PptxModelSourceArchive;
+  readonly transferArchive: PptxModelSourceArchive;
   close(): void;
 }
 
@@ -111,7 +112,17 @@ export class WorkerPresentationSourceOwner<TArchive extends OoxmlWorkerArchive> 
       try { opened.close(); } catch {}
       throw error;
     }
-    this.modelSource = { archive: opened.archive, close: opened.close };
+    const transferArchive = new Proxy(opened.archive, {
+      get(target, key) {
+        if (key === 'pull_slide') {
+          return (...args: Parameters<PptxModelSourceArchive['pull_slide']>) =>
+            new Uint8Array(copyModelSourceBytes(target.pull_slide(...args)));
+        }
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    this.modelSource = { archive: opened.archive, transferArchive, close: opened.close };
     return opened.archive;
   }
 
@@ -127,7 +138,7 @@ export class WorkerPresentationSourceOwner<TArchive extends OoxmlWorkerArchive> 
       return this.ooxmlHost.run(() => operation(archive));
     }
     try {
-      return operation(source.archive);
+      return operation(source.transferArchive);
     } catch (error) {
       if (isWasmTrap(error) && this.modelSource === source) {
         try { this.closeModelSource(); } catch {}

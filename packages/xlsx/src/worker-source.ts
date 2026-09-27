@@ -10,8 +10,9 @@ import {
   type PullSessionCommand,
 } from '@silurus/ooxml-core/worker';
 import type { WorkerRequest, WorkerResponse } from './types.js';
-import { readXlsxArchiveBootstrap } from './internal/archive-bootstrap.js';
-import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-worker.js';
+import { readXlsxArchiveBootstrap } from './internal/archive-bootstrap-source.js';
+import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-source-worker.js';
+import type { WorkerWorksheetSourceOwner } from './internal/worker-worksheet-source.js';
 
 // RB6: a `panic = "abort"` build traps (not unwinds) on a Rust panic / OOM /
 // stack overflow, poisoning this worker's single WASM instance so every LATER
@@ -35,18 +36,25 @@ const host = new WasmParserHost<XlsxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
+let source: WorkerWorksheetSourceOwner<XlsxArchive> | undefined;
 const worksheetPull = new WorksheetPullWorker(
-  () => host.archive,
+  () => source?.cursor() ?? host.archive,
   undefined,
   (operation) => {
+    if (source) return source.execute(operation);
     const archive = host.archive;
     if (!archive) throw new Error('Workbook not loaded');
     return host.run(() => operation(archive));
   },
+  undefined,
 );
 
 self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<number>>) => {
   const req = e.data;
+
+  // A model source's host-layout reply is consumed by its own listener
+  // (requestHostLayoutFromPage) and never enters the request-id dispatcher.
+  if (source?.isHostLayoutResult(req)) return;
 
   if (isWorksheetPullCommand(req)) {
     await worksheetPull.dispatchSafely(req, (response, transfer) =>
@@ -66,8 +74,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   if (req.type === 'openSheetSession') worksheetPull.reserveOpen(req);
   try {
     if (req.type === 'openSheetSession') {
-      await host.ensureReady();
-      if (host.archive) host.run(() => host.archive?.assert_healthy());
+      if (!source) await host.ensureReady();
+      if (source?.cursor()) source.execute((archive) => archive.assert_healthy());
+      else if (host.archive) host.run(() => host.archive?.assert_healthy());
       await worksheetPull.open(req.sheetIndex, req.sheetName, req);
       await worksheetPull.postOpenedSafely(
         req,
@@ -88,14 +97,36 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
     }
     if (req.type === 'parse') await worksheetPull.reset();
     await worksheetPull.run(async () => {
-    await host.ensureReady();
-    if (req.type !== 'parse' && host.archive) {
-      const retained = host.archive;
-      host.run(() => retained.assert_healthy());
+    if (req.type === 'parse' ? !req.source : !source) await host.ensureReady();
+    if (req.type !== 'parse' && (source?.cursor() ?? host.archive)) {
+      if (source) source.execute((archive) => archive.assert_healthy());
+      else host.run(() => host.archive?.assert_healthy());
     }
     if (req.type === 'parse') {
-      const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
-      const bytes = new Uint8Array(req.data);
+      source?.closeModelSource();
+      source = undefined;
+      if (req.source) {
+        host.disposeArchive();
+        if (!req.sourceOwnerUrl) throw new TypeError('XLSX source owner URL is missing');
+        const { WorkerWorksheetSourceOwner } = await import(/* @vite-ignore */ req.sourceOwnerUrl) as typeof import('./internal/worker-worksheet-source.js');
+        const owner = new WorkerWorksheetSourceOwner(host);
+        source = owner;
+        // The renderer lives on the page in this mode, so the page measures.
+        await owner.openModelSource(
+          new Uint8Array(req.data),
+          req.source,
+          (font) => owner.requestHostLayoutFromPage(self as unknown as Parameters<typeof owner.requestHostLayoutFromPage>[0], font),
+          req.sourceTransfer,
+        );
+      } else {
+        const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
+        const bytes = new Uint8Array(req.data);
+        host.run(() => {
+          const opened = new XlsxArchive(bytes, maxEntry, maxTotal, maxEntries);
+          host.setArchive(opened);
+          return opened;
+        });
+      }
       // Both the construction and `parse()` run under `host.run` so a trap in
       // EITHER poisons + recycles the instance (and frees the archive). Adopting
       // via `setArchive` frees any prior handle first — the re-parse dispose.
@@ -104,22 +135,28 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // buffer, so forward it to main as a transferable — no clone, no decode
       // here. The single decode + JSON.parse happens on main.
       const { workbook: json, usage } = readXlsxArchiveBootstrap(
-        () => host.run(() => {
-          const archive = new XlsxArchive(bytes, maxEntry, maxTotal, maxEntries);
-          host.setArchive(archive);
-          return archive.parse();
-        }),
-        () => host.run(() => host.archive!.resource_usage()),
+        () => source
+          ? source.execute((current) => current.parse())
+          : host.run(() => host.archive!.parse()),
+        () => source
+          ? source.resourceUsage()
+          : host.run(() => host.archive!.resource_usage()),
       );
-      const workbookJson = json.buffer as ArrayBuffer;
-      const res: WorkerResponse = { type: 'parsed', id, workbookJson, usage };
+      const workbookJson = source
+        ? source.copyBytes(json)
+        : json.buffer as ArrayBuffer;
+      const maximumDigitWidth = source?.maximumDigitWidth;
+      const res: WorkerResponse = {
+        type: 'parsed', id, workbookJson, usage,
+        ...(maximumDigitWidth === undefined ? {} : { layoutMetrics: { maximumDigitWidth } }),
+      };
       (self.postMessage as (message: unknown, transfer: Transferable[]) => void)(res, [
         workbookJson,
       ]);
       return;
     }
 
-    const archive = host.archive;
+    const archive = source?.cursor() ?? host.archive;
 
     if (req.type === 'extractImage') {
       if (!archive) throw new Error('No xlsx loaded');
@@ -128,7 +165,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // so `.buffer` is a full-span, non-WASM-backed ArrayBuffer we own outright —
       // transfer it directly. A second `new Uint8Array(bytes).slice()` would just
       // re-copy the whole entry for nothing.
-      const out = host.run(() => archive.extract_image(req.path).buffer as ArrayBuffer);
+      const out = source
+        ? source.extractImage(req.path)
+        : host.run(() => archive.extract_image(req.path).buffer as ArrayBuffer);
       const res: WorkerResponse = { type: 'imageExtracted', id, bytes: out };
       (self.postMessage as (message: unknown, transfer: Transferable[]) => void)(res, [out]);
       return;
@@ -136,7 +175,8 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
 
     if (req.type === 'resourceUsage') {
       if (!archive) throw new Error('No xlsx loaded');
-      const usage = host.run(() => decodeOoxmlResourceUsage(archive.resource_usage()));
+      const bytes = source ? source.resourceUsage() : host.run(() => host.archive!.resource_usage());
+      const usage = bytes === undefined ? undefined : decodeOoxmlResourceUsage(bytes);
       self.postMessage({ type: 'resourceUsage', id, usage } satisfies WorkerResponse);
       return;
     }
@@ -146,7 +186,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // Project the already-opened handle to markdown (no re-copy of the file,
       // no re-scan of the central directory). A plain string has no transferable
       // backing, so it is posted by structured clone like any other value.
-      const markdown = host.run(() => archive.to_markdown());
+      const markdown = source ? source.toMarkdown() : host.run(() => host.archive!.to_markdown());
       const res: WorkerResponse = { type: 'markdownRendered', id, markdown };
       self.postMessage(res);
       return;
@@ -154,6 +194,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
     });
   } catch (err) {
     if (req.type === 'openSheetSession') worksheetPull.abandonOpen(req.sessionId);
+    if (req.type === 'parse') {
+      try { source?.closeModelSource(); } catch {}
+    }
     const res: WorkerResponse = { type: 'error', id, ...serializeWorkerError(err) };
     try {
       self.postMessage(res);

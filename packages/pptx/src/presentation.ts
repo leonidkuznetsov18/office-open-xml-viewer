@@ -26,7 +26,6 @@ import {
   resolveOoxmlContainer,
   toArrayBuffer,
   OoxmlResourceLimitError,
-  type AdmittedModelSourceLoad,
   type LoadOptions as CoreLoadOptions,
   type ProgressiveLayoutPartial,
   type ProgressiveLayoutProgress,
@@ -276,8 +275,6 @@ export class PptxPresentation {
   private _embeddedFontAuthoredFamilies: ReadonlyMap<string, string> = new Map();
   private _embeddedFontTuples: ReadonlySet<string> = new Set();
   private _destroyed = false;
-  /** The admitted model-source load while `load()` builds its parse request. */
-  private _sourceLoad: AdmittedModelSourceLoad | undefined;
   /** One stable closure per instance: the decoded-bitmap and SVG caches key on
    *  this identity to scope decodes per deck (so two open decks never swap
    *  images for a shared zip path like ppt/media/image1.png). Reusing the same
@@ -294,7 +291,7 @@ export class PptxPresentation {
   private _chartEx: ChartExRenderer | undefined;
   private _tiff: TiffRenderer | undefined;
 
-  private constructor(worker: Worker, mode: 'main' | 'worker', wasmUrlOverride?: string | URL, initializeWasm = true) {
+  private constructor(worker: Worker, mode: 'main' | 'worker', wasmUrlOverride?: string | URL) {
     this._worker = worker;
     this._mode = mode;
     this._bridge = new WorkerBridge<
@@ -319,10 +316,8 @@ export class PptxPresentation {
     // Default: the parser WASM emitted next to this bundle, resolved relative to
     // the document URL. `wasmUrl` overrides it (CDN / self-hosted copy); a
     // relative override is still resolved against `location.href`.
-    if (initializeWasm) {
-      const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
-      this._bridge.post({ kind: 'init', wasmUrl } satisfies PptxWorkerRequest);
-    }
+    const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
+    this._bridge.post({ kind: 'init', wasmUrl } satisfies PptxWorkerRequest);
   }
 
   private _assertResourceHealthy(): void {
@@ -345,6 +340,10 @@ export class PptxPresentation {
     source: string | ArrayBuffer,
     opts: LoadOptions = {},
   ): Promise<PptxPresentation> {
+    if (opts.modelSources !== undefined) {
+      const { loadPptxModelSource } = await import('./internal/presentation-model-source.js');
+      return loadPptxModelSource(source, opts);
+    }
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const mode = opts.mode ?? 'main';
@@ -373,17 +372,7 @@ export class PptxPresentation {
     // when `opts.password` is supplied ([MS-OFFCRYPTO]); a password-protected
     // file without a password, or a legacy-binary / unknown CFB, becomes a typed
     // OoxmlError (whose `instanceof` would not survive the worker boundary).
-    // An application-supplied model source claims its input from the raw bytes
-    // before OOXML container resolution; without `modelSources` nothing here
-    // runs and the OOXML path is unchanged.
-    let sourceLoad: AdmittedModelSourceLoad | undefined;
-    if (opts.modelSources !== undefined) {
-      const { selectModelSource, beginModelSourceLoad } = await import('@silurus/ooxml-core/internal/model-source');
-      const selected = selectModelSource(opts.modelSources, 'pptx', new Uint8Array(buffer));
-      if (selected) sourceLoad = beginModelSourceLoad(selected, 'pptx');
-    }
-    try {
-    if (!sourceLoad) buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
+    buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
     metrics.setSourceBytes(buffer.byteLength);
     metrics.checkpoint('container ready');
     // The render worker is reachable only through this dynamic import, so
@@ -395,8 +384,7 @@ export class PptxPresentation {
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     let pres: PptxPresentation | undefined;
     try {
-      pres = new PptxPresentation(worker, mode, opts.wasmUrl, sourceLoad === undefined);
-      pres._sourceLoad = sourceLoad;
+      pres = new PptxPresentation(worker, mode, opts.wasmUrl);
       pres._metrics = metrics;
       if (opts.math && mode === 'worker' && !rendererDescriptors?.math) {
         console.warn(
@@ -461,17 +449,11 @@ export class PptxPresentation {
         );
       }
       metrics.succeed({ slides: pres.slideCount });
-      sourceLoad?.release();
       return pres;
     } catch (error) {
       const rejectedPresentation = pres;
       disposeRejectedLoad(worker, rejectedPresentation ? () => rejectedPresentation.destroy() : undefined);
       throw error;
-    } finally {
-      if (pres) pres._sourceLoad = undefined;
-    }
-    } finally {
-      sourceLoad?.release();
     }
     } catch (error) {
       metrics.fail(error);
@@ -504,9 +486,9 @@ export class PptxPresentation {
     const response = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers, ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined) } satisfies RenderWorkerRequest)
-          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback, ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined) } satisfies PptxWorkerRequest),
-      this._sourceLoad ? [buffer, ...this._sourceLoad.transfer] : [buffer],
+          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers } satisfies RenderWorkerRequest)
+          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback } satisfies PptxWorkerRequest),
+      [buffer],
       { timeoutMs },
     );
     if (this._mode === 'worker') {
@@ -606,9 +588,8 @@ export class PptxPresentation {
       (id) => ({
         kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback,
         progressiveLayout: true,
-        ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined),
       }) satisfies PptxWorkerRequest,
-      this._sourceLoad ? [buffer, ...this._sourceLoad.transfer] : [buffer],
+      [buffer],
       { timeoutMs },
     );
     const bootstrap = normalizePresentationBootstrap(
@@ -691,10 +672,9 @@ export class PptxPresentation {
         return {
           kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers,
           progressiveLayout: true,
-          ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined),
         } satisfies RenderWorkerRequest;
       },
-      this._sourceLoad ? [buffer, ...this._sourceLoad.transfer] : [buffer],
+      [buffer],
       // Healthy progressive work may exceed this interval while continuing to
       // publish slides. Measure silence between publications instead of using
       // an absolute deadline for the authoritative final response.
@@ -1536,17 +1516,4 @@ export class PptxPresentation {
     dropImageBitmapCache(this._fetchImage);
     dropSvgImageCache(this._fetchImage);
   }
-}
-
-/** Parse-request fields for an application-selected model source. */
-function modelSourceFields(
-  load: AdmittedModelSourceLoad,
-): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
-  const sourceOwnerUrl = new URL(
-    import.meta.env.DEV ? './internal/worker-presentation-source.ts' : './pptx-source-worker.mjs',
-    import.meta.url,
-  ).href;
-  return load.transfer.length > 0
-    ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
-    : { source: load.module, sourceOwnerUrl };
 }

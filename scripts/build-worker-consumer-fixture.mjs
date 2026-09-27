@@ -402,8 +402,8 @@ writeFileSync(join(outDir, 'chart-ex.pptx'), storedZip([
 
 const workers = readdirSync(join(outDir, 'assets'))
   .filter((name) => /^render-worker-[\w-]+\.js$/.test(name)
-    && !name.startsWith('render-worker-host-'));
-if (workers.length !== 3) {
-  throw new Error(`Vite consumer output must contain 3 render workers, found ${workers.length}`);
+    && !name.includes('-host-'));
+if (workers.length < 3 || workers.length > 6) {
+  throw new Error(`Vite consumer output must contain 3 ordinary and up to 3 opt-in source render workers, found ${workers.length}`);
 }
 console.log(`Vite consumer bundle: ${workers.length} self-contained render workers`);

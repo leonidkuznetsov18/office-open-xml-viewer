@@ -58,12 +58,12 @@ export const RULES = [
 export const ALLOWED_COMPUTED_IMPORTS = new Map([
   ['packages/core/src/math/engine-runtime.ts', ['src']],
   ['packages/core/src/source/model-source.ts', ['module.moduleUrl']],
-  ['packages/docx/src/worker.ts', ['req.sourceOwnerUrl']],
-  ['packages/docx/src/render-worker.ts', ['req.sourceOwnerUrl']],
-  ['packages/xlsx/src/worker.ts', ['req.sourceOwnerUrl']],
-  ['packages/xlsx/src/render-worker.ts', ['req.sourceOwnerUrl']],
-  ['packages/pptx/src/worker.ts', ['request.sourceOwnerUrl']],
-  ['packages/pptx/src/render-worker.ts', ['request.sourceOwnerUrl']],
+  ['packages/docx/src/worker-source.ts', ['req.sourceOwnerUrl']],
+  ['packages/docx/src/render-worker-source.ts', ['req.sourceOwnerUrl']],
+  ['packages/xlsx/src/worker-source.ts', ['req.sourceOwnerUrl']],
+  ['packages/xlsx/src/render-worker-source.ts', ['req.sourceOwnerUrl']],
+  ['packages/pptx/src/worker-source.ts', ['request.sourceOwnerUrl']],
+  ['packages/pptx/src/render-worker-source.ts', ['request.sourceOwnerUrl']],
   // Local benchmark CLIs load the caller-specified build they are measuring.
   ['packages/node/src/bench-handle.mjs', ['jsPath']],
   ['packages/node/src/bench-parse.mjs', ['resolve(HERE, relJs)']],
@@ -79,6 +79,12 @@ export const ALLOWED_COMPUTED_IMPORTS = new Map([
   ['packages/node/src/xlsx-border-crisp.probe.test.ts', ['ORCH_PATH']],
   ['packages/node/src/xlsx-find.test.ts', ['FIND_PATH', 'NUMFMT_PATH']],
   ['packages/node/src/xlsx-merge-border-zorder.probe.test.ts', ['ORCH_PATH']],
+]);
+
+// The Node WASM locator needs resolution only. It never loads a package and
+// its exact call shape is checked below; no other require factory is allowed.
+export const ALLOWED_INDIRECT_REQUIRE = new Map([
+  ['packages/node/src/wasm-loader.ts', 'createRequire(metaUrl).resolve(workspaceSpecifier)'],
 ]);
 
 function expressionName(node) {
@@ -110,26 +116,43 @@ function isLegacyModule(path) {
 /** Use the same compiler options and module resolver as TypeScript's program. */
 export function createTypeScriptResolver(root = process.cwd()) {
   const configs = new Map();
-  return (importer, specifier) => {
+  const resolver = (importer, specifier) => {
     const absolute = nodePath.resolve(root, importer);
-    const packageName = importer.split('/')[1];
-    const configPath = nodePath.resolve(root, 'packages', packageName, 'tsconfig.json');
+    const packageName = importer.startsWith('packages/') ? importer.split('/')[1] : undefined;
+    const configPath = packageName
+      ? nodePath.resolve(root, 'packages', packageName, 'tsconfig.json')
+      : nodePath.resolve(root, 'tsconfig.json');
     let options = configs.get(configPath);
     if (!options) {
-      const config = ts.readConfigFile(configPath, ts.sys.readFile);
-      if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-      options = ts.parseJsonConfigFileContent(config.config, ts.sys, nodePath.dirname(configPath)).options;
+      if (existsSync(configPath)) {
+        const config = ts.readConfigFile(configPath, ts.sys.readFile);
+        if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
+        options = ts.parseJsonConfigFileContent(config.config, ts.sys, nodePath.dirname(configPath)).options;
+      } else {
+        // A reached file can live outside the guarded package. Resolve its
+        // imports with the importing program's already loaded options.
+        options = configs.values().next().value;
+        if (!options) throw new Error(`No TypeScript program for ${importer}`);
+      }
       configs.set(configPath, options);
     }
     return ts.resolveModuleName(specifier, absolute, options, ts.sys).resolvedModule?.resolvedFileName;
   };
+  resolver.root = nodePath.resolve(root);
+  return resolver;
 }
 
 export function findViolations(files, { resolveModule } = {}) {
   const violations = [];
-  for (const { path, text } of files) {
+  const queue = [...files];
+  const seen = new Set();
+  const root = resolveModule?.root ?? process.cwd();
+  while (queue.length > 0) {
+    const { path, text } = queue.shift();
+    if (seen.has(path)) continue;
+    seen.add(path);
     const lines = text.split('\n');
-    lines.forEach((line, index) => {
+    if (isGuardedPath(path)) lines.forEach((line, index) => {
       for (const rule of RULES) {
         if (rule.pattern.test(line)) {
           violations.push({ path, line: index + 1, rule: rule.id, text: line.trim().slice(0, 160) });
@@ -140,7 +163,47 @@ export function findViolations(files, { resolveModule } = {}) {
       const source = parse(text, { sourceType: 'unambiguous', errorRecovery: true, plugins: ['typescript', 'jsx'] });
       const allowedExpressions = ALLOWED_COMPUTED_IMPORTS.get(path) ?? [];
       const usedExpressions = new Set();
-      const inspect = (node) => {
+      const indirectAllowed = ALLOWED_INDIRECT_REQUIRE.get(path);
+      const inspect = (node, parent, grandparent) => {
+        const line = node.loc?.start.line ?? 1;
+        const rejectIndirect = () => violations.push({
+          path, line, rule: 'indirect-require', text: lines[line - 1].trim().slice(0, 160),
+        });
+        if (node.type === 'ImportSpecifier' && node.imported.name === 'createRequire'
+          && (indirectAllowed === undefined || node.local.name !== 'createRequire')) rejectIndirect();
+        if (node.type === 'ObjectProperty' && node.key.type === 'Identifier'
+          && node.key.name === 'createRequire' && parent?.type === 'ObjectPattern') rejectIndirect();
+        if (node.type === 'MemberExpression' && (
+          (node.object.type === 'Identifier' && node.object.name === 'require')
+          || (node.property.type === 'Identifier' && node.property.name === 'createRequire')
+          || (node.property.type === 'StringLiteral' && node.property.value === 'createRequire')
+          || ((node.object.type === 'Identifier'
+            && ['module', 'globalThis'].includes(node.object.name))
+            && ((node.property.type === 'Identifier' && node.property.name === 'require')
+              || (node.property.type === 'StringLiteral' && node.property.value === 'require')))
+        )) rejectIndirect();
+        if (node.type === 'CallExpression' && node.callee.type === 'Identifier'
+          && node.callee.name === 'createRequire') {
+          const approved = indirectAllowed !== undefined
+            && parent?.type === 'MemberExpression' && parent.object === node
+            && parent.property.type === 'Identifier' && parent.property.name === 'resolve'
+            && grandparent?.type === 'CallExpression' && grandparent.callee === parent
+            && node.arguments.length === 1 && expressionName(node.arguments[0]) === 'metaUrl'
+            && grandparent.arguments.length === 1
+            && expressionName(grandparent.arguments[0]) === 'workspaceSpecifier';
+          if (!approved) rejectIndirect();
+        }
+        if (node.type === 'OptionalCallExpression'
+          && node.callee.type === 'Identifier' && node.callee.name === 'require') rejectIndirect();
+        if (node.type === 'Identifier' && node.name === 'createRequire'
+          && parent?.type !== 'ImportSpecifier'
+          && !(parent?.type === 'CallExpression' && parent.callee === node)
+          && !(parent?.type === 'MemberExpression' && parent.property === node)) rejectIndirect();
+        if (node.type === 'Identifier' && node.name === 'require'
+          && !(parent?.type === 'CallExpression' && parent.callee === node)
+          && !(parent?.type === 'MemberExpression' && (parent.object === node || parent.property === node))
+          && !(parent?.type === 'ClassMethod' && parent.key === node)
+          && !(parent?.type === 'OptionalCallExpression' && parent.callee === node)) rejectIndirect();
         let literal;
         let dynamic = false;
         if (['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type)) {
@@ -183,14 +246,23 @@ export function findViolations(files, { resolveModule } = {}) {
               violations.push({ path, line, rule: 'legacy-package', text: specifier.slice(0, 160) });
             }
           }
+          if (compilerResolved && !isLegacyModule(compilerResolved)
+            && /\.[cm]?[jt]sx?$/.test(compilerResolved)
+            && !compilerResolved.includes(`${nodePath.sep}node_modules${nodePath.sep}`)
+            && (compilerResolved === root || compilerResolved.startsWith(root + nodePath.sep))) {
+            const child = nodePath.relative(root, compilerResolved).replaceAll('\\', '/');
+            if (!seen.has(child) && existsSync(compilerResolved)) {
+              queue.push({ path: child, text: readFileSync(compilerResolved, 'utf8') });
+            }
+          }
         }
         for (const value of Object.values(node)) {
           if (Array.isArray(value)) {
             for (const child of value) {
-              if (child && typeof child === 'object' && typeof child.type === 'string') inspect(child);
+              if (child && typeof child === 'object' && typeof child.type === 'string') inspect(child, node, parent);
             }
           } else if (value && typeof value === 'object' && typeof value.type === 'string') {
-            inspect(value);
+            inspect(value, node, parent);
           }
         }
       };

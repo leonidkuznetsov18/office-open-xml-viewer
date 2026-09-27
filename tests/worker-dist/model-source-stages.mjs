@@ -66,9 +66,10 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-export async function runModelSourceStages({ DocxDocument, XlsxWorkbook, bytes }) {
+export async function runModelSourceStages({ DocxDocument, XlsxWorkbook, PptxPresentation, bytes }) {
   const tracked = await bytes('/consumer/tracked.docx');
   const bordered = await bytes('/consumer/bordered.xlsx');
+  const slides = await bytes('/packages/pptx/public/demo/sample-1.pptx');
   for (const mode of ['main', 'worker']) {
     document.body.dataset.stage = `model-source-docx-${mode}`;
     const final = await docxPage(DocxDocument, tracked, { mode });
@@ -114,6 +115,24 @@ export async function runModelSourceStages({ DocxDocument, XlsxWorkbook, bytes }
     });
     assert(wide !== plain, `${mode}: the host-measured Normal font must size the grid`);
     document.body.dataset[`xlsxHostLayout${mode === 'main' ? 'Main' : 'Worker'}`] = wide;
+
+    document.body.dataset.stage = `model-source-pptx-${mode}`;
+    const presentation = await PptxPresentation.load(slides.slice(0), {
+      mode,
+      modelSources: [fakeSource('pptx', { minimal: true })],
+    });
+    try {
+      assert(presentation.slideCount > 0, `${mode}: source presentation is empty`);
+      if (mode === 'worker') {
+        const bitmap = await presentation.renderSlideToBitmap(0, { width: 360, dpr: 1 });
+        bitmap.close();
+      } else {
+        const canvas = window.document.createElement('canvas');
+        await presentation.renderSlide(canvas, 0, { width: 360, dpr: 1 });
+      }
+    } finally {
+      presentation.destroy();
+    }
   }
   delete document.body.dataset.xlsxHostLayoutMain;
   delete document.body.dataset.xlsxHostLayoutWorker;

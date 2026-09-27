@@ -113,7 +113,7 @@ function installSelf(): FakeSelf {
 async function loadWorker(): Promise<FakeSelf> {
   const fake = installSelf();
   vi.resetModules();
-  await import('./worker.js');
+  await import('./worker-source.js');
   return fake;
 }
 

@@ -8,7 +8,7 @@ import {
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
 } from '@silurus/ooxml-core/internal/model-source';
-import type { WorksheetCursorArchive } from '../worksheet-pull-worker.js';
+import type { WorksheetCursorArchive } from '../worksheet-pull-source-worker.js';
 import {
   configureHostLayout,
   isHostLayoutResult,
@@ -78,6 +78,7 @@ const openXlsxModelSource: OpenModelSource = (descriptor, bytes, transfer) =>
 
 interface OwnedModelSource {
   readonly archive: XlsxModelSourceArchive;
+  readonly transferArchive: XlsxModelSourceArchive;
   close(): void;
 }
 
@@ -135,7 +136,17 @@ export class WorkerWorksheetSourceOwner<TArchive extends OoxmlWorksheetArchive> 
       try { opened.close(); } catch {}
       throw error;
     }
-    const source = { archive: opened.archive, close: opened.close };
+    const transferArchive = new Proxy(opened.archive, {
+      get(target, key) {
+        if (key === 'pull_sheet_cursor') {
+          return (...args: Parameters<XlsxModelSourceArchive['pull_sheet_cursor']>) =>
+            new Uint8Array(copyModelSourceBytes(target.pull_sheet_cursor(...args)));
+        }
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const source = { archive: opened.archive, transferArchive, close: opened.close };
     this.modelSource = source;
     try {
       this.measuredMaximumDigitWidth = await configureHostLayout(
@@ -168,7 +179,7 @@ export class WorkerWorksheetSourceOwner<TArchive extends OoxmlWorksheetArchive> 
       return this.ooxmlHost.run(() => operation(archive));
     }
     try {
-      return operation(source.archive);
+      return operation(source.transferArchive);
     } catch (error) {
       if (isWasmTrap(error) && this.modelSource === source) {
         try { this.closeModelSource(); } catch {}

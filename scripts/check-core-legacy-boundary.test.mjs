@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTypeScriptResolver, findViolations, isGuardedPath } from './check-core-legacy-boundary.mjs';
 import { legacyBundleBoundary } from '../vite.config.ts';
+import { build } from 'vite';
 
 const rules = (text) => findViolations([{ path: 'packages/docx/src/x.ts', text }]).map((v) => v.rule);
 
@@ -55,6 +56,44 @@ test('rejects computed imports and requires, import attributes and type-level im
   );
 });
 
+test('rejects indirect Node require forms even with escaped module names', () => {
+  for (const code of [
+    "import { createRequire } from 'node:module'; const load = createRequire(import.meta.url); load(name);",
+    "import { createRequire as cr } from 'node:module'; cr(import.meta.url)(name);",
+    'require.call(null, name);',
+    'require.apply(null, [name]);',
+    'require.bind(null)(name);',
+    'require?.(name);',
+    'module.require(name);',
+    "module['require'](name);",
+  ]) {
+    assert.ok(rules(code).includes('indirect-require'), code);
+  }
+});
+
+test('follows a relay outside guarded roots to a dynamic legacy import', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ooxml-boundary-relay-'));
+  try {
+    mkdirSync(join(root, 'packages/core/src'), { recursive: true });
+    mkdirSync(join(root, 'packages/legacy-converter/src'), { recursive: true });
+    mkdirSync(join(root, 'shared'), { recursive: true });
+    writeFileSync(join(root, 'packages/core/tsconfig.json'), JSON.stringify({
+      compilerOptions: { moduleResolution: 'bundler', module: 'esnext' },
+    }));
+    writeFileSync(join(root, 'packages/legacy-converter/src/index.ts'), 'export const reader = 1;');
+    writeFileSync(join(root, 'shared/reader.ts'),
+      "export const reader = () => import('../packages/legacy-converter/src/index.ts');");
+    const violations = findViolations([{
+      path: 'packages/core/src/probe.ts',
+      text: "export { reader } from '../../../shared/reader.ts';",
+    }], { resolveModule: createTypeScriptResolver(root) });
+    assert.ok(violations.some((violation) => violation.rule === 'legacy-package'
+      && violation.path === 'shared/reader.ts'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('TypeScript module resolution catches a path alias into the legacy package', () => {
   const root = mkdtempSync(join(tmpdir(), 'ooxml-boundary-'));
   try {
@@ -96,6 +135,36 @@ test('built chunk graph rejects a resolved legacy module even after aliasing', (
       'shared.js': { type: 'chunk', fileName: 'shared.js', isEntry: false, imports: [], modules: { '/repo/packages/legacy-converter/src/index.ts': {} } },
     },
   ), /forbidden legacy module/);
+  assert.throws(() => hook.call(
+    { error(message) { throw new Error(message); } },
+    {},
+    {
+      'docx.mjs': { type: 'chunk', fileName: 'docx.mjs', isEntry: true, imports: [], dynamicImports: ['relay.js'], modules: {} },
+      'relay.js': { type: 'chunk', fileName: 'relay.js', isEntry: false, imports: [], dynamicImports: [], modules: { '/repo/packages/legacy-converter/src/index.ts': {} } },
+    },
+  ), /forbidden legacy module/);
+});
+
+test('a real build rejects a dynamic chunk reached through a relay', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ooxml-boundary-bundle-'));
+  try {
+    mkdirSync(join(root, 'packages/core/src'), { recursive: true });
+    mkdirSync(join(root, 'packages/legacy-converter/src'), { recursive: true });
+    mkdirSync(join(root, 'shared'), { recursive: true });
+    const entry = join(root, 'packages/core/src/probe.ts');
+    writeFileSync(entry, "export { reader } from '../../../shared/reader.ts';");
+    writeFileSync(join(root, 'shared/reader.ts'),
+      "export const reader = () => import('../packages/legacy-converter/src/index.ts');");
+    writeFileSync(join(root, 'packages/legacy-converter/src/index.ts'), 'export const value = 1;');
+    await assert.rejects(() => build({
+      configFile: false,
+      logLevel: 'silent',
+      plugins: [legacyBundleBoundary()],
+      build: { write: false, lib: { entry, formats: ['es'] } },
+    }), /forbidden legacy module/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('guards source, parser and manifest files but not generated or private output', () => {

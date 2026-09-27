@@ -24,8 +24,8 @@ import {
   readPptxSlideCursorUsage,
   SlidePullWorker,
   type PresentationBootstrap,
+  type PptxNodeArchive,
 } from '@silurus/ooxml-pptx/internal/session';
-import type { PptxNodeSessionArchive as PptxNodeArchive, acquirePptxSessionFromArchive } from '@silurus/ooxml-pptx/internal/model-source-session';
 import { InProcessPullTransport } from '@silurus/ooxml-core/internal/in-process-pull-transport';
 import type { OoxmlNodeSessionOptions } from './session-options.ts';
 import type { NodeCanvasFactory, NodeCanvasLike } from './render.ts';
@@ -86,44 +86,12 @@ async function openPptxPresentationImpl(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenPptxPresentationOptions = {},
 ): Promise<PptxPresentationSessionImpl> {
+  if (options.modelSources !== undefined) {
+    const { openPptxSource } = await import('./pptx-model-source.ts');
+    return openPptxSource(buffer, options, getPptxWasmModule);
+  }
   const cjkFallback = resolveCjkFallback(options.cjkFallback);
-  if (options.modelSources === undefined) {
-    const acquired = await acquirePptxNodeSession(toUint8(buffer), getPptxWasmModule(), options);
-    return new PptxPresentationSessionImpl(
-      acquired.closeArchive, acquired.archive, acquired.bootstrap,
-      acquired.metrics, options.signal, cjkFallback,
-    );
-  }
-  const [{ resolveNodeSessionInput }, {
-    acquirePptxSessionFromArchive: acquireSourceArchive,
-    validatePptxModelSourceArchive,
-    validatePptxModelSourceViewDefaults,
-  }] = await Promise.all([
-    import('./model-source.ts'),
-    import('@silurus/ooxml-pptx/internal/model-source-session'),
-  ]);
-  const input = await resolveNodeSessionInput(
-    buffer,
-    'pptx',
-    options,
-    validatePptxModelSourceArchive,
-  );
-  let acquired: ReturnType<typeof acquirePptxSessionFromArchive>;
-  if (input.kind === 'ooxml') {
-    acquired = await acquirePptxNodeSession(input.bytes, getPptxWasmModule(), options);
-  } else {
-    try {
-      validatePptxModelSourceViewDefaults(input.opened.viewDefaults);
-    } catch (error) {
-      try { input.opened.close(); } catch {}
-      throw error;
-    }
-    acquired = acquireSourceArchive({
-      archive: input.opened.archive,
-      sourceByteLength: input.sourceByteLength,
-      closeArchive: input.opened.close,
-    }, options);
-  }
+  const acquired = await acquirePptxNodeSession(toUint8(buffer), getPptxWasmModule(), options);
   return new PptxPresentationSessionImpl(
     acquired.closeArchive,
     acquired.archive,
@@ -134,7 +102,7 @@ async function openPptxPresentationImpl(
   );
 }
 
-class PptxPresentationSessionImpl implements PptxPresentationSession {
+export class PptxPresentationSessionImpl implements PptxPresentationSession {
   readonly slideCount: number;
   readonly slideWidth: number;
   readonly slideHeight: number;
@@ -152,7 +120,7 @@ class PptxPresentationSessionImpl implements PptxPresentationSession {
   private readonly fetchImage = (path: string, mimeType: string): Promise<Blob> =>
     this.getPartInternal(path, mimeType, (archive) => archive.extract_image(path));
   private readonly fetchMedia = (path: string): Promise<Blob> =>
-    this.getPartInternal(path, 'application/octet-stream', (archive) => extractMedia(archive, path));
+    this.getPartInternal(path, 'application/octet-stream', (archive) => archive.extract_media(path));
   private readonly rawParts = new BoundedRawPartCache({
     maxEntries: HARD_MAX_RAW_PART_CACHE_ENTRIES,
     maxBytes: HARD_MAX_RAW_PART_CACHE_BYTES,
@@ -217,7 +185,7 @@ class PptxPresentationSessionImpl implements PptxPresentationSession {
 
   async getMedia(path: string, mimeType = 'application/octet-stream'): Promise<Blob> {
     this.assertOpen();
-    return this.getPartInternal(path, mimeType, (archive) => extractMedia(archive, path))
+    return this.getPartInternal(path, mimeType, (archive) => archive.extract_media(path))
       .catch((error: unknown) => this.failOperation(error));
   }
 
@@ -338,8 +306,6 @@ class PptxPresentationSessionImpl implements PptxPresentationSession {
 
   private refreshResourceUsage(): OoxmlResourceUsageSnapshot | undefined {
     try {
-      // Inside the try: reading a trapped runtime's archive property throws.
-      if (!this.archive.resource_usage) return this.usage;
       this.usage = decodeOoxmlResourceUsage(this.archive.resource_usage());
       this.metrics.observeUsage(this.usage);
     } catch {
@@ -379,10 +345,8 @@ export async function materializePptxPresentation(
   );
 }
 
-/** Media reads are an optional model-source capability. */
-function extractMedia(archive: PptxNodeArchive, path: string): Uint8Array {
-  if (!archive.extract_media) throw new Error('media extraction is unsupported for this source');
-  return archive.extract_media(path);
+function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
+  return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -390,8 +354,4 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   const error = new Error('PPTX presentation session was aborted');
   error.name = 'AbortError';
   throw error;
-}
-
-function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
-  return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }

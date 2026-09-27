@@ -28,6 +28,8 @@
     "./wasm": "./src/wasm/xlsx_parser.js",
     "./wasm-binary": "./src/wasm/xlsx_parser_bg.wasm",
     "./internal/session": "./src/internal/session.ts",
+    "./internal/grid-geometry": "./src/internal/grid-geometry.ts",
+    "./internal/source-pull-worker": "./src/worksheet-pull-source-worker.ts",
     "./internal/model-source-session": "./src/internal/model-source-session.ts",
     "./internal/host-layout-measure": "./src/internal/host-layout-measure.ts"
   },

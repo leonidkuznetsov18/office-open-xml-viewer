@@ -14,7 +14,6 @@ import {
   dropDecodedBitmapCache,
   resolveOoxmlContainer,
   toArrayBuffer,
-  type AdmittedModelSourceLoad,
   type LoadOptions as CoreLoadOptions,
   type ProgressiveLayoutPartial,
   type ProgressiveLayoutProgress,
@@ -260,10 +259,9 @@ interface WorkerProgressiveLoad {
   readonly onPartial?: LoadOptions['onLayoutPartial'];
   readonly onComplete?: LoadOptions['onLayoutComplete'];
   readonly onProgress?: LoadOptions['onLayoutProgress'];
-  /** The view this load paginates: the parse request's view, replaced once by
-   *  the worker's effective view before the first publication. Later
-   *  publications may update host geometry only while this view is active. */
-  layoutOptions: LayoutOptions;
+  /** The immutable view selected by the parse request. Later publications from
+   *  this load may update host geometry only while this view remains active. */
+  readonly layoutOptions: LayoutOptions;
   readonly abort: AbortController;
   /** Settles when the worker publishes its first prefix, or — when it publishes
    *  none — when the authoritative `parsedMeta` lands. Either way it is what
@@ -290,21 +288,6 @@ function sameLayoutView(
   return left !== null
     && left.currentDateMs === right.currentDateMs
     && (left.showTrackedChanges === true) === (right.showTrackedChanges === true);
-}
-
-/** Parse-request fields for an application-selected model source. */
-function modelSourceFields(
-  load: AdmittedModelSourceLoad,
-): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
-  // The source owner is an opt-in ESM sidecar. An inline OOXML worker contains
-  // only this URL and imports the sidecar after a source is selected.
-  const sourceOwnerUrl = new URL(
-    import.meta.env.DEV ? './internal/worker-document-source.ts' : './docx-source-worker.mjs',
-    import.meta.url,
-  ).href;
-  return load.transfer.length > 0
-    ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
-    : { source: load.module, sourceOwnerUrl };
 }
 
 function deferred<T>(): Deferred<T> {
@@ -382,9 +365,6 @@ export class DocxDocument {
    * order; only this generation may atomically install its variant + metadata. */
   private _layoutViewGeneration = 0;
   private _mode: 'main' | 'worker' = 'main';
-  /** The caller's own tracked-change choice (tri-state). A model source's view
-   * default applies only while this is undefined. */
-  private _callerShowTrackedChanges: boolean | undefined;
   private _threeD: ChartThreeDRenderer | undefined;
   private _regionMap: ChartRegionMapRenderer | undefined;
   private _chartEx: ChartExRenderer | undefined;
@@ -421,7 +401,6 @@ export class DocxDocument {
     mode: 'main' | 'worker',
     defaultCurrentDateMs: number,
     wasmUrlOverride?: string | URL,
-    initializeWasm = true,
   ) {
     this._worker = worker;
     this._mode = mode;
@@ -459,13 +438,15 @@ export class DocxDocument {
     // Default: the parser WASM emitted next to this bundle, resolved relative to
     // the document URL. `wasmUrl` overrides it (CDN / self-hosted copy); a
     // relative override is still resolved against `location.href`.
-    if (initializeWasm) {
-      const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
-      this._bridge.post({ type: 'init', wasmUrl } satisfies WorkerRequest);
-    }
+    const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
+    this._bridge.post({ type: 'init', wasmUrl } satisfies WorkerRequest);
   }
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+    if (opts.modelSources !== undefined) {
+      const { loadDocxModelSource } = await import('./internal/document-model-source.js');
+      return loadDocxModelSource(source, opts);
+    }
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const defaultCurrentDateMs = Date.now();
@@ -490,20 +471,10 @@ export class DocxDocument {
     } else {
       buffer = source;
     }
-    // An application-supplied model source claims its input from the raw bytes
-    // before OOXML container resolution; without `modelSources` nothing here
-    // runs and the OOXML path below is unchanged.
-    let sourceLoad: AdmittedModelSourceLoad | undefined;
-    if (opts.modelSources !== undefined) {
-      const { selectModelSource, beginModelSourceLoad } = await import('@silurus/ooxml-core/internal/model-source');
-      const selected = selectModelSource(opts.modelSources, 'docx', new Uint8Array(buffer));
-      if (selected) sourceLoad = beginModelSourceLoad(selected, 'docx');
-    }
-    try {
     // Resolve the container on the main thread before spinning up the worker.
     // Container errors remain typed OoxmlError instances here; `instanceof`
     // would not survive the worker boundary.
-    if (!sourceLoad) buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
+    buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
     metrics.setSourceBytes(buffer.byteLength);
     metrics.checkpoint('container ready');
     // The render worker is reachable only through this dynamic import, so
@@ -516,10 +487,9 @@ export class DocxDocument {
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
     let doc: DocxDocument | undefined;
     try {
-      doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl, sourceLoad === undefined);
+      doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl);
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
-      doc._callerShowTrackedChanges = opts.showTrackedChanges;
       // The variant the caller will actually render, recorded for BOTH render
       // modes and recorded BEFORE the parse: geometry accessors and the
       // per-call option fill-in (`_withActiveView`) read it, the wire options
@@ -556,7 +526,6 @@ export class DocxDocument {
               settled: false,
             }
           : undefined,
-        sourceLoad,
       );
       if (mode === 'worker' && doc._mode === 'main') {
         metrics.setMode('main');
@@ -822,15 +791,11 @@ export class DocxDocument {
       );
       metrics.checkpoint('model and layout ready');
       metrics.succeed({ pages: doc.pageCount });
-      sourceLoad?.release();
       return doc;
     } catch (error) {
       const rejectedDocument = doc;
       disposeRejectedLoad(worker, rejectedDocument ? () => rejectedDocument.destroy() : undefined);
       throw error;
-    }
-    } finally {
-      sourceLoad?.release();
     }
     } catch (error) {
       metrics.fail(error);
@@ -846,7 +811,6 @@ export class DocxDocument {
     onUsage?: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     renderers?: WorkerRendererDescriptors,
     progressive?: WorkerProgressiveLoad,
-    sourceLoad?: AdmittedModelSourceLoad,
   ): Promise<void> {
     if (progressive) {
       await this._parseProgressively(
@@ -857,16 +821,15 @@ export class DocxDocument {
         onUsage,
         renderers,
         progressive,
-        sourceLoad,
       );
       return;
     }
     const res = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined), useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
-          : ({ type: 'parse', id, data: buffer, resourcePolicy, ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined) } satisfies WorkerRequest),
-      sourceLoad ? [buffer, ...sourceLoad.transfer] : [buffer],
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
+      [buffer],
       { timeoutMs },
     );
     if ('protocol' in res) {
@@ -875,7 +838,6 @@ export class DocxDocument {
     if (this._mode === 'worker') {
       if ('usage' in res && res.usage) onUsage?.(res.usage);
       if (res.type === 'mainThreadVerticalFallback') {
-        this._adoptSourceViewDefaults(res.viewDefaults);
         const adapted = await materializeDocumentPullAdapterSession(
           this._bridge.transport(isDocumentPullResponse),
           res,
@@ -886,13 +848,10 @@ export class DocxDocument {
         this._meta = null;
         this._mode = 'main';
       } else {
-        const parsed = res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>;
-        this._adoptWorkerView(parsed.showTrackedChanges);
-        this._meta = parsed.meta;
+        this._meta = (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta;
       }
     } else {
       const identity = res as Extract<WorkerResponse, { type: 'documentSessionOpened' }>;
-      this._adoptSourceViewDefaults(identity.viewDefaults);
       const adapted = await materializeDocumentPullAdapterSession(
         this._bridge.transport(isDocumentPullResponse),
         identity,
@@ -934,10 +893,6 @@ export class DocxDocument {
       return;
     }
     if (res.type !== 'layoutPartial' || !progressive) return;
-    // The worker chose the load's view before its first pagination (caller
-    // choice, else the model source's view default); adopt it before the first
-    // publication installs any geometry.
-    if (!progressive.published) this._adoptWorkerView(res.showTrackedChanges);
     // The worker continues its load-time variant after setLayoutView() builds a
     // different one. The original session may keep priming its own store entry,
     // but its pushes no longer own the host's synchronous geometry.
@@ -1138,37 +1093,8 @@ export class DocxDocument {
       ...(active.currentDateMs === runtime.defaultCurrentDateMs
         ? {}
         : { currentDateMs: active.currentDateMs }),
-      // Tri-state: an explicit caller choice (including `false`) is sent; an
-      // unchosen view is omitted so the worker can apply a model source's view
-      // default before its first pagination.
-      ...(this._callerShowTrackedChanges !== undefined || active.showTrackedChanges === true
-        ? { showTrackedChanges: active.showTrackedChanges === true }
-        : {}),
+      ...(active.showTrackedChanges === true ? { showTrackedChanges: true } : {}),
     };
-  }
-
-  /** Main-mode half of the view precedence: explicit caller option > model
-   *  source view default > renderer default. Runs before the first layout. */
-  private _adoptSourceViewDefaults(viewDefaults: { showTrackedChanges?: boolean } | undefined): void {
-    if (this._callerShowTrackedChanges !== undefined) return;
-    const preferred = viewDefaults?.showTrackedChanges;
-    if (preferred === undefined) return;
-    this._adoptWorkerView(preferred);
-  }
-
-  /** Record the effective tracked-change view before any geometry exists. */
-  private _adoptWorkerView(showTrackedChanges: boolean | undefined): void {
-    if (showTrackedChanges === undefined) return;
-    const runtime = documentLayoutRuntimeOf(this);
-    const active = runtime.activeLayoutOptions;
-    if (!active || (active.showTrackedChanges === true) === showTrackedChanges) return;
-    const next = normalizeLayoutOptions(
-      active.currentDateMs,
-      runtime.defaultCurrentDateMs,
-      showTrackedChanges,
-    );
-    runtime.activeLayoutOptions = next;
-    if (this._progressive) this._progressive.layoutOptions = next;
   }
 
   /**
@@ -1190,7 +1116,6 @@ export class DocxDocument {
     onUsage: ((usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void) | undefined,
     renderers: WorkerRendererDescriptors | undefined,
     progressive: WorkerProgressiveLoad,
-    sourceLoad: AdmittedModelSourceLoad | undefined,
   ): Promise<void> {
     this._progressive = progressive;
     this._layoutAbort = progressive.abort;
@@ -1203,7 +1128,6 @@ export class DocxDocument {
           id,
           data: buffer,
           resourcePolicy,
-          ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined),
           useGoogleFonts,
           cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
@@ -1212,7 +1136,7 @@ export class DocxDocument {
           progressiveLayout: true,
         } satisfies RenderWorkerRequest;
       },
-      sourceLoad ? [buffer, ...sourceLoad.transfer] : [buffer],
+      [buffer],
       { timeoutMs: false },
     );
     // Retained rather than awaited: once a publication resolves load(), a later
@@ -1234,7 +1158,6 @@ export class DocxDocument {
           progressive.settled = true;
           this._progressive = null;
           this._layoutAbort = null;
-          this._adoptSourceViewDefaults(res.viewDefaults);
           const adapted = await materializeDocumentPullAdapterSession(
             this._bridge.transport(isDocumentPullResponse),
             res,
@@ -1251,9 +1174,9 @@ export class DocxDocument {
           progressive.firstPublication.resolve();
           return;
         }
-        const parsedMeta = res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>;
-        if (!progressive.published) this._adoptWorkerView(parsedMeta.showTrackedChanges);
-        this._onAuthoritativeMeta(parsedMeta.meta);
+        this._onAuthoritativeMeta(
+          (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta,
+        );
       },
       (error: unknown) => {
         this._parseRequestId = null;

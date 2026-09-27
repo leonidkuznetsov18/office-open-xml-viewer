@@ -131,7 +131,7 @@ function installSelf(): FakeSelf {
 async function loadRenderWorker(): Promise<FakeSelf> {
   const fake = installSelf();
   vi.resetModules();
-  await import('./render-worker.js');
+  await import('./render-worker-source.js');
   return fake;
 }
 
