@@ -129,6 +129,11 @@ export function breakDrawingMlText<T>(
       const nextCp = next.text.codePointAt(0);
       if (prevCp === undefined || nextCp === undefined) return false;
       if (prevCp === 0x200b) return true;
+      // Observed PowerPoint table controls T00–T08: NBSP binds the adjacent
+      // words. At a narrow width Office moves the whole "and NBSP Partner"
+      // group after the preceding ordinary space; once that group fits, it
+      // stays on the first line. The matching Arial controls bound the rule
+      // independently of Segoe UI's host-only font metrics.
       if (isUax14NoBreakPair(prevCp, nextCp)) return false;
       if (isCjk(prev) || isCjk(next)) return true;
       if (index > 1 && (lineBreakClass(prevCp) === 'HY' || lineBreakClass(prevCp) === 'HH')) {
