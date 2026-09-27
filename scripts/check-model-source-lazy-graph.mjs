@@ -195,22 +195,43 @@ function assertNoSourceRuntime(code, name) {
   }
 }
 
-// Baseline: the post-#1562 OOXML production build. The shared DrawingML text
-// breaker and bidi segment kernel increased the static XLSX/PPTX entries and
-// ordinary render workers, while keeping model-source loads behind their
-// existing dynamic boundary. Reset the measured sizes here so the original
-// small dispatch budgets still guard future eager coupling; ordinary workers
-// retain zero growth allowance. Before #1562 the corresponding clean build
-// measured 2528311/1837981/1826158/2579338 static bytes
-// (DOCX/XLSX/PPTX/Node) and 1416412/1458524/2046946 ordinary-worker
-// bytes (XLSX/PPTX/DOCX in ascending size order).
+// Baseline: the pre-feature OOXML production build at 776237df. The small
+// entry allowance covers the modelSources presence dispatch and its Vite
+// dynamic-chunk factoring; ordinary worker payloads have no allowance.
+// Rebased DOCX and Node entries against the clean 470743cb build for #1557
+// (merged by PR #1586):
+// sliced layout, stepwise finalization, and viewer load ownership add 4,728
+// DOCX bytes; shared layout validation/freezing adds 398 Node bytes. The
+// optional model-source runtime remains outside both eager entry graphs.
+// The ordinary DOCX render worker grows by 289 bytes from those same layout
+// changes. PR #1590's projection consolidation then brings the measured main
+// graph at aec306b6 to 2,533,239 DOCX, 2,579,716 Node, and 2,047,181 worker
+// bytes (+200, -20, and -54 respectively versus the #1557 guard values).
+// #1562 then moves DrawingML text phases into core and shares the bidi
+// segment kernel. Against the clean 036ddd31 graph, static bytes change by
+// +98 DOCX, +8,409 XLSX, +1,080 PPTX, and -273 Node. Ordinary worker bytes
+// change by +5,627 XLSX, +367 PPTX, and +93 DOCX. These are measured
+// post-merge baselines; the dispatch allowances below remain unchanged.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_528_427, inline: 31_624, budget: 2_800 },
-  xlsx: { entry: 1_846_390, inline: 39_902, budget: 2_500 },
+  // DOCX and the Node entry include the explicit-state line-breaker and body
+  // table modules from #1566. Against aec306b6, the DOCX static graph grows
+  // 18,002 bytes (2,533,239 → 2,551,241) in the same 36 chunks: the moved
+  // line-breaker contributes 18,953 rendered module bytes and table measurement
+  // 2,501, offset by minification. The old implementations are absent and the
+  // explicit state and named call boundaries remain. The allowance is unchanged.
+  docx: { entry: 2_551_339, inline: 31_624, budget: 2_800 },
+  // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
+  // viewer state restoration. The optional model-source runtime stays lazy.
+  xlsx: { entry: 1_852_591, inline: 39_902, budget: 2_500 },
+  // PPTX measures identically on aec306b6 and this merge. Re-pin the older
+  // guard value to the measured graph without changing its allowance.
   pptx: { entry: 1_827_238, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_579_083, budget: 3_600 },
+  node: { entry: 2_597_445, budget: 3_600 },
 });
-const OOXML_RENDER_WORKERS = [1_422_039, 1_458_891, 2_047_039];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
+// DOCX worker includes PRs #1586 and #1590 plus the #1566 line-breaker split
+// (+19,183 bytes against aec306b6). Workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_422_575, 1_458_891, 2_066_457];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

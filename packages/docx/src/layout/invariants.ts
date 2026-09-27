@@ -31,6 +31,10 @@ import type {
 import { unionLayoutRects } from './rect-union.js';
 
 import { documentLayoutValidationEnabled } from './validation-policy.js';
+// Pagination's generator yields page counts for public progress telemetry.
+// Final validation/freezing also needs suspension points, but commits no new
+// pages; the scheduler ignores this non-finite internal sentinel.
+const FINALIZATION_SUSPENSION = Number.NaN;
 const LAYOUT_DIAGNOSTIC_CODE_MEMBERS = {
   FLOW_OVERLAP: true,
   BOTTOM_MARGIN_INVASION: true,
@@ -59,7 +63,7 @@ const SOURCE_STORIES = new Set<SourceRef['story']>(
   Object.keys(SOURCE_STORY_MEMBERS) as SourceRef['story'][],
 );
 
-function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<object>()): void {
+function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<object>(), deferPages = false): void {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {
@@ -91,7 +95,9 @@ function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<o
         if (!descriptor?.enumerable || !('value' in descriptor)) {
           throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}[${key}] is not plain data`);
         }
-        assertPlainData(descriptor.value, `${path}[${key}]`, ancestors);
+        if (!(deferPages && path === 'layout.pages')) {
+          assertPlainData(descriptor.value, `${path}[${key}]`, ancestors);
+        }
         indexCount += 1;
       }
       if (indexCount !== value.length) {
@@ -112,7 +118,7 @@ function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<o
       if (!descriptor?.enumerable || !('value' in descriptor)) {
         throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}.${key} is not plain data`);
       }
-      assertPlainData(descriptor.value, `${path}.${key}`, ancestors);
+      assertPlainData(descriptor.value, `${path}.${key}`, ancestors, deferPages);
     }
   } finally {
     ancestors.delete(value);
@@ -510,8 +516,11 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
   });
 }
 
-function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
-  assertPlainData(layout, 'layout');
+function* assertDocumentLayoutUncheckedSteps(layout: DocumentLayout): Generator<number, void, void> {
+  // Validate the root and the pages array now, then validate each complete page
+  // before yielding. This preserves the plain-data contract while giving the
+  // scheduler a safe suspension point in the formerly monolithic final walk.
+  assertPlainData(layout, 'layout', new WeakSet<object>(), true);
   layout.diagnostics.forEach((diagnostic, index) => {
     const path = `diagnostics[${index}]`;
     if (!LAYOUT_DIAGNOSTIC_CODES.has(diagnostic.code)) {
@@ -535,7 +544,8 @@ function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
     }
   });
   const documentRetainedNodeIds = new Set<string>();
-  layout.pages.forEach((page, pageIndex) => {
+  for (const [pageIndex, page] of layout.pages.entries()) {
+    assertPlainData(page, `layout.pages[${pageIndex}]`);
     if (!Number.isInteger(page.pageIndex) || page.pageIndex !== pageIndex) {
       throw new LayoutInvariantError(
         'INVALID_REFERENCE',
@@ -989,12 +999,17 @@ function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
         }
       }
     }
-  });
+    yield FINALIZATION_SUSPENSION;
+  }
 }
 
 export function assertDocumentLayout(layout: DocumentLayout): void {
+  for (const _step of assertDocumentLayoutSteps(layout)) { /* drain */ }
+}
+
+function* assertDocumentLayoutSteps(layout: DocumentLayout): Generator<number, void, void> {
   try {
-    assertDocumentLayoutUnchecked(layout);
+    yield* assertDocumentLayoutUncheckedSteps(layout);
   } catch (error) {
     if (error instanceof LayoutInvariantError) throw error;
     if (error instanceof TypeError || error instanceof RangeError) {
@@ -1092,11 +1107,28 @@ export function deepFreezeDocumentLayout(layout: DocumentLayout): DeepReadonly<D
 export function assertAndDeepFreezeDocumentLayout(
   layout: DocumentLayout,
 ): DeepReadonly<DocumentLayout> {
+  const steps = assertAndDeepFreezeDocumentLayoutSteps(layout);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+/** The same invariant and freeze operations as the synchronous boundary, with
+ * page-level suspension points for main-thread pagination. */
+export function* assertAndDeepFreezeDocumentLayoutSteps(
+  layout: DocumentLayout,
+): Generator<number, DeepReadonly<DocumentLayout>, void> {
   if (verifiedFrozenDocumentLayouts.has(layout)) {
     return layout as DeepReadonly<DocumentLayout>;
   }
-  assertDocumentLayout(layout);
-  const frozen = freezeDocumentLayout(layout);
+  yield* assertDocumentLayoutSteps(layout);
+  const seen = new WeakSet<object>();
+  for (const page of layout.pages) {
+    deepFreeze(page, seen);
+    yield FINALIZATION_SUSPENSION;
+  }
+  const frozen = deepFreeze(layout, seen);
+  frozenDocumentLayouts.add(frozen);
   verifiedFrozenDocumentLayouts.add(frozen);
   return frozen;
 }
