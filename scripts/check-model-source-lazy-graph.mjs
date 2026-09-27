@@ -228,10 +228,11 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   pptx: { entry: 1_839_457, inline: 59_554, budget: 2_100 },
   node: { entry: 2_597_718, budget: 3_600 },
 });
-// The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
-// DOCX worker includes PRs #1586 and #1590 plus the #1566 line-breaker split
-// (+19,183 bytes against aec306b6). Workers retain zero allowance.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_066_364];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction and
+// 51 bytes for table-style font color precedence. The DOCX worker includes
+// PRs #1586 and #1590 plus the #1566 line-breaker split (+19,183 bytes
+// against aec306b6). Workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_416_999, 1_458_524, 2_066_364];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

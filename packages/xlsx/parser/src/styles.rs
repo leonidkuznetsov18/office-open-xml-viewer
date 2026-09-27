@@ -80,7 +80,10 @@ pub(crate) fn parse_styles(
     let fonts = parse_fonts(&doc, theme_colors);
     let fills = parse_fills(&doc, theme_colors);
     let borders = parse_borders(&doc, theme_colors);
-    let cell_xfs = parse_cell_xfs(&doc);
+    let mut cell_xfs = parse_cell_xfs(&doc);
+    for (xf, own) in cell_xfs.iter_mut().zip(own_font_color_flags(&doc)) {
+        xf.own_font_color = own;
+    }
     let dxfs = parse_dxfs(&doc, theme_colors);
 
     Ok(ParsedStylesPart {
@@ -454,6 +457,158 @@ pub(crate) fn parse_borders(doc: &roxmltree::Document, theme_colors: &[String]) 
     borders
 }
 
+/// An authored attribute value in its schema type (whitespace-collapsed and
+/// numeric, so `theme="01"` equals `theme="1"`), or its trimmed text when it
+/// is not a valid value of that type.
+#[derive(Debug, Clone, PartialEq)]
+enum Typed<T> {
+    Value(T),
+    Invalid(String),
+}
+
+fn typed<T: std::str::FromStr>(value: Option<&str>) -> Option<Typed<T>> {
+    let value = value?.trim();
+    Some(
+        value
+            .parse()
+            .map(Typed::Value)
+            .unwrap_or_else(|_| Typed::Invalid(value.to_string())),
+    )
+}
+
+/// A font's `<color>` as authored (ECMA-376 §18.8.3 CT_Color), compared
+/// without resolving it: Excel treats `rgb="FF000000"`, `indexed="8"`,
+/// `auto="1"` and an absent `<color>` as colors distinct from the Normal
+/// font's `theme="1"`, although all of them draw black. A zero `tint` is the
+/// same as none.
+#[derive(Debug, Clone, PartialEq)]
+struct AuthoredColor {
+    auto: Typed<bool>,
+    rgb: Option<String>,
+    theme: Option<Typed<u32>>,
+    indexed: Option<Typed<u32>>,
+    tint: Option<Typed<f64>>,
+}
+
+/// Each `<font>`'s authored color; the inner `None` is a font without a
+/// `<color>` element.
+fn authored_font_colors(doc: &roxmltree::Document) -> Vec<Option<AuthoredColor>> {
+    let Some(fonts) = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "fonts" && is_x_ns(n.tag_name().namespace()))
+    else {
+        return Vec::new();
+    };
+    fonts
+        .children()
+        .filter(|n| n.tag_name().name() == "font")
+        .map(|font| {
+            let color = font.children().find(|c| c.tag_name().name() == "color")?;
+            let rgb = color.attribute("rgb").map(|v| {
+                let v = v.trim().to_ascii_uppercase();
+                if v.len() == 6 {
+                    format!("FF{v}")
+                } else {
+                    v
+                }
+            });
+            Some(AuthoredColor {
+                // xsd:boolean: 1/true and 0/false; omitted means false.
+                auto: match color.attribute("auto").map(str::trim) {
+                    None | Some("0" | "false") => Typed::Value(false),
+                    Some("1" | "true") => Typed::Value(true),
+                    Some(other) => Typed::Invalid(other.to_string()),
+                },
+                rgb,
+                theme: typed(color.attribute("theme")),
+                indexed: typed(color.attribute("indexed")),
+                // A non-finite tint stays text so equality remains reflexive.
+                tint: match typed::<f64>(color.attribute("tint")) {
+                    Some(Typed::Value(0.0)) => None,
+                    Some(Typed::Value(t)) if !t.is_finite() => color
+                        .attribute("tint")
+                        .map(|v| Typed::Invalid(v.trim().to_string())),
+                    other => other,
+                },
+            })
+        })
+        .collect()
+}
+
+/// `own_font_color` for every `<cellXfs>` entry, in order. The Normal cell
+/// style is `<cellStyle builtinId="0">` (ECMA-376 §18.8.7), whose `xfId`
+/// selects its `<cellStyleXfs>` entry. A cell's own color is one whose font
+/// color, or whose cell style's (`xf/@xfId`) font color, is authored
+/// differently from the Normal font color. Excel draws such a color over a
+/// table style's element font color — measured with Office-exported controls
+/// covering theme / rgb / indexed / auto / absent colors and cell-style
+/// inheritance.
+///
+/// The measurements cover resolvable references only. When the Normal style,
+/// a font or a parent style cannot be resolved, the cell keeps the previous
+/// precedence (the table color applies) rather than an unmeasured guess.
+fn own_font_color_flags(doc: &roxmltree::Document) -> Vec<bool> {
+    let colors = authored_font_colors(doc);
+    // `fontId` is read as parse_cell_xfs reads it, so the flag describes the
+    // font the cell actually renders with.
+    let xfs_in = |tag: &str| -> Vec<(usize, Option<usize>)> {
+        doc.descendants()
+            .find(|n| n.tag_name().name() == tag && is_x_ns(n.tag_name().namespace()))
+            .map(|list| {
+                list.children()
+                    .filter(|n| n.tag_name().name() == "xf")
+                    .map(|xf| {
+                        let font_id = xf
+                            .attribute("fontId")
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(0) as usize;
+                        let xf_id = match xf.attribute("xfId") {
+                            None => Some(0),
+                            Some(v) => v.trim().parse().ok(),
+                        };
+                        (font_id, xf_id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let style_xfs = xfs_in("cellStyleXfs");
+    let normal_xf = doc
+        .descendants()
+        .find(|n| {
+            n.tag_name().name() == "cellStyle"
+                && is_x_ns(n.tag_name().namespace())
+                && n.attribute("builtinId")
+                    .is_some_and(|v| v.trim().parse::<u32>() == Ok(0))
+        })
+        .and_then(|n| n.attribute("xfId"))
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    // Normal's authored color, then one "differs from Normal" answer per font
+    // (None: the font index does not resolve), so each xf is a lookup.
+    let Some(normal) = normal_xf
+        .and_then(|id| style_xfs.get(id))
+        .and_then(|&(font_id, _)| colors.get(font_id))
+    else {
+        return Vec::new();
+    };
+    let differs: Vec<bool> = colors.iter().map(|color| color != normal).collect();
+    let font_differs = |font_id: usize| differs.get(font_id).copied();
+    let style_differs = |xf_id: Option<usize>| {
+        xf_id
+            .and_then(|id| style_xfs.get(id))
+            .and_then(|&(font_id, _)| font_differs(font_id))
+    };
+    xfs_in("cellXfs")
+        .into_iter()
+        .map(
+            |(font_id, xf_id)| match (font_differs(font_id), style_differs(xf_id)) {
+                (Some(own), Some(style)) => own || style,
+                _ => false,
+            },
+        )
+        .collect()
+}
+
 pub(crate) fn parse_cell_xfs(doc: &roxmltree::Document) -> Vec<CellXf> {
     let mut xfs = Vec::new();
     for xfs_node in doc.descendants() {
@@ -529,6 +684,7 @@ pub(crate) fn parse_cell_xfs(doc: &roxmltree::Document) -> Vec<CellXf> {
                     text_rotation,
                     shrink_to_fit,
                     reading_order,
+                    own_font_color: false,
                 });
             }
             break;
@@ -638,6 +794,115 @@ mod strict_namespace_tests {
         assert_eq!(
             parse_default_font(&doc),
             (Some("Arial".into()), Some(12.0), true, true)
+        );
+    }
+
+    #[test]
+    fn own_font_color_follows_excel_table_style_precedence() {
+        // Expectations measured in Excel (PDF export of control workbooks):
+        // only a color authored exactly like the Normal font's, with a cell
+        // style that keeps it, lets a table style's font color through.
+        // Normal is cellStyleXfs[1] here, found through builtinId="0".
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts>
+    <font><sz val="11"/><color theme="1"/></font>
+    <font><sz val="11"/><color rgb="FF000000"/></font>
+    <font><b/><sz val="11"/><color theme="1"/></font>
+    <font><sz val="11"/><color rgb="FFFF0000"/></font>
+    <font><sz val="11"/></font>
+    <font><sz val="11"/><color auto="1"/></font>
+    <font><sz val="11"/><color indexed="8"/></font>
+    <font><sz val="11"/><color theme="1" tint="0"/></font>
+  </fonts>
+  <cellStyleXfs><xf fontId="3"/><xf fontId="0"/></cellStyleXfs>
+  <cellXfs>
+    <xf fontId="0" xfId="1"/><xf fontId="1" xfId="1"/><xf fontId="2" xfId="1"/>
+    <xf fontId="3" xfId="1"/><xf fontId="4" xfId="1"/><xf fontId="5" xfId="1"/>
+    <xf fontId="6" xfId="1"/><xf fontId="7" xfId="1"/>
+    <xf fontId="3" xfId="0"/><xf fontId="0" xfId="0"/>
+  </cellXfs>
+  <cellStyles><cellStyle name="Red" xfId="0"/><cellStyle name="Normal" xfId="1" builtinId="0"/></cellStyles>
+</styleSheet>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        assert_eq!(
+            own_font_color_flags(&doc),
+            [
+                false, // Normal font
+                true,  // rgb black
+                false, // theme black, bold
+                true,  // red
+                true,  // no <color>
+                true,  // auto
+                true,  // indexed black
+                false, // theme black, zero tint
+                true,  // red from the cell style
+                true,  // Normal font under a red cell style
+            ]
+        );
+    }
+
+    #[test]
+    fn own_font_color_compares_typed_values_and_fails_safe() {
+        let sheet = |fonts: &str, style_xfs: &str, cell_xfs: &str, styles: &str| {
+            format!(
+                r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts>{fonts}</fonts><cellStyleXfs>{style_xfs}</cellStyleXfs>
+  <cellXfs>{cell_xfs}</cellXfs>{styles}</styleSheet>"#
+            )
+        };
+        let flags = |xml: String| own_font_color_flags(&roxmltree::Document::parse(&xml).unwrap());
+        let normal =
+            r#"<cellStyles><cellStyle name="Normal" xfId="1" builtinId="00"/></cellStyles>"#;
+        // Same values spelled differently are the same authored color; the
+        // Normal style is still found through a zero-padded builtinId.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1" tint=" 0.5 "/></font><font><color theme="01" tint="0.50"/></font><font><color rgb="FFFF0000"/></font>"#,
+                r#"<xf fontId="2"/><xf fontId="0"/>"#,
+                r#"<xf fontId="1" xfId="1"/><xf fontId="2" xfId="1"/>"#,
+                normal,
+            )),
+            [false, true]
+        );
+        // Without a resolvable Normal style nothing is classified as owned.
+        assert!(flags(sheet(
+            r#"<font><color theme="1"/></font><font><color rgb="FFFF0000"/></font>"#,
+            r#"<xf fontId="1"/><xf fontId="0"/>"#,
+            r#"<xf fontId="0" xfId="1"/>"#,
+            "",
+        ))
+        .is_empty());
+        // A non-finite tint compares equal to itself; auto spellings
+        // normalize, while an invalid auto value stays distinct.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1" tint="NaN" auto="0"/></font><font><color theme="1" tint=" NaN " auto="false"/></font><font><color theme="1" tint="NaN" auto="no"/></font>"#,
+                r#"<xf fontId="0"/>"#,
+                r#"<xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/><xf fontId="2" xfId="0"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [false, false, true]
+        );
+        // A fontId beyond u32 falls back to font 0, as parse_cell_xfs does,
+        // so the cell is classified by the red font it renders with.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color rgb="FFFF0000"/></font><font><color theme="1"/></font>"#,
+                r#"<xf fontId="1"/>"#,
+                r#"<xf fontId="4294967296" xfId="0"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [true]
+        );
+        // An unresolvable font or parent style keeps the table color.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1"/></font>"#,
+                r#"<xf fontId="0"/>"#,
+                r#"<xf fontId="9" xfId="0"/><xf fontId="0" xfId="7"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [false, false]
         );
     }
 
