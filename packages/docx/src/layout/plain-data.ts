@@ -232,7 +232,7 @@ function cloneAndFreezePlainData<T>(value: T, seen: Map<object, unknown>): DeepR
   return copy as DeepReadonly<T>;
 }
 
-export function snapshotPlainData<T>(value: T, label: string): DeepReadonly<T> {
+export function snapshotPlainData<T>(value: T, label: string, ownedProjectionOf?: object): DeepReadonly<T> {
   if (typeof value === 'object' && value !== null && processedPlainData.has(value)) {
     return value as DeepReadonly<T>;
   }
@@ -244,7 +244,14 @@ export function snapshotPlainData<T>(value: T, label: string): DeepReadonly<T> {
     validatePlainData(value, label);
   }
   try {
-    const snapshot = cloneAndFreezePlainData(value, new Map<object, unknown>());
+    // Projection owns every newly allocated node. With a verified frozen
+    // source root, its remaining aliases are immutable source facts and the
+    // new nodes can be frozen in place. This avoids copying the entire
+    // occurrence after translation/re-keying already made its distinct nodes.
+    // Unverified or mutable sources still take the deep-copy path.
+    const snapshot = ownedProjectionOf && processedPlainData.has(ownedProjectionOf)
+      ? deepFreezePlainData(value)
+      : cloneAndFreezePlainData(value, new Map<object, unknown>());
     if (typeof snapshot === 'object' && snapshot !== null) processedPlainData.add(snapshot);
     return snapshot;
   } catch (error) {
