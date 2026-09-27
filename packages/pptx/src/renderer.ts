@@ -1529,37 +1529,78 @@ export function layoutParagraph(
 
 // ===== Element renderers =====
 
-async function renderBackground(
-  ctx: CanvasRenderingContext2D,
+/**
+ * One slide-paint step whose asynchronous inputs (decoded images, posters) are
+ * already resolved, so `paint` issues its canvas calls synchronously.
+ *
+ * Why the slide is painted in one task: Chrome records Canvas2D calls and
+ * rasterizes the pending recording when it flushes the canvas, which happens
+ * at the end of any task that drew to a displayed canvas (for example when a
+ * frame is produced while the renderer awaits a decode). Rasterization of an
+ * antialiased path is not independent of that chunking: in Chrome 153's
+ * software canvas, an antialiased concave path covers a few edge pixels
+ * differently once the same unflushed recording already holds six such
+ * "slow" paths or clips (cc's `kMinNumberOfSlowPathsForMSAA` heuristic). A
+ * paint that awaits between draw calls therefore rasterizes differently
+ * depending on when decodes settle, so an unchanged renderer and document could
+ * produce different pixels on a first paint than on a repaint (issue #1580).
+ * Resolving every input first and then painting without yielding keeps the
+ * whole slide in one task, which also stops a half-painted slide from being
+ * presented while decodes are still pending.
+ *
+ * `failure` carries an error that must propagate (decoded-image budget, TIFF
+ * decode). It is rethrown right after `paint`, at this step's position in the
+ * slide's paint order, so the canvas holds exactly what the former
+ * interleaved paint left before throwing.
+ */
+interface PreparedPaint {
+  readonly paint: (ctx: CanvasRenderingContext2D) => void;
+  readonly failure?: { readonly error: unknown };
+}
+
+const NO_PAINT: PreparedPaint = { paint: () => {} };
+
+async function prepareBackground(
   fill: Fill | null,
   canvasW: number,
   canvasH: number,
   scale: number,
-  superseded: () => boolean,
   fetchImage?: (path: string, mime: string) => Promise<Blob>,
   tiff?: TiffRenderer,
   svgDecoder?: SvgBlobDecoder,
   imagePlan?: DecodedImageTargetPlan,
-) {
-  // ECMA-376 §20.1.8.14 — image (blipFill) background. Paint an opaque white
-  // base first so a partially transparent image (alphaModFix) composites over
-  // white, and so a decode failure still leaves a defined background.
+): Promise<PreparedPaint> {
   if (fill && fill.fillType === 'image') {
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, canvasW, canvasH);
+    // ECMA-376 §20.1.8.14 — image (blipFill) background. Paint an opaque white
+    // base first so a partially transparent image (alphaModFix) composites over
+    // white, and so a decode failure still leaves a defined background.
+    const paintBase = (ctx: CanvasRenderingContext2D) => {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+    };
     // The lazy pipeline always emits imagePath + mimeType for blip fills; bail
     // to the white base if either the path or the byte source is missing.
-    if (!fill.imagePath || !fill.mimeType || !fetchImage) return;
+    if (!fill.imagePath || !fill.mimeType || !fetchImage) return { paint: paintBase };
+    const failed = (error: unknown): PreparedPaint => {
+      if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
+        return {
+          paint: (ctx) => {
+            paintBase(ctx);
+            paintOptionalImagePlaceholder(ctx, 'tiff', {
+              x: 0, y: 0, width: canvasW, height: canvasH,
+            });
+          },
+        };
+      }
+      if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
+        return { paint: paintBase, failure: { error } };
+      }
+      // Decode failed — the white base remains as the fallback.
+      return { paint: paintBase };
+    };
+    let bitmap: Awaited<ReturnType<typeof getCachedDuotoneBitmapByPath>>;
+    let sourceInspection: Awaited<ReturnType<typeof inspectCachedRasterSource>> | undefined;
     try {
-      const fr = fill.fillRect ?? {};
-      const l = fr.l ?? 0;
-      const t = fr.t ?? 0;
-      const r = fr.r ?? 0;
-      const b = fr.b ?? 0;
-      const dx = l * canvasW;
-      const dy = t * canvasH;
-      const dw = canvasW * (1 - l - r);
-      const dh = canvasH * (1 - t - b);
       // Size the metafile raster from the fill box (canvasW/H are CSS px;
       // scale is px-per-EMU, so px/scale = EMU, /PT_TO_EMU = pt).
       // §20.1.8.23 duotone recolour on the raster blip (issue #889): route
@@ -1568,10 +1609,10 @@ async function renderBackground(
       const planned = imagePlan && !pixelTransform(fill)
         ? plannedRasterOptions(imagePlan, imagePlanKey(fill.imagePath, pixelTransform(fill)))
         : undefined;
-      const sourceInspection = fill.tile
+      sourceInspection = fill.tile
         ? await inspectCachedRasterSource(fill.imagePath, fill.mimeType, fetchImage)
         : undefined;
-      const bitmap = await getCachedDuotoneBitmapByPath(
+      bitmap = await getCachedDuotoneBitmapByPath(
         fill.imagePath,
         fill.mimeType,
         pixelTransform(fill),
@@ -1584,53 +1625,74 @@ async function renderBackground(
           svgDecoder,
         },
       );
-      if (superseded()) return;
-      // A null bitmap (unsupported metafile, e.g. true EMF) → keep the white
-      // base painted above as the fallback, exactly like a decode failure.
-      if (!bitmap) return;
-      ctx.save();
-      // Clip to the slide rectangle so overscan (negative insets) or tile
-      // bleed is cropped at the slide edge rather than spilling onto
-      // neighbouring content.
-      ctx.beginPath();
-      ctx.rect(0, 0, canvasW, canvasH);
-      ctx.clip();
-      if (fill.alpha != null) ctx.globalAlpha = fill.alpha;
-      if (fill.tile) {
-        // §20.1.8.58 — tiled placement: repeat the blip at its native size.
-        paintTiledBackground(
-          ctx,
-          bitmap,
-          fill.tile,
-          canvasW,
-          canvasH,
-          scale,
-          fill.srcRect,
-          sourceInspection?.dimensions ?? undefined,
-        );
-      } else {
-        // §20.1.8.56 stretch into the destination rect from the §20.1.8.30
-        // fillRect insets. l/t are left/top insets, r/b are right/bottom
-        // insets, so the destination spans [l, 1-r] × [t, 1-b] of the box;
-        // negative edges overscan past the box.
-        drawImageCropped(ctx, bitmap, fill.srcRect, dx, dy, dw, dh);
-      }
-      ctx.restore();
     } catch (error) {
-      if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
-        paintOptionalImagePlaceholder(ctx, 'tiff', {
-          x: 0, y: 0, width: canvasW, height: canvasH,
-        });
-        return;
-      }
-      if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
-      // Decode failed — the white base painted above remains as the fallback.
+      return failed(error);
     }
-    return;
+    // A null bitmap (unsupported metafile, e.g. true EMF) → keep the white
+    // base as the fallback, exactly like a decode failure.
+    if (!bitmap) return { paint: paintBase };
+    const source = bitmap;
+    return {
+      paint: (ctx) => {
+        paintBase(ctx);
+        try {
+          const fr = fill.fillRect ?? {};
+          const l = fr.l ?? 0;
+          const t = fr.t ?? 0;
+          const r = fr.r ?? 0;
+          const b = fr.b ?? 0;
+          const dx = l * canvasW;
+          const dy = t * canvasH;
+          const dw = canvasW * (1 - l - r);
+          const dh = canvasH * (1 - t - b);
+          ctx.save();
+          // Clip to the slide rectangle so overscan (negative insets) or tile
+          // bleed is cropped at the slide edge rather than spilling onto
+          // neighbouring content.
+          ctx.beginPath();
+          ctx.rect(0, 0, canvasW, canvasH);
+          ctx.clip();
+          if (fill.alpha != null) ctx.globalAlpha = fill.alpha;
+          if (fill.tile) {
+            // §20.1.8.58 — tiled placement: repeat the blip at its native size.
+            paintTiledBackground(
+              ctx,
+              source,
+              fill.tile,
+              canvasW,
+              canvasH,
+              scale,
+              fill.srcRect,
+              sourceInspection?.dimensions ?? undefined,
+            );
+          } else {
+            // §20.1.8.56 stretch into the destination rect from the §20.1.8.30
+            // fillRect insets. l/t are left/top insets, r/b are right/bottom
+            // insets, so the destination spans [l, 1-r] × [t, 1-b] of the box;
+            // negative edges overscan past the box.
+            drawImageCropped(ctx, source, fill.srcRect, dx, dy, dw, dh);
+          }
+          ctx.restore();
+        } catch (error) {
+          if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
+            paintOptionalImagePlaceholder(ctx, 'tiff', {
+              x: 0, y: 0, width: canvasW, height: canvasH,
+            });
+            return;
+          }
+          if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+          // Paint failed — the white base painted above remains as the fallback.
+        }
+      },
+    };
   }
-  const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH);
-  ctx.fillStyle = bg ?? '#FFFFFF';
-  ctx.fillRect(0, 0, canvasW, canvasH);
+  return {
+    paint: (ctx) => {
+      const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH);
+      ctx.fillStyle = bg ?? '#FFFFFF';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+    },
+  };
 }
 
 /**
@@ -5421,20 +5483,20 @@ function paintUnavailablePicture(
   }
 }
 
-async function renderPicture(
-  ctx: CanvasRenderingContext2D,
+/** Resolve a picture's drawable source; the returned step paints it without
+ *  yielding (see {@link PreparedPaint}). */
+async function preparePicture(
   el: PictureElement,
   scale: number,
-  superseded: () => boolean,
   fetchImage?: (path: string, mime: string) => Promise<Blob>,
   tiff?: TiffRenderer,
   dpr = 1,
   svgDecoder?: SvgBlobDecoder,
   imagePlan?: DecodedImageTargetPlan,
-) {
+): Promise<PreparedPaint> {
   // No byte source → nothing to draw (the lazy pipeline always supplies one in
   // both render modes; this guards the rare misconfiguration).
-  if (!fetchImage) return;
+  if (!fetchImage) return NO_PAINT;
   try {
     // Prefer the vector original (Microsoft svgBlip extension); fall back to the
     // raster on any SVG decode failure. `bitmap` widens to the union of the two
@@ -5460,7 +5522,7 @@ async function renderPicture(
       el.width / PT_TO_EMU,
       el.height / PT_TO_EMU,
     );
-    if (!rasterSize) return;
+    if (!rasterSize) return NO_PAINT;
     const { widthPt, heightPt } = rasterSize;
     const rawTarget = rasterTargetOptions(
       emuToPx(el.width, scale),
@@ -5537,7 +5599,34 @@ async function renderPicture(
     // Skip a picture whose blip is an unsupported metafile (null bitmap), the
     // same way an SVG-decode failure that also fails its raster fallback would
     // throw out of this try — here we simply return without painting.
-    if (!bitmap || superseded()) return;
+    if (!bitmap) return NO_PAINT;
+    const source = bitmap;
+    return { paint: (ctx) => paintResolvedPicture(ctx, el, source, scale) };
+  } catch (error) {
+    return pictureFailure(el, scale, error);
+  }
+}
+
+/** A picture whose source or paint failed: a missing optional TIFF codec
+ *  paints the unavailable-picture placeholder, a decoded-image budget or TIFF
+ *  decode error propagates, and any other broken image is skipped. */
+function pictureFailure(el: PictureElement, scale: number, error: unknown): PreparedPaint {
+  if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
+    return { paint: (ctx) => paintUnavailablePicture(ctx, el, scale) };
+  }
+  if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
+    return { ...NO_PAINT, failure: { error } };
+  }
+  return NO_PAINT;
+}
+
+function paintResolvedPicture(
+  ctx: CanvasRenderingContext2D,
+  el: PictureElement,
+  bitmap: ImageBitmap | HTMLImageElement,
+  scale: number,
+): void {
+  try {
     ctx.save();
     if (el.alpha != null) ctx.globalAlpha *= el.alpha;
     const x = emuToPx(el.x, scale);
@@ -5944,20 +6033,17 @@ async function renderPicture(
     ctx.restore();
     // bitmap is owned by getCachedBitmapByPath's cache — do not close it here.
   } catch (error) {
-    if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
-      if (!superseded()) paintUnavailablePicture(ctx, el, scale);
-      return;
-    }
-    if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
-    // silently skip broken images
+    const failure = pictureFailure(el, scale, error);
+    failure.paint(ctx);
+    if (failure.failure) throw failure.failure.error;
   }
 }
 
-async function renderMedia(
-  ctx: CanvasRenderingContext2D,
+/** Resolve a media element's poster frame; the returned step paints the
+ *  poster (or the plain media fill) without yielding (see {@link PreparedPaint}). */
+async function prepareMedia(
   el: MediaElement,
   scale: number,
-  superseded: () => boolean,
   fetchMedia?: (path: string) => Promise<Blob>,
   skipControls?: boolean,
   bitmapOwner?: PosterFetchImage,
@@ -5965,7 +6051,7 @@ async function renderMedia(
   dpr = 1,
   svgDecoder?: SvgBlobDecoder,
   imagePlan?: DecodedImageTargetPlan,
-) {
+): Promise<PreparedPaint> {
   const x = emuToPx(el.x, scale);
   const y = emuToPx(el.y, scale);
   const w = emuToPx(el.width, scale);
@@ -5975,8 +6061,8 @@ async function renderMedia(
   let posterCodecUnavailable = false;
   if (el.posterPath && fetchMedia) {
     try {
-      // Poster is cached (and prefetched by renderSlide); do not close it here —
-      // it is reused across renders of the same slide.
+      // Poster is cached; do not close it here — it is reused across renders
+      // of the same slide.
       const target = el.posterMimeType === 'image/svg+xml'
         ? rasterTargetOptions(w, h, dpr)
         : imagePlan
@@ -5987,30 +6073,32 @@ async function renderMedia(
       if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
         posterCodecUnavailable = true;
       } else {
-        if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+        if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
+          return { ...NO_PAINT, failure: { error } };
+        }
         // fall through to plain fill
       }
     }
   }
 
-  if (superseded()) return;
+  return {
+    paint: (ctx) => {
+      ctx.save();
+      applyFrameTransform(ctx, el, scale);
+      if (poster) {
+        ctx.drawImage(poster, x, y, w, h);
+      } else {
+        ctx.fillStyle = el.mediaKind === 'video' ? '#111' : '#f0f0f0';
+        ctx.fillRect(x, y, w, h);
+        if (posterCodecUnavailable) {
+          paintOptionalImagePlaceholder(ctx, 'tiff', { x, y, width: w, height: h });
+        }
+      }
 
-  // Do not retain a saved canvas state across the asynchronous poster decode:
-  // a newer render may reuse the same context while the promise is pending.
-  ctx.save();
-  applyFrameTransform(ctx, el, scale);
-  if (poster) {
-    ctx.drawImage(poster, x, y, w, h);
-  } else {
-    ctx.fillStyle = el.mediaKind === 'video' ? '#111' : '#f0f0f0';
-    ctx.fillRect(x, y, w, h);
-    if (posterCodecUnavailable) {
-      paintOptionalImagePlaceholder(ctx, 'tiff', { x, y, width: w, height: h });
-    }
-  }
-
-  if (!skipControls) drawPlayBadge(ctx, x + w / 2, y + h / 2, w, h, 'paused');
-  ctx.restore();
+      if (!skipControls) drawPlayBadge(ctx, x + w / 2, y + h / 2, w, h, 'paused');
+      ctx.restore();
+    },
+  };
 }
 
 // ===== Table renderer =====
@@ -6837,10 +6925,10 @@ async function renderSlideLeased(
 ): Promise<HTMLCanvasElement | OffscreenCanvas> {
   // Cancellation guard. renderSlide is async (it awaits image / equation decode),
   // so rapid navigation can start a newer render of the SAME canvas before this
-  // one finishes. Both would `canvas.width = …` (clear) and then draw, and their
-  // draws interleave at the await points — ghosting multiple slides together.
-  // Stamp a per-canvas token; once a newer render supersedes us, stop drawing at
-  // the next await so only the latest render's output survives.
+  // one finishes. The caller stamps a per-canvas token; once a newer render
+  // supersedes us, we stop before clearing the canvas so only the latest
+  // render's output survives. The paint itself never yields, so two renders'
+  // draws cannot interleave.
   const targetWidth = opts.width ?? ((isHTMLCanvas(canvas) ? canvas.offsetWidth : 0) || 960);
   const scale = targetWidth / slideWidth;
   const canvasW = Math.round(targetWidth);
@@ -6869,30 +6957,36 @@ async function renderSlideLeased(
     opts.tiff,
   );
   const imagePlan = await plannedImages;
-  canvas.width = clamped.width;
-  canvas.height = clamped.height;
-  // CSS size only applies to the visible HTMLCanvasElement (not OffscreenCanvas)
-  if (isHTMLCanvas(canvas)) {
-    canvas.style.width = `${canvasW}px`;
-    // Mirror the docx renderer: when callers use `renderSlide(canvas, ...)`
-    // directly without the {@link PptxViewer} wrapper, set `display:block`
-    // as a safety net so the inline-element baseline does not leave a
-    // descender gap below the canvas. Respect any user-specified value.
-    if (!canvas.style.display) canvas.style.display = 'block';
-  }
+  // Resizing the backing store clears it, so it starts the slide's paint. Every
+  // asynchronous input is resolved before this is called, and from here to the
+  // end of the paint nothing yields (see PreparedPaint).
+  const beginPaint = (): CanvasRenderingContext2D => {
+    canvas.width = clamped.width;
+    canvas.height = clamped.height;
+    // CSS size only applies to the visible HTMLCanvasElement (not OffscreenCanvas)
+    if (isHTMLCanvas(canvas)) {
+      canvas.style.width = `${canvasW}px`;
+      // Mirror the docx renderer: when callers use `renderSlide(canvas, ...)`
+      // directly without the {@link PptxViewer} wrapper, set `display:block`
+      // as a safety net so the inline-element baseline does not leave a
+      // descender gap below the canvas. Respect any user-specified value.
+      if (!canvas.style.display) canvas.style.display = 'block';
+    }
 
-  const ctx = canvas.getContext('2d') as CanvasRenderingContext2D | null;
-  if (!ctx) throw new Error('Could not get 2D context');
-  // Use the effective dpr (folded with any clamp factor) so drawing fills the
-  // clamped backing store and crisp-offset math stays aligned with it.
-  ctx.scale(effectiveDpr, effectiveDpr);
+    const ctx = canvas.getContext('2d') as CanvasRenderingContext2D | null;
+    if (!ctx) throw new Error('Could not get 2D context');
+    // Use the effective dpr (folded with any clamp factor) so drawing fills the
+    // clamped backing store and crisp-offset math stays aligned with it.
+    ctx.scale(effectiveDpr, effectiveDpr);
+    return ctx;
+  };
 
   // RB7 partial degradation: a slide whose part failed to parse (see the Rust
   // `broken_slide`) carries `parseError` and no elements. Paint a visible error
   // placeholder — correctly sized so navigation geometry is unchanged — instead
   // of a blank frame, and stop. Healthy slides (no parseError) are unaffected.
   if (slide.parseError) {
-    drawParseErrorPlaceholder(ctx, canvasW, canvasH, slide.slideNumber, slide.parseError);
+    drawParseErrorPlaceholder(beginPaint(), canvasW, canvasH, slide.slideNumber, slide.parseError);
     return canvas;
   }
 
@@ -6922,116 +7016,68 @@ async function renderSlideLeased(
     shapeFillImages,
   };
 
-  await renderBackground(
-    ctx,
+  // Steps painted before the slide's elements, in paint order. A step with a
+  // failure stops further preparation, exactly as the former interleaved paint
+  // stopped at the throwing await.
+  const leadingSteps: PreparedPaint[] = [];
+  const failed = () => leadingSteps.some((step) => step.failure);
+  leadingSteps.push(await prepareBackground(
     slide.background,
     canvasW,
     canvasH,
     scale,
-    superseded,
     opts.fetchImage,
     opts.tiff,
     opts.svgDecoder,
     imagePlan,
-  );
+  ));
   if (superseded()) return canvas;
 
   // Pre-rasterize any equations so the synchronous text layout can place them.
   // `math` is the engine injected once at PptxPresentation.load and threaded in
   // here; without it, equations are skipped and the asset never enters the bundle.
-  if (opts.math) await prepareSlideMath(slide, opts.math);
-  if (superseded()) return canvas;
+  if (!failed() && opts.math) {
+    try {
+      await prepareSlideMath(slide, opts.math);
+    } catch (error) {
+      leadingSteps.push({ ...NO_PAINT, failure: { error } });
+    }
+    if (superseded()) return canvas;
+  }
 
   const slideNumber = slide.slideNumber;
 
-  // Warm the bitmap caches for every image-bearing element concurrently.
-  // The draw loop below still awaits in element order (z-order), but each
-  // await now hits a settled/in-flight promise instead of starting a serial
-  // fetch+decode — first paint cost becomes max(decode) instead of sum.
-  for (const el of slide.elements) {
-    if (el.type === 'picture' && opts.fetchImage) {
-      // Warm exactly the source the draw loop (renderPicture) will await: the
-      // SVG decode when the picture carries an svgImagePath and no srcRect crop,
-      // otherwise the raster bitmap. This mirrors the draw-path source selection
-      // above, so the await there hits a settled/in-flight promise instead of
-      // starting a serial fetch + decode. Warming the raster for an uncropped
-      // SVG-bearing picture would instead leave the hot (SVG) cache cold and
-      // waste a fetch + createImageBitmap on a fallback that is never drawn.
-      // (The draw path still falls back to getCachedBitmapByPath on SVG decode
-      // failure, so the raster stays cold only in that rare case.)
-      const p = el as PictureElement;
-      const pDataIsSvg = p.mimeType === 'image/svg+xml';
-      const pVector = preferVectorBlip(p) || pDataIsSvg;
-      const planned = !pVector && !pixelTransform(p)
-        ? plannedRasterOptions(
-            imagePlan,
-            imagePlanKey(pictureResourcePath(p), pixelTransform(p)),
-          )
-        : undefined;
-      const rawTarget = rasterTargetOptions(
-        emuToPx(p.width, scale),
-        emuToPx(p.height, scale),
-        effectiveDpr,
-        p.srcRect,
-      );
-      const target = pVector ? rawTarget : planned;
-      const svgPixelLimit = target && 'maxRetainedPixels' in target
-        ? target.maxRetainedPixels as number
-        : undefined;
-      const svgOptions = {
-        ...(target ? {
-          targetWidthPx: target.targetWidthPx,
-          targetHeightPx: target.targetHeightPx,
-          ...(svgPixelLimit === undefined ? {} : { maxRetainedPixels: svgPixelLimit }),
-        } : {}),
-        workerDecoder: opts.svgDecoder,
-      };
-      if (preferVectorBlip(p)) {
-        void getCachedSvgImageByPath(p.svgImagePath, opts.fetchImage, svgOptions).catch(() => undefined);
-      } else if (pDataIsSvg) {
-        void getCachedSvgImageByPath(p.imagePath, opts.fetchImage, svgOptions).catch(() => undefined);
-      } else {
-        // Pass the picture's pt size so a metafile blip warms at the same raster
-        // size the draw loop requests. A cropped metafile warms at its full
-        // picture frame, matching the draw path's `metafileRasterSize` call.
-        const warm = metafileRasterSize(
-          p.mimeType,
-          p.srcRect,
-          p.width / PT_TO_EMU,
-          p.height / PT_TO_EMU,
+  // Resolve every picture and media poster concurrently, so the paint cost is
+  // max(decode) instead of sum; the paint below consumes them in z-order.
+  const elementPreparations: Promise<PreparedPaint | null>[] = failed()
+    ? []
+    : slide.elements.map((el) => {
+      if (el.type === 'picture') {
+        return preparePicture(
+          el,
+          scale,
+          opts.fetchImage,
+          opts.tiff,
+          effectiveDpr,
+          opts.svgDecoder,
+          imagePlan,
         );
-        if (!warm) continue;
-        // Warm through the duotone cache so a §20.1.8.23 recolour picture warms
-        // its recoloured variant (keyed by path + colours); no duotone ⇒ this is
-        // the plain base-bitmap warm, byte-identical to before.
-        void getCachedDuotoneBitmapByPath(p.imagePath, p.mimeType, pixelTransform(p), opts.fetchImage, {
-          widthPt: warm.widthPt,
-          heightPt: warm.heightPt,
-          ...(target ?? {}),
-          tiff: opts.tiff,
-          svgDecoder: opts.svgDecoder,
-        }).catch(() => undefined);
       }
-    } else if (el.type === 'media') {
-      const m = el as MediaElement;
-      if (m.posterPath && opts.fetchMedia) {
-        void getPosterBitmap(
-          m,
+      if (el.type === 'media') {
+        return prepareMedia(
+          el,
+          scale,
           opts.fetchMedia,
+          opts.skipMediaControls,
           bitmapOwner,
           opts.tiff,
-          m.posterMimeType === 'image/svg+xml'
-            ? rasterTargetOptions(
-                emuToPx(m.width, scale),
-                emuToPx(m.height, scale),
-                effectiveDpr,
-              )
-            : plannedRasterOptions(imagePlan, imagePlanKey(m.posterPath)),
+          effectiveDpr,
           opts.svgDecoder,
-        ).catch(() => undefined);
+          imagePlan,
+        );
       }
-    }
-  }
+      return Promise.resolve(null);
+    });
 
   const chartMarkerImages = new Map<string, CanvasImageSource | null>();
   // Picture bullets (`<a:buBlip>`, §21.1.2.4.2) and chart picture markers are
@@ -7040,7 +7086,7 @@ async function renderSlideLeased(
   // exact prefetch result: a display-sized decode lives under a resolution-
   // specific cache key that the synchronous native-key peek cannot see.
   // Missing/failed decodes resolve to null and the marker is simply skipped.
-  if (opts.fetchImage) {
+  if (!failed() && opts.fetchImage) {
     const fetchImage = opts.fetchImage;
     const shapeFills = new Map<string, {
       fill: ImageFill;
@@ -7367,14 +7413,31 @@ async function renderSlideLeased(
           shapeFillImages.set(key, null);
         }
       });
-      await Promise.all([...bulletPromises, ...chartPromises, ...shapePromises]);
+      try {
+        await Promise.all([...bulletPromises, ...chartPromises, ...shapePromises]);
+      } catch (error) {
+        leadingSteps.push({ ...NO_PAINT, failure: { error } });
+      }
       if (superseded()) return canvas;
     }
   }
 
+  // Preparations never reject: every failure is carried by its step.
+  const elementSteps = await Promise.all(elementPreparations);
+  // A newer render of this canvas started while we awaited an image/equation —
+  // stop before clearing the canvas so we don't paint this (now stale) slide.
+  if (superseded()) return canvas;
+
+  // ---- Paint: synchronous from here on, so the whole slide is one task. ----
+  const ctx = beginPaint();
+  for (const step of leadingSteps) {
+    step.paint(ctx);
+    if (step.failure) throw step.failure.error;
+  }
+
   for (const [elementIndex, el] of slide.elements.entries()) {
-    // A newer render of this canvas started while we awaited an image/equation —
-    // stop so we don't paint this (now stale) slide over the newer one.
+    // A text-run callback may start a newer render of this canvas; stop so we
+    // don't paint this (now stale) slide over the newer one.
     if (superseded()) return canvas;
     if (el.type === 'shape') {
       const elementTextRun: TextRunCallback | undefined = onTextRun
@@ -7385,18 +7448,12 @@ async function renderSlideLeased(
           })
         : undefined;
       renderShape(ctx, el, scale, themeDefaultColor, slideNumber, rc, elementTextRun, opts.fetchImage);
-    } else if (el.type === 'picture') {
-      await renderPicture(
-        ctx,
-        el,
-        scale,
-        superseded,
-        opts.fetchImage,
-        opts.tiff,
-        effectiveDpr,
-        opts.svgDecoder,
-        imagePlan,
-      );
+    } else if (el.type === 'picture' || el.type === 'media') {
+      const step = elementSteps[elementIndex];
+      if (step) {
+        step.paint(ctx);
+        if (step.failure) throw step.failure.error;
+      }
     } else if (el.type === 'table') {
       const elementTextRun: TextRunCallback | undefined = onTextRun
         ? (run) => onTextRun({
@@ -7406,20 +7463,6 @@ async function renderSlideLeased(
           })
         : undefined;
       renderTable(ctx, el, scale, slideNumber, rc, elementTextRun);
-    } else if (el.type === 'media') {
-      await renderMedia(
-        ctx,
-        el,
-        scale,
-        superseded,
-        opts.fetchMedia,
-        opts.skipMediaControls,
-        opts.fetchImage,
-        opts.tiff,
-        effectiveDpr,
-        opts.svgDecoder,
-        imagePlan,
-      );
     } else if (el.type === 'chart') {
       // OOXML: 1pt = 12700 EMU. The slide renderer's `scale` is px-per-EMU,
       // so PT_TO_EMU * scale gives pixels-per-point at the current display size.
