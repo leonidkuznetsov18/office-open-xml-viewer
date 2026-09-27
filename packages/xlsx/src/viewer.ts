@@ -61,6 +61,7 @@ import { SelectionInput } from './internal/viewer/selection-input.js';
 import { SelectionOverlay } from './internal/viewer/selection-overlay.js';
 import { SelectionNotifier } from './internal/viewer/selection-notifier.js';
 import { SelectionContextReader } from './internal/viewer/selection-context.js';
+import { ChromeTheme } from './internal/viewer/chrome-theme.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -143,22 +144,6 @@ function ensureViewerStyleInjected(ownerDocument: Document): void {
   style.setAttribute(VIEWER_STYLE_ATTR, '');
   style.textContent = VIEWER_STYLE_CSS;
   ownerDocument.head.appendChild(style);
-}
-
-const XLSX_CHROME_COLOR_PROPERTIES = {
-  background: '--ooxml-xlsx-chrome-background',
-  surface: '--ooxml-xlsx-chrome-surface',
-  mutedSurface: '--ooxml-xlsx-chrome-surface-muted',
-  text: '--ooxml-xlsx-chrome-text',
-  mutedText: '--ooxml-xlsx-chrome-text-muted',
-  border: '--ooxml-xlsx-chrome-border',
-  selectedSurface: '--ooxml-xlsx-chrome-selection-background',
-  accent: '--ooxml-xlsx-chrome-accent',
-} as const satisfies Record<keyof XlsxChromeColors, string>;
-
-function sameChromeColors(left: XlsxChromeColors, right: XlsxChromeColors): boolean {
-  return Object.keys(XLSX_CHROME_COLOR_PROPERTIES).every((key) =>
-    left[key as keyof XlsxChromeColors] === right[key as keyof XlsxChromeColors]);
 }
 
 export interface XlsxSheetViewerOptions extends LoadOptions {
@@ -430,10 +415,11 @@ class XlsxViewerEngine implements ZoomableViewer {
    *  viewers' `_destroyed` flag. */
   private _destroyed = false;
   private resizeObserver: ResizeObserver | null = null;
-  private chromeColors: XlsxChromeColors = {};
-  private chromeStyleObserver: MutationObserver | null = null;
-  private chromeSchemeMedia: MediaQueryList | null = null;
-  private chromeSchemeListener: (() => void) | null = null;
+  /** Inherited chrome CSS variables for Canvas-painted headers and gutters. */
+  private chromeTheme!: ChromeTheme;
+  private get chromeColors(): XlsxChromeColors {
+    return this.chromeTheme.colors;
+  }
   /** Last offset delivered to onViewportChange. Keeping this in the shared
    *  engine prevents a programmatic scroll followed by the browser's native
    *  scroll event from producing duplicate notifications. */
@@ -665,7 +651,17 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.wrapper.appendChild(this.gridRegion);
     if (this.sheetTabs) this.wrapper.appendChild(this.sheetTabs.tabBar);
     container.appendChild(this.wrapper);
-    this.installChromeThemeRefresh();
+    this.chromeTheme = new ChromeTheme({
+      hostWindow: this.hostWindow,
+      container: this.container,
+      wrapper: this.wrapper,
+      isDestroyed: () => this._destroyed,
+      onChange: () => {
+        this.renderGutters();
+        this.scheduleRender();
+      },
+    });
+    this.chromeTheme.install();
 
     // Gutter click handling (XL4): +/- toggles and the numbered level banks
     // (each in its own gutter's header strip; the corner is inert background).
@@ -799,53 +795,6 @@ class XlsxViewerEngine implements ZoomableViewer {
       }
     }
 
-  }
-
-  /**
-   * Re-read the CSS custom properties that affect Canvas-painted Viewer chrome.
-   * DOM chrome follows inherited CSS variables without help; row/column headers
-   * and outline gutters need an explicit repaint because their colors are baked
-   * into pixels.
-   */
-  private refreshChromeTheme(): void {
-    if (this._destroyed) return;
-    const getComputedStyle = this.hostWindow.getComputedStyle?.bind(this.hostWindow);
-    if (!getComputedStyle) return;
-    const computed = getComputedStyle(this.wrapper);
-    const next: Record<string, string> = {};
-    for (const [key, property] of Object.entries(XLSX_CHROME_COLOR_PROPERTIES)) {
-      const value = computed.getPropertyValue(property).trim();
-      if (value) next[key] = value;
-    }
-    const nextColors = next as XlsxChromeColors;
-    if (sameChromeColors(this.chromeColors, nextColors)) return;
-    this.chromeColors = nextColors;
-    this.renderGutters();
-    this.scheduleRender();
-  }
-
-  /** Observe the ordinary ways an application changes theme state. */
-  private installChromeThemeRefresh(): void {
-    this.refreshChromeTheme();
-
-    const MutationObserverClass = this.hostWindow.MutationObserver ?? globalThis.MutationObserver;
-    if (MutationObserverClass) {
-      this.chromeStyleObserver = new MutationObserverClass(() => this.refreshChromeTheme());
-      for (let target: HTMLElement | null = this.container; target; target = target.parentElement) {
-        this.chromeStyleObserver.observe(target, {
-          attributes: true,
-          attributeFilter: ['class', 'style', 'data-theme'],
-        });
-      }
-    }
-
-    const media = this.hostWindow.matchMedia?.('(prefers-color-scheme: dark)') ?? null;
-    if (media) {
-      const listener = () => this.refreshChromeTheme();
-      media.addEventListener?.('change', listener);
-      this.chromeSchemeMedia = media;
-      this.chromeSchemeListener = listener;
-    }
   }
 
   /**
@@ -2331,13 +2280,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.selectionInput.destroy();
     this.sheetRequestGeneration++;
     this.resizeObserver?.disconnect();
-    this.chromeStyleObserver?.disconnect();
-    this.chromeStyleObserver = null;
-    if (this.chromeSchemeMedia && this.chromeSchemeListener) {
-      this.chromeSchemeMedia.removeEventListener?.('change', this.chromeSchemeListener);
-    }
-    this.chromeSchemeMedia = null;
-    this.chromeSchemeListener = null;
+    this.chromeTheme.destroy();
     this.renderDispatcher.destroy();
     this.surface.destroy();
     this.sheetTabs?.destroy();
