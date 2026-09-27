@@ -199,9 +199,16 @@ function assertNoSourceRuntime(code, name) {
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
+  // Shared scroll collaborators add 11,866 bytes to the DOCX static graph:
+  // Vite factors a 31,779-byte controller chunk, while the entry shrinks by
+  // 16,921 bytes and a 2,992-byte boundary chunk is absorbed. File count stays
+  // at 36; the optional model-source runtime remains outside the graph.
+  docx: { entry: 2_537_512, inline: 31_624, budget: 2_800 },
   xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
-  pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
+  // PPTX shares that controller chunk; its entry shrinks by 15,276 bytes and
+  // the same 2,992-byte boundary chunk is absorbed. Net growth is 13,511
+  // bytes with 38 files and no optional model-source runtime in the graph.
+  pptx: { entry: 1_837_773, inline: 59_554, budget: 2_100 },
   node: { entry: 2_575_997, budget: 3_600 },
 });
 const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
