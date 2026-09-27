@@ -1854,7 +1854,11 @@ function buildConcreteBodyLayoutKernel(
               }
               throw error;
             }
-            const separator = first ? Object.freeze([Object.freeze({
+            // An explicit empty reserved note story suppresses the ink, while
+            // Word retains the same separator space before the note body.
+            const separatorMode = request.kind === 'footnote'
+              ? noteSettings?.footnoteSeparator : noteSettings?.endnoteSeparator;
+            const separator = first && separatorMode !== 'none' ? Object.freeze([Object.freeze({
               edge: 'top' as const,
               from: Object.freeze({
                 xPt: request.container.bounds.xPt,

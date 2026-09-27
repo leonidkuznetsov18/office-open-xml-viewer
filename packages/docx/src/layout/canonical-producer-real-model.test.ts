@@ -595,6 +595,40 @@ describe('canonical producer with a real document model', () => {
     expect(placement).toMatchObject({ noteReference: { kind: 'footnote', id: '7' } });
   });
 
+  it('removes only the explicitly empty footnote separator rule', () => {
+    const section = {
+      pageWidth: 200, pageHeight: 140,
+      marginTop: 10, marginRight: 10, marginBottom: 10, marginLeft: 10,
+      headerDistance: 5, footerDistance: 5, titlePage: false,
+      evenAndOddHeaders: false, sectionStart: 'nextPage', columns: null,
+    } as SectionProps;
+    const base = {
+      section, body: [paragraph()],
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+      footnotes: [{ id: '7', content: [ordinaryParagraph('note')] }],
+      endnotes: [], fontFamilyClasses: {},
+    };
+    const render = (separator?: string) => {
+      const model = {
+        ...base, __noteLayoutSettings: { footnoteSeparator: separator },
+      } as unknown as DocxDocumentModel;
+      const services = createLayoutServices(model, { measureContext: measureContext() });
+      return layoutDocument(model, services, { currentDateMs: 0 })
+        .pages.flatMap((page) => page.layers.notes)[0];
+    };
+    const standard = render();
+    const empty = render('none');
+    expect(standard?.kind).toBe('note');
+    expect(empty?.kind).toBe('note');
+    if (standard?.kind !== 'note' || empty?.kind !== 'note') {
+      throw new Error('Expected retained footnote');
+    }
+    expect(standard?.separator).toHaveLength(1);
+    expect(empty?.separator).toHaveLength(0);
+    expect(empty?.flowBounds).toEqual(standard?.flowBounds);
+  });
+
   it('retains a frame paragraph as an out-of-flow placed occurrence', () => {
     const framed = paragraph();
     framed.framePr = {
