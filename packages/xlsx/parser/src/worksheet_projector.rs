@@ -910,19 +910,11 @@ impl StreamedRowBatch {
         // batch-arena ceiling. A single row may exceed that batching target but
         // has already passed the separate hard row-projection invariant above.
         if self.would_exceed_byte_ceiling(&row) {
-            self.dispatch(
-                inputs.shared_strings,
-                inputs.theme_colors,
-                ready_rows,
-            )?;
+            self.dispatch(inputs.shared_strings, inputs.theme_colors, ready_rows)?;
         }
         self.push(row);
         if self.should_dispatch() {
-            self.dispatch(
-                inputs.shared_strings,
-                inputs.theme_colors,
-                ready_rows,
-            )?;
+            self.dispatch(inputs.shared_strings, inputs.theme_colors, ready_rows)?;
         }
         Ok(())
     }
@@ -1659,7 +1651,6 @@ where
             Some(reporter),
         ))
     }
-
 }
 
 impl<S, T> WorksheetRowProjector<BufReader<Box<dyn Read>>, S, T>
@@ -1848,13 +1839,8 @@ mod worksheet_streaming_tests {
                     && is_x_ns(node.tag_name().namespace())
             })
             .map(|node| {
-                let row = parse_row_node(
-                    &node,
-                    &mut previous_row,
-                    shared_strings,
-                    theme_colors,
-                )
-                .expect("reference worksheet row parses");
+                let row = parse_row_node(&node, &mut previous_row, shared_strings, theme_colors)
+                    .expect("reference worksheet row parses");
                 if let Some(height) = row.height {
                     heights.insert(row.index, height);
                 }

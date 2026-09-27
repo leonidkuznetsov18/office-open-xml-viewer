@@ -32,6 +32,29 @@ function command(
 }
 
 describe('WorksheetPullWorker', () => {
+  it.each([
+    ['ordinary', WorksheetPullWorker],
+    ['source', SourceWorksheetPullWorker],
+  ] as const)('serves a visible image while a %s pull is paused for paint', async (_, Worker) => {
+    const archive = {
+      open_sheet_cursor: vi.fn(), pull_sheet_cursor: vi.fn(),
+      sheet_cursor_pull_finished: vi.fn(), sheet_cursor_resource_usage: vi.fn(() => usageBytes),
+      acknowledge_sheet_cursor_terminal: vi.fn(), cancel_sheet_cursor: vi.fn(),
+      close_sheet_cursor: vi.fn(),
+    };
+    const worker = new Worker(() => archive);
+    await openWorker(worker);
+    const ordinary = vi.fn(() => 'after terminal');
+    const queued = worker.run(ordinary);
+    const image = vi.fn(() => 'image bytes');
+    await expect(worker.runDuringPull(image)).resolves.toBe('image bytes');
+    expect(ordinary).not.toHaveBeenCalled();
+    await worker.dispatch(command(1, { kind: 'cancel', reason: 'request-error' }), () => undefined);
+    await expect(queued).resolves.toBe('after terminal');
+    expect(image).toHaveBeenCalledOnce();
+    expect(archive.cancel_sheet_cursor).toHaveBeenCalledOnce();
+  });
+
   it('latches an ordinary worker-side renderer violation for sibling operations', async () => {
     const fatal = new OoxmlResourceLimitError('renderer index limit', {
       stage: 'layout',

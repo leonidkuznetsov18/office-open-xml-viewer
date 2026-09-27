@@ -13,14 +13,18 @@ function intersects(range: WorksheetCellRange, viewport: ViewportRange): boolean
 }
 
 function anchorMayReachViewport(
-  anchor: { fromRow: number; fromCol: number; toRow: number; toCol: number },
+  anchor: { fromRow: number; fromCol: number; fromRowOff: number; fromColOff: number },
   viewport: ViewportRange,
 ): boolean {
-  // DrawingML markers are zero-based (§20.5.2.33). An anchor beginning below
-  // or to the right of the initial viewport cannot paint into it.
-  return anchor.fromRow + 1 <= viewport.row + viewport.rows - 1 &&
-    anchor.fromCol + 1 <= viewport.col + viewport.cols - 1 &&
-    anchor.toRow + 1 >= viewport.row && anchor.toCol + 1 >= viewport.col;
+  // DrawingML markers are zero-based (§20.5.2.33). An anchor is provably
+  // outside only when its start is below or right of the viewport with a
+  // nonnegative offset. End markers and native extents can exceed their cells,
+  // so an anchor starting above/left may still reach the viewport.
+  const below = anchor.fromRow + 1 > viewport.row + viewport.rows - 1 &&
+    Number.isFinite(anchor.fromRowOff) && anchor.fromRowOff >= 0;
+  const right = anchor.fromCol + 1 > viewport.col + viewport.cols - 1 &&
+    Number.isFinite(anchor.fromColOff) && anchor.fromColOff >= 0;
+  return !below && !right;
 }
 
 /** Eligible cells have all their row-local values and every visual dependency.

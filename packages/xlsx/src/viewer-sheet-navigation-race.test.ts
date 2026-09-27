@@ -64,11 +64,42 @@ function buildViewer(onSheetChange = vi.fn(), names = ['A', 'B']) {
   engine.renderCurrentSheet = vi.fn(async () => {
     // The render double represents a committed first frame.
     engine.firstPreviewRender = false;
+    engine.committedFrameCount = Number(engine.committedFrameCount) + 1;
   });
   return { viewer, engine, workbook, requests, onSheetChange, container };
 }
 
 describe('XlsxViewer sheet acquisition generation', () => {
+  it('waits for a committed frame when completion supersedes the first paint', async () => {
+    const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
+    const completion = deferred<Worksheet>();
+    const model = worksheet('A');
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: vi.fn(async () => ({
+        worksheet: model, release: vi.fn(), partial: true,
+        completion: completion.promise, waitForRows: vi.fn(async () => undefined),
+        releaseFirstPaint: vi.fn(),
+      })),
+    });
+    engine.scheduleRender = vi.fn();
+    let attempts = 0;
+    engine.renderCurrentSheet = vi.fn(async () => {
+      attempts++;
+      if (attempts === 1) {
+        completion.resolve(model);
+        await Promise.resolve();
+        // The completion callback has invalidated this in-flight frame.
+        return;
+      }
+      engine.committedFrameCount = Number(engine.committedFrameCount) + 1;
+    });
+
+    await engine.showSheet(0);
+    expect(engine.renderCurrentSheet).toHaveBeenCalledTimes(2);
+    expect(attempts).toBe(2);
+    viewer.destroy();
+  });
+
   it('clears a provisional frame and reports a pull failure after first paint', async () => {
     const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
     const onError = vi.fn();

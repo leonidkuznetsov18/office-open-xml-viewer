@@ -3567,9 +3567,8 @@ fn build_cursor_preview(
     let ordered_rows = scanned.ordered_rows;
     let reporter = zip.active_operation()?.limit_reporter()?;
     let Some(tail) = scanned.tail else {
-        return serialize_cursor_preview(
-            None, Some("metadata-unavailable"), 0, 0, &reporter, part,
-        ).map(|preview| (preview, raw));
+        return serialize_cursor_preview(None, Some("metadata-unavailable"), 0, 0, &reporter, part)
+            .map(|preview| (preview, raw));
     };
     let parsed = parse_projected_worksheet_tail(tail, shared.theme_colors.as_ref(), name)?;
     if let Some(reason) = cursor_preview_blocker(has_row_outline, ordered_rows, &parsed.0)? {
@@ -3773,9 +3772,8 @@ impl XlsxArchive {
                     }
                 },
                 SheetPartKind::Worksheet => {
-                    let preview_result = build_cursor_preview(
-                        zip, shared, sheet_index, name, &sheet_path, &part,
-                    );
+                    let preview_result =
+                        build_cursor_preview(zip, shared, sheet_index, name, &sheet_path, &part);
                     let mut buffered_xml = None;
                     match preview_result {
                         Ok((bytes, raw)) => {
@@ -3800,12 +3798,15 @@ impl XlsxArchive {
                     } else {
                         let cursor_result = if let Some(raw) = buffered_xml {
                             zip.open_buffered_worksheet_cursor(
-                                &part, raw, Rc::clone(&shared.shared_strings),
+                                &part,
+                                raw,
+                                Rc::clone(&shared.shared_strings),
                                 Rc::clone(&shared.theme_colors),
                             )
                         } else {
                             zip.open_worksheet_cursor(
-                                &part, Rc::clone(&shared.shared_strings),
+                                &part,
+                                Rc::clone(&shared.shared_strings),
                                 Rc::clone(&shared.theme_colors),
                             )
                         };
@@ -4143,7 +4144,8 @@ impl XlsxArchive {
             // operation, then let terminal ACK commit the combined usage.
             read_zip_bytes(&mut self.archive, path)
         } else {
-            self.archive.run_operation("extract-image", |zip| read_zip_bytes(zip, path))
+            self.archive
+                .run_operation("extract-image", |zip| read_zip_bytes(zip, path))
         };
         result.map_err(|error| JsValue::from_str(&error))
     }
@@ -7104,8 +7106,11 @@ mod rb7_partial_degradation_tests {
     #[test]
     fn cursor_preview_has_final_shell_and_implicit_scroll_bounds_before_rows() {
         let padding = "x".repeat(550_000);
-        let sheet = format!(r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{padding}</t></is></c></row><row r="2"><c r="C2" t="inlineStr"><is><t>{padding}</t></is></c></row></sheetData></worksheet>"#);
-        let mut archive = XlsxArchive::new(build_sheet_xml_workbook(&sheet), None, None, None).unwrap();
+        let sheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{padding}</t></is></c></row><row r="2"><c r="C2" t="inlineStr"><is><t>{padding}</t></is></c></row></sheetData></worksheet>"#
+        );
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(&sheet), None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Sheet1").unwrap();
         let first: serde_json::Value =
             serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
@@ -7126,7 +7131,7 @@ mod rb7_partial_degradation_tests {
 
     #[test]
     fn small_worksheet_emits_preview_before_rows() {
-        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1:A3"><cfRule type="top10" rank="1" priority="1"/></conditionalFormatting></worksheet>"#;
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B2"/></mergeCells><conditionalFormatting sqref="A1:A3"><cfRule type="top10" rank="1" priority="1"/></conditionalFormatting></worksheet>"#;
         let mut archive =
             XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Sheet1").unwrap();
@@ -7135,6 +7140,24 @@ mod rb7_partial_degradation_tests {
         assert_eq!(first["kind"], "preview");
         assert!(first["reason"].is_null());
         assert!(first["worksheet"].is_object());
+        assert_eq!(first["worksheet"]["mergeCells"][0]["bottom"], 2);
+        assert_eq!(
+            first["worksheet"]["conditionalFormats"][0]["sqref"][0]["bottom"],
+            3
+        );
+        archive.cancel_sheet_cursor();
+    }
+
+    #[test]
+    fn row_outline_requires_complete_sheet_before_paint() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="200" outlineLevel="1"><c r="A200"><v>2</v></c></row></sheetData></worksheet>"#;
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(first["reason"], "outline");
+        assert!(first["worksheet"].is_null());
         archive.cancel_sheet_cursor();
     }
 

@@ -28,9 +28,31 @@ describe('first viewport dependency gate', () => {
   it('permits a row-local comparison and a drawing anchored below the viewport', () => {
     const ws = sheet([{ sqref: [{ top: 1, left: 1, bottom: 70000, right: 1 }],
       rules: [{ type: 'cellIs', operator: 'greaterThan', formulas: ['10'], dxfId: 0, priority: 1 }] }]);
-    ws.charts = [{ fromRow: 500, fromCol: 1, toRow: 520, toCol: 12 }] as Worksheet['charts'];
+    ws.charts = [{ fromRow: 500, fromRowOff: 0, fromCol: 1, fromColOff: 0,
+      toRow: 520, toCol: 12 }] as Worksheet['charts'];
     expect(viewportPreviewBlocker(ws, viewport, 128)).toBeNull();
-    ws.charts = [{ fromRow: 0, fromCol: 1, toRow: 15, toCol: 12 }] as Worksheet['charts'];
+    ws.charts = [{ fromRow: 500, fromRowOff: -1_000_000_000, fromCol: 1, fromColOff: 0,
+      toRow: 520, toCol: 12 }] as Worksheet['charts'];
     expect(viewportPreviewBlocker(ws, viewport, 128)).toBe('drawing-dependency');
+    ws.charts = [{ fromRow: 0, fromRowOff: 0, fromCol: 1, fromColOff: 0,
+      toRow: 15, toCol: 12 }] as Worksheet['charts'];
+    expect(viewportPreviewBlocker(ws, viewport, 128)).toBe('drawing-dependency');
+  });
+
+  it('uses known merge, table, and image anchors in the first viewport', () => {
+    const ws = sheet([]);
+    ws.mergeCells = [{ top: 1, left: 1, bottom: 2, right: 2 }];
+    ws.tables = [{ range: { top: 1, left: 1, bottom: 70_000, right: 3 } }] as Worksheet['tables'];
+    ws.images = [{ fromRow: 1, fromCol: 1, toRow: 15, toCol: 5 }] as Worksheet['images'];
+    expect(viewportPreviewBlocker(ws, viewport, 128)).toBeNull();
+  });
+
+  it('waits for references beyond the loaded rows but permits an offscreen statistic', () => {
+    const ws = sheet([{ sqref: [{ top: 1, left: 1, bottom: 70_000, right: 1 }],
+      rules: [{ type: 'cellIs', operator: 'greaterThan', formulas: ['A500'], dxfId: 0, priority: 1 }] }]);
+    expect(viewportPreviewBlocker(ws, viewport, 128)).toBe('conditional-format-range');
+    ws.conditionalFormats = [{ sqref: [{ top: 500, left: 1, bottom: 70_000, right: 1 }],
+      rules: [{ type: 'colorScale', priority: 1, stops: [] }] }];
+    expect(viewportPreviewBlocker(ws, viewport, 128)).toBeNull();
   });
 });

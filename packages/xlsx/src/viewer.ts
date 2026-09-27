@@ -734,6 +734,10 @@ class XlsxViewerEngine implements ZoomableViewer {
   private currentWorksheet: Worksheet | null = null;
   private previewCompletion: Promise<Worksheet> | null = null;
   private firstPreviewRender = false;
+  /** Counts frames that actually reached the canvas. Completing a pull can
+   * supersede the first render before it commits, even when the preview flag
+   * has already been cleared by the completion callback. */
+  private committedFrameCount = 0;
   private previewPreparedViewport: { width: number; height: number; scale: number } | null = null;
   private previewFallbackReason: ViewportPreviewBlocker | null = null;
   private releaseCurrentWorksheet: (() => void) | null = null;
@@ -1531,8 +1535,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.resetHorizontalScroll();
     let paintedEarly = false;
     try {
+      const frameBefore = this.committedFrameCount;
       await this.renderCurrentSheet();
-      paintedEarly = !this.firstPreviewRender;
+      paintedEarly = this.committedFrameCount > frameBefore;
     } finally {
       releaseFirstPaint?.();
     }
@@ -5250,6 +5255,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     // same scroll offset. No-op when the sheet has no outlining.
     this.renderGutters();
     this.firstPreviewRender = false;
+    this.committedFrameCount++;
   }
 
   private computeHeaderHighlight(): {

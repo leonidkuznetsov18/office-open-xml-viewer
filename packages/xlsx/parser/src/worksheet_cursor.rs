@@ -9,17 +9,21 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::rc::Rc;
 
-use ooxml_common::bounded_xml::MCE_NS;
 #[cfg(test)]
 use ooxml_common::bounded_xml::BoundedXmlReader;
+use ooxml_common::bounded_xml::MCE_NS;
 #[cfg(test)]
 use ooxml_common::ns::is_x_ns;
 #[cfg(test)]
 use quick_xml::events::{BytesStart, Event};
 
-
-use crate::worksheet_projector::{ProjectedWorksheetRow, WorksheetProjectorItem, WorksheetRowProjector};
-use crate::{parse_cell_ref_checked, resolve_implicit_ordinal, Row, SharedString, SpreadsheetOrdinal, XlsxZip};
+use crate::worksheet_projector::{
+    ProjectedWorksheetRow, WorksheetProjectorItem, WorksheetRowProjector,
+};
+use crate::{
+    parse_cell_ref_checked, resolve_implicit_ordinal, Row, SharedString, SpreadsheetOrdinal,
+    XlsxZip,
+};
 
 /// Default semantic credit for one production pull. Rows are indivisible: the
 /// cursor never splits a row to satisfy this credit.
@@ -90,7 +94,11 @@ impl WorksheetCursor {
         let entry = archive.active_operation()?.open_entry(part)?;
         let reporter = entry.limit_reporter()?;
         let projector = WorksheetRowProjector::from_owned_reader(
-            Box::new(entry), part.to_string(), reporter, shared_strings, theme_colors,
+            Box::new(entry),
+            part.to_string(),
+            reporter,
+            shared_strings,
+            theme_colors,
         );
         Ok(Self {
             projector: Some(projector),
@@ -109,10 +117,16 @@ impl WorksheetCursor {
     ) -> Result<Self, String> {
         let reporter = archive.active_operation()?.limit_reporter()?;
         let projector = WorksheetRowProjector::from_owned_reader(
-            Box::new(Cursor::new(raw)), part.to_string(), reporter, shared_strings, theme_colors,
+            Box::new(Cursor::new(raw)),
+            part.to_string(),
+            reporter,
+            shared_strings,
+            theme_colors,
         );
         Ok(Self {
-            projector: Some(projector), pending_row: None, pending_tail: None,
+            projector: Some(projector),
+            pending_row: None,
+            pending_tail: None,
             state: WorksheetCursorState::Open,
         })
     }
@@ -240,34 +254,45 @@ impl XlsxZip {
     ) -> Result<WorksheetCursorPreview, String> {
         let mut entry = self.active_operation()?.open_entry(part)?;
         let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
         let raw: Rc<[u8]> = bytes.into();
         let scanned = lexical_scan_worksheet_preview(Rc::clone(&raw));
         let mut preview = match scanned {
             Ok(preview) => preview,
-            Err(_) => return Ok(WorksheetCursorPreview {
-                tail: None, raw, max_row: 0, max_col: 0,
-                has_row_outline: false, ordered_rows: false,
-            }),
+            Err(_) => {
+                return Ok(WorksheetCursorPreview {
+                    tail: None,
+                    raw,
+                    max_row: 0,
+                    max_col: 0,
+                    has_row_outline: false,
+                    ordered_rows: false,
+                })
+            }
         };
-        if preview.tail.is_some() && raw.windows(MCE_NS.len()).any(|window| window == MCE_NS.as_bytes()) {
+        if let Some(tail) = preview.tail.as_mut().filter(|_| {
+            raw.windows(MCE_NS.len())
+                .any(|window| window == MCE_NS.as_bytes())
+        }) {
             // The shell may carry MCE attributes. Apply the same projection as
             // the terminal cursor, but only to the small, row-free shell.
-            let shell = preview.tail.as_ref().unwrap().shell_xml.as_bytes().to_vec();
+            let shell = tail.shell_xml.as_bytes().to_vec();
             let reporter = self.active_operation()?.limit_reporter()?;
             let mut projector = WorksheetRowProjector::from_owned_reader(
-                Box::new(Cursor::new(shell)), part.to_string(), reporter,
-                shared_strings, theme_colors,
+                Box::new(Cursor::new(shell)),
+                part.to_string(),
+                reporter,
+                shared_strings,
+                theme_colors,
             );
-            loop {
-                match projector.next_item().map_err(|error| error.to_string())? {
-                    WorksheetProjectorItem::Finished(projected) => {
-                        preview.tail.as_mut().unwrap().shell_xml = projected.shell_xml;
-                        break;
-                    }
-                    WorksheetProjectorItem::Row(_) => {
-                        return Err("row-free worksheet shell contained a row".to_string());
-                    }
+            match projector.next_item().map_err(|error| error.to_string())? {
+                WorksheetProjectorItem::Finished(projected) => {
+                    tail.shell_xml = projected.shell_xml;
+                }
+                WorksheetProjectorItem::Row(_) => {
+                    return Err("row-free worksheet shell contained a row".to_string());
                 }
             }
         }
@@ -295,7 +320,11 @@ impl XlsxZip {
         theme_colors: Rc<[String]>,
     ) -> Result<WorksheetCursor, String> {
         WorksheetCursor::open_from_buffer_under_active_operation(
-            self, part, raw, shared_strings, theme_colors,
+            self,
+            part,
+            raw,
+            shared_strings,
+            theme_colors,
         )
     }
 }
@@ -306,7 +335,9 @@ fn numeric_attribute(start: &BytesStart<'_>, name: &[u8]) -> Result<Option<Strin
         let attribute = attribute.map_err(|error| error.to_string())?;
         if attribute.key.as_ref() == name {
             return std::str::from_utf8(attribute.value.as_ref())
-                .map(str::to_string).map(Some).map_err(|error| error.to_string());
+                .map(str::to_string)
+                .map(Some)
+                .map_err(|error| error.to_string());
         }
     }
     Ok(None)
@@ -337,40 +368,73 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
         let x = is_x_ns(read.namespace.as_deref());
         let empty = matches!(read.event, Event::Empty(_));
         match read.event {
-            Event::Start(start) | Event::Empty(start) if x && start.local_name().as_ref() == b"sheetData" => {
-                if sheet_start.is_some() { return Err("worksheet has repeated sheetData".to_string()); }
+            Event::Start(start) | Event::Empty(start)
+                if x && start.local_name().as_ref() == b"sheetData" =>
+            {
+                if sheet_start.is_some() {
+                    return Err("worksheet has repeated sheetData".to_string());
+                }
                 sheet_start = Some(read.span.end as usize);
-                if empty { sheet_end = sheet_start; }
-                else { inside_sheet = true; }
+                if empty {
+                    sheet_end = sheet_start;
+                } else {
+                    inside_sheet = true;
+                }
             }
             Event::End(end) if x && end.local_name().as_ref() == b"sheetData" => {
                 sheet_end = Some(read.span.start as usize);
                 inside_sheet = false;
             }
-            Event::Start(start) | Event::Empty(start) if inside_sheet && x && start.local_name().as_ref() == b"row" => {
+            Event::Start(start) | Event::Empty(start)
+                if inside_sheet && x && start.local_name().as_ref() == b"row" =>
+            {
                 let explicit = numeric_attribute(&start, b"r")?
-                    .map(|value| value.parse::<u32>().map_err(|_| format!("invalid row ordinal: {value}")))
+                    .map(|value| {
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid row ordinal: {value}"))
+                    })
                     .transpose()?;
                 let previous = previous_row;
-                let row = resolve_implicit_ordinal(explicit, &mut previous_row, SpreadsheetOrdinal::Row)?;
+                let row =
+                    resolve_implicit_ordinal(explicit, &mut previous_row, SpreadsheetOrdinal::Row)?;
                 ordered_rows &= row > previous;
                 max_row = max_row.max(row);
                 previous_col = 0;
-                let hidden = matches!(numeric_attribute(&start, b"hidden")?.as_deref(), Some("1" | "true"));
-                let height = if hidden { Some(0.0) } else { numeric_attribute(&start, b"ht")?
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .filter(|value| value.is_finite() && *value >= 0.0) };
-                if let Some(height) = height { row_heights.insert(row, height); }
+                let hidden = matches!(
+                    numeric_attribute(&start, b"hidden")?.as_deref(),
+                    Some("1" | "true")
+                );
+                let height = if hidden {
+                    Some(0.0)
+                } else {
+                    numeric_attribute(&start, b"ht")?
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                };
+                if let Some(height) = height {
+                    row_heights.insert(row, height);
+                }
                 let outline = numeric_attribute(&start, b"outlineLevel")?
-                    .and_then(|value| value.parse::<u8>().ok()).unwrap_or(0);
-                let collapsed = matches!(numeric_attribute(&start, b"collapsed")?.as_deref(), Some("1" | "true"));
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .unwrap_or(0);
+                let collapsed = matches!(
+                    numeric_attribute(&start, b"collapsed")?.as_deref(),
+                    Some("1" | "true")
+                );
                 has_row_outline |= outline != 0 || collapsed;
             }
-            Event::Start(start) | Event::Empty(start) if inside_sheet && x && start.local_name().as_ref() == b"c" => {
+            Event::Start(start) | Event::Empty(start)
+                if inside_sheet && x && start.local_name().as_ref() == b"c" =>
+            {
                 let explicit = numeric_attribute(&start, b"r")?
                     .map(|reference| parse_cell_ref_checked(&reference).map(|(col, _)| col))
                     .transpose()?;
-                let col = resolve_implicit_ordinal(explicit, &mut previous_col, SpreadsheetOrdinal::Column)?;
+                let col = resolve_implicit_ordinal(
+                    explicit,
+                    &mut previous_col,
+                    SpreadsheetOrdinal::Column,
+                )?;
                 max_col = max_col.max(col);
             }
             Event::Eof => break,
@@ -383,9 +447,11 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
     if end < start || end > raw.len() {
         return Err("worksheet sheetData boundary is invalid".to_string());
     }
-    if raw[start..end].windows(b"AlternateContent".len())
+    if raw[start..end]
+        .windows(b"AlternateContent".len())
         .any(|window| window == b"AlternateContent")
-        || raw.windows(b"ProcessContent".len())
+        || raw
+            .windows(b"ProcessContent".len())
             .any(|window| window == b"ProcessContent")
     {
         return Err("worksheet row MCE requires the complete projector".to_string());
@@ -395,13 +461,22 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
     shell.extend_from_slice(&raw[end..]);
     let shell_xml = String::from_utf8(shell).map_err(|error| error.to_string())?;
     Ok(WorksheetCursorPreview {
-        tail: Some(WorksheetCursorTail { shell_xml, row_heights }),
-        raw, max_row, max_col, has_row_outline, ordered_rows,
+        tail: Some(WorksheetCursorTail {
+            shell_xml,
+            row_heights,
+        }),
+        raw,
+        max_row,
+        max_col,
+        has_row_outline,
+        ordered_rows,
     })
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn tag_end(bytes: &[u8], start: usize) -> Result<usize, String> {
@@ -425,28 +500,48 @@ fn tag_end(bytes: &[u8], start: usize) -> Result<usize, String> {
 
 fn tag_attribute<'a>(tag: &'a [u8], name: &[u8]) -> Result<Option<&'a [u8]>, String> {
     let mut i = 1;
-    while i < tag.len() && !tag[i].is_ascii_whitespace() && tag[i] != b'>' && tag[i] != b'/' { i += 1; }
-    while i < tag.len() {
-        while i < tag.len() && tag[i].is_ascii_whitespace() { i += 1; }
-        if i == tag.len() || tag[i] == b'/' || tag[i] == b'>' { return Ok(None); }
-        let key_start = i;
-        while i < tag.len() && !tag[i].is_ascii_whitespace() && tag[i] != b'=' { i += 1; }
-        let key = &tag[key_start..i];
-        while i < tag.len() && tag[i].is_ascii_whitespace() { i += 1; }
-        if i == tag.len() || tag[i] != b'=' { return Err("worksheet preview attribute is malformed".to_string()); }
+    while i < tag.len() && !tag[i].is_ascii_whitespace() && tag[i] != b'>' && tag[i] != b'/' {
         i += 1;
-        while i < tag.len() && tag[i].is_ascii_whitespace() { i += 1; }
+    }
+    while i < tag.len() {
+        while i < tag.len() && tag[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == tag.len() || tag[i] == b'/' || tag[i] == b'>' {
+            return Ok(None);
+        }
+        let key_start = i;
+        while i < tag.len() && !tag[i].is_ascii_whitespace() && tag[i] != b'=' {
+            i += 1;
+        }
+        let key = &tag[key_start..i];
+        while i < tag.len() && tag[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == tag.len() || tag[i] != b'=' {
+            return Err("worksheet preview attribute is malformed".to_string());
+        }
+        i += 1;
+        while i < tag.len() && tag[i].is_ascii_whitespace() {
+            i += 1;
+        }
         if i == tag.len() || (tag[i] != b'\'' && tag[i] != b'"') {
             return Err("worksheet preview attribute is unquoted".to_string());
         }
         let quote = tag[i];
         i += 1;
         let value_start = i;
-        while i < tag.len() && tag[i] != quote { i += 1; }
-        if i == tag.len() { return Err("worksheet preview attribute is unclosed".to_string()); }
+        while i < tag.len() && tag[i] != quote {
+            i += 1;
+        }
+        if i == tag.len() {
+            return Err("worksheet preview attribute is unclosed".to_string());
+        }
         let value = &tag[value_start..i];
         i += 1;
-        if key == name { return Ok(Some(value)); }
+        if key == name {
+            return Ok(Some(value));
+        }
     }
     Ok(None)
 }
@@ -457,12 +552,17 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
     let Some(open) = find_bytes(&raw, b"<sheetData") else {
         return Err("worksheet has no unprefixed sheetData".to_string());
     };
-    if raw.get(open + b"<sheetData".len()).is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>') {
+    if raw
+        .get(open + b"<sheetData".len())
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>')
+    {
         return Err("worksheet sheetData tag is ambiguous".to_string());
     }
     let start = tag_end(&raw, open)?;
     let self_closing = raw[open..start].ends_with(b"/>");
-    let end = if self_closing { start } else {
+    let end = if self_closing {
+        start
+    } else {
         let close = find_bytes(&raw[start..], b"</sheetData>")
             .ok_or_else(|| "worksheet has no closing sheetData".to_string())?;
         start + close
@@ -487,44 +587,72 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
     while let Some(found) = body[offset..].iter().position(|byte| *byte == b'<') {
         let begin = offset + found;
         let after = begin + 1;
-        if after >= body.len() { return Err("worksheet preview ends in a tag".to_string()); }
+        if after >= body.len() {
+            return Err("worksheet preview ends in a tag".to_string());
+        }
         let close = tag_end(body, begin)?;
         offset = close;
-        if body[after] == b'/' { continue; }
-        if body[after] == b'!' || body[after] == b'?' { return Err("worksheet preview has special row markup".to_string()); }
+        if body[after] == b'/' {
+            continue;
+        }
+        if body[after] == b'!' || body[after] == b'?' {
+            return Err("worksheet preview has special row markup".to_string());
+        }
         let mut name_end = after;
-        while name_end < close && !body[name_end].is_ascii_whitespace()
-            && body[name_end] != b'/' && body[name_end] != b'>' { name_end += 1; }
+        while name_end < close
+            && !body[name_end].is_ascii_whitespace()
+            && body[name_end] != b'/'
+            && body[name_end] != b'>'
+        {
+            name_end += 1;
+        }
         let name = &body[after..name_end];
-        if name.contains(&b':') { return Err("worksheet preview has prefixed row markup".to_string()); }
+        if name.contains(&b':') {
+            return Err("worksheet preview has prefixed row markup".to_string());
+        }
         let tag = &body[begin..close];
         if name == b"row" {
             let explicit = tag_attribute(tag, b"r")?
-                .map(|value| std::str::from_utf8(value).map_err(|error| error.to_string())
-                    .and_then(|value| value.parse::<u32>().map_err(|error| error.to_string())))
+                .map(|value| {
+                    std::str::from_utf8(value)
+                        .map_err(|error| error.to_string())
+                        .and_then(|value| value.parse::<u32>().map_err(|error| error.to_string()))
+                })
                 .transpose()?;
             let prior = previous_row;
-            let row = resolve_implicit_ordinal(explicit, &mut previous_row, SpreadsheetOrdinal::Row)?;
+            let row =
+                resolve_implicit_ordinal(explicit, &mut previous_row, SpreadsheetOrdinal::Row)?;
             ordered_rows &= row > prior;
             max_row = max_row.max(row);
             previous_col = 0;
             let hidden = matches!(tag_attribute(tag, b"hidden")?, Some(value) if value == b"1" || value == b"true");
-            let height = if hidden { Some(0.0) } else { tag_attribute(tag, b"ht")?
-                .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0) };
-            if let Some(height) = height { row_heights.insert(row, height); }
+            let height = if hidden {
+                Some(0.0)
+            } else {
+                tag_attribute(tag, b"ht")?
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            };
+            if let Some(height) = height {
+                row_heights.insert(row, height);
+            }
             let outline = tag_attribute(tag, b"outlineLevel")?
                 .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| value.parse::<u8>().ok()).unwrap_or(0);
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0);
             let collapsed = matches!(tag_attribute(tag, b"collapsed")?, Some(value) if value == b"1" || value == b"true");
             has_row_outline |= outline != 0 || collapsed;
         } else if name == b"c" {
             let explicit = tag_attribute(tag, b"r")?
-                .map(|value| std::str::from_utf8(value).map_err(|error| error.to_string())
-                    .and_then(|reference| parse_cell_ref_checked(reference).map(|(col, _)| col)))
+                .map(|value| {
+                    std::str::from_utf8(value)
+                        .map_err(|error| error.to_string())
+                        .and_then(|reference| parse_cell_ref_checked(reference).map(|(col, _)| col))
+                })
                 .transpose()?;
-            let col = resolve_implicit_ordinal(explicit, &mut previous_col, SpreadsheetOrdinal::Column)?;
+            let col =
+                resolve_implicit_ordinal(explicit, &mut previous_col, SpreadsheetOrdinal::Column)?;
             max_col = max_col.max(col);
         }
     }
@@ -536,8 +664,15 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
     }
     let shell_xml = String::from_utf8(shell).map_err(|error| error.to_string())?;
     Ok(WorksheetCursorPreview {
-        tail: Some(WorksheetCursorTail { shell_xml, row_heights }),
-        raw, max_row, max_col, has_row_outline, ordered_rows,
+        tail: Some(WorksheetCursorTail {
+            shell_xml,
+            row_heights,
+        }),
+        raw,
+        max_row,
+        max_col,
+        has_row_outline,
+        ordered_rows,
     })
 }
 
@@ -607,7 +742,10 @@ mod tests {
         assert_eq!(lexical.max_col, parsed.max_col);
         assert_eq!(lexical.has_row_outline, parsed.has_row_outline);
         assert_eq!(lexical.ordered_rows, parsed.ordered_rows);
-        assert_eq!(lexical.tail.unwrap().row_heights, parsed.tail.unwrap().row_heights);
+        assert_eq!(
+            lexical.tail.unwrap().row_heights,
+            parsed.tail.unwrap().row_heights
+        );
     }
 
     #[test]
