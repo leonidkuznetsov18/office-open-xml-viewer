@@ -133,18 +133,28 @@ impl Border {
             25 => "threeDEngrave",
             26 => "outset",
             27 => "inset",
-            0xff if !old && b[3] == 0xff => {
+            0xff if !old && b[3] == 0xff && matches!((b[6], b[7]), (0, 0) | (0xe0, 0xff)) => {
                 // [MS-DOC] 2.9.22 leaves 0xFF undefined by the spec. Word
                 // writes `w:val="nil"` for this automatic-color cell border
                 // at widths 1, 8, 24 and 255, with both 00/00 and E0/FF
-                // trailing bytes (d16 and brc Word-save controls). On the
+                // trailing bytes (brc-ff-width1, d16-w8-ff-e0ff,
+                // d16-w24-ff-e0ff, d16-w255-ff-0000). On the
                 // original table it draws no cell strokes; mapping to single
                 // paints 31.875-point black slabs across its contents.
-                // Explicit black/red color controls do not follow this rule
-                // and remain gated. Word's FF versus true NilBrc controls do
-                // reflow later pages, despite saving both as `nil`; that
-                // native-only layout distinction is not represented here.
+                // Word's FF versus true NilBrc controls do reflow later pages,
+                // despite saving both as `nil`; that native-only layout
+                // distinction is not represented here.
                 "nil"
+            }
+            0xff if !old && b[3] == 0 && b[6] == 0 && b[7] == 0 => {
+                // Word-save controls d16-w8-ff-{black,red,green,white} instead
+                // write `w:val="none"`, retaining width and color. Red widths
+                // 1/8/24/255 (d16-w1-ff-red and d16-w255-ff-red included)
+                // preserve that result; a
+                // valid single-red border visibly prints, so FF is not a
+                // color-independent alias of single or nil. Other ColorRef
+                // forms and trailing flag combinations remain gated.
+                "none"
             }
             // MS-DOC 2.9.22: image (art) borders 0x40..=0xE3 are valid only
             // for page borders; 0x02, 0x04 and every other value is undefined.
@@ -370,13 +380,30 @@ mod tests {
                 .style,
             "nil"
         );
-        for color in [[0, 0, 0, 0], [255, 0, 0, 0]] {
-            let error = Border::read(
-                &[color[0], color[1], color[2], color[3], 8, 255, 0, 0],
-                false,
-            )
-            .err()
-            .unwrap();
+        for (color, expected) in [
+            ([0, 0, 0], "000000"),
+            ([255, 0, 0], "FF0000"),
+            ([0, 255, 0], "00FF00"),
+            ([255, 255, 255], "FFFFFF"),
+        ] {
+            for width in [1, 8, 24, 255] {
+                let actual =
+                    Border::read(&[color[0], color[1], color[2], 0, width, 255, 0, 0], false)
+                        .unwrap()
+                        .direct_spec();
+                assert_eq!(actual.style, "none");
+                assert_eq!(
+                    actual.color.as_deref(),
+                    Some(expected.to_ascii_lowercase().as_str())
+                );
+            }
+        }
+        for bytes in [
+            [0, 0, 0, 1, 8, 255, 0, 0],
+            [0, 0, 0, 0, 8, 255, 0xe0, 0xff],
+            [255, 255, 255, 255, 8, 255, 1, 0],
+        ] {
+            let error = Border::read(&bytes, false).err().unwrap();
             assert!(error.contains("undefined Word border type 0xFF"), "{error}");
         }
         for (kind, expected) in [
