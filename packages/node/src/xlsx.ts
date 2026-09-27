@@ -50,7 +50,10 @@ export interface MaterializedXlsxWorkbook {
 }
 
 /** Options for the bounded Node workbook session. */
-export type OpenXlsxWorkbookOptions = OoxmlNodeSessionOptions;
+export type OpenXlsxWorkbookOptions = OoxmlNodeSessionOptions & {
+  /** Canvas for a selected model source's Normal-font measurement. */
+  readonly factory?: import('./render.ts').NodeCanvasFactory;
+};
 
 export type XlsxWorksheetRowChunk =
   | {
@@ -93,11 +96,15 @@ export async function openXlsxWorkbook(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenXlsxWorkbookOptions = {},
 ): Promise<XlsxWorkbookSession> {
+  if (options.modelSources !== undefined) {
+    const { openXlsxSource } = await import('./xlsx-model-source.ts');
+    return openXlsxSource(buffer, options, getXlsxWasmModule);
+  }
   const bytes = toUint8(buffer);
   const acquired = await acquireXlsxNodeSession(bytes, getXlsxWasmModule(), options);
   return new XlsxWorkbookSessionImpl(
     acquired.closeArchive,
-    acquired.archive,
+    acquired.archive as XlsxNodeArchive,
     acquired.workbookIndex,
     acquired.metrics,
     acquired.usage,
@@ -109,12 +116,12 @@ type ActiveWorksheetOperation = {
   cleanupPromise?: Promise<void>;
 };
 
-class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
+export class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
   readonly workbookIndex: ReadonlyParsedWorkbook;
   readonly sheetCount: number;
   readonly sheetNames: ReadonlyArray<string>;
 
-  private readonly pull: WorksheetPullWorker;
+  protected pull: Pick<WorksheetPullWorker, 'dispatchSafely' | 'open' | 'reserveOpen' | 'reset'>;
   private readonly transport: InProcessPullTransport<PullSessionResponse<ArrayBuffer, number>>;
   private readonly worksheetPullClient: XlsxWorksheetPullClient;
   private active: ActiveWorksheetOperation | undefined;

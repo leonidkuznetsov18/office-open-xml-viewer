@@ -443,6 +443,10 @@ export class DocxDocument {
   }
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+    if (opts.modelSources !== undefined) {
+      const { loadDocxModelSource } = await import('./internal/document-model-source.js');
+      return loadDocxModelSource(source, opts);
+    }
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const defaultCurrentDateMs = Date.now();
@@ -1283,7 +1287,7 @@ export class DocxDocument {
 
   private async _resourceUsage(
     timeoutMs: number,
-  ): Promise<import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot> {
+  ): Promise<import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot | undefined> {
     const res = await this._bridge.request(
       (id) => ({ type: 'resourceUsage', id }) satisfies WorkerRequest,
       undefined,

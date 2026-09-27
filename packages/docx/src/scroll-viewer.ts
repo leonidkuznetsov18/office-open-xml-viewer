@@ -459,6 +459,10 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  variant the viewer reads geometry from; toggle it with
    *  {@link setShowTrackedChanges}. */
   private _showTrackedChanges: boolean;
+  /** The tracked-change view requested by the caller or by
+   *  {@link setShowTrackedChanges}; `undefined` lets each loaded document's
+   *  own view default apply. Sent tri-state on every load. */
+  declare private _requestedShowTrackedChanges: boolean | undefined;
   /** Canonical epoch milliseconds for the document-global field-date layout
    * axis. Kept beside `_showTrackedChanges` because borrowed documents can
    * change either axis after construction. */
@@ -507,6 +511,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._opts = opts;
     this._errorRouter = new CanvasViewerErrorRouter('DocxScrollViewer', opts.onError);
     this._showTrackedChanges = opts.showTrackedChanges === true;
+    if (opts.modelSources !== undefined) this._requestedShowTrackedChanges = opts.showTrackedChanges;
     this._currentDate = opts.currentDate;
     // `??` (not `||`): a caller's explicit `false` must disable the shadow, not
     // fall through to the default.
@@ -662,10 +667,17 @@ export class DocxScrollViewer implements ZoomableViewer {
         // The variant the viewer will render. Without these, load builds the
         // final view while every render asks for the markup view, and the first
         // paint pays a full synchronous repagination.
-        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
+        // An explicit choice (including `false`) is forwarded; otherwise the
+        // document's own view default applies.
+        ...(this._opts.modelSources === undefined
+          ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
+          : (this._requestedShowTrackedChanges === undefined
+            ? undefined
+            : { showTrackedChanges: this._requestedShowTrackedChanges })),
         ...(this._currentDate === undefined
           ? {}
           : { currentDate: this._currentDate }),
+        ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
         ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
         ...(this._opts.sliceLayout ? { sliceLayout: true } : {}),
         onLayoutProgress: this._opts.onLayoutProgress,
@@ -692,6 +704,11 @@ export class DocxScrollViewer implements ZoomableViewer {
       });
       if (!doc) return;
       if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
+      // The loaded document's active view is authoritative (it may come from
+      // the document's own view default).
+      if (this._opts.modelSources !== undefined) {
+        this._showTrackedChanges = activeDocxLayoutViewOf(doc).showTrackedChanges;
+      }
       this._bindLayoutDocument(doc);
       this._find.invalidate();
       this._findActive = false;
@@ -2212,6 +2229,9 @@ export class DocxScrollViewer implements ZoomableViewer {
   async setShowTrackedChanges(value: boolean): Promise<void> {
     const generation = ++this._layoutViewGeneration;
     const doc = this._doc;
+    // Explicitness is independent of the current value: false before load
+    // must win over a model source's true view default.
+    if (this._opts.modelSources !== undefined) this._requestedShowTrackedChanges = value;
     if (this._showTrackedChanges === value) {
       if (doc) await selectDocxLayoutView(doc, {
         showTrackedChanges: value,
@@ -2231,6 +2251,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     if (!selected) return;
     if (this._destroyed || generation !== this._layoutViewGeneration || doc !== this._doc) return;
     this._showTrackedChanges = value;
+    if (this._opts.modelSources !== undefined) this._requestedShowTrackedChanges = value;
     this._find.invalidate();
     // Re-render every mounted slot at the new variant, and relayout: heights,
     // spacer and mount window all follow the new page count, and a shrinking

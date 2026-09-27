@@ -76,11 +76,45 @@ export function wasmAssetUrl(): Plugin {
       // asset URLs for CJS. Restore the Node entry's own file URL for static
       // sidecars; otherwise importing the CJS package throws immediately.
       const restored = code.replace(
-        /new URL\((["'`])([^"'`]+\.(?:wasm|ttf))\1,\s*\{\}\.url\)\.href/g,
+        /new URL\((["'`])([^"'`]+\.(?:wasm|ttf|mjs))\1,\s*\{\}\.url\)\.href/g,
         (_match, _quote, file) =>
           `new URL(${JSON.stringify(file)}, require('node:url').pathToFileURL(__filename)).href`,
       );
       return restored === code ? null : { code: restored, map: null };
+    },
+  };
+}
+
+/** Resolve the emitted chunk graph, including aliases, before publishing. */
+export function legacyBundleBoundary(): Plugin {
+  return {
+    name: 'legacy-bundle-boundary',
+    generateBundle(_options, bundle) {
+      // Optional legacy-* entries are allowed to contain the reader. Follow
+      // static and dynamic edges from ordinary entries and workers; a relay
+      // outside the guarded source roots cannot hide the reader in a chunk.
+      const entries = Object.values(bundle).filter((output) =>
+        output.type === 'chunk' && output.isEntry
+        && !output.fileName.startsWith('.types-work/')
+        && !/(?:^|[\\/])legacy-(?:doc|xls|ppt)\./.test(output.fileName));
+      const visited = new Set<string>();
+      const pending = [...entries];
+      while (pending.length > 0) {
+        const output = pending.pop()!;
+        if (output.type !== 'chunk') continue;
+        if (visited.has(output.fileName)) continue;
+        visited.add(output.fileName);
+        for (const moduleId of Object.keys(output.modules)) {
+          if (/(?:^|[\\/])packages[\\/]legacy-converter(?:[\\/]|$)/.test(moduleId)
+            || moduleId.includes('@silurus/ooxml-legacy-converter')) {
+            this.error(`${output.fileName} contains forbidden legacy module ${moduleId}`);
+          }
+        }
+        for (const imported of [...output.imports, ...(output.dynamicImports ?? [])]) {
+          const child = bundle[imported];
+          if (child?.type === 'chunk') pending.push(child);
+        }
+      }
     },
   };
 }
@@ -94,6 +128,7 @@ export default defineConfig(({ command, mode }) => ({
   plugins: [
     wasmAssetUrl(),
     wasm(),
+    legacyBundleBoundary(),
     // Storybook loads the root Vite config in serve mode. The declaration
     // plugins are build-only: their Rolldown buildStart hooks expect library
     // inputs and fail against Storybook's dev-server graph.
@@ -163,7 +198,7 @@ export default defineConfig(({ command, mode }) => ({
     // Built-in worker renderers lazy-import the same optional math engine. Keep
     // its ~3 MB `?url` asset external in nested worker builds too; otherwise
     // library mode base64-inlines one copy into every format worker chunk.
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
       output: {
         assetFileNames: '[name][extname]',

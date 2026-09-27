@@ -147,6 +147,8 @@ export class DocxViewer implements ZoomableViewer {
    *  1×1 offscreen canvas, so measuring never touches the visible canvas). */
   private _measureCtx: CanvasRenderingContext2D | null = null;
   private _opts: DocxViewerOptions;
+  /** A pre-load setter call is a choice even when it repeats the final-view default. */
+  private _showTrackedChangesExplicit = false;
   private readonly _mode: 'main' | 'worker';
   private readonly _renderDispatcher: StaticCanvasRenderDispatcher;
   private readonly _errorRouter: CanvasViewerErrorRouter;
@@ -192,6 +194,7 @@ export class DocxViewer implements ZoomableViewer {
   constructor(canvas: HTMLCanvasElement, opts: DocxViewerOptions = {}) {
     this._canvas = canvas;
     this._opts = opts;
+    this._showTrackedChangesExplicit = opts.showTrackedChanges !== undefined;
     const borrowedDocument = (opts as InternalDocxViewerOptions)[borrowedDocumentOption];
     this._borrowed = borrowedDocument !== undefined;
     this._mode = resolveCanvasViewerMode('DocxViewer', opts.mode, borrowedDocument);
@@ -306,7 +309,14 @@ export class DocxViewer implements ZoomableViewer {
         onLayoutComplete: this._opts.onLayoutComplete,
         // The variant this viewer renders, so load builds that one rather than
         // paying for a second full pagination on the first render.
-        ...(this._opts.showTrackedChanges === true ? { showTrackedChanges: true } : {}),
+        // An explicit choice (including `false`) is forwarded; otherwise the
+        // document's own view default applies.
+        ...(this._opts.modelSources === undefined
+          ? (this._opts.showTrackedChanges === true ? { showTrackedChanges: true } : {})
+          : (!this._showTrackedChangesExplicit
+            ? undefined
+            : { showTrackedChanges: this._opts.showTrackedChanges })),
+        ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
         ...(this._opts.currentDate === undefined
           ? {}
           : { currentDate: this._opts.currentDate }),
@@ -955,7 +965,18 @@ export class DocxViewer implements ZoomableViewer {
   async setShowTrackedChanges(value: boolean): Promise<void> {
     const generation = ++this._layoutViewGeneration;
     const doc = this._doc;
-    if ((this._opts.showTrackedChanges === true) === value) {
+    // Compare with the document's active view: it may come from the loaded
+    // document's own view default rather than from this viewer's options.
+    const current = this._opts.modelSources === undefined
+      ? this._opts.showTrackedChanges === true
+      : doc
+        ? activeDocxLayoutViewOf(doc).showTrackedChanges
+        : this._opts.showTrackedChanges === true;
+    if (!doc || current === value) {
+      this._showTrackedChangesExplicit = true;
+      this._opts = { ...this._opts, showTrackedChanges: value };
+    }
+    if (current === value) {
       // Still forward the installed value: it cancels an older in-flight
       // worker switch that has not become this viewer's state yet.
       if (doc) await selectDocxLayoutView(doc, {
@@ -976,6 +997,7 @@ export class DocxViewer implements ZoomableViewer {
       : true;
     if (!selected) return;
     if (this._destroyed || generation !== this._layoutViewGeneration || doc !== this._doc) return;
+    this._showTrackedChangesExplicit = true;
     this._opts = nextOptions;
     this._find.invalidate();
     this._currentPage = Math.max(0, Math.min(this._currentPage, this.pageCount - 1));

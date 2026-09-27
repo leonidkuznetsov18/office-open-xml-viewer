@@ -125,6 +125,23 @@ export { sniffCfb, type CfbKind } from './errors/cfb-sniff';
 // call: it returns plaintext ZIP bytes, decrypting an Agile-encrypted file when
 // a password is supplied ([MS-OFFCRYPTO], PD8).
 export { assertNotCfbContainer, resolveOoxmlContainer, toArrayBuffer } from './errors/cfb-guard';
+// Application-supplied model sources (LoadOptions.modelSources): a
+// format-generic contract for opening non-OOXML input into a renderer's own
+// model archive. Core and the format packages never name a concrete source.
+// A type-only root export keeps the optional source runtime out of every
+// ordinary OOXML entry. Selected sources load it through the internal subpath.
+export type {
+  AdmittedModelSourceLoad,
+  ModelSource,
+  ModelSourceConfig,
+  ModelSourceConfigValue,
+  ModelSourceLoad,
+  ModelSourceModule,
+  ModelSourceModuleDescriptor,
+  ModelSourceTarget,
+  OpenedModelSource,
+  OpenedModelSourceModule,
+} from './source/model-source';
 // Agile Encryption decryption ([MS-OFFCRYPTO]): `decryptOoxml` turns an
 // encrypted CFB + password into plaintext ZIP bytes. Lower-level primitives
 // (key derivation, EncryptionInfo parse) are exported for testing / advanced use.

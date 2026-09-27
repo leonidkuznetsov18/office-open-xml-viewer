@@ -1,7 +1,18 @@
 import { expect, test } from '@playwright/test';
 
 async function expectWorkerBitmaps(page: import('@playwright/test').Page, url: string) {
-  await page.goto(url);
+  const sourceRequests: string[] = [];
+  page.on('request', (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if ((pathname.startsWith('/dist/') || pathname.startsWith('/consumer/assets/'))
+      && /model-source|source-worker|worker-source|render-worker-source/.test(pathname)) {
+      sourceRequests.push(pathname);
+    }
+  });
+  await page.goto(`${url}${url.includes('?') ? '&' : '?'}pause-sources`);
+  await expect(page.locator('body')).toHaveAttribute('data-ordinary-ready', 'true', { timeout: 60_000 });
+  expect(sourceRequests, 'ordinary OOXML main/worker loads must not fetch source chunks').toEqual([]);
+  await page.evaluate(() => (window as typeof window & { resumeSourceStages?: () => void }).resumeSourceStages?.());
   await expect.poll(
     () => page.locator('body').getAttribute('data-status'),
     { timeout: 60_000 },
@@ -40,6 +51,8 @@ async function expectWorkerBitmaps(page: import('@playwright/test').Page, url: s
     });
     expect(ink, `${id} worker bitmap should contain ink`).toBeGreaterThan(100);
   }
+
+  await expect(page.locator('body')).toHaveAttribute('data-model-sources', 'ready');
 
   const pptxTextRuns = await page.evaluate(() => (
     window as typeof window & { pptxTextRuns?: Array<Record<string, unknown>> }
