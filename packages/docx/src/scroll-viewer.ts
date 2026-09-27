@@ -19,6 +19,7 @@ import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
 import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
+import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -401,6 +402,40 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._commitCommentRuns(page, slot, runs);
       this._highlights.redrawSlot(page, slot);
     },
+    reportError: (error) => this._reportRenderError(error),
+  });
+  private readonly _main = new MainSlotRenderer<PageSlot, DocxTextRunInfo>({
+    slots: () => this._slots,
+    epoch: () => this._renderEpoch,
+    scale: () => this._scale,
+    token: () => 0,
+    nextToken: () => 0,
+    slotIndex: (slot) => slot.renderedPage,
+    wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) ||
+      this._findActive || !!slot.commentTintLayer,
+    render: (page, canvas, width, dpr, onTextRun) =>
+      renderDocxFocusedPage(this._doc!, canvas, page, 'main', {
+        width, dpr,
+        imageResources: this._opts.imageResources,
+        defaultTextColor: this._opts.defaultTextColor,
+        currentDate: this._currentDate,
+        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
+        onTextRun,
+      }),
+    commitRuns: (page, slot, runs, canvas, _width, wantedRuns, settled) => {
+      if (slot.textLayer) {
+        if (settled) this._clearTextLayerPreview(slot.textLayer);
+        if (this._opts.enableTextSelection) {
+          const { width, height } = this._canvasCssPx(canvas);
+          buildDocxTextLayer(slot.textLayer, runs, width, height,
+            this._hyperlinkHandler(), (font) => this._highlights.measure(font), page);
+        }
+      }
+      if (wantedRuns) this._highlights.refreshRuns(page, runs);
+      this._commitCommentRuns(page, slot, runs);
+      this._highlights.redrawSlot(page, slot);
+    },
+    shadow: () => this._pageShadow,
     reportError: (error) => this._reportRenderError(error),
   });
   private readonly _selection = new SelectionContextController<DocxSelectionContext, DocxElementContext, DocxDocument, PageSlot>({
@@ -1322,70 +1357,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       );
     }
 
-    // Main mode: render straight onto the slot's canvas.
-    const runs: DocxTextRunInfo[] = [];
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive || !!slot.commentTintLayer;
-    const onTextRun = wantRuns ? (r: DocxTextRunInfo) => runs.push(r) : undefined;
-    let render: Promise<void>;
-    try {
-      render = renderDocxFocusedPage(this._doc, slot.canvas, i, 'main', {
-        width: widthPx, // this page's own px width → uniform px-per-pt scale (§7)
-        dpr,
-        imageResources: this._opts.imageResources,
-        defaultTextColor: this._opts.defaultTextColor,
-        currentDate: this._currentDate,
-        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
-        onTextRun,
-      });
-    } catch (error) {
-      if (reportErrors) {
-        this._reportRenderError(error);
-        return Promise.resolve();
-      }
-      return Promise.reject(error);
-    }
-    return render
-      .then(() => {
-        // Stale if the epoch moved (a setScale rescaled mid-flight — the run
-        // geometry is at the old scale), or a recycle re-purposed this slot for a
-        // different page / freed it. Either way: skip the (stale) overlay build.
-        // The engine's per-canvas token already discards the superseded pixels.
-        if (
-          !dispatcher.isCurrent(generation) ||
-          epoch !== this._renderEpoch ||
-          this._slots.get(i) !== slot ||
-          slot.renderedPage !== i
-        ) return;
-        // This fresh render defines the scale the on-screen bitmap now lives at,
-        // so a subsequent zoom preview stretches from HERE.
-        slot.renderedScale = scale;
-        if (wantOverlay && slot.textLayer) {
-          const { width, height } = this._canvasCssPx(slot.canvas);
-          buildDocxTextLayer(
-            slot.textLayer,
-            runs,
-            width,
-            height,
-            this._hyperlinkHandler(),
-            (font) => this._highlights.measure(font),
-            i,
-          );
-        }
-        if (wantRuns) this._highlights.refreshRuns(i, runs);
-        this._commitCommentRuns(i, slot, runs);
-        this._highlights.redrawSlot(i, slot);
-      })
-      .catch((err: unknown) => {
-        const isCurrent =
-          dispatcher.isCurrent(generation) &&
-          epoch === this._renderEpoch &&
-          this._slots.get(i) === slot &&
-          slot.renderedPage === i;
-        if (!isCurrent) return;
-        if (reportErrors) this._reportRenderError(err);
-        else throw err;
-      });
+    return this._main.render(i, slot, widthPx, dpr, 0, dispatcher, generation, reportErrors);
   }
 
   /**
@@ -1556,80 +1528,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       return;
     }
 
-    // Main mode: double-buffer. Render into a spare canvas kept off-DOM. The
-    // spare REPLACES the on-screen canvas on swap, so it must carry the page
-    // shadow too — otherwise a settle would silently drop it.
-    const spare = document.createElement('canvas');
-    spare.style.cssText = 'display:block;background:#fff;';
-    this._applyPageShadow(spare);
-    const spareDispatcher = new StaticCanvasRenderDispatcher(spare, false);
-    const generation = spareDispatcher.begin();
-    const runs: DocxTextRunInfo[] = [];
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive || !!slot.commentTintLayer;
-    const onTextRun = wantRuns ? (r: DocxTextRunInfo) => runs.push(r) : undefined;
-    renderDocxFocusedPage(this._doc, spare, i, 'main', {
-      width: widthPx,
-      dpr,
-      imageResources: this._opts.imageResources,
-      defaultTextColor: this._opts.defaultTextColor,
-      currentDate: this._currentDate,
-      ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
-      onTextRun,
-    })
-      .then(() => {
-        // Discard if superseded: a later setScale bumped the epoch (this spare is
-        // at a stale scale), or the slot recycled / moved to another page. Drop
-        // the spare (it is off-DOM, so GC reclaims it) and do NOT swap.
-        if (
-          !spareDispatcher.isCurrent(generation) ||
-          epoch !== this._renderEpoch ||
-          this._slots.get(i) !== slot ||
-          slot.renderedPage !== i
-        ) {
-          spareDispatcher.destroy();
-          return;
-        }
-        // Swap the freshly-painted spare in for the old (stretched-preview) canvas.
-        // The old canvas was the only child that showed content; replacing it in
-        // one DOM op means the screen goes from preview → crisp with no blank tick.
-        const old = slot.canvas;
-        slot.dispatcher.destroy();
-        slot.wrapper.insertBefore(spare, old);
-        old.remove();
-        slot.canvas = spare;
-        slot.dispatcher = spareDispatcher;
-        slot.renderedScale = scale;
-        // Rebuild the overlay at the full resolution and CLEAR the preview
-        // transform (the crisp render no longer needs the scale()).
-        if (slot.textLayer) {
-          this._clearTextLayerPreview(slot.textLayer);
-          if (wantOverlay) {
-            const { width, height } = this._canvasCssPx(spare);
-            buildDocxTextLayer(
-              slot.textLayer,
-              runs,
-              width,
-              height,
-              this._hyperlinkHandler(),
-              (font) => this._highlights.measure(font),
-              i,
-            );
-          }
-        }
-        if (wantRuns) this._highlights.refreshRuns(i, runs);
-        this._commitCommentRuns(i, slot, runs);
-        this._highlights.redrawSlot(i, slot);
-      })
-      .catch((err: unknown) => {
-        if (
-          spareDispatcher.isCurrent(generation) &&
-          epoch === this._renderEpoch &&
-          this._slots.get(i) === slot &&
-          slot.renderedPage === i
-        ) this._reportRenderError(err);
-        spareDispatcher.destroy();
-      });
+    this._main.settle(i, slot, widthPx, dpr);
   }
 
   // ─── §17.13.5 tracked-changes view toggle ─────────────────────────────────

@@ -15,6 +15,7 @@ import {
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
 import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
+import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -392,6 +393,36 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._commitSlotComments(slide, slot);
       this._highlights.redrawSlot(slide, slot);
     },
+    reportError: (error) => this._reportRenderError(error),
+  });
+  private readonly _main = new MainSlotRenderer<SlideSlot, PptxTextRunInfo>({
+    slots: () => this._slots,
+    epoch: () => this._renderEpoch,
+    scale: () => this._scale,
+    token: (slot) => slot.renderGeneration,
+    nextToken: (slot) => ++slot.renderGeneration,
+    slotIndex: (slot) => slot.renderedSlide,
+    wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) || this._findActive,
+    render: (slide, canvas, width, dpr, onTextRun, settled) =>
+      renderPptxFocusedSlide(this._pres!, canvas, slide, 'main', {
+        width, dpr,
+        ...(settled ? {} : { imageResources: this._opts.imageResources }),
+        onTextRun,
+      }),
+    commitRuns: (slide, slot, runs, _canvas, width, wantedRuns, settled) => {
+      if (slot.textLayer) {
+        if (settled) this._clearTextLayerPreview(slot.textLayer);
+        if (this._opts.enableTextSelection) {
+          buildPptxTextLayer(slot.textLayer, runs,
+            Math.round(width), Math.round(this._slideHeightPx()),
+            this._hyperlinkHandler(), slide);
+        }
+      }
+      if (wantedRuns) this._highlights.refreshRuns(slide, runs);
+      this._commitSlotComments(slide, slot);
+      this._highlights.redrawSlot(slide, slot);
+    },
+    shadow: () => this._pageShadow,
     reportError: (error) => this._reportRenderError(error),
   });
   private readonly _selection = new SelectionContextController<PptxSelectionContext, PptxElementContext, PptxPresentation, SlideSlot>({
@@ -1158,60 +1189,8 @@ export class PptxScrollViewer implements ZoomableViewer {
       );
     }
 
-    // Main mode: render straight onto the slot's canvas.
-    const runs: PptxTextRunInfo[] = [];
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive;
-    const onTextRun = wantRuns ? (r: PptxTextRunInfo) => runs.push(r) : undefined;
-    const canvas = slot.canvas;
-    return this._trackSlotLoading(i, slot, renderGeneration, renderPptxFocusedSlide(this._pres, canvas, i, 'main', {
-      width: widthPx, // this slide's own px width → uniform px-per-EMU scale (§7)
-      dpr,
-      imageResources: this._opts.imageResources,
-      onTextRun,
-    })
-      .then(() => {
-        // Stale if the epoch moved (a setScale rescaled mid-flight — the run
-        // geometry is at the old scale), or a recycle re-purposed this slot for a
-        // different slide / freed it. Either way: skip the (stale) overlay build.
-        // The engine's per-canvas token already discards the superseded pixels.
-        if (
-          renderGeneration !== slot.renderGeneration ||
-          !dispatcher.isCurrent(generation) ||
-          canvas !== slot.canvas ||
-          epoch !== this._renderEpoch ||
-          this._slots.get(i) !== slot ||
-          slot.renderedSlide !== i
-        ) return;
-        // This fresh render defines the scale the on-screen bitmap now lives at,
-        // so a subsequent zoom preview stretches from HERE.
-        slot.renderedScale = scale;
-        if (wantOverlay && slot.textLayer) {
-          // buildPptxTextLayer takes NUMBERS (not strings) for width/height. The
-          // overlay must match the slot's CSS box, NOT the canvas backing store:
-          // renderSlide sets `canvas.width = cssWidth × dpr`, so on a retina (dpr 2)
-          // display the backing store is 2× the CSS box. Passing it would size the
-          // overlay 2× too large (overflowing the wrapper + inflating the scroll
-          // area). Pass the CSS px directly — the uniform slide width/height at the
-          // current scale (rounded).
-          buildPptxTextLayer(slot.textLayer, runs, Math.round(widthPx), Math.round(this._slideHeightPx()), this._hyperlinkHandler(), i);
-        }
-        if (wantRuns) this._highlights.refreshRuns(i, runs);
-        this._commitSlotComments(i, slot);
-        this._highlights.redrawSlot(i, slot);
-      })
-      .catch((err: unknown) => {
-        const isCurrent =
-          renderGeneration === slot.renderGeneration &&
-          dispatcher.isCurrent(generation) &&
-          canvas === slot.canvas &&
-          epoch === this._renderEpoch &&
-          this._slots.get(i) === slot &&
-          slot.renderedSlide === i;
-        if (!isCurrent) return;
-        if (reportErrors) this._reportRenderError(err);
-        else throw err;
-      }));
+    return this._trackSlotLoading(i, slot, renderGeneration,
+      this._main.render(i, slot, widthPx, dpr, renderGeneration, dispatcher, generation, reportErrors));
   }
 
   private async _trackSlotLoading(
@@ -1565,72 +1544,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       return;
     }
 
-    // Main mode: double-buffer. Render into a spare canvas kept off-DOM. The
-    // spare REPLACES the on-screen canvas on swap, so it must carry the slide
-    // shadow too — otherwise a settle would silently drop it.
-    const spare = document.createElement('canvas');
-    const renderGeneration = ++slot.renderGeneration;
-    spare.style.cssText = 'display:block;background:#fff;';
-    this._applyPageShadow(spare);
-    const spareDispatcher = new StaticCanvasRenderDispatcher(spare, false);
-    const generation = spareDispatcher.begin();
-    const runs: PptxTextRunInfo[] = [];
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive;
-    const onTextRun = wantRuns ? (r: PptxTextRunInfo) => runs.push(r) : undefined;
-    renderPptxFocusedSlide(this._pres, spare, i, 'main', {
-      width: widthPx,
-      dpr,
-      onTextRun,
-    })
-      .then(() => {
-        // Discard if superseded: a later setScale bumped the epoch (this spare is
-        // at a stale scale), or the slot recycled / moved to another slide. Drop
-        // the spare (it is off-DOM, so GC reclaims it) and do NOT swap.
-        if (
-          renderGeneration !== slot.renderGeneration ||
-          !spareDispatcher.isCurrent(generation) ||
-          epoch !== this._renderEpoch ||
-          this._slots.get(i) !== slot ||
-          slot.renderedSlide !== i
-        ) {
-          spareDispatcher.destroy();
-          return;
-        }
-        // Swap the freshly-painted spare in for the old (stretched-preview) canvas.
-        // The old canvas was the only child that showed content; replacing it in
-        // one DOM op means the screen goes from preview → crisp with no blank tick.
-        const old = slot.canvas;
-        slot.dispatcher.destroy();
-        slot.wrapper.insertBefore(spare, old);
-        old.remove();
-        slot.canvas = spare;
-        slot.dispatcher = spareDispatcher;
-        slot.renderedScale = scale;
-        // Rebuild the overlay at the full resolution and CLEAR the preview
-        // transform (the crisp render no longer needs the scale()).
-        if (slot.textLayer) {
-          this._clearTextLayerPreview(slot.textLayer);
-          if (wantOverlay) {
-            // buildPptxTextLayer takes NUMBERS: pass the CSS box (uniform slide
-            // width/height at the current scale), NOT the retina backing store.
-            buildPptxTextLayer(slot.textLayer, runs, Math.round(widthPx), Math.round(this._slideHeightPx()), this._hyperlinkHandler(), i);
-          }
-        }
-        if (wantRuns) this._highlights.refreshRuns(i, runs);
-        this._commitSlotComments(i, slot);
-        this._highlights.redrawSlot(i, slot);
-      })
-      .catch((err: unknown) => {
-        if (
-          renderGeneration === slot.renderGeneration &&
-          spareDispatcher.isCurrent(generation) &&
-          epoch === this._renderEpoch &&
-          this._slots.get(i) === slot &&
-          slot.renderedSlide === i
-        ) this._reportRenderError(err);
-        spareDispatcher.destroy();
-      });
+    this._main.settle(i, slot, widthPx, dpr);
   }
 
   /**
