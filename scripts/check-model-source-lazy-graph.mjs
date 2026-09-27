@@ -230,8 +230,10 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
 });
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
 // DOCX worker includes PRs #1586 and #1590 plus the #1566 line-breaker split
-// (+19,183 bytes against aec306b6). Workers retain zero allowance.
-const OOXML_RENDER_WORKERS = [1_422_575, 1_458_891, 2_066_457];
+// (+19,183 bytes against aec306b6). The #1562 display-equation boundary and
+// incremental wrap search add 923 XLSX and 961 PPTX worker bytes; DOCX is
+// unchanged. These are measured outputs, and workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_423_498, 1_459_852, 2_066_457];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

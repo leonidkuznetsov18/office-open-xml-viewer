@@ -1934,6 +1934,11 @@ export interface ShapeParagraph {
     marL?: number;
     marR?: number;
     indent?: number;
+    defTabSz?: number;
+    tabStops?: {
+        pos: number;
+        algn: string;
+    }[];
     spaceLine?: SpaceLine | null;
     runs: ShapeTextRun[];
 }

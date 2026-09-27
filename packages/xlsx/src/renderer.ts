@@ -4842,7 +4842,6 @@ export function drawShapeText(
           kind: 'math', font: '', color: run.color ?? '#000000', pxSize,
           render, ascent, descent,
         };
-        if (run.display) input.push({ type: 'break' });
         input.push({ type: 'object', width: render.widthEm * pxSize, style, payload: style, display: run.display });
         continue;
       }
@@ -4852,10 +4851,6 @@ export function drawShapeText(
       input.push({ type: 'text', text: run.text,
         style: { kind: 'text', font, color: run.color ?? '#000000', pxSize: px } });
     }
-    const paragraphTabs = p as typeof p & {
-      defTabSz?: number;
-      tabStops?: { pos: number; algn: string }[];
-    };
     const broken = breakDrawingMlText(input, {
       maxWidth: wrap ? paraW : Infinity,
       firstLineIndent,
@@ -4866,10 +4861,10 @@ export function drawShapeText(
       sameStyle: (left, right) => left.kind === right.kind
         && left.font === right.font && left.color === right.color
         && left.pxSize === right.pxSize,
-      tabStops: paragraphTabs.tabStops?.map((tab) => ({
+      tabStops: p.tabStops?.map((tab) => ({
         pos: tab.pos / EMU_PER_PX * cs, algn: tab.algn,
       })),
-      defaultTabSize: (paragraphTabs.defTabSz ?? 914400) / EMU_PER_PX * cs,
+      defaultTabSize: (p.defTabSz ?? 914400) / EMU_PER_PX * cs,
       tabStartPen: (index) => marLpx + (index === 0 ? firstLineIndent : 0),
     });
     let fallbackPt = 0;

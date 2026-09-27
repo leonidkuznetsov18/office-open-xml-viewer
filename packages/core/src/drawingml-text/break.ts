@@ -81,6 +81,10 @@ export function breakDrawingMlText<T>(
       continue;
     }
     if (run.type === 'object') {
+      // ECMA-376 §22.1 m:oMathPara is display math. It occupies its own visual
+      // line: break after preceding text and before following text. An authored
+      // hard break already supplies the first edge.
+      if (run.display && regions.at(-1)!.length > 0) regions.push([]);
       regions.at(-1)!.push({ type: 'object', style: run.style, run: runIndex, width: run.width, payload: run.payload });
       if (run.display) regions.push([]);
       runIndex++;
@@ -152,6 +156,43 @@ export function breakDrawingMlText<T>(
       return false;
     };
 
+    // A continuation of an overwide word can begin at every grapheme. Cache
+    // these paragraph-local predicates once; searching the whole remaining
+    // word on every continuation made a narrow box quadratic in word length.
+    const breakAt = new Uint8Array(end + 1);
+    const nextBreak = new Int32Array(end + 1);
+    const nonTextOrCjk = new Int32Array(end + 1);
+    const styleSeams = new Int32Array(end + 1);
+    for (let i = 1; i < end; i++) breakAt[i] = mayBreakAt(i) ? 1 : 0;
+    nextBreak[end] = end;
+    for (let i = end - 1; i >= 0; i--) nextBreak[i] = breakAt[i + 1] ? i + 1 : nextBreak[i + 1];
+    for (let i = 0; i < end; i++) {
+      const atom = atoms[i];
+      const validWordAtom = atom.type === 'text' && !isCjk(atom);
+      nonTextOrCjk[i + 1] = nonTextOrCjk[i] + (validWordAtom ? 0 : 1);
+      styleSeams[i + 1] = styleSeams[i] + (
+        i > 0 && validWordAtom && atoms[i - 1].type === 'text'
+          && !isCjk(atoms[i - 1]) && !sameStyle(atoms[i - 1].style, atom.style) ? 1 : 0
+      );
+    }
+
+    // Most DrawingML paragraphs use one resolved paint style and no tabs or
+    // objects. Build UTF-16 offsets once so every fit probe measures exactly
+    // the same substring that makeSegments would coalesce, without rebuilding
+    // the segment array for each candidate prefix. This also preserves shaping
+    // across authored run seams when their resolved styles agree.
+    const plainStyle = atoms[0]?.style;
+    const plainText = end > 0 && atoms.every((atom) => atom.type === 'text'
+      && sameStyle(plainStyle, atom.style))
+      ? atoms.map((atom) => atom.type === 'text' ? atom.text : '').join('') : null;
+    const plainOffsets = plainText === null ? null : new Int32Array(end + 1);
+    if (plainOffsets) {
+      for (let i = 0; i < end; i++) {
+        const atom = atoms[i];
+        plainOffsets[i + 1] = plainOffsets[i] + (atom.type === 'text' ? atom.text.length : 0);
+      }
+    }
+
     const isSingleExplicitTabCell = (index: number): boolean => {
       const tab = atoms[index];
       const first = atoms[index + 1];
@@ -162,23 +203,22 @@ export function breakDrawingMlText<T>(
           && !isSpace(atom) && !isCjk(atom));
     };
 
-    const makeSegments = (start: number, stop: number, lineIndex: number): DrawingMlBrokenLine<T> => {
-      const segments: DrawingMlLineSegment<T>[] = [];
-      for (let i = start; i < stop; i++) {
-        const atom = atoms[i];
-        if (atom.type === 'text') {
-          const last = segments.at(-1);
-          if (last?.type === 'text' && sameStyle(last.style, atom.style)) {
-            last.text += atom.text;
-            continue;
-          }
-          segments.push({ type: 'text', text: atom.text, style: atom.style, width: 0 });
-        } else if (atom.type === 'tab') {
-          segments.push({ type: 'tab', style: atom.style, width: 0 });
-        } else {
-          segments.push({ type: 'object', style: atom.style, width: atom.width, payload: atom.payload });
+    const appendAtom = (segments: DrawingMlLineSegment<T>[], atom: Atom<T>): void => {
+      if (atom.type === 'text') {
+        const last = segments.at(-1);
+        if (last?.type === 'text' && sameStyle(last.style, atom.style)) {
+          last.text += atom.text;
+          return;
         }
+        segments.push({ type: 'text', text: atom.text, style: atom.style, width: 0 });
+      } else if (atom.type === 'tab') {
+        segments.push({ type: 'tab', style: atom.style, width: 0 });
+      } else {
+        segments.push({ type: 'object', style: atom.style, width: atom.width, payload: atom.payload });
       }
+    };
+
+    const measureSegments = (segments: DrawingMlLineSegment<T>[], lineIndex: number): number => {
       let noStopGap = 0;
       const items = segments.map((seg, i) => {
         if (seg.type === 'text') {
@@ -188,7 +228,13 @@ export function breakDrawingMlText<T>(
             seg.width += options.boundaryAdvance?.(previous.style, seg.style) ?? 0;
           }
         }
-        if (seg.type === 'tab') noStopGap = options.measureText(' ', seg.style);
+        if (seg.type === 'tab') {
+          // The non-monotone scan reuses this prefix array after measuring its
+          // previous length. A tab's earlier resolved gap is not an input to
+          // the next candidate's tab-stop resolution.
+          seg.width = 0;
+          noStopGap = options.measureText(' ', seg.style);
+        }
         return { isTab: seg.type === 'tab', width: seg.width };
       });
       if (items.some((item) => item.isTab)) {
@@ -202,7 +248,18 @@ export function breakDrawingMlText<T>(
         );
         for (let i = 0; i < segments.length; i++) segments[i].width = widths[i];
       }
-      return { segments, width: segments.reduce((sum, seg) => sum + seg.width, 0) };
+      return segments.reduce((sum, seg) => sum + seg.width, 0);
+    };
+
+    const makeSegments = (start: number, stop: number, lineIndex: number): DrawingMlBrokenLine<T> => {
+      if (plainText !== null && plainOffsets && plainStyle !== undefined) {
+        const text = plainText.slice(plainOffsets[start], plainOffsets[stop]);
+        const width = options.measureText(text, plainStyle);
+        return { segments: [{ type: 'text', text, style: plainStyle, width }], width };
+      }
+      const segments: DrawingMlLineSegment<T>[] = [];
+      for (let i = start; i < stop; i++) appendAtom(segments, atoms[i]);
+      return { segments, width: measureSegments(segments, lineIndex) };
     };
 
     let start = 0;
@@ -213,24 +270,53 @@ export function breakDrawingMlText<T>(
     while (start < end) {
       const lineIndex = lines.length;
       const budget = options.maxWidth - (lineIndex === 0 ? options.firstLineIndent ?? 0 : 0);
-      const widthAt = (stop: number): number => makeSegments(start, stop, lineIndex).width;
+      const widthAt = (stop: number): number =>
+        plainText !== null && plainOffsets && plainStyle !== undefined
+          ? options.measureText(plainText.slice(plainOffsets[start], plainOffsets[stop]), plainStyle)
+          : makeSegments(start, stop, lineIndex).width;
       let fit = end;
-      if (Number.isFinite(budget) && widthAt(end) > budget) {
-        if (options.nonMonotoneMeasure) {
-          fit = start;
-          for (let i = start + 1; i <= end; i++) {
-            if (widthAt(i) <= budget) fit = i;
+      if (Number.isFinite(budget) && options.nonMonotoneMeasure && widthAt(end) > budget) {
+        // The requested non-monotone contract can have a later fitting prefix
+        // after an earlier overflow. Every candidate must be checked unless
+        // the end fits. Reuse the growing segment array for mixed-style/tabbed
+        // paragraphs instead of rebuilding each candidate prefix.
+        fit = start;
+        if (plainText !== null) {
+          for (let i = end - 1; i > start; i--) {
+            if (widthAt(i) <= budget) { fit = i; break; }
           }
         } else {
-          let lo = start;
-          let hi = end;
-          while (lo < hi) {
-            const mid = Math.ceil((lo + hi) / 2);
-            if (widthAt(mid) <= budget) lo = mid;
-            else hi = mid - 1;
+          const prefixSegments: DrawingMlLineSegment<T>[] = [];
+          for (let i = start + 1; i < end; i++) {
+            appendAtom(prefixSegments, atoms[i - 1]);
+            if (measureSegments(prefixSegments, lineIndex) <= budget) fit = i;
           }
-          fit = lo;
         }
+      } else if (Number.isFinite(budget) && !options.nonMonotoneMeasure) {
+        // Exponential search only measures prefixes close to the fit boundary.
+        // In a one-grapheme box this avoids measuring the whole remaining word
+        // on every visual line. The existing binary search still chooses the
+        // greatest fitting prefix when advances are monotone.
+        let lo = start;
+        let hi = end;
+        let step = 1;
+        while (lo < end) {
+          const probe = Math.min(end, start + step);
+          if (widthAt(probe) <= budget) {
+            lo = probe;
+            if (probe === end) break;
+            step *= 2;
+          } else {
+            hi = probe - 1;
+            break;
+          }
+        }
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          if (widthAt(mid) <= budget) lo = mid;
+          else hi = mid - 1;
+        }
+        fit = lo;
       }
       if (fit >= end) {
         const line = makeSegments(start, end, lineIndex);
@@ -240,7 +326,7 @@ export function breakDrawingMlText<T>(
       }
 
       let split = 0;
-      for (let i = start + 1; i <= fit; i++) if (mayBreakAt(i)) split = i;
+      for (let i = start + 1; i <= fit; i++) if (breakAt[i]) split = i;
       if (split > start && isSingleExplicitTabCell(split)) {
         // Office keeps the tab and following Latin cell on the authored line
         // for an explicit stop, even when the cell passes the box edge. The
@@ -263,20 +349,16 @@ export function breakDrawingMlText<T>(
           split = start + 1;
           if (split < end && atoms[split].type === 'text') {
             split++;
-            while (split < end && !mayBreakAt(split)) split++;
+            while (split < end && !breakAt[split]) split++;
           }
         } else {
           split = Math.max(start + 1, fit); // overwide word: grapheme-safe emergency break
           // A mixed-font/style Latin word has no shaping-preserving emergency
           // break: retaining the old overflow avoids inventing a run seam as a
           // break. The matched C01 control has identical styles and does split.
-          let nextOpportunity = end;
-          for (let i = start + 1; i < end; i++) {
-            if (mayBreakAt(i)) { nextOpportunity = i; break; }
-          }
-          const styledWord = atoms.slice(start, nextOpportunity);
-          if (styledWord.every((atom) => atom.type === 'text' && !isCjk(atom))
-              && styledWord.some((atom, i) => i > 0 && !sameStyle(styledWord[i - 1].style, atom.style))) {
+          const nextOpportunity = nextBreak[start];
+          if (nonTextOrCjk[nextOpportunity] === nonTextOrCjk[start]
+              && styleSeams[nextOpportunity] > styleSeams[start + 1]) {
             split = nextOpportunity;
           }
         }
