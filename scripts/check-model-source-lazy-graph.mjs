@@ -207,6 +207,14 @@ function assertNoSourceRuntime(code, name) {
 // changes. PR #1590's projection consolidation then brings the measured main
 // graph at aec306b6 to 2,533,239 DOCX, 2,579,716 Node, and 2,047,181 worker
 // bytes (+200, -20, and -54 respectively versus the #1557 guard values).
+// Issue #1591 then makes validation paths lazy, brands only frozen plain-data
+// roots, shares verified occurrence-independent data, and bounds text caches.
+// Against clean aec306b6, that grew the DOCX worker from 2,047,181 to
+// 2,047,720 bytes (+539) while keeping its zero-allowance guard.
+// The combined 546160b1 + #1591 production build measures 2,563,637 DOCX,
+// 1,845,156 XLSX, 1,839,481 PPTX, and 2,598,519 Node static bytes. This
+// rebases exact measured entries after the DOCX heap work and merged XLSX
+// formatting changes; the dispatch allowances remain unchanged.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
   // #1566's explicit-state line-breaker and table measurement add 18,002
   // DOCX bytes against aec306b6 (2,533,239 -> 2,551,241) in 36 chunks:
@@ -218,19 +226,19 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   // from the old viewer/find modules; other graph changes account for the rest.
   // The static chunk count remains 36 and the dispatch allowance is unchanged.
   // Chart labels sharing the worksheet date/time formatter add 5,041 bytes.
-  docx: { entry: 2_567_877, inline: 31_624, budget: 2_800 },
+  docx: { entry: 2_568_678, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
   // Moving the date/time formatter into core, shared with chart labels,
   // removes a net 165 bytes.
-  xlsx: { entry: 1_844_017, inline: 39_902, budget: 2_500 },
+  xlsx: { entry: 1_844_991, inline: 39_902, budget: 2_500 },
   // PPTX #1561 adds 13,299 static bytes against main (036ddd31): 48,632
   // bytes in shared/adapter modules offset 30,988 removed viewer/find bytes,
   // with the remaining graph changes preserving the 38 static chunks.
   // The dispatch allowance is unchanged. Chart labels sharing the worksheet
   // date/time formatter add 5,041 bytes to PPTX and Node alike.
-  pptx: { entry: 1_844_498, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_602_759, budget: 3_600 },
+  pptx: { entry: 1_844_522, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_603_560, budget: 3_600 },
 });
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction and
 // 51 bytes for table-style font color precedence. The DOCX worker includes
@@ -238,10 +246,11 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
 // against aec306b6). Rounding Excel serials to the nearest millisecond adds
 // 24 bytes to every worker, and per-section date/time format detection with
 // text-section exclusion another 618 to the XLSX worker. Sharing that
-// date/time formatter with chart labels moves it into core: the DOCX and PPTX
-// workers gain 3,800 and 3,795 bytes, the XLSX worker sheds 693. Workers
-// retain zero allowance.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_462_348, 2_070_183];
+// date/time formatter with chart labels moves it into core: the other two
+// workers gain 3,800 and 3,795 bytes, the XLSX worker sheds 693.
+// Issue #1591 adds 539 measured bytes to the combined DOCX worker.
+// Workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_416_948, 1_462_348, 2_070_722];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

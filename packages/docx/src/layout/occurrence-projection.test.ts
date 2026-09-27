@@ -7,6 +7,7 @@ import type {
 import type { TableFragmentLayout, TableRowFragmentLayout } from './table-pagination.js';
 import type { AnchorFrameResult } from './anchor-frame.js';
 import { floatingTableAxesFollowHostFlow } from './retained-geometry-translation.js';
+import { snapshotPlainData } from './plain-data.js';
 
 const source = (path: readonly number[]) => ({ story: 'body' as const, storyInstance: 'body', path });
 const rect = (xPt: number, yPt: number, widthPt = 10, heightPt = 10) => ({ xPt, yPt, widthPt, heightPt });
@@ -199,6 +200,31 @@ describe('translateBodyOccurrence', () => {
 });
 
 describe('projectBodyOccurrence', () => {
+  it('shares verified unchanged source data while isolating occurrence-owned geometry and identity', () => {
+    const retained = snapshotPlainData(table(), 'table acquisition') as TableLayout;
+    const first = projectBodyOccurrence(retained, options);
+    const second = projectBodyOccurrence(retained, { ...options, occurrenceId: 'page-3' });
+
+    expect(first.source).toBe(retained.source);
+    expect(second.source).toBe(retained.source);
+    expect(first.source.path).toBe(retained.source.path);
+    expect(first.rows[0]).not.toBe(second.rows[0]);
+    expect(first.rows[0]!.cells[0]!.blocks[0]!.layout)
+      .not.toBe(second.rows[0]!.cells[0]!.blocks[0]!.layout);
+    expect(first.id).not.toBe(second.id);
+    expect(first.flowBounds).not.toBe(second.flowBounds);
+    expect(Object.isFrozen(first.source)).toBe(true);
+  });
+
+  it('copies unchanged data from an unverified mutable source', () => {
+    const retained = table();
+    const projected = projectBodyOccurrence(retained, options);
+    (retained.source.path as number[])[0] = 99;
+
+    expect(projected.source.path).toEqual([1]);
+    expect(projected.source).not.toBe(retained.source);
+  });
+
   it('rejects two distinct drawing owners claiming one raw anchor occurrence ID', () => {
     const retained = paragraph();
     const drawing = (id: string) => ({
