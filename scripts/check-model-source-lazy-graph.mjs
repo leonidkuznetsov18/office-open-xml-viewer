@@ -2,6 +2,8 @@
 // The optional model-source implementation must stay outside every ordinary
 // OOXML entry and worker. Resolve workspace package exports with TypeScript,
 // then inspect the emitted static JS graph and decoded inline worker payloads.
+// This guards accidental eager coupling by maintainers or agents; it is not a
+// security boundary against deliberately adversarial JavaScript.
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve, dirname, relative, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';

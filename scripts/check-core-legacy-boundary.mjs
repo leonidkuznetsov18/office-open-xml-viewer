@@ -6,6 +6,8 @@
 // contract. Core, DOCX, XLSX, PPTX and the Node facade must therefore carry no
 // legacy-specific names, branches, defaults, dependencies or imports: anything
 // they need must be expressible as a generic contract or capability.
+// This check catches accidental coupling introduced by maintainers or agents;
+// it is not a sandbox for deliberately adversarial JavaScript.
 //
 // Usage: node scripts/check-core-legacy-boundary.mjs [--ref <git-ref>]
 // Without --ref the working tree's tracked files are checked.
@@ -85,6 +87,29 @@ export const ALLOWED_COMPUTED_IMPORTS = new Map([
 // require an exact file path here and a justification beside the source use.
 export const ALLOWED_LOADER_IDENTIFIERS = new Set();
 
+// A blanket constructor-property ban closes the cheap Function-constructor
+// escape. These exact expressions serve unrelated existing behavior. Every
+// exception needs a source-side explanation and a review of its input owner.
+export const ALLOWED_CONSTRUCTOR_MEMBERS = new Map([
+  // The rendering context owns its canvas; this constructs a compatible canvas.
+  ['packages/core/src/canvas/aux-canvas.ts', 'ctx.canvas?.constructor'],
+  // MathJax's font class owns already bundled glyph setup metadata.
+  ['packages/core/build/stix2-entry.mjs', 'svgJax.font.constructor'],
+  // The test checks that a serialized built-in error keeps its original class.
+  ['packages/core/src/worker/error-wire.test.ts', 'original.constructor'],
+]);
+
+export const ALLOWED_FUNCTION_MATCHERS = new Set([
+  // These test assertions only ask Vitest to match a callback's type.
+  'packages/core/src/worker/bridge.test.ts',
+  'packages/core/src/worker/renderer-module.test.ts',
+  'packages/docx/src/render-worker-model-source.test.ts',
+  'packages/pptx/src/presentation-handle-media-errors.test.ts',
+  'packages/pptx/src/render-worker-init-hang.test.ts',
+  'packages/pptx/src/renderer-picture-raster-target.test.ts',
+  'packages/pptx/src/scroll-viewer.test.ts',
+]);
+
 function expressionName(node) {
   if (node?.type === 'Identifier') return node.name;
   if (node?.type === 'MemberExpression' && !node.computed && node.property.type === 'Identifier') {
@@ -105,6 +130,21 @@ function literalValue(node) {
     return node.quasis[0].value.cooked;
   }
   return undefined;
+}
+
+function memberKey(node) {
+  if (!['MemberExpression', 'OptionalMemberExpression'].includes(node?.type)) return undefined;
+  return node.computed ? literalValue(node.property)
+    : node.property.type === 'Identifier' ? node.property.name : undefined;
+}
+
+function isGlobalName(node) {
+  return node?.type === 'Identifier' && ['globalThis', 'self', 'window'].includes(node.name);
+}
+
+function isProcessObject(node) {
+  return (node?.type === 'Identifier' && node.name === 'process')
+    || (memberKey(node) === 'process' && isGlobalName(node.object));
 }
 
 function isPropertyName(node, parent) {
@@ -175,10 +215,65 @@ export function findViolations(files, { resolveModule } = {}) {
       const usedExpressions = new Set();
       const inspect = (node, parent, grandparent) => {
         const line = node.loc?.start.line ?? 1;
+        const guarded = isGuardedPath(path);
+        const report = (rule) => violations.push({
+          path, line, rule, text: lines[line - 1].trim().slice(0, 160),
+        });
         if (isGuardedPath(path) && ALLOWED_LOADER_IDENTIFIERS.has(path) === false
           && node.type === 'Identifier' && ['require', 'module'].includes(node.name)
           && !isPropertyName(node, parent)) {
-          violations.push({ path, line, rule: 'loader-identifier', text: lines[line - 1].trim().slice(0, 160) });
+          report('loader-identifier');
+        }
+        if (guarded && node.type === 'Identifier' && ['eval', 'getBuiltinModule'].includes(node.name)) {
+          report('runtime-loader-capability');
+        }
+        if (guarded && node.type === 'Identifier' && node.name === 'Function') {
+          const typePosition = parent?.type === 'TSTypeReference' && parent.typeName === node;
+          const matcher = ALLOWED_FUNCTION_MATCHERS.has(path)
+            && parent?.type === 'CallExpression'
+            && text.slice(parent.start, parent.end) === 'expect.any(Function)';
+          if (!typePosition && !matcher && !isPropertyName(node, parent)) {
+            report('function-constructor-capability');
+          }
+        }
+        if (guarded && node.type === 'Identifier' && node.name === 'importScripts') {
+          const literalCall = ['CallExpression', 'OptionalCallExpression'].includes(parent?.type)
+            && parent.callee === node
+            && parent.arguments.every((argument) => literalValue(argument) !== undefined);
+          if (!literalCall && !isPropertyName(node, parent)) report('computed-import-scripts');
+        }
+        if (guarded && ['MemberExpression', 'OptionalMemberExpression'].includes(node.type)) {
+          const key = memberKey(node);
+          if (key === 'eval' || key === 'getBuiltinModule') report('runtime-loader-capability');
+          if (key === 'Function' && isGlobalName(node.object)) report('function-constructor-capability');
+          if (key === 'binding' && isProcessObject(node.object)) report('process-binding');
+          if (key === 'importScripts' && isGlobalName(node.object)) {
+            const literalCall = ['CallExpression', 'OptionalCallExpression'].includes(parent?.type)
+              && parent.callee === node
+              && parent.arguments.every((argument) => literalValue(argument) !== undefined);
+            if (!literalCall) report('computed-import-scripts');
+          }
+          if (key === 'constructor'
+            && ALLOWED_CONSTRUCTOR_MEMBERS.get(path) !== text.slice(node.start, node.end)) {
+            report('function-constructor-capability');
+          }
+          if (node.computed && isGlobalName(node.object)
+            && literalValue(node.property) === undefined
+            && node.property.type !== 'NumericLiteral') {
+            report('computed-global-member');
+          }
+        }
+        if (guarded && ['CallExpression', 'OptionalCallExpression', 'NewExpression'].includes(node.type)) {
+          if ((node.callee.type === 'Identifier' && node.callee.name === 'Function')
+            || (memberKey(node.callee) === 'Function' && isGlobalName(node.callee.object))) {
+            report('function-constructor-capability');
+          }
+          if (node.type !== 'NewExpression'
+            && ((node.callee.type === 'Identifier' && node.callee.name === 'importScripts')
+              || (memberKey(node.callee) === 'importScripts' && isGlobalName(node.callee.object)))
+            && node.arguments.some((argument) => literalValue(argument) === undefined)) {
+            report('computed-import-scripts');
+          }
         }
         let literal;
         let dynamic = false;

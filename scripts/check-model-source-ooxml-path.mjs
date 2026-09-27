@@ -3,6 +3,7 @@
 // Source-only branches are excluded; every remaining await must keep its
 // original order and callee. The XLSX render worker also retains one host.run
 // around archive construction and parse, as in the previous renderer.
+// This regression check covers accidental edits, not intentionally hostile code.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

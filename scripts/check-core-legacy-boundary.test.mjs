@@ -89,6 +89,46 @@ test('rejects every Node module import form and loader identifier reference', ()
   }
 });
 
+test('rejects alternate runtime loaders and code generation capabilities', () => {
+  for (const code of [
+    "process.getBuiltinModule('module').createRequire(import.meta.url)(name);",
+    "globalThis['process'].getBuiltinModule('module').createRequire(import.meta.url)(name);",
+    "const load = process['getBuiltinModule']('module');",
+    "process.binding('natives');",
+    "globalThis.process.binding('natives');",
+    "eval('process');",
+    "(0, eval)('process');",
+    "globalThis.eval('process');",
+    "new Function('return process')();",
+    "Function('return process')();",
+    "globalThis.Function('return process')();",
+    "const make = Function; make('return process')();",
+    "const make = globalThis['Function']; make('return process')();",
+    "({}).constructor.constructor('return process')();",
+    "importScripts(path);",
+    "const load = importScripts; load(path);",
+    "const load = self['importScripts']; load(path);",
+    "globalThis[key];",
+    "self[key];",
+    "window[key];",
+    "globalThis['eval']('process');",
+    "globalThis['process']['binding']('natives');",
+  ]) {
+    assert.ok(rules(code).length > 0, code);
+  }
+  for (const code of [
+    "importScripts('./worker.js');",
+    "globalThis['document'];",
+    "self[`location`];",
+    "window[0];",
+  ]) {
+    assert.deepEqual(rules(code), [], code);
+  }
+  assert.deepEqual(findViolations([{
+    path: 'packages/core/src/worker/bridge.test.ts', text: 'expect.any(Function);',
+  }]), []);
+});
+
 test('follows a relay outside guarded roots to a dynamic legacy import', () => {
   const root = mkdtempSync(join(tmpdir(), 'ooxml-boundary-relay-'));
   try {

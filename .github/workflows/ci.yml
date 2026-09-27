@@ -149,6 +149,7 @@ jobs:
           node --test scripts/check-core-legacy-boundary.test.mjs
           pnpm check:core-legacy-boundary
           node --test scripts/check-model-source-lazy-graph.test.mjs
+          node --test scripts/check-model-source-lazy-runtime.test.mjs
           node --test scripts/check-model-source-ooxml-path.test.mjs
           pnpm check:model-source-ooxml-path
 
