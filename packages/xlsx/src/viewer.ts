@@ -28,7 +28,6 @@ import {
   getGridGeometryForWorksheet,
   rtlMirrorX,
 } from './renderer.js';
-import { findListValidationAt } from './data-validation.js';
 import { formatA1, parseA1 } from './a1.js';
 import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
 import { viewportPreviewBlocker, type ViewportPreviewBlocker } from './internal/worksheet-preview-eligibility.js';
@@ -62,15 +61,12 @@ export type { CellAddress } from './selection.js';
 import { XlsxFindController, type FindCell, type XlsxMatchLocation } from './find.js';
 import { computeCommentPopupPosition } from './comment-popup.js';
 import type { XlsxCommentsOptions } from './comment-card.js';
-import {
-  computeValidationPanelPosition,
-  type ResolvedList,
-} from './validation-list.js';
 import { withViewerRenderContext } from './worker-protocol.js';
 import { SheetViewEdits } from './internal/viewer/sheet-view-edits.js';
 import { OutlineGutter } from './internal/viewer/outline-gutter.js';
 import { SheetTabBar } from './internal/viewer/sheet-tab-bar.js';
 import { ZoomControl } from './internal/viewer/zoom-control.js';
+import { ValidationPanel } from './internal/viewer/validation-panel.js';
 import type { OutlineAxis } from './outline.js';
 import {
   GridGeometry,
@@ -802,23 +798,8 @@ class XlsxViewerEngine implements ZoomableViewer {
   private commentUi: XlsxCommentUiRuntime | null = null;
   private commentPopupRenderGeneration = 0;
 
-  // ─── List data-validation dropdown panel (display-only) ───────────────────
-  /** DOM overlay listing a list-validated cell's allowed values. Lives in
-   *  canvasArea above the scrollHost; unlike the comment popup this is a click
-   *  target (`pointer-events:auto`). Read-only: hovering an item highlights it
-   *  but selecting does NOT change the cell. */
-  private validationPanel: HTMLDivElement;
-  /** `"row:col"` of the cell whose panel is pending or open, or null. Claiming
-   *  the key before async range resolution lets a re-click cancel the request. */
-  private validationPanelKey: string | null = null;
-  private validationRequestGeneration = 0;
-  /** Screen rect (canvasArea CSS px) of the dropdown arrow button last drawn by
-   *  {@link maybeDrawValidationDropdown}, so pointerdown can hit-test it. Null
-   *  when no arrow is currently visible. */
-  private validationArrowRect: { x: number; y: number; w: number; h: number } | null = null;
-  /** Document-level pointerdown listener that closes the panel on an outside
-   *  click; installed only while the panel is open. */
-  private validationOutsideHandler: ((e: PointerEvent) => void) | null = null;
+  /** List data-validation dropdown arrow and display-only value panel. */
+  private readonly validation: ValidationPanel;
 
   constructor(
     container: HTMLElement,
@@ -900,7 +881,22 @@ class XlsxViewerEngine implements ZoomableViewer {
       });
       this.commentPopupResizeObserver.observe(this.commentPopup);
     }
-    this.validationPanel = this.overlayHost.validation;
+    this.validation = new ValidationPanel({
+      ownerDocument: this.hostDocument,
+      canvasArea: this.canvasArea,
+      surface: this.surface,
+      overlayHost: this.overlayHost,
+      worksheet: () => this.currentWorksheet,
+      workbook: () => this.wb,
+      currentSheet: () => this.currentSheet,
+      activeCell: () => this.activeCell,
+      selectionMode: () => this.selectionMode,
+      scale: () => this.viewport.scale,
+      isRtl: () => this.isRtl,
+      isDestroyed: () => this._destroyed,
+      cellRect: (row, col) => this._cellRect(row, col),
+      screenX: (x, w) => this.screenX(x, w),
+    });
     this.outlineGutter = new OutlineGutter({
       gridRegion: this.gridRegion,
       canvasArea: this.canvasArea,
@@ -2716,7 +2712,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     // (pointer-events:none); clicks are hit-tested against its rect in the
     // pointerdown handler, which opens a panel listing the allowed values
     // (display only — picking a value never changes the cell).
-    this.maybeDrawValidationDropdown();
+    this.validation.drawDropdown();
   }
 
   private drawElementContextOverlay(): void {
@@ -2744,73 +2740,6 @@ class XlsxViewerEngine implements ZoomableViewer {
       `transform:rotate(${projection.rotation}deg);transform-origin:center;pointer-events:none;`;
     clip.appendChild(frame);
     this.overlayHost.appendSelection(clip);
-  }
-
-  /** Draw the Excel list-validation dropdown button just outside the
-   *  bottom-right corner of the *active* cell when that cell is covered by a
-   *  `list` data-validation rule. Anchored to the single active cell (not the
-   *  whole range) to mirror Excel, which attaches the button to the active
-   *  cell of the selection. */
-  private maybeDrawValidationDropdown(): void {
-    // The overlay is rebuilt on every selection / scroll change, so the
-    // arrow's hit-test rect is recomputed here each time (cleared when no arrow
-    // is currently shown).
-    this.validationArrowRect = null;
-    if (this.selectionMode !== 'cells') return;
-    const ws = this.currentWorksheet;
-    const active = this.activeCell;
-    if (!ws || !active) return;
-    const dv = findListValidationAt(ws.dataValidations, active.row, active.col);
-    if (!dv) return;
-
-    const rect = this._cellRect(active.row, active.col);
-    if (!rect) return;
-
-    // Excel's dropdown button is a fixed square sized to the cell height,
-    // clamped to a sensible range so it stays usable at small zoom and doesn't
-    // dominate tall rows. The arrow glyph is centered inside.
-    const cs = this.viewport.scale;
-    const headerW = Math.round(HEADER_W * cs);
-    const headerH = Math.round(HEADER_H * cs);
-    const side = Math.max(14, Math.min(rect.h, 22 * cs));
-    // Button sits flush to the right of the cell, top-aligned with it.
-    const btnLogicalX = rect.x + rect.w;
-    const btnY = rect.y;
-    // Cull when the active cell (hence its button) is scrolled behind the
-    // fixed headers.
-    if (btnLogicalX + side <= headerW || btnY + side <= headerH) return;
-
-    const screenLeft = this.screenX(btnLogicalX, side);
-
-    const btn = this.hostDocument.createElement('div');
-    btn.setAttribute('data-xlsx-validation-dropdown', '');
-    btn.style.cssText =
-      `position:absolute;` +
-      `left:${screenLeft}px;top:${btnY}px;width:${side}px;height:${side}px;` +
-      `box-sizing:border-box;display:flex;align-items:center;justify-content:center;` +
-      // Match Excel's grey button chrome; non-interactive (display only).
-      `background:#f0f0f0;border:1px solid #7f7f7f;pointer-events:none;`;
-    const arrow = Math.max(4, Math.round(side * 0.42));
-    btn.innerHTML =
-      `<svg width="${arrow}" height="${arrow}" viewBox="0 0 10 6" aria-hidden="true">` +
-      `<path d="M0 0 L10 0 L5 6 Z" fill="#333"/></svg>`;
-    this.overlayHost.appendSelection(btn);
-
-    // Record the arrow's on-screen rect (canvasArea space) for pointer
-    // hit-testing. The button element has pointer-events:none, so clicks fall
-    // through to the scrollHost where the pointerdown handler tests this rect.
-    this.validationArrowRect = { x: screenLeft, y: btnY, w: side, h: side };
-
-    // Keep an already-open panel glued to the arrow as the grid scrolls. If the
-    // active cell's validation differs from the open panel (selection moved),
-    // close it instead.
-    if (this.validationPanel.style.display !== 'none') {
-      if (this.validationPanelKey === `${active.row}:${active.col}`) {
-        this.positionValidationPanel();
-      } else {
-        this.hideValidationPanel();
-      }
-    }
   }
 
   // ─── IX2 find-highlight overlay ──────────────────────────────────────────
@@ -2961,153 +2890,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.setViewportLeft(offset.x);
   }
 
-  // ─── List data-validation dropdown panel (display-only) ───────────────────
-
-  /** Toggle the dropdown panel for the active cell's list validation. Called
-   *  from pointerdown when the arrow rect is hit. Re-clicking the same arrow
-   *  closes it. */
-  private toggleValidationPanel(): void {
-    const ws = this.currentWorksheet;
-    const active = this.activeCell;
-    if (!ws || !active) return;
-    const key = `${active.row}:${active.col}`;
-    if (this.validationPanelKey === key) {
-      this.hideValidationPanel();
-      return;
-    }
-    const dv = findListValidationAt(ws.dataValidations, active.row, active.col);
-    if (!dv) return;
-    this.hideValidationPanel();
-    this.validationPanelKey = key;
-    void this.openValidationPanel(active, dv.formula1);
-  }
-
-  /** Resolve the allowed values for `formula1` (relative to the current sheet)
-   *  and render them in the panel anchored below the active cell. Async because
-   *  cross-sheet range references may need a lazily-parsed worksheet. */
-  private async openValidationPanel(cell: CellAddress, formula1: string | undefined): Promise<void> {
-    const generation = ++this.validationRequestGeneration;
-    const workbook = this.wb;
-    const sheet = this.currentSheet;
-    if (!workbook || this._destroyed) return;
-    let resolved: ResolvedList;
-    try {
-      resolved = await workbook.resolveValidationList(sheet, formula1);
-    } catch {
-      if (!this.isCurrentValidationRequest(generation, workbook, sheet, cell)) return;
-      // A resolution failure (e.g. a missing sheet) must not break the viewer;
-      // fall back to disclosing the raw formula.
-      resolved = { kind: 'formula', formula: formula1 ?? '' };
-    }
-    if (!this.isCurrentValidationRequest(generation, workbook, sheet, cell)) return;
-
-    this.renderValidationPanel(resolved);
-    this.positionValidationPanel();
-    this.installValidationOutsideHandler();
-  }
-
-  private isCurrentValidationRequest(
-    generation: number,
-    workbook: XlsxWorkbook,
-    sheet: number,
-    cell: CellAddress,
-  ): boolean {
-    const active = this.activeCell;
-    return !this._destroyed
-      && generation === this.validationRequestGeneration
-      && this.wb === workbook
-      && this.currentSheet === sheet
-      && this.validationPanelKey === `${cell.row}:${cell.col}`
-      && active?.row === cell.row
-      && active?.col === cell.col;
-  }
-
-  /** Build the panel's children. Uses textContent throughout (no HTML injection
-   *  from cell values). Items highlight on hover but are NOT selectable —
-   *  this is a read-only viewer, so clicking a value must not change the cell. */
-  private renderValidationPanel(resolved: ResolvedList): void {
-    const panel = this.validationPanel;
-    panel.textContent = '';
-    if (resolved.kind === 'formula' || resolved.values.length === 0) {
-      // Unresolved operand (named range / complex formula) or an empty range:
-      // disclose the formula / a placeholder rather than showing a blank box.
-      const note = this.hostDocument.createElement('div');
-      note.style.cssText = 'padding:4px 8px;color:#666;font-style:italic;white-space:pre-wrap;word-break:break-word;';
-      note.textContent =
-        resolved.kind === 'formula'
-          ? (resolved.formula ? `= ${resolved.formula}` : '(no list)')
-          : '(empty list)';
-      panel.appendChild(note);
-      return;
-    }
-    for (const value of resolved.values) {
-      const item = this.hostDocument.createElement('div');
-      item.setAttribute('data-xlsx-validation-item', '');
-      item.style.cssText = 'padding:3px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default;';
-      item.textContent = value;
-      // Hover highlight only — no click/select (read-only viewer).
-      item.addEventListener('pointerenter', () => {
-        item.style.background = '#cfe3ff';
-      });
-      item.addEventListener('pointerleave', () => {
-        item.style.background = '';
-      });
-      panel.appendChild(item);
-    }
-  }
-
-  /** Position the (already-populated, visible-or-becoming-visible) panel below
-   *  the dropdown arrow / active cell using the pure geometry calculator. */
-  private positionValidationPanel(): void {
-    const active = this.activeCell;
-    if (!active) return;
-    const rect = this._cellRect(active.row, active.col);
-    if (!rect) return;
-    const screenLeft = this.screenX(rect.x, rect.w);
-    // Make it measurable off-screen first so offsetWidth/Height reflect content.
-    this.validationPanel.style.left = '-9999px';
-    this.validationPanel.style.top = '-9999px';
-    this.validationPanel.style.display = 'block';
-    const pos = computeValidationPanelPosition({
-      cell: { x: screenLeft, y: rect.y, w: rect.w, h: rect.h },
-      panel: { w: this.validationPanel.offsetWidth, h: this.validationPanel.offsetHeight },
-      viewport: { w: this.canvasArea.clientWidth, h: this.canvasArea.clientHeight },
-      rtl: this.isRtl,
-    });
-    this.overlayHost.showValidation(pos.left, pos.top);
-  }
-
-  /** Install a document-level pointerdown listener that closes the panel on a
-   *  click outside it (and outside the arrow, which toggles via its own path).
-   *  Removed by {@link hideValidationPanel}. */
-  private installValidationOutsideHandler(): void {
-    if (this.validationOutsideHandler) return;
-    this.validationOutsideHandler = (e: PointerEvent) => {
-      const target = e.target as Node | null;
-      if (target && this.validationPanel.contains(target)) return; // inside panel
-      // A click on the arrow is handled by the scrollHost pointerdown (toggle);
-      // don't double-handle it here. Detect by hit-testing the arrow rect.
-      const { x: ax, y: ay } = this.surface.localPoint(e.clientX, e.clientY);
-      const ar = this.validationArrowRect;
-      if (ar && ax >= ar.x && ax <= ar.x + ar.w && ay >= ar.y && ay <= ar.y + ar.h) {
-        return;
-      }
-      this.hideValidationPanel();
-    };
-    // Capture phase so we see the click before it mutates selection.
-    this.hostDocument.addEventListener('pointerdown', this.validationOutsideHandler, true);
-  }
-
-  /** Hide the panel and detach its outside-click listener. Called on re-click,
-   *  outside click, Esc, scroll, selection change, sheet switch and destroy. */
+  /** Close the list-validation panel and cancel a pending resolution. */
   private hideValidationPanel(): void {
-    this.validationRequestGeneration++;
-    this.overlayHost.hideValidation();
-    this.validationPanelKey = null;
-    if (this.validationOutsideHandler) {
-      this.hostDocument.removeEventListener('pointerdown', this.validationOutsideHandler, true);
-      this.validationOutsideHandler = null;
-    }
+    this.validation.hide();
   }
 
   // ─── Comment hover popup ──────────────────────────────────────────────────
@@ -3659,14 +3444,10 @@ class XlsxViewerEngine implements ZoomableViewer {
       // arrow button drawn on the active cell, toggle the value panel instead of
       // re-selecting the cell. The arrow's rect is in canvasArea space, so map
       // the client point through canvasArea's box.
-      const ar = this.validationArrowRect;
-      if (ar) {
-        const { x: ax, y: ay } = this.surface.localPoint(e.clientX, e.clientY);
-        if (ax >= ar.x && ax <= ar.x + ar.w && ay >= ar.y && ay <= ar.y + ar.h) {
-          e.preventDefault();
-          this.toggleValidationPanel();
-          return;
-        }
+      if (this.validation.hitsArrow(e.clientX, e.clientY)) {
+        e.preventDefault();
+        this.validation.toggle();
+        return;
       }
 
       // A pointerdown on the native scrollbar must not move the cell
@@ -4002,7 +3783,7 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.updateSelectionOverlay();
         this.updateFindOverlay();
         this.emitViewportChange();
-      } else if (e.key === 'Escape' && this.validationPanel.style.display !== 'none') {
+      } else if (e.key === 'Escape' && this.validation.isOpen()) {
         this.hideValidationPanel();
       } else if (e.key === 'Escape' && this.commentPopup.style.display !== 'none') {
         this.hideCommentPopup();
@@ -4422,7 +4203,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.sheetTabs?.destroy();
     this.zoomControl?.destroy();
     this.hideCommentPopup();
-    this.hideValidationPanel();
+    this.validation.destroy();
     // IX2 — drop the find state (matches + cursor) so a stale
     // findNext()/findPrev() after teardown returns null instead of a match
     // pointing into a dead viewer (same fix as DocxViewer/PptxViewer.destroy).
