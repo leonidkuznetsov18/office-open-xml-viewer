@@ -3497,14 +3497,15 @@ function styleFontColor(
 }
 
 /** Rich-text runs as Excel draws them under a table style font color
- *  (measured): a run whose <rPr> color is authored like the Normal style's
- *  (`!ownColor`) takes the table color; a run with its own or automatic color
- *  keeps it. Runs without <rPr> take the base font, whose color the caller
- *  sets to the table color. `tableColor` null (no table color, or the cell's
- *  font color is its own) leaves the runs unchanged. */
+ *  (measured): a run whose <rPr> color is confirmed to be authored like the
+ *  Normal style's (`normalColor`) takes the table color; any other run with
+ *  <rPr> keeps its own color (automatic when it has none). Runs without <rPr>
+ *  take the base font, whose color the caller sets to the table color.
+ *  `tableColor` null (no table color, or the cell's font color is its own)
+ *  leaves the runs unchanged. */
 function richRunsWithTableColor(runs: Run[], tableColor: string | null): Run[] {
   if (tableColor == null) return runs;
-  return runs.map((run) => (run.font && !run.font.ownColor
+  return runs.map((run) => (run.font?.normalColor
     ? { ...run, font: { ...run.font, color: tableColor } }
     : run));
 }

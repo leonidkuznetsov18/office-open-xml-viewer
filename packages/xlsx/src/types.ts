@@ -1004,10 +1004,10 @@ export interface RunFont {
    * Absent leaves the run on the baseline.
    */
   vertAlign?: 'superscript' | 'subscript';
-  /** The run's `<rPr>` color is its own formatting: authored differently from
-   *  the Normal style font's color, or absent (automatic). Excel draws it over
-   *  a table style's font color. Omitted = false. */
-  ownColor?: boolean;
+  /** The run's `<rPr>` color is confirmed to be authored exactly like the
+   *  Normal style font's color. Excel then draws a table style's font color
+   *  over it; any other run keeps its own color. Omitted = false. */
+  normalColor?: boolean;
 }
 
 export interface SharedString {

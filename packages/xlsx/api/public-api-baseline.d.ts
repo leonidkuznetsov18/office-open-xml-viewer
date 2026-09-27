@@ -1786,7 +1786,7 @@ export interface RunFont {
     name?: string | null;
     underlineStyle?: string;
     vertAlign?: 'superscript' | 'subscript';
-    ownColor?: boolean;
+    normalColor?: boolean;
 }
 export interface SecondaryValueAxis {
     style?: ChartExElementStyle | null;

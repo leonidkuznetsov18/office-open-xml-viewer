@@ -1687,12 +1687,11 @@ pub struct RunFont {
     /// "baseline". Absent leaves the run on the baseline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vert_align: Option<String>,
-    /// The run's `<rPr>` color is its own formatting rather than the Normal
-    /// style's: authored differently from the Normal cell style font's
-    /// color, or absent (automatic). Excel then draws it over a table
-    /// style's font color. Omitted when false.
+    /// The run's `<rPr>` color is confirmed to be authored exactly like the
+    /// Normal cell style font's color. Excel then draws a table style's font
+    /// color over it; any other run keeps its own color. Omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub own_color: bool,
+    pub normal_color: bool,
     /// Parser-internal canonical key of the authored `<color>` (None: no
     /// `<color>`), compared with the Normal style once styles are read.
     #[serde(skip)]
