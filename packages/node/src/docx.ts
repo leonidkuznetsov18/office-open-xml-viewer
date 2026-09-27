@@ -87,7 +87,7 @@ export async function openDocxDocument(
   options: OpenDocxDocumentOptions,
 ): Promise<DocxDocumentSession> {
   if (!options?.factory) throw new TypeError('openDocxDocument requires a canvas factory');
-  if (options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
     const { openDocxSource } = await import('./docx-model-source.ts');
     return openDocxSource(buffer, options, getDocxWasmModule);
   }
@@ -146,7 +146,7 @@ export async function materializeDocxDocument(
   buffer: ArrayBuffer | Uint8Array,
   options: OoxmlNodeSessionOptions = {},
 ): Promise<DocxDocumentModel> {
-  if (options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
     const { materializeDocxSource } = await import('./docx-model-source.ts');
     return materializeDocxSource(buffer, options, getDocxWasmModule);
   }
@@ -367,3 +367,4 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   error.name = 'AbortError';
   throw error;
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

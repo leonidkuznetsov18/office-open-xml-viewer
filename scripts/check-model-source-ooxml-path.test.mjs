@@ -8,6 +8,10 @@ test('an OOXML await added outside a selected-source branch fails the AST audit'
   assert.throws(() => auditAwaitCase('sample.ts', 'load', previous, changed), /OOXML awaits changed/);
   const sourceOnly = 'async function load() { if (opts.modelSources !== undefined) await helper(); await open(); await parse(); }';
   assert.equal(auditAwaitCase('sample.ts', 'load', previous, sourceOnly), 2);
+  const gatedSourceOnly = 'async function load() { if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) await helper(); await open(); await parse(); }';
+  assert.equal(auditAwaitCase('sample.ts', 'load', previous, gatedSourceOnly), 2);
+  const inverted = 'async function load() { if (__OOXML_MODEL_SOURCES__ && opts.modelSources === undefined) await helper(); await open(); await parse(); }';
+  assert.throws(() => auditAwaitCase('sample.ts', 'load', previous, inverted), /OOXML awaits changed/);
 });
 
 test('XLSX construction and parse must share one host.run', () => {
