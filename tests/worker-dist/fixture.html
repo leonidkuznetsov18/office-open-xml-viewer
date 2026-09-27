@@ -22,7 +22,6 @@
     import { threeD } from '/dist/three-d.mjs';
     import { regionMap } from '/dist/region-map.mjs';
     import { chartEx } from '/dist/chart-ex.mjs';
-    import { legacyDocSource } from '/dist/legacy-doc.mjs';
     import { runModelSourceStages } from '/tests/worker-dist/model-source-stages.mjs';
 
     const renderers = { math, threeD, regionMap, chartEx };
@@ -148,6 +147,8 @@
       if (new URLSearchParams(location.search).has('pause-sources')) {
         await new Promise((resolve) => { window.resumeSourceStages = resolve; });
       }
+      // The optional legacy entry is part of the selected-source stage.
+      const { legacyDocSource } = await import('/dist/legacy-doc.mjs');
       await runModelSourceStages({
         DocxDocument,
         DocxViewer,

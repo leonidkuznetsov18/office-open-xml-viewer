@@ -5,7 +5,6 @@ import { math } from '@silurus/ooxml/math';
 import { threeD } from '@silurus/ooxml/three-d';
 import { regionMap } from '@silurus/ooxml/region-map';
 import { chartEx } from '@silurus/ooxml/chart-ex';
-import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
 import { runModelSourceStages } from '../model-source-stages.mjs';
 
 const renderers = { math, threeD, regionMap, chartEx };
@@ -129,6 +128,7 @@ try {
   if (new URLSearchParams(location.search).has('pause-sources')) {
     await new Promise((resolve) => { window.resumeSourceStages = resolve; });
   }
+  const { legacyDocSource } = await import('@silurus/ooxml/legacy-doc');
   await runModelSourceStages({
     DocxDocument,
     DocxViewer,
