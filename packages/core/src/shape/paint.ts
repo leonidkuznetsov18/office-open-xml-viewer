@@ -171,13 +171,12 @@ export function resolveFill(
   if (!fill || fill.fillType === 'none') return null;
   if (fill.fillType === 'solid') return hexToRgba(fill.color);
   if (fill.fillType === 'pattern') {
-    const origin = activePatternOrigin.get(ctx);
     const slideRoot = activePatternCoordinateRoot.get(ctx);
     return resolvePatternFill(
       fill, ctx, patternPtToUserUnits ?? activePatternPointScale.get(ctx) ?? 4 / 3,
       patternCoordinateTransform ?? (slideRoot
         ? patternTransformToRoot(ctx.getTransform(), slideRoot)
-        : origin ? { e: origin.x, f: origin.y } : undefined),
+        : undefined),
     );
   }
   if (fill.fillType === 'gradient') {
@@ -249,11 +248,9 @@ export function resolveFill(
 // Chart families resolve fills through many shared painters. A chart installs
 // its host's point scale for the duration of the render, so chart-space,
 // series, legend, labels, markers and optional 3-D paths use the same units.
-// XLSX also supplies the chart drawing object's origin for pattern phase. The
-// scope changes no canvas geometry, so a chart without patterns paints exactly
-// as before. Both values are restored for nested charts and later shapes.
+// The scope changes no canvas geometry, so a chart without patterns paints
+// exactly as before. The scale is restored for nested charts and later shapes.
 const activePatternPointScale = new WeakMap<CanvasRenderingContext2D, number>();
-const activePatternOrigin = new WeakMap<CanvasRenderingContext2D, { x: number; y: number }>();
 type PatternMatrix = { a: number; b: number; c: number; d: number; e: number; f: number };
 const activePatternCoordinateRoot = new WeakMap<CanvasRenderingContext2D, PatternMatrix>();
 
@@ -304,20 +301,14 @@ export function withPatternPointScale<T>(
   ctx: CanvasRenderingContext2D,
   ptToUserUnits: number,
   paint: () => T,
-  origin?: { x: number; y: number },
 ): T {
   const previous = activePatternPointScale.get(ctx);
-  const previousOrigin = activePatternOrigin.get(ctx);
   activePatternPointScale.set(ctx, ptToUserUnits);
-  if (origin) activePatternOrigin.set(ctx, origin);
-  else activePatternOrigin.delete(ctx);
   try {
     return paint();
   } finally {
     if (previous === undefined) activePatternPointScale.delete(ctx);
     else activePatternPointScale.set(ctx, previous);
-    if (previousOrigin === undefined) activePatternOrigin.delete(ctx);
-    else activePatternOrigin.set(ctx, previousOrigin);
   }
 }
 
@@ -340,7 +331,7 @@ export function withInheritedPatternScope<T>(
     : paint();
   return scale === undefined
     ? run()
-    : withPatternPointScale(target, scale, run, activePatternOrigin.get(source));
+    : withPatternPointScale(target, scale, run);
 }
 
 /**

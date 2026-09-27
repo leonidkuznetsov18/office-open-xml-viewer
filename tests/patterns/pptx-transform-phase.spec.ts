@@ -51,3 +51,41 @@ test('PowerPoint pattern cells keep slide phase through rotation and reflection'
     ]);
   }
 });
+
+test('transparent picture backing keeps the slide pattern grid through rotation and flip', async ({ page }) => {
+  const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
+  await page.addScriptTag({ content: bundle.output[0].code });
+  const regions = await page.evaluate(async () => {
+    const renderer = (globalThis as typeof globalThis & {
+      pptxRenderer: typeof import('../../packages/pptx/src/renderer.js');
+    }).pptxRenderer;
+    const source = document.createElement('canvas');
+    source.width = source.height = 2;
+    const blob = await new Promise<Blob>((resolve, reject) =>
+      source.toBlob(value => value ? resolve(value) : reject(new Error('PNG encode failed')), 'image/png'));
+    const result: number[][] = [];
+    for (const transform of [
+      { rotation: 0, flipH: false },
+      { rotation: 315, flipH: false },
+      { rotation: 0, flipH: true },
+    ]) {
+      const canvas = document.createElement('canvas');
+      const slide = {
+        index: 0, slideNumber: 1, background: null,
+        elements: [{
+          type: 'picture', x: 100 * 12700, y: 100 * 12700,
+          width: 160 * 12700, height: 160 * 12700,
+          ...transform, flipV: false, imagePath: 'transparent.png', mimeType: 'image/png', stroke: null,
+          fill: { fillType: 'pattern', preset: 'horz', fg: 'D21D54', bg: '12CED4' },
+        }],
+      };
+      await renderer.renderSlide(canvas, slide as never, 960 * 12700, 540 * 12700,
+        { width: 960, dpr: 1, fetchImage: async () => blob });
+      result.push(Array.from(canvas.getContext('2d')!.getImageData(150, 150, 60, 60).data));
+    }
+    return result;
+  });
+  expect(regions[0].some((channel, i) => i % 4 === 0 && channel === 210)).toBe(true);
+  expect(regions[1]).toEqual(regions[0]);
+  expect(regions[2]).toEqual(regions[0]);
+});

@@ -294,7 +294,7 @@ export function paintLayoutPageContent(
   page: LayoutPage,
   context: CanvasPaintContext,
 ): void {
-  // word-drawingml-header-pattern-page-grid: capture the page frame before
+  // word-drawingml-pattern-page-grid: capture the page frame before
   // region, anchor, or shape transforms so the 8pt tile keeps page axes and
   // phase. Only DrawingML shapes consume this frame; chart and VML hosts keep
   // their separate fill-coordinate policies.

@@ -47,6 +47,7 @@ describe('chart preset pattern point units', () => {
       // Chart space, plot area, series and legend are separate render paths.
       expect(matrices.length).toBeGreaterThanOrEqual(4);
       expect(matrices.every(matrix => matrix.a === ptToPx / 8 && matrix.d === ptToPx / 8)).toBe(true);
+      expect(matrices.every(matrix => (matrix.e ?? 0) === 0 && (matrix.f ?? 0) === 0)).toBe(true);
       resolveFill(pattern('pct30'), ctx, 0, 0, 100, 100);
       expect(matrices.at(-1)?.a).toBeCloseTo((4 / 3) / 8);
     } finally {
@@ -54,23 +55,4 @@ describe('chart preset pattern point units', () => {
     }
   });
 
-  it('scopes a chart-local phase to every chart fill and restores it afterward', () => {
-    const prior = globalThis.OffscreenCanvas;
-    vi.stubGlobal('OffscreenCanvas', class {
-      constructor(public width: number, public height: number) {}
-      getContext() { return { fillStyle: '', fillRect() {} }; }
-    });
-    try {
-      const { ctx, matrices } = recordingContext();
-      renderChart(ctx, chart, { x: 20, y: 30, w: 400, h: 300 }, 4 / 3,
-        0, undefined, undefined, undefined, undefined, { x: 20, y: 30 });
-      expect(matrices.length).toBeGreaterThanOrEqual(4);
-      expect(matrices.every(matrix => matrix.e === 20 && matrix.f === 30)).toBe(true);
-      resolveFill(pattern('pct30'), ctx, 0, 0, 100, 100);
-      expect(matrices.at(-1)?.e ?? 0).toBe(0);
-      expect(matrices.at(-1)?.f ?? 0).toBe(0);
-    } finally {
-      vi.stubGlobal('OffscreenCanvas', prior);
-    }
-  });
 });

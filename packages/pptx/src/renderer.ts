@@ -996,7 +996,9 @@ function applyTextRunReflection(
     liveTransform.e - cropX,
     liveTransform.f - cropY,
   );
-  paintText(sourceCtx);
+  // The reflection source is cropped in device space. Carry the slide pattern
+  // frame into that crop so a patterned glyph keeps its original tile phase.
+  withInheritedPatternScope(liveCtx, sourceCtx, () => paintText(sourceCtx), { x: cropX, y: cropY });
   sourceCtx.restore();
 
   const localTop = bbox.y - cropY;
@@ -5083,7 +5085,9 @@ export function renderTextBody(
             ctx,
             (target) => {
               target.font = seg.font;
-              target.fillStyle = seg.color;
+              target.fillStyle = seg.patternFill
+                ? resolveFillCore(seg.patternFill, target, penX, segBaseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
+                : seg.color;
               drawRun(target, 'fill');
             },
             bbox,
@@ -5094,7 +5098,9 @@ export function renderTextBody(
             deviceH,
           );
           ctx.font = seg.font;
-          ctx.fillStyle = seg.color;
+          ctx.fillStyle = seg.patternFill
+            ? resolveFillCore(seg.patternFill, ctx, penX, segBaseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
+            : seg.color;
         }
       }
 
@@ -6152,6 +6158,8 @@ function paintResolvedPicture(
           h: (ctx.canvas as { height: number }).height || 0,
         })
       : rawMask;
+    // The caller paints this prepared picture in the slide pattern scope,
+    // including transparent blip areas and any authored rotation or flip.
     paintWithRasterEffects(
       ctx,
       el,

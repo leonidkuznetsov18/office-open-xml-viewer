@@ -5663,9 +5663,11 @@ function renderCharts(
       regionMap,
       fill => loadedImages?.get(chartImageFillKey(fill)),
       chartEx,
-      // Preserve chart geometry while anchoring its pattern phase to the
-      // drawing object. The origin changes with zoom, not with scroll phase.
-      { x: cx / cs, y: cy / cs },
+      // Excel PDF controls at 75/100/200% view zoom and two scroll positions
+      // retain the same page-grid tile matrix. Moving the chart 5 pt moves its
+      // fill rectangle but leaves that matrix fixed. Keep the chart pattern on
+      // the viewport grid (the existing main policy), while the CTM above
+      // scales each cell with worksheet zoom on screen.
     );
     ctx.restore();
     ctx.restore();

@@ -80,3 +80,39 @@ test('plain PPTX glyph pattern renders on main canvas and OffscreenCanvas worker
   }, { script, slide });
   expect(countColors(new Uint8ClampedArray(worker))).toEqual(mainColors);
 });
+
+test('PPTX pattern glyphs retain their fill with a run reflection on main and worker canvases', async ({ page }) => {
+  test.setTimeout(90_000);
+  const reflectedSlide = structuredClone(slide);
+  reflectedSlide.elements = [reflectedSlide.elements[0]];
+  const run = reflectedSlide.elements[0].textBody.paragraphs[0].runs[0] as Record<string, unknown>;
+  run.reflection = { blur: 0, dist: 25400, dir: 90, stA: 1, stPos: 0, endA: 0, endPos: 1, sx: 1, sy: -1 };
+  const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
+  const script = bundle.output[0].code;
+  await page.addScriptTag({ content: script });
+  const colors = await page.evaluate(async ({ script, slide }) => {
+    const renderer = (globalThis as typeof globalThis & { pptxRenderer: typeof import('../../packages/pptx/src/renderer.js') }).pptxRenderer;
+    const render = async (canvas: HTMLCanvasElement | OffscreenCanvas) => {
+      await renderer.renderSlide(canvas as HTMLCanvasElement, slide as never, 9144000, 6858000, { width: 960, dpr: 1 });
+      const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+      return Array.from(data);
+    };
+    const main = await render(document.createElement('canvas'));
+    const source = `${script}\nself.onmessage = async (event) => { const canvas = new OffscreenCanvas(1, 1); await pptxRenderer.renderSlide(canvas, event.data, 9144000, 6858000, { width: 960, dpr: 1 }); self.postMessage(Array.from(canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data)); };`;
+    const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    try {
+      const worker = new Worker(url);
+      const offscreen = await new Promise<number[]>((resolve, reject) => {
+        worker.onmessage = event => resolve(event.data);
+        worker.onerror = event => reject(new Error(event.message));
+        worker.postMessage(slide);
+      });
+      worker.terminate();
+      return { main, offscreen };
+    } finally { URL.revokeObjectURL(url); }
+  }, { script, slide: reflectedSlide });
+  const mainColors = countColors(new Uint8ClampedArray(colors.main));
+  expect(mainColors.red).toBeGreaterThan(50);
+  expect(mainColors.cyan).toBeGreaterThan(50);
+  expect(countColors(new Uint8ClampedArray(colors.offscreen))).toEqual(mainColors);
+});

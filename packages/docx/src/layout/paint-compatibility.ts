@@ -1,15 +1,15 @@
 import { defineCompatibilityRule } from './compatibility.js';
 
-export const WORD_DRAWINGML_HEADER_PATTERN_PAGE_GRID = defineCompatibilityRule({
-  id: 'word-drawingml-header-pattern-page-grid',
+export const WORD_DRAWINGML_PATTERN_PAGE_GRID = defineCompatibilityRule({
+  id: 'word-drawingml-pattern-page-grid',
   evidence: {
     kind: 'office-observation',
-    syntheticFixtureId: 'header-drawingml-pattern-phase-controls',
+    syntheticFixtureId: 'header-body-footer-drawingml-pattern-phase-controls',
     application: 'Microsoft Word',
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'Header-anchored DrawingML pct50 and dnDiag fills use a 64×64 image tile at 8pt, with 1pt cells on the page-origin 8pt grid. Unrotated, 315-degree rotated, and page-sized controls preserve page axes and cell size. Chart and VML hosts are outside this rule.',
+  description: 'Header, body and footer anchored DrawingML pct50 and dnDiag fills use a 64×64 image tile at 8pt, with 1pt cells on the page-origin 8pt grid. All three stories preserve page axes under 315-degree rotation; header page-sized controls do as well. Chart and VML hosts are outside this rule.',
 });
 
 export const WORD_VML_TEXTPATH_IMAGE_PATTERN_SOLID = defineCompatibilityRule({

@@ -79,7 +79,7 @@ test('worksheet shape pattern scales with zoom through renderViewport', async ({
   expect(samples[2]).toBeCloseTo(8 * 8 / 3, 0);
 });
 
-test('chart pattern phase follows its anchor while scrolling', async ({ page }) => {
+test('chart pattern keeps the fixed viewport grid while scrolling', async ({ page }) => {
   const samples = await page.evaluate(({ worksheet, styles, fill }) => {
     const renderer = (globalThis as typeof globalThis & {
       xlsxRenderer: typeof import('../../packages/xlsx/src/renderer.js');
@@ -90,10 +90,12 @@ test('chart pattern phase follows its anchor while scrolling', async ({ page }) 
       showLegend: false, showDataLabels: false,
       catAxisHidden: true, valAxisHidden: true,
     };
-    const frames: Array<{ minX: number; minY: number; pixels: number[] }> = [];
+    const outputs: Array<{ scale: number; period: number; frames: Array<{ pixels: number[] }> }> = [];
+    for (const cellScale of [1, 2]) {
+    const frames: Array<{ minX: number; minY: number; data: Uint8ClampedArray; width: number }> = [];
     for (const scrollOffsetX of [0, 3]) {
       const canvas = document.createElement('canvas');
-      canvas.width = 1100; canvas.height = 500;
+      canvas.width = 2200; canvas.height = 1000;
       const ctx = canvas.getContext('2d')!;
       renderer.renderViewport(ctx, {
         ...worksheet,
@@ -102,7 +104,7 @@ test('chart pattern phase follows its anchor while scrolling', async ({ page }) 
           toCol: 8, toColOff: 0, toRow: 12, toRowOff: 0,
           chart,
         }],
-      } as never, styles as never, { row: 1, col: 1, rows: 25, cols: 15 }, { scrollOffsetX });
+      } as never, styles as never, { row: 1, col: 1, rows: 25, cols: 15 }, { scrollOffsetX, cellScale });
       const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
       let minX = canvas.width, minY = canvas.height;
       for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
@@ -111,17 +113,36 @@ test('chart pattern phase follows its anchor while scrolling', async ({ page }) 
           minX = Math.min(minX, x); minY = Math.min(minY, y);
         }
       }
-      const pixels: number[] = [];
-      for (let y = 25; y < 55; y++) for (let x = 25; x < 55; x++) {
-        const p = ((minY + y) * canvas.width + minX + x) * 4;
-        pixels.push(data[p], data[p + 1], data[p + 2]);
-      }
-      frames.push({ minX, minY, pixels });
+      frames.push({ minX, minY, data, width: canvas.width });
     }
-    return frames;
+    const x0 = Math.max(...frames.map(frame => frame.minX)) + 25;
+    const y0 = Math.max(...frames.map(frame => frame.minY)) + 25;
+    const first = frames[0];
+    const starts: number[] = [];
+    const stripeY = first.minY + 5 * cellScale;
+    let priorRed = false;
+    for (let x = first.minX; x < first.minX + 150 * cellScale; x++) {
+      const p = (stripeY * first.width + x) * 4;
+      const red = first.data[p] > 180 && first.data[p + 1] < 70 && first.data[p + 2] < 130;
+      if (red && !priorRed) starts.push(x);
+      priorRed = red;
+    }
+    outputs.push({ scale: cellScale, period: starts.length > 5 ? (starts[5] - starts[1]) / 4 : 0, frames: frames.map(frame => {
+      const pixels: number[] = [];
+      for (let y = y0; y < y0 + 30; y++) for (let x = x0; x < x0 + 30; x++) {
+        const p = (y * frame.width + x) * 4;
+        pixels.push(frame.data[p], frame.data[p + 1], frame.data[p + 2]);
+      }
+      return { pixels };
+    }) });
+    }
+    return outputs;
   }, { worksheet: baseWorksheet, styles, fill });
-  expect(samples[0].minX - samples[1].minX).toBe(3);
-  expect(samples[0].pixels).toEqual(samples[1].pixels);
+  // A fixed grid can move the first red stripe by a whole cell when the chart
+  // clip moves three pixels, so compare a shared viewport rectangle instead.
+  for (const sample of samples) expect(sample.frames[0].pixels).toEqual(sample.frames[1].pixels);
+  expect(samples[0].period).toBeCloseTo(8 * 4 / 3, 0);
+  expect(samples[1].period).toBeCloseTo(16 * 4 / 3, 0);
 });
 
 test('shape rotation and reflection transform the geometry while preserving the pattern grid', async ({ page }) => {

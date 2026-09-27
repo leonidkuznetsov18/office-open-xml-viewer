@@ -364,9 +364,9 @@ function renderChartImpl(
   }
 }
 
-/** Paint a chart in the host's user units. `patternOrigin`, when supplied by
- * the worksheet renderer, phases every chart fill from that drawing object's
- * anchor without changing chart geometry or non-pattern pixels. */
+/** Paint a chart in the host's user units. Excel's chart PDF controls keep a
+ * fixed page-grid phase when its chart anchor moves; the host supplies only
+ * the point-to-user-unit scale. */
 export function renderChart(
   ctx: CanvasRenderingContext2D,
   chart: ChartModel,
@@ -377,7 +377,6 @@ export function renderChart(
   regionMap?: ChartRegionMapRenderer,
   imageLookup?: ChartImageLookup,
   chartEx?: ChartExRenderer,
-  patternOrigin?: { x: number; y: number },
 ): void {
   withPatternPointScale(ctx, ptToPx, () => withChartStyleIndexCache(() => {
     withSparseStyleIndexCache(() => {
@@ -400,5 +399,5 @@ export function renderChart(
         }, undefined, effectConsumers);
       });
     });
-  }), patternOrigin);
+  }));
 }

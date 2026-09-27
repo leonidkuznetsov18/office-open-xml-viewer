@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const entry = fileURLToPath(new URL('../../packages/docx/src/paint/canvas-page.ts', import.meta.url));
 
-test('header DrawingML watermark retains the page grid through rotation and page sizing', async ({ page }) => {
+test('header, body and footer DrawingML patterns retain the page grid through rotation', async ({ page }) => {
   const bundle = await build({ input: entry, output: { format: 'iife', name: 'docxPage' }, platform: 'browser' });
   await page.addScriptTag({ content: bundle.output[0].code });
   const samples = await page.evaluate(async () => {
@@ -14,16 +14,20 @@ test('header DrawingML watermark retains the page grid through rotation and page
     const results: number[][][] = [];
     for (const scale of [1, 2]) {
       const cases: number[][] = [];
-      for (const [rotationDeg, size] of [[0, 160], [315, 160], [315, 280]] as const) {
+      for (const [story, rotationDeg, size] of [
+        ['header', 0, 160], ['header', 315, 160], ['header', 315, 280],
+        ['body', 0, 160], ['body', 315, 160],
+        ['footer', 0, 160], ['footer', 315, 160],
+      ] as const) {
         const canvas = document.createElement('canvas');
         // Deliberately offset the shape from the 8-point page grid.
         const x = (320 - size) / 2 + 3;
         const y = (320 - size) / 2 + 5;
         const bounds = { xPt: x, yPt: y, widthPt: size, heightPt: size };
         const drawing = {
-          kind: 'drawing', id: 'header-watermark',
-          source: { story: 'header', storyInstance: 'default', path: [0] },
-          flowDomainId: 'header', flowBounds: bounds, inkBounds: bounds,
+          kind: 'drawing', id: `${story}-pattern`,
+          source: { story, storyInstance: 'default', path: [0] },
+          flowDomainId: story, flowBounds: bounds, inkBounds: bounds,
           advancePt: 0, ordinaryFlow: false,
           commands: [{ kind: 'drawingml-shape', plan: {
             rect: { x, y, w: size, h: size },
@@ -37,9 +41,9 @@ test('header DrawingML watermark retains the page grid through rotation and page
           geometry: { widthPt: 320, heightPt: 320 },
           flowDomains: [], sectionRegions: [], columnSeparators: [], pageBorder: null,
           layers: { paintOrder: [{
-            kind: 'drawing', layer: 'behindText', sourceLayer: 'header',
-            rootNodeId: 'header-watermark', coordinateSpace: 'section-logical',
-            flowDomainId: 'header', node: drawing, textBoxes: [], frames: [],
+            kind: 'drawing', layer: 'behindText', sourceLayer: story,
+            rootNodeId: `${story}-pattern`, coordinateSpace: 'section-logical',
+            flowDomainId: story, node: drawing, textBoxes: [], frames: [],
             layoutTranslationPt: { xPt: 0, yPt: 0 },
           }] },
         }], diagnostics: [] };
@@ -53,10 +57,6 @@ test('header DrawingML watermark retains the page grid through rotation and page
     return results;
   });
   for (const scaleCases of samples) {
-    expect(scaleCases).toEqual([
-      [210, 18, 18, 210, 210, 18],
-      [210, 18, 18, 210, 210, 18],
-      [210, 18, 18, 210, 210, 18],
-    ]);
+    expect(scaleCases).toEqual(Array.from({ length: 7 }, () => [210, 18, 18, 210, 210, 18]));
   }
 });

@@ -4,6 +4,40 @@ import { fileURLToPath } from 'node:url';
 
 const paintEntry = fileURLToPath(new URL('../../packages/core/src/shape/paint.ts', import.meta.url));
 const chartEntry = fileURLToPath(new URL('../../packages/core/src/chart/renderer.ts', import.meta.url));
+const bitmapEntry = fileURLToPath(new URL('../../packages/core/src/shape/pattern-bitmaps.ts', import.meta.url));
+
+test('translucent diagonal tile stores independent foreground, midpoint and background alpha', async ({ page }) => {
+  const bundle = await build({ input: bitmapEntry, output: { format: 'iife', name: 'patternBitmap' }, platform: 'browser' });
+  await page.addScriptTag({ content: bundle.output[0].code });
+  const cells = await page.evaluate(() => {
+    const bitmap = (globalThis as typeof globalThis & {
+      patternBitmap: typeof import('../../packages/core/src/shape/pattern-bitmaps.js');
+    }).patternBitmap;
+    return [
+      ['D21D5480', '12CED480'],
+      ['D21D5440', '12CED4BF'],
+      ['D21D5400', '12CED480'],
+      ['D21D54FF', '12CED400'],
+    ].map(([fg, bg]) => {
+      const tile = bitmap.buildPatternBitmap('dnDiag', fg, bg)!;
+      const ctx = tile.getContext('2d')!;
+      return [4, 12, 20].map(x => Array.from(ctx.getImageData(x, 4, 1, 1).data));
+    });
+  });
+  const expected = [
+    [[210, 29, 84, 128], [114, 118, 148, 128], [18, 206, 212, 128]],
+    [[210, 29, 84, 64], [114, 118, 148, 128], [18, 206, 212, 191]],
+    [[0, 0, 0, 0], [114, 118, 148, 64], [18, 206, 212, 128]],
+    [[210, 29, 84, 255], [114, 118, 148, 128], [0, 0, 0, 0]],
+  ];
+  for (let caseIndex = 0; caseIndex < expected.length; caseIndex++) {
+    for (let cellIndex = 0; cellIndex < 3; cellIndex++) {
+      for (let channel = 0; channel < 4; channel++) {
+        expect(Math.abs(cells[caseIndex][cellIndex][channel] - expected[caseIndex][cellIndex][channel])).toBeLessThanOrEqual(2);
+      }
+    }
+  }
+});
 
 test('preset cells stay uniformly coloured in Chrome at several point scales', async ({ page }) => {
   const bundle = await build({
@@ -37,7 +71,7 @@ test('preset cells stay uniformly coloured in Chrome at several point scales', a
   }
 });
 
-test('chart effect surfaces inherit point scale and drawing-object phase', async ({ page }) => {
+test('chart effect surfaces inherit point scale and fixed page phase', async ({ page }) => {
   const bundle = await build({
     input: chartEntry,
     output: { format: 'iife', name: 'patternChart' },
@@ -69,14 +103,14 @@ test('chart effect surfaces inherit point scale and drawing-object phase', async
       (globalThis as typeof globalThis & {
         patternChart: typeof import('../../packages/core/src/chart/renderer.js');
       }).patternChart.renderChart(ctx, chart as never, { x: 20, y: 30, w: 400, h: 300 }, 1,
-        0, undefined, undefined, undefined, undefined, { x: 20, y: 30 });
+        0, undefined, undefined, undefined, undefined);
       return recorded;
     } finally {
       CanvasPattern.prototype.setTransform = original;
     }
   });
   expect(matrices.length).toBeGreaterThanOrEqual(2);
-  expect(matrices.every(([a, d, e, f]) => a === 1 / 8 && d === 1 / 8 && e === 20 && f === 30)).toBe(true);
+  expect(matrices.every(([a, d, e, f]) => a === 1 / 8 && d === 1 / 8 && e === 0 && f === 0)).toBe(true);
 });
 
 test('a scaled and rotated group keeps the slide pattern grid', async ({ page }) => {
