@@ -201,6 +201,9 @@ export class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
         this.signal,
       )) {
         if (this.closed) throw new Error('XLSX workbook session is closed');
+        // Browser viewers may paint from this provisional shell. The Node row
+        // stream keeps its established rows-then-terminal contract.
+        if (unit.kind === 'preview') continue;
         if (unit.kind === 'rows') {
           this.rowBatches += 1;
           this.emittedRows += unit.rows.length;

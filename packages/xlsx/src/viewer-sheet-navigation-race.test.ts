@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { XlsxViewer } from './viewer.js';
 import { XlsxWorkbook } from './workbook.js';
+import { WorksheetPreview } from './internal/worksheet-preview.js';
 import type { Worksheet } from './types.js';
 import { installDom, makeContainer } from './viewer-destroy-test-dom.js';
 
@@ -61,11 +62,182 @@ function buildViewer(onSheetChange = vi.fn(), names = ['A', 'B']) {
     'buildCommentMap', 'buildHyperlinkMap', 'buildOutline', 'layoutGutters', 'updateSpacerSize',
     'resetHorizontalScroll', 'updateFindOverlay', 'emitViewportChange',
   ]) engine[method] = vi.fn();
-  engine.renderCurrentSheet = vi.fn(async () => undefined);
+  engine.renderCurrentSheet = vi.fn(async () => {
+    // The render double represents a committed first frame.
+    engine.firstPreviewRender = false;
+    engine.committedFrameCount = Number(engine.committedFrameCount) + 1;
+  });
   return { viewer, engine, workbook, requests, onSheetChange, container };
 }
 
 describe('XlsxViewer sheet acquisition generation', () => {
+  it('covers the viewport after saved hidden rows are restored while the pull continues', async () => {
+    const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
+    delete engine.renderCurrentSheet;
+    const model = worksheet('A');
+    const progress = new WorksheetPreview([]);
+    progress.preview(model, null, 1_000, 1);
+    progress.append(Array.from({ length: 128 }, (_, i) => ({ index: i + 1, height: null, cells: [] })));
+    const completion = deferred<Worksheet>();
+    const sizes = engine.sizeOverrideStore as Map<number, unknown>;
+    sizes.set(0, {
+      rows: new Map(Array.from({ length: 200 }, (_, i) => [i + 1, 0])),
+      automaticRows: new Map(), cols: new Map(), revision: 1,
+    });
+    const area = engine.canvasArea as { clientWidth: number; clientHeight: number };
+    area.clientWidth = 800;
+    area.clientHeight = 600;
+    let requestedRow = 0;
+    let renderRow = 0;
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: async () => ({
+        worksheet: model, release: vi.fn(), partial: true, completion: completion.promise,
+        waitForRows: (row: number) => { requestedRow = row; return progress.waitFor(row); },
+      }),
+      renderViewport: async (_target: unknown, _index: number, range: { row: number; rows: number }) => {
+        renderRow = range.row + range.rows - 1;
+        await progress.waitFor(renderRow);
+      },
+    });
+
+    const shown = engine.showSheet(0);
+    // Subsequent row chunks do not wait for the provisional render. In the
+    // old handshake, restoring rows 1–200 as hidden made paint wait for rows
+    // beyond the paused chunk and neither side could resume.
+    progress.append(Array.from({ length: 128 }, (_, i) => ({ index: i + 129, height: null, cells: [] })));
+    await shown;
+    expect(requestedRow).toBeGreaterThan(128);
+    expect(renderRow).toBeLessThanOrEqual(progress.coveredThrough);
+    progress.finish(model);
+    completion.resolve(model);
+    viewer.destroy();
+  });
+
+  it.each([
+    ['frozen row', 1, 0, 1, 2],
+    ['frozen column', 0, 1, 2, 1],
+    ['frozen corner', 1, 1, 1, 1],
+  ] as const)('checks conditional formatting in the %s before provisional paint',
+    async (_region, freezeRows, freezeCols, row, col) => {
+    const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
+    const model = worksheet('A');
+    model.freezeRows = freezeRows;
+    model.freezeCols = freezeCols;
+    model.conditionalFormats = [{
+      sqref: [{ top: row, left: col, bottom: row, right: col }],
+      rules: [{ type: 'cellIs', operator: 'greaterThan', formulas: ['A500'], dxfId: 0, priority: 1 }],
+    }];
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: async () => ({
+        worksheet: model, release: vi.fn(), partial: true,
+        completion: Promise.resolve(model), waitForRows: async () => undefined,
+      }),
+    });
+    await engine.showSheet(0);
+    expect(engine.previewFallbackReason).toBe('conditional-format-range');
+    viewer.destroy();
+  });
+
+  it('waits for a committed frame when completion supersedes the first paint', async () => {
+    const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
+    const completion = deferred<Worksheet>();
+    const model = worksheet('A');
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: vi.fn(async () => ({
+        worksheet: model, release: vi.fn(), partial: true,
+        completion: completion.promise, waitForRows: vi.fn(async () => undefined),
+        releaseFirstPaint: vi.fn(),
+      })),
+    });
+    engine.scheduleRender = vi.fn();
+    let attempts = 0;
+    engine.renderCurrentSheet = vi.fn(async () => {
+      attempts++;
+      if (attempts === 1) {
+        completion.resolve(model);
+        await Promise.resolve();
+        // The completion callback has invalidated this in-flight frame.
+        return;
+      }
+      engine.committedFrameCount = Number(engine.committedFrameCount) + 1;
+    });
+
+    await engine.showSheet(0);
+    expect(engine.renderCurrentSheet).toHaveBeenCalledTimes(2);
+    expect(attempts).toBe(2);
+    viewer.destroy();
+  });
+
+  it('clears a provisional frame and reports a pull failure after first paint', async () => {
+    const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
+    const onError = vi.fn();
+    (engine.opts as { onError?: (error: Error) => void }).onError = onError;
+    let rejectCompletion!: (error: Error) => void;
+    const completion = new Promise<Worksheet>((_, reject) => { rejectCompletion = reject; });
+    const release = vi.fn();
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: vi.fn(async () => ({
+        worksheet: worksheet('A'), release, partial: true, completion,
+        waitForRows: vi.fn(async () => undefined),
+      })),
+    });
+
+    await engine.showSheet(0);
+    expect(engine.currentWorksheet).not.toBeNull();
+    const error = new Error('row pull failed');
+    rejectCompletion(error);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(engine.currentWorksheet).toBeNull();
+    expect(release).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(error);
+    viewer.destroy();
+  });
+
+  it('replaces a provisional sheet with the parser placeholder after a late row error', async () => {
+    const { viewer, engine, workbook } = buildViewer(vi.fn(), ['A']);
+    const completion = deferred<Worksheet>();
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: vi.fn(async () => ({
+        worksheet: worksheet('A'), release: vi.fn(), partial: true,
+        completion: completion.promise, waitForRows: vi.fn(async () => undefined),
+        releaseFirstPaint: vi.fn(),
+      })),
+    });
+    engine.scheduleRender = vi.fn();
+
+    await engine.showSheet(0);
+    completion.resolve({ ...worksheet('A'), parseError: 'invalid later cell' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(engine.currentWorksheet?.parseError).toBe('invalid later cell');
+    expect(engine.scheduleRender).toHaveBeenCalled();
+    viewer.destroy();
+  });
+
+  it('ignores an old provisional completion after sheet navigation', async () => {
+    const { viewer, engine, workbook } = buildViewer();
+    const first = deferred<Worksheet>();
+    const firstSheet = worksheet('A');
+    const secondSheet = worksheet('B');
+    Object.assign(workbook, {
+      acquireWorksheetPreviewLease: vi.fn(async (index: number) => index === 0
+        ? { worksheet: firstSheet, release: vi.fn(), partial: true,
+            completion: first.promise, waitForRows: vi.fn(async () => undefined),
+            releaseFirstPaint: vi.fn() }
+        : { worksheet: secondSheet, release: vi.fn(), partial: false,
+            completion: Promise.resolve(secondSheet) }),
+    });
+
+    await engine.showSheet(0);
+    await engine.showSheet(1);
+    first.resolve(firstSheet);
+    await Promise.resolve();
+    expect(engine.currentSheet).toBe(1);
+    expect(engine.currentWorksheet).toMatchObject(secondSheet);
+    viewer.destroy();
+  });
+
   it('releases the outgoing active model so a one-sheet cache can navigate', async () => {
     const { viewer, engine, workbook } = buildViewer();
     let held: number | null = null;
