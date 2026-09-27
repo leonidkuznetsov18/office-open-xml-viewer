@@ -26,11 +26,17 @@
     import { regionMap } from '@ooxml-test-region-map-renderer';
     import { tiff } from '@ooxml-test-tiff-renderer';
 
-    // Text rasterization must not depend on how quickly Vite serves the
-    // fontsource CSS and weight-specific WOFF files. Regression baselines compare
-    // renderer output, so wait for the declared fixture fonts before painting.
-    await document.fonts.ready;
-
+    // These CSS faces have no DOM text consumer. FontFaceSet.ready alone can
+    // resolve before Canvas first requests them, leaving fallback text in the
+    // initial bitmap even if the face has loaded by capture time.
+    const fixtureFaces = [
+      '300 16px "Nunito Sans"',
+      '400 16px "Nunito Sans"',
+      'italic 400 16px "Nunito Sans"',
+      '600 16px "Nunito Sans"',
+      '700 16px "Nunito Sans"',
+      'italic 700 16px "Nunito Sans"',
+    ];
     const params   = new URLSearchParams(location.search);
     const slideIdx = Math.max(0, parseInt(params.get('slide') ?? '0', 10));
     const pptxName = params.get('pptx') ?? 'sample';
@@ -60,6 +66,11 @@
     window.addEventListener('pagehide', destroy, { once: true });
 
     try {
+      await Promise.all(fixtureFaces.map(async (font) => {
+        const loaded = await document.fonts.load(font);
+        if (loaded.length === 0) throw new Error(`fixture font unavailable: ${font}`);
+      }));
+      await document.fonts.ready;
       const resp = await fetch(`/${pptxName}.pptx`);
       if (!resp.ok) throw new Error(`fetch failed: ${resp.status}`);
       const buf = await resp.arrayBuffer();
@@ -68,8 +79,20 @@
       if (slideIdx !== 0) {
         await viewer.goToSlide(slideIdx);
       }
+      const settleSlide = async (slideIndex) => {
+        // The first Canvas paint may discover another font face. Waiting for
+        // that load leaves the original fallback pixels intact, so repaint via
+        // the viewer's paint-completion promise before advertising readiness.
+        await document.fonts.ready;
+        await viewer.goToSlide(slideIndex);
+        await document.fonts.ready;
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      };
+      await settleSlide(slideIdx);
       window.renderPptxVrtSlide = async (slideIndex) => {
         await viewer.goToSlide(slideIndex);
+        await settleSlide(slideIndex);
       };
       document.body.dataset.status = 'ready';
     } catch (err) {
