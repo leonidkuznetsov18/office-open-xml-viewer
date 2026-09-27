@@ -132,9 +132,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
 
   // Take the first section (positive / no-sign section)
   const hasAmPm = hasAmPmToken(section);
-  const eraLocale = sectionEraLocale(section);
-  // Taiwan (ROC) era: 1912 is year 1; earlier years stay Gregorian.
-  const rocYear = yr >= 1912 ? yr - 1911 : yr;
+  const japaneseEra = sectionHasJapaneseLocale(section);
   let era: ReturnType<typeof resolveJpEra> | null = null;
   const getEra = (): ReturnType<typeof resolveJpEra> => era ?? (era = resolveJpEra(date));
 
@@ -242,15 +240,12 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'g' || ch === 'G') {
-      // Era name (§18.8.30 International Considerations). ja-JP:
+      // Era name. Under a `[$-411]` (ja-JP) section, as Excel renders it:
       //   g → 'R' / 'H' / 'S' / 'T' / 'M', gg → '令' …, ggg → '令和' ….
-      // zh-TW: g is gg, the short ROC era name; ggg the long one. Other
-      // locales are not specified and keep the ja-JP names.
+      // Excel draws no era name in any other section (other LCIDs or none).
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'g') { n++; i++; }
-      if (eraLocale === 'zh-TW') {
-        result += n >= 3 ? '中華民國' : '民國';
-      } else {
+      if (japaneseEra) {
         const e = getEra();
         if      (n === 1) result += e.abbr;
         else if (n === 2) result += e.short;
@@ -259,29 +254,28 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'e' || ch === 'E') {
-      // Era year: ja-JP era year (`ee` zero-padded), zh-TW ROC year, and in
-      // other locales `e` becomes `yyyy` and `ee` becomes `yy`.
+      // Era year: under `[$-411]` the Japanese era year (`ee` zero-padded);
+      // Excel renders `e` and `ee` as the four-digit year in any other section.
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'e') { n++; i++; }
-      if (eraLocale === 'other') {
-        result += n >= 2 ? String(yr).slice(-2) : String(yr).padStart(4, '0');
-      } else {
-        const y = eraLocale === 'zh-TW' ? rocYear : getEra().year;
+      if (japaneseEra) {
+        const y = getEra().year;
         result += n >= 2 ? String(y).padStart(2, '0') : String(y);
+      } else {
+        result += String(yr).padStart(4, '0');
       }
       prevWasHour = false;
 
     } else if (ch === 'r' || ch === 'R') {
-      // ja-JP / zh-TW locale codes: in ja-JP `r` becomes `ee` and `rr`
-      // becomes `gggee`; in zh-TW both become `e`. Other locales are not
-      // specified and keep the ja-JP reading.
+      // Under `[$-411]`, `r` is `ee` and `rr` is `gggee` (§18.8.30); Excel
+      // renders both as the four-digit year in any other section.
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'r') { n++; i++; }
-      if (eraLocale === 'zh-TW') {
-        result += String(rocYear);
-      } else {
+      if (japaneseEra) {
         const e = getEra();
         result += (n >= 2 ? e.long : '') + String(e.year).padStart(2, '0');
+      } else {
+        result += String(yr).padStart(4, '0');
       }
       prevWasHour = false;
 
@@ -316,12 +310,12 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   return result;
 }
 
-/** The locale that era codes follow (§18.8.30 International
- *  Considerations): the language ID of a `[$…-LCID]` bracket outside quotes
- *  — 0x0411 ja-JP, 0x0404 zh-TW, any other language `other`. Without one, or
- *  for the system date / time specials (0xF800 / 0xF400), era codes keep the
- *  viewer's ja-JP reading. */
-function sectionEraLocale(section: string): 'ja-JP' | 'zh-TW' | 'other' {
+/** Whether era codes in a section read as the Japanese era: the section
+ *  carries a `[$…-LCID]` bracket (outside quotes) whose language ID is
+ *  0x0411 ja-JP. Measured in Excel (ja-JP macOS): `[$-411]` renders the
+ *  Japanese era, while `[$-404]`, `[$-409]` and codes without an LCID all
+ *  render `g` as nothing and `e` / `ee` / `r` / `rr` as the four-digit year. */
+function sectionHasJapaneseLocale(section: string): boolean {
   let i = 0;
   while (i < section.length) {
     const ch = section[i];
@@ -334,18 +328,13 @@ function sectionEraLocale(section: string): 'ja-JP' | 'zh-TW' | 'other' {
       const end = section.indexOf(']', i);
       if (end < 0) break;
       const lcid = /^\$[^-]*-([0-9a-f]+)$/i.exec(section.slice(i + 1, end));
-      if (lcid) {
-        const language = parseInt(lcid[1], 16) & 0xffff;
-        if (language === 0x0411) return 'ja-JP';
-        if (language === 0x0404) return 'zh-TW';
-        if (language !== 0xf800 && language !== 0xf400) return 'other';
-      }
+      if (lcid && (parseInt(lcid[1], 16) & 0xffff) === 0x0411) return true;
       i = end + 1;
     } else {
       i++;
     }
   }
-  return 'ja-JP';
+  return false;
 }
 
 /** Whether a section holds an AM/PM or A/P token outside quotes, escapes and

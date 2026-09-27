@@ -249,14 +249,14 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(fmt(45292.54166666667, 'h:mm "AM/PM"')).toBe('13:00 AM/PM');
   });
 
-  it('reads era codes in the locale of the section (§18.8.30)', () => {
-    // Other locales: e → yyyy, ee → yy.
-    expect(fmt(45292, '[$-409]e')).toBe('2024');
-    expect(fmt(45292, '[$-409]ee')).toBe('24');
-    // zh-TW: ROC era (1912 = year 1); r / rr become e.
-    expect(fmt(45292, '[$-404]gge')).toBe('民國113');
-    expect(fmt(45292, '[$-404]ggge')).toBe('中華民國113');
-    expect(fmt(45292, '[$-404]rr')).toBe('113');
+  it('reads era codes as the Japanese era only under [$-411], as Excel does', () => {
+    // Measured in Excel (ja-JP macOS): other LCIDs and no LCID render no era
+    // name and the four-digit year for e / ee / r / rr.
+    for (const code of ['[$-409]e', '[$-409]ee', '[$-409]rr', '[$-404]ggge', '[$-404]rr', 'ggge', 'ee', 'r']) {
+      expect(fmt(45292, code), code).toBe('2024');
+    }
+    expect(fmt(45292, '[$-411]ggge"/"m"/"d')).toBe('令和6/1/1');
+    expect(fmt(1, '[$-411]ggge"/"m"/"d')).toBe('明治33/1/1');
   });
 
   it('decides number vs time from the section the value selects', () => {
