@@ -353,6 +353,9 @@ struct WorkbookShared {
     /// workbook styles stay owned by the full-parse path instead of being
     /// retained and deeply cloned here.
     default_font: DefaultFont,
+    /// The Normal cell style font's authored color key (see
+    /// `styles::normal_font_color_key`); marks rich-text runs' own colors.
+    normal_font_color: Option<Option<String>>,
     chart_number_formats: ChartNumberFormatCache,
     shared_strings: Rc<[SharedString]>,
     /// #773: a part-tagged degradation error set when `xl/sharedStrings.xml` was
@@ -472,31 +475,43 @@ impl WorkbookShared {
         let theme_fonts = theme.fonts;
         let theme_japanese_fonts = theme.japanese_fonts;
         let theme_chart_images = Rc::new(theme.chart_images);
-        let (default_font, chart_number_formats, styles) = if include_full_styles {
+        let (default_font, normal_font_color, chart_number_formats, styles) = if include_full_styles
+        {
             match parse_styles(archive, theme_colors.as_ref()) {
                 Ok(parsed) => (
                     parsed.default_font,
+                    parsed.normal_font_color,
                     parsed.chart_number_formats,
                     Some(Ok(parsed.styles)),
                 ),
                 Err(error) => (
                     (None, None, false, false),
+                    None,
                     ChartNumberFormatCache::default(),
                     Some(Err(error)),
                 ),
             }
         } else {
             match styles::parse_style_projection(archive) {
-                Ok(parsed) => (parsed.default_font, parsed.chart_number_formats, None),
+                Ok(parsed) => (
+                    parsed.default_font,
+                    parsed.normal_font_color,
+                    parsed.chart_number_formats,
+                    None,
+                ),
                 Err(_) => (
                     (None, None, false, false),
+                    None,
                     ChartNumberFormatCache::default(),
                     None,
                 ),
             }
         };
-        let (shared_strings, shared_strings_error) =
+        let (mut shared_strings, shared_strings_error) =
             read_shared_strings(archive, theme_colors.as_ref());
+        for string in &mut shared_strings {
+            mark_own_run_colors(string.runs.as_deref_mut(), normal_font_color.as_ref());
+        }
         Ok((
             WorkbookShared {
                 workbook_xml,
@@ -509,6 +524,7 @@ impl WorkbookShared {
                 theme_fonts,
                 theme_japanese_fonts,
                 default_font,
+                normal_font_color,
                 chart_number_formats,
                 shared_strings: shared_strings.into(),
                 shared_strings_error,
@@ -759,6 +775,13 @@ fn finalize_projected_sheet(
         &mut reference_session,
     );
     ws.sparkline_groups = sparkline_groups;
+    for row in &mut ws.rows {
+        for cell in &mut row.cells {
+            if let CellValue::Text { runs, .. } = &mut cell.value {
+                mark_own_run_colors(runs.as_deref_mut(), shared.normal_font_color.as_ref());
+            }
+        }
+    }
     ws.default_font_family = shared.default_font.0.clone();
     ws.default_font_size = shared.default_font.1;
     ws.default_font_bold = shared.default_font.2.then_some(true);
@@ -1302,6 +1325,7 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
                                     }
                                     "color" => {
                                         f.color = parse_color(&rp, theme_colors);
+                                        f.authored_color = Some(styles::authored_color_key(&rp));
                                     }
                                     "rFont" | "name" => {
                                         f.name = rp.attribute("val").map(|s| s.to_string());
@@ -1330,6 +1354,22 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
         phonetic_pr,
     }
 }
+/// Mark each rich-text run whose `<rPr>` color is its own formatting: authored
+/// differently from the Normal style font's color, or absent (automatic).
+/// Measured in Excel: such a run keeps its color inside a table, while a run
+/// authored like Normal takes the table style's font color. When the Normal
+/// style cannot be resolved (`normal` is `None`) no run is marked, keeping
+/// the table color. Runs without `<rPr>` are the cell's font and are left to
+/// the cell's own classification.
+fn mark_own_run_colors(runs: Option<&mut [Run]>, normal: Option<&Option<String>>) {
+    let (Some(runs), Some(normal)) = (runs, normal) else {
+        return;
+    };
+    for font in runs.iter_mut().filter_map(|run| run.font.as_mut()) {
+        font.own_color = &font.authored_color != normal;
+    }
+}
+
 /// Pending cell-hyperlink descriptors, awaiting rels resolution of the external
 /// `r:id`. Each entry is `(col, row, rid, location, display)`:
 /// - `rid`: the external relationship id (§18.3.1.47 `r:id`), if present.
@@ -5938,6 +5978,42 @@ mod phonetic_tests {
     use super::*;
 
     const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+    /// Rich-text runs are marked own-colored exactly when their `<rPr>`
+    /// `<color>` is authored differently from the Normal style font's
+    /// (typed comparison) or absent; runs without `<rPr>` are left to the
+    /// cell. Measured in Excel against a table style font color.
+    #[test]
+    fn rich_runs_mark_colors_that_differ_from_normal() {
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><color theme="1"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let normal = styles::normal_font_color_key(&roxmltree::Document::parse(styles).unwrap());
+        let xml = format!(
+            r#"<si xmlns="{ns}"><r><t>a</t></r><r><rPr><color theme="1"/></rPr><t>b</t></r><r><rPr><color theme="01"/></rPr><t>c</t></r><r><rPr><sz val="11"/></rPr><t>d</t></r><r><rPr><color rgb="FF000000"/></rPr><t>e</t></r></si>"#,
+            ns = NS,
+        );
+        let doc = roxmltree::Document::parse(&xml).expect("parse");
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_own_run_colors(ss.runs.as_deref_mut(), normal.as_ref());
+        let own: Vec<Option<bool>> = ss
+            .runs
+            .unwrap()
+            .iter()
+            .map(|run| run.font.as_ref().map(|font| font.own_color))
+            .collect();
+        assert_eq!(
+            own,
+            [None, Some(false), Some(false), Some(true), Some(true)]
+        );
+
+        // Without a resolvable Normal style no run is marked.
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_own_run_colors(ss.runs.as_deref_mut(), None);
+        assert!(ss
+            .runs
+            .unwrap()
+            .iter()
+            .all(|run| run.font.as_ref().is_none_or(|f| !f.own_color)));
+    }
 
     /// ECMA-376 §18.4.6 / §18.4.3: a `<si>` with `<rPh>` runs and a
     /// `<phoneticPr>` must parse the furigana runs (sb/eb + hint text) and the

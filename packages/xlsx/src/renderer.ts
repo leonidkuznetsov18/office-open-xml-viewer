@@ -1050,8 +1050,10 @@ function drawTextDecoLine(
 /**
  * Resolve a Run's font against a base Font. Per ECMA-376, a run's <rPr>
  * completely specifies bold/italic/underline/strike for that run, while
- * size/color/name fall back to the base when omitted. A run with no
- * <rPr> (run.font undefined) inherits the base entirely.
+ * size/name fall back to the base when omitted. A run with no <rPr>
+ * (run.font undefined) inherits the base entirely. An <rPr> without a
+ * <color> is automatic (black) rather than the cell's color: Excel draws
+ * such a run black even in a red cell.
  */
 function applyRunFont(base: CellFont, run: Run): CellFont {
   const rf = run.font;
@@ -1063,7 +1065,7 @@ function applyRunFont(base: CellFont, run: Run): CellFont {
     underlineStyle: rf.underlineStyle,
     strike: rf.strike,
     size: rf.size ?? base.size,
-    color: rf.color ?? base.color,
+    color: rf.color ?? null,
     name: rf.name ?? base.name,
     vertAlign: rf.vertAlign,
   };
@@ -2452,7 +2454,12 @@ function renderQuadrant(
     // Using the same code keeps the off-screen-anchor pre-pass and the
     // in-viewport-anchor path identical, so a merged cell renders the same
     // text whether or not its top-left anchor cell is scrolled out of view.
-    const runs = cell.value.type === 'text' ? cell.value.runs : undefined;
+    // Rich runs take the table style's font color by the measured run rule
+    // (richRunsWithTableColor); runs without <rPr> through the base font.
+    const tableRunColor = tableStyleFontColor(tableFontDxfFor(tableStyle, styles), xf);
+    const rawRuns = cell.value.type === 'text' ? cell.value.runs : undefined;
+    const runs = rawRuns && richRunsWithTableColor(rawRuns, tableRunColor);
+    const richBaseFont = tableRunColor != null ? { ...fontForDraw, color: tableRunColor } : fontForDraw;
     const hasRichText = runs && runs.length > 0;
 
     if (xf.wrapText && hasRichText) {
@@ -2461,7 +2468,7 @@ function renderQuadrant(
       // underline/strike, and bidi (previously this pre-pass drew only plain
       // per-segment fonts).
       drawWrappedRichText(
-        ctx, runs, fontForDraw,
+        ctx, runs, richBaseFont,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
         cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
@@ -2479,7 +2486,7 @@ function renderQuadrant(
       // off-screen-anchored merge renders identical per-run text (single line, or
       // multiple lines on a hard break) instead of joined base-font text.
       drawNonWrapRichText(
-        ctx, runs, fontForDraw,
+        ctx, runs, richBaseFont,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
         cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
@@ -3138,15 +3145,18 @@ function renderQuadrant(
           cellBaseRtl(xf.readingOrder, text) ? 'rtl' : 'ltr';
       } catch { /* ignore */ }
 
-      // Rich text: draw each run with its own font. Only supported for the
-      // non-wrap path (wrap with mixed fonts is significantly more complex).
-      const runs = cell.value.type === 'text' ? cell.value.runs : undefined;
+      // Rich text: draw each run with its own font. Rich runs take the table
+      // style's font color by the measured run rule (richRunsWithTableColor).
+      const tableRunColor = tableStyleFontColor(tableFontDxf, xf);
+      const rawRuns = cell.value.type === 'text' ? cell.value.runs : undefined;
+      const runs = rawRuns && richRunsWithTableColor(rawRuns, tableRunColor);
+      const richBaseFont = tableRunColor != null ? { ...fontForDraw, color: tableRunColor } : fontForDraw;
       const hasRichText = runs && runs.length > 0;
 
       if (xf.wrapText && hasRichText) {
         // Rich text with wrapping — shared with the off-screen pre-pass.
         drawWrappedRichText(
-          ctx, runs, fontForDraw,
+          ctx, runs, richBaseFont,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
           cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
@@ -3166,7 +3176,7 @@ function renderQuadrant(
         // and a value with breaks as multiple lines, keeping this in-viewport
         // path and the off-screen-anchor pre-pass identical.
         drawNonWrapRichText(
-          ctx, runs, fontForDraw,
+          ctx, runs, richBaseFont,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
           cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
@@ -3472,6 +3482,19 @@ function tableFontDxfFor(tableStyle: TableCellStyle | undefined, styles: Styles)
  *  style): Excel draws that color over the table style's. */
 function tableStyleFontColor(tableFontDxf: Dxf | undefined, xf: CellXf): string | null {
   return xf.ownFontColor ? null : tableFontDxf?.font?.color ?? null;
+}
+
+/** Rich-text runs as Excel draws them under a table style font color
+ *  (measured): a run whose <rPr> color is authored like the Normal style's
+ *  (`!ownColor`) takes the table color; a run with its own or automatic color
+ *  keeps it. Runs without <rPr> take the base font, whose color the caller
+ *  sets to the table color. `tableColor` null (no table color, or the cell's
+ *  font color is its own) leaves the runs unchanged. */
+function richRunsWithTableColor(runs: Run[], tableColor: string | null): Run[] {
+  if (tableColor == null) return runs;
+  return runs.map((run) => (run.font && !run.font.ownColor
+    ? { ...run, font: { ...run.font, color: tableColor } }
+    : run));
 }
 
 /** The cell font with its bold/italic/underline/strike composed from every

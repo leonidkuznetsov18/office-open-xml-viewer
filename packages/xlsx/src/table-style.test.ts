@@ -131,3 +131,85 @@ describe('custom table style font color vs the cell font', () => {
     expect(color('own auto')).toMatch(/^(#000000|rgba\(0,0,0,1\))$/);
   });
 });
+
+/**
+ * Rich-text runs under a custom table style font color, as measured in Excel
+ * (body rows under a blue wholeTable dxf):
+ * - a run without <rPr> takes the cell's drawn color (the table's, unless the
+ *   cell's own font color wins);
+ * - a run whose <rPr> color is authored like Normal's (`!ownColor`) takes the
+ *   table color, but only when the cell's font color is not its own;
+ * - a run with its own <rPr> color keeps it, and an <rPr> without <color> is
+ *   automatic black, even in a red cell.
+ */
+describe('rich-text runs under a custom table style font color', () => {
+  const font = (color: string | null): CellFont => ({
+    bold: false, italic: false, underline: false, strike: false, size: 11, color, name: 'Arial',
+  });
+  const runFont = (color: string | null, ownColor: boolean) => ({
+    bold: false, italic: false, underline: false, strike: false, size: 11,
+    ...(color ? { color } : {}), ...(ownColor ? { ownColor } : {}),
+  });
+  const styles: Styles = {
+    fonts: [font('#000000'), font('#FF0000')],
+    fills: [],
+    borders: [],
+    cellXfs: [
+      { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false },
+      { fontId: 1, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false, ownFontColor: true },
+    ],
+    numFmts: [],
+    dxfs: [{ font: font('#0070C0'), fill: null, border: null }],
+  };
+  // [column, cell xf, runs]
+  const cases: Array<[number, number, Array<{ text: string; font?: ReturnType<typeof runFont> }>]> = [
+    [1, 0, [{ text: 'd1' }, { text: 'd2', font: runFont('#000000', false) }]],
+    [2, 0, [{ text: 'e1', font: runFont('#000000', true) }, { text: 'e2', font: runFont('#000000', false) }]],
+    [3, 0, [{ text: 'c1', font: runFont(null, true) }]],
+    [4, 1, [{ text: 'g1', font: runFont('#000000', false) }, { text: 'h1', font: runFont(null, true) }, { text: 'k1' }]],
+  ];
+  const ws = {
+    name: 'T',
+    rows: [{
+      index: 2, height: null,
+      cells: cases.map(([col, styleIndex, runs]) => ({
+        row: 2, col, styleIndex,
+        value: { type: 'text' as const, text: runs.map((r) => r.text).join(''), runs },
+      })),
+    }],
+    colWidths: { 1: 20, 2: 20, 3: 20, 4: 20 }, rowHeights: {}, defaultColWidth: 8.43, defaultRowHeight: 15,
+    mergeCells: [], freezeRows: 0, freezeCols: 0, conditionalFormats: [], images: [], charts: [],
+    tables: [{
+      range: { top: 1, left: 1, bottom: 2, right: 4 }, styleName: 'Custom', headerRowCount: 1, totalsRowCount: 0,
+      showRowStripes: false, showColumnStripes: false, showFirstColumn: false, showLastColumn: false,
+      accentColor: '#808080', isCustom: true, wholeTableDxf: 0, columns: [],
+    }],
+  } as unknown as Worksheet;
+
+  it('paints each run with the measured color', () => {
+    let fillStyle = '';
+    const drawn = new Map<string, string>();
+    const noop = () => {};
+    const ctx = new Proxy({
+      canvas: { width: 800, height: 100 },
+      font: '11px Arial',
+      get fillStyle() { return fillStyle; },
+      set fillStyle(value: string) { fillStyle = value; },
+      measureText: (t: string) => ({ width: t.length * 7 }) as TextMetrics,
+      fillText: (t: string) => { drawn.set(t, fillStyle); },
+    } as Record<string | symbol, unknown>, {
+      get: (target, key) => (key in target ? target[key] : noop),
+      set: (target, key, value) => { target[key] = value; return true; },
+    }) as unknown as CanvasRenderingContext2D;
+    renderViewport(ctx, ws, styles, { row: 1, col: 1, rows: 2, cols: 4 });
+    const hex = (t: string) => {
+      const c = drawn.get(t)?.replace(/\s/g, '').toLowerCase() ?? '';
+      const m = /^rgba\((\d+),(\d+),(\d+),1\)$/.exec(c);
+      return m ? '#' + m.slice(1, 4).map((n) => Number(n).toString(16).padStart(2, '0')).join('') : c;
+    };
+    const blue = '#0070c0', black = '#000000', red = '#ff0000';
+    expect(Object.fromEntries(['d1', 'd2', 'e1', 'e2', 'c1', 'g1', 'h1', 'k1'].map((t) => [t, hex(t)]))).toEqual({
+      d1: blue, d2: blue, e1: black, e2: blue, c1: black, g1: black, h1: black, k1: red,
+    });
+  });
+});
