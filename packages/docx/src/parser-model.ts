@@ -69,7 +69,7 @@ import {
   type BodySectionIndexInput,
   type BodySectionOccurrence,
 } from './layout/context.js';
-import { normalizeAdjacentTables } from './layout/adjacent-tables.js';
+import { normalizeAdjacentTables, type AdjacentTableSequenceInput } from './layout/adjacent-tables.js';
 import { isWrapFloat } from './float-layout.js';
 import type {
   BodyLayoutAcquisitionInput,
@@ -753,13 +753,27 @@ export function tableFormatInput(table: TableLayoutSource): TableFormatInput {
 export function adjacentTableSequenceInput(
   body: readonly BodyElement[],
 ): readonly import('./layout/adjacent-tables.js').AdjacentTableSequenceInput[] {
-  return Object.freeze(body.map((element) => {
-    if (element.type !== 'table') return Object.freeze({ element, table: null });
+  return Object.freeze([...adjacentTableSequenceEntries(body)]);
+}
+
+/** Yield one source fact at a time so body acquisition never retains a second
+ * body-sized array of these transient grouping inputs. */
+function* adjacentTableSequenceEntries(
+  body: readonly BodyElement[],
+): Generator<AdjacentTableSequenceInput> {
+  for (const element of body) {
+    if (element.type !== 'table') {
+      yield Object.freeze({ element, table: null });
+      continue;
+    }
     const format = tableFormatInput(element);
     // A hand-built public table has no acquisition wire and therefore no
     // parser-owned logical identity; it can never join a logical sequence.
-    if (format.logicalSequenceId == null) return Object.freeze({ element, table: null });
-    return Object.freeze({
+    if (format.logicalSequenceId == null) {
+      yield Object.freeze({ element, table: null });
+      continue;
+    }
+    yield Object.freeze({
       element,
       table: Object.freeze({
         logicalSequenceId: format.logicalSequenceId,
@@ -768,7 +782,7 @@ export function adjacentTableSequenceInput(
         rowCount: element.rows.length,
       }),
     });
-  }));
+  }
 }
 
 type AcquiredBodySectionReference = Readonly<{
@@ -878,7 +892,7 @@ function bodyLayoutSequenceInput(
   sectionAtMarker: (bodyIndex: number) => AcquiredBodySectionReference,
 ): readonly BodyLayoutSequenceEntryFor<AcquiredBodySectionReference>[] {
   let bodyIndex = 0;
-  return Object.freeze(normalizeAdjacentTables(adjacentTableSequenceInput(body)).map((entry) => {
+  return Object.freeze(Array.from(normalizeAdjacentTables(adjacentTableSequenceEntries(body)), (entry) => {
     if (entry.kind === 'adjacent-table-group') {
       const firstIndex = bodyIndex;
       bodyIndex += entry.tables.length;
@@ -1175,14 +1189,16 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
     followingGutterPt = gutterPt;
   }
 
+  // Section placement is also consumed independently by public-model callers.
+  // Keep this immutable boundary; body acquisition reuses it by reference.
   return snapshotPlainData({
     bodyLength: doc.body.length,
     occurrences,
   }, 'DOCX body section index input') as BodySectionIndexInput;
 }
 
-/** Consume parser-owned document nodes and private settings into one clone-safe
- * structural value before layout resolves section contexts. */
+/** Acquire parser facts into a transient value. The following layout projection
+ * validates and snapshots its retained fields once, after section resolution. */
 export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAcquisitionInput {
   const sectionIndex = bodySectionIndexInput(doc);
   const incomingByMarker = new Map<number, BodySectionOccurrence>();
@@ -1198,7 +1214,7 @@ export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAc
       startType: occurrence.startType,
     });
   });
-  return snapshotPlainData({
+  return {
     sectionIndex,
     evenAndOddHeaders: doc.section.evenAndOddHeaders,
     endnoteIds: (doc.endnotes ?? []).map((note) => note.id),
@@ -1209,7 +1225,7 @@ export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAc
       doc.body.length,
     ),
     sequence,
-  }, 'DOCX body layout acquisition input') as BodyLayoutAcquisitionInput;
+  };
 }
 
 /** Resolved transitional VML facts emitted by the parser in addition to the

@@ -136,8 +136,7 @@ export interface LoadOptions extends CoreLoadOptions {
    * has no additional effect unless progressive layout is enabled. `load()`
    * still resolves only once layout is complete.
    *
-   * Off by default: for small documents the slicing is pure overhead, and
-   * existing callers should not silently change scheduling behaviour.
+   * On by default in main mode. Pass `false` to run the same layout synchronously.
    */
   sliceLayout?: boolean;
   /**
@@ -226,6 +225,16 @@ export interface LoadOptions extends CoreLoadOptions {
    * load time", which is what the renderer defaults to.
    */
   currentDate?: Date | number;
+}
+
+/** Internal viewer ownership signal. Kept outside LoadOptions so the public
+ * load contract and declaration baseline do not acquire a cancellation option. */
+export const docxViewerLoadSignal = Symbol('docxViewerLoadSignal');
+export interface DocxViewerLoadControl {
+  readonly signal: AbortSignal;
+  /** Defined only after an explicit view toggle during this load. */
+  readonly requestedView: () => boolean | undefined;
+  readonly subscribeViewChange: (listener: () => void) => () => void;
 }
 
 /** Options for {@link DocxDocument.collectPageRuns}. */
@@ -443,9 +452,20 @@ export class DocxDocument {
   }
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+    const control = (opts as LoadOptions & { [docxViewerLoadSignal]?: DocxViewerLoadControl })[docxViewerLoadSignal];
+    const signal = control?.signal;
+    const checkAbort = () => {
+      if (signal?.aborted) throw new PaginationAbortError();
+    };
+    checkAbort();
     if (opts.modelSources !== undefined) {
       const { loadDocxModelSource } = await import('./internal/document-model-source.js');
-      return loadDocxModelSource(source, opts);
+      const modelDocument = await loadDocxModelSource(source, opts, control);
+      if (signal?.aborted) {
+        modelDocument.destroy();
+        throw new PaginationAbortError();
+      }
+      return modelDocument;
     }
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
@@ -465,16 +485,18 @@ export class DocxDocument {
     }
     let buffer: ArrayBuffer;
     if (typeof source === 'string') {
-      const res = await fetch(source);
+      const res = await fetch(source, { signal });
       if (!res.ok) throw new Error(`Failed to fetch: ${res.status} ${res.statusText}`);
       buffer = await res.arrayBuffer();
     } else {
       buffer = source;
     }
+    checkAbort();
     // Resolve the container on the main thread before spinning up the worker.
     // Container errors remain typed OoxmlError instances here; `instanceof`
     // would not survive the worker boundary.
     buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
+    checkAbort();
     metrics.setSourceBytes(buffer.byteLength);
     metrics.checkpoint('container ready');
     // The render worker is reachable only through this dynamic import, so
@@ -486,8 +508,16 @@ export class DocxDocument {
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
     let doc: DocxDocument | undefined;
+    let disposed = false;
+    const abortDocument = () => {
+      if (disposed || !doc) return;
+      disposed = true;
+      doc.destroy();
+    };
     try {
       doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl);
+      signal?.addEventListener('abort', abortDocument, { once: true });
+      checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
       // The variant the caller will actually render, recorded for BOTH render
@@ -527,6 +557,7 @@ export class DocxDocument {
             }
           : undefined,
       );
+      checkAbort();
       if (mode === 'worker' && doc._mode === 'main') {
         metrics.setMode('main');
         console.warn(
@@ -574,6 +605,12 @@ export class DocxDocument {
           doc._document,
           (p) => loadingDocument.getFontBytes(p),
         );
+        // destroy() may have run while FontFace.load() was pending. A late
+        // acquisition is not in the document's arrays that destroy() drained.
+        if (signal?.aborted) {
+          unregisterEmbeddedFonts(loadedEmbedded.faces);
+          throw new PaginationAbortError();
+        }
         doc._embeddedFontFaces = loadedEmbedded.faces;
         embeddedMetrics = loadedEmbedded.metrics;
         embeddedRoutes = loadedEmbedded.routes;
@@ -583,13 +620,22 @@ export class DocxDocument {
             !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
+      if (signal?.aborted) {
+        unloadOfficeFontFallbacks(officeFonts.faces);
+        throw new PaginationAbortError();
+      }
       doc._officeFontFaces = officeFonts.faces;
       if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
         // A proven local Calibri face already resolves this authored family;
         // avoid the optional Google Fonts substitution for the same request.
         const names = docxFontPreloadNames(doc._document, cjkFallback).filter((name) =>
           name?.toLowerCase() !== 'calibri' || !('calibri' in officeFonts.routes));
-        doc._googleFontFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        const googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        if (signal?.aborted) {
+          unloadGoogleFonts(googleFaces);
+          throw new PaginationAbortError();
+        }
+        doc._googleFontFaces = googleFaces;
       }
       // Equations are converted + rasterized before pagination (which reads their
       // extents synchronously). Requires the opt-in `math` engine; without it,
@@ -599,6 +645,7 @@ export class DocxDocument {
       if (doc._mode === 'main' && opts.math && doc._document && documentHasMath(doc._document)) {
         preparedMath = await prepareMathRuns(doc._document, opts.math);
       }
+      checkAbort();
       if (doc._mode === 'main' && doc._document && doc._source) {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
@@ -621,7 +668,7 @@ export class DocxDocument {
         // Worker mode must build this layout to return parsedMeta. Main mode does
         // the same work here so layout failures reject load() in both modes.
         //
-        // Sliced when asked: the same pagination generator, drained across
+        // Sliced by default in main mode: the same pagination generator, drained across
         // event-loop turns instead of in one blocking call, then deposited in
         // the variant store so every later synchronous render selects it
         // normally. The layout is identical either way.
@@ -766,14 +813,54 @@ export class DocxDocument {
             );
           });
           await firstPublication.promise;
-        } else if (deferrable && (opts.sliceLayout || opts.onLayoutProgress)) {
-          const layout = await layoutDocumentInputAsync(
-            doc._source.bodyLayoutInput,
-            services,
-            layoutOptions,
-            scheduler,
-          );
-          retained.layoutVariants.prime(layoutOptions, layout);
+        } else if (deferrable && (opts.sliceLayout !== false || opts.onLayoutProgress)) {
+          // Vertical OpenType glyph selection can force worker mode back to
+          // main-thread measurement, but it does not require one-shot layout:
+          // the canonical paginator's suspension points retain identical
+          // geometry for vertical and horizontal page frames.
+          // An in-flight viewer toggle invalidates this variant. Cancel at the
+          // next paginator suspension point and restart against the same parsed
+          // source; the original load promise still resolves only for the
+          // authoritative requested view.
+          for (;;) {
+            checkAbort();
+            const requestedView = control?.requestedView();
+            const currentOptions = requestedView === undefined
+              ? layoutOptions
+              : normalizeLayoutOptions(opts.currentDate, runtime.defaultCurrentDateMs, requestedView);
+            runtime.activeLayoutOptions = currentOptions;
+            const abort = new AbortController();
+            let viewChanged = false;
+            const unsubscribe = control?.subscribeViewChange(() => {
+              // Viewer callbacks may re-apply their setting on every progress
+              // update. Only a different view invalidates this in-flight
+              // pagination; repeated notifications must not restart it.
+              const requested = control.requestedView();
+              if (viewChanged || requested === undefined
+                || (requested === true) === (currentOptions.showTrackedChanges === true)) return;
+              viewChanged = true;
+              abort.abort();
+            });
+            doc._layoutAbort = abort;
+            try {
+              const layout = await layoutDocumentInputAsync(
+                doc._source.bodyLayoutInput,
+                services,
+                currentOptions,
+                { ...scheduler, signal: abort.signal },
+              );
+              checkAbort();
+              if (viewChanged) continue;
+              retained.layoutVariants.prime(currentOptions, layout);
+              break;
+            } catch (error) {
+              if (error instanceof PaginationAbortError && viewChanged && !signal?.aborted) continue;
+              throw error;
+            } finally {
+              unsubscribe?.();
+              doc._layoutAbort = null;
+            }
+          }
         } else {
           // Build the variant that will be rendered, not the default one.
           retained.layoutVariants.layoutFor(layoutOptions);
@@ -783,6 +870,7 @@ export class DocxDocument {
       // after the parse response. Telemetry is strictly best-effort: a worker
       // failure or a silent worker may omit the newest counters, but must not
       // turn an otherwise successful load into a rejection or an endless wait.
+      checkAbort();
       await doc._resourceUsage(
         opts.workerTimeoutMs ?? OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS,
       ).then(
@@ -790,12 +878,14 @@ export class DocxDocument {
         () => undefined,
       );
       metrics.checkpoint('model and layout ready');
+      checkAbort();
       metrics.succeed({ pages: doc.pageCount });
       return doc;
     } catch (error) {
-      const rejectedDocument = doc;
-      disposeRejectedLoad(worker, rejectedDocument ? () => rejectedDocument.destroy() : undefined);
+      disposeRejectedLoad(worker, doc ? abortDocument : undefined);
       throw error;
+    } finally {
+      signal?.removeEventListener('abort', abortDocument);
     }
     } catch (error) {
       metrics.fail(error);
