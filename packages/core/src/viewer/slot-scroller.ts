@@ -1,3 +1,6 @@
+/** UI gesture debounce; repeated CSS previews settle into one full render. */
+export const DEFAULT_ZOOM_SETTLE_MS = 150;
+
 /** The geometry can use either per-unit offsets or a uniform stride. Only the
  * visible window is needed by the slot pool. */
 export interface SlotWindow {
@@ -95,6 +98,9 @@ export class SlotScroller<Slot, Range extends SlotWindow> {
   }
 
   preview(): void {
+    // Slots already mounted keep their device buffers; only CSS geometry grows
+    // until a debounced settle paints a crisp replacement. New entrants paint
+    // at the current scale directly, so they have nothing to stretch.
     if (this._destroyed || this.hooks.count() === 0) return;
     const range = this.hooks.range();
     this.lastRange = range;

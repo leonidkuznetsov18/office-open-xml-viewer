@@ -19,7 +19,11 @@ export interface MainSlotHooks<Slot extends MainSlot, Run> {
   reportError(error: unknown): void;
 }
 
-/** Direct main-thread painting and blank-free spare-canvas settle. */
+/** Direct main-thread painting and blank-free spare-canvas settle. Direct
+ * paint skips overlay side effects when a zoom/recycle moves the epoch or slot
+ * identity. During settle, the renderer may clear a canvas backing store before
+ * its first await, so a spare stays off DOM until it can replace the stretched
+ * preview in one operation. */
 export class MainSlotRenderer<Slot extends MainSlot, Run> {
   constructor(private readonly hooks: MainSlotHooks<Slot, Run>) {}
 

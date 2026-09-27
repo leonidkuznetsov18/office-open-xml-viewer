@@ -151,6 +151,11 @@ export class ScrollZoomController {
   }
 
   onResize(): void {
+    // Only a width change alters the fit base, but a height-only resize can
+    // expose new units and must still mount them. A zero-width opening layout
+    // is retried here. Preserve the user's multiplier over the old base when
+    // fitting the new width, then route through setScale so stale renders lose
+    // their epoch and the current pixels remain visible until settle.
     if (this.hooks.count() === 0) return;
     if (!this.established) {
       this.hooks.relayout();

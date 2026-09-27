@@ -9,6 +9,9 @@ export interface ScrollViewportOptions {
   dpr?: number;
 }
 
+/** Default canvas-only shadow; a false option disables it without moving layout. */
+export const DEFAULT_SCROLL_PAGE_SHADOW = '0 1px 3px rgba(0,0,0,0.2)';
+
 /** Format-neutral desk gutters, fit width, overscan and device pixel ratio. */
 export class ScrollViewportPolicy {
   constructor(private readonly hooks: {

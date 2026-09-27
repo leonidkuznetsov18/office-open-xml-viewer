@@ -1,13 +1,11 @@
 import { EMU_PER_PX, type FindHighlightColors, type FindMatch, type FindMatchesOptions, type HyperlinkTarget, type OoxmlResourceMetrics, type ViewerContextMenuEvent, type ZoomableViewer, openExternalHyperlink } from '@silurus/ooxml-core';
 import {
   computeUniformVisibleWindow,
-  resolveItemStartScrollTop,
   type VisibleWindow,
 } from '@silurus/ooxml-core/internal/virtual-scroll';
 import {
   createCanvasElementOutlineLayer,
   CanvasViewerErrorRouter,
-  renderCanvasElementOutline,
   resolveCanvasViewerMode,
   StaticCanvasRenderDispatcher,
   TerminalResourceOwner,
@@ -18,8 +16,8 @@ import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-ren
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
-import { ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
-import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
+import { DEFAULT_SCROLL_PAGE_SHADOW, ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
+import { DEFAULT_ZOOM_SETTLE_MS, SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
@@ -58,28 +56,6 @@ import { createPptxLoadingLayer } from './loading-indicator';
 import { PptxScrollMediaController } from './scroll-media-controller';
 import { PptxScrollCommentNavigation } from './scroll-comment-navigation';
 
-/**
- * Debounce window (ms) after the last `setScale` in a zoom burst before the
- * full-resolution settle re-render is dispatched (design §7 "Flicker-free zoom").
- *
- * This is a UI-INTERACTION-FEEL policy constant, NOT an ECMA-376 / ISO-29500
- * value: it exists only so a rapid wheel/pinch gesture (which fires dozens of
- * `setScale` calls) coalesces into a single high-res render at the end instead of
- * re-rendering per tick. Each `setScale` shows an immediate CSS preview (the
- * existing bitmap stretched) and resets this timer; the settle fires once the
- * gesture pauses for `ZOOM_SETTLE_MS`. Lower = snappier but more redundant renders
- * mid-gesture; higher = fewer renders but a longer soft-preview tail. Deliberately
- * duplicated per viewer (a one-line timing constant, not shared logic).
- */
-const ZOOM_SETTLE_MS = 150;
-
-/**
- * Default CSS `box-shadow` painted on every slide canvas — the soft drop shadow a
- * presentation viewer casts under each slide (matches the Examples/recipe look,
- * which the scroll viewer now reproduces with zero config). See
- * {@link PptxScrollViewerOptions.pageShadow}.
- */
-const DEFAULT_PAGE_SHADOW = '0 1px 3px rgba(0,0,0,0.2)';
 const COMMENT_MARGIN_GAP_PX = 12;
 type PptxCommentUiRuntime = typeof import('./comment-ui-runtime.js');
 let pptxCommentUiRuntimePromise: Promise<PptxCommentUiRuntime> | undefined;
@@ -516,7 +492,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._elementHitTolerance = elementHitTolerance;
     // `??` (not `||`): a caller's explicit `false` must disable the shadow, not
     // fall through to the default.
-    this._pageShadow = opts.pageShadow ?? DEFAULT_PAGE_SHADOW;
+    this._pageShadow = opts.pageShadow ?? DEFAULT_SCROLL_PAGE_SHADOW;
     const borrowedPresentation = (opts as InternalPptxScrollViewerOptions)[borrowedPresentationOption];
     this._borrowed = borrowedPresentation !== undefined;
     if (borrowedPresentation) {
@@ -940,28 +916,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._scrollHost.clientWidth, this._viewport.horizontalPadding().left);
   }
 
-  /**
-   * Render slide `i` into `slot`. Routes strictly on the constructor-resolved
-   * `_mode` (design §11 — no probing, no silent mis-pathing): `main` ⇒ paint the
-   * slot's canvas directly via `renderSlide`; `worker` ⇒ transfer an ImageBitmap
-   * from `renderSlideToBitmap`.
-   *
-   * Slot-identity guard: a slot recycled to a DIFFERENT slide while a previous
-   * render is in flight must not repaint the stale slide. `slot.renderedSlide`
-   * tracks the slide this slot is committed to; we stamp it up-front and bail on
-   * resolution if it changed (the engine's own token guard is per-canvas; this is
-   * the viewer's per-slot slide-identity check).
-   *
-   * Render epoch (main path): pixel staleness after a mid-flight `setScale` is
-   * already handled by the engine's per-canvas token (the newer renderSlide on the
-   * same canvas wins) — `setScale` recycles + re-mounts, and the re-mount always
-   * re-dispatches `renderSlide` (renderedSlide reset to -1), so a fresh render is
-   * always issued. But the viewer-side side effects of a STALE resolution — the
-   * text-layer build (its run geometry is at the OLD scale) and the renderedSlide
-   * bookkeeping — must NOT run, or a superseded render would rebuild the overlay
-   * with stale x/y/w/h (the pool reuses slot objects, so the identity check alone
-   * can pass for an old-epoch resolution). We gate them on the captured epoch.
-   */
+  /** Static slot dispatch is owned by core; media remains a PPTX hook. */
   private _renderSlot(
     i: number,
     slot: SlideSlot,
@@ -1150,26 +1105,8 @@ export class PptxScrollViewer implements ZoomableViewer {
   fitWidth(): void { this._zoom.fit('width'); }
   fitPage(): void { this._zoom.fit('page'); }
 
-  /**
-   * CSS preview of the visible window at the current `_scale` (design §7
-   * mechanism 1), WITHOUT re-rendering. Slots leaving the window recycle normally;
-   * slots ENTERING the window mount fresh (rendered at the current scale directly,
-   * so they never need a preview); slots that STAY are repositioned and their
-   * canvas + text overlay are CSS-transformed to the new size (the device buffer
-   * is untouched — that is the whole point: no synchronous clear, no blank frame).
-   */
   private _previewVisible(): void { this._scroller.preview(); }
 
-  /**
-   * CSS-preview a single already-mounted slot at the new geometry (design §7): the
-   * wrapper is repositioned + sized (via `_positionSlot`), the canvas bitmap is
-   * STRETCHED to the new CSS size (no `canvas.width` — the device buffer, and thus
-   * the drawn pixels, are left intact, just scaled by the browser), and the text
-   * overlay is scaled by `newScale / renderedScale` so it tracks the stretched
-   * slide. `renderedScale <= 0` means the slot's first render hasn't resolved yet
-   * (nothing to stretch); the pending render captured the current scale, so it
-   * lands correct and no preview is needed.
-   */
   private _previewSlot(slot: SlideSlot, i: number, r: VisibleWindow): void {
     this._positionSlot(slot, i, r);
     this._layers.preview(slot, this._slideWidthPx(), this._slideHeightPx(), this._scale);
@@ -1179,37 +1116,10 @@ export class PptxScrollViewer implements ZoomableViewer {
     clearTextLayerPreview(layer);
   }
 
-  /** (Re)schedule the debounced settle re-render (design §7 mechanism 2). Resets
-   *  the timer on every call so a burst of `setScale` dispatches ONE settle
-   *  ZOOM_SETTLE_MS after the LAST call. Cleared in `destroy()`. */
-  private _scheduleSettle(): void { this._scroller.scheduleSettle(ZOOM_SETTLE_MS); }
+  private _scheduleSettle(): void { this._scroller.scheduleSettle(DEFAULT_ZOOM_SETTLE_MS); }
 
-  /** Full-resolution settle re-render of the visible window (design §7 mechanisms
-   *  2+3). Re-renders each mounted slot at the current scale via the double-buffer
-   *  swap (main) / same-canvas transfer (worker). Both modes rebuild the text
-   *  overlay from the fresh render's run geometry (IX6 — worker mode collects the
-   *  runs off-thread via `_renderSlotBitmap`) and clear the preview transform.
-   *  Dispatched at the CURRENT epoch; the existing epoch gate discards it if a
-   *  later `setScale` supersedes it mid-render. */
   private _settleRender(): void { this._scroller.settle(); }
 
-  /**
-   * Settle-render one slot at the current scale (design §7 mechanism 3).
-   *
-   * WORKER: re-dispatch the bitmap render into the SAME canvas. The worker path
-   * sizes the device buffer and `transferFromImageBitmap`s it in ONE synchronous
-   * step (no await between `canvas.width = …` and the transfer), so the browser
-   * never composites an intermediate blank frame — no spare canvas is needed. The
-   * `renderedScale === _scale` gate in `_settleRender` plus the epoch gate inside
-   * `_renderSlotBitmap` keep this correct and idempotent.
-   *
-   * MAIN: `renderSlide` synchronously sets `canvas.width = …` (which CLEARS the
-   * backing store to blank) BEFORE its first await and paints AFTER — so rendering
-   * into the on-screen canvas would flash it white. Render into a SPARE off-DOM
-   * canvas instead; only once it resolves at the current epoch do we swap it into
-   * the wrapper (replacing the old canvas). The old canvas keeps showing the
-   * stretched preview until the instant of the swap — blank-free.
-   */
   private _settleSlot(i: number, slot: SlideSlot): void {
     if (!this._pres) return;
     const dpr = this._viewport.dpr();
@@ -1429,32 +1339,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     return idx === undefined ? target : { ...target, slideIndex: idx };
   }
 
-  /**
-   * Re-fit the base scale on a container resize while PRESERVING the current zoom
-   * multiplier (design §11), then re-anchor + re-render. A `ResizeObserver` fires
-   * on any box change, but only a WIDTH change alters the fit-to-width base scale;
-   * a height-only change skips the re-fit yet STILL re-mounts the visible window
-   * (via `_mountVisible`), because a taller viewport reveals rows that were below
-   * the fold and would otherwise stay blank until the next scroll. Empty/unloaded
-   * ⇒ no-op; a still-zero width ⇒ defer.
-   *
-   * Zero-width recovery: a container that was 0-wide at construction never
-   * established a scale (`_scaleEstablished` is false), so the first non-zero
-   * resize establishes it here via `relayout()` — completing the T2 deferral.
-   *
-   * Re-fit math (zoom multiplier preserved):
-   *   mult      = _scale / _prevBase            (the user's zoom over the old base)
-   *   newScale  = newBase × mult
-   * Routing through `setScale(newScale)` bumps `_renderEpoch` (resize IS an epoch
-   * event — T4 banner) and re-anchors + CSS-previews + debounces a settle re-render
-   * of every slot at the new geometry, exactly like a zoom (design §7 flicker-free
-   * path — a rapid ResizeObserver burst therefore also coalesces into one settle).
-   * `setScale`'s clamp/no-op guards apply: an unchanged newScale (identical width)
-   * is a no-op there — so we short-circuit BEFORE it when the fit-width is
-   * unchanged (mounting the revealed window without a needless re-render), and
-   * after it we call `_mountVisible` again to cover the case where the clamp made
-   * `setScale` no-op yet the viewport still grew.
-   */
   private _onResize(): void { this._zoom.onResize(); }
 
   get topVisibleSlide(): number {

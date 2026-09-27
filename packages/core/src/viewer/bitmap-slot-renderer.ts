@@ -28,7 +28,10 @@ export interface BitmapSlotHooks<Slot extends BitmapSlot, Run> {
 }
 
 /** Coalesces worker bitmap dispatches and follows a superseded dispatch until
- * the live slot receives current pixels. A plain render failure never retries. */
+ * the live slot receives current pixels. A recycled slot can return to the same
+ * unit while its old-scale bitmap is in flight; epoch, slot, canvas and format
+ * token guards jointly close that orphan. A plain render failure never retries
+ * because it could otherwise create an unbounded reject/redispatch loop. */
 export class BitmapSlotRenderer<Slot extends BitmapSlot, Run> {
   constructor(private readonly hooks: BitmapSlotHooks<Slot, Run>) {}
 
