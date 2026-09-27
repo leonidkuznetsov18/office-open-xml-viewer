@@ -1,8 +1,9 @@
-//! Gate regressions for conditional table-style margins.
+//! Conditional table-style margin precedence and remaining gates.
 //!
 //! Word 16.112.4 DOC93-DOC95 controls establish isolated serialization, while
 //! New138-new145 bordered controls isolate D63E from D634 and establish one
-//! bounded conditional path: a single non-inherited FIRST_ROW D63E record.
+//! bounded conditional path: a single FIRST_ROW D63E record. Word 16.113.2
+//! based-on style controls additionally establish overlap with base margins.
 
 use super::*;
 
@@ -112,20 +113,36 @@ fn unconditional_d63e_overrides_d634_in_both_record_orders() {
 }
 
 #[test]
-fn conditional_d63e_with_overlapping_d634_stays_gated() {
+fn conditional_d63e_overrides_overlapping_d634_on_selected_side() {
     for (side, width) in [(0x01, 216), (0x02, 288), (0x04, 360), (0x08, 432)] {
         let unconditional = margin(0xd634, 0x0f, 72);
         let conditional = first_row(&margin(0xd63e, side, width));
         let tapx = [unconditional.as_slice(), conditional.as_slice()].concat();
         let mut value = formatting(&tapx);
 
-        let (defaults, cells) = value.table_cell_margins(Some(0)).unwrap();
+        let key = TableFormattingKey {
+            selected_style: 0,
+            matches: [
+                None,
+                None,
+                None,
+                Some(crate::doc::table_style_condition::FIRST_ROW),
+                None,
+            ],
+        };
+        let (defaults, cells) = value.table_cell_margins_for_key(Some(key)).unwrap();
 
         let mut expected = table::MarginPatch::default();
         expected.apply_style(0xd634, &unconditional[2..]).unwrap();
         assert_eq!(defaults, expected);
-        assert_eq!(cells, table::MarginPatch::default());
-        assert!(value.unsupported_table_properties);
+        let mut row = table::Row::default();
+        row.apply(0x7621, &[0, 1, 0xe8, 3]).unwrap();
+        row.resolve_style_aware_margins(defaults, cells);
+        let selected = side.trailing_zeros() as usize;
+        for (index, actual) in row.cells[0].margins.iter().enumerate() {
+            assert_eq!(*actual, Some(if index == selected { width } else { 72 }));
+        }
+        assert!(!value.unsupported_table_properties);
     }
 }
 

@@ -324,9 +324,6 @@ impl Formatting<'_> {
         let mut vertical_source = None;
         let mut has_inherited_conditional_shading = false;
         let mut conditional_border_rejected = false;
-        let mut default_margin_sides = 0u8;
-        let mut style_margin_sides = 0u8;
-        let mut conditional_margin_sides = 0u8;
         let interpret_table_styles = self.interpret_table_styles;
         for style_id in chain {
             let sets = *self.styles[style_id]
@@ -416,7 +413,6 @@ impl Formatting<'_> {
                             if let tapx::Scope::Conditional(condition) = scope {
                                 if code != 0xd63e
                                     || condition != crate::doc::table_style_condition::FIRST_ROW
-                                    || inherited
                                     || profile.conditional_first_row_margins.is_some()
                                 {
                                     profile.unsupported_table = true;
@@ -424,7 +420,6 @@ impl Formatting<'_> {
                                 }
                                 let mut patch = table::MarginPatch::default();
                                 let sides = patch.apply_style(code, operand)?;
-                                conditional_margin_sides = sides;
                                 if sides == 0 {
                                     return Ok(false);
                                 }
@@ -435,29 +430,18 @@ impl Formatting<'_> {
                             if scope != tapx::Scope::Unconditional {
                                 return Ok(false);
                             }
-                            let (patch, own_sides, other_sides) = if code == 0xd634 {
-                                (
-                                    &mut profile.table_default_margins,
-                                    &mut default_margin_sides,
-                                    style_margin_sides,
-                                )
+                            let patch = if code == 0xd634 {
+                                &mut profile.table_default_margins
                             } else {
-                                (
-                                    &mut profile.table_style_margins,
-                                    &mut style_margin_sides,
-                                    default_margin_sides,
-                                )
+                                &mut profile.table_style_margins
                             };
-                            let sides = patch.apply_style(code, operand)?;
-                            // [MS-DOC] 2.6.3 defines D63E as the selected table
-                            // style's margin and D634 as its fallback. Native
-                            // controls establish that precedence in both record
-                            // orders for a non-inherited style. Cross-property
-                            // composition through basedOn remains unestablished.
-                            if inherited && sides & other_sides != 0 {
-                                profile.unsupported_table = true;
-                            }
-                            *own_sides |= sides;
+                            patch.apply_style(code, operand)?;
+                            // [MS-DOC] 2.6.3: D63E is the style margin and
+                            // D634 its fallback, regardless of record order.
+                            // Word 16.113.2 controls with a based-on table
+                            // style and overlapping first-row margin show
+                            // that conditional D63E replaces the same side
+                            // while the ordinary row retains the base value.
                             Ok(interpret_table_styles)
                         }
                         0xd687 => {
@@ -627,15 +611,6 @@ impl Formatting<'_> {
                     },
                 )?;
             }
-        }
-        if conditional_margin_sides != 0
-            && (conditional_margin_sides & default_margin_sides != 0
-                || conditional_margin_sides & style_margin_sides != conditional_margin_sides)
-        {
-            // D63E-over-D63E is the only established baseline. Evaluate this
-            // after the whole TAPX so serialization order cannot bypass it.
-            profile.unsupported_table = true;
-            profile.conditional_first_row_margins = None;
         }
         // Native Word controls establish field-wise base-to-child composition
         // for supported conditional color, absolute CHps and logical PJc,

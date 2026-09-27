@@ -1704,8 +1704,8 @@ mod tests {
     }
 
     #[test]
-    fn table_style_margin_overlap_is_gated_but_disjoint_sides_resolve() {
-        for (style_side, expected_gate) in [(0x02, true), (0x08, false)] {
+    fn table_style_margin_overlap_uses_style_before_default_by_side() {
+        for style_side in [0x02, 0x08] {
             let mut formatting = observed_table_style_formatting();
             formatting.configure_table_styles(0x0112, true);
             formatting.styles[0]
@@ -1727,19 +1727,19 @@ mod tests {
             let mut row = table::Row::default();
             row.apply(0x7621, &[0, 1, 0xe8, 3]).unwrap();
             row.resolve_style_aware_margins(defaults, cells);
-            if expected_gate {
+            if style_side == 0x02 {
                 assert_eq!(row.cells[0].margins[1], Some(720));
                 assert_eq!(row.cells[0].margins[3], Some(108));
             } else {
                 assert_eq!(row.cells[0].margins[1], Some(360));
                 assert_eq!(row.cells[0].margins[3], Some(720));
             }
-            assert_eq!(formatting.unsupported_table_properties, expected_gate);
+            assert!(!formatting.unsupported_table_properties);
         }
     }
 
     #[test]
-    fn conditional_table_style_margin_remains_gated_and_does_not_project() {
+    fn conditional_first_row_margin_overrides_inherited_default_and_style() {
         let mut formatting = observed_table_style_formatting();
         formatting.configure_table_styles(0x0112, true);
         formatting.styles[0]
@@ -1748,18 +1748,43 @@ mod tests {
             .table
             .as_mut()
             .unwrap()
-            .tapx = leaked(cnf(
-            0xd66a,
-            table_style_condition::FIRST_ROW,
-            &table_style_margin(0xd63e, 0x02, 3, 360),
-        ));
+            .tapx = leaked(table_style_margin(0xd634, 0x02, 3, 120));
+        formatting.styles[1]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .tapx = leaked(
+            [
+                table_style_margin(0xd63e, 0x02, 3, 120),
+                cnf(
+                    0xd66a,
+                    table_style_condition::FIRST_ROW,
+                    &table_style_margin(0xd63e, 0x02, 3, 600),
+                ),
+            ]
+            .concat(),
+        );
 
-        let (defaults, cells) = formatting.table_cell_margins(Some(0)).unwrap();
-        let mut row = table::Row::default();
-        row.apply(0x7621, &[0, 1, 0xe8, 3]).unwrap();
-        row.resolve_style_aware_margins(defaults, cells);
-        assert_eq!(row.cells[0].margins[1], Some(108));
-        assert!(formatting.unsupported_table_properties);
+        for (first_row, expected) in [(false, 120), (true, 600)] {
+            let key = TableFormattingKey {
+                selected_style: 1,
+                matches: [
+                    None,
+                    None,
+                    None,
+                    first_row.then_some(table_style_condition::FIRST_ROW),
+                    None,
+                ],
+            };
+            let (defaults, cells) = formatting.table_cell_margins_for_key(Some(key)).unwrap();
+            let mut row = table::Row::default();
+            row.apply(0x7621, &[0, 1, 0xe8, 3]).unwrap();
+            row.resolve_style_aware_margins(defaults, cells);
+            assert_eq!(row.cells[0].margins[1], Some(expected));
+        }
+        assert!(!formatting.unsupported_table_properties);
     }
 
     #[test]
