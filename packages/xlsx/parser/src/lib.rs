@@ -1416,7 +1416,7 @@ fn stream_sheet_data_from_archive(
                 return Ok(StreamedSheetData {
                     shell_xml: tail.shell_xml,
                     rows,
-                    row_heights: tail.row_heights,
+                    row_geometry: tail.row_geometry,
                 });
             }
             Err(error) => {
@@ -1455,7 +1455,10 @@ fn parse_projected_worksheet(
     // whether the declaration also needs the compact public wire form.
     let mut authored_col_widths: Vec<(crate::types::ColumnWidthRange, bool)> = Vec::new();
     let mut authored_col_styles: Vec<crate::types::ColumnStyleRange> = Vec::new();
-    let mut row_heights = streamed.row_heights;
+    let worksheet_projector::AuthoredRowGeometry {
+        heights: mut row_heights,
+        unspecified_visible,
+    } = streamed.row_geometry;
     // Outline (grouping) metadata — ECMA-376 §18.3.1.13 (col) / §18.3.1.73
     // (row) / §18.3.1.61 (outlinePr). Only non-default entries are recorded so
     // an outline-free sheet keeps empty maps / a `None` outlinePr (byte-stable
@@ -2199,11 +2202,19 @@ fn parse_projected_worksheet(
     conditional_formats.extend(x14_icon_formats);
 
     if rows_hidden_by_default {
+        // ECMA-376 §18.3.1.81 `zeroHeight` hides only *unspecified* rows. An
+        // explicit, visible `<row>` without `@ht` keeps the authored default
+        // band. The bounded cursor has already emitted (and dropped) its rows
+        // by the time this shell is parsed, so the band is resolved from the
+        // row-geometry facts recorded while streaming, never from `rows`.
+        // This keeps the full, cursor and preview paths identical regardless
+        // of where `sheetFormatPr` appears. `row.height` stays the authored
+        // `@ht` fact; the renderer's auto-fit already treats a `rowHeights`
+        // entry as authoritative.
         let visible_default_height = default_row_height;
-        for row in &mut rows {
-            if !row.hidden && row.height.is_none() {
-                row.height = Some(visible_default_height);
-                row_heights.insert(row.index, visible_default_height);
+        for &(first, last) in &unspecified_visible {
+            for index in first..=last {
+                row_heights.insert(index, visible_default_height);
             }
         }
         // Unspecified rows remain hidden. The sparse grid axis represents the
@@ -2286,7 +2297,7 @@ fn parse_projected_worksheet_tail(
         StreamedSheetData {
             shell_xml: tail.shell_xml,
             rows: Vec::new(),
-            row_heights: tail.row_heights,
+            row_geometry: tail.row_geometry,
         },
         theme_colors,
         name,
@@ -3297,8 +3308,18 @@ fn parse_row_cells(
 /// Accepts `1`/`true`/`on` as true and `0`/`false`/`off` as false (case-insensitive).
 /// Returns `None` when the attribute is absent so callers can apply their own default.
 pub(crate) fn attr_bool(node: &roxmltree::Node, name: &str) -> Option<bool> {
-    node.attribute(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+    node.attribute(name).map(xml_bool_value)
+}
+
+/// Truth value of a decoded SpreadsheetML boolean attribute. The row
+/// projector (via [`attr_bool`]) and the lexical worksheet preview both use
+/// this one reader, so a lenient spelling such as `hidden="True"` cannot give
+/// a provisional frame different row geometry from the completed sheet.
+pub(crate) fn xml_bool_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    )
 }
 
 pub(crate) fn parse_cell_ref(reference: &str) -> (u32, u32) {
@@ -4623,7 +4644,9 @@ mod sheet_view_tests {
         let (ws, _) = parse_worksheet(&xml, &[], &[], "Sheet1").expect("worksheet parses");
         assert_eq!(ws.default_row_height, 0.0, "unspecified rows are hidden");
         assert_eq!(ws.row_heights.get(&3).copied(), Some(22.0));
-        assert_eq!(ws.rows[0].height, Some(22.0));
+        // `row.height` remains the authored `@ht` fact on every parse path;
+        // the resolved band lives in `row_heights`.
+        assert_eq!(ws.rows[0].height, None);
         assert!(!ws.rows[0].hidden);
     }
 
@@ -7160,6 +7183,93 @@ mod rb7_partial_degradation_tests {
             }
         }
         archive.cancel_sheet_cursor();
+    }
+
+    /// Pull a cursor to completion, returning the provisional preview unit and
+    /// the terminal worksheet with its streamed rows attached.
+    fn cursor_preview_and_terminal(sheet: &str) -> (serde_json::Value, serde_json::Value) {
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let preview: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(preview["kind"], "preview");
+        let mut rows = Vec::new();
+        let terminal = loop {
+            let mut unit: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(128).unwrap()).unwrap();
+            if unit["kind"] == "rows" {
+                rows.append(unit["rows"].as_array_mut().unwrap());
+                continue;
+            }
+            assert_eq!(unit["kind"], "finished");
+            let mut worksheet = unit["worksheet"].take();
+            worksheet["rows"] = serde_json::Value::Array(rows);
+            break worksheet;
+        };
+        archive.acknowledge_sheet_cursor_terminal_inner().unwrap();
+        (preview, terminal)
+    }
+
+    /// ECMA-376 §18.3.1.81: `zeroHeight` hides unspecified rows only. A visible
+    /// explicit row without `@ht` keeps the default band on the preview, the
+    /// bounded cursor and the full parse alike, so the first frame cannot
+    /// collapse a row that the completed sheet shows.
+    #[test]
+    fn zero_height_visible_rows_without_ht_keep_the_default_band_on_every_path() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetFormatPr defaultRowHeight="22" zeroHeight="1"/><sheetData><row r="1" ht="30"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3" hidden="1"><c r="A3"><v>3</v></c></row><row r="4" hidden="0"><c r="A4"><v>4</v></c></row><row r="5"><c r="A5"><v>5</v></c></row></sheetData></worksheet>"#;
+        let expected = serde_json::json!({"1": 30.0, "2": 22.0, "3": 0.0, "4": 22.0, "5": 22.0});
+        let (preview, terminal) = cursor_preview_and_terminal(sheet);
+        assert!(preview["reason"].is_null());
+        assert_eq!(preview["worksheet"]["rowHeights"], expected);
+        assert_eq!(preview["worksheet"]["defaultRowHeight"], 0.0);
+        assert_eq!(terminal["rowHeights"], expected);
+        assert_eq!(terminal["defaultRowHeight"], 0.0);
+
+        let (full, _) = parse_worksheet(sheet, &[], &[], "Sheet1").unwrap();
+        let full = serde_json::to_value(full).unwrap();
+        assert_eq!(full["rowHeights"], expected);
+        assert_eq!(full["rows"], terminal["rows"]);
+    }
+
+    /// The row projector reads booleans leniently (`attr_bool`). The lexical
+    /// preview must use the same reader, or a `hidden="True"` row would paint
+    /// at the default height first and collapse when loading completes.
+    #[test]
+    fn lenient_row_booleans_give_the_preview_the_terminal_row_geometry() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" hidden="True"><c r="A1"><v>1</v></c></row><row r="2" hidden=" on "><c r="A2"><v>2</v></c></row><row r="3" hidden="false" ht="40"><c r="A3"><v>3</v></c></row></sheetData></worksheet>"#;
+        let (preview, terminal) = cursor_preview_and_terminal(sheet);
+        let expected = serde_json::json!({"1": 0.0, "2": 0.0, "3": 40.0});
+        assert_eq!(preview["worksheet"]["rowHeights"], expected);
+        assert_eq!(terminal["rowHeights"], expected);
+
+        // A lenient `collapsed` spelling is still an outline, which the
+        // viewer's gutter needs the complete sheet to lay out.
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" collapsed="TRUE"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+        let (preview, _) = cursor_preview_and_terminal(sheet);
+        assert_eq!(preview["reason"], "outline");
+    }
+
+    /// The lexical preview identifies elements by unprefixed name. When that
+    /// cannot mean SpreadsheetML, or `sheetData` is not the root child the
+    /// projector requires, the sheet waits for the complete model.
+    #[test]
+    fn preview_requires_the_projector_namespace_and_sheet_data_position() {
+        for sheet in [
+            r#"<worksheet xmlns="urn:example:other"><sheetData><row r="1" ht="30"/></sheetData></worksheet>"#,
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" ht="30" xmlns="urn:example:other"/></sheetData></worksheet>"#,
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr><sheetData/></sheetPr><sheetData><row r="1" ht="30"/></sheetData></worksheet>"#,
+        ] {
+            let mut archive =
+                XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+            archive.open_sheet_cursor(0, "Sheet1").unwrap();
+            let preview: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+            assert_eq!(preview["kind"], "preview", "{sheet}");
+            assert_eq!(preview["reason"], "metadata-unavailable", "{sheet}");
+            assert!(preview["worksheet"].is_null(), "{sheet}");
+            archive.cancel_sheet_cursor();
+        }
     }
 
     #[test]

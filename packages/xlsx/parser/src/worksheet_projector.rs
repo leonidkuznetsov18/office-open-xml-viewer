@@ -45,7 +45,49 @@ use crate::{
 pub(super) struct StreamedSheetData {
     pub(super) shell_xml: String,
     pub(super) rows: Vec<Row>,
-    pub(super) row_heights: BTreeMap<u32, f64>,
+    pub(super) row_geometry: AuthoredRowGeometry,
+}
+
+/// Row-band facts authored on `<row>` elements (ECMA-376 §18.3.1.73), recorded
+/// while `sheetData` streams so the shell parse can resolve sheet-level rules
+/// (`sheetFormatPr@zeroHeight`, §18.3.1.81) after the rows themselves have been
+/// emitted and dropped. Both the bounded row projector and the lexical
+/// worksheet preview record through [`AuthoredRowGeometry::record`] with a
+/// height from [`authored_row_height`], so the two paths cannot diverge.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct AuthoredRowGeometry {
+    /// Hidden rows (zero) and rows with a valid `@ht`, last authored row wins.
+    pub(super) heights: BTreeMap<u32, f64>,
+    /// Visible rows without a valid `@ht`, as inclusive index runs in
+    /// document order. Contiguous authored rows collapse into one run, so this
+    /// stays small for ordinary data and never exceeds the row count.
+    pub(super) unspecified_visible: Vec<(u32, u32)>,
+}
+
+impl AuthoredRowGeometry {
+    pub(super) fn record(&mut self, index: u32, height: Option<f64>) {
+        match height {
+            Some(height) => {
+                self.heights.insert(index, height);
+            }
+            None => match self.unspecified_visible.last_mut() {
+                Some((_, last)) if last.checked_add(1) == Some(index) => *last = index,
+                _ => self.unspecified_visible.push((index, index)),
+            },
+        }
+    }
+}
+
+/// Authored band of one row. `hidden` (already read as an XML boolean) forces
+/// a zero band; otherwise `@ht` is the height in points when it is a finite,
+/// nonnegative number. `customHeight` records how the height was set and does
+/// not gate the value. `None` means the sheet default applies.
+pub(super) fn authored_row_height(hidden: bool, ht: Option<&str>) -> Option<f64> {
+    if hidden {
+        return Some(0.0);
+    }
+    ht.and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// Hidden safety ceiling for one lexical XML event. `quick_xml` otherwise keeps
@@ -473,14 +515,7 @@ fn parse_row_node(
     let row_idx = resolve_implicit_ordinal(explicit_row, prev_row_idx, SpreadsheetOrdinal::Row)?;
     let hidden = attr_bool(node, "hidden").unwrap_or(false);
     // ECMA-376 §18.3.1.73 `<row>@ht` is the row height in points.
-    // `customHeight` describes how it was set and does not gate the value.
-    let height = if hidden {
-        Some(0.0)
-    } else {
-        node.attribute("ht")
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0)
-    };
+    let height = authored_row_height(hidden, node.attribute("ht"));
     let custom_height = attr_bool(node, "customHeight").unwrap_or(false);
     let outline_level = node
         .attribute("outlineLevel")
@@ -831,7 +866,7 @@ struct StreamedRowBatch {
     max_row_arena_bytes: usize,
     max_single_row_projection_bytes: usize,
     previous_index: u32,
-    heights: BTreeMap<u32, f64>,
+    geometry: AuthoredRowGeometry,
 }
 
 struct RowProjectionInputs<'a> {
@@ -879,9 +914,7 @@ impl StreamedRowBatch {
             shared_strings,
             theme_colors,
         )? {
-            if let Some(height) = row.row.height {
-                self.heights.insert(row.row.index, height);
-            }
+            self.geometry.record(row.row.index, row.row.height);
             ready_rows.push_back(row);
         }
         self.pending_bytes = 0;
@@ -923,7 +956,7 @@ impl StreamedRowBatch {
 #[derive(Debug)]
 pub(super) struct StreamedWorksheetRows {
     pub(super) shell_xml: String,
-    pub(super) row_heights: BTreeMap<u32, f64>,
+    pub(super) row_geometry: AuthoredRowGeometry,
     #[cfg(test)]
     max_row_arena_bytes: usize,
     #[cfg(test)]
@@ -1519,7 +1552,7 @@ where
         let max_single_row_projection_bytes = self.row_batch.max_single_row_projection_bytes;
         self.finished_tail = Some(StreamedWorksheetRows {
             shell_xml,
-            row_heights: std::mem::take(&mut self.row_batch.heights),
+            row_geometry: std::mem::take(&mut self.row_batch.geometry),
             #[cfg(test)]
             max_row_arena_bytes,
             #[cfg(test)]
@@ -1755,7 +1788,7 @@ pub(super) fn stream_sheet_data(
     Ok(StreamedSheetData {
         shell_xml: streamed.shell_xml,
         rows,
-        row_heights: streamed.row_heights,
+        row_geometry: streamed.row_geometry,
     })
 }
 #[cfg(test)]
@@ -1780,7 +1813,7 @@ mod worksheet_streaming_tests {
                     return Ok(StreamedSheetData {
                         shell_xml: tail.shell_xml,
                         rows,
-                        row_heights: tail.row_heights,
+                        row_geometry: tail.row_geometry,
                     });
                 }
             }
@@ -1827,10 +1860,10 @@ mod worksheet_streaming_tests {
         xml: &str,
         shared_strings: &[SharedString],
         theme_colors: &[String],
-    ) -> (Vec<Row>, BTreeMap<u32, f64>) {
+    ) -> (Vec<Row>, AuthoredRowGeometry) {
         let doc = parse_guarded(xml).expect("legacy full worksheet DOM parses");
         let mut previous_row = 0;
-        let mut heights = BTreeMap::new();
+        let mut heights = AuthoredRowGeometry::default();
         let rows = doc
             .descendants()
             .filter(|node| {
@@ -1841,9 +1874,7 @@ mod worksheet_streaming_tests {
             .map(|node| {
                 let row = parse_row_node(&node, &mut previous_row, shared_strings, theme_colors)
                     .expect("reference worksheet row parses");
-                if let Some(height) = row.height {
-                    heights.insert(row.index, height);
-                }
+                heights.record(row.index, row.height);
                 row
             })
             .collect();
@@ -1857,7 +1888,7 @@ mod worksheet_streaming_tests {
             serde_json::to_value(&streamed.rows).expect("streamed rows serialize"),
             serde_json::to_value(&dom_rows).expect("DOM rows serialize")
         );
-        assert_eq!(streamed.row_heights, dom_heights);
+        assert_eq!(streamed.row_geometry, dom_heights);
         let shell = parse_guarded(&streamed.shell_xml).expect("worksheet shell stays valid");
         assert!(!shell
             .descendants()
@@ -1899,7 +1930,7 @@ mod worksheet_streaming_tests {
             serde_json::to_value(actual.rows).unwrap(),
             serde_json::to_value(expected.rows).unwrap()
         );
-        assert_eq!(actual.row_heights, expected.row_heights);
+        assert_eq!(actual.row_geometry, expected.row_geometry);
         assert_eq!(actual.shell_xml, expected.shell_xml);
     }
 
@@ -2460,7 +2491,7 @@ mod worksheet_streaming_tests {
         assert!(projector.active_row.is_none());
         assert!(projector.shell_xml.is_empty());
         assert!(projector.row_batch.pending.is_empty());
-        assert!(projector.row_batch.heights.is_empty());
+        assert_eq!(projector.row_batch.geometry, AuthoredRowGeometry::default());
         assert!(projector.ready_rows.is_empty());
         assert!(projector.finished_tail.is_none());
         assert!(shared_weak.upgrade().is_none());

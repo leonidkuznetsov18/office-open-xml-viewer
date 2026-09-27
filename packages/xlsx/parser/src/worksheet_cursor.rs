@@ -6,6 +6,7 @@
 //! ancillary parts are charged to the same operation.
 
 use std::borrow::Cow;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::rc::Rc;
@@ -13,17 +14,17 @@ use std::rc::Rc;
 #[cfg(test)]
 use ooxml_common::bounded_xml::BoundedXmlReader;
 use ooxml_common::bounded_xml::MCE_NS;
-#[cfg(test)]
 use ooxml_common::ns::is_x_ns;
 #[cfg(test)]
 use quick_xml::events::{BytesStart, Event};
 
 use crate::worksheet_projector::{
-    ProjectedWorksheetRow, WorksheetProjectorItem, WorksheetRowProjector,
+    authored_row_height, AuthoredRowGeometry, ProjectedWorksheetRow, WorksheetProjectorItem,
+    WorksheetRowProjector,
 };
 use crate::{
-    parse_cell_ref_checked, resolve_implicit_ordinal, Row, SharedString, SpreadsheetOrdinal,
-    XlsxZip,
+    parse_cell_ref_checked, resolve_implicit_ordinal, xml_bool_value, Row, SharedString,
+    SpreadsheetOrdinal, XlsxZip,
 };
 
 /// Default semantic credit for one production pull. Rows are indivisible: the
@@ -46,7 +47,7 @@ enum WorksheetCursorState {
 #[derive(Debug)]
 pub(super) struct WorksheetCursorTail {
     pub(super) shell_xml: String,
-    pub(super) row_heights: BTreeMap<u32, f64>,
+    pub(super) row_geometry: AuthoredRowGeometry,
 }
 
 /// Facts that the viewer needs before accepting an exact provisional frame.
@@ -165,7 +166,7 @@ impl WorksheetCursor {
                 Ok(WorksheetProjectorItem::Finished(tail)) => {
                     let tail = WorksheetCursorTail {
                         shell_xml: tail.shell_xml,
-                        row_heights: tail.row_heights,
+                        row_geometry: tail.row_geometry,
                     };
                     if rows.is_empty() {
                         self.state = WorksheetCursorState::Finished;
@@ -319,7 +320,7 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
     let mut max_col = 0;
     let mut has_row_outline = false;
     let mut ordered_rows = true;
-    let mut row_heights = BTreeMap::new();
+    let mut row_geometry = AuthoredRowGeometry::default();
     loop {
         let read = reader.read_event().map_err(|error| format!("{error:?}"))?;
         let x = is_x_ns(read.namespace.as_deref());
@@ -358,27 +359,15 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
                 ordered_rows &= row > previous;
                 max_row = max_row.max(row);
                 previous_col = 0;
-                let hidden = matches!(
-                    numeric_attribute(&start, b"hidden")?.as_deref(),
-                    Some("1" | "true")
-                );
-                let height = if hidden {
-                    Some(0.0)
-                } else {
-                    numeric_attribute(&start, b"ht")?
-                        .and_then(|value| value.parse::<f64>().ok())
-                        .filter(|value| value.is_finite() && *value >= 0.0)
-                };
-                if let Some(height) = height {
-                    row_heights.insert(row, height);
-                }
+                let hidden = numeric_attribute(&start, b"hidden")?
+                    .is_some_and(|value| xml_bool_value(&value));
+                let ht = numeric_attribute(&start, b"ht")?;
+                row_geometry.record(row, authored_row_height(hidden, ht.as_deref()));
                 let outline = numeric_attribute(&start, b"outlineLevel")?
                     .and_then(|value| value.parse::<u8>().ok())
                     .unwrap_or(0);
-                let collapsed = matches!(
-                    numeric_attribute(&start, b"collapsed")?.as_deref(),
-                    Some("1" | "true")
-                );
+                let collapsed = numeric_attribute(&start, b"collapsed")?
+                    .is_some_and(|value| xml_bool_value(&value));
                 has_row_outline |= outline != 0 || collapsed;
             }
             Event::Start(start) | Event::Empty(start)
@@ -420,7 +409,7 @@ fn fast_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPreview, 
     Ok(WorksheetCursorPreview {
         tail: Some(WorksheetCursorTail {
             shell_xml,
-            row_heights,
+            row_geometry,
         }),
         max_row,
         max_col,
@@ -603,11 +592,28 @@ fn lexical_scan_worksheet_preview<R: Read>(source: R) -> Result<WorksheetCursorP
     result
 }
 
+/// The lexical scan identifies SpreadsheetML elements by their unprefixed
+/// names. That is sound only while the in-scope default namespace is
+/// SpreadsheetML (transitional or strict), exactly as the row projector checks
+/// with a namespace-aware reader. A default-namespace declaration naming any
+/// other vocabulary disables the preview instead of letting foreign `row`
+/// elements contribute geometry the terminal model would not have.
+fn foreign_default_namespace(tag: &[u8]) -> Result<bool, String> {
+    if !tag.windows(b"xmlns".len()).any(|part| part == b"xmlns") {
+        return Ok(false);
+    }
+    Ok(tag_attribute(tag, b"xmlns")?.is_some_and(|namespace| !is_x_ns(Some(&namespace))))
+}
+
 fn lexical_scan_worksheet_preview_inner<R: Read>(
     reader: &mut BufReader<R>,
 ) -> Result<WorksheetCursorPreview, String> {
     let mut shell = Vec::new();
     let mut tag = Vec::with_capacity(128);
+    // Element depth of the head. `sheetData` must be a direct child of the
+    // SpreadsheetML `worksheet` root (§18.3.1.99), which the row projector
+    // also enforces; a nested look-alike never authorizes a preview.
+    let mut depth = 0usize;
     let self_closing = loop {
         if !next_markup(reader, Some(&mut shell), &mut tag)? {
             return Err("worksheet has no unprefixed sheetData".to_string());
@@ -622,12 +628,39 @@ fn lexical_scan_worksheet_preview_inner<R: Read>(
             return Err("worksheet requires the complete XML projector".to_string());
         }
         append_shell(&mut shell, &tag)?;
+        if tag.starts_with(b"<?") {
+            continue;
+        }
+        if tag.starts_with(b"</") {
+            depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| "worksheet preview head is unbalanced".to_string())?;
+            continue;
+        }
+        if depth == 0 {
+            let root = tag.starts_with(b"<worksheet")
+                && tag
+                    .get(b"<worksheet".len())
+                    .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>');
+            let namespace = tag_attribute(&tag, b"xmlns")?;
+            if !root || !namespace.is_some_and(|namespace| is_x_ns(Some(&namespace))) {
+                return Err("worksheet preview needs an unprefixed SpreadsheetML root".to_string());
+            }
+        } else if foreign_default_namespace(&tag)? {
+            return Err("worksheet preview has a foreign default namespace".to_string());
+        }
         if tag.starts_with(b"<sheetData")
             && tag
                 .get(b"<sheetData".len())
                 .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'/' || *byte == b'>')
         {
+            if depth != 1 {
+                return Err("worksheet preview sheetData is not a root child".to_string());
+            }
             break tag.ends_with(b"/>");
+        }
+        if !tag.ends_with(b"/>") {
+            depth += 1;
         }
     };
     let mut previous_row = 0;
@@ -636,7 +669,7 @@ fn lexical_scan_worksheet_preview_inner<R: Read>(
     let mut max_col = 0;
     let mut has_row_outline = false;
     let mut ordered_rows = true;
-    let mut row_heights = BTreeMap::new();
+    let mut row_geometry = AuthoredRowGeometry::default();
     if !self_closing {
         loop {
             if !next_markup(reader, None, &mut tag)? {
@@ -676,6 +709,9 @@ fn lexical_scan_worksheet_preview_inner<R: Read>(
             if name.contains(&b':') {
                 return Err("worksheet preview has prefixed row markup".to_string());
             }
+            if foreign_default_namespace(&tag)? {
+                return Err("worksheet preview has a foreign default namespace".to_string());
+            }
             if name == b"row" {
                 let explicit = tag_attribute(&tag, b"r")?
                     .map(|value| value.parse::<u32>().map_err(|error| error.to_string()))
@@ -686,21 +722,18 @@ fn lexical_scan_worksheet_preview_inner<R: Read>(
                 ordered_rows &= row > prior;
                 max_row = max_row.max(row);
                 previous_col = 0;
-                let hidden = matches!(tag_attribute(&tag, b"hidden")?, Some(value) if value == "1" || value == "true");
-                let height = if hidden {
-                    Some(0.0)
-                } else {
-                    tag_attribute(&tag, b"ht")?
-                        .and_then(|value| value.parse::<f64>().ok())
-                        .filter(|value| value.is_finite() && *value >= 0.0)
-                };
-                if let Some(height) = height {
-                    row_heights.insert(row, height);
-                }
+                // Same readers as the row projector's `parse_row_node`: the
+                // tail parse resolves sheet-level rules such as zeroHeight from
+                // these recorded facts on both paths.
+                let hidden =
+                    tag_attribute(&tag, b"hidden")?.is_some_and(|value| xml_bool_value(&value));
+                let ht = tag_attribute(&tag, b"ht")?;
+                row_geometry.record(row, authored_row_height(hidden, ht.as_deref()));
                 let outline = tag_attribute(&tag, b"outlineLevel")?
                     .and_then(|value| value.parse::<u8>().ok())
                     .unwrap_or(0);
-                let collapsed = matches!(tag_attribute(&tag, b"collapsed")?, Some(value) if value == "1" || value == "true");
+                let collapsed =
+                    tag_attribute(&tag, b"collapsed")?.is_some_and(|value| xml_bool_value(&value));
                 has_row_outline |= outline != 0 || collapsed;
             } else if name == b"c" {
                 let explicit = tag_attribute(&tag, b"r")?
@@ -720,7 +753,7 @@ fn lexical_scan_worksheet_preview_inner<R: Read>(
     Ok(WorksheetCursorPreview {
         tail: Some(WorksheetCursorTail {
             shell_xml,
-            row_heights,
+            row_geometry,
         }),
         max_row,
         max_col,
@@ -796,8 +829,8 @@ mod tests {
         assert_eq!(lexical.has_row_outline, parsed.has_row_outline);
         assert_eq!(lexical.ordered_rows, parsed.ordered_rows);
         assert_eq!(
-            lexical.tail.unwrap().row_heights,
-            parsed.tail.unwrap().row_heights
+            lexical.tail.unwrap().row_geometry,
+            parsed.tail.unwrap().row_geometry
         );
     }
 
@@ -808,7 +841,7 @@ mod tests {
         assert_eq!(preview.max_row, 3);
         assert_eq!(preview.max_col, 3);
         assert_eq!(
-            preview.tail.unwrap().row_heights,
+            preview.tail.unwrap().row_geometry.heights,
             BTreeMap::from([(2, 30.0)])
         );
 
@@ -829,13 +862,13 @@ mod tests {
 
     #[test]
     fn special_row_markup_cannot_forge_the_tail_boundary() {
-        let xml = r#"<worksheet><sheetData><row r="1"/><![CDATA[</sheetData><mergeCells/>]]><row r="2"/></sheetData></worksheet>"#;
+        let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"/><![CDATA[</sheetData><mergeCells/>]]><row r="2"/></sheetData></worksheet>"#;
         assert!(lexical_scan_worksheet_preview(xml.as_bytes()).is_err());
 
-        let xml = r#"<?pi <sheetData><row r="1"/></sheetData> ?><worksheet><sheetData><row r="2"/></sheetData></worksheet>"#;
+        let xml = r#"<?pi <sheetData><row r="1"/></sheetData> ?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="2"/></sheetData></worksheet>"#;
         assert!(lexical_scan_worksheet_preview(xml.as_bytes()).is_err());
 
-        let xml = r#"<worksheet><sheetData><row r="1" ht="&#51;0"/></sheetData><mergeCells count="0"/></worksheet>"#;
+        let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" ht="&#51;0"/></sheetData><mergeCells count="0"/></worksheet>"#;
         let reader = xml
             .as_bytes()
             .chunks(3)
@@ -853,7 +886,10 @@ mod tests {
             }
         }
         let preview = lexical_scan_worksheet_preview(ShortRead(reader)).unwrap();
-        assert_eq!(preview.tail.unwrap().row_heights.get(&1), Some(&30.0));
+        assert_eq!(
+            preview.tail.unwrap().row_geometry.heights.get(&1),
+            Some(&30.0)
+        );
     }
 
     #[test]
