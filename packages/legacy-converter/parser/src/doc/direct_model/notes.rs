@@ -146,10 +146,14 @@ pub(super) fn validate(
             "Word end-of-section endnote placement is not supported",
         ));
     }
-    // MS-DOC 2.3.3 separator stories. Word writes the separator (U+0003) and
-    // continuation separator (U+0004) characters as one paragraph followed by
-    // the guard mark; the continuation notice is empty or one empty paragraph.
-    // Their paragraph formatting is not retained, as for DOCX separator notes.
+    // [MS-DOC] 2.3.3 separator stories. Word can use U+0003 (the short
+    // separator) in the continuation-separator slot as well as U+0004 (the
+    // full-width continuation separator). A one-character binary control
+    // changed only U+0003 to U+0004 in that slot: seven continued-note pages
+    // gained a full-width line, while the other 280 pages were pixel-identical.
+    // The shared note layout draws a short line. Retain both admitted forms
+    // for now; the U+0004 form needs a generic continuation-line capability
+    // before its continued-note pages can be fidelity-complete.
     let headers = headers
         .ok_or_else(|| unsupported("Word notes without separator stories are not supported"))?;
     for (present, base) in [(footnotes, 0), (endnotes, 3)] {
@@ -157,7 +161,7 @@ pub(super) fn validate(
             continue;
         }
         if headers.separator_text(base) != "\u{3}\r\r"
-            || headers.separator_text(base + 1) != "\u{4}\r\r"
+            || !matches!(headers.separator_text(base + 1), "\u{3}\r\r" | "\u{4}\r\r")
             || !matches!(headers.separator_text(base + 2), "" | "\r\r")
         {
             return Err(unsupported("custom Word note separators are not supported"));
@@ -300,7 +304,7 @@ mod tests {
     use crate::cfb::CompoundFile;
     use docx_model::{BodyElement, DocRun, Document};
 
-    const SEPARATORS: [&str; 6] = ["\u{3}\r\r", "\u{4}\r\r", "", "", "", ""];
+    const SEPARATORS: [&str; 6] = ["\u{3}\r\r", "\u{3}\r\r", "", "", "", ""];
 
     fn document(text: &str, fixture: &NotesFixture<'_>) -> Result<Document, String> {
         let sections = [(text.encode_utf16().count(), 2, 12_240, 15_840, 1, 720)];
@@ -418,10 +422,10 @@ mod tests {
         missing.dop = None;
         assert!(reject(missing, "A\u{2}\r").contains("note properties"));
         for separators in [
-            ["", "\u{4}\r\r", "", "", "", ""],
-            ["\u{3}\r\r\r", "\u{4}\r\r", "", "", "", ""],
-            ["\u{3}\r\r", "\u{3}\r\r", "", "", "", ""],
-            ["\u{3}\r\r", "\u{4}\r\r", "x\r\r", "", "", ""],
+            ["", "\u{3}\r\r", "", "", "", ""],
+            ["\u{3}\r\r\r", "\u{3}\r\r", "", "", "", ""],
+            ["\u{3}\r\r", "x\r\r", "", "", "", ""],
+            ["\u{3}\r\r", "\u{3}\r\r", "x\r\r", "", "", ""],
         ] {
             let mut properties = fixture(&notes, &references);
             properties.separators = separators;
