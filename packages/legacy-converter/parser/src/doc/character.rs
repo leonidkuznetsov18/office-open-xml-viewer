@@ -533,6 +533,20 @@ impl Properties {
                 }
                 return Ok(u16_at(operand, 0)? == 1252);
             }
+            0x2a86 => {
+                // [MS-DOC] 2.9.81: ffmNone=0 requests no extra substitution;
+                // ffmDefault=1 requests the default font fallback. Both leave
+                // the authored font/language facts intact, which the shared
+                // Canvas font path already uses for missing glyphs. Word
+                // 0/1/2/4 controls of an RTL page are pixel-identical. A
+                // separate missing-Arabic-glyph font-table control repeatedly
+                // prints 0 and 1 identically (its first export was affected
+                // by Word's font cache), and the default-marked source page
+                // retains all text in the direct rendering. Language/UI font
+                // choices 2/4 are still gated: they need a selected fallback
+                // family that the current model does not carry.
+                return Ok(operand.len() == 1 && matches!(operand[0], 0 | 1));
+            }
             0x484e => {
                 // [MS-DOC] 2.9.118 HresiOperand: hresNormal with a zero
                 // replacement character is the default word-breaking method.
@@ -941,6 +955,22 @@ mod tests {
 
     fn bidi(properties: &Properties) -> Option<&'static str> {
         properties.resolved_languages().unwrap().bidi
+    }
+
+    #[test]
+    fn default_font_fixup_keeps_the_authored_font_for_normal_fallback() {
+        let baseline = Properties::default();
+        for marker in [0, 1] {
+            let mut value = baseline.clone();
+            assert!(value.apply(0x2a86, &[marker], &baseline).unwrap());
+            assert_eq!(run_json(&value), run_json(&baseline));
+        }
+        for marker in [2, 4] {
+            assert!(!baseline
+                .clone()
+                .apply(0x2a86, &[marker], &baseline)
+                .unwrap());
+        }
     }
 
     #[test]
