@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createBodyLayoutInput } from './body-layout-input.js';
 import { bodyLayoutAcquisitionInput } from './parser-model.js';
+import { projectBodyLayoutInput } from './layout/body-layout-input.js';
 import type { BodyElement, DocxDocumentModel, SectionProps } from './types.js';
 
 const paragraph = (text: string, spaceBefore = 0, spaceAfter = 0): BodyElement => ({
@@ -36,6 +36,9 @@ const finalSection = (overrides: Partial<SectionProps> = {}): SectionProps => ({
   lineNumbering: null,
   ...overrides,
 });
+
+const createBodyLayoutInput = (document: DocxDocumentModel) =>
+  projectBodyLayoutInput(bodyLayoutAcquisitionInput(document));
 
 describe('canonical body layout input', () => {
   it('distinguishes ordinary visible text from inline-object and mark-only paragraphs', () => {
