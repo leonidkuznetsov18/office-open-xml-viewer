@@ -8,7 +8,7 @@ import {
   retainXlsxViewerFonts,
 } from './workbook.js';
 import type { LoadOptions } from './workbook.js';
-import type { Cell, Row, ViewportRange, Worksheet, XlsxChromeColors, XlsxComment } from './types.js';
+import type { ViewportRange, Worksheet, XlsxChromeColors, XlsxComment } from './types.js';
 import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
 import { nextVisibleIndex, resolveVisibleIndex, countVisible, anchoredZoomOffset, openExternalHyperlink, nextZoomStep, prevZoomStep, fitScale } from '@silurus/ooxml-core';
 import {
@@ -29,9 +29,7 @@ import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-boun
 import { viewportPreviewBlocker, type ViewportPreviewBlocker } from './internal/worksheet-preview-eligibility.js';
 import type {
   CellAddress,
-  XlsxSelectionArea,
   XlsxSelectionContext,
-  XlsxSelectionContextCell,
   XlsxSelectionContextOptions,
   XlsxElementContext,
   XlsxSelectionInput,
@@ -43,10 +41,7 @@ import {
   type XlsxElementHitViewport,
 } from './element-context.js';
 import {
-  MAX_SELECTION_CONTEXT_CELLS,
-  MAX_SELECTION_CONTEXT_TEXT_CHARACTERS,
   normalizeSelectionState,
-  selectionCoordinateCountUpperBound,
   selectionStateFromReference,
   selectionStatesEqual,
 } from './selection.js';
@@ -64,6 +59,8 @@ import { FindAdapter } from './internal/viewer/find-adapter.js';
 import { CopyController } from './internal/viewer/copy-controller.js';
 import { SelectionInput } from './internal/viewer/selection-input.js';
 import { SelectionOverlay } from './internal/viewer/selection-overlay.js';
+import { SelectionNotifier } from './internal/viewer/selection-notifier.js';
+import { SelectionContextReader } from './internal/viewer/selection-context.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -71,11 +68,7 @@ import {
   createCommentMap,
 } from './internal/viewer/comment-popup.js';
 import type { OutlineAxis } from './outline.js';
-import {
-  GridGeometry,
-  MAX_WORKSHEET_COL,
-  MAX_WORKSHEET_ROW,
-} from './internal/grid-geometry.js';
+import { GridGeometry } from './internal/grid-geometry.js';
 import {
   SheetAcquisition,
   SheetRenderDispatcher,
@@ -343,70 +336,6 @@ export type XlsxCopyResult =
   | Readonly<{ status: 'clipboard-unavailable' }>
   | Readonly<{ status: 'clipboard-denied' }>;
 
-type SelectionInterval = Readonly<{ first: number; last: number }>;
-
-function mergeSelectionIntervals(intervals: readonly SelectionInterval[]): SelectionInterval[] {
-  const sorted = [...intervals].sort((a, b) => a.first - b.first || a.last - b.last);
-  const merged: SelectionInterval[] = [];
-  for (const interval of sorted) {
-    const previous = merged.at(-1);
-    if (!previous || interval.first > previous.last + 1) {
-      merged.push({ ...interval });
-    } else if (interval.last > previous.last) {
-      merged[merged.length - 1] = { first: previous.first, last: interval.last };
-    }
-  }
-  return merged;
-}
-
-function intervalContains(intervals: readonly SelectionInterval[], value: number): boolean {
-  let low = 0;
-  let high = intervals.length - 1;
-  while (low <= high) {
-    const middle = (low + high) >>> 1;
-    const interval = intervals[middle];
-    if (value < interval.first) high = middle - 1;
-    else if (value > interval.last) low = middle + 1;
-    else return true;
-  }
-  return false;
-}
-
-function lowerBoundBy<T>(items: readonly T[], value: number, key: (item: T) => number): number {
-  let low = 0;
-  let high = items.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    if (key(items[middle]) < value) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
-function orderedBy<T>(items: readonly T[], key: (item: T) => number): readonly T[] {
-  for (let index = 1; index < items.length; index++) {
-    if (key(items[index - 1]) > key(items[index])) {
-      return [...items].sort((left, right) => key(left) - key(right));
-    }
-  }
-  return items;
-}
-
-const DEFAULT_SELECTION_CONTEXT_TEXT_CHARACTERS = 1 * 1_024 * 1_024;
-const DEFAULT_SELECTION_CONTEXT_NOTIFICATION_TEXT_CHARACTERS = 65_536;
-const MAX_SELECTION_CONTEXT_FIELD_CHARACTERS = 65_536;
-const MAX_REENTRANT_SELECTION_NOTIFICATIONS = 100;
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, Math.max(0, maxCodeUnits));
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
-}
-
 export { resizeHitIndex } from './internal/viewer/selection-input.js';
 
 export { selectionOverlayStyle } from './internal/viewer/selection-overlay.js';
@@ -529,19 +458,10 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   // Selection state
   private readonly selectionController = new SelectionController();
-  private lastNotifiedSelectionState: XlsxSelectionState | null = null;
-  private emittingSelectionChange = false;
-  private pendingSelectionChange = false;
-  private selectionNotificationScheduled = false;
-  private selectionNotificationCount = 0;
-  private selectionContextNotificationFrame: number | null = null;
-  private selectionContextNotificationMicrotask = false;
-  // SpreadsheetML permits explicit row/cell references to appear out of
-  // coordinate order. Cache a canonical view once per immutable parsed model
-  // so range extraction can use binary search without silently skipping such
-  // cells on every subsequent context read.
-  private readonly selectionContextRows = new WeakMap<Worksheet, readonly Row[]>();
-  private readonly selectionContextCells = new WeakMap<Row, readonly Cell[]>();
+  /** onSelectionStateChange / onSelectionContextChange delivery. */
+  private readonly notifier: SelectionNotifier;
+  /** Bounded range-context extraction for getSelectionContext(). */
+  private readonly contextReader = new SelectionContextReader();
   private elementContext: XlsxElementContext | null = null;
   /** Selection / object-context overlay painter. */
   private readonly selectionPaint: SelectionOverlay;
@@ -634,6 +554,16 @@ class XlsxViewerEngine implements ZoomableViewer {
       commentMaxHeight: COMMENT_POPUP_MAX_H,
       validationMaxWidth: VALIDATION_PANEL_MAX_W,
       validationMaxHeight: VALIDATION_PANEL_MAX_H,
+    });
+    this.notifier = new SelectionNotifier({
+      hostWindow: this.hostWindow,
+      isDestroyed: () => this._destroyed,
+      selectionState: () => this.selectionState,
+      onSelectionStateChange: () => this.opts.onSelectionStateChange,
+      onSelectionContextChange: () => this.opts.onSelectionContextChange,
+      readContext: (maxTextCharacters) => this.getSelectionContext({ maxTextCharacters }),
+      emitSelectionChange: () => this.emitSelectionChange(),
+      scheduleSelectionContextNotification: () => this.scheduleSelectionContextNotification(),
     });
     this.selectionPaint = new SelectionOverlay({
       ownerDocument: this.hostDocument,
@@ -1784,165 +1714,14 @@ class XlsxViewerEngine implements ZoomableViewer {
     const worksheet = this.currentWorksheet;
     const selection = this.selectionState;
     if (!worksheet || !selection) return null;
-    const requestedMax = options.maxCells ?? 1_000;
-    if (!Number.isFinite(requestedMax) || requestedMax < 0) {
-      throw new RangeError('maxCells must be a finite non-negative number.');
-    }
-    const maxCells = Math.min(MAX_SELECTION_CONTEXT_CELLS, Math.floor(requestedMax));
-    const requestedTextMax = options.maxTextCharacters ?? DEFAULT_SELECTION_CONTEXT_TEXT_CHARACTERS;
-    if (!Number.isFinite(requestedTextMax) || requestedTextMax < 0) {
-      throw new RangeError('maxTextCharacters must be a finite non-negative number.');
-    }
-    const maxTextCharacters = Math.min(
-      MAX_SELECTION_CONTEXT_TEXT_CHARACTERS,
-      Math.floor(requestedTextMax),
-    );
-    let textCharacters = 0;
-    let textTruncated = false;
-    const boundedField = (input: string | readonly Readonly<{ text: string }>[]): string => {
-      const parts: readonly (string | Readonly<{ text: string }>)[] =
-        typeof input === 'string' ? [input] : input;
-      const chunks: string[] = [];
-      let fieldCharacters = 0;
-      for (let index = 0; index < parts.length; index++) {
-        const sourcePart = parts[index];
-        const part = typeof sourcePart === 'string' ? sourcePart : sourcePart.text;
-        const allowed = Math.max(0, Math.min(
-          MAX_SELECTION_CONTEXT_FIELD_CHARACTERS - fieldCharacters,
-          maxTextCharacters - textCharacters,
-        ));
-        const chunk = safeUtf16Prefix(part, allowed);
-        chunks.push(chunk);
-        fieldCharacters += chunk.length;
-        textCharacters += chunk.length;
-        if (chunk.length < part.length || index + 1 < parts.length && allowed === 0) {
-          textTruncated = true;
-          break;
-        }
-      }
-      return chunks.join('');
-    };
-    const sheetSelected = selection.areas.some((area) => area.kind === 'sheet');
-    const rowIntervals = mergeSelectionIntervals(selection.areas.flatMap((area) =>
-      area.kind === 'rows' ? [{ first: area.firstRow, last: area.lastRow }] : []));
-    const columnIntervals = mergeSelectionIntervals(selection.areas.flatMap((area) =>
-      area.kind === 'columns'
-        ? [{ first: area.firstColumn, last: area.lastColumn }]
-        : []));
-    const rectangles = selection.areas.flatMap((area) => area.kind === 'cells' ? [area] : []);
-    const events = rectangles.flatMap((area, index) => [
-      { row: area.top, index, active: true },
-      { row: area.bottom + 1, index, active: false },
-    ]).sort((a, b) => a.row - b.row || Number(a.active) - Number(b.active));
-    const activeRectangles = new Set<number>();
-    let eventIndex = 0;
-    let activeColumnIntervals: SelectionInterval[] = [];
-    const cells: XlsxSelectionContextCell[] = [];
-    let cellsTruncated = false;
-    const selectedRowIntervals = sheetSelected || columnIntervals.length > 0
-      ? [{ first: 1, last: MAX_WORKSHEET_ROW }]
-      : mergeSelectionIntervals([
-          ...rowIntervals,
-          ...rectangles.map((area) => ({ first: area.top, last: area.bottom })),
-        ]);
-    let rows = this.selectionContextRows.get(worksheet);
-    if (!rows) {
-      rows = orderedBy(worksheet.rows, (row) => row.index);
-      this.selectionContextRows.set(worksheet, rows);
-    }
-
-    cellScan: for (const selectedRows of selectedRowIntervals) {
-      let rowIndex = lowerBoundBy(rows, selectedRows.first, (row) => row.index);
-      while (rowIndex < rows.length) {
-        const row = rows[rowIndex++];
-        if (row.index > selectedRows.last) break;
-        let changed = false;
-        while (eventIndex < events.length && events[eventIndex].row <= row.index) {
-          const event = events[eventIndex++];
-          if (event.active) activeRectangles.add(event.index);
-          else activeRectangles.delete(event.index);
-          changed = true;
-        }
-        if (changed) {
-          activeColumnIntervals = mergeSelectionIntervals([...activeRectangles].map((index) => ({
-            first: rectangles[index].left,
-            last: rectangles[index].right,
-          })));
-        }
-        const wholeRow = sheetSelected || intervalContains(rowIntervals, row.index);
-        const selectedColumns = wholeRow
-          ? [{ first: 1, last: MAX_WORKSHEET_COL }]
-          : mergeSelectionIntervals([...columnIntervals, ...activeColumnIntervals]);
-        for (const selectedColumnsInterval of selectedColumns) {
-          let rowCells = this.selectionContextCells.get(row);
-          if (!rowCells) {
-            rowCells = orderedBy(row.cells, (cell) => cell.col);
-            this.selectionContextCells.set(row, rowCells);
-          }
-          let cellIndex = lowerBoundBy(rowCells, selectedColumnsInterval.first, (cell) => cell.col);
-          while (cellIndex < rowCells.length) {
-            const cell = rowCells[cellIndex++];
-            if (cell.col > selectedColumnsInterval.last) break;
-            const raw = cell.value;
-            const sourceComment = this.sourceCommentMap.get(`${cell.row}:${cell.col}`);
-            if (raw.type === 'empty' && cell.formula === undefined && !sourceComment) continue;
-            if (cells.length >= maxCells) { cellsTruncated = true; break cellScan; }
-            const displayText = boundedField(this.wb?.cellText(worksheet, cell) ?? '');
-            const value = raw.type === 'text'
-              ? boundedField(raw.runs ?? raw.text)
-              : raw.type === 'number'
-                ? raw.number
-                : raw.type === 'bool'
-                  ? raw.bool
-                  : raw.type === 'error'
-                    ? boundedField(raw.error)
-                  : null;
-            const comment = sourceComment ? {
-              root: {
-                id: sourceComment.id,
-                author: sourceComment.author,
-                date: sourceComment.date,
-                text: boundedField(sourceComment.rootText ?? sourceComment.text),
-                status: sourceComment.resolved ? 'resolved' as const : 'active' as const,
-              },
-              replies: (sourceComment.replies ?? []).map((reply) => ({
-                id: reply.id,
-                author: reply.author,
-                date: reply.date,
-                text: boundedField(reply.text),
-                status: reply.resolved ? 'resolved' as const : 'active' as const,
-              })),
-            } : undefined;
-            cells.push({
-              address: { row: cell.row, col: cell.col },
-              displayText,
-              valueType: raw.type,
-              value,
-              ...(cell.formula === undefined ? {} : { formula: boundedField(cell.formula) }),
-              ...(comment === undefined ? {} : { comment }),
-            });
-            if (textTruncated) break cellScan;
-          }
-        }
-      }
-    }
-    const truncationReasons: Array<'cells' | 'text'> = [];
-    if (cellsTruncated) truncationReasons.push('cells');
-    if (textTruncated) truncationReasons.push('text');
-    return {
-      format: 'xlsx',
-      kind: 'range',
-      sheetIndex: this.currentSheet,
-      sheetName: worksheet.name,
+    return this.contextReader.read(
+      worksheet,
+      this.currentSheet,
       selection,
-      coordinateCountUpperBound: selectionCoordinateCountUpperBound(selection),
-      cells,
-      truncated: truncationReasons.length > 0,
-      truncationReasons,
-      maxCells,
-      textCharacters,
-      maxTextCharacters,
-    };
+      this.sourceCommentMap,
+      this.wb,
+      options,
+    );
   }
 
   private commitSelection(next: XlsxSelectionState | null): void {
@@ -1965,78 +1744,11 @@ class XlsxViewerEngine implements ZoomableViewer {
   }
 
   private scheduleSelectionContextNotification(): void {
-    if (!this.opts.onSelectionContextChange || this._destroyed ||
-        this.selectionContextNotificationFrame !== null ||
-        this.selectionContextNotificationMicrotask) return;
-    const notify = () => {
-      this.selectionContextNotificationFrame = null;
-      this.selectionContextNotificationMicrotask = false;
-      if (this._destroyed) return;
-      const context = this.getSelectionContext({
-        maxTextCharacters: DEFAULT_SELECTION_CONTEXT_NOTIFICATION_TEXT_CHARACTERS,
-      });
-      this.opts.onSelectionContextChange?.(context ? structuredClone(context) : null);
-    };
-    if (typeof this.hostWindow.requestAnimationFrame === 'function') {
-      this.selectionContextNotificationFrame = this.hostWindow.requestAnimationFrame(notify);
-    } else {
-      this.selectionContextNotificationMicrotask = true;
-      queueMicrotask(notify);
-    }
+    this.notifier.scheduleContextNotification();
   }
 
   private emitSelectionChange(): void {
-    const state = this.selectionState;
-    if (!selectionStatesEqual(state, this.lastNotifiedSelectionState)) {
-      this.scheduleSelectionContextNotification();
-    }
-    if (this.emittingSelectionChange) {
-      this.pendingSelectionChange = true;
-      this.scheduleSelectionNotification();
-      return;
-    }
-    this.pendingSelectionChange = false;
-    if (selectionStatesEqual(state, this.lastNotifiedSelectionState)) {
-      this.finishSelectionNotificationChain();
-      return;
-    }
-
-    if (this.selectionNotificationCount >= MAX_REENTRANT_SELECTION_NOTIFICATIONS) {
-      // A callback feedback cycle must not monopolize the main thread. The
-      // canonical state remains authoritative; only notifications beyond the
-      // documented per-chain safety limit are suppressed.
-      this.lastNotifiedSelectionState = state ? structuredClone(state) : null;
-      this.finishSelectionNotificationChain();
-      return;
-    }
-    this.selectionNotificationCount++;
-    this.lastNotifiedSelectionState = state ? structuredClone(state) : null;
-    this.emittingSelectionChange = true;
-    try {
-      this.opts.onSelectionStateChange?.(state ? structuredClone(state) : null);
-    } finally {
-      this.emittingSelectionChange = false;
-      if (this.pendingSelectionChange ||
-          !selectionStatesEqual(this.selectionState, this.lastNotifiedSelectionState)) {
-        this.scheduleSelectionNotification();
-      } else {
-        this.finishSelectionNotificationChain();
-      }
-    }
-  }
-
-  private scheduleSelectionNotification(): void {
-    if (this.selectionNotificationScheduled || this._destroyed) return;
-    this.selectionNotificationScheduled = true;
-    queueMicrotask(() => {
-      this.selectionNotificationScheduled = false;
-      if (!this._destroyed) this.emitSelectionChange();
-    });
-  }
-
-  private finishSelectionNotificationChain(): void {
-    this.pendingSelectionChange = false;
-    this.selectionNotificationCount = 0;
+    this.notifier.emit();
   }
 
   /** Refit automatic rows once after a column-resize gesture. Doing this on
@@ -2615,11 +2327,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     // viewer (checked at the top of _reportRenderError). The acquisition owner
     // invalidates any load still in flight below.
     this._destroyed = true;
-    if (this.selectionContextNotificationFrame !== null) {
-      this.hostWindow.cancelAnimationFrame(this.selectionContextNotificationFrame);
-      this.selectionContextNotificationFrame = null;
-    }
-    this.selectionContextNotificationMicrotask = false;
+    this.notifier.destroy();
     this.selectionInput.destroy();
     this.sheetRequestGeneration++;
     this.resizeObserver?.disconnect();
@@ -2657,8 +2365,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.outlineGutter.destroy();
     this.elementContext = null;
     this.selectionController.reset();
-    this.lastNotifiedSelectionState = null;
-    this.finishSelectionNotificationChain();
     this.acquisition.destroy();
     // Remove the whole UI subtree so the container is empty again. This also
     // detaches every listener bound to elements within it (scrollHost pointer/
