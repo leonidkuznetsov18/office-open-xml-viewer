@@ -10,6 +10,9 @@ pub(super) struct Properties {
     /// ECMA-376 Part 1 17.15.3.1 adjustLineHeightInTable, the inverse of
     /// MS-DOC 2.7.13 Copts.fDontAdjustLineHeightInTable.
     pub adjust_line_height_in_table: bool,
+    /// MS-DOC 2.7.13 Copts.fSplitPgBreakAndParaMark: a paragraph mark after
+    /// an authored page break belongs to the destination page.
+    pub split_pg_break_and_para_mark: bool,
     /// ECMA-376 Part 1 17.15.3.3 balanceSingleByteDoubleByteWidth, the
     /// inverse of MS-DOC 2.7.11 Copts60.fDntBlnSbDbWid.
     pub balance_single_byte_double_byte_width: bool,
@@ -97,6 +100,10 @@ pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, Stri
     } else {
         true
     };
+    // The b bit of the same Copts flag word is bit 27. Word-owned DOCX
+    // controls with this option on/off retain/remove the destination-page
+    // paragraph mark and change whether exact-height following rows fit.
+    let split_pg_break_and_para_mark = dop.len() >= 544 && u32_at(dop, 512)? & (1 << 27) != 0;
     // MS-DOC 2.7.2 DopBase.copts60 (offset 8), 2.7.11 bit P.
     let balance_single_byte_double_byte_width = u16_at(dop, 8)? & (1 << 15) == 0;
     // MS-DOC 2.7.4 Dop97: dop95 (88 bytes) and adt (2 bytes) precede the
@@ -126,6 +133,7 @@ pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, Stri
         even_and_odd_headers: dop[0] & 1 != 0,
         notes,
         adjust_line_height_in_table,
+        split_pg_break_and_para_mark,
         balance_single_byte_double_byte_width,
         character_spacing_control,
     }))
@@ -204,6 +212,26 @@ mod tests {
         // Dop97 and older carry no fDontAdjustLineHeightInTable flag.
         assert!(adjust(500, 0));
         assert!(adjust(84, 0));
+    }
+
+    #[test]
+    fn dop2000_copts_moves_only_enabled_page_break_marks() {
+        let read_bit = |size: u32, bits: u32| {
+            let (word, mut table) = fixture(size, 720);
+            if size >= 544 {
+                table[7 + 512..7 + 516].copy_from_slice(&bits.to_le_bytes());
+            }
+            read(&word, &table)
+                .unwrap()
+                .unwrap()
+                .split_pg_break_and_para_mark
+        };
+        assert!(!read_bit(500, 1 << 27));
+        for size in [544, 616, 694] {
+            assert!(!read_bit(size, 0));
+            assert!(!read_bit(size, (1 << 26) | (1 << 28)));
+            assert!(read_bit(size, 1 << 27));
+        }
     }
 
     #[test]

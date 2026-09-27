@@ -129,6 +129,7 @@ impl<'a, 'h> Resolver<'a, 'h> {
             &mut body,
             None,
             table_sequence,
+            false,
         )?;
         if body.iter().any(|element| {
             matches!(element, BodyElement::Paragraph(paragraph)

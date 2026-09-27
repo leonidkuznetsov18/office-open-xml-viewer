@@ -307,6 +307,7 @@ pub(super) fn project(
             &mut content,
             None,
             table_sequence,
+            false,
         )?;
         let id = (index + 1).to_string();
         budget.charge(id.capacity())?;

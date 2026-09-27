@@ -11,7 +11,7 @@ use crate::doc::{
     floating, formatting, numbering, picture_bullets, pictures, table, table_context,
     table_style_condition, unsupported, Paragraph, Story, Token,
 };
-use docx_model::paragraph_breaks::visit_para_on_page_breaks;
+use docx_model::paragraph_breaks::visit_para_on_page_breaks_with_trailing_mark;
 use docx_model::{BodyElement, BreakType, DocRun, ImageRun};
 
 mod borders;
@@ -34,6 +34,7 @@ pub(super) fn project(
     body: &mut Vec<BodyElement>,
     ending_kind: Option<&str>,
     table_sequence: &mut usize,
+    split_pg_break_and_para_mark: bool,
 ) -> Result<(), String> {
     let paragraph_count = paragraphs.len();
     let mut prepared = Vec::new();
@@ -562,26 +563,41 @@ pub(super) fn project(
                                 same_paragraph_as_previous: None,
                             },
                         )?;
+                        if split_pg_break_and_para_mark {
+                            // MS-DOC 2.7.13 Copts.fSplitPgBreakAndParaMark
+                            // moves this paragraph mark to the destination
+                            // page. The mark retains its source formatting
+                            // and can prevent the next exact-height row from
+                            // fitting there (Word DOC/DOCX on/off controls).
+                            paragraph.runs.clear();
+                            budget.normalized_paragraph(&paragraph)?;
+                            budget.push(&mut blocks.0, Block::Paragraph(Box::new(paragraph)))?;
+                        }
                     }
                 }
                 [DocRun::Break {
                     break_type: BreakType::Column,
                 }] => budget.push(&mut blocks.0, Block::ColumnBreak)?,
-                _ => visit_para_on_page_breaks(paragraph, |piece| {
-                    let element = match piece {
-                        ParaPiece::Para(paragraph) => {
-                            budget.normalized_paragraph(&paragraph)?;
-                            Block::Paragraph(Box::new(paragraph))
-                        }
-                        ParaPiece::PageBreak {
-                            same_paragraph_as_previous,
-                        } => Block::PageBreak {
-                            same_paragraph_as_previous: same_paragraph_as_previous.then_some(true),
-                        },
-                        ParaPiece::ColumnBreak => Block::ColumnBreak,
-                    };
-                    budget.push(&mut blocks.0, element)
-                })?,
+                _ => visit_para_on_page_breaks_with_trailing_mark(
+                    paragraph,
+                    split_pg_break_and_para_mark,
+                    |piece| {
+                        let element = match piece {
+                            ParaPiece::Para(paragraph) => {
+                                budget.normalized_paragraph(&paragraph)?;
+                                Block::Paragraph(Box::new(paragraph))
+                            }
+                            ParaPiece::PageBreak {
+                                same_paragraph_as_previous,
+                            } => Block::PageBreak {
+                                same_paragraph_as_previous: same_paragraph_as_previous
+                                    .then_some(true),
+                            },
+                            ParaPiece::ColumnBreak => Block::ColumnBreak,
+                        };
+                        budget.push(&mut blocks.0, element)
+                    },
+                )?,
             }
         }
         tables.push(table_properties, source.mark, blocks, budget)?;
@@ -997,6 +1013,7 @@ fn textbox_content(
         &mut body,
         None,
         table_sequence,
+        false,
     )?;
     // List counters shared between textboxes and the main story, and breaks
     // inside a textbox, have no Office control yet: keep them fail-closed.
@@ -1757,6 +1774,7 @@ mod tests {
                 &mut body,
                 None,
                 &mut table_sequence,
+                false,
             )?;
 
             let mut colors = Vec::new();

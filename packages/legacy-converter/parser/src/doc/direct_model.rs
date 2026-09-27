@@ -64,6 +64,7 @@ pub(super) fn build(
             // collapse a page of following content.
             use_fe_layout: Some(true),
             adjust_line_height_in_table: Some(settings.adjust_line_height_in_table),
+            split_pg_break_and_para_mark: Some(settings.split_pg_break_and_para_mark),
             balance_single_byte_double_byte_width: Some(
                 settings.balance_single_byte_double_byte_width,
             ),
@@ -165,6 +166,10 @@ pub(super) fn build(
             &mut body,
             ending.as_ref().map(|ending| ending.kind.as_str()),
             &mut table_sequence,
+            facts
+                .document_settings
+                .as_ref()
+                .is_some_and(|settings| settings.split_pg_break_and_para_mark),
         )?;
         if super::character::Properties::unrenderable_east_asian_vertical(
             &body[section_start..],
@@ -579,6 +584,7 @@ pub(in crate::doc) fn project_story_for_test(
         &mut body,
         None,
         &mut 0,
+        false,
     )?;
     Ok(body)
 }
