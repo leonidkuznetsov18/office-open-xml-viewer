@@ -131,7 +131,10 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   const sc = elapsedSection ? Math.floor(absMs / 1_000) % 60 : date.getUTCSeconds();
 
   // Take the first section (positive / no-sign section)
-  const hasAmPm = /am\/pm|a\/p/i.test(section);
+  const hasAmPm = hasAmPmToken(section);
+  const eraLocale = sectionEraLocale(section);
+  // Taiwan (ROC) era: 1912 is year 1; earlier years stay Gregorian.
+  const rocYear = yr >= 1912 ? yr - 1911 : yr;
   let era: ReturnType<typeof resolveJpEra> | null = null;
   const getEra = (): ReturnType<typeof resolveJpEra> => era ?? (era = resolveJpEra(date));
 
@@ -239,34 +242,47 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'g' || ch === 'G') {
-      // Japanese era name (ECMA-376 §18.8.30 ja locale):
-      //   g   → 'R' / 'H' / 'S' / 'T' / 'M'
-      //   gg  → '令' / '平' / '昭' / '大' / '明'
-      //   ggg → '令和' / '平成' / '昭和' / '大正' / '明治'
+      // Era name (§18.8.30 International Considerations). ja-JP:
+      //   g → 'R' / 'H' / 'S' / 'T' / 'M', gg → '令' …, ggg → '令和' ….
+      // zh-TW: g is gg, the short ROC era name; ggg the long one. Other
+      // locales are not specified and keep the ja-JP names.
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'g') { n++; i++; }
-      const e = getEra();
-      if      (n === 1) result += e.abbr;
-      else if (n === 2) result += e.short;
-      else              result += e.long;
+      if (eraLocale === 'zh-TW') {
+        result += n >= 3 ? '中華民國' : '民國';
+      } else {
+        const e = getEra();
+        if      (n === 1) result += e.abbr;
+        else if (n === 2) result += e.short;
+        else              result += e.long;
+      }
       prevWasHour = false;
 
     } else if (ch === 'e' || ch === 'E') {
-      // Japanese era year: `e` → unpadded, `ee` → 2-digit zero-padded.
+      // Era year: ja-JP era year (`ee` zero-padded), zh-TW ROC year, and in
+      // other locales `e` becomes `yyyy` and `ee` becomes `yy`.
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'e') { n++; i++; }
-      const y = getEra().year;
-      result += n >= 2 ? String(y).padStart(2, '0') : String(y);
+      if (eraLocale === 'other') {
+        result += n >= 2 ? String(yr).slice(-2) : String(yr).padStart(4, '0');
+      } else {
+        const y = eraLocale === 'zh-TW' ? rocYear : getEra().year;
+        result += n >= 2 ? String(y).padStart(2, '0') : String(y);
+      }
       prevWasHour = false;
 
     } else if (ch === 'r' || ch === 'R') {
-      // ja-JP locale codes (§18.8.30 International Considerations):
-      // `r` becomes `ee` (two-digit era year), `rr` becomes `gggee` (full
-      // era name and two-digit era year).
+      // ja-JP / zh-TW locale codes: in ja-JP `r` becomes `ee` and `rr`
+      // becomes `gggee`; in zh-TW both become `e`. Other locales are not
+      // specified and keep the ja-JP reading.
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'r') { n++; i++; }
-      const e = getEra();
-      result += (n >= 2 ? e.long : '') + String(e.year).padStart(2, '0');
+      if (eraLocale === 'zh-TW') {
+        result += String(rocYear);
+      } else {
+        const e = getEra();
+        result += (n >= 2 ? e.long : '') + String(e.year).padStart(2, '0');
+      }
       prevWasHour = false;
 
     } else if (ch === 'A' || ch === 'a') {
@@ -298,6 +314,61 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   }
 
   return result;
+}
+
+/** The locale that era codes follow (§18.8.30 International
+ *  Considerations): the language ID of a `[$…-LCID]` bracket outside quotes
+ *  — 0x0411 ja-JP, 0x0404 zh-TW, any other language `other`. Without one, or
+ *  for the system date / time specials (0xF800 / 0xF400), era codes keep the
+ *  viewer's ja-JP reading. */
+function sectionEraLocale(section: string): 'ja-JP' | 'zh-TW' | 'other' {
+  let i = 0;
+  while (i < section.length) {
+    const ch = section[i];
+    if (ch === '\\' || ch === '_' || ch === '*') {
+      i += 2;
+    } else if (ch === '"') {
+      const end = section.indexOf('"', i + 1);
+      i = end < 0 ? section.length : end + 1;
+    } else if (ch === '[') {
+      const end = section.indexOf(']', i);
+      if (end < 0) break;
+      const lcid = /^\$[^-]*-([0-9a-f]+)$/i.exec(section.slice(i + 1, end));
+      if (lcid) {
+        const language = parseInt(lcid[1], 16) & 0xffff;
+        if (language === 0x0411) return 'ja-JP';
+        if (language === 0x0404) return 'zh-TW';
+        if (language !== 0xf800 && language !== 0xf400) return 'other';
+      }
+      i = end + 1;
+    } else {
+      i++;
+    }
+  }
+  return 'ja-JP';
+}
+
+/** Whether a section holds an AM/PM or A/P token outside quotes, escapes and
+ *  pad / fill pairs (a quoted "AM/PM" is literal text). */
+function hasAmPmToken(section: string): boolean {
+  let i = 0;
+  while (i < section.length) {
+    const ch = section[i];
+    if (ch === '\\' || ch === '_' || ch === '*') {
+      i += 2;
+    } else if (ch === '"') {
+      const end = section.indexOf('"', i + 1);
+      i = end < 0 ? section.length : end + 1;
+    } else if (ch === '[') {
+      const end = section.indexOf(']', i);
+      i = end < 0 ? section.length : end + 1;
+    } else if (/^(am\/pm|a\/p)/i.test(section.slice(i))) {
+      return true;
+    } else {
+      i++;
+    }
+  }
+  return false;
 }
 
 /** Whether a section holds an elapsed-time bracket `[h]` / `[mm]` / `[ss]`

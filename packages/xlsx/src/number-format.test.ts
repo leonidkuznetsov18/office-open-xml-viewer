@@ -245,6 +245,20 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(fmt(-0.25, 'h:mm "[h]"')).toBe('18:00 [h]');
   });
 
+  it('keeps a quoted AM/PM literal on the 24-hour clock', () => {
+    expect(fmt(45292.54166666667, 'h:mm "AM/PM"')).toBe('13:00 AM/PM');
+  });
+
+  it('reads era codes in the locale of the section (§18.8.30)', () => {
+    // Other locales: e → yyyy, ee → yy.
+    expect(fmt(45292, '[$-409]e')).toBe('2024');
+    expect(fmt(45292, '[$-409]ee')).toBe('24');
+    // zh-TW: ROC era (1912 = year 1); r / rr become e.
+    expect(fmt(45292, '[$-404]gge')).toBe('民國113');
+    expect(fmt(45292, '[$-404]ggge')).toBe('中華民國113');
+    expect(fmt(45292, '[$-404]rr')).toBe('113');
+  });
+
   it('decides number vs time from the section the value selects', () => {
     expect(fmt(5, '0.00;h:mm')).toBe('5.00');
     expect(fmt(-0.5, '0.00;h:mm')).toBe('12:00');
