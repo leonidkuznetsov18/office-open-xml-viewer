@@ -63,4 +63,38 @@ describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
     expect(lines(['abc\tdef'], 85)).toEqual(['abc', '\td', 'ef']);
   });
 
+  it('puts a display equation on its own line between text runs', () => {
+    const result = breakDrawingMlText<string>([
+      { type: 'text', text: 'before', style: 'same' },
+      { type: 'object', width: 30, style: 'same', payload: 'equation', display: true },
+      { type: 'text', text: 'after', style: 'same' },
+    ], { maxWidth: 200, measureText: measure });
+    expect(result.map((line) => line.segments.map((segment) =>
+      segment.type === 'text' ? segment.text : segment.type === 'object' ? '[equation]' : '\t').join('')))
+      .toEqual(['before', '[equation]', 'after']);
+  });
+
+  it('bounds work for a long unbreakable word in a one-character box', () => {
+    let measuredCharacters = 0;
+    const start = performance.now();
+    const result = breakDrawingMlText([{ type: 'text', text: 'a'.repeat(3200), style: 'same' }], {
+      maxWidth: 1,
+      measureText(value) { measuredCharacters += value.length; return value.length; },
+    });
+    const elapsedMs = performance.now() - start;
+    expect(result).toHaveLength(3200);
+    expect(measuredCharacters).toBeLessThan(30_000);
+    expect(elapsedMs).toBeLessThan(100);
+  });
+
+  it('keeps the last fitting prefix when negative tracking makes widths non-monotone', () => {
+    const result = breakDrawingMlText([{ type: 'text', text: 'abcd', style: 'same' }], {
+      maxWidth: 1,
+      nonMonotoneMeasure: true,
+      measureText(value) { return [0, 1, 3, 0.5, 5][value.length]; },
+    });
+    expect(result.map((line) => line.segments.map((segment) => segment.type === 'text' ? segment.text : '').join('')))
+      .toEqual(['abc', 'd']);
+  });
+
 });
