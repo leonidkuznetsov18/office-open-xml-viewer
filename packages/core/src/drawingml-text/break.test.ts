@@ -87,6 +87,38 @@ describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
     expect(elapsedMs).toBeLessThan(100);
   });
 
+  it('bounds measurement for negative tracking in a one-character box', () => {
+    let measuredCharacters = 0;
+    const start = performance.now();
+    const result = breakDrawingMlText([{ type: 'text', text: 'a'.repeat(3200), style: 'same' }], {
+      maxWidth: 1,
+      nonMonotoneMeasure: true,
+      measureText(value) { measuredCharacters += value.length; return value.length; },
+    });
+    const elapsedMs = performance.now() - start;
+    expect(result).toHaveLength(3200);
+    expect(measuredCharacters).toBeLessThan(1_000_000);
+    expect(elapsedMs).toBeLessThan(100);
+  });
+
+  it('keeps the last fitting prefix past a shaping window under negative tracking', () => {
+    // 'a' advances 9px and 'b' 30px with -10px tracking: each 'a' after the
+    // first narrows the line, so the 20th-glyph prefix fits after the first
+    // glyph alone overflows, and the final 'b' does not.
+    const text = `${'a'.repeat(20)}b`;
+    const result = breakDrawingMlText([{ type: 'text', text, style: 'same' }], {
+      maxWidth: 8,
+      nonMonotoneMeasure: true,
+      measureText(value) {
+        let width = 0;
+        for (const ch of value) width += ch === 'b' ? 30 : 9;
+        return width - 10 * Math.max(0, value.length - 1);
+      },
+    });
+    expect(result.map((line) => line.segments.map((segment) => segment.type === 'text' ? segment.text : '').join('')))
+      .toEqual(['a'.repeat(20), 'b']);
+  });
+
   it('keeps the last fitting prefix when negative tracking makes widths non-monotone', () => {
     const result = breakDrawingMlText([{ type: 'text', text: 'abcd', style: 'same' }], {
       maxWidth: 1,

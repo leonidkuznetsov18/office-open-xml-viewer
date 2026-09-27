@@ -37,7 +37,11 @@ export interface DrawingMlBreakOptions<T> {
   defaultTabSize?: number;
   /** Pen position relative to the leading inset; includes paragraph margin. */
   tabStartPen?(lineIndex: number): number;
-  /** Use a linear fit for negative tracking or a nonmonotone measurement hook. */
+  /**
+   * Negative tracking can make a longer prefix narrower. Every prefix is then
+   * a fit candidate; widths are accumulated from segment heads and
+   * per-grapheme advances measured with a bounded left shaping context.
+   */
   nonMonotoneMeasure?: boolean;
 }
 
@@ -262,6 +266,242 @@ export function breakDrawingMlText<T>(
       return { segments, width: measureSegments(segments, lineIndex) };
     };
 
+    // Negative tracking (`rPr@spc < 0`) can make a longer prefix narrower, so
+    // the fit inspects every candidate prefix and keeps the greatest fitting
+    // one. Measuring each candidate afresh made a narrow box cubic in run
+    // length. The paragraph is measured once instead: each text segment's
+    // first SHAPING_CONTEXT + 1 graphemes as one string, then each later
+    // grapheme's advance after the preceding SHAPING_CONTEXT graphemes of the
+    // same segment. Tracking is a per-grapheme addend, so the accumulated
+    // width equals the measured string's width whenever shaping context
+    // (kerning pairs, joining) stays within that window. Segment seams, tabs
+    // and objects contribute exactly as measureSegments does.
+    const SHAPING_CONTEXT = 8;
+    const BLOCK = 32;
+    interface NonMonotoneModel {
+      /** Start of the coalesced text segment containing each text atom. */
+      segStart: Int32Array;
+      segEnd: Int32Array;
+      /** Segment text width through atom t while t is within its head. */
+      head: Float64Array;
+      /** Advance of atom t after its SHAPING_CONTEXT predecessors. */
+      tail: Float64Array;
+      tailSum: Float64Array;
+      tailBlockMin: Float64Array;
+      /** Line width of atoms [0, i) with segments coalesced from atom 0. */
+      natural: Float64Array;
+      naturalBlockMin: Float64Array;
+      tabsBefore: Int32Array;
+    }
+    let model: NonMonotoneModel | null = null;
+    const atomText = (from: number, to: number): string => {
+      let text = '';
+      for (let i = from; i < to; i++) {
+        const atom = atoms[i];
+        if (atom.type === 'text') text += atom.text;
+      }
+      return text;
+    };
+    const blockMins = (values: Float64Array): Float64Array => {
+      const mins = new Float64Array(Math.ceil(values.length / BLOCK)).fill(Infinity);
+      for (let i = 0; i < values.length; i++) {
+        const b = Math.floor(i / BLOCK);
+        if (values[i] < mins[b]) mins[b] = values[i];
+      }
+      return mins;
+    };
+    const buildModel = (): NonMonotoneModel => {
+      const segStart = new Int32Array(end).fill(-1);
+      const segEnd = new Int32Array(end).fill(-1);
+      const head = new Float64Array(end).fill(NaN);
+      const tail = new Float64Array(end);
+      const tailSum = new Float64Array(end + 1);
+      const natural = new Float64Array(end + 1);
+      const tabsBefore = new Int32Array(end + 1);
+      let first = -1;
+      let style: T | undefined;
+      let boundary: number | null = null;
+      let base = 0;
+      let text = 0;
+      const close = (stop: number): void => {
+        for (let t = first; first >= 0 && t < stop; t++) segEnd[t] = stop;
+      };
+      for (let t = 0; t < end; t++) {
+        const atom = atoms[t];
+        tabsBefore[t + 1] = tabsBefore[t] + (atom.type === 'tab' ? 1 : 0);
+        if (!(atom.type === 'text' && first >= 0 && sameStyle(style as T, atom.style))) {
+          close(t);
+          base = natural[t];
+          if (atom.type === 'text') {
+            boundary = first >= 0 ? options.boundaryAdvance?.(style as T, atom.style) ?? 0 : null;
+            first = t;
+            style = atom.style;
+          } else {
+            first = -1;
+            style = undefined;
+          }
+        }
+        if (atom.type === 'text') {
+          const segmentStyle = style as T;
+          segStart[t] = first;
+          if (t - first <= SHAPING_CONTEXT) {
+            text = options.measureText(atomText(first, t + 1), segmentStyle);
+            head[t] = text;
+          } else {
+            const context = atomText(t - SHAPING_CONTEXT, t);
+            tail[t] = options.measureText(context + atom.text, segmentStyle)
+              - options.measureText(context, segmentStyle);
+            text += tail[t];
+          }
+          natural[t + 1] = base + (boundary === null ? text : text + boundary);
+        } else {
+          natural[t + 1] = base + (atom.type === 'object' ? atom.width : 0);
+        }
+        tailSum[t + 1] = tailSum[t] + tail[t];
+      }
+      close(end);
+      return {
+        segStart, segEnd, head, tail, tailSum,
+        tailBlockMin: blockMins(tailSum),
+        natural,
+        naturalBlockMin: blockMins(natural),
+        tabsBefore,
+      };
+    };
+
+    /** Greatest i in (from, to] with offset + values[i] <= budget, else -1. */
+    const lastFitting = (
+      values: Float64Array, mins: Float64Array, offset: number, from: number, to: number, budget: number,
+    ): number => {
+      let i = to;
+      while (i > from) {
+        const lo = Math.floor(i / BLOCK) * BLOCK;
+        if (lo > from && offset + mins[lo / BLOCK] > budget) {
+          i = lo - 1;
+          continue;
+        }
+        if (offset + values[i] <= budget) return i;
+        i--;
+      }
+      return -1;
+    };
+
+    /** Text width of atoms [lineStart, stop) within one coalesced segment. */
+    const lineHeadWidths = new Map<number, number>();
+    const firstSegmentWidth = (m: NonMonotoneModel, lineStart: number, stop: number): number => {
+      if (lineStart === m.segStart[lineStart]) {
+        const last = Math.min(stop, lineStart + SHAPING_CONTEXT + 1) - 1;
+        return m.head[last] + (m.tailSum[stop] - m.tailSum[last + 1]);
+      }
+      const headStop = Math.min(stop, lineStart + SHAPING_CONTEXT + 1);
+      let width = lineHeadWidths.get(headStop);
+      if (width === undefined) {
+        width = options.measureText(atomText(lineStart, headStop), atoms[lineStart].style);
+        lineHeadWidths.set(headStop, width);
+      }
+      return width + (m.tailSum[stop] - m.tailSum[headStop]);
+    };
+
+    const nonMonotoneFit = (lineStart: number, lineIndex: number, budget: number): number => {
+      const m = model ??= buildModel();
+      lineHeadWidths.clear();
+      if (m.tabsBefore[end] !== m.tabsBefore[lineStart]) {
+        return tabbedNonMonotoneFit(m, lineStart, lineIndex, budget);
+      }
+      const first = atoms[lineStart];
+      const firstEnd = first.type === 'text' ? m.segEnd[lineStart] : lineStart + 1;
+      const firstWidth = first.type === 'text' ? firstSegmentWidth(m, lineStart, firstEnd)
+        : first.type === 'object' ? first.width : 0;
+      if (firstEnd < end) {
+        // The next segment's seam advance is relative to this line's first style.
+        const next = atoms[firstEnd];
+        const seam = first.type === 'text' && next.type === 'text' && options.boundaryAdvance
+          ? options.boundaryAdvance(first.style, next.style)
+            - options.boundaryAdvance(atoms[m.segStart[lineStart]].style, next.style)
+          : 0;
+        const found = lastFitting(m.natural, m.naturalBlockMin,
+          firstWidth + seam - m.natural[firstEnd], firstEnd, end, budget);
+        if (found >= 0) return found;
+      }
+      if (firstWidth <= budget) return firstEnd;
+      if (first.type !== 'text') return lineStart;
+      const headStop = lineStart + SHAPING_CONTEXT + 1;
+      if (firstEnd - 1 > headStop) {
+        const offset = firstSegmentWidth(m, lineStart, headStop) - m.tailSum[headStop];
+        const found = lastFitting(m.tailSum, m.tailBlockMin, offset, headStop, firstEnd - 1, budget);
+        if (found >= 0) return found;
+      }
+      for (let i = Math.min(firstEnd - 1, headStop); i > lineStart; i--) {
+        if (firstSegmentWidth(m, lineStart, i) <= budget) return i;
+      }
+      return lineStart;
+    };
+
+    // Tabs make each prefix's width depend on its stop resolution. Resolve the
+    // cached segment widths per candidate instead of re-measuring text.
+    const tabGaps = new Map<number, number>();
+    const tabbedNonMonotoneFit = (
+      m: NonMonotoneModel, lineStart: number, lineIndex: number, budget: number,
+    ): number => {
+      const items: { isTab: boolean; width: number }[] = [];
+      let fit = lineStart;
+      let noStopGap = 0;
+      let hasTab = false;
+      let closedSum = 0;
+      let segFirst = -1;
+      let boundary: number | null = null;
+      for (let i = lineStart + 1; i <= end; i++) {
+        const index = i - 1;
+        const atom = atoms[index];
+        if (atom.type === 'text' && segFirst >= 0 && m.segStart[index] === m.segStart[index - 1]) {
+          const text = firstSegmentWidthFrom(m, segFirst, lineStart, i);
+          items[items.length - 1].width = boundary === null ? text : text + boundary;
+        } else {
+          if (items.length > 0) closedSum += items[items.length - 1].width;
+          if (atom.type === 'text') {
+            const previous = segFirst >= 0 ? atoms[segFirst] : undefined;
+            boundary = previous?.type === 'text' ? options.boundaryAdvance?.(previous.style, atom.style) ?? 0 : null;
+            segFirst = index;
+            const text = firstSegmentWidthFrom(m, segFirst, lineStart, i);
+            items.push({ isTab: false, width: boundary === null ? text : text + boundary });
+          } else {
+            segFirst = -1;
+            if (atom.type === 'tab') {
+              hasTab = true;
+              let gap = tabGaps.get(index);
+              if (gap === undefined) {
+                gap = options.measureText(' ', atom.style);
+                tabGaps.set(index, gap);
+              }
+              noStopGap = gap;
+              items.push({ isTab: true, width: 0 });
+            } else {
+              items.push({ isTab: false, width: atom.width });
+            }
+          }
+        }
+        const width = hasTab
+          ? resolveDrawingMlTabWidths(
+            items,
+            options.tabStops ?? [],
+            options.tabStartPen?.(lineIndex) ?? (lineIndex === 0 ? options.firstLineIndent ?? 0 : 0),
+            Infinity,
+            noStopGap,
+            options.defaultTabSize ?? 0,
+          ).reduce((sum, value) => sum + value, 0)
+          : closedSum + items[items.length - 1].width;
+        if (i === end && width <= budget) return end;
+        if (i < end && width <= budget) fit = i;
+      }
+      return fit;
+    };
+    /** Width of segment text [segFirst, stop), where segFirst is lineStart or a natural start. */
+    const firstSegmentWidthFrom = (
+      m: NonMonotoneModel, segFirst: number, lineStart: number, stop: number,
+    ): number => segFirst === lineStart
+      ? firstSegmentWidth(m, lineStart, stop)
+      : firstSegmentWidth(m, segFirst, stop);
+
     let start = 0;
     if (end === 0) {
       lines.push({ segments: [], width: 0, ...(regionIndex + 1 < regions.length ? { endsWithBreak: true } : {}) });
@@ -275,24 +515,12 @@ export function breakDrawingMlText<T>(
           ? options.measureText(plainText.slice(plainOffsets[start], plainOffsets[stop]), plainStyle)
           : makeSegments(start, stop, lineIndex).width;
       let fit = end;
-      if (Number.isFinite(budget) && options.nonMonotoneMeasure && widthAt(end) > budget) {
-        // The requested non-monotone contract can have a later fitting prefix
-        // after an earlier overflow. Every candidate must be checked unless
-        // the end fits. Reuse the growing segment array for mixed-style/tabbed
-        // paragraphs instead of rebuilding each candidate prefix.
-        fit = start;
-        if (plainText !== null) {
-          for (let i = end - 1; i > start; i--) {
-            if (widthAt(i) <= budget) { fit = i; break; }
-          }
-        } else {
-          const prefixSegments: DrawingMlLineSegment<T>[] = [];
-          for (let i = start + 1; i < end; i++) {
-            appendAtom(prefixSegments, atoms[i - 1]);
-            if (measureSegments(prefixSegments, lineIndex) <= budget) fit = i;
-          }
-        }
-      } else if (Number.isFinite(budget) && !options.nonMonotoneMeasure) {
+      if (Number.isFinite(budget) && options.nonMonotoneMeasure) {
+        // A later prefix can fit after an earlier overflow, so every candidate
+        // is still checked and the greatest fitting one wins (the whole line
+        // when it fits). Prefix widths are accumulated, not re-measured.
+        fit = nonMonotoneFit(start, lineIndex, budget);
+      } else if (Number.isFinite(budget)) {
         // Exponential search only measures prefixes close to the fit boundary.
         // In a one-grapheme box this avoids measuring the whole remaining word
         // on every visual line. The existing binary search still chooses the
