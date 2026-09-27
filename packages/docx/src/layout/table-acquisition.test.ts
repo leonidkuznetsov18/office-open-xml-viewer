@@ -3,7 +3,9 @@ import type { DocParagraph, DocTable } from '../types.js';
 import { tableColumnLayoutInput } from '../parser-model.js';
 import {
   acquireRetainedTable,
+  retainedTableAcquisitionIsReusableAcrossPages,
 } from './table-acquisition.js';
+import { layoutParagraph } from './paragraph.js';
 import type {
   LayoutServices,
   ParagraphLayout,
@@ -23,11 +25,138 @@ function retainedParagraph(widthPt: number): ParagraphLayout {
     flowBounds: bounds, inkBounds: bounds, advancePt: 8,
     alignment: 'left', bidi: false,
     spacing: { beforePt: 0, afterPt: 0 },
-    borders: [], lines: [],
+    borders: [], lines: [], resources: [], drawings: [], textBoxes: [],
+    events: [], exclusions: [],
   } as unknown as ParagraphLayout;
 }
 
 describe('retained table acquisition', () => {
+  it('groups adjacent framed cell paragraphs once outside ordinary cell flow', () => {
+    const framePr = {
+      dropCap: 'none', lines: 1, wrap: 'around', hAnchor: 'page', vAnchor: 'page',
+      hRule: 'auto', hSpace: 0, vSpace: 0, w: 30, x: 20, y: 30,
+    } as const;
+    const frameMembers = [
+      { type: 'paragraph', runs: [{ type: 'text', text: 'first' }], framePr },
+      { type: 'paragraph', runs: [{ type: 'text', text: 'second' }], framePr },
+    ] as unknown as DocParagraph[];
+    const following = { type: 'paragraph', runs: [{ type: 'text', text: 'following' }] } as unknown as DocParagraph;
+    const table = {
+      type: 'table', rows: [{
+        cells: [{ content: [...frameMembers, following], colSpan: 1, vMerge: null,
+          borders: noBorders, background: null, vAlign: 'top' }],
+        gridBefore: 0, gridAfter: 0, isHeader: false, cantSplit: false,
+      }], colWidths: [100], borders: noBorders,
+      cellMarginTop: 0, cellMarginRight: 0, cellMarginBottom: 0, cellMarginLeft: 0,
+      jc: 'left', bidiVisual: false,
+    } as unknown as DocTable;
+    const acquiredMembers = frameMembers.map((member, index) => ({
+      paragraph: member,
+      fragment: layoutParagraph({
+        kind: 'paragraph', id: `framed-${index}`,
+        source: { story: 'body', storyInstance: 'body', path: [0, 0, 0, index] },
+        flowDomainId: 'cell', ordinaryFlow: true,
+        flowBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+        inkBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+        spacing: { beforePt: 0, afterPt: 0 }, contextualSpacing: false,
+        lines: [], borders: [], resources: [], drawings: [], textBoxes: [],
+        events: [], exclusions: [],
+      }),
+      source: { story: 'body' as const, storyInstance: 'body', path: [0, 0, 0, index] },
+    }));
+    let groupCount = 0;
+    const result = acquireRetainedTable(
+      table, [100], 100, { y: 0 }, [0], {
+        layoutServices: () => ({}) as LayoutServices,
+        tableFormat: () => ({
+          effectiveStyleId: null, ordinaryFlow: true, positioning: null,
+          firstRowException: null,
+          rows: [{ height: null, cantSplit: false, repeatedHeader: false,
+            cellSpacingPt: 0, justification: null, exception: null,
+            cells: [{ marginsPt: { top: 0, right: 0, bottom: 0, left: 0 } }] }],
+        }),
+        resolveColumns: () => [],
+        createCellState: (state) => ({ ...state }),
+        acquireParagraph: () => retainedParagraph(100),
+        registerFloatingTable: () => null,
+        advanceState: (state, advance) => { state.y += advance; },
+        cursorY: (state) => state.y,
+        frameReference: () => ({ pageWidthPt: 200, pageHeightPt: 300,
+          marginLeftPt: 10, marginRightPt: 10, marginTopPt: 10, marginBottomPt: 10 }),
+        acquireCellFrameGroup: () => {
+          groupCount += 1;
+          return { box: {
+            bounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+            exclusionBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+            exclusionId: 'frame',
+          }, members: acquiredMembers };
+        },
+      },
+    );
+    expect(groupCount).toBe(1);
+    const inputCell = result.input.rows[0]?.cells[0];
+    expect(inputCell?.blocks.map((block) => block.sourceBlockIndex)).toEqual([2]);
+    expect(inputCell?.frames?.[0]?.memberSourceBlockIndexes).toEqual([0, 1]);
+    expect(result.layout.rows[0]?.cells[0]?.frames?.[0]?.bounds).toMatchObject({
+      xPt: 20, yPt: 30, widthPt: 30,
+    });
+    expect(result.layout.rows[0]?.cells[0]?.blocks).toHaveLength(1);
+    expect(retainedTableAcquisitionIsReusableAcrossPages(result)).toBe(false);
+  });
+
+  it('keeps Word-measured nonmoving frame cases in cell flow', () => {
+    const framePr = {
+      dropCap: 'none', lines: 1, wrap: 'around', hAnchor: 'page', vAnchor: 'page',
+      hRule: 'auto', hSpace: 0, vSpace: 0, x: 20, y: 30,
+    } as const;
+    const ordinary = { type: 'paragraph', runs: [{ type: 'text', text: 'before' }] } as unknown as DocParagraph;
+    const cases = [
+      { name: 'absent width', content: [{ ...ordinary, framePr }], cellIndex: 0 },
+      { name: 'zero width', content: [{ ...ordinary, framePr: { ...framePr, w: 0 } }], cellIndex: 0 },
+      { name: 'after ordinary paragraph', content: [ordinary,
+        { ...ordinary, framePr: { ...framePr, w: 30 } }], cellIndex: 0 },
+      { name: 'neighboring cell', content: [{ ...ordinary, framePr: { ...framePr, w: 30 } }], cellIndex: 1 },
+      { name: 'split-row later group', content: [ordinary,
+        { ...ordinary, framePr: { ...framePr, w: 30 } }, ordinary], cellIndex: 0 },
+    ];
+    for (const { name, content, cellIndex } of cases) {
+      const cell = (items: DocParagraph[]) => ({
+        content: items, colSpan: 1, vMerge: null, borders: noBorders,
+        background: null, vAlign: 'top',
+      });
+      const cells = cellIndex === 0 ? [cell(content)] : [cell([ordinary]), cell(content)];
+      const table = {
+        type: 'table', rows: [{ cells, gridBefore: 0, gridAfter: 0,
+          isHeader: false, cantSplit: false }],
+        colWidths: cells.map(() => 100), borders: noBorders,
+        cellMarginTop: 0, cellMarginRight: 0, cellMarginBottom: 0, cellMarginLeft: 0,
+        jc: 'left', bidiVisual: false,
+      } as unknown as DocTable;
+      const result = acquireRetainedTable(table, cells.map(() => 100),
+        cells.length * 100, { y: 0 }, [0], {
+          layoutServices: () => ({}) as LayoutServices,
+          tableFormat: () => ({
+            effectiveStyleId: null, ordinaryFlow: true, positioning: null,
+            firstRowException: null,
+            rows: [{ height: null, cantSplit: false, repeatedHeader: false,
+              cellSpacingPt: 0, justification: null, exception: null,
+              cells: cells.map(() => ({ marginsPt: {
+                top: 0, right: 0, bottom: 0, left: 0,
+              } })) }],
+          }),
+          resolveColumns: () => [],
+          createCellState: (state) => ({ ...state }),
+          acquireParagraph: () => retainedParagraph(100),
+          registerFloatingTable: () => null,
+          advanceState: (state, advance) => { state.y += advance; },
+          cursorY: (state) => state.y,
+          acquireCellFrameGroup: () => { throw new Error(`${name} unexpectedly positioned`); },
+        });
+      expect(result.input.rows[0]?.cells[cellIndex]?.frames ?? [], name).toHaveLength(0);
+      expect(result.input.rows[0]?.cells[cellIndex]?.blocks, name).toHaveLength(content.length);
+    }
+  });
+
   it('retains the immutable layout input and recursive acquisitions beside final geometry', () => {
     const nested = {
       type: 'table', rows: [], colWidths: [], borders: noBorders,
@@ -151,7 +280,10 @@ describe('retained table acquisition', () => {
       type: 'paragraph', runs: [{ type: 'text' }],
     } as unknown as DocParagraph;
     const framedParagraph = {
-      type: 'paragraph', runs: [{ type: 'text' }], framePr: {},
+      type: 'paragraph', runs: [{ type: 'text' }], framePr: {
+        dropCap: 'none', lines: 1, wrap: 'around', hAnchor: 'page', vAnchor: 'page',
+        hRule: 'auto', hSpace: 0, vSpace: 0,
+      },
     } as unknown as DocParagraph;
     const floating = {
       type: 'table',

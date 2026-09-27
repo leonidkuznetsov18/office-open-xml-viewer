@@ -328,6 +328,75 @@ function buildMeasureState(
           yPt: registered.imageY - textFrame.yPt,
         });
       },
+      frameReference: (state) => Object.freeze({
+        pageWidthPt: state.pageWidth,
+        pageHeightPt: state.pageH,
+        marginLeftPt: state.marginLeft,
+        marginRightPt: state.marginRight,
+        marginTopPt: state.marginTop,
+        marginBottomPt: state.marginBottom,
+      }),
+      cursorY: (state) => state.y,
+      acquireCellFrameGroup: (cellState, group, cellWidthPt, sourceRefs, cellContent) => {
+        const borderEdges = group.members.map((member, index) => resolveParagraphBorderEdges(
+          group.members[index - 1] ?? null,
+          member,
+          group.members[index + 1] ?? null,
+          true,
+        ));
+        const localState = { ...cellState, contentX: 0, contentW: cellWidthPt };
+        const anchorLineHeightPt = frameAnchorLineHeightPx(
+          cellContent as readonly LayoutStoryBlock[],
+          group.owner as LayoutParagraphBlock,
+          cellState,
+        );
+        let placedBox: FrameBox | undefined;
+        const acquired = acquireRetainedFrameGroup(group, {
+          contexts: group.members.map((member) => resolveStateParagraphLayoutContext(cellState, member)),
+          inputs: group.members.map((member, index) =>
+            cellState.acquisitionInputs.paragraphAcquisitionInput(member, sourceRefs[index]!)),
+          borderEdges,
+          borderExtentsPt: group.members.map((member, index) =>
+            borderEdges[index]?.bottom === 'none' ? 0 : bottomBorderExtentPt(member.borders)),
+          measurer: { context: cellState.ctx, fontFamilyClasses: cellState.fontFamilyClasses },
+          environment: paragraphMeasurementEnvironment(cellState),
+          containerShading: cellState.containerShading,
+          anchorFrames: bodyAnchorReferenceFrames(cellState),
+          maximumWidthPt: Math.max(0, (() => {
+            const band = frameXContainer(group.framePr.hAnchor, localState);
+            return band.right - band.left;
+          })()),
+          acquisitionSession: cellState,
+          placementSignature: `cell:${sourceRefs[0]?.path.join('.')}:${cellState.pageIndex}:${cellState.y}:${cellWidthPt}`,
+          sourceForMember: (index) => sourceRefs[index]!,
+          place: (contentWidthPt, contentHeightPt) => {
+            const box = computeFrameBox(
+              group.framePr,
+              localState,
+              cellState.y,
+              contentWidthPt,
+              contentHeightPt,
+              anchorLineHeightPt,
+            );
+            placedBox = box;
+            return Object.freeze({
+              bounds: Object.freeze({ xPt: box.x, yPt: box.y, widthPt: box.w, heightPt: box.h }),
+              exclusionBounds: Object.freeze({
+                xPt: box.exLeft,
+                yPt: box.exTop,
+                widthPt: box.exRight - box.exLeft,
+                heightPt: box.exBottom - box.exTop,
+              }),
+            });
+          },
+        });
+        // A text-anchored frame is cell-local at acquisition time. Absolute
+        // page/margin anchors are resolved after the table fragment is placed.
+        if (placedBox && group.framePr.hAnchor === 'text' && group.framePr.vAnchor === 'text') {
+          registerFrameFloat(placedBox, group.framePr, cellState);
+        }
+        return acquired;
+      },
       advanceState: (state, advancePt) => {
         state.y += advancePt;
       },
@@ -694,18 +763,24 @@ function buildConcreteBodyLayoutKernel(
           contentX: 0,
           contentW: request.acquired.flowBounds.widthPt,
           y: request.acquired.flowBounds.yPt,
-          floats: (request.floatingTableExclusions ?? []).map((bounds, index): FloatRect => ({
-            kind: 'table', tableOverlap: 'never', mode: 'square',
-            imageKey: `${TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX}${index}`,
-            imageX: bounds.xPt, imageY: bounds.yPt,
-            imageW: bounds.widthPt, imageH: bounds.heightPt,
-            xLeft: bounds.xPt,
-            xRight: bounds.xPt + bounds.widthPt,
-            yTop: bounds.yPt,
-            yBottom: bounds.yPt + bounds.heightPt,
-            side: 'bothSides', distLeft: 0, distRight: 0, distTop: 0, distBottom: 0,
-            paraId: index,
-          })),
+          floats: (request.floatingTableExclusions ?? []).map((bounds, index): FloatRect => {
+            const common = {
+              mode: bounds.mode ?? 'square',
+              imageKey: `${TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX}${index}`,
+              imageX: bounds.xPt, imageY: bounds.yPt,
+              imageW: bounds.widthPt, imageH: bounds.heightPt,
+              xLeft: bounds.xPt,
+              xRight: bounds.xPt + bounds.widthPt,
+              yTop: bounds.yPt,
+              yBottom: bounds.yPt + bounds.heightPt,
+              side: 'bothSides' as const,
+              distLeft: 0, distRight: 0, distTop: 0, distBottom: 0,
+              paraId: index,
+            };
+            return bounds.kind === 'frame'
+              ? { ...common, kind: 'frame' }
+              : { ...common, kind: 'table', tableOverlap: 'never' };
+          }),
           floatParaSeq: request.floatingTableExclusions?.length ?? 0,
           pageAnchorPrescanned: new Set<ParagraphLayoutSource>(),
         };

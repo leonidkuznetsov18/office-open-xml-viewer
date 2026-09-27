@@ -5,6 +5,8 @@ import type {
 } from '../types.js';
 import type { ParagraphLayoutSource } from './text.js';
 import type { TableLayoutSource } from './table-source-acquisition.js';
+import { collectBodyFrameGroups, type BodyFrameGroup } from './frame.js';
+import type { RetainedFrameGroupAcquisition } from './paragraph.js';
 import {
   acquireTableCellBlocks,
   isStructuralTrailingParagraph,
@@ -23,6 +25,7 @@ import type {
   ParagraphLayout,
   TableBorderInput,
   TableCellVerticalMode,
+  CellFramePlacementInput,
   TableEdgeInputs,
   TableFormatInput,
   TableLayout,
@@ -58,6 +61,15 @@ export interface RetainedTableAcquisitionDependencies<State> {
     }>,
   ): Readonly<{ xPt: number; yPt: number }> | null;
   advanceState(state: State, advancePt: number): void;
+  acquireCellFrameGroup?(
+    state: State,
+    group: BodyFrameGroup,
+    contentWidthPt: number,
+    sourceRefs: readonly SourceRef[],
+    cellContent: TableLayoutSource['rows'][number]['cells'][number]['content'],
+  ): RetainedFrameGroupAcquisition;
+  frameReference?(state: State): NonNullable<TableLayoutInput['pageFrame']>;
+  cursorY?(state: State): number;
 }
 
 /**
@@ -151,6 +163,12 @@ function retainedTableAcquisitionGraphIsReusableAcrossPages(
     )))
   ));
   return rowsAreReusable
+    && acquisition.input.rows.every((row) => row.cells.every((cell) => (
+      (cell.frames ?? []).every((frame) => (
+        frame.framePr.hAnchor === 'text' && frame.framePr.vAnchor === 'text'
+        && frame.members.every((member) => retainedNodeIsReusableAcrossPages(member, visited))
+      ))
+    )))
     && Object.values(acquisition.nestedById).every(
       (nested) => retainedTableAcquisitionGraphIsReusableAcrossPages(nested, visited),
     );
@@ -414,9 +432,21 @@ export function acquireRetainedTable<State>(
           - (formatMargins.left + formatMargins.right),
       );
       const verticalMode = cell.vMerge === false ? undefined : verticalCellMode(cell);
-      const acquireAt = (lineWidthPt: number | undefined) => cell.vMerge === false
-        ? []
-        : acquireTableCellBlocks({
+      const frameGroups = collectBodyFrameGroups(cell.content);
+      const positionedFrameGroups = new Map<ParagraphLayoutSource, BodyFrameGroup>();
+      if (cellIndex === 0) {
+        for (const element of cell.content) {
+          if (element.type !== 'paragraph' || (element.framePr?.w ?? 0) <= 0) continue;
+          const group = frameGroups.get(element);
+          if (group?.sourceIndices[0] === 0) positionedFrameGroups.set(element, group);
+        }
+      }
+      let acquiredCellFrames: CellFramePlacementInput[] = [];
+      const acquireAt = (lineWidthPt: number | undefined) => {
+        acquiredCellFrames = [];
+        if (cell.vMerge === false) return [];
+        const frameAcquisitions = new Map<BodyFrameGroup, RetainedFrameGroupAcquisition>();
+        return acquireTableCellBlocks({
             cell,
             table,
             cellTotalWidthPt,
@@ -443,16 +473,59 @@ export function acquireRetainedTable<State>(
               paragraphWidthPt,
               paragraphPath,
               paragraphBorderEdges,
-            ) => dependencies.acquireParagraph(
-              cellState,
-              paragraph,
-              paragraphWidthPt,
-              paragraphPath,
-              `${flowDomainId}:cell:${rowIndex}.${cellIndex}`,
-              paragraphBorderEdges,
-              undefined,
-              sourceAt(paragraphPath),
-            ),
+            ) => {
+              // ECMA-376 §17.3.1.11 permits framePr in every cell paragraph,
+              // but Word's printed placement is narrower than that syntax.
+              // Width-boundary controls show that positive width positions an
+              // initial group in the first cell; absent/zero width remains in
+              // flow. Paragraph-order and cell-index counterexamples show that
+              // a preceding ordinary paragraph or a neighboring cell keeps
+              // even a positive-width group in flow. Split-row controls keep a
+              // later group in flow, immediately after the repeated header on
+              // the continuation page. Do not infer placement beyond this
+              // measured envelope.
+              const group = positionedFrameGroups.get(paragraph);
+              if (group) {
+                let acquiredGroup = frameAcquisitions.get(group);
+                if (!acquiredGroup) {
+                  if (!dependencies.acquireCellFrameGroup || !dependencies.cursorY) {
+                    throw new Error('Cell frame acquisition requires its placement dependencies');
+                  }
+                  const anchorOffsetPt = dependencies.cursorY(cellState);
+                  acquiredGroup = dependencies.acquireCellFrameGroup(
+                    cellState,
+                    group,
+                    paragraphWidthPt,
+                    group.sourceIndices.map((index) => sourceAt([...cellPath, index])),
+                    cell.content,
+                  );
+                  frameAcquisitions.set(group, acquiredGroup);
+                  acquiredCellFrames.push(Object.freeze({
+                    id: `${cellId}:frame:${group.id}`,
+                    firstSourceBlockIndex: group.sourceIndices[0]!,
+                    memberSourceBlockIndexes: Object.freeze([...group.sourceIndices]),
+                    framePr: group.framePr,
+                    acquiredBounds: acquiredGroup.box.bounds,
+                    acquiredExclusionBounds: acquiredGroup.box.exclusionBounds,
+                    anchorOffsetPt,
+                    members: Object.freeze(acquiredGroup.members.map((member) => member.fragment)),
+                  }));
+                }
+                const member = acquiredGroup.members.find((entry) => entry.paragraph === paragraph);
+                if (!member) throw new Error('Cell frame group omitted its member');
+                return member.fragment;
+              }
+              return dependencies.acquireParagraph(
+                cellState,
+                paragraph,
+                paragraphWidthPt,
+                paragraphPath,
+                `${flowDomainId}:cell:${rowIndex}.${cellIndex}`,
+                paragraphBorderEdges,
+                undefined,
+                sourceAt(paragraphPath),
+              );
+            },
             acquireNestedTable: (cellState, nestedTable, nestedContentWidthPt, nestedPath) => {
               const nestedColumns = dependencies.resolveColumns(
                 nestedTable,
@@ -495,7 +568,9 @@ export function acquireRetainedTable<State>(
               return nested.layout;
             },
             advanceState: dependencies.advanceState,
+            advancesParagraph: (paragraph) => !positionedFrameGroups.has(paragraph),
           });
+      };
       let acquired: ReturnType<typeof acquireAt>;
       let verticalText: TableLayoutInput['rows'][number]['cells'][number]['verticalText'];
       if (verticalMode) {
@@ -563,10 +638,13 @@ export function acquireRetainedTable<State>(
         } : {}),
         ...(verticalText ? { verticalText } : {}),
         blocks: cellBlocks(acquired),
+        ...(acquiredCellFrames.length ? { frames: Object.freeze(acquiredCellFrames) } : {}),
       };
       function cellBlocks(layouts: typeof acquired) {
         return layouts.flatMap((layout, sourceBlockIndex) => {
           const sourceElement = cell.content[sourceBlockIndex];
+          if (sourceElement?.type === 'paragraph'
+            && positionedFrameGroups.has(sourceElement)) return [];
           // ECMA-376 §17.4.57 keeps tblpPr tables at their logical source
           // position only for anchoring; they do not participate in cell flow.
           if (
@@ -625,6 +703,7 @@ export function acquireRetainedTable<State>(
     columnWidthsPt,
     borders: retainedEdges(table.borders),
     rows,
+    ...(dependencies.frameReference ? { pageFrame: dependencies.frameReference(outerState) } : {}),
   }, 'RetainedTableAcquisition.input') as TableLayoutInput;
   const bounds = {
     xPt: 0,

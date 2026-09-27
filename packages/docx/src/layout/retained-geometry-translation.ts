@@ -388,6 +388,18 @@ export function translateTableLayout(table: TableLayout, delta: LayoutTranslatio
         } : { contentBounds: translateRect(cell.contentBounds, delta) }),
         // Cell paint adds contentBounds/offsetPt; retained descendants are cell-local.
         blocks: cell.blocks,
+        ...(cell.frames ? { frames: cell.frames.map((frame) => {
+          const frameDelta = {
+            xPt: frame.horizontalFollowsCell ? delta.xPt : 0,
+            yPt: frame.verticalFollowsCell ? delta.yPt : 0,
+          };
+          return {
+            ...frame,
+            bounds: translateRect(frame.bounds, frameDelta),
+            exclusionBounds: translateRect(frame.exclusionBounds, frameDelta),
+            members: frame.members.map((member) => translateParagraphLayout(member, frameDelta)),
+          };
+        }) } : {}),
       })),
     })),
   };

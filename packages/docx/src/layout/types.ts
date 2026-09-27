@@ -1,5 +1,5 @@
 import type { SectionLayoutContext } from '../layout-context.js';
-import type { DocxStorySource } from '../types.js';
+import type { DocxStorySource, FramePr } from '../types.js';
 import type {
   GlyphInkBounds,
   TextFontSlotPresence,
@@ -677,9 +677,35 @@ export interface CompoundBorderFrameLayout {
 
 export interface TableCellBlockLayout {
   readonly layout: ParagraphLayout | TableLayout;
+  readonly sourceBlockIndex?: number;
   /** Final block origin from the cell border-box top. */
   readonly offsetPt: number;
   readonly advancePt: number;
+}
+
+/** §17.3.1.11 frame group owned by a table cell. Its member paragraphs are
+ * acquired at the frame width and never advance the ordinary cell block stack.
+ * Placement is resolved again for each page fragment after the cell has its
+ * final physical origin. */
+export interface CellFramePlacementInput {
+  readonly id: LayoutNodeId;
+  readonly firstSourceBlockIndex: number;
+  readonly memberSourceBlockIndexes: readonly number[];
+  readonly framePr: FramePr;
+  readonly acquiredBounds: LayoutRect;
+  readonly acquiredExclusionBounds: LayoutRect;
+  readonly anchorOffsetPt: number;
+  readonly members: readonly ParagraphLayout[];
+}
+
+export interface CellFramePlacementLayout {
+  readonly id: LayoutNodeId;
+  readonly firstSourceBlockIndex: number;
+  readonly bounds: LayoutRect;
+  readonly exclusionBounds: LayoutRect;
+  readonly members: readonly ParagraphLayout[];
+  readonly horizontalFollowsCell: boolean;
+  readonly verticalFollowsCell: boolean;
 }
 
 /** ECMA-376 §17.4.72 rotated cell text, expressed with the DrawingML text-box
@@ -701,6 +727,7 @@ export interface TableCellLayout extends LayoutNodeBase {
   readonly vAlign: 'top' | 'center' | 'bottom';
   readonly background?: FillPaint;
   readonly blocks: readonly TableCellBlockLayout[];
+  readonly frames?: readonly CellFramePlacementLayout[];
   /** Present for rotated cell text: blocks are in the local frame. */
   readonly verticalText?: TableCellVerticalTextLayout;
 }
@@ -1332,6 +1359,7 @@ export interface TableCellLayoutInput {
     tr2bl: TableBorderInput | null;
   }>;
   readonly blocks: readonly TableCellBlockInput[];
+  readonly frames?: readonly CellFramePlacementInput[];
   /** ECMA-376 §17.4.72 rotated cell text. Blocks were acquired with
    * `lineLengthPt` as their line width; the cell requires
    * `requiredLineLengthPt` of physical content height. */
@@ -1377,6 +1405,17 @@ export interface TableLayoutInput {
   readonly columnWidthKeys?: readonly (string | null)[];
   readonly borders: TableEdgeInputs;
   readonly rows: readonly TableRowLayoutInput[];
+  /** Section page frame used by cell-owned page/margin text frames. The
+   * fragment's physical page supplies placement; these dimensions are
+   * reacquired when the owning page/section changes. */
+  readonly pageFrame?: Readonly<{
+    pageWidthPt: number;
+    pageHeightPt: number;
+    marginLeftPt: number;
+    marginRightPt: number;
+    marginTopPt: number;
+    marginBottomPt: number;
+  }>;
 }
 
 export type FlowBlockInput = ParagraphLayoutInput | TableLayoutInput;

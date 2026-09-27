@@ -2803,6 +2803,22 @@ mod tests {
         assert!(unlocked_wire.get("__anchorLock").is_none());
     }
 
+    #[test]
+    fn frame_pr_keeps_absent_zero_and_positive_width_distinct() {
+        // §17.3.1.11 makes w optional. Word's table-cell controls position a
+        // positive-width frame separately, but keep absent/zero widths in cell
+        // flow, so layout must receive the authored width without defaulting.
+        for (xml, expected) in [
+            (r#"<w:framePr w:hAnchor="page"/>"#, None),
+            (r#"<w:framePr w:hAnchor="page" w:w="0"/>"#, Some(0.0)),
+            (r#"<w:framePr w:hAnchor="page" w:w="1"/>"#, Some(0.05)),
+        ] {
+            let frame = para_fmt_from(xml).frame_pr.expect("framePr parses");
+            assert_eq!(frame.w, expected);
+            assert_eq!(frame.h_anchor, "page");
+        }
+    }
+
     // ── RB2 neutralization: a pathologically deep styles.xml is rejected by the
     //    depth pre-check in `parse_guarded` BEFORE roxmltree's recursive tree
     //    builder runs, so `StyleMap::parse` returns gracefully instead of trapping

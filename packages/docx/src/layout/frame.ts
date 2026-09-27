@@ -13,6 +13,7 @@ import {
 } from './paragraph-border-adjacency.js';
 import type { LayoutParagraphBlock, LayoutStoryBlock } from './layout-source-store.js';
 import type { ParagraphLayoutSource } from './text.js';
+import type { DeepReadonly } from './types.js';
 
 /** Parser-private effective CT_FramePr state required for grouping, not API. */
 type EffectiveFramePr = FramePr & Readonly<{ __anchorLock?: boolean }>;
@@ -73,7 +74,7 @@ export function effectiveFrameIdentity(framePr: FramePr): string {
 
 /** Build the body-local adjacency groups once, before pagination mutates pages. */
 export function collectBodyFrameGroups(
-  body: readonly (BodyElement | LayoutStoryBlock)[],
+  body: readonly (DeepReadonly<BodyElement> | LayoutStoryBlock)[],
 ): WeakMap<ParagraphLayoutSource, BodyFrameGroup> {
   const result = new WeakMap<ParagraphLayoutSource, BodyFrameGroup>();
   for (let index = 0; index < body.length;) {

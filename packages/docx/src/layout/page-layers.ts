@@ -219,6 +219,11 @@ function visitTableAnchoredDrawings(
             candidates,
           );
         }
+        for (const frame of cell.frames ?? []) {
+          for (const member of frame.members) {
+            visitAnchoredDrawings(member, root, rotatedFrames, layoutTranslationPt, candidates);
+          }
+        }
         continue;
       }
       for (const block of cell.blocks) {
@@ -235,6 +240,11 @@ function visitTableAnchoredDrawings(
           layoutTranslationPt,
           candidates,
         );
+      }
+      for (const frame of cell.frames ?? []) {
+        for (const member of frame.members) {
+          visitAnchoredDrawings(member, root, cellFrames, layoutTranslationPt, candidates);
+        }
       }
     }
   }

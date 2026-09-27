@@ -235,6 +235,68 @@ describe('retained table pagination', () => {
     vi.restoreAllMocks();
   });
 
+  it('owns a cell frame only on the first fragment of a split paragraph row', () => {
+    const base = row(0, 120, { paragraph: paragraph('split-body', [40, 40, 40]) });
+    const frame = {
+      id: 'split-cell-frame', firstSourceBlockIndex: 0,
+      memberSourceBlockIndexes: [0],
+      framePr: {
+        dropCap: 'none', lines: 1, wrap: 'around', hAnchor: 'page', vAnchor: 'page',
+        hRule: 'auto', hSpace: 0, vSpace: 0, w: 30, x: 10, y: 10,
+      } as const,
+      acquiredBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+      acquiredExclusionBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+      anchorOffsetPt: 0, members: [paragraph('frame-member', [8])],
+    };
+    const inputRow = {
+      ...base,
+      cells: [{ ...base.cells[0]!, frames: [frame],
+        blocks: [{ ...base.cells[0]!.blocks[0]!, sourceBlockIndex: 1 }] }],
+    };
+    const source = acquisition([inputRow]);
+    const first = take(source, 80);
+    expect(first.fragment?.rows[0]?.cells[0]?.frames).toHaveLength(1);
+    expect(first.nextCursor).not.toBeNull();
+    const second = take(source, 80, first.nextCursor!, {
+      page: { physicalPageIndex: 1, displayPageNumber: 2, occurrenceId: 'page-1' },
+    });
+    expect(second.fragment?.rows[0]?.cells[0]?.frames ?? []).toHaveLength(0);
+  });
+
+  it('resolves a page-anchored cell frame against its destination page', () => {
+    const base = row(0, 20);
+    const frame = {
+      id: 'destination-page-frame', firstSourceBlockIndex: 0,
+      memberSourceBlockIndexes: [0],
+      framePr: {
+        dropCap: 'none', lines: 1, wrap: 'none', hAnchor: 'page', vAnchor: 'page',
+        hRule: 'auto', hSpace: 0, vSpace: 0, w: 30, x: 10, yAlign: 'bottom',
+      } as const,
+      acquiredBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+      acquiredExclusionBounds: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 8 },
+      anchorOffsetPt: 0, members: [paragraph('page-frame', [8])],
+    };
+    const input = {
+      ...acquisition([{ ...base, cells: [{ ...base.cells[0]!, frames: [frame],
+        blocks: [{ ...base.cells[0]!.blocks[0]!, sourceBlockIndex: 1 }] }] }]),
+    };
+    const source = {
+      ...input,
+      input: { ...input.input, pageFrame: {
+        pageWidthPt: 100, pageHeightPt: 100,
+        marginLeftPt: 10, marginRightPt: 10, marginTopPt: 10, marginBottomPt: 10,
+      } },
+    };
+    const result = take(source, 80, startTableFragmentCursor(), {
+      floatingTableFrames: {
+        page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 200 },
+        margin: { xPt: 10, yPt: 10, widthPt: 180, heightPt: 180 },
+        column: { xPt: 10, yPt: 10, widthPt: 100, heightPt: 180 },
+      },
+    });
+    expect(result.fragment?.rows[0]?.cells[0]?.frames?.[0]?.bounds.yPt).toBe(192);
+  });
+
   it('charges a completed partial row from a bounded row window, not the whole suffix', () => {
     const original = tableModule.layoutTable;
     const completedPartialRowCounts: number[] = [];

@@ -120,6 +120,8 @@ export interface PageDependentTableBlockRequest {
     yPt: number;
     widthPt: number;
     heightPt: number;
+    mode?: 'square' | 'topAndBottom';
+    kind?: 'frame' | 'table';
   }>[];
 }
 
@@ -238,6 +240,29 @@ function nestedTableFragmentContext(
   });
 }
 
+/** Page/margin anchors belong to the destination fragment, not the page on
+ * which the whole table was first acquired. Re-derive the reference from the
+ * pagination context for each physical occurrence. */
+function fragmentPageFrame(
+  source: RetainedTableAcquisition,
+  context: TableFragmentContext,
+): Pick<TableLayoutInput, 'pageFrame'> {
+  const frames = context.floatingTableFrames;
+  if (!source.input.pageFrame || !frames) return {};
+  const marginLeftPt = frames.margin.xPt - frames.page.xPt;
+  const marginTopPt = frames.margin.yPt - frames.page.yPt;
+  return {
+    pageFrame: {
+      pageWidthPt: frames.page.widthPt,
+      pageHeightPt: frames.page.heightPt,
+      marginLeftPt,
+      marginRightPt: frames.page.widthPt - marginLeftPt - frames.margin.widthPt,
+      marginTopPt,
+      marginBottomPt: frames.page.heightPt - marginTopPt - frames.margin.heightPt,
+    },
+  };
+}
+
 function paginationRowHeightForOccurrence(
   source: RetainedTableAcquisition,
   row: TableRowLayoutInput,
@@ -247,6 +272,7 @@ function paginationRowHeightForOccurrence(
   if (row === source.input.rows[rowIndex]) return paginationRowHeight(source, rowIndex);
   const occurrence = layoutTable({
     ...source.input,
+    ...fragmentPageFrame(source, context),
     id: `${source.input.id}:row-occurrence:${context.page.occurrenceId}:${row.logicalRowIndex}`,
     rows: [row],
   }, context.placement, context.services).layout;
@@ -312,6 +338,7 @@ function completedPartialRowTrackHeight(
   const sliceEnd = Math.min(sourceRows.length, windowEnd + 2);
   const occurrence = layoutTable({
     ...source.input,
+    ...fragmentPageFrame(source, context),
     id: `${source.input.id}:completed-partial:${context.page.occurrenceId}:${row.logicalRowIndex}`,
     rows: [row, ...sourceRows.slice(rowIndex + 1, sliceEnd)],
   }, context.placement, context.services).layout;
@@ -380,6 +407,11 @@ function remainingRowAtCursor(
       const cellCursor = cursor.cells[cellIndex] ?? emptyCellCursor();
       return {
         ...cell,
+        frames: (cell.frames ?? []).filter((frame) => (
+          cellFrameAnchorBlockIndex(cell, frame) >= cellCursor.blockIndex
+          && !(cellCursor.paragraphLineStart > 0
+            && cellFrameAnchorBlockIndex(cell, frame) === cellCursor.blockIndex)
+        )),
         blocks: cell.blocks.slice(cellCursor.blockIndex).map((block, blockOffset) => {
           if (blockOffset === 0 && cellCursor.nestedCursor && block.layout.kind === 'table') {
             const nested = source.nestedById[block.layout.id];
@@ -421,6 +453,19 @@ function remainingRowAtCursor(
   };
 }
 
+/** An initial positioned cell frame follows its first ordinary cell block
+ * across a row split. The frame itself has no flow advance, so its source
+ * index cannot decide fragment ownership. A terminal frame belongs to the
+ * fragment that completes the cell. */
+function cellFrameAnchorBlockIndex(
+  cell: TableCellLayoutInput,
+  frame: NonNullable<TableCellLayoutInput['frames']>[number],
+): number {
+  const lastMember = frame.memberSourceBlockIndexes.at(-1) ?? frame.firstSourceBlockIndex;
+  const next = cell.blocks.findIndex((block) => block.sourceBlockIndex > lastMember);
+  return next < 0 ? cell.blocks.length : next;
+}
+
 function finalFrameRow(
   source: RetainedTableAcquisition,
   row: TableRowLayoutInput,
@@ -449,7 +494,12 @@ function finalFrameRow(
     sourceRow.cells.some((cell) => cell.id === occurrence.hostCellId)
     && ownsAnchorStart(occurrence)
   ));
-  if (occurrences.length === 0) return { row, resolved: [], registry, nextParagraphId };
+  const hasPageDependentCellFrame = row.cells.some((cell) => (cell.frames ?? []).some(
+    (frame) => frame.framePr.hAnchor !== 'text' || frame.framePr.vAnchor !== 'text',
+  ));
+  if (occurrences.length === 0 && !hasPageDependentCellFrame) {
+    return { row, resolved: [], registry, nextParagraphId };
+  }
   const requiredAnchorByCell = new Map<string, number>();
   for (const occurrence of occurrences) {
     requiredAnchorByCell.set(
@@ -473,6 +523,7 @@ function finalFrameRow(
   );
   const provisional = layoutTable({
     ...source.input,
+    ...fragmentPageFrame(source, context),
     id: `${source.input.id}:float-probe:${context.page.occurrenceId}:${row.logicalRowIndex}`,
     rows: [remainingRow],
   }, rowPlacement, context.services).layout;
@@ -525,6 +576,7 @@ function finalFrameRow(
     );
     const laidOut = candidate === row ? provisional : layoutTable({
       ...source.input,
+      ...fragmentPageFrame(source, context),
       id: `${source.input.id}:float-converge:${context.page.occurrenceId}:${row.logicalRowIndex}`,
       rows: [remainingCandidate],
     }, rowPlacement, context.services).layout;
@@ -554,16 +606,16 @@ function finalFrameRow(
       resolved.push(resolution.placement);
       transaction = resolution.transaction;
     }
-    return { resolved: Object.freeze(resolved), transaction };
+    return { resolved: Object.freeze(resolved), transaction, laidOut, rowInput: remainingCandidate };
   };
   const reacquireCandidate = (
-    resolved: readonly ResolvedFloatingTablePlacementLayout[],
+    resolution: ReturnType<typeof resolveCandidate>,
   ): TableRowLayoutInput => ({
     ...row,
     cells: row.cells.map((cell, logicalCellIndex) => ({
       ...cell,
       blocks: cell.blocks.map((block) => {
-        const exclusions = resolved.filter((placement) => (
+        const exclusions = resolution.resolved.filter((placement) => (
           placement.source.hostCellId === cell.id
           && placement.source.anchorBlockIndex === block.sourceBlockIndex
         )).map((placement) => Object.freeze({
@@ -572,6 +624,33 @@ function finalFrameRow(
           widthPt: placement.exclusionBounds.widthPt,
           heightPt: placement.exclusionBounds.heightPt,
         }));
+        const laidOutCell = resolution.laidOut.rows[0]?.cells[logicalCellIndex];
+        if (laidOutCell && block.layout.kind === 'paragraph') {
+          for (const frame of laidOutCell.frames ?? []) {
+            const frameInput = resolution.rowInput.cells[logicalCellIndex]?.frames?.find(
+              (candidate) => candidate.id === frame.id,
+            );
+            if (!frameInput || frameInput.firstSourceBlockIndex >= block.sourceBlockIndex
+              || frameInput.framePr.wrap === 'none') continue;
+            const frameX = frame.exclusionBounds.xPt
+              + (frame.horizontalFollowsCell ? translation.xPt : 0);
+            const frameY = frame.exclusionBounds.yPt
+              + (frame.verticalFollowsCell ? translation.yPt : 0);
+            exclusions.push(Object.freeze({
+              xPt: frameX - laidOutCell.contentBounds.xPt - translation.xPt,
+              yPt: frameY - laidOutCell.flowBounds.yPt
+                - (laidOutCell.blocks.find((candidate) => (
+                  candidate.sourceBlockIndex === block.sourceBlockIndex
+                ))?.offsetPt ?? 0)
+                - translation.yPt + block.layout.flowBounds.yPt,
+              widthPt: frame.exclusionBounds.widthPt,
+              heightPt: frame.exclusionBounds.heightPt,
+              mode: frameInput.framePr.wrap === 'notBeside'
+                ? 'topAndBottom' as const : 'square' as const,
+              kind: 'frame' as const,
+            }));
+          }
+        }
         if (exclusions.length === 0 || block.layout.kind !== 'paragraph') return block;
         return {
           ...block,
@@ -597,10 +676,11 @@ function finalFrameRow(
       layout: block.layout,
     }))),
     placements: resolved,
+    frames: candidate.cells.map((cell) => cell.frames),
   });
 
   const initialResolution = resolveCandidate(row);
-  if (initialResolution.resolved.length === 0) {
+  if (initialResolution.resolved.length === 0 && !hasPageDependentCellFrame) {
     return { row, resolved: [], registry, nextParagraphId };
   }
   type Pass = Readonly<{
@@ -612,9 +692,7 @@ function finalFrameRow(
     const result = convergeExactState<Pass>({
       seedState: convergenceKey(row, initialResolution.resolved),
       step: (previous) => {
-        const candidate = reacquireCandidate(
-          previous?.resolution.resolved ?? initialResolution.resolved,
-        );
+        const candidate = reacquireCandidate(previous?.resolution ?? initialResolution);
         const resolution = resolveCandidate(candidate);
         return Object.freeze({
           candidate,
@@ -790,7 +868,7 @@ function selectCell(
     // fragment owns the whole rotated content.
     const atStart = cursor.blockIndex === 0 && cursor.paragraphLineStart === 0;
     return {
-      input: { ...cell, blocks: atStart ? cell.blocks : [] },
+      input: { ...cell, blocks: atStart ? cell.blocks : [], frames: atStart ? cell.frames : [] },
       range: atStart
         ? cell.blocks.map((block) => ({ kind: 'whole' as const, blockIndex: block.sourceBlockIndex }))
         : [],
@@ -893,8 +971,16 @@ function selectCell(
   }
 
   const complete = blockIndex >= cell.blocks.length;
+  const frames = (cell.frames ?? []).filter((frame) => {
+    const anchorIndex = cellFrameAnchorBlockIndex(cell, frame);
+    return anchorIndex >= cursor.blockIndex
+      && !(cursor.paragraphLineStart > 0 && anchorIndex === cursor.blockIndex)
+      && (anchorIndex < blockIndex
+        || (anchorIndex === blockIndex
+          && (complete || paragraphLineStart > cursor.paragraphLineStart)));
+  });
   return {
-    input: { ...cell, blocks },
+    input: { ...cell, blocks, frames },
     range,
     next: Object.freeze({ blockIndex, paragraphLineStart, nestedCursor, nestedFragmentIndex }),
     complete,
@@ -1022,6 +1108,7 @@ function materializeFragment(
 ): TableFragmentLayout {
   const fragmentInput: TableLayoutInput = {
     ...source.input,
+    ...fragmentPageFrame(source, context),
     id: `${source.input.id}:fragment:${context.page.occurrenceId}`,
     rows: selected.map((row) => row.input),
   };
