@@ -8,6 +8,7 @@ import { legacyBundleBoundary, wasmAssetUrl } from '../../vite.config';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  define: { __OOXML_MODEL_SOURCES__: 'true' },
   root: __dirname,
   plugins: [wasmAssetUrl(), wasm(), topLevelAwait(), legacyBundleBoundary()],
   resolve: {
