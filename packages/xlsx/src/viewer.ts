@@ -665,11 +665,19 @@ class XlsxViewerEngine implements ZoomableViewer {
   private colOutline: OutlineLayout | null = null;
   private rowOutlineBands: BandOutline[] = [];
   private colOutlineBands: BandOutline[] = [];
-  /** Original row heights / column widths stashed the first time a band is
-   *  collapsed, so expanding restores a custom size rather than the default.
-   *  Keyed by band index; per current worksheet (cleared on sheet switch). */
+  /** Original sizes stashed while the active sheet has collapsed bands. The
+   * maps belong to outlineStateStore and survive projection eviction. */
   private stashedRowHeights = new Map<number, number | undefined>();
   private stashedColWidths = new Map<number, number | undefined>();
+  /** Only user-mutated outline flags and pre-collapse sizes survive a sheet
+   * switch. The parser's filters and frozen panes are read-only here; selection
+   * and scroll are viewer viewport state, reset by navigation as before. */
+  private outlineStateStore = new Map<number, {
+    rowCollapsed: Map<number, boolean>;
+    colCollapsed: Map<number, boolean>;
+    stashedRowHeights: Map<number, number | undefined>;
+    stashedColWidths: Map<number, number | undefined>;
+  }>();
   /**
    * Per-sheet cumulative record of every view-only size mutation (outline
    * collapse/expand, drag-to-resize #567), keyed by sheet index. Value = the
@@ -1305,6 +1313,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (this.preparedWorkbook === workbook) return true;
     this._find.invalidate();
     this.sizeOverrideStore.clear();
+    this.outlineStateStore.clear();
     this.sheetViews.clear();
     this.buildTabs();
     this.preparedWorkbook = workbook;
@@ -1349,6 +1358,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       sourceWorksheet = lease.worksheet;
       releaseNewWorksheet = lease.release;
       worksheet = this.sheetViews.get(index) ?? this.createVisibleSheetView(sourceWorksheet);
+      if (!this.sheetViews.has(index)) this.restoreSheetViewState(index, worksheet);
       const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
       if (typeof prepareRowHeights === 'function') {
         const measureCanvas = this.hostDocument.createElement('canvas');
@@ -1433,8 +1443,16 @@ class XlsxViewerEngine implements ZoomableViewer {
    *  Both axes are `null` (gutters collapse to 0) when the sheet has no
    *  outlining, so an outline-free sheet is untouched. */
   private buildOutline(ws: Worksheet): void {
-    this.stashedRowHeights.clear();
-    this.stashedColWidths.clear();
+    let state = this.outlineStateStore.get(this.currentSheet);
+    if (!state) {
+      state = {
+        rowCollapsed: new Map(), colCollapsed: new Map(),
+        stashedRowHeights: new Map(), stashedColWidths: new Map(),
+      };
+      this.outlineStateStore.set(this.currentSheet, state);
+    }
+    this.stashedRowHeights = state.stashedRowHeights;
+    this.stashedColWidths = state.stashedColWidths;
     this.rowOutlineBands = rowBands(ws);
     this.colOutlineBands = colBands(ws);
     const rowLayout = buildOutlineLayout(this.rowOutlineBands, summaryAfterFor(ws, 'row'));
@@ -1979,6 +1997,8 @@ class XlsxViewerEngine implements ZoomableViewer {
   private setBandCollapsed(axis: OutlineAxis, index: number, collapsed: boolean): void {
     const ws = this.currentWorksheet;
     if (!ws) return;
+    const state = this.outlineStateStore.get(this.currentSheet);
+    (axis === 'row' ? state?.rowCollapsed : state?.colCollapsed)?.set(index, collapsed);
     if (axis === 'row') {
       const row = ws.rows.find((r) => r.index === index);
       if (row) row.collapsed = collapsed;
@@ -1986,6 +2006,37 @@ class XlsxViewerEngine implements ZoomableViewer {
       ws.colCollapsed = ws.colCollapsed ?? {};
       if (collapsed) ws.colCollapsed[index] = true;
       else delete ws.colCollapsed[index];
+    }
+  }
+
+  /** Rebuild only the mutable projection fields. The large row/cell graph is
+   * reacquired from the workbook cache and may have been evicted meanwhile. */
+  private restoreSheetViewState(sheetIndex: number, worksheet: Worksheet): void {
+    const sizes = this.sizeOverrideStore.get(sheetIndex);
+    if (sizes) {
+      for (const [index, size] of sizes.rows) {
+        if (size === null) delete worksheet.rowHeights[index];
+        else worksheet.rowHeights[index] = size;
+      }
+      for (const [index, size] of sizes.cols) {
+        if (size === null) delete worksheet.colWidths[index];
+        else worksheet.colWidths[index] = size;
+      }
+    }
+    const outline = this.outlineStateStore.get(sheetIndex);
+    if (!outline) return;
+    if (outline.rowCollapsed.size > 0) {
+      for (const row of worksheet.rows) {
+        const collapsed = outline.rowCollapsed.get(row.index);
+        if (collapsed !== undefined) row.collapsed = collapsed;
+      }
+    }
+    if (outline.colCollapsed.size > 0) {
+      worksheet.colCollapsed = worksheet.colCollapsed ?? {};
+      for (const [index, collapsed] of outline.colCollapsed) {
+        if (collapsed) worksheet.colCollapsed[index] = true;
+        else delete worksheet.colCollapsed[index];
+      }
     }
   }
 
@@ -5132,6 +5183,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.releaseCurrentWorksheet?.();
     this.releaseCurrentWorksheet = null;
     this.sheetViews.clear();
+    this.outlineStateStore.clear();
+    this.stashedRowHeights.clear();
+    this.stashedColWidths.clear();
     this.currentSourceComments = [];
     this.sourceCommentMap.clear();
     this.commentMap.clear();

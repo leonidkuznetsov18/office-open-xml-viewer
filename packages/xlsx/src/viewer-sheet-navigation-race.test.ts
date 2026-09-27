@@ -193,4 +193,77 @@ describe('XlsxViewer sheet acquisition generation', () => {
     expect(container.children).toHaveLength(0);
     expect(engine.currentWorksheet).toBeNull();
   });
+
+  it('retains resized row geometry across A → B → A', async () => {
+    const { viewer, engine, requests } = buildViewer();
+    requests[0].resolve(worksheet('A'));
+    requests[1].resolve(worksheet('B'));
+    await engine.showSheet(0);
+    engine.scheduleRender = vi.fn();
+    engine.resizeDrag = { kind: 'row', index: 1, originScaled: 0, mdw: 7 };
+    (engine.applyResize as (x: number, y: number) => void)(0, 120);
+    const resized = (engine.currentWorksheet as Worksheet).rowHeights[1];
+    expect(resized).toBeGreaterThan(20);
+
+    await engine.showSheet(1);
+    await engine.showSheet(0);
+    expect((engine.currentWorksheet as Worksheet).rowHeights[1]).toBe(resized);
+    expect((engine.wireSizeOverrides as () => { overrides: { rows: Record<number, number> } })()
+      .overrides.rows[1]).toBe(resized);
+    viewer.destroy();
+  });
+
+  it('retains resized column geometry across A → B → A', async () => {
+    const { viewer, engine, requests } = buildViewer();
+    requests[0].resolve(worksheet('A'));
+    requests[1].resolve(worksheet('B'));
+    await engine.showSheet(0);
+    engine.scheduleRender = vi.fn();
+    engine.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
+    (engine.applyResize as (x: number, y: number) => void)(120, 0);
+    const resized = (engine.currentWorksheet as Worksheet).colWidths[2];
+    expect(resized).toBeGreaterThan(0);
+
+    await engine.showSheet(1);
+    await engine.showSheet(0);
+    expect((engine.currentWorksheet as Worksheet).colWidths[2]).toBe(resized);
+    expect((engine.wireSizeOverrides as () => { overrides: { cols: Record<number, number> } })()
+      .overrides.cols[2]).toBe(resized);
+    viewer.destroy();
+  });
+
+  it('retains outline collapse and pre-collapse sizes across A → B → A', async () => {
+    const { viewer, engine, requests } = buildViewer();
+    requests[0].resolve({
+      ...worksheet('A'),
+      rows: [
+        { index: 1, height: null, cells: [], outlineLevel: 1 },
+        { index: 2, height: null, cells: [], collapsed: false },
+      ],
+      rowHeights: { 1: 31 },
+      colWidths: { 1: 12 },
+      colOutlineLevels: { 1: 1 },
+      colCollapsed: {},
+    } as Worksheet);
+    requests[1].resolve(worksheet('B'));
+    delete engine.buildOutline;
+    await engine.showSheet(0);
+    (engine.setBandHidden as (axis: 'row' | 'col', index: number, hidden: boolean) => void)('row', 1, true);
+    (engine.setBandHidden as (axis: 'row' | 'col', index: number, hidden: boolean) => void)('col', 1, true);
+    (engine.setBandCollapsed as (axis: 'row' | 'col', index: number, collapsed: boolean) => void)('row', 2, true);
+    (engine.setBandCollapsed as (axis: 'row' | 'col', index: number, collapsed: boolean) => void)('col', 2, true);
+
+    await engine.showSheet(1);
+    await engine.showSheet(0);
+    const restored = engine.currentWorksheet as Worksheet;
+    expect(restored.rowHeights[1]).toBe(0);
+    expect(restored.colWidths[1]).toBe(0);
+    expect(restored.rows.find((row) => row.index === 2)?.collapsed).toBe(true);
+    expect(restored.colCollapsed?.[2]).toBe(true);
+    (engine.setBandHidden as (axis: 'row' | 'col', index: number, hidden: boolean) => void)('row', 1, false);
+    (engine.setBandHidden as (axis: 'row' | 'col', index: number, hidden: boolean) => void)('col', 1, false);
+    expect(restored.rowHeights[1]).toBe(31);
+    expect(restored.colWidths[1]).toBe(12);
+    viewer.destroy();
+  });
 });
