@@ -9,7 +9,7 @@ import {
   retainXlsxViewerFonts,
 } from './workbook.js';
 import type { LoadOptions } from './workbook.js';
-import type { Cell, Hyperlink, Row, ViewportRange, Worksheet, XlsxChromeColors, XlsxComment } from './types.js';
+import type { Cell, Row, ViewportRange, Worksheet, XlsxChromeColors, XlsxComment } from './types.js';
 import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
 import { nextVisibleIndex, resolveVisibleIndex, countVisible, zoomStepScale, anchoredZoomOffset, openExternalHyperlink, nextZoomStep, prevZoomStep, fitScale } from '@silurus/ooxml-core';
 import {
@@ -30,7 +30,6 @@ import {
 import { formatA1, parseA1 } from './a1.js';
 import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
 import { viewportPreviewBlocker, type ViewportPreviewBlocker } from './internal/worksheet-preview-eligibility.js';
-import { resolveXlsxInternalHyperlink } from './internal-hyperlink.js';
 import type {
   CellAddress,
   XlsxSelectionArea,
@@ -65,6 +64,7 @@ import { OutlineGutter } from './internal/viewer/outline-gutter.js';
 import { SheetTabBar } from './internal/viewer/sheet-tab-bar.js';
 import { ZoomControl } from './internal/viewer/zoom-control.js';
 import { ValidationPanel } from './internal/viewer/validation-panel.js';
+import { HyperlinkDispatcher } from './internal/viewer/hyperlink-dispatcher.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -765,11 +765,8 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   /** Excel-style hover note for the displayed sheet's comments. */
   private readonly comments: CommentPopup;
-  /** IX1 — `"row:col"` → hyperlink for the current sheet, rebuilt on every
-   *  showSheet. Keys mirror the renderer's `hyperlinkMap` (1-based row/col, the
-   *  first cell of a hyperlink `ref` range per the parser), so a `getCellAt`
-   *  {row,col} looks up directly. */
-  private hyperlinkMap = new Map<string, Hyperlink>();
+  /** IX1 — cell hyperlink index, enable gate and click dispatch. */
+  private readonly hyperlinks: HyperlinkDispatcher;
 
   /** List data-validation dropdown arrow and display-only value panel. */
   private readonly validation: ValidationPanel;
@@ -854,6 +851,17 @@ class XlsxViewerEngine implements ZoomableViewer {
       isDestroyed: () => this._destroyed,
       cellRect: (row, col) => this._cellRect(row, col),
       screenX: (x, w) => this.screenX(x, w),
+      reportError: (error) => this._reportRenderError(error),
+    });
+    this.hyperlinks = new HyperlinkDispatcher({
+      hostWindow: this.hostWindow,
+      enabled: () => this.opts.enableHyperlinks !== false,
+      onHyperlinkClick: () => this.opts.onHyperlinkClick,
+      currentSheet: () => this.currentSheet,
+      sheetNames: () => this.sheetNames,
+      definedNames: () => this.currentWorksheet?.definedNames ?? [],
+      goToSheet: (index) => this.goToSheet(index),
+      scrollToCell: (ref) => this.scrollToCell(ref),
       reportError: (error) => this._reportRenderError(error),
     });
     this.validation = new ValidationPanel({
@@ -2905,83 +2913,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     return unresolved;
   }
 
-  /** IX1 — index the current sheet's hyperlinks by `"row:col"` (1-based, first
-   *  cell of the `ref` range) so a clicked/hovered cell resolves in O(1). Keys
-   *  match the renderer's `hyperlinkMap` exactly (`${hl.row}:${hl.col}`). */
+  /** IX1 — index the displayed sheet's hyperlinks for hover and click. */
   private buildHyperlinkMap(ws: Worksheet): void {
-    this.hyperlinkMap = new Map();
-    for (const hl of ws.hyperlinks ?? []) {
-      this.hyperlinkMap.set(`${hl.row}:${hl.col}`, hl);
-    }
-  }
-
-  /** IX1 — the hyperlink at a cell, or null. `getCellAt` returns 1-based
-   *  {row,col}, matching the parser/renderer keying.
-   *
-   *  Returns null unconditionally when `enableHyperlinks` is `false`: this is the
-   *  single gate that disables hyperlink interactivity. Both consumers — the
-   *  pointermove pointer-cursor affordance and the click dispatch
-   *  ({@link dispatchHyperlink}) — funnel through this hit-test, so a null result
-   *  means no cursor change, no default navigation, and no `onHyperlinkClick`. */
-  private hyperlinkAtCell(cell: CellAddress): Hyperlink | null {
-    if (this.opts.enableHyperlinks === false) return null;
-    return this.hyperlinkMap.get(`${cell.row}:${cell.col}`) ?? null;
-  }
-
-  /**
-   * IX1 — dispatch a click on a hyperlinked cell. Builds a
-   * {@link HyperlinkTarget} from the parsed hyperlink (external `url` wins over
-   * internal `location`, matching Excel: a `<hyperlink>` carrying both navigates
-   * to the external target) and routes it to the caller's `onHyperlinkClick`
-   * (which fully owns behaviour) or the built-in default. Returns true when a
-   * hyperlink was found and dispatched.
-   */
-  private dispatchHyperlink(cell: CellAddress): boolean {
-    const hl = this.hyperlinkAtCell(cell);
-    if (!hl) return false;
-    let target: HyperlinkTarget;
-    if (hl.url) {
-      target = { kind: 'external', url: hl.url };
-    } else if (hl.location) {
-      target = { kind: 'internal', ref: hl.location };
-    } else {
-      return false; // parser only emits a hyperlink with url or location
-    }
-    const custom = this.opts.onHyperlinkClick;
-    if (custom) {
-      custom(target);
-      return true;
-    }
-    // Built-in default. External: open in a new tab, sanitised against the safe
-    // scheme allowlist (a blocked scheme like `javascript:` is a no-op, not a
-    // navigation). Internal: best-effort sheet navigation, below.
-    if (target.kind === 'external') {
-      openExternalHyperlink(target.url, undefined, this.hostWindow);
-    } else {
-      void this.navigateInternalHyperlink(target.ref).catch(
-        (error) => this._reportRenderError(error),
-      );
-    }
-    return true;
-  }
-
-  /**
-   * IX1 default handler for an internal `location` target (§18.3.1.47): resolve
-   * a direct cell/range or an in-scope defined name (§18.2.5), switch sheets when
-   * needed, then scroll the first referenced cell into view.
-   */
-  private async navigateInternalHyperlink(location: string): Promise<void> {
-    const target = resolveXlsxInternalHyperlink(
-      location,
-      this.currentSheet,
-      this.sheetNames,
-      this.currentWorksheet?.definedNames ?? [],
-    );
-    if (!target) return;
-    if (target.sheetIndex !== this.currentSheet) {
-      await this.goToSheet(target.sheetIndex);
-    }
-    await this.scrollToCell(target.cellRef);
+    this.hyperlinks.build(ws);
   }
 
   /** Hide the comment popup and cancel any pending show. */
@@ -3423,7 +3357,7 @@ class XlsxViewerEngine implements ZoomableViewer {
         // pointer is NOT over a resize border (that path returns above), so the
         // resize cursor is never clobbered. Otherwise clear back to default.
         this.scrollHost.style.cursor =
-          hovered && this.hyperlinkAtCell(hovered) ? 'pointer' : '';
+          hovered && this.hyperlinks.at(hovered) ? 'pointer' : '';
       }
 
       if (!this.isSelecting || e.pointerId !== this.selectionPointerId) return;
@@ -3488,7 +3422,7 @@ class XlsxViewerEngine implements ZoomableViewer {
             }
           }
           // IX1 — a touch/pen tap on a hyperlinked cell activates it.
-          if (this.activeCell) this.dispatchHyperlink(this.activeCell);
+          if (this.activeCell) this.hyperlinks.dispatch(this.activeCell);
         }
         this.pendingTap = null;
       }
@@ -3506,7 +3440,7 @@ class XlsxViewerEngine implements ZoomableViewer {
           upCell.row === this.pendingClick.cell.row &&
           upCell.col === this.pendingClick.cell.col
         ) {
-          this.dispatchHyperlink(this.pendingClick.cell);
+          this.hyperlinks.dispatch(this.pendingClick.cell);
         }
         this.pendingClick = null;
       }
@@ -4061,7 +3995,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.viewEdits.destroy();
     this.currentSourceComments = [];
     this.sourceCommentMap.clear();
-    this.hyperlinkMap.clear();
+    this.hyperlinks.destroy();
     this.preparedWorkbook = null;
     this.outlineGutter.destroy();
     this.elementContext = null;
