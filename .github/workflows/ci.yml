@@ -278,6 +278,7 @@ jobs:
           # compatibility has its own clean-build job; avoiding a second
           # rolldown-plugin-dts invocation also keeps this browser job focused.
           pnpm build:runtime
+          pnpm check:model-source-lazy-graph
           pnpm check:production-render-workers
           pnpm test:production-render-workers
 
