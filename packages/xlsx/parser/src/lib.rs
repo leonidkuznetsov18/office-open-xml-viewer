@@ -532,6 +532,16 @@ fn parse_sheet_with(
     sheet_index: u32,
     name: &str,
 ) -> Result<Vec<u8>, String> {
+    let (worksheet, part) = parse_sheet_model_with(archive, shared, sheet_index, name)?;
+    serialize_worksheet_bounded(archive, &part, &worksheet)
+}
+
+fn parse_sheet_model_with(
+    archive: &mut XlsxZip,
+    shared: &WorkbookShared,
+    sheet_index: u32,
+    name: &str,
+) -> Result<(Worksheet, String), String> {
     // `workbook.xml.rels` is mandatory for a sheet parse (the original
     // the historical worksheet path read it with `?`). `WorkbookShared` caches it leniently for
     // the `parse_xlsx` path, so on the (defensive) missing-rels case re-read it
@@ -574,7 +584,7 @@ fn parse_sheet_with(
         Ok(parsed) => parsed,
         Err(detail) => {
             let ws = Worksheet::placeholder(name, format!("{sheet_part}: {detail}"));
-            return serialize_worksheet_bounded(archive, &sheet_part, &ws);
+            return Ok((ws, sheet_part));
         }
     };
     // Dialog sheets are legacy form definitions, not worksheet grids. Their
@@ -582,7 +592,7 @@ fn parse_sheet_with(
     // so do not spend bounded package resources materializing content the
     // renderer intentionally replaces with an informational surface.
     if sheet_part_kind == SheetPartKind::DialogSheet {
-        return serialize_worksheet_bounded(archive, &sheet_part, &parsed.0);
+        return Ok((parsed.0, sheet_part));
     }
     let worksheet = finalize_projected_sheet(
         archive,
@@ -593,7 +603,7 @@ fn parse_sheet_with(
         parsed,
         CurrentSheetLookup::BuildFromMaterializedRows,
     )?;
-    serialize_worksheet_bounded(archive, &sheet_part, &worksheet)
+    Ok((worksheet, sheet_part))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3401,8 +3411,13 @@ pub(crate) fn resolve_implicit_ordinal(
 /// Returns workbook overview (sheet names and metadata) as JSON.
 /// Native equivalent of `parse_xlsx` for use from the MCP server.
 pub fn parse_workbook_native(data: &[u8]) -> Result<String, String> {
-    parse_xlsx_inner(data)
-        .and_then(|wb| serde_json::to_string(&wb.workbook).map_err(|e| e.to_string()))
+    parse_workbook_model_native(data)
+        .and_then(|wb| serde_json::to_string(&wb).map_err(|e| e.to_string()))
+}
+
+/// Native typed workbook overview through the same parse and resource limits.
+pub fn parse_workbook_model_native(data: &[u8]) -> Result<xlsx_model::Workbook, String> {
+    parse_xlsx_inner(data).map(|parsed| parsed.workbook)
 }
 
 /// Parse the workbook and project every sheet to GitHub-flavoured markdown:
@@ -4047,6 +4062,22 @@ pub fn parse_sheet_native(data: &[u8], sheet_index: u32, name: &str) -> Result<S
         let shared = WorkbookShared::load(archive)?;
         let json = parse_sheet_with(archive, &shared, sheet_index, name)?;
         String::from_utf8(json).map_err(|error| error.to_string())
+    })
+}
+
+/// Native typed worksheet through the same parse operation and bounded JSON
+/// projection check as `parse_sheet_native`.
+pub fn parse_sheet_model_native(
+    data: &[u8],
+    sheet_index: u32,
+    name: &str,
+) -> Result<xlsx_model::Worksheet, String> {
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    archive.run_operation("parse-sheet", |archive| {
+        let shared = WorkbookShared::load(archive)?;
+        let (worksheet, part) = parse_sheet_model_with(archive, &shared, sheet_index, name)?;
+        serialize_worksheet_bounded(archive, &part, &worksheet)?;
+        Ok(worksheet)
     })
 }
 

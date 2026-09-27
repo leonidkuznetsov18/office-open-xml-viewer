@@ -112,9 +112,6 @@ test.describe('visual regression', () => {
           throw new Error(`Fixture error on ${name} slide ${slideNum}: ${msg}`);
         }
 
-        // Give the browser one extra frame to flush composite layers
-        await page.waitForTimeout(200);
-
         // ── Capture the canvas via toDataURL ──────────────────────────────
         const dataUrl = await page.evaluate(() => {
           const canvas = document.querySelector('canvas') as HTMLCanvasElement;
@@ -267,7 +264,6 @@ test.describe('private corpus self regression', () => {
           const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
           throw new Error(`${stem} slide ${slideIndex + 1}: ${message}`);
         }
-        await page.waitForTimeout(200);
       };
 
       await openSlide(0);
@@ -282,7 +278,6 @@ test.describe('private corpus self regression', () => {
             }).renderPptxVrtSlide;
             await render(index);
           }, slideIndex);
-          await page.waitForTimeout(200);
         }
         const dataUrl = await page.evaluate(() =>
           (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
