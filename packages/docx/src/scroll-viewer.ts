@@ -22,6 +22,7 @@ import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-con
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
 import { DEFAULT_SCROLL_PAGE_SHADOW, ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
 import { VisibleUnitEvents } from '@silurus/ooxml-core/internal/visible-unit-events';
+import { ScrollLoadController } from '@silurus/ooxml-core/internal/scroll-load-controller';
 import { DEFAULT_ZOOM_SETTLE_MS, SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -313,6 +314,75 @@ export class DocxScrollViewer implements ZoomableViewer {
   private readonly _visibleEvents = new VisibleUnitEvents(
     (index, total, complete) => this._opts.onVisiblePageChange?.(index, total, complete),
   );
+  private readonly _loader = new ScrollLoadController<DocxDocument>({
+    name: () => 'DocxScrollViewer',
+    borrowed: () => this._borrowed,
+    borrowedMessage: () => 'DocxScrollViewer.load() is unsupported on a Viewer created by fromDocument(); ' +
+      'the borrowed document is already loaded.',
+    destroyed: () => this._destroyed,
+    owner: () => this._documentOwner,
+    acquire: (source) => DocxDocument.load(source, {
+      password: this._opts.password,
+      useGoogleFonts: this._opts.useGoogleFonts,
+      cjkFallback: this._opts.cjkFallback,
+      maxZipEntryBytes: this._opts.maxZipEntryBytes,
+      resourceLimits: this._opts.resourceLimits,
+      debug: this._opts.debug,
+      onResourceMetrics: this._opts.onResourceMetrics,
+      workerTimeoutMs: this._opts.workerTimeoutMs,
+      wasmUrl: this._opts.wasmUrl,
+      math: this._opts.math,
+      threeD: this._opts.threeD,
+      regionMap: this._opts.regionMap,
+      chartEx: this._opts.chartEx,
+      tiff: this._opts.tiff,
+      mode: this._mode,
+      // The first paint must use the selected layout variant. A document with
+      // model sources can instead supply its own view default.
+      ...(this._opts.modelSources === undefined
+        ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
+        : (this._requestedShowTrackedChanges === undefined
+          ? undefined : { showTrackedChanges: this._requestedShowTrackedChanges })),
+      ...(this._currentDate === undefined ? {} : { currentDate: this._currentDate }),
+      ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
+      ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
+      ...(this._opts.sliceLayout ? { sliceLayout: true } : {}),
+      onLayoutProgress: this._opts.onLayoutProgress,
+      onLayoutPartial: this._opts.onLayoutPartial,
+      onLayoutComplete: this._opts.onLayoutComplete,
+    }),
+    beforeReplace: (previous) => {
+      this._selection.invalidateElementContext(false);
+      this._findRequestGeneration++;
+      this._find.invalidate();
+      this._findActive = false;
+      this._activeCommentId = null;
+      this._activeCommentPage = null;
+      this._commentNavigation.reset();
+      this._unbindLayoutDocument();
+      if (previous) {
+        for (const [index, slot] of [...this._slots]) this._recycleSlot(index, slot);
+        this._visibleEvents.reset();
+      }
+    },
+    afterReplace: (doc) => {
+      if (this._opts.modelSources !== undefined) {
+        this._showTrackedChanges = activeDocxLayoutViewOf(doc).showTrackedChanges;
+      }
+      this._bindLayoutDocument(doc);
+      this._find.invalidate();
+      this._findActive = false;
+      this._activeCommentId = null;
+      this._activeCommentPage = null;
+      this._commentNavigation.reset();
+    },
+    mountOpeningWindow: async () => {
+      const initialRenders: Promise<void>[] = [];
+      this._relayout(initialRenders);
+      await Promise.all(initialRenders);
+    },
+    selectionChanged: () => this._selection.emitChange(),
+  });
   private _layoutUnsubscribe: (() => void) | null = null;
   /** Page prefix currently represented by the native scroll extent. */
   private _presentedPageCount = 0;
@@ -540,106 +610,8 @@ export class DocxScrollViewer implements ZoomableViewer {
     }
   }
 
-  /**
-   * Load a DOCX from URL or ArrayBuffer and render the first window.
-   * Unsupported on a Viewer created by {@link fromDocument}; the caller already
-   * owns the parsed engine.
-   */
   async load(source: string | ArrayBuffer): Promise<void> {
-    if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
-    if (this._borrowed) {
-      throw new Error(
-        'DocxScrollViewer.load() is unsupported on a Viewer created by fromDocument(); ' +
-          'the borrowed document is already loaded.',
-      );
-    }
-    // SC20 atomic swap: a self-loaded viewer OWNS its engine, so a re-load must
-    // not orphan the previous one.
-    // Retain it locally and free it only after the new engine loads — a FAILED
-    // re-load then keeps the current document rendered rather than going blank.
-    // (The borrowed path returned above can never reach here, so this only ever
-    // frees an engine we created.)
-    let elementInvalidated = false;
-    try {
-      const doc = await this._documentOwner.replace(() => DocxDocument.load(source, {
-        password: this._opts.password,
-        useGoogleFonts: this._opts.useGoogleFonts,
-        cjkFallback: this._opts.cjkFallback,
-        maxZipEntryBytes: this._opts.maxZipEntryBytes,
-        resourceLimits: this._opts.resourceLimits,
-        debug: this._opts.debug,
-        onResourceMetrics: this._opts.onResourceMetrics,
-        workerTimeoutMs: this._opts.workerTimeoutMs,
-        wasmUrl: this._opts.wasmUrl,
-        math: this._opts.math,
-        threeD: this._opts.threeD,
-        regionMap: this._opts.regionMap,
-        chartEx: this._opts.chartEx,
-        tiff: this._opts.tiff,
-        mode: this._mode,
-        // The variant the viewer will render. Without these, load builds the
-        // final view while every render asks for the markup view, and the first
-        // paint pays a full synchronous repagination.
-        // An explicit choice (including `false`) is forwarded; otherwise the
-        // document's own view default applies.
-        ...(this._opts.modelSources === undefined
-          ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
-          : (this._requestedShowTrackedChanges === undefined
-            ? undefined
-            : { showTrackedChanges: this._requestedShowTrackedChanges })),
-        ...(this._currentDate === undefined
-          ? {}
-          : { currentDate: this._currentDate }),
-        ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
-        ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
-        ...(this._opts.sliceLayout ? { sliceLayout: true } : {}),
-        onLayoutProgress: this._opts.onLayoutProgress,
-        onLayoutPartial: this._opts.onLayoutPartial,
-        onLayoutComplete: this._opts.onLayoutComplete,
-      }), (ownedDocument) => {
-        this._selection.invalidateElementContext(false);
-        elementInvalidated = true;
-        this._findRequestGeneration++;
-        this._find.invalidate();
-        this._findActive = false;
-        this._activeCommentId = null;
-        this._activeCommentPage = null;
-        this._commentNavigation.reset();
-        this._unbindLayoutDocument();
-        if (ownedDocument) {
-          // Recycle before the old worker is terminated. Every captured slot
-          // dispatcher then becomes stale before its expected rejection lands.
-          for (const [idx, slot] of [...this._slots]) this._recycleSlot(idx, slot);
-          this._visibleEvents.reset();
-        }
-      });
-      if (!doc) return;
-      if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
-      // The loaded document's active view is authoritative (it may come from
-      // the document's own view default).
-      if (this._opts.modelSources !== undefined) {
-        this._showTrackedChanges = activeDocxLayoutViewOf(doc).showTrackedChanges;
-      }
-      this._bindLayoutDocument(doc);
-      this._find.invalidate();
-      this._findActive = false;
-      this._activeCommentId = null;
-      this._activeCommentPage = null;
-      this._commentNavigation.reset();
-      // Lay out + mount the first window now that the engine exists (mirrors the
-      // borrowed-engine path in the constructor). relayout() is idempotent and
-      // defers under a zero-width container — `_onResize` re-runs it once width
-      // appears.
-      const initialRenders: Promise<void>[] = [];
-      this._relayout(initialRenders);
-      await Promise.all(initialRenders);
-    } catch (err) {
-      // Superseded loads own no error reporting — the winning load (or destroy())
-      // is the outcome the caller awaits; swallow this stale rejection.
-      if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
-      throw err instanceof Error ? err : new Error(String(err));
-    }
-    if (elementInvalidated && !this._destroyed) this._selection.emitChange();
+    await this._loader.load(source);
   }
 
   get pageCount(): number {

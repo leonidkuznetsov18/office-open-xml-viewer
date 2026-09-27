@@ -63,6 +63,7 @@
     "./internal/scroll-navigation-controller": "./src/viewer/scroll-navigation-controller.ts",
     "./internal/scroll-viewport-policy": "./src/viewer/scroll-viewport-policy.ts",
     "./internal/visible-unit-events": "./src/viewer/visible-unit-events.ts",
+    "./internal/scroll-load-controller": "./src/viewer/scroll-load-controller.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"
