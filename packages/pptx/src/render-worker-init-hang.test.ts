@@ -153,7 +153,6 @@ describe('pptx render-worker.ts — init failure never hangs a request (AR4)', (
     const archive = new FakePptxArchive(new Uint8Array());
     openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close: vi.fn() });
     const fake = await loadRenderWorker();
-    fake.onmessage?.({ data: { kind: 'init', wasmUrl: 'x' } } as MessageEvent);
     fake.onmessage?.({ data: {
       kind: 'parse', id: 40, buffer: new ArrayBuffer(4), resourcePolicy,
       source: modelSource,

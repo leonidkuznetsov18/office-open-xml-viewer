@@ -123,6 +123,16 @@ describe('XlsxWorkbook.load with model sources', () => {
     workbook.destroy();
   });
 
+  it('terminates an opened worker when release throws after a successful parse', async () => {
+    install(parseWorkerScript());
+    const failure = new Error('release failed');
+    const { source, release } = fakeSource();
+    release.mockImplementation(() => { throw failure; });
+    await expect(XlsxWorkbook.load(cfbBytes(), { modelSources: [source] })).rejects.toBe(failure);
+    expect(release).toHaveBeenCalledOnce();
+    expect(ProtocolWorker.instances[0]!.terminated).toBe(true);
+  });
+
   it('keeps unclaimed input on the OOXML path and releases a failed load once', async () => {
     install(() => undefined);
     const unclaimed = fakeSource(false);

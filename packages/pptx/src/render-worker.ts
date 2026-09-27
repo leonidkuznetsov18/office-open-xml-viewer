@@ -11,6 +11,7 @@ import { PptxSlideRepository } from './slide-repository';
 import { loadPptxSlideFromCursor, readPptxSlideCursorUsage } from './slide-cursor-operation';
 import { SlidePullWorker } from './slide-pull-worker';
 import {
+  copyModelSourceBytes,
   preloadGoogleFonts,
   loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
@@ -44,21 +45,26 @@ import type {
 import { findPptxElementBoundsByIds, hitTestPptxSlideContext } from './element-selection';
 import { excludeEmbeddedFontFamilies, loadEmbeddedFonts, uncoveredOfficeFontRequests } from './embedded-fonts';
 import { ProgressivePreflightGate } from './progressive-preflight-gate';
-import { WorkerPresentationSourceOwner } from './internal/worker-presentation-source';
+import type { WorkerPresentationSourceOwner, WorkerCursorArchive } from './internal/worker-presentation-source';
 
 const host = new WasmParserHost<PptxArchive>(init, {
   freeArchive: (archive) => archive.free(),
   reinit,
 });
-const source = new WorkerPresentationSourceOwner(host);
-let ooxmlWasmInput: Parameters<typeof host.setWasmInput>[0] | undefined;
+let source: WorkerPresentationSourceOwner<PptxArchive> | undefined;
 
-const executeArchive = source.execute.bind(source);
+function executeArchive<T>(operation: (archive: WorkerCursorArchive) => T): T {
+  if (source) return source.execute(operation);
+  const archive = host.archive;
+  if (!archive) throw new Error('Presentation not loaded');
+  return host.run(() => operation(archive));
+}
 
 const slidePull = new SlidePullWorker(
-  () => source.cursor(),
+  () => source?.cursor() ?? host.archive,
   undefined,
   (operation) => executeArchive(operation),
+  () => source !== undefined,
 );
 
 let preflight: PresentationPreflight | null = null;
@@ -158,7 +164,7 @@ function loadSlide(slideIndex: number) {
 function getMedia(path: string): Promise<Blob> {
   const mimeType = findPreflightMimeType(requirePreflight(), path);
   return rawParts.get(path, mimeType, () => slidePull.run(() => {
-    const bytes = source.extractMedia(path);
+    const bytes = source ? source.extractMedia(path) : host.run(() => host.archive!.extract_media(path));
     return new Blob([bytes as BlobPart], { type: mimeType });
   }));
 }
@@ -172,7 +178,7 @@ function getImage(path: string, mimeType: string): Promise<Blob> {
 
 function getFontBytes(path: string): Promise<Uint8Array> {
   return slidePull.run(() => {
-    const bytes = source.extractFont(path);
+    const bytes = source ? source.extractFont(path) : host.run(() => host.archive!.extract_font(path));
     return new Uint8Array(bytes as Uint8Array);
   });
 }
@@ -294,18 +300,20 @@ async function waitForSlideAvailability(slideIndex: number): Promise<void> {
   }
 }
 
-async function executeArchiveFromNew(
+function executeArchiveFromNew(
   request: Extract<RenderWorkerRequest, { kind: 'parse' }>,
-): Promise<PresentationBootstrap> {
+): PresentationBootstrap | Promise<PresentationBootstrap> {
   if (request.source) {
-    await source.openModelSource(new Uint8Array(request.buffer), request.source, request.sourceTransfer);
-    return JSON.parse(new TextDecoder().decode(
-      source.execute((archive) => archive.presentation_bootstrap()),
-    )) as PresentationBootstrap;
+    const descriptor = request.source;
+    return (async () => {
+      const { WorkerPresentationSourceOwner } = await import('./internal/worker-presentation-source');
+      source = new WorkerPresentationSourceOwner(host);
+      await source.openModelSource(new Uint8Array(request.buffer), descriptor, request.sourceTransfer);
+      return JSON.parse(new TextDecoder().decode(
+        source.execute((archive) => archive.presentation_bootstrap()),
+      )) as PresentationBootstrap;
+    })();
   }
-  if (ooxmlWasmInput === undefined) throw new Error('PPTX WASM input was not configured');
-  host.setWasmInput(ooxmlWasmInput);
-  await host.ensureReady();
   const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(request.resourcePolicy);
   return host.run(() => {
     const archive = new PptxArchive(
@@ -323,7 +331,7 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
     return;
   }
   if (request.kind === 'init') {
-    ooxmlWasmInput = decodeDataUrl(request.wasmUrl) ?? request.wasmUrl;
+    host.setWasmInput(decodeDataUrl(request.wasmUrl) ?? request.wasmUrl);
     return;
   }
   if (request.kind === 'continuePresentationPreflight') {
@@ -337,6 +345,7 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
       reservePresentationParse();
       ownsParseReservation = true;
     }
+    if (request.kind === 'parse' ? !request.source : !source) await host.ensureReady();
     if (request.kind === 'parse') {
       const compact = await openPresentation(request);
       post({
@@ -459,26 +468,29 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
       return;
     }
     if (request.kind === 'extractFont') {
-      const bytes = (await getFontBytes(request.path)).buffer as ArrayBuffer;
+      const font = await getFontBytes(request.path);
+      const bytes = source
+        ? copyModelSourceBytes(font)
+        : font.buffer as ArrayBuffer;
       post({ kind: 'fontExtracted', id: request.id, bytes }, [bytes]);
       return;
     }
     if (request.kind === 'resourceUsage') {
-      const bytes = source.resourceUsage();
+      const bytes = source ? source.resourceUsage() : host.run(() => host.archive?.resource_usage());
       const usage = bytes === undefined ? undefined : decodeOoxmlResourceUsage(bytes);
       post({ kind: 'resourceUsage', id: request.id, usage });
       return;
     }
 
     if (request.kind === 'toMarkdown') {
-      const markdown = await slidePull.run(() => source.toMarkdown());
+      const markdown = await slidePull.run(() => source ? source.toMarkdown() : host.run(() => host.archive!.to_markdown()));
       post({ kind: 'markdownRendered', id: request.id, markdown });
     }
   } catch (error) {
     if (ownsParseReservation) {
       presentationState = 'failed';
       wakeSlideAvailabilityWaiters();
-      try { source.closeModelSource(); } catch {}
+      try { source?.closeModelSource(); } catch {}
     }
     if (ownsParseReservation) {
       progressivePreflightGate.reset();

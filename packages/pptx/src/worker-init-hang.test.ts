@@ -125,12 +125,36 @@ afterEach(() => {
 });
 
 describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
+  it('transfers only source-returned image, media and font subarray bytes', async () => {
+    const bytes = (middle: number) => new Uint8Array([91, middle, 92]).subarray(1, 2);
+    const archive = {
+      ...sourceArchive(),
+      extract_image: vi.fn(() => bytes(1)),
+      extract_media: vi.fn(() => bytes(2)),
+      extract_font: vi.fn(() => bytes(3)),
+    };
+    openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close: vi.fn() });
+    const fake = await loadWorker();
+    fake.onmessage?.({ data: {
+      kind: 'parse', id: 40, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource,
+    } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationOpened', id: 40 })));
+    for (const [kind, response, id, expected] of [
+      ['extractImage', 'imageExtracted', 41, 1],
+      ['extractMedia', 'mediaExtracted', 42, 2],
+      ['extractFont', 'fontExtracted', 43, 3],
+    ] as const) {
+      fake.onmessage?.({ data: { kind, id, path: 'part' } } as MessageEvent);
+      await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: response, id })));
+      const posted = fake.posted.find((item) => (item as { id?: number }).id === id) as { bytes: ArrayBuffer };
+      expect(Array.from(new Uint8Array(posted.bytes))).toEqual([expected]);
+    }
+  });
   it('opens a model-source cursor without initializing OOXML WASM and closes it on a trap', async () => {
     const archive = sourceArchive();
     const close = vi.fn();
     openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close });
     const fake = await loadWorker();
-    fake.onmessage?.({ data: { kind: 'init', wasmUrl: 'x' } } as MessageEvent);
     fake.onmessage?.({ data: {
       kind: 'parse', id: 30, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource,
     } } as MessageEvent);

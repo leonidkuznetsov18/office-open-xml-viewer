@@ -98,9 +98,13 @@ export async function openDocxDocument(
 ): Promise<DocxDocumentSession> {
   if (!options?.factory) throw new TypeError('openDocxDocument requires a canvas factory');
   const cjkFallback = resolveCjkFallback(options.cjkFallback);
-  const { acquired, viewDefaults } = await acquireDocxInput(
-    buffer,
-    options,
+  const sourceInput = options.modelSources === undefined ? undefined : await acquireDocxInput(
+    buffer, options,
+    (transport, identity, pullOptions) =>
+      materializeDocumentPullLayoutSession(transport, identity, pullOptions),
+  );
+  const acquired = sourceInput?.acquired ?? await acquireDocxNodeDocument(
+    toUint8(buffer), getDocxWasmModule(), options,
     (transport, identity, pullOptions) =>
       materializeDocumentPullLayoutSession(transport, identity, pullOptions),
   );
@@ -119,7 +123,7 @@ export async function openDocxDocument(
     );
     // Node sessions offer no view option, so a model source's own view default
     // (else the renderer default, the final view) selects the paginated view.
-    const showTrackedChanges = viewDefaults.showTrackedChanges === true;
+    const showTrackedChanges = sourceInput?.viewDefaults.showTrackedChanges === true;
     const layout = showTrackedChanges
       ? retained.layoutVariants.layoutFor(
         normalizeLayoutOptions(defaultCurrentDateMs, defaultCurrentDateMs, true),
@@ -161,9 +165,13 @@ export async function materializeDocxDocument(
 ): Promise<DocxDocumentModel> {
   return usingOwnedSession(
     async () => {
-      const { acquired } = await acquireDocxInput(
-        buffer,
-        options,
+      const sourceInput = options.modelSources === undefined ? undefined : await acquireDocxInput(
+        buffer, options,
+        (transport, identity, pullOptions) =>
+          materializeDocumentPullSession(transport, identity, pullOptions),
+      );
+      const acquired = sourceInput?.acquired ?? await acquireDocxNodeDocument(
+        toUint8(buffer), getDocxWasmModule(), options,
         (transport, identity, pullOptions) =>
           materializeDocumentPullSession(transport, identity, pullOptions),
       );
@@ -415,4 +423,8 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   const error = new Error('DOCX document session was aborted');
   error.name = 'AbortError';
   throw error;
+}
+
+function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
+  return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }

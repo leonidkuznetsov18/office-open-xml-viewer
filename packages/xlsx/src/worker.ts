@@ -1,5 +1,6 @@
 import init, { XlsxArchive, reinit } from './wasm/xlsx_parser.js';
 import {
+  copyModelSourceBytes,
   decodeDataUrl,
   WasmParserHost,
 } from '@silurus/ooxml-core';
@@ -12,7 +13,7 @@ import {
 import type { WorkerRequest, WorkerResponse } from './types.js';
 import { readXlsxArchiveBootstrap } from './internal/archive-bootstrap.js';
 import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-worker.js';
-import { WorkerWorksheetSourceOwner } from './internal/worker-worksheet-source.js';
+import type { WorkerWorksheetSourceOwner } from './internal/worker-worksheet-source.js';
 import { isHostLayoutResult, requestHostLayoutFromPage } from './internal/host-layout.js';
 
 // RB6: a `panic = "abort"` build traps (not unwinds) on a Rust panic / OOM /
@@ -37,14 +38,18 @@ const host = new WasmParserHost<XlsxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
-const source = new WorkerWorksheetSourceOwner(host);
-let ooxmlWasmInput: Parameters<typeof host.setWasmInput>[0] | undefined;
+let source: WorkerWorksheetSourceOwner<XlsxArchive> | undefined;
 const worksheetPull = new WorksheetPullWorker(
-  () => source.cursor(),
+  () => source?.cursor() ?? host.archive,
   undefined,
   (operation) => {
-    return source.execute(operation);
+    if (source) return source.execute(operation);
+    const archive = host.archive;
+    if (!archive) throw new Error('Workbook not loaded');
+    return host.run(() => operation(archive));
   },
+  undefined,
+  () => source !== undefined,
 );
 
 self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<number>>) => {
@@ -62,7 +67,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   }
 
   if (req.type === 'init') {
-    ooxmlWasmInput = decodeDataUrl(req.wasmUrl) ?? req.wasmUrl;
+    host.setWasmInput(decodeDataUrl(req.wasmUrl) ?? req.wasmUrl);
     return;
   }
 
@@ -72,8 +77,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   if (req.type === 'openSheetSession') worksheetPull.reserveOpen(req);
   try {
     if (req.type === 'openSheetSession') {
-      if (source.kind === 'ooxml') await host.ensureReady();
-      if (source.cursor()) source.execute((archive) => archive.assert_healthy());
+      if (!source) await host.ensureReady();
+      if (source?.cursor()) source.execute((archive) => archive.assert_healthy());
+      else if (host.archive) host.run(() => host.archive?.assert_healthy());
       await worksheetPull.open(req.sheetIndex, req.sheetName, req);
       await worksheetPull.postOpenedSafely(
         req,
@@ -94,14 +100,18 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
     }
     if (req.type === 'parse') await worksheetPull.reset();
     await worksheetPull.run(async () => {
-    if (req.type !== 'parse' && source.kind === 'ooxml') await host.ensureReady();
-    if (req.type !== 'parse' && source.cursor()) {
-      source.execute((archive) => archive.assert_healthy());
+    if (req.type === 'parse' ? !req.source : !source) await host.ensureReady();
+    if (req.type !== 'parse' && (source?.cursor() ?? host.archive)) {
+      if (source) source.execute((archive) => archive.assert_healthy());
+      else host.run(() => host.archive?.assert_healthy());
     }
     if (req.type === 'parse') {
-      source.closeModelSource();
+      source?.closeModelSource();
+      source = undefined;
       if (req.source) {
         host.disposeArchive();
+        const { WorkerWorksheetSourceOwner } = await import('./internal/worker-worksheet-source.js');
+        source = new WorkerWorksheetSourceOwner(host);
         // The renderer lives on the page in this mode, so the page measures.
         await source.openModelSource(
           new Uint8Array(req.data),
@@ -110,9 +120,6 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
           req.sourceTransfer,
         );
       } else {
-        if (ooxmlWasmInput === undefined) throw new Error('XLSX WASM input was not configured');
-        host.setWasmInput(ooxmlWasmInput);
-        await host.ensureReady();
         const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
         const bytes = new Uint8Array(req.data);
         host.run(() => {
@@ -129,11 +136,17 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // buffer, so forward it to main as a transferable — no clone, no decode
       // here. The single decode + JSON.parse happens on main.
       const { workbook: json, usage } = readXlsxArchiveBootstrap(
-        () => source.execute((current) => current.parse()),
-        () => source.resourceUsage(),
+        () => source
+          ? source.execute((current) => current.parse())
+          : host.run(() => host.archive!.parse()),
+        () => source
+          ? source.resourceUsage()
+          : host.run(() => host.archive!.resource_usage()),
       );
-      const workbookJson = json.buffer as ArrayBuffer;
-      const maximumDigitWidth = source.maximumDigitWidth;
+      const workbookJson = source
+        ? copyModelSourceBytes(json)
+        : json.buffer as ArrayBuffer;
+      const maximumDigitWidth = source?.maximumDigitWidth;
       const res: WorkerResponse = {
         type: 'parsed', id, workbookJson, usage,
         ...(maximumDigitWidth === undefined ? {} : { layoutMetrics: { maximumDigitWidth } }),
@@ -144,7 +157,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       return;
     }
 
-    const archive = source.cursor();
+    const archive = source?.cursor() ?? host.archive;
 
     if (req.type === 'extractImage') {
       if (!archive) throw new Error('No xlsx loaded');
@@ -153,7 +166,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // so `.buffer` is a full-span, non-WASM-backed ArrayBuffer we own outright —
       // transfer it directly. A second `new Uint8Array(bytes).slice()` would just
       // re-copy the whole entry for nothing.
-      const out = source.execute((current) => current.extract_image(req.path).buffer as ArrayBuffer);
+      const out = source
+        ? source.execute((current) => copyModelSourceBytes(current.extract_image(req.path)))
+        : host.run(() => archive.extract_image(req.path).buffer as ArrayBuffer);
       const res: WorkerResponse = { type: 'imageExtracted', id, bytes: out };
       (self.postMessage as (message: unknown, transfer: Transferable[]) => void)(res, [out]);
       return;
@@ -161,7 +176,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
 
     if (req.type === 'resourceUsage') {
       if (!archive) throw new Error('No xlsx loaded');
-      const bytes = source.resourceUsage();
+      const bytes = source ? source.resourceUsage() : host.run(() => host.archive!.resource_usage());
       const usage = bytes === undefined ? undefined : decodeOoxmlResourceUsage(bytes);
       self.postMessage({ type: 'resourceUsage', id, usage } satisfies WorkerResponse);
       return;
@@ -172,7 +187,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // Project the already-opened handle to markdown (no re-copy of the file,
       // no re-scan of the central directory). A plain string has no transferable
       // backing, so it is posted by structured clone like any other value.
-      const markdown = source.toMarkdown();
+      const markdown = source ? source.toMarkdown() : host.run(() => host.archive!.to_markdown());
       const res: WorkerResponse = { type: 'markdownRendered', id, markdown };
       self.postMessage(res);
       return;
@@ -181,7 +196,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   } catch (err) {
     if (req.type === 'openSheetSession') worksheetPull.abandonOpen(req.sessionId);
     if (req.type === 'parse') {
-      try { source.closeModelSource(); } catch {}
+      try { source?.closeModelSource(); } catch {}
     }
     const res: WorkerResponse = { type: 'error', id, ...serializeWorkerError(err) };
     try {

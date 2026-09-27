@@ -45,6 +45,7 @@ const source: ModelSourceModuleDescriptor = {
 describe('DOCX parse worker with a model source', () => {
   it('streams source units without the OOXML runtime, supersedes cleanly, fails closed and keeps OOXML working', async () => {
     const first = new CursorArchive();
+    first.extract_image.mockReturnValue(new Uint8Array([90, 9, 91]).subarray(1, 2));
     const second = new CursorArchive();
     const third = new CursorArchive();
     const broken = new CursorArchive();
@@ -71,7 +72,6 @@ describe('DOCX parse worker with a model source', () => {
     } as MessageEvent);
     const response = (id: number) => harness.posts.find((message) => (message as { id?: number }).id === id);
 
-    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/docx.wasm' } } as MessageEvent);
     await parse(1);
     expect(state.ensureReady).not.toHaveBeenCalled();
     expect(state.setWasmInput).not.toHaveBeenCalled();
@@ -88,6 +88,7 @@ describe('DOCX parse worker with a model source', () => {
     await dispatch({ data: { type: 'extractImage', id: 2, path: 'media/1' } } as MessageEvent);
     expect(first.extract_image).toHaveBeenCalledWith('media/1');
     expect(response(2)).toMatchObject({ type: 'imageExtracted' });
+    expect(Array.from(new Uint8Array((response(2) as { bytes: ArrayBuffer }).bytes))).toEqual([9]);
     await dispatch({ data: { type: 'resourceUsage', id: 3 } } as MessageEvent);
     await dispatch({ data: { type: 'toMarkdown', id: 4 } } as MessageEvent);
     expect(response(3)).toEqual({ type: 'resourceUsage', id: 3, usage: undefined });
@@ -120,6 +121,7 @@ describe('DOCX parse worker with a model source', () => {
     expect(state.ooxmlConstruct).not.toHaveBeenCalled();
 
     // Without a source the ordinary OOXML path initializes and answers without viewDefaults.
+    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/docx.wasm' } } as MessageEvent);
     await parse(10, {});
     expect(state.setWasmInput).toHaveBeenCalledOnce();
     expect(state.ensureReady).toHaveBeenCalledOnce();

@@ -11,6 +11,9 @@ importers:
       '@ast-grep/cli':
         specifier: ^0.43.0
         version: 0.43.0
+      '@babel/parser':
+        specifier: 7.29.2
+        version: 7.29.2
       '@chromatic-com/storybook':
         specifier: ^5.1.2
         version: 5.1.2(storybook@10.3.5(@testing-library/dom@10.4.1)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))

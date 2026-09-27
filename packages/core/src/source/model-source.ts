@@ -98,6 +98,7 @@ const MAX_URL_LENGTH = 8192;
 const MAX_CONFIG_ENTRIES = 32;
 const MAX_CONFIG_STRING_LENGTH = 8192;
 const MAX_VIEW_DEFAULT_ENTRIES = 16;
+const MAX_TRANSFER_ITEMS = 32;
 const CONFIG_KEY = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 
 /**
@@ -173,6 +174,22 @@ export function beginModelSourceLoad(
     if (!Array.isArray(transfer)) {
       throw new TypeError('model source load transfer must be an array');
     }
+    if (transfer.length > MAX_TRANSFER_ITEMS) {
+      throw new RangeError(`model source load transfer accepts at most ${MAX_TRANSFER_ITEMS} items`);
+    }
+    const seen = new Set<Transferable>();
+    for (const item of transfer) {
+      if (
+        !(item instanceof ArrayBuffer)
+        && !(typeof MessagePort !== 'undefined' && item instanceof MessagePort)
+        && !(typeof ImageBitmap !== 'undefined' && item instanceof ImageBitmap)
+        && !(typeof OffscreenCanvas !== 'undefined' && item instanceof OffscreenCanvas)
+      ) {
+        throw new TypeError('model source load transfer contains an unsupported item');
+      }
+      if (seen.has(item)) throw new TypeError('model source load transfer contains a duplicate item');
+      seen.add(item);
+    }
     return Object.freeze({
       module,
       transfer: Object.freeze([...transfer]),
@@ -182,6 +199,21 @@ export function beginModelSourceLoad(
     try { releaseOnce(); } catch {}
     throw error;
   }
+}
+
+/**
+ * A source archive may return a view into a larger buffer, shared memory, or
+ * memory it still owns. Copy the exact byte range into a standalone, library
+ * owned ArrayBuffer before transferring it. Ordinary wasm-bindgen archive
+ * results already own full-span buffers and keep their existing zero-copy path.
+ */
+export function copyModelSourceBytes(value: Uint8Array): ArrayBuffer {
+  if (!(value instanceof Uint8Array)) {
+    throw new TypeError('model source archive must return Uint8Array bytes');
+  }
+  const copy = new Uint8Array(value.byteLength);
+  copy.set(value);
+  return copy.buffer;
 }
 
 /**

@@ -1,5 +1,6 @@
 import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
+  copyModelSourceBytes,
   decodeDataUrl,
   WasmParserHost,
 } from '@silurus/ooxml-core';
@@ -13,7 +14,7 @@ import {
 } from '@silurus/ooxml-core/worker';
 import type { WorkerRequest, WorkerResponse } from './types';
 import { DocumentPullWorker, isDocumentPullCommand } from './document-pull-worker.js';
-import { WorkerDocumentSourceOwner } from './internal/worker-document-source.js';
+import type { WorkerDocumentSourceOwner } from './internal/worker-document-source.js';
 
 // RB6: a `panic = "abort"` build traps (not unwinds) on a Rust panic / OOM /
 // stack overflow, poisoning this worker's single WASM instance so every LATER
@@ -35,14 +36,20 @@ const host = new WasmParserHost<DocxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
-const source = new WorkerDocumentSourceOwner(host);
+let source: WorkerDocumentSourceOwner<DocxArchive> | undefined;
 const documentPull = new DocumentPullWorker(
-  () => source.cursor(),
-  (operation) => source.execute(operation),
+  () => source?.cursor() ?? host.archive,
+  (operation) => source
+    ? source.execute(operation)
+    : host.run(() => {
+      const archive = host.archive;
+      if (!archive) throw new Error('No docx loaded');
+      return operation(archive);
+    }),
+  () => source !== undefined,
 );
 let documentGeneration = 0;
 let parseGeneration = 0;
-let ooxmlWasmInput: Parameters<typeof host.setWasmInput>[0] | undefined;
 
 const post = (
   message: WorkerResponse | PullSessionResponse<ArrayBuffer, number>,
@@ -70,7 +77,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   }
 
   if (req.type === 'init') {
-    ooxmlWasmInput = decodeDataUrl(req.wasmUrl) ?? req.wasmUrl;
+    host.setWasmInput(decodeDataUrl(req.wasmUrl) ?? req.wasmUrl);
     return;
   }
 
@@ -79,15 +86,18 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   const id = req.id;
   let requestedParseGeneration: number | undefined;
   try {
-    if (req.type !== 'parse' && source.cursor()) {
-      source.execute((archive) => archive.assert_healthy());
+    if (req.type === 'parse' ? !req.source : !source) await host.ensureReady();
+    if (req.type !== 'parse' && (source?.cursor() ?? host.archive)) {
+      if (source) source.execute((archive) => archive.assert_healthy());
+      else host.run(() => host.archive?.assert_healthy());
     }
     if (req.type === 'parse') {
       const requestedGeneration = ++parseGeneration;
       requestedParseGeneration = requestedGeneration;
       await documentPull.reset();
       if (requestedGeneration !== parseGeneration) throw supersededParseError();
-      source.closeModelSource();
+      source?.closeModelSource();
+      source = undefined;
       host.run(() => host.disposeArchive());
       const bytes = new Uint8Array(req.data);
       // OOXML construction/cursor calls run under `host.run`; a model source
@@ -96,14 +106,13 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // value, cross to Window and require consumer ACK.
       let viewDefaults: { showTrackedChanges?: boolean } | undefined;
       if (req.source) {
+        const { WorkerDocumentSourceOwner } = await import('./internal/worker-document-source.js');
+        source ??= new WorkerDocumentSourceOwner(host);
         viewDefaults = await source.openModelSource(bytes, req.source, req.sourceTransfer);
         if (requestedGeneration !== parseGeneration) {
           throw supersededParseError();
         }
       } else {
-        if (ooxmlWasmInput === undefined) throw new Error('DOCX WASM input was not configured');
-        host.setWasmInput(ooxmlWasmInput);
-        await host.ensureReady();
         if (requestedGeneration !== parseGeneration) throw supersededParseError();
         const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
         host.run(() => {
@@ -133,13 +142,21 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // so `.buffer` is a full-span, non-WASM-backed ArrayBuffer we own outright —
       // transfer it directly. A second `new Uint8Array(bytes).slice()` would just
       // re-copy the whole entry for nothing.
-      const out = source.execute((archive) => archive.extract_image(req.path).buffer as ArrayBuffer);
+      const out = source
+        ? source.execute((archive) => copyModelSourceBytes(archive.extract_image(req.path)))
+        : host.run(() => {
+          const archive = host.archive;
+          if (!archive) throw new Error('No docx loaded');
+          return archive.extract_image(req.path).buffer as ArrayBuffer;
+        });
       const res: WorkerResponse = { type: 'imageExtracted', id, bytes: out };
       (self.postMessage as (message: unknown, transfer: Transferable[]) => void)(res, [out]);
       return;
     }
     if (req.type === 'resourceUsage') {
-      const bytes = source.resourceUsage();
+      const bytes = source?.resourceUsage() ?? (host.archive
+        ? host.run(() => host.archive?.resource_usage())
+        : undefined);
       post({ type: 'resourceUsage', id, usage: bytes ? decodeOoxmlResourceUsage(bytes) : undefined });
       return;
     }
@@ -147,7 +164,13 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // Project the already-opened handle to markdown (no re-copy of the file,
       // no re-scan of the central directory). A plain string has no transferable
       // backing, so it is posted by structured clone like any other value.
-      const markdown = source.toMarkdown();
+      const markdown = source
+        ? source.toMarkdown()
+        : host.run(() => {
+          const archive = host.archive;
+          if (!archive) throw new Error('No docx loaded');
+          return archive.to_markdown();
+        });
       const res: WorkerResponse = { type: 'markdownRendered', id, markdown };
       post(res);
       return;
@@ -156,7 +179,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
     if (requestedParseGeneration !== undefined && requestedParseGeneration === parseGeneration) {
       await documentPull.reset().catch(() => undefined);
       if (requestedParseGeneration === parseGeneration) {
-        try { source.closeModelSource(); } catch {}
+        try { source?.closeModelSource(); } catch {}
       }
     }
     const res: WorkerResponse = { type: 'error', id, ...serializeWorkerError(err) };

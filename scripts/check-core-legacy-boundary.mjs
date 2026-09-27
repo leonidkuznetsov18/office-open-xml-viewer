@@ -12,6 +12,8 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import nodePath from 'node:path';
+import { parse } from '@babel/parser';
 
 export const GUARDED_ROOTS = [
   'packages/core/',
@@ -59,6 +61,50 @@ export function findViolations(files) {
         }
       }
     });
+    if (/\.[cm]?[jt]sx?$/.test(path)) {
+      const source = parse(text, { sourceType: 'unambiguous', errorRecovery: true, plugins: ['typescript', 'jsx'] });
+      const inspect = (node) => {
+        let literal;
+        if (['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type)) {
+          literal = node.source;
+        } else if (node.type === 'TSImportEqualsDeclaration'
+          && node.moduleReference?.type === 'TSExternalModuleReference') {
+          literal = node.moduleReference.expression;
+        } else if (node.type === 'CallExpression' && node.arguments.length === 1
+          && (node.callee.type === 'Import'
+            || (node.callee.type === 'Identifier' && node.callee.name === 'require'))) {
+          [literal] = node.arguments;
+        }
+        if (literal?.type === 'StringLiteral'
+          || (literal?.type === 'TemplateLiteral' && literal.expressions.length === 0)) {
+          // The parser has already decoded string escapes here. Normalize
+          // relative paths as well as package names before checking the import.
+          const specifier = literal.type === 'StringLiteral'
+            ? literal.value
+            : literal.quasis[0].value.cooked;
+          if (typeof specifier !== 'string') return;
+          const resolved = specifier.startsWith('.')
+            ? nodePath.posix.normalize(nodePath.posix.join(nodePath.posix.dirname(path), specifier))
+            : specifier;
+          if (/ooxml-legacy-converter|(?:^|\/)legacy-converter(?:\/|$)/.test(resolved)) {
+            const line = literal.loc.start.line;
+            if (!violations.some((entry) => entry.path === path && entry.line === line && entry.rule === 'legacy-package')) {
+              violations.push({ path, line, rule: 'legacy-package', text: specifier.slice(0, 160) });
+            }
+          }
+        }
+        for (const value of Object.values(node)) {
+          if (Array.isArray(value)) {
+            for (const child of value) {
+              if (child && typeof child === 'object' && typeof child.type === 'string') inspect(child);
+            }
+          } else if (value && typeof value === 'object' && typeof value.type === 'string') {
+            inspect(value);
+          }
+        }
+      };
+      inspect(source);
+    }
   }
   return violations;
 }

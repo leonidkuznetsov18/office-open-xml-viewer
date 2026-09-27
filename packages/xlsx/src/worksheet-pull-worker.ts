@@ -64,6 +64,7 @@ export class WorksheetPullWorker {
     private readonly executeArchive: <T>(operation: (archive: WorksheetCursorArchive) => T) => T =
       (operation) => operation(this.requireArchive()),
     private readonly prepareRows?: (rows: Row[]) => void,
+    private readonly copyPulledBytes: () => boolean = () => false,
   ) {}
 
   /** Register synchronously before a worker handler's first await. */
@@ -133,7 +134,7 @@ export class WorksheetPullWorker {
               }
             }
             terminalPending = done;
-            const payload = exactTransferableArrayBuffer(bytes);
+            const payload = exactTransferableArrayBuffer(bytes, this.copyPulledBytes());
             return { payload, byteLength: payload.byteLength, done, transfer: [payload] };
           },
           measureChunk: ({ payload }) => payload.byteLength,
