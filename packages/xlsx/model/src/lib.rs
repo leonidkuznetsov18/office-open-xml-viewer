@@ -1023,12 +1023,25 @@ pub struct ShapeParagraph {
     /// §21.1.2.2.7. `None` = unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indent: Option<i64>,
+    /// `<a:pPr@defTabSz>` in EMU; absent uses the DrawingML host default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub def_tab_sz: Option<i64>,
+    /// Authored `<a:tabLst>/<a:tab>` positions and alignment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tab_stops: Vec<ShapeTabStop>,
     /// `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5). Direct-only.
     /// `None` = unset. Omitted from JSON when `None` so existing output stays
     /// byte-identical (additive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_line: Option<SpaceLine>,
     pub runs: Vec<ShapeTextRun>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeTabStop {
+    pub pos: i64,
+    pub algn: String,
 }
 
 /// A run within a shape paragraph. Tagged union (mirrors the pptx `TextRun`
