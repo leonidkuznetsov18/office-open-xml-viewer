@@ -26,6 +26,7 @@ mod numbering;
 mod paragraph;
 mod picture_bullets;
 mod pictures;
+mod ref_bookmark_flow;
 mod sections;
 mod settings;
 mod sprm;
@@ -70,6 +71,7 @@ struct AcquiredDoc<'a> {
     effective_nfib: u16,
     note_references: notes::References,
     picture_bullets: Result<Option<picture_bullets::Document>, String>,
+    ref_leading_break_targets: std::collections::HashMap<String, String>,
     pictures: pictures::Store<'a>,
     floating: floating::Store<'a>,
 }
@@ -171,6 +173,10 @@ fn with_acquired_doc<T>(
     formatting.configure_table_styles(effective_nfib, true);
     let note_references = notes::References::read(&note_stories, &story, &mut formatting)?;
     let picture_bullets = picture_bullets::read(&word, &table);
+    // An invalid or over-budget optional bookmark table leaves REF's cached
+    // result intact. Only a structurally proven leading break is projected.
+    let ref_leading_break_targets =
+        ref_bookmark_flow::read(&word, &table, &story.text).unwrap_or_default();
     let pictures = pictures::Store::new(&data);
     let floating = floating::Store::read_stories(&word, &table, clx, ccp_text)?;
     let main_fields = header_fields::Table::read_at(&word, &table, 0x11a, ccp_text);
@@ -190,6 +196,7 @@ fn with_acquired_doc<T>(
         effective_nfib,
         note_references,
         picture_bullets,
+        ref_leading_break_targets,
         pictures,
         floating,
     })

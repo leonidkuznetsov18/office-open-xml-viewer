@@ -98,7 +98,8 @@ pub(super) fn build(
         facts.headers.as_ref(),
     )?;
     let main_fields = match &facts.main_fields {
-        Ok(table) => fields::StoryFields::analyze(&facts.story.text, table, &[])?,
+        Ok(table) => fields::StoryFields::analyze(&facts.story.text, table, &[])?
+            .with_ref_leading_breaks(&facts.ref_leading_break_targets),
         Err(error) => return Err(error.clone()),
     };
     // Header drawings and textbox stories are resolved only by this model;

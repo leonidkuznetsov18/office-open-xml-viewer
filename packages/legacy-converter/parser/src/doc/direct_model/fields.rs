@@ -107,6 +107,8 @@ pub(in crate::doc) struct StoryFields {
     /// Piecewise-constant link context: each entry applies from its CP up to
     /// the next entry.
     links: Vec<(usize, Option<Link>)>,
+    ref_candidates: Vec<(usize, String, String)>,
+    leading_ref_breaks: Vec<usize>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -157,6 +159,7 @@ impl StoryFields {
         let mut stack: Vec<Open> = Vec::new();
         let mut evaluated = Vec::new();
         let mut links = Vec::new();
+        let mut ref_candidates = Vec::new();
         let mut listed = 0usize;
         let mut cp = 0usize;
         for character in text.chars() {
@@ -231,6 +234,29 @@ impl StoryFields {
                     if let Some(entry) = classify(&field, flags)? {
                         evaluated.push((field.begin, cp, entry));
                     }
+                    // ECMA-376 §17.16.5.51: a REF reproduces the bookmarked
+                    // range. The cached text alone cannot carry a leading
+                    // page break, so keep a bounded candidate until the DOC
+                    // bookmark table proves that exact structure.
+                    if !field.parent
+                        && !field.hidden
+                        && !field.instruction_overflow
+                        && !field.result_overflow
+                        && !field.instruction_controls
+                        && !field.result_controls
+                        && !field.child_in_result
+                        && ref_candidates.len() < 1024
+                    {
+                        if let (Some(target), Some(result_cp)) =
+                            (ref_target(&field.instruction), field.result_cp)
+                        {
+                            ref_candidates.push((
+                                result_cp,
+                                target.to_string(),
+                                field.result.clone(),
+                            ));
+                        }
+                    }
                     if field.role != Role::None {
                         links.push((cp, effective_link(&stack)?));
                     }
@@ -253,7 +279,31 @@ impl StoryFields {
         }
         // Evaluated fields have no nested fields, so closing order is begin order.
         evaluated.sort_unstable_by_key(|(begin, ..)| *begin);
-        Ok(Self { evaluated, links })
+        Ok(Self {
+            evaluated,
+            links,
+            ref_candidates,
+            leading_ref_breaks: Vec::new(),
+        })
+    }
+
+    pub(in crate::doc) fn with_ref_leading_breaks(
+        mut self,
+        targets: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        self.leading_ref_breaks = self
+            .ref_candidates
+            .iter()
+            .filter_map(|(cp, name, cached)| {
+                targets
+                    .get(name)
+                    .filter(|target| *target == cached)
+                    .map(|_| *cp)
+            })
+            .collect();
+        self.leading_ref_breaks.sort_unstable();
+        self.leading_ref_breaks.dedup();
+        self
     }
 
     fn link_at(&self, cp: usize) -> Option<&Link> {
@@ -282,8 +332,18 @@ impl StoryFields {
             .take_while(|(begin, ..)| *begin <= limit)
             .peekable();
         let mut covered_until = None;
+        let mut next_break = self.leading_ref_breaks.partition_point(|cp| *cp < base_cp);
         for paragraph in paragraphs {
             for (token, cp) in std::mem::take(&mut paragraph.tokens) {
+                while self
+                    .leading_ref_breaks
+                    .get(next_break)
+                    .is_some_and(|at| *at <= cp)
+                {
+                    let at = self.leading_ref_breaks[next_break];
+                    paragraph.tokens.push((Token::PageBreak, at));
+                    next_break += 1;
+                }
                 while let Some((begin, end, field)) = pending.next_if(|(begin, ..)| *begin < cp) {
                     paragraph
                         .tokens
@@ -308,12 +368,21 @@ impl StoryFields {
                     .push((Token::EvaluatedField(Box::new(field.clone())), *begin));
                 covered_until = Some(*end);
             }
+            while self
+                .leading_ref_breaks
+                .get(next_break)
+                .is_some_and(|at| *at <= paragraph.end_cp)
+            {
+                let at = self.leading_ref_breaks[next_break];
+                paragraph.tokens.push((Token::PageBreak, at));
+                next_break += 1;
+            }
             if self.links.is_empty() {
                 continue;
             }
             for (token, cp) in &mut paragraph.tokens {
                 // A FieldRun carries no link in the DOCX model.
-                if matches!(token, Token::EvaluatedField(_)) {
+                if matches!(token, Token::EvaluatedField(_) | Token::PageBreak) {
                     continue;
                 }
                 if let Some(link) = self.link_at(*cp) {
@@ -429,6 +498,21 @@ fn role(instruction: &str) -> Result<Role, String> {
         }
     }
     Ok(Role::None)
+}
+
+fn ref_target(instruction: &str) -> Option<&str> {
+    let mut words = instruction.split_whitespace();
+    words
+        .next()
+        .filter(|word| word.eq_ignore_ascii_case("REF"))?;
+    let target = words.next().filter(|word| {
+        !word.is_empty() && !word.starts_with('\\') && !word.contains(['\'', '"'])
+    })?;
+    match (words.next(), words.next()) {
+        (None, None) => Some(target),
+        (Some(switch), None) if switch.eq_ignore_ascii_case("\\h") => Some(target),
+        _ => None,
+    }
 }
 
 /// ECMA-376 17.16.5.25 HYPERLINK with 17.16.1 argument quoting: an optional
@@ -1061,6 +1145,52 @@ mod tests {
             form_data_cp: None,
             ruby: None,
         }
+    }
+
+    #[test]
+    fn ref_replays_only_a_proven_bookmarked_leading_break() {
+        let text = "See \u{13}REF target \\h\u{14}Target\u{15} after\r";
+        let table = with_types(text, &[0x03], &[0x80]);
+        let mut paragraphs = tokenize_with_fields(text, &mut Fields::default(), 0, true);
+        StoryFields::analyze(text, &table, &[])
+            .unwrap()
+            .with_ref_leading_breaks(&[("target".into(), "Target".into())].into())
+            .apply(0, &mut paragraphs)
+            .unwrap();
+        assert_eq!(
+            paragraphs[0]
+                .tokens
+                .iter()
+                .filter(|(token, _)| matches!(token, Token::PageBreak))
+                .count(),
+            1
+        );
+        assert_eq!(
+            paragraphs[0]
+                .tokens
+                .iter()
+                .filter_map(|(token, _)| match token {
+                    Token::Text(text) => Some(text.as_str()),
+                    Token::Linked(link) => match &link.token {
+                        Token::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<String>(),
+            "See Target after"
+        );
+
+        let mut paragraphs = tokenize_with_fields(text, &mut Fields::default(), 0, true);
+        StoryFields::analyze(text, &table, &[])
+            .unwrap()
+            .with_ref_leading_breaks(&[("target".into(), "different".into())].into())
+            .apply(0, &mut paragraphs)
+            .unwrap();
+        assert!(!paragraphs[0]
+            .tokens
+            .iter()
+            .any(|(token, _)| matches!(token, Token::PageBreak)));
     }
 
     #[test]
