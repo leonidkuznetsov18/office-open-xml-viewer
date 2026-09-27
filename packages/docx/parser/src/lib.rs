@@ -532,8 +532,15 @@ impl DocxArchive {
 /// Native equivalent of `parse_docx` for use from the MCP server.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn parse_docx_native(data: &[u8]) -> Result<String, String> {
-    parser::parse_from_bytes(data)
+    parse_docx_model_native(data)
         .and_then(|doc| serde_json::to_string(&doc).map_err(|e| e.to_string()))
+}
+
+/// Native typed equivalent of `parse_docx`; it shares the JSON entry point's
+/// parser operation and resource policy.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn parse_docx_model_native(data: &[u8]) -> Result<docx_model::Document, String> {
+    parser::parse_from_bytes(data)
 }
 
 /// Parse a docx and project the result to GitHub-flavoured markdown:
