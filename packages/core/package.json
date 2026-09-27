@@ -51,6 +51,7 @@
     "./internal/virtual-scroll": "./src/internal/virtual-scroll.ts",
     "./internal/find-controller": "./src/viewer/find-controller.ts",
     "./internal/slot-scroller": "./src/viewer/slot-scroller.ts",
+    "./internal/comment-margin-controller": "./src/viewer/comment-margin-controller.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"

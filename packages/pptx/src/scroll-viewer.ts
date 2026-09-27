@@ -14,6 +14,7 @@ import {
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/dom-interaction-boundary';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
+import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { PptxPresentation, type LoadOptions, type RenderSlideOptions } from './presentation';
 import type { PresentationHandle } from './presentation-handle';
@@ -368,8 +369,19 @@ export class PptxScrollViewer implements ZoomableViewer {
     readonly connectorsOnly: boolean;
   }>();
   private _hasComments = false;
-  /** Horizontal origin used only for a reachable left-hand review rail. */
-  private _reviewOriginPx = 0;
+  private readonly _commentMargin = new CommentMarginController({
+    container: () => this._container,
+    scrollHost: () => this._scrollHost,
+    spacer: () => this._spacer,
+    enabled: () => this._commentsEnabled(),
+    cards: () => this._commentsOptions()?.cards !== false,
+    hasDisplayableComments: () => this._hasComments,
+    requestedSide: () => this._commentsOptions()?.side,
+    zoom: () => this._scaleEstablished ? this._scale : 1,
+    gapPx: COMMENT_MARGIN_GAP_PX,
+    widthPx: COMMENT_MARGIN_WIDTH_PX,
+    fontSizePx: COMMENT_MARGIN_FONT_SIZE_PX,
+  });
   /** Opening prefix already inspected for authored comments. Progressive
    * presentations make metadata authoritative one slide at a time, so a
    * negative scan is provisional until this frontier reaches slideCount. */
@@ -741,21 +753,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     return available;
   }
 
-  private _commentMarginExtent(): number {
-    return this._hasCommentMargin()
-      ? (COMMENT_MARGIN_GAP_PX + COMMENT_MARGIN_WIDTH_PX) * this._commentZoom()
-      : 0;
-  }
-
-  private _hasCommentMargin(): boolean {
-    return this._commentsEnabled() && this._hasComments &&
-      this._commentsOptions()?.cards !== false;
-  }
-
-  /** Comment chrome uses the same absolute zoom as the rendered presentation. */
-  private _commentZoom(): number {
-    return this._scaleEstablished ? this._scale : 1;
-  }
 
   private _commentsEnabled(): boolean {
     return this._opts.comments === true || typeof this._opts.comments === 'object';
@@ -765,30 +762,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     return typeof this._opts.comments === 'object' ? this._opts.comments : undefined;
   }
 
-  private _commentSide(): 'left' | 'right' {
-    const requested = this._commentsOptions()?.side;
-    if (requested === 'left' || requested === 'right') return requested;
-    const computedDirection = this._container.ownerDocument.defaultView?.getComputedStyle?.(
-      this._container,
-    ).direction;
-    const direction = computedDirection || this._container.dir || this._container.style.direction;
-    return direction === 'rtl' ? 'left' : 'right';
-  }
-
-  private _syncCommentMarginGeometry(margin: HTMLDivElement | null): void {
-    if (!margin) return;
-    // An absolutely positioned margin still contributes to native overflow even
-    // when it contains no cards. Keep it out of layout until an authoritative
-    // comment scan says the review surface exists.
-    margin.style.display = this._hasCommentMargin() ? '' : 'none';
-    const zoom = this._commentZoom();
-    const offset = `calc(100% + ${COMMENT_MARGIN_GAP_PX * zoom}px)`;
-    margin.style.left = this._commentSide() === 'right' ? offset : '';
-    margin.style.right = this._commentSide() === 'left' ? offset : '';
-    margin.style.width = `${COMMENT_MARGIN_WIDTH_PX * zoom}px`;
-    margin.style.fontSize = `${COMMENT_MARGIN_FONT_SIZE_PX}px`;
-    margin.dataset.ooxmlCommentZoom = String(zoom);
-  }
 
   /** Inspect only the prefix whose slide metadata is authoritative. When a
    * later publication reveals the first comment, enable the already-present
@@ -979,19 +952,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  current slide px width. */
   private _syncSpacerWidth(): void {
     const { left, right } = this._padH();
-    const marginExtent = this._commentMarginExtent();
-    const next = this._commentSide() === 'left' ? marginExtent : 0;
-    const delta = next - this._reviewOriginPx;
-    const targetScrollLeft = Math.max(0, this._scrollHost.scrollLeft + delta);
-    // Establish the new native scroll range before applying compensation.
-    // Browsers clamp scrollLeft to the current range at assignment time.
-    this._spacer.style.width = `${this._slideWidthPx() + marginExtent + left + right}px`;
-    if (delta === 0) return;
-    this._reviewOriginPx = next;
-    (this._scrollHost.style as CSSStyleDeclaration & Record<string, string>)[
-      '--ooxml-review-origin-x'
-    ] = `${next}px`;
-    this._scrollHost.scrollLeft = targetScrollLeft;
+    this._commentMargin.syncSpacerWidth(this._slideWidthPx(), left, right);
   }
 
   private _onScroll(): void {
@@ -1027,7 +988,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         this._commentsEnabled(),
         this._commentsOptions()?.cards !== false,
         this._commentsOptions()?.connectors !== undefined,
-        (margin) => this._syncCommentMarginGeometry(margin),
+        (margin) => this._commentMargin.syncMargin(margin),
       );
     const elementLayer = createCanvasElementOutlineLayer(
       wrapper,
@@ -1120,10 +1081,10 @@ export class PptxScrollViewer implements ZoomableViewer {
     const wpx = this._slideWidthPx();
     slot.wrapper.style.width = `${wpx}px`;
     slot.wrapper.style.height = `${this._slideHeightPx()}px`;
-    this._syncCommentMarginGeometry(slot.commentMargin);
+    this._commentMargin.syncMargin(slot.commentMargin);
     if (slot.commentDecorationLayer) {
-      const marginExtent = this._commentMarginExtent();
-      slot.commentDecorationLayer.style.left = this._commentSide() === 'left'
+      const marginExtent = this._commentMargin.extent();
+      slot.commentDecorationLayer.style.left = this._commentMargin.side() === 'left'
         ? `${-marginExtent}px`
         : '0px';
       slot.commentDecorationLayer.style.width = `${wpx + marginExtent}px`;
@@ -1139,7 +1100,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     // duplicated per viewer (one line; not hoisted to core).
     const { left: padL } = this._padH();
     const authoredLeft = Math.max(padL, (this._scrollHost.clientWidth - wpx) / 2);
-    slot.wrapper.style.left = this._commentSide() === 'left' && this._commentsEnabled()
+    slot.wrapper.style.left = this._commentMargin.side() === 'left' && this._commentsEnabled()
       ? `calc(${authoredLeft}px + var(--ooxml-review-origin-x, 0px))`
       : `${authoredLeft}px`;
   }
@@ -2244,7 +2205,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     const slideLeft = Math.max(
       paddingLeft,
       (this._scrollHost.clientWidth - width) / 2,
-    ) + this._reviewOriginPx;
+    ) + this._commentMargin.originPx;
     const range = this._rangeAt(0, this._overscan());
     const maxTop = Math.max(0, range.totalHeight - this._scrollHost.clientHeight);
     const spacerWidth = this._spacer.offsetWidth || Number.parseFloat(this._spacer.style.width) || 0;
@@ -2428,7 +2389,7 @@ export class PptxScrollViewer implements ZoomableViewer {
 
   private _redrawSlotComments(slide: number, slot: SlideSlot): void {
     if (!this._pres || !slot.commentMarkerLayer) return;
-    this._syncCommentMarginGeometry(slot.commentMargin);
+    this._commentMargin.syncMargin(slot.commentMargin);
     const commentUi = this._commentUi;
     if (!commentUi) {
       slot.commentMarkerLayer.replaceChildren();
@@ -2457,7 +2418,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         }
         this._emitSelectionContextChange();
       },
-      this._commentZoom(),
+      this._commentMargin.zoom(),
       COMMENT_MARGIN_WIDTH_PX,
       this._commentsOptions()?.markers !== false,
       this._commentsOptions()?.includeResolved === true,
@@ -2479,8 +2440,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     if (!layer || !margin || !geometry || !connectorOptions) return;
     const width = this._slideWidthPx();
     const height = this._slideHeightPx();
-    const side = this._commentSide();
-    const marginExtent = this._commentMarginExtent();
+    const side = this._commentMargin.side();
+    const marginExtent = this._commentMargin.extent();
     const commentUi = this._commentUi;
     if (!commentUi) return;
     commentUi.buildReadOnlyCommentDecoration(
@@ -3000,6 +2961,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
     // deterministic.
     this._scroller.destroy();
+    this._commentMargin.destroy();
     this._presentationOwner.close();
     this._wrapper.remove();
   }
