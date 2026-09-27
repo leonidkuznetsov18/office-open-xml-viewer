@@ -5,6 +5,7 @@
 //! package operation so workbook dependencies, every row pull, and the sheet's
 //! ancillary parts are charged to the same operation.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::rc::Rc;
@@ -498,7 +499,7 @@ fn tag_end(bytes: &[u8], start: usize) -> Result<usize, String> {
     Err("worksheet preview tag is unclosed".to_string())
 }
 
-fn tag_attribute<'a>(tag: &'a [u8], name: &[u8]) -> Result<Option<&'a [u8]>, String> {
+fn tag_attribute<'a>(tag: &'a [u8], name: &[u8]) -> Result<Option<Cow<'a, str>>, String> {
     let mut i = 1;
     while i < tag.len() && !tag[i].is_ascii_whitespace() && tag[i] != b'>' && tag[i] != b'/' {
         i += 1;
@@ -540,7 +541,24 @@ fn tag_attribute<'a>(tag: &'a [u8], name: &[u8]) -> Result<Option<&'a [u8]>, Str
         let value = &tag[value_start..i];
         i += 1;
         if key == name {
-            return Ok(Some(value));
+            let encoded = std::str::from_utf8(value).map_err(|error| error.to_string())?;
+            if encoded.contains('<') {
+                return Err("worksheet preview attribute contains unescaped markup".to_string());
+            }
+            if !encoded.contains('&') {
+                return Ok(Some(Cow::Borrowed(encoded)));
+            }
+            // The terminal row parser reads roxmltree's decoded attribute
+            // values. Use that same XML decoder for the uncommon entity path;
+            // a malformed or unsupported entity disables the preview.
+            let delimiter = quote as char;
+            let xml = format!("<v a={delimiter}{encoded}{delimiter}/>");
+            let document = roxmltree::Document::parse(&xml).map_err(|error| error.to_string())?;
+            let decoded = document
+                .root_element()
+                .attribute("a")
+                .ok_or_else(|| "worksheet preview attribute disappeared".to_string())?;
+            return Ok(Some(Cow::Owned(decoded.to_string())));
         }
     }
     Ok(None)
@@ -613,11 +631,7 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
         let tag = &body[begin..close];
         if name == b"row" {
             let explicit = tag_attribute(tag, b"r")?
-                .map(|value| {
-                    std::str::from_utf8(value)
-                        .map_err(|error| error.to_string())
-                        .and_then(|value| value.parse::<u32>().map_err(|error| error.to_string()))
-                })
+                .map(|value| value.parse::<u32>().map_err(|error| error.to_string()))
                 .transpose()?;
             let prior = previous_row;
             let row =
@@ -625,12 +639,11 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
             ordered_rows &= row > prior;
             max_row = max_row.max(row);
             previous_col = 0;
-            let hidden = matches!(tag_attribute(tag, b"hidden")?, Some(value) if value == b"1" || value == b"true");
+            let hidden = matches!(tag_attribute(tag, b"hidden")?, Some(value) if value == "1" || value == "true");
             let height = if hidden {
                 Some(0.0)
             } else {
                 tag_attribute(tag, b"ht")?
-                    .and_then(|value| std::str::from_utf8(value).ok())
                     .and_then(|value| value.parse::<f64>().ok())
                     .filter(|value| value.is_finite() && *value >= 0.0)
             };
@@ -638,18 +651,13 @@ fn lexical_scan_worksheet_preview(raw: Rc<[u8]>) -> Result<WorksheetCursorPrevie
                 row_heights.insert(row, height);
             }
             let outline = tag_attribute(tag, b"outlineLevel")?
-                .and_then(|value| std::str::from_utf8(value).ok())
                 .and_then(|value| value.parse::<u8>().ok())
                 .unwrap_or(0);
-            let collapsed = matches!(tag_attribute(tag, b"collapsed")?, Some(value) if value == b"1" || value == b"true");
+            let collapsed = matches!(tag_attribute(tag, b"collapsed")?, Some(value) if value == "1" || value == "true");
             has_row_outline |= outline != 0 || collapsed;
         } else if name == b"c" {
             let explicit = tag_attribute(tag, b"r")?
-                .map(|value| {
-                    std::str::from_utf8(value)
-                        .map_err(|error| error.to_string())
-                        .and_then(|reference| parse_cell_ref_checked(reference).map(|(col, _)| col))
-                })
+                .map(|reference| parse_cell_ref_checked(&reference).map(|(col, _)| col))
                 .transpose()?;
             let col =
                 resolve_implicit_ordinal(explicit, &mut previous_col, SpreadsheetOrdinal::Column)?;
@@ -746,6 +754,32 @@ mod tests {
             lexical.tail.unwrap().row_heights,
             parsed.tail.unwrap().row_heights
         );
+    }
+
+    #[test]
+    fn lexical_scan_decodes_row_attributes_like_the_terminal_xml_parser() {
+        let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="&#50;" ht="&#51;0"><c r="B&#50;"><v>1</v></c></row><row r="3" ht="3&amp;0"><c r="C3"><v>2</v></c></row></sheetData></worksheet>"#;
+        let preview = lexical_scan_worksheet_preview(xml.as_bytes().into()).unwrap();
+        assert_eq!(preview.max_row, 3);
+        assert_eq!(preview.max_col, 3);
+        assert_eq!(
+            preview.tail.unwrap().row_heights,
+            BTreeMap::from([(2, 30.0)])
+        );
+
+        // The main row projector uses roxmltree attribute values. Compare the
+        // same decoded values, including a predefined named entity whose
+        // result is not a valid row height.
+        let document = roxmltree::Document::parse(xml).unwrap();
+        let rows: Vec<_> = document
+            .descendants()
+            .filter(|node| node.has_tag_name("row"))
+            .collect();
+        assert_eq!(rows[0].attribute("ht"), Some("30"));
+        assert_eq!(rows[1].attribute("ht"), Some("3&0"));
+
+        let unsupported = xml.replace("3&amp;0", "3&unknown;0");
+        assert!(lexical_scan_worksheet_preview(unsupported.as_bytes().into()).is_err());
     }
 
     #[test]

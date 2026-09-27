@@ -7152,6 +7152,32 @@ mod rb7_partial_degradation_tests {
     }
 
     #[test]
+    fn encoded_row_height_preview_matches_completed_sheet() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="&#49;" ht="&#51;0"><c r="A&#49;"><v>1</v></c></row><row r="2" ht="3&amp;0"><c r="A2"><v>2</v></c></row></sheetData></worksheet>"#;
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let preview: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(preview["kind"], "preview");
+        assert_eq!(preview["worksheet"]["rowHeights"]["1"], 30.0);
+        assert!(preview["worksheet"]["rowHeights"].get("2").is_none());
+
+        loop {
+            let unit: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+            if unit["kind"] == "finished" {
+                assert_eq!(
+                    unit["worksheet"]["rowHeights"],
+                    preview["worksheet"]["rowHeights"]
+                );
+                break;
+            }
+        }
+        archive.cancel_sheet_cursor();
+    }
+
+    #[test]
     fn row_outline_requires_complete_sheet_before_paint() {
         let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="200" outlineLevel="1"><c r="A200"><v>2</v></c></row></sheetData></worksheet>"#;
         let mut archive =
