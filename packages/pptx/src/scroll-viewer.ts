@@ -13,6 +13,7 @@ import {
   TerminalResourceOwner,
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/dom-interaction-boundary';
+import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { PptxPresentation, type LoadOptions, type RenderSlideOptions } from './presentation';
 import type { PresentationHandle } from './presentation-handle';
@@ -315,14 +316,36 @@ export class PptxScrollViewer implements ZoomableViewer {
    * the same value a single-canvas viewer would show.
    */
   private _pendingScale: number | null = null;
-  /** Live slots keyed by slide index. */
-  private readonly _slots = new Map<number, SlideSlot>();
-  /** Recyclable detached slots (canvas + textLayer reused across slides). */
-  private readonly _free: SlideSlot[] = [];
+  private readonly _scroller = new SlotScroller<SlideSlot, VisibleWindow>({
+    spacer: () => this._spacer,
+    count: () => this._pres?.slideCount ?? 0,
+    range: () => this._range(),
+    createSlot: () => this._createSlot(),
+    attachSlot: (slot) => this._scrollHost.appendChild(slot.wrapper),
+    resetSlot: (index, slot) => this._resetSlot(index, slot),
+    positionSlot: (index, slot, range) => this._positionSlot(slot, index, range),
+    renderSlot: (index, slot, reportErrors) => this._renderSlot(
+      index, slot,
+      this._opts.enableMediaPlayback === true && this._rangeContains(this._mediaRange(), index),
+      reportErrors,
+    ),
+    previewSlot: (index, slot, range) => this._previewSlot(slot, index, range),
+    settleSlot: (index, slot) => this._settleSlot(index, slot),
+    renderedScale: (slot) => slot.renderedScale,
+    scale: () => this._scale,
+    syncSpacerWidth: () => this._syncSpacerWidth(),
+    onRange: (range) => this._emitVisibleSlideChange(range),
+    // PPTX keeps media handles only near the viewport. Mounted static slides
+    // retain their canvas and can upgrade when the media window reaches them.
+    onNewSlot: (index, slot) => this._redrawSlotComments(index, slot),
+    afterMount: () => { if (this._opts.enableMediaPlayback) this._syncMediaPlayback(); },
+    awaitInitialRender: (index) => index < this.availableSlideCount,
+    shouldSettle: (index) => !this._opts.enableMediaPlayback || this._rangeContains(this._mediaRange(), index),
+  });
+  private readonly _slots = this._scroller.slots;
   /** Uniform slide height at the current scale. Keeping the scalar avoids both
    * the document-length height and offset arrays in every scroll query. */
   private _uniformSlideHeight = 0;
-  private _lastRange: VisibleWindow | null = null;
   private _lastTopIndex = -1;
   private _lastReportedTotal = -1;
   private _lastReportedLayoutComplete: boolean | null = null;
@@ -374,20 +397,15 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  epoch (`_renderEpoch`): each dispatch captures the epoch, and on resolution a
    *  moved epoch ⇒ STALE (close + re-dispatch the live slot). See
    *  `_renderSlotBitmap`. */
-  private readonly _slideInFlight = new Set<number>();
+  private readonly _slideInFlight = this._scroller.inFlight;
   /** Render generation, bumped on every effective `setScale` (and the resize
    *  re-fit in `_onResize`, which routes through `setScale`). Stamped into each async render
    *  dispatch; a resolution whose captured epoch ≠ this value is STALE — its
    *  pixels/geometry are at a superseded scale. Worker path: close the orphan
    *  bitmap + re-dispatch the live slot. Main path: skip the (stale) text-layer
    *  build; the engine's per-canvas token already discards the stale pixels. */
-  private _renderEpoch = 0;
-  /** Pending settle-render timer handle (design §7 mechanism 2). Set by
-   *  `_scheduleSettle` after each `setScale`, reset on the next one so a burst
-   *  dispatches ONE settle at the end, and cleared in `destroy()`. `ReturnType`
-   *  of `setTimeout` (a number in the DOM, a Timeout object in node) so the type
-   *  is host-agnostic. */
-  private _settleTimer: ReturnType<typeof setTimeout> | null = null;
+  private get _renderEpoch(): number { return this._scroller.renderEpoch; }
+  private set _renderEpoch(value: number) { this._scroller.renderEpoch = value; }
   private _wheelListener: ((e: WheelEvent) => void) | null = null;
   /** Gesture-only pointer anchor for the NEXT `setScale`, in scrollHost-viewport
    *  px (`{ x, y }` from the wheel event, relative to the scroll host's top-left).
@@ -950,12 +968,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     return index >= r.start && index <= r.end;
   }
 
-  private _syncSpacer(): void {
-    const r = this._range();
-    this._lastRange = r;
-    this._spacer.style.height = `${r.totalHeight}px`;
-    this._syncSpacerWidth();
-  }
+  private _syncSpacer(): void { this._scroller.syncSpacer(); }
 
   /** Horizontal scroll extent: the (uniform deck-wide) slide width plus both
    *  gutters. A spacer NARROWER than the container never creates a scrollbar
@@ -987,49 +1000,8 @@ export class PptxScrollViewer implements ZoomableViewer {
   }
 
   /** Mount/recycle slots for the current visible window. */
-  private _mountVisible(
-    initialRenders?: Promise<void>[],
-    repositionExisting = true,
-  ): void {
-    if (!this._pres || this._pres.slideCount === 0) return;
-    const r = this._range();
-    const mediaRange = this._opts.enableMediaPlayback ? this._mediaRange() : null;
-    this._lastRange = r;
-
-    // Detach slots that left [start, end] into the free pool.
-    for (const [idx, slot] of [...this._slots]) {
-      if (idx < r.start || idx > r.end) {
-        this._recycleSlot(idx, slot);
-      }
-    }
-    // Mount any missing index in the window.
-    for (let i = r.start; i <= r.end; i++) {
-      if (!this._slots.has(i)) {
-        const slot = this._acquireSlot();
-        this._positionSlot(slot, i, r);
-        this._slots.set(i, slot);
-        this._redrawSlotComments(i, slot);
-        const render = this._renderSlot(
-          i,
-          slot,
-          !!mediaRange && this._rangeContains(mediaRange, i),
-          initialRenders === undefined,
-        );
-        // Progressive load resolves once the opening paintable prefix is on
-        // screen. Later mounted slots keep their loading UI and finish from the
-        // presentation's availability wait; they must not hold `load()` open.
-        if (initialRenders && render && i < this.availableSlideCount) initialRenders.push(render);
-      } else if (repositionExisting) {
-        // Re-position (offsets shift after a spacer/height change).
-        this._positionSlot(this._slots.get(i)!, i, r);
-      }
-    }
-    if (mediaRange) this._syncMediaPlayback(mediaRange);
-    // onVisibleSlideChange fires ONLY when the top visible slide actually changes
-    // (change-only latch; `_lastTopIndex` starts at -1 so the first layout fires
-    // once for slide 0). Every mount path — scroll, zoom, resize re-fit, and
-    // scrollToSlide — funnels through here, so navigation never double-fires.
-    this._emitVisibleSlideChange(r);
+  private _mountVisible(initialRenders?: Promise<void>[], repositionExisting = true): void {
+    this._scroller.mount(initialRenders, repositionExisting);
   }
 
   /** Apply the resolved slide-canvas shadow (design: recipe drop shadow by
@@ -1042,60 +1014,21 @@ export class PptxScrollViewer implements ZoomableViewer {
     if (this._pageShadow !== false) canvas.style.boxShadow = this._pageShadow;
   }
 
-  private _acquireSlot(): SlideSlot {
-    const reused = this._free.pop();
-    if (reused) {
-      // _recycleSlot already reset renderedSlide to -1 before pooling this slot.
-      this._scrollHost.appendChild(reused.wrapper);
-      return reused;
-    }
-    // `left` is set explicitly per mount by `_positionSlot` (JS centering with a
-    // left-gutter floor), so no CSS auto-centering (`left:0;right:0;margin:0 auto`)
-    // here — it would fight the explicit `left`.
-    const wrapper = document.createElement('div');
-    wrapper.style.cssText = 'position:absolute;';
-    const canvas = document.createElement('canvas');
-    canvas.style.cssText = 'display:block;background:#fff;';
-    this._applyPageShadow(canvas);
-    wrapper.appendChild(canvas);
-    let textLayer: HTMLDivElement | null = null;
-    if (this._opts.enableTextSelection) {
-      textLayer = document.createElement('div');
-      textLayer.style.cssText =
-        'position:absolute;top:0;left:0;width:100%;height:100%;' +
-        'overflow:hidden;pointer-events:none;user-select:text;-webkit-user-select:text;';
-      wrapper.appendChild(textLayer);
-    }
-    const highlightLayer = document.createElement('div');
-    highlightLayer.style.cssText =
-      'position:absolute;top:0;left:0;width:100%;height:100%;' +
-      'overflow:hidden;pointer-events:none;';
-    wrapper.appendChild(highlightLayer);
+  private _createSlot(): SlideSlot {
+    // The common canvas, selection and highlight stack is owned by core.
+    const { wrapper, canvas, textLayer, highlightLayer } = createSlotHost(
+      this._scrollHost, this._opts.enableTextSelection === true, this._pageShadow,
+    );
     const loadingLayer = createPptxLoadingLayer(document);
     wrapper.appendChild(loadingLayer);
-    let commentMarkerLayer: HTMLDivElement | null = null;
-    let commentMargin: HTMLDivElement | null = null;
-    let commentDecorationLayer: HTMLDivElement | null = null;
-    if (this._commentsEnabled()) {
-      commentMarkerLayer = document.createElement('div');
-      commentMarkerLayer.style.cssText =
-        'position:absolute;inset:0;overflow:hidden;pointer-events:none;';
-      wrapper.appendChild(commentMarkerLayer);
-      if (this._commentsOptions()?.cards !== false) {
-        commentMargin = document.createElement('div');
-        commentMargin.style.cssText =
-          'position:absolute;top:0;height:100%;box-sizing:border-box;' +
-          'overflow-x:hidden;overflow-y:auto;pointer-events:auto;';
-        this._syncCommentMarginGeometry(commentMargin);
-        if (this._commentsOptions()?.connectors !== undefined) {
-          commentDecorationLayer = document.createElement('div');
-          commentDecorationLayer.style.cssText =
-            'position:absolute;top:0;left:0;overflow:visible;pointer-events:none;';
-          wrapper.appendChild(commentDecorationLayer);
-        }
-        wrapper.appendChild(commentMargin);
-      }
-    }
+    const { markerLayer: commentMarkerLayer, margin: commentMargin, decorationLayer: commentDecorationLayer } =
+      createCommentSlotLayers(
+        wrapper,
+        this._commentsEnabled(),
+        this._commentsOptions()?.cards !== false,
+        this._commentsOptions()?.connectors !== undefined,
+        (margin) => this._syncCommentMarginGeometry(margin),
+      );
     const elementLayer = createCanvasElementOutlineLayer(
       wrapper,
       this._opts.enableElementSelection === true,
@@ -1130,7 +1063,10 @@ export class PptxScrollViewer implements ZoomableViewer {
   }
 
   private _recycleSlot(idx: number, slot: SlideSlot): void {
-    this._slots.delete(idx);
+    this._scroller.recycleSlot(idx, slot);
+  }
+
+  private _resetSlot(_idx: number, slot: SlideSlot): void {
     slot.renderGeneration++;
     // Invalidate pending presentSlide() calls before releasing the current
     // handle. A pending handle destroys itself when it resolves and observes the
@@ -1146,19 +1082,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         this._mode === 'worker' && !this._opts.enableMediaPlayback,
       );
     }
-    // Clear the per-slot text overlay so a slot sitting in the free pool holds no
-    // stale spans. buildPptxTextLayer also clears on its next build, but an
-    // unrendered pooled slot never gets that build, and the detached spans would
-    // otherwise linger; drop them here.
-    if (slot.textLayer) {
-      slot.textLayer.innerHTML = '';
-      // Drop any preview transform so a pooled slot re-used for another slide does
-      // not inherit a stale scale() before its overlay is rebuilt.
-      this._clearTextLayerPreview(slot.textLayer);
-    }
-    slot.highlightLayer.innerHTML = '';
-    slot.highlightLayer.style.transform = '';
-    slot.highlightLayer.style.transformOrigin = '';
+    resetSlotHost(slot);
     slot.loadingLayer.style.display = 'none';
     if (slot.commentMarkerLayer) {
       slot.commentMarkerLayer.replaceChildren();
@@ -1188,7 +1112,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     slot.renderedSlide = -1;
     slot.renderedScale = -1;
     slot.wrapper.remove();
-    this._free.push(slot);
   }
 
   private _positionSlot(slot: SlideSlot, i: number, _r: VisibleWindow): void {
@@ -1438,7 +1361,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         !!mediaRange && this._rangeContains(mediaRange, slideIndex),
       );
     }
-    if (this._lastRange) this._emitVisibleSlideChange(this._lastRange);
+    if (this._scroller.lastRange) this._emitVisibleSlideChange(this._scroller.lastRange);
   }
 
   private _wakeLayoutWaiters(): void {
@@ -2016,34 +1939,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    * canvas + text overlay are CSS-transformed to the new size (the device buffer
    * is untouched — that is the whole point: no synchronous clear, no blank frame).
    */
-  private _previewVisible(): void {
-    if (!this._pres || this._pres.slideCount === 0) return;
-    const r = this._range();
-    const mediaRange = this._opts.enableMediaPlayback ? this._mediaRange() : null;
-    this._lastRange = r;
-
-    // Recycle slots that left [start, end].
-    for (const [idx, slot] of [...this._slots]) {
-      if (idx < r.start || idx > r.end) this._recycleSlot(idx, slot);
-    }
-    // For every index in the window: mount fresh if missing (renders at the current
-    // scale), or CSS-preview if already mounted (no re-render, no device resize).
-    for (let i = r.start; i <= r.end; i++) {
-      const existing = this._slots.get(i);
-      if (!existing) {
-        const slot = this._acquireSlot();
-        this._positionSlot(slot, i, r);
-        this._slots.set(i, slot);
-        this._redrawSlotComments(i, slot);
-        this._renderSlot(i, slot, !!mediaRange && this._rangeContains(mediaRange, i));
-      } else {
-        this._previewSlot(existing, i, r);
-      }
-    }
-    if (mediaRange) this._syncMediaPlayback(mediaRange);
-    // Fire onVisibleSlideChange only when the top slide actually changed.
-    this._emitVisibleSlideChange(r);
-  }
+  private _previewVisible(): void { this._scroller.preview(); }
 
   /**
    * CSS-preview a single already-mounted slot at the new geometry (design §7): the
@@ -2057,23 +1953,8 @@ export class PptxScrollViewer implements ZoomableViewer {
    */
   private _previewSlot(slot: SlideSlot, i: number, r: VisibleWindow): void {
     this._positionSlot(slot, i, r);
-    // Stretch the existing bitmap to the new CSS box (device buffer untouched).
-    slot.canvas.style.width = `${this._slideWidthPx()}px`;
-    slot.canvas.style.height = `${this._slideHeightPx()}px`;
-    if (slot.textLayer && slot.renderedScale > 0) {
-      const ratio = this._scale / slot.renderedScale;
-      slot.textLayer.style.transformOrigin = '0 0';
-      // `_positionSlot` has already grown the wrapper to the new scale. Keep the
-      // overlay's layout box at the dimensions of the bitmap it was built for,
-      // then transform that committed box to the preview size. Leaving it at
-      // 100% here would scale the new wrapper-sized box a second time, briefly
-      // inflating the scroll extent until the crisp render settles.
-      slot.textLayer.style.width = `${this._slideWidthPx() / ratio}px`;
-      slot.textLayer.style.height = `${this._slideHeightPx() / ratio}px`;
-      slot.textLayer.style.transform = `scale(${ratio})`;
-    }
-    if (slot.renderedScale > 0) {
-      const ratio = this._scale / slot.renderedScale;
+    const ratio = previewSlotHost(slot, this._slideWidthPx(), this._slideHeightPx(), this._scale);
+    if (ratio !== null) {
       const previewScale = Math.round(ratio * 1_000_000) / 1_000_000;
       if (slot.commentMargin) this._commentUi?.previewReadOnlyCommentMargin(slot.commentMargin, ratio);
       for (const marker of slot.commentMarkerLayer?.children ?? []) {
@@ -2093,22 +1974,13 @@ export class PptxScrollViewer implements ZoomableViewer {
   }
 
   private _clearTextLayerPreview(layer: HTMLDivElement): void {
-    layer.style.transform = '';
-    layer.style.transformOrigin = '';
-    layer.style.width = '100%';
-    layer.style.height = '100%';
+    clearTextLayerPreview(layer);
   }
 
   /** (Re)schedule the debounced settle re-render (design §7 mechanism 2). Resets
    *  the timer on every call so a burst of `setScale` dispatches ONE settle
    *  ZOOM_SETTLE_MS after the LAST call. Cleared in `destroy()`. */
-  private _scheduleSettle(): void {
-    if (this._settleTimer !== null) clearTimeout(this._settleTimer);
-    this._settleTimer = setTimeout(() => {
-      this._settleTimer = null;
-      this._settleRender();
-    }, ZOOM_SETTLE_MS);
-  }
+  private _scheduleSettle(): void { this._scroller.scheduleSettle(ZOOM_SETTLE_MS); }
 
   /** Full-resolution settle re-render of the visible window (design §7 mechanisms
    *  2+3). Re-renders each mounted slot at the current scale via the double-buffer
@@ -2117,20 +1989,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  runs off-thread via `_renderSlotBitmap`) and clear the preview transform.
    *  Dispatched at the CURRENT epoch; the existing epoch gate discards it if a
    *  later `setScale` supersedes it mid-render. */
-  private _settleRender(): void {
-    if (this._destroyed || !this._pres || this._pres.slideCount === 0) return;
-    const mediaRange = this._opts.enableMediaPlayback ? this._mediaRange() : null;
-    for (const [i, slot] of [...this._slots]) {
-      // Whole-deck text mounting must not turn a zoom settle into a whole-deck
-      // media rebuild. Offscreen static canvases keep their CSS preview and are
-      // redrawn through presentSlide only when they enter the bounded media range.
-      if (mediaRange && !this._rangeContains(mediaRange, i)) continue;
-      // Skip slots already at the current scale (a slot that entered the window
-      // during the burst mounted fresh at the current scale — nothing to settle).
-      if (slot.renderedScale === this._scale) continue;
-      this._settleSlot(i, slot);
-    }
-  }
+  private _settleRender(): void { this._scroller.settle(); }
 
   /**
    * Settle-render one slot at the current scale (design §7 mechanism 3).
@@ -2506,6 +2365,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     const generation = ++this._findGeneration;
     this._findActive = query.length > 0;
     if (query.length === 0) {
+      // A progressive deck must clear existing highlights without waiting for
+      // slides that have not finished preparing. DOCX retains its layout wait.
       this._find.invalidate();
       this._redrawHighlights();
       return [];
@@ -2879,7 +2740,7 @@ export class PptxScrollViewer implements ZoomableViewer {
   }
 
   get topVisibleSlide(): number {
-    return this._lastRange?.topIndex ?? 0;
+    return this._scroller.lastRange?.topIndex ?? 0;
   }
 
   /** @internal test hook: slide indices currently mounted. */
@@ -3138,12 +2999,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     // (design §7 mechanism 2). `_destroyed` also guards `_settleRender`, but
     // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
     // deterministic.
-    if (this._settleTimer !== null) {
-      clearTimeout(this._settleTimer);
-      this._settleTimer = null;
-    }
-    for (const [idx, slot] of [...this._slots]) this._recycleSlot(idx, slot);
-    this._free.length = 0;
+    this._scroller.destroy();
     this._presentationOwner.close();
     this._wrapper.remove();
   }

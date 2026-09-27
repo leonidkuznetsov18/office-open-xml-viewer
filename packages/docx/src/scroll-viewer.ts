@@ -17,6 +17,7 @@ import {
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/read-only-comment-contract';
 import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/dom-interaction-boundary';
+import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { DocxDocument } from './document';
 import type { LoadOptions } from './document';
@@ -320,16 +321,31 @@ export class DocxScrollViewer implements ZoomableViewer {
    * the same value a single-canvas viewer would show.
    */
   private _pendingScale: number | null = null;
-  /** Live slots keyed by page index. */
-  private readonly _slots = new Map<number, PageSlot>();
-  /** Recyclable detached slots (canvas + textLayer reused across pages). */
-  private readonly _free: PageSlot[] = [];
+  private readonly _scroller = new SlotScroller<PageSlot, VisibleRange>({
+    spacer: () => this._spacer,
+    count: () => this._doc?.pageCount ?? 0,
+    range: () => this._range(),
+    createSlot: () => this._createSlot(),
+    attachSlot: (slot) => this._scrollHost.appendChild(slot.wrapper),
+    resetSlot: (index, slot) => this._resetSlot(index, slot),
+    positionSlot: (index, slot, range) => this._positionSlot(slot, index, range),
+    renderSlot: (index, slot, reportErrors) => this._renderSlot(index, slot, reportErrors),
+    previewSlot: (index, slot, range) => this._previewSlot(slot, index, range),
+    settleSlot: (index, slot) => this._refreshSlotAtomically(index, slot),
+    renderedScale: (slot) => slot.renderedScale,
+    scale: () => this._scale,
+    syncSpacerWidth: () => this._syncSpacerWidth(),
+    onRange: (range) => this._emitVisiblePageChange(range),
+    // An authoritative DOCX layout publication may replace an already mounted
+    // page without changing its index. _renderSlot checks whether it is current.
+    onExistingSlot: (index, slot, reportErrors) => this._renderSlot(index, slot, reportErrors),
+  });
+  private readonly _slots = this._scroller.slots;
   /** Cached per-page heights in px at the current scale (index-aligned). */
   private _heights: number[] = [];
   /** Prefix offsets rebuilt only when scale/page geometry changes. Pure scroll
    * queries binary-search this cache instead of walking every document page. */
   private _scrollGeometry: VirtualScrollGeometry = { offsets: [], totalHeight: 0 };
-  private _lastRange: VisibleRange | null = null;
   private _lastTopIndex = -1;
   /** Second half of the visible-page latch: a document that grows under the
    *  viewport changes `total` without changing `topIndex`. */
@@ -404,20 +420,15 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  epoch (`_renderEpoch`): each dispatch captures the epoch, and on resolution a
    *  moved epoch ⇒ STALE (close + re-dispatch the live slot). See
    *  `_renderSlotBitmap`. */
-  private readonly _bitmapInFlight = new Set<number>();
+  private readonly _bitmapInFlight = this._scroller.inFlight;
   /** Render generation, bumped on every effective `setScale` (and the resize
    *  re-fit in `_onResize`, which routes through `setScale`). Stamped into each async render
    *  dispatch; a resolution whose captured epoch ≠ this value is STALE — its
    *  pixels/geometry are at a superseded scale. Worker path: close the orphan
    *  bitmap + re-dispatch the live slot. Main path: skip the (stale) text-layer
    *  build; the engine's per-canvas token already discards the stale pixels. */
-  private _renderEpoch = 0;
-  /** Pending settle-render timer handle (design §7 mechanism 2). Set by
-   *  `_scheduleSettle` after each `setScale`, reset on the next one so a burst
-   *  dispatches ONE settle at the end, and cleared in `destroy()`. `ReturnType`
-   *  of `setTimeout` (a number in the DOM, a Timeout object in node) so the type
-   *  is host-agnostic. */
-  private _settleTimer: ReturnType<typeof setTimeout> | null = null;
+  private get _renderEpoch(): number { return this._scroller.renderEpoch; }
+  private set _renderEpoch(value: number) { this._scroller.renderEpoch = value; }
   private _wheelListener: ((e: WheelEvent) => void) | null = null;
   /** Gesture-only pointer anchor for the NEXT `setScale`, in scrollHost-viewport
    *  px (`{ x, y }` from the wheel event, relative to the scroll host's top-left).
@@ -1141,12 +1152,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     );
   }
 
-  private _syncSpacer(): void {
-    const r = this._range();
-    this._lastRange = r;
-    this._spacer.style.height = `${r.totalHeight}px`;
-    this._syncSpacerWidth();
-  }
+  private _syncSpacer(): void { this._scroller.syncSpacer(); }
 
   /** Horizontal scroll extent: the widest page (docx pages can differ in width)
    *  plus both gutters. A spacer NARROWER than the container never creates a
@@ -1184,42 +1190,8 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
   /** Mount/recycle slots for the current visible window. */
-  private _mountVisible(
-    initialRenders?: Promise<void>[],
-    repositionExisting = true,
-  ): void {
-    if (!this._doc || this._doc.pageCount === 0) return;
-    const r = this._range();
-    this._lastRange = r;
-
-    // Detach slots that left [start, end] into the free pool.
-    for (const [idx, slot] of [...this._slots]) {
-      if (idx < r.start || idx > r.end) {
-        this._recycleSlot(idx, slot);
-      }
-    }
-    // Mount any missing index in the window.
-    for (let i = r.start; i <= r.end; i++) {
-      if (!this._slots.has(i)) {
-        const slot = this._acquireSlot();
-        this._positionSlot(slot, i, r);
-        this._slots.set(i, slot);
-        const render = this._renderSlot(i, slot, initialRenders === undefined);
-        if (initialRenders && render) initialRenders.push(render);
-      } else if (repositionExisting) {
-        // Re-position (offsets shift after a spacer/height change).
-        const slot = this._slots.get(i)!;
-        this._positionSlot(slot, i, r);
-        // `_renderSlot` returns null when the slot already holds page `i`, so
-        // ordinary scrolling and resizing never re-render a mounted page.
-        // Layout replacement and zoom settle use `_refreshSlotAtomically`
-        // separately so the live canvas remains painted until its replacement
-        // is ready.
-        const render = this._renderSlot(i, slot, initialRenders === undefined);
-        if (initialRenders && render) initialRenders.push(render);
-      }
-    }
-    this._emitVisiblePageChange(r);
+  private _mountVisible(initialRenders?: Promise<void>[], repositionExisting = true): void {
+    this._scroller.mount(initialRenders, repositionExisting);
   }
 
   /**
@@ -1257,58 +1229,19 @@ export class DocxScrollViewer implements ZoomableViewer {
     if (this._pageShadow !== false) canvas.style.boxShadow = this._pageShadow;
   }
 
-  private _acquireSlot(): PageSlot {
-    const reused = this._free.pop();
-    if (reused) {
-      // _recycleSlot already reset renderedPage to -1 before pooling this slot.
-      this._scrollHost.appendChild(reused.wrapper);
-      return reused;
-    }
-    // `left` is set explicitly per mount by `_positionSlot` (JS centering with a
-    // left-gutter floor), so no CSS auto-centering (`left:0;right:0;margin:0 auto`)
-    // here — it would fight the explicit `left`.
-    const wrapper = document.createElement('div');
-    wrapper.style.cssText = 'position:absolute;';
-    const canvas = document.createElement('canvas');
-    canvas.style.cssText = 'display:block;background:#fff;';
-    this._applyPageShadow(canvas);
-    wrapper.appendChild(canvas);
-    let textLayer: HTMLDivElement | null = null;
-    if (this._opts.enableTextSelection) {
-      textLayer = document.createElement('div');
-      textLayer.style.cssText =
-        'position:absolute;top:0;left:0;width:100%;height:100%;' +
-        'overflow:hidden;pointer-events:none;user-select:text;-webkit-user-select:text;';
-      wrapper.appendChild(textLayer);
-    }
-    const highlightLayer = document.createElement('div');
-    highlightLayer.style.cssText =
-      'position:absolute;top:0;left:0;width:100%;height:100%;' +
-      'overflow:hidden;pointer-events:none;';
-    wrapper.appendChild(highlightLayer);
-    let commentTintLayer: HTMLDivElement | null = null;
-    let commentMargin: HTMLDivElement | null = null;
-    let commentDecorationLayer: HTMLDivElement | null = null;
-    if (this._commentsEnabled()) {
-      commentTintLayer = document.createElement('div');
-      commentTintLayer.style.cssText =
-        'position:absolute;inset:0;overflow:hidden;pointer-events:none;';
-      wrapper.appendChild(commentTintLayer);
-      if (this._commentsOptions()?.cards !== false) {
-        commentMargin = document.createElement('div');
-        commentMargin.style.cssText =
-          'position:absolute;top:0;height:100%;box-sizing:border-box;' +
-          'overflow-x:hidden;overflow-y:auto;pointer-events:auto;';
-        this._syncCommentMarginGeometry(commentMargin);
-        if (this._commentsOptions()?.connectors !== undefined) {
-          commentDecorationLayer = document.createElement('div');
-          commentDecorationLayer.style.cssText =
-            'position:absolute;top:0;left:0;overflow:visible;pointer-events:none;';
-          wrapper.appendChild(commentDecorationLayer);
-        }
-        wrapper.appendChild(commentMargin);
-      }
-    }
+  private _createSlot(): PageSlot {
+    // The common canvas, selection and highlight stack is owned by core.
+    const { wrapper, canvas, textLayer, highlightLayer } = createSlotHost(
+      this._scrollHost, this._opts.enableTextSelection === true, this._pageShadow,
+    );
+    const { markerLayer: commentTintLayer, margin: commentMargin, decorationLayer: commentDecorationLayer } =
+      createCommentSlotLayers(
+        wrapper,
+        this._commentsEnabled(),
+        this._commentsOptions()?.cards !== false,
+        this._commentsOptions()?.connectors !== undefined,
+        (margin) => this._syncCommentMarginGeometry(margin),
+      );
     const elementLayer = createCanvasElementOutlineLayer(
       wrapper,
       this._opts.enableElementSelection === true,
@@ -1333,24 +1266,15 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
   private _recycleSlot(idx: number, slot: PageSlot): void {
-    this._slots.delete(idx);
+    this._scroller.recycleSlot(idx, slot);
+  }
+
+  private _resetSlot(_idx: number, slot: PageSlot): void {
     slot.dispatcher.destroy();
     if (!this._destroyed) {
       slot.dispatcher = new StaticCanvasRenderDispatcher(slot.canvas, this._mode === 'worker');
     }
-    // Clear the per-slot text overlay so a slot sitting in the free pool holds no
-    // stale spans. buildDocxTextLayer also clears on its next build, but an
-    // unrendered pooled slot never gets that build, and the detached spans would
-    // otherwise linger; drop them here.
-    if (slot.textLayer) {
-      slot.textLayer.innerHTML = '';
-      // Drop any preview transform so a pooled slot re-used for another page does
-      // not inherit a stale scale() before its overlay is rebuilt.
-      this._clearTextLayerPreview(slot.textLayer);
-    }
-    slot.highlightLayer.innerHTML = '';
-    slot.highlightLayer.style.transform = '';
-    slot.highlightLayer.style.transformOrigin = '';
+    resetSlotHost(slot);
     if (slot.commentTintLayer) {
       slot.commentTintLayer.replaceChildren();
       slot.commentTintLayer.style.transform = '';
@@ -1372,7 +1296,6 @@ export class DocxScrollViewer implements ZoomableViewer {
     slot.renderedPage = -1;
     slot.renderedScale = -1;
     slot.wrapper.remove();
-    this._free.push(slot);
   }
 
   private _positionSlot(slot: PageSlot, i: number, r: VisibleRange): void {
@@ -2001,30 +1924,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    * canvas + text overlay are CSS-transformed to the new size (the device buffer
    * is untouched — that is the whole point: no synchronous clear, no blank frame).
    */
-  private _previewVisible(): void {
-    if (!this._doc || this._doc.pageCount === 0) return;
-    const r = this._range();
-    this._lastRange = r;
-
-    // Recycle slots that left [start, end].
-    for (const [idx, slot] of [...this._slots]) {
-      if (idx < r.start || idx > r.end) this._recycleSlot(idx, slot);
-    }
-    // For every index in the window: mount fresh if missing (renders at the current
-    // scale), or CSS-preview if already mounted (no re-render, no device resize).
-    for (let i = r.start; i <= r.end; i++) {
-      const existing = this._slots.get(i);
-      if (!existing) {
-        const slot = this._acquireSlot();
-        this._positionSlot(slot, i, r);
-        this._slots.set(i, slot);
-        this._renderSlot(i, slot);
-      } else {
-        this._previewSlot(existing, i, r);
-      }
-    }
-    this._emitVisiblePageChange(r);
-  }
+  private _previewVisible(): void { this._scroller.preview(); }
 
   /**
    * CSS-preview a single already-mounted slot at the new geometry (design §7): the
@@ -2038,26 +1938,8 @@ export class DocxScrollViewer implements ZoomableViewer {
    */
   private _previewSlot(slot: PageSlot, i: number, r: VisibleRange): void {
     this._positionSlot(slot, i, r);
-    // Stretch the existing bitmap to the new CSS box (device buffer untouched).
-    slot.canvas.style.width = `${this._pageWidthPx(i)}px`;
-    slot.canvas.style.height = `${this._pageHeightPx(i)}px`;
-    if (slot.renderedScale > 0) {
-      const ratio = this._scale / slot.renderedScale;
-      if (slot.textLayer) {
-        slot.textLayer.style.transformOrigin = '0 0';
-        // The wrapper has already moved to the new layout dimensions. Keep the
-        // overlay's box at its last committed dimensions while scaling it;
-        // otherwise width/height:100% resolve against the NEW wrapper and the
-        // transform applies the zoom ratio a second time. Besides mis-sizing the
-        // overlay, that transformed border box becomes scrollable overflow. In
-        // worker mode each page settles independently, so the document extent
-        // would then shrink page-by-page and could strand the viewport over blank
-        // space. The transformed box below is exactly the current page box:
-        // (new / ratio) × ratio = new.
-        slot.textLayer.style.width = `${this._pageWidthPx(i) / ratio}px`;
-        slot.textLayer.style.height = `${this._pageHeightPx(i) / ratio}px`;
-        slot.textLayer.style.transform = `scale(${ratio})`;
-      }
+    const ratio = previewSlotHost(slot, this._pageWidthPx(i), this._pageHeightPx(i), this._scale);
+    if (ratio !== null) {
       if (slot.commentMargin) this._commentUi?.previewReadOnlyCommentMargin(slot.commentMargin, ratio);
       for (const marker of slot.commentTintLayer?.children ?? []) {
         if ((marker as HTMLElement).dataset.ooxmlCommentMarker === undefined) continue;
@@ -2077,22 +1959,13 @@ export class DocxScrollViewer implements ZoomableViewer {
 
   /** Restore a text overlay after its transient CSS zoom preview. */
   private _clearTextLayerPreview(layer: HTMLDivElement): void {
-    layer.style.transform = '';
-    layer.style.transformOrigin = '';
-    layer.style.width = '100%';
-    layer.style.height = '100%';
+    clearTextLayerPreview(layer);
   }
 
   /** (Re)schedule the debounced settle re-render (design §7 mechanism 2). Resets
    *  the timer on every call so a burst of `setScale` dispatches ONE settle
    *  ZOOM_SETTLE_MS after the LAST call. Cleared in `destroy()`. */
-  private _scheduleSettle(): void {
-    if (this._settleTimer !== null) clearTimeout(this._settleTimer);
-    this._settleTimer = setTimeout(() => {
-      this._settleTimer = null;
-      this._settleRender();
-    }, ZOOM_SETTLE_MS);
-  }
+  private _scheduleSettle(): void { this._scroller.scheduleSettle(ZOOM_SETTLE_MS); }
 
   /** Full-resolution settle re-render of the visible window (design §7 mechanisms
    *  2+3). Re-renders each mounted slot at the current scale via the double-buffer
@@ -2101,15 +1974,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  runs off-thread via `_renderSlotBitmap`) and clear the preview transform.
    *  Dispatched at the CURRENT epoch; the existing epoch gate discards it if a
    *  later `setScale` supersedes it mid-render. */
-  private _settleRender(): void {
-    if (this._destroyed || !this._doc || this._doc.pageCount === 0) return;
-    for (const [i, slot] of [...this._slots]) {
-      // Skip slots already at the current scale (a slot that entered the window
-      // during the burst mounted fresh at the current scale — nothing to settle).
-      if (slot.renderedScale === this._scale) continue;
-      this._refreshSlotAtomically(i, slot);
-    }
-  }
+  private _settleRender(): void { this._scroller.settle(); }
 
   /**
    * Refresh one mounted slot without exposing an intermediate blank frame.
@@ -2824,7 +2689,7 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
   get topVisiblePage(): number {
-    return this._lastRange?.topIndex ?? 0;
+    return this._scroller.lastRange?.topIndex ?? 0;
   }
 
   /** @internal test hook: page indices currently mounted. */
@@ -3074,12 +2939,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     // (design §7 mechanism 2). `_destroyed` also guards `_settleRender`, but
     // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
     // deterministic.
-    if (this._settleTimer !== null) {
-      clearTimeout(this._settleTimer);
-      this._settleTimer = null;
-    }
-    for (const [idx, slot] of [...this._slots]) this._recycleSlot(idx, slot);
-    this._free.length = 0;
+    this._scroller.destroy();
     this._documentOwner.close();
     this._wrapper.remove();
   }

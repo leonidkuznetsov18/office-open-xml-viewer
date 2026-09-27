@@ -687,20 +687,6 @@ describe('PptxScrollViewer — layout + virtualization (T2)', () => {
     void dom;
   });
 
-  it('recycles slots on scroll without unbounded canvas growth (pool reuse)', () => {
-    const { v, scrollHost } = setup(50);
-    v.relayout();
-    const initialMount = scrollHost.children.length;
-    // Scroll far down and fire the scroll listener repeatedly.
-    for (let top = 0; top <= 4000; top += 400) {
-      scrollHost.scrollTop = top;
-      scrollHost.dispatch('scroll');
-    }
-    // The DOM child count (spacer + mounted slots) must stay bounded — the pool
-    // reuses slots rather than appending a new canvas per slide.
-    expect(scrollHost.children.length).toBeLessThanOrEqual(initialMount + 2);
-  });
-
   it('scrolling far then back reuses pooled slot wrappers (bounded distinct allocations)', () => {
     const { v, scrollHost } = setup(50);
     v.relayout();
