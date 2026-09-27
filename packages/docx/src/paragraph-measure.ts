@@ -4,6 +4,7 @@ import {
 } from './layout-context.js';
 import {
   buildSegments,
+  fontFamilyPitchesByClasses,
   getDefaultFontSize,
   isGridLineRule,
   layoutLines,
@@ -231,6 +232,7 @@ export function measureParagraph(
 
   const segments = buildSegments(paragraph.runs, {
     ...environment,
+    fontFamilyPitches: fontFamilyPitchesByClasses.get(fontFamilyClasses),
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
   });

@@ -527,6 +527,23 @@ export function wordIsOverflowPunctuation(
   return parentRunHasLatinText && LATIN_WORD_OVERFLOW_PUNCTUATION.has(character);
 }
 
+/** ECMA-376 §17.3.1.21 permits a closing mark beyond the paragraph extent.
+ * A Word-produced Japanese fixed-pitch table control pulls a full-width closing
+ * parenthesis and its preceding CJK glyph into the line when their measured
+ * excess is at most one ideographic cell. Synthetic narrower/disabled
+ * boundaries and Word body controls ending in 、 or 。 are counterexamples.
+ * Keep this observed pair rule separate from the normative kinsoku split. */
+export function wordPullsClosingParenthesisPair(input: Readonly<{
+  readonly overflowPunct: boolean;
+  readonly fixedPitch: boolean;
+  readonly punctuation: string;
+  readonly excessPx: number;
+  readonly ideographicCellPx: number;
+}>): boolean {
+  return input.overflowPunct && input.fixedPitch && input.punctuation === '）'
+    && input.excessPx <= input.ideographicCellPx;
+}
+
 /** Compatibility projection governed by {@link WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT}. */
 export function wordCandidateFitWidthPx(input: Readonly<{
   widthPx: number;

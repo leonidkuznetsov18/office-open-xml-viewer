@@ -85,6 +85,33 @@ function isText(s: LayoutSeg): s is LayoutTextSeg {
 }
 
 describe('§17.3.2.35 run charSpacing survives into the paint-scale advance', () => {
+  it('uses Word measured Japanese pitch for a signed spacing run', () => {
+    // Word-owned OOXML controls with a Japanese run and w:spacing values
+    // -8, -4, 0, and +4 twentieth-points measure 8.92, 9.32, 9.72,
+    // and 10.12 pt between glyph origins. The zero-width-grid and
+    // grid-disabled controls preserve the same 0.4 pt change per 0.2 pt
+    // authored spacing. The Latin and untagged routes retain §17.3.2.35.
+    const japanese = { script: 'eastAsia' as const, eastAsiaLanguage: 'ja-JP', eastAsianFixedPitch: true as const };
+    expect(charSpacingDeltaPx(textSeg('あ', { ...japanese, charSpacing: -0.2 }) as LayoutTextSeg, 1))
+      .toBeCloseTo(-0.4, 8);
+    expect(charSpacingDeltaPx(textSeg('あ', { ...japanese, charSpacing: 0.2 }) as LayoutTextSeg, 1))
+      .toBeCloseTo(0.4, 8);
+    expect(charSpacingDeltaPx(textSeg('あ', { ...japanese, charSpacing: 0 }) as LayoutTextSeg, 1))
+      .toBe(0);
+    expect(charSpacingDeltaPx(textSeg('a', { script: 'ascii', charSpacing: -0.2 }) as LayoutTextSeg, 1))
+      .toBeCloseTo(-0.2, 8);
+    expect(charSpacingDeltaPx(textSeg('あ', { script: 'eastAsia', eastAsiaLanguage: 'zh-CN', charSpacing: -0.2 }) as LayoutTextSeg, 1))
+      .toBeCloseTo(-0.2, 8);
+    expect(charSpacingDeltaPx(textSeg('あ', {
+      script: 'eastAsia', eastAsiaLanguage: 'ja-JP', charSpacing: -0.2,
+    }) as LayoutTextSeg, 1)).toBeCloseTo(-0.2, 8);
+
+    const stamp = layoutLines(makeLinearCtx(), [
+      textSeg('あ'.repeat(10), { ...japanese, charSpacing: -0.2 }),
+    ], 56.5, 0, 1);
+    expect(stamp).toHaveLength(1);
+  });
+
   it('the scale-1 stamp already folds charSpacing into the advance (baseline)', () => {
     const ctx = makeLinearCtx();
     const stamp = layoutLines(ctx, makeSegs(), WIDE, 0, 1);

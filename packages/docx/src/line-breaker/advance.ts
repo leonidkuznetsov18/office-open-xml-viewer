@@ -89,10 +89,22 @@ export function charSpacingDeltaPx(seg: LayoutTextSeg, scale: number): number {
 
 
 /** The uniform paint/measure pitch contributed by run-authored `w:spacing`.
- * Document-level punctuation compression is a one-time trailing-cell advance
- * adjustment, not a per-glyph Canvas letter-spacing value. */
+ * ECMA-376 §17.3.2.35 defines one authored pitch per character. Word's
+ * Japanese East Asian route instead paints twice that pitch: Word-created
+ * controls at -0.4, -0.2, 0 and +0.2 pt moved glyph origins by -0.8, -0.4,
+ * 0 and +0.4 pt against the zero control on the fixed-pitch MS Mincho face.
+ * The same -0.2 result persisted with the character grid disabled, so this
+ * is not a grid adjustment. A variable-pitch East Asian face is a VRT
+ * counterexample to applying the fixed-pitch rule across all Japanese text;
+ * it retains the specified pitch pending its own Word boundary matrix.
+ * Document-level punctuation compression remains a one-time
+ * trailing-cell advance adjustment, not per-glyph Canvas letter spacing. */
 export function effectiveCharacterSpacingPt(seg: LayoutTextSeg): number {
-  return seg.charSpacing ?? 0;
+  const authoredPt = seg.charSpacing ?? 0;
+  return seg.script === 'eastAsia' && seg.eastAsianFixedPitch === true
+    && /^ja(?:-|$)/iu.test(seg.eastAsiaLanguage ?? '')
+    ? authoredPt * 2
+    : authoredPt;
 }
 
 

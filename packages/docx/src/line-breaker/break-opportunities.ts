@@ -11,6 +11,7 @@ import { EAST_ASIAN_RE, nextTabStop } from '../layout/text.js';
 import {
   wordIsOverflowPunctuation,
   wordIdeographicSpaceLineEndAllowanceCount,
+  wordPullsClosingParenthesisPair,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -1023,23 +1024,39 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // paragraph extents. The isolated compatibility projection resolves the
   // language-specific set and its precedence over kinsoku at this internal
   // CJK split.
-  const hangingSplit =
-    overflowPunct &&
-    rawSplit < allChars.length &&
-    (breakerState.currentLine.length > 0 || rawSplit > 0) &&
+  const isHangingPunctuation = (index: number): boolean =>
     wordIsOverflowPunctuation(
-      allChars[rawSplit],
+      allChars[index],
       s.eastAsiaLanguage,
       s.overflowPunctuationEastAsianRun === true,
       s.script === 'ascii' || s.script === 'highAnsi',
       s.script === 'complexScript',
       s.overflowPunctuationBidiLanguage,
-    )
+    );
+  const hangingSplit =
+    overflowPunct &&
+    rawSplit < allChars.length &&
+    (breakerState.currentLine.length > 0 || rawSplit > 0) &&
+    isHangingPunctuation(rawSplit)
       ? rawSplit + 1
+      : null;
+  // The Office-observed pair boundary is isolated in line-compatibility;
+  // this branch supplies its measured line and ideographic-cell advances.
+  const pairedHangingSplit =
+    overflowPunct && hangingSplit === null && rawSplit > 0 && rawSplit + 1 < allChars.length &&
+    !isHangingPunctuation(rawSplit) && isHangingPunctuation(rawSplit + 1) &&
+    wordPullsClosingParenthesisPair({
+      overflowPunct,
+      fixedPitch: s.eastAsianFixedPitch === true,
+      punctuation: allChars[rawSplit + 1],
+      excessPx: strAdvance(s, allChars.slice(0, rawSplit + 2).join('')) - available,
+      ideographicCellPx: strAdvance(s, '一'),
+    })
+      ? rawSplit + 2
       : null;
   const proposedSplit = extendThroughTrailingIdeographicSpaces(
     allChars,
-    hangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
+    hangingSplit ?? pairedHangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
     paragraphFinalIdeographicSpaceTail && maximumIdeographicSpaceHang === 0
       ? 0
       : maximumIdeographicSpaceHang,

@@ -4,6 +4,7 @@ import type { ParagraphLayoutContext } from '../layout-context.js';
 import {
   buildFont,
   buildSegments,
+  fontFamilyPitchesByClasses,
   hasCJKBreakOpportunity,
   layoutLines,
   segAdvanceWidth,
@@ -479,6 +480,9 @@ export function measureParagraphIntrinsicWidths(
 
   const segments = mergeCompatibleTextSegments(buildSegments(paragraph.runs, {
     ...environment,
+    fontFamilyPitches: fontFamilyPitchesByClasses.get(
+      measurer.fontFamilyClasses as Record<string, string>,
+    ),
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
   }));

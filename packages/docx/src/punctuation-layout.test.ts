@@ -81,9 +81,10 @@ function lines(
   width: number,
   overflowPunct: boolean,
   characterGrid?: DocGridCtx,
+  canvasContext = context(),
 ): LayoutLine[] {
   return layoutLines(
-    context(),
+    canvasContext,
     segments,
     width,
     0,
@@ -349,6 +350,27 @@ describe('ECMA-376 East-Asian punctuation fit', () => {
     }), 20, false);
     expect(disabled).toHaveLength(2);
     expect(disabled.map(textOf)).toEqual(['甲', '乙．']);
+  });
+
+  it('keeps an East Asian closing mark with its preceding glyph at a bounded line edge', () => {
+    const make = (text = '甲乙）丙') => (buildSegments([textRun(text)], {
+      pageIndex: 0,
+      totalPages: 1,
+    }) as LayoutTextSeg[]).map((segment) => ({ ...segment, eastAsianFixedPitch: true as const }));
+    const weighted = context();
+    const originalMeasure = weighted.measureText.bind(weighted);
+    const widths: Record<string, number> = { 甲: 12, 乙: 9, '）': 3, '。': 3, 丙: 10 };
+    Object.defineProperty(weighted, 'measureText', {
+      value: (value: string) => ({
+        ...originalMeasure(value),
+        width: [...value].reduce((sum, character) => sum + (widths[character] ?? 10), 0),
+      }),
+    });
+
+    expect(textOf(lines(make(), 14, true, undefined, weighted)[0])).toBe('甲乙）');
+    expect(textOf(lines(make(), 13, true, undefined, weighted)[0])).toBe('甲');
+    expect(textOf(lines(make(), 14, false, undefined, weighted)[0])).toBe('甲');
+    expect(textOf(lines(make('甲乙。丙'), 14, true, undefined, weighted)[0])).toBe('甲');
   });
 
   it('does not uniformly compress a Japanese middle dot', () => {

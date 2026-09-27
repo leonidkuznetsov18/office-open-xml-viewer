@@ -32,6 +32,7 @@ import {
   wordExternalLinkSyntaxBreakOffsets,
 } from '../layout/line-compatibility.js';
 import { type LayoutSeg, type LayoutTextSeg, type LineLayoutEnvironment } from './model.js';
+import { fontTableFact } from './font-routes.js';
 import { charScaleFactor, retainHorizontalPunctuationInkClearance } from './advance.js';
 import {
   COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION,
@@ -1232,6 +1233,10 @@ function emitResolvedTextSegment(
   segs.push({
     text,
     script: resolvedScript,
+    ...(resolvedScript === 'eastAsia' && eaFontFamily && environment.fontFamilyPitches
+      && fontTableFact(environment.fontFamilyPitches, eaFontFamily) === 'fixed'
+      ? { eastAsianFixedPitch: true as const }
+      : {}),
     ...(widthBalanceGridDeltaFactor !== undefined
       ? {
           // §17.15.3.3 defines the SBCS:DBCS width ratio as 1:2; the

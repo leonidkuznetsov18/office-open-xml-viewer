@@ -201,6 +201,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
    *  `ctx.letterSpacing` delta on BOTH measure and paint (measure==paint), on top
    *  of any docGrid / justify delta. Absent ⇒ 0. */
   charSpacing?: number;
+  /** §17.8.3.14 fontTable declares the resolved East Asian face fixed-pitch.
+   * Word's observed Japanese spacing projection is bounded to this class. */
+  eastAsianFixedPitch?: true;
   /** ECMA-376 §17.15.1.18 document-level full-width character compression.
    * Each entry belongs to one shaped grapheme and adjusts the advance after its
    * UTF-16 end offset. Keeping the complete list preserves contextual shaping
@@ -565,6 +568,8 @@ export interface LineLayoutEnvironment {
   /** §17.15.3.3 w:balanceSingleByteDoubleByteWidth document compatibility switch. */
   readonly balanceSingleByteDoubleByteWidth?: boolean;
   readonly resolvedLocalFonts?: Readonly<Record<string, ResolvedFontMetric>>;
+  /** ECMA-376 §17.8.3.14 per-family pitch from fontTable.xml. */
+  readonly fontFamilyPitches?: Readonly<Record<string, string>>;
   readonly layoutServices?: LayoutServices;
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   /** ECMA-376 §17.15.1.18 document-wide full-width character compression. */
