@@ -1,4 +1,4 @@
-import { copyModelSourceBytes, decodeDataUrl, WasmParserHost } from '@silurus/ooxml-core';
+import { decodeDataUrl, WasmParserHost } from '@silurus/ooxml-core';
 import {
   decodeOoxmlResourceUsage,
   resourcePolicyForWasm,
@@ -115,7 +115,8 @@ self.onmessage = async (
         preflightBuilder = null;
         let bootstrap: PresentationBootstrap;
         if (request.source) {
-          const { WorkerPresentationSourceOwner } = await import('./internal/worker-presentation-source.js');
+          if (!request.sourceOwnerUrl) throw new TypeError('PPTX source owner URL is missing');
+          const { WorkerPresentationSourceOwner } = await import(/* @vite-ignore */ request.sourceOwnerUrl) as typeof import('./internal/worker-presentation-source.js');
           source = new WorkerPresentationSourceOwner(host);
           await source.openModelSource(
             new Uint8Array(request.buffer),
@@ -165,7 +166,7 @@ self.onmessage = async (
           ? source.extractMedia(request.path)
           : host.run(() => host.archive!.extract_media(request.path));
         const bytes = source
-          ? copyModelSourceBytes(media)
+          ? source.copyBytes(media)
           : media.buffer as ArrayBuffer;
         post({ kind: 'mediaExtracted', id, bytes }, [bytes]);
         return;
@@ -173,7 +174,7 @@ self.onmessage = async (
 
       if (request.kind === 'extractImage') {
         const bytes = source
-          ? source.execute((current) => copyModelSourceBytes(current.extract_image(request.path)))
+          ? source.extractImage(request.path)
           : host.run(() => archive.extract_image(request.path).buffer as ArrayBuffer);
         post({ kind: 'imageExtracted', id, bytes }, [bytes]);
         return;
@@ -184,7 +185,7 @@ self.onmessage = async (
           ? source.extractFont(request.path)
           : host.run(() => host.archive!.extract_font(request.path));
         const bytes = source
-          ? copyModelSourceBytes(font)
+          ? source.copyBytes(font)
           : font.buffer as ArrayBuffer;
         post({ kind: 'fontExtracted', id, bytes }, [bytes]);
         return;

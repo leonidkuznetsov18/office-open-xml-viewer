@@ -88,9 +88,12 @@ vi.mock('./wasm/pptx_parser.js', () => ({
 }));
 vi.mock('@silurus/ooxml-core', async (importOriginal) => ({
   ...await importOriginal<typeof import('@silurus/ooxml-core')>(),
-  openModelSourceModule: (...args: unknown[]) => openSourceMock(...args),
   loadOfficeFontFallbacks: fontMocks.load,
   unloadOfficeFontFallbacks: fontMocks.unload,
+}));
+vi.mock('@silurus/ooxml-core/internal/model-source', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@silurus/ooxml-core/internal/model-source')>(),
+  openModelSourceModule: (...args: unknown[]) => openSourceMock(...args),
 }));
 vi.mock('./google-fonts', async (importOriginal) => ({
   ...await importOriginal<typeof import('./google-fonts')>(),
@@ -155,7 +158,7 @@ describe('pptx render-worker.ts — init failure never hangs a request (AR4)', (
     const fake = await loadRenderWorker();
     fake.onmessage?.({ data: {
       kind: 'parse', id: 40, buffer: new ArrayBuffer(4), resourcePolicy,
-      source: modelSource,
+      source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
     } } as MessageEvent);
     await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
       kind: 'presentationReady', id: 40,
@@ -179,7 +182,7 @@ describe('pptx render-worker.ts — init failure never hangs a request (AR4)', (
     const fake = await loadRenderWorker();
     fake.onmessage?.({ data: {
       kind: 'parse', id: 42, buffer: new ArrayBuffer(4), resourcePolicy,
-      source: modelSource,
+      source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
     } } as MessageEvent);
     await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
       kind: 'error', id: 42, message: expect.stringContaining('render bootstrap trap'),

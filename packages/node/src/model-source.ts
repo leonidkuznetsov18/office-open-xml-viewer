@@ -1,12 +1,12 @@
 import {
   beginModelSourceLoad,
   openModelSourceModule,
-  resolveOoxmlContainer,
   selectModelSource,
   type ModelSource,
   type ModelSourceTarget,
   type OpenedModelSourceModule,
-} from '@silurus/ooxml-core';
+} from '@silurus/ooxml-core/internal/model-source';
+import { resolveOoxmlContainer } from '@silurus/ooxml-core';
 
 /** One Node input: an opened model-source archive, or resolved OOXML bytes. */
 export type NodeSessionInput<TArchive> =

@@ -15,13 +15,10 @@ import {
 } from '@silurus/ooxml-core/worker';
 import {
   acquireDocxNodeDocument,
-  acquireDocxSessionFromArchive,
   normalizeDocxDocumentModel,
   normalizeLayoutOptions,
   materializeDocumentPullLayoutSession,
   materializeDocumentPullSession,
-  validateDocxModelSourceArchive,
-  validateDocxModelSourceViewDefaults,
   type AcquiredDocxNodeDocument,
   type DocxNodeAcquisitionOptions,
   type DocxNodePullIdentity,
@@ -40,7 +37,6 @@ import {
 } from './render.ts';
 import { createLazyWasmModule, resolveWasm } from './wasm-loader.ts';
 import { usingOwnedSession } from '@silurus/ooxml-core/internal/owned-session';
-import { resolveNodeSessionInput } from './model-source.ts';
 
 const getDocxWasmModule = createLazyWasmModule(() => resolveWasm(
     import.meta.url,
@@ -217,6 +213,14 @@ async function acquireDocxInput<TResult>(
   acquired: AcquiredDocxNodeDocument<TResult>;
   viewDefaults: Readonly<{ showTrackedChanges?: boolean }>;
 }>> {
+  const [{ resolveNodeSessionInput }, {
+    acquireDocxSessionFromArchive,
+    validateDocxModelSourceArchive,
+    validateDocxModelSourceViewDefaults,
+  }] = await Promise.all([
+    import('./model-source.ts'),
+    import('@silurus/ooxml-docx/internal/model-source-session'),
+  ]);
   const input = await resolveNodeSessionInput(
     buffer,
     'docx',

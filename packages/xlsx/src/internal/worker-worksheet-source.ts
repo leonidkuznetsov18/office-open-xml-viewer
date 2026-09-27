@@ -1,16 +1,18 @@
+import { isWasmTrap, type WasmParserHost } from '@silurus/ooxml-core';
 import {
+  copyModelSourceBytes,
   hasModelSourceCapability,
-  isWasmTrap,
   openModelSourceModule,
   requireModelSourceArchiveMethods,
   unsupportedModelSourceCapability,
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
-  type WasmParserHost,
-} from '@silurus/ooxml-core';
+} from '@silurus/ooxml-core/internal/model-source';
 import type { WorksheetCursorArchive } from '../worksheet-pull-worker.js';
 import {
   configureHostLayout,
+  isHostLayoutResult,
+  requestHostLayoutFromPage,
   type HostLayoutArchive,
   type HostLayoutFont,
 } from './host-layout.js';
@@ -83,6 +85,25 @@ interface OwnedModelSource {
 export class WorkerWorksheetSourceOwner<TArchive extends OoxmlWorksheetArchive> {
   private modelSource: OwnedModelSource | undefined;
   private measuredMaximumDigitWidth: number | undefined;
+
+  copyBytes(value: Uint8Array): ArrayBuffer {
+    return copyModelSourceBytes(value);
+  }
+
+  isHostLayoutResult(value: unknown): boolean {
+    return isHostLayoutResult(value);
+  }
+
+  requestHostLayoutFromPage(
+    scope: Parameters<typeof requestHostLayoutFromPage>[0],
+    font: HostLayoutFont,
+  ): Promise<number | undefined> {
+    return requestHostLayoutFromPage(scope, font);
+  }
+
+  extractImage(path: string): ArrayBuffer {
+    return this.execute((archive) => this.copyBytes(archive.extract_image(path)));
+  }
 
   constructor(
     private readonly ooxmlHost: WasmParserHost<TArchive>,

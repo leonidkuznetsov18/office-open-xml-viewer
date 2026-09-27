@@ -9,7 +9,6 @@
  */
 import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
-  copyModelSourceBytes,
   decodeDataUrl,
   preloadGoogleFonts,
   loadOfficeFontFallbacks,
@@ -227,9 +226,10 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // Both sources drain the same pull/ACK state machine locally. OOXML
       // construction/calls use host.run; a model source applies its own trap
       // boundary. Neither route creates a monolithic model JSON value.
-      let viewDefaults: DocxModelSourceViewDefaults = {};
+      let viewDefaults: DocxModelSourceViewDefaults | undefined;
       if (req.source) {
-        const { WorkerDocumentSourceOwner } = await import('./internal/worker-document-source.js');
+        if (!req.sourceOwnerUrl) throw new TypeError('DOCX source owner URL is missing');
+        const { WorkerDocumentSourceOwner } = await import(/* @vite-ignore */ req.sourceOwnerUrl) as typeof import('./internal/worker-document-source.js');
         sourceOwner = new WorkerDocumentSourceOwner(host);
         viewDefaults = await sourceOwner.openModelSource(bytes, req.source, req.sourceTransfer);
         if (requestedGeneration !== parseGeneration) {
@@ -370,7 +370,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // model source's own view default, else the renderer default (final
       // view). The parse request is this worker's own structured clone, so the
       // resolved view is recorded on it for every later use in this load.
-      req.showTrackedChanges ??= viewDefaults.showTrackedChanges;
+      if (viewDefaults) req.showTrackedChanges ??= viewDefaults.showTrackedChanges;
       const layoutOptions = normalizeLayoutOptions(
         req.currentDateMs,
         req.defaultCurrentDateMs,
@@ -505,7 +505,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // wasm-bindgen returns an owned full-span Uint8Array; transfer its
       // standalone buffer directly, matching the parse worker contract.
       const bytes = executeArchive((archive) => sourceOwner
-        ? copyModelSourceBytes(archive.extract_image(req.path))
+        ? sourceOwner.copyBytes(archive.extract_image(req.path))
         : archive.extract_image(req.path).buffer as ArrayBuffer);
       post({ type: 'imageExtracted', id, bytes }, [bytes]);
       return;

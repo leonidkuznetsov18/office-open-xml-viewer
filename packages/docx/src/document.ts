@@ -14,8 +14,6 @@ import {
   dropDecodedBitmapCache,
   resolveOoxmlContainer,
   toArrayBuffer,
-  beginModelSourceLoad,
-  selectModelSource,
   type AdmittedModelSourceLoad,
   type LoadOptions as CoreLoadOptions,
   type ProgressiveLayoutPartial,
@@ -297,10 +295,16 @@ function sameLayoutView(
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
   load: AdmittedModelSourceLoad,
-): { source?: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[] } {
+): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
+  // The source owner is an opt-in ESM sidecar. An inline OOXML worker contains
+  // only this URL and imports the sidecar after a source is selected.
+  const sourceOwnerUrl = new URL(
+    import.meta.env.DEV ? './internal/worker-document-source.ts' : './docx-source-worker.mjs',
+    import.meta.url,
+  ).href;
   return load.transfer.length > 0
-    ? { source: load.module, sourceTransfer: load.transfer }
-    : { source: load.module };
+    ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
+    : { source: load.module, sourceOwnerUrl };
 }
 
 function deferred<T>(): Deferred<T> {
@@ -491,6 +495,7 @@ export class DocxDocument {
     // runs and the OOXML path below is unchanged.
     let sourceLoad: AdmittedModelSourceLoad | undefined;
     if (opts.modelSources !== undefined) {
+      const { selectModelSource, beginModelSourceLoad } = await import('@silurus/ooxml-core/internal/model-source');
       const selected = selectModelSource(opts.modelSources, 'docx', new Uint8Array(buffer));
       if (selected) sourceLoad = beginModelSourceLoad(selected, 'docx');
     }

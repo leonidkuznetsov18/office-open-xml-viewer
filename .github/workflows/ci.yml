@@ -148,6 +148,8 @@ jobs:
         run: |
           node --test scripts/check-core-legacy-boundary.test.mjs
           pnpm check:core-legacy-boundary
+          node --test scripts/check-model-source-ooxml-path.test.mjs
+          pnpm check:model-source-ooxml-path
 
       # The WASM parsers are git-ignored build output; the TypeScript packages
       # import their generated .d.ts/.js, so typecheck requires building them first.
@@ -176,6 +178,7 @@ jobs:
       - name: Public API compatibility
         run: |
           pnpm build
+          pnpm check:model-source-lazy-graph
           pnpm check:production-render-workers
           pnpm check:optional-chart-ex
           pnpm check:optional-tiff

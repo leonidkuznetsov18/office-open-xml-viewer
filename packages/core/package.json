@@ -23,6 +23,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./worker": "./src/worker/index.ts",
+    "./internal/model-source": "./src/source/model-source.ts",
     "./types": "./src/types/common.ts",
     "./testing": "./src/testing/index.ts",
     "./internal/bounded-async-lru-cache": "./src/internal/bounded-async-lru-cache.ts",

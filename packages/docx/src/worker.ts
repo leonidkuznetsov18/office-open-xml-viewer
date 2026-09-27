@@ -1,6 +1,5 @@
 import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
-  copyModelSourceBytes,
   decodeDataUrl,
   WasmParserHost,
 } from '@silurus/ooxml-core';
@@ -106,7 +105,8 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // value, cross to Window and require consumer ACK.
       let viewDefaults: { showTrackedChanges?: boolean } | undefined;
       if (req.source) {
-        const { WorkerDocumentSourceOwner } = await import('./internal/worker-document-source.js');
+        if (!req.sourceOwnerUrl) throw new TypeError('DOCX source owner URL is missing');
+        const { WorkerDocumentSourceOwner } = await import(/* @vite-ignore */ req.sourceOwnerUrl) as typeof import('./internal/worker-document-source.js');
         source ??= new WorkerDocumentSourceOwner(host);
         viewDefaults = await source.openModelSource(bytes, req.source, req.sourceTransfer);
         if (requestedGeneration !== parseGeneration) {
@@ -143,7 +143,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // transfer it directly. A second `new Uint8Array(bytes).slice()` would just
       // re-copy the whole entry for nothing.
       const out = source
-        ? source.execute((archive) => copyModelSourceBytes(archive.extract_image(req.path)))
+        ? source.extractImage(req.path)
         : host.run(() => {
           const archive = host.archive;
           if (!archive) throw new Error('No docx loaded');

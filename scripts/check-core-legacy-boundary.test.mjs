@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { findViolations, isGuardedPath } from './check-core-legacy-boundary.mjs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createTypeScriptResolver, findViolations, isGuardedPath } from './check-core-legacy-boundary.mjs';
+import { legacyBundleBoundary } from '../vite.config.ts';
 
 const rules = (text) => findViolations([{ path: 'packages/docx/src/x.ts', text }]).map((v) => v.rule);
 
@@ -31,6 +35,58 @@ test('decodes escaped static, dynamic, require and re-export module specifiers',
   ]) {
     assert.deepEqual(rules(code), ['legacy-package'], code);
   }
+});
+
+test('rejects computed imports and requires, import attributes and type-level imports', () => {
+  for (const code of [
+    "import('@silurus/ooxml-' + 'legacy' + '-converter');",
+    "import(`@silurus/ooxml-${'legacy'}-converter`);",
+    "const p = '@silurus/ooxml-\\u006cegacy-converter'; require(p);",
+  ]) {
+    assert.ok(rules(code).includes('computed-module'), code);
+  }
+  assert.deepEqual(rules("import('@silurus/ooxml-\\u006cegacy-converter/package.json', { with: { type: 'json' } });"), ['legacy-package']);
+  assert.deepEqual(rules("type X = import('@silurus/ooxml-\\u006cegacy-converter').X;"), ['legacy-package']);
+  assert.deepEqual(rules('require(variable);'), ['computed-module']);
+  assert.deepEqual(rules('import(variable);'), ['computed-module']);
+  assert.deepEqual(
+    findViolations([{ path: 'packages/docx/src/new-probe.test.ts', text: 'import(variable);' }]).map((v) => v.rule),
+    ['computed-module'],
+  );
+});
+
+test('TypeScript module resolution catches a path alias into the legacy package', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ooxml-boundary-'));
+  try {
+    mkdirSync(join(root, 'packages/core/src'), { recursive: true });
+    mkdirSync(join(root, 'packages/legacy-converter/src'), { recursive: true });
+    writeFileSync(join(root, 'packages/legacy-converter/src/index.ts'), 'export const reader = 1;');
+    writeFileSync(join(root, 'packages/core/tsconfig.json'), JSON.stringify({
+      compilerOptions: { baseUrl: '../..', paths: { '@reader': ['packages/legacy-converter/src/index.ts'] }, moduleResolution: 'bundler', module: 'esnext' },
+    }));
+    const violations = findViolations(
+      [{ path: 'packages/core/src/probe.ts', text: "import { reader } from '@reader';" }],
+      { resolveModule: createTypeScriptResolver(root) },
+    );
+    assert.deepEqual(violations.map((v) => v.rule), ['legacy-package']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('built chunk graph rejects a resolved legacy module even after aliasing', () => {
+  const hook = legacyBundleBoundary().generateBundle;
+  assert.equal(typeof hook, 'function');
+  const invoke = (moduleId) => hook.call(
+    { error(message) { throw new Error(message); } },
+    {},
+    { 'entry.js': { type: 'chunk', modules: { [moduleId]: {} } } },
+  );
+  assert.doesNotThrow(() => invoke('/repo/packages/core/src/index.ts'));
+  assert.throws(
+    () => invoke('/repo/packages/legacy-converter/src/index.ts'),
+    /forbidden legacy module/,
+  );
 });
 
 test('guards source, parser and manifest files but not generated or private output', () => {

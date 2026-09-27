@@ -16,8 +16,6 @@ import {
   dropSvgImageCache,
   resolveOoxmlContainer,
   toArrayBuffer,
-  beginModelSourceLoad,
-  selectModelSource,
   type AdmittedModelSourceLoad,
   type LoadOptions as CoreLoadOptions,
   type MathRenderer,
@@ -81,7 +79,6 @@ import {
   XlsxWorksheetPullClient,
 } from './worksheet-pull-client.js';
 import { applyAutoRowHeights, bindXlsxOfficeFontRoutes, bindXlsxWorksheetOfficeFontRoutes, computeMdw, inheritSheetRenderCache, getGridGeometryForWorksheet, pinXlsxGridGeometry } from './renderer.js';
-import { respondToHostLayoutRequest } from './internal/host-layout.js';
 import {
   assertDelimitedTextSourceBytes,
   resolveDelimitedTextOptions,
@@ -122,10 +119,14 @@ interface RetainedFontSet {
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
   load: AdmittedModelSourceLoad,
-): { source?: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[] } {
+): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
+  const sourceOwnerUrl = new URL(
+    import.meta.env.DEV ? './internal/worker-worksheet-source.ts' : './xlsx-source-worker.mjs',
+    import.meta.url,
+  ).href;
   return load.transfer.length > 0
-    ? { source: load.module, sourceTransfer: load.transfer }
-    : { source: load.module };
+    ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
+    : { source: load.module, sourceOwnerUrl };
 }
 
 export interface LoadOptions extends CoreLoadOptions {
@@ -213,6 +214,11 @@ export class XlsxWorkbook {
     mode: 'main' | 'worker',
     wasmUrlOverride?: string | URL,
     initializeWasm = true,
+    sourceHostLayout?: (
+      post: (message: unknown) => void,
+      message: unknown,
+      measure: (font: { readonly family: string; readonly sizePt: number; readonly bold: boolean; readonly italic: boolean }) => number | undefined,
+    ) => boolean,
   ) {
     this._mode = mode;
     if (!worker) return;
@@ -233,7 +239,7 @@ export class XlsxWorkbook {
       onUnsolicited: (res) => {
         // A model source's parse worker asks the page, which owns the
         // renderer in this mode, to measure its Normal font (host-layout.ts).
-        if (respondToHostLayoutRequest(
+        if (sourceHostLayout?.(
           (message) => worker.postMessage(message),
           res,
           (font) => computeMdw(
@@ -397,6 +403,7 @@ export class XlsxWorkbook {
     // runs and the OOXML path is unchanged.
     let sourceLoad: AdmittedModelSourceLoad | undefined;
     if (opts.modelSources !== undefined) {
+      const { selectModelSource, beginModelSourceLoad } = await import('@silurus/ooxml-core/internal/model-source');
       const selected = selectModelSource(opts.modelSources, 'xlsx', new Uint8Array(buffer));
       if (selected) sourceLoad = beginModelSourceLoad(selected, 'xlsx');
     }
@@ -413,7 +420,10 @@ export class XlsxWorkbook {
         : new InlineWorker();
     let wb: XlsxWorkbook | undefined;
     try {
-      wb = new XlsxWorkbook(worker, mode, opts.wasmUrl, sourceLoad === undefined);
+      const sourceHostLayout = sourceLoad && mode === 'main'
+        ? (await import('./internal/host-layout.js')).respondToHostLayoutRequest
+        : undefined;
+      wb = new XlsxWorkbook(worker, mode, opts.wasmUrl, sourceLoad === undefined, sourceHostLayout);
       wb.metrics = metrics;
       await wb._load(
         buffer,

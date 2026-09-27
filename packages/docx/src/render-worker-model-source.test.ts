@@ -31,9 +31,12 @@ const workerMocks = vi.hoisted(() => ({
 }));
 vi.mock('@silurus/ooxml-core', async importOriginal => ({
   ...await importOriginal<typeof import('@silurus/ooxml-core')>(),
-  openModelSourceModule: (...args: unknown[]) => workerMocks.opens.at(-1)!(...args),
   loadOfficeFontFallbacks: workerMocks.metrics,
   unloadOfficeFontFallbacks: workerMocks.unloadLocal,
+}));
+vi.mock('@silurus/ooxml-core/internal/model-source', async importOriginal => ({
+  ...await importOriginal<typeof import('@silurus/ooxml-core/internal/model-source')>(),
+  openModelSourceModule: (...args: unknown[]) => workerMocks.opens.at(-1)!(...args),
 }));
 vi.mock('./wasm/docx_parser.js', () => ({
   default: workerMocks.parserInit, reinit: vi.fn(), DocxArchive: class {},
@@ -253,6 +256,7 @@ function modelSource(
 function parseRequest(id: number) {
   return {
     type: 'parse' as const, id, data: new ArrayBuffer(1), source: descriptor,
+    sourceOwnerUrl: './internal/worker-document-source.js',
     resourcePolicy: {}, useGoogleFonts: false, defaultCurrentDateMs: 0,
   };
 }

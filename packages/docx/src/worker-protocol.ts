@@ -114,6 +114,7 @@ export type RenderWorkerRequest =
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
       useGoogleFonts?: boolean;
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;
       defaultCurrentDateMs: number;

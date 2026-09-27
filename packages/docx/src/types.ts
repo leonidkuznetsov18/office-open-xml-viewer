@@ -1642,6 +1642,7 @@ export type WorkerRequest =
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
     }
   | { type: 'extractImage'; id: number; path: string }
   | { type: 'resourceUsage'; id: number }
