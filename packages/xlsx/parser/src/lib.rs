@@ -1360,7 +1360,11 @@ fn mark_run_colors(runs: Option<&mut [Run]>, normal: Option<&Option<String>>) {
         return;
     };
     for font in runs.iter_mut().filter_map(|run| run.font.as_mut()) {
-        font.normal_color = &font.authored_color == normal;
+        // Only an authored `<color>` can confirm the match: a run without one
+        // is automatic, measured against a `theme="1"` Normal; the boundary
+        // where Normal also lacks `<color>` is not measured and keeps the
+        // run's own (automatic) color.
+        font.normal_color = font.authored_color.is_some() && &font.authored_color == normal;
     }
 }
 
@@ -5991,12 +5995,13 @@ mod phonetic_tests {
 
     const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 
-    /// Rich-text runs are marked own-colored exactly when their `<rPr>`
-    /// `<color>` is authored differently from the Normal style font's
-    /// (typed comparison) or absent; runs without `<rPr>` are left to the
-    /// cell. Measured in Excel against a table style font color.
+    /// Rich-text runs are marked `normal_color` exactly when their `<rPr>`
+    /// carries a `<color>` authored like the Normal style font's (typed
+    /// comparison). Runs without `<rPr>`, without `<color>` (even when Normal
+    /// has none), or with another color, and every run when Normal cannot be
+    /// resolved, stay unmarked and keep their own color.
     #[test]
-    fn rich_runs_mark_colors_that_differ_from_normal() {
+    fn rich_runs_mark_only_colors_authored_like_normal() {
         let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><color theme="1"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
         let normal = styles::normal_font_color_key(&roxmltree::Document::parse(styles).unwrap());
         let xml = format!(
@@ -6020,6 +6025,17 @@ mod phonetic_tests {
         // Without a resolvable Normal style no run is marked.
         let mut ss = parse_si_node(&doc.root_element(), &[]);
         mark_run_colors(ss.runs.as_deref_mut(), None);
+        assert!(ss
+            .runs
+            .unwrap()
+            .iter()
+            .all(|run| run.font.as_ref().is_none_or(|f| !f.normal_color)));
+
+        // Normal without <color>: a run without <color> is not confirmed.
+        let bare = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><sz val="11"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let bare_normal = styles::normal_font_color_key(&roxmltree::Document::parse(bare).unwrap());
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), bare_normal.as_ref());
         assert!(ss
             .runs
             .unwrap()
