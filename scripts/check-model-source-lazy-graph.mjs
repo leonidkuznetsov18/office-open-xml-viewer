@@ -198,27 +198,40 @@ function assertNoSourceRuntime(code, name) {
 // Baseline: the pre-feature OOXML production build at 776237df. The small
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
+// Rebased DOCX and Node entries against the clean 470743cb build for #1557
+// (merged by PR #1586):
+// sliced layout, stepwise finalization, and viewer load ownership add 4,728
+// DOCX bytes; shared layout validation/freezing adds 398 Node bytes. The
+// optional model-source runtime remains outside both eager entry graphs.
+// The ordinary DOCX render worker grows by 289 bytes from those same layout
+// changes. PR #1590's projection consolidation then brings the measured main
+// graph at aec306b6 to 2,533,239 DOCX, 2,579,716 Node, and 2,047,181 worker
+// bytes (+200, -20, and -54 respectively versus the #1557 guard values).
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  // Against fed37873, the shared viewer moves 37,917 rendered module bytes
-  // into core, while the DOCX viewer/find modules shrink by 28,790 and the
-  // format layout/comment adapters add 6,317. Vite factors these into a
-  // shared 31,779-byte chunk in place of a 2,992-byte boundary chunk. The
-  // measured DOCX static graph grows 11,302 bytes (36 files); across DOCX and
-  // PPTX together, unique static bytes fall by 4,483. No optional source
-  // runtime or new worker code enters the graph.
-  docx: { entry: 2_536_948, inline: 31_624, budget: 2_800 },
+  // #1566's explicit-state line-breaker and table measurement add 18,002
+  // DOCX bytes against aec306b6 (2,533,239 -> 2,551,241) in 36 chunks:
+  // 18,953 and 2,501 rendered module bytes respectively, offset by minification.
+  // That main (036ddd31) also includes #1586 sliced layout and #1590 projection
+  // consolidation. #1561 adds another 11,595
+  // static bytes after moving scroll/find behavior into core collaborators:
+  // 44,570 bytes in new shared/adapter modules offset 28,748 removed bytes
+  // from the old viewer/find modules; other graph changes account for the rest.
+  // The static chunk count remains 36 and the dispatch allowance is unchanged.
+  docx: { entry: 2_562_836, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
   xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
-  // PPTX uses the same core chunk. Its viewer/find modules shrink by 30,988
-  // rendered bytes and format layout/media/comment adapters add 10,379;
-  // its measured static graph grows 13,002 bytes (38 files).
-  pptx: { entry: 1_837_264, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_575_997, budget: 3_600 },
+  // PPTX #1561 adds 13,299 static bytes against main (036ddd31): 48,632
+  // bytes in shared/adapter modules offset 30,988 removed viewer/find bytes,
+  // with the remaining graph changes preserving the 38 static chunks.
+  // The dispatch allowance is unchanged.
+  pptx: { entry: 1_839_457, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_597_718, budget: 3_600 },
 });
-// The XLSX render worker adds 536 bytes for explicit worksheet eviction;
-// DOCX and PPTX worker payloads are unchanged.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_046_946];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
+// DOCX worker includes PRs #1586 and #1590 plus the #1566 line-breaker split
+// (+19,183 bytes against aec306b6). Workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_066_364];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
