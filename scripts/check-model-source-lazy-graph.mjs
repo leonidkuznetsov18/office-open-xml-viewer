@@ -231,8 +231,11 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction and
 // 51 bytes for table-style font color precedence. The DOCX worker includes
 // PRs #1586 and #1590 plus the #1566 line-breaker split (+19,183 bytes
-// against aec306b6). Workers retain zero allowance.
-const OOXML_RENDER_WORKERS = [1_416_999, 1_458_524, 2_066_364];
+// against aec306b6). Rounding Excel serials to the nearest millisecond adds
+// 24 bytes to every worker, and per-section date/time format detection with
+// text-section exclusion another 618 to the XLSX worker. Workers retain zero
+// allowance.
+const OOXML_RENDER_WORKERS = [1_417_641, 1_458_548, 2_066_388];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
