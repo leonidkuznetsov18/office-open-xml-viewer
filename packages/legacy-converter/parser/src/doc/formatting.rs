@@ -101,6 +101,8 @@ pub struct Formatting<'a> {
     pub characters: Index<'a>,
     paragraphs: Index<'a>,
     fonts: Vec<String>,
+    /// [MS-DOC] 2.9.80/2.9.82 FFID.prq from each SttbfFfn record.
+    font_pitches: BTreeMap<String, String>,
     defaults: Properties,
     styles: Vec<Option<Style<'a>>>,
     paragraph_cache: BTreeMap<(usize, Option<TableFormattingKey>), Properties>,
@@ -144,7 +146,7 @@ impl<'a> Formatting<'a> {
     }
 
     pub fn read(word: &'a [u8], table: &'a [u8], data: &'a [u8]) -> Result<Self, String> {
-        let fonts = read_fonts(fkp::table_part(word, table, 0x112)?)?;
+        let (fonts, font_pitches) = read_fonts(fkp::table_part(word, table, 0x112)?)?;
         let (defaults, styles) = read_styles(fkp::table_part(word, table, 0xa2)?)?;
         let characters = Index::read(word, table, Kind::Character)?;
         let paragraphs = Index::read(word, table, Kind::Paragraph)?;
@@ -154,6 +156,7 @@ impl<'a> Formatting<'a> {
             characters,
             paragraphs,
             fonts,
+            font_pitches,
             defaults,
             styles,
             paragraph_cache: BTreeMap::new(),
@@ -180,6 +183,10 @@ impl<'a> Formatting<'a> {
             return Err(unsupported("Word paragraph mark outside formatting ranges"));
         }
         fkp::paragraph_style(&self.paragraphs, end_fc)
+    }
+
+    pub(in crate::doc) fn direct_font_family_pitches(&self) -> BTreeMap<String, String> {
+        self.font_pitches.clone()
     }
 
     pub(in crate::doc) fn configure_table_styles(
@@ -803,9 +810,9 @@ impl<'a> Formatting<'a> {
     }
 }
 
-fn read_fonts(bytes: &[u8]) -> Result<Vec<String>, String> {
+fn read_fonts(bytes: &[u8]) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeMap::new()));
     }
     let count = u16_at(bytes, 0)? as usize;
     if count > 0x7ff0 || u16_at(bytes, 2)? != 0 {
@@ -813,6 +820,8 @@ fn read_fonts(bytes: &[u8]) -> Result<Vec<String>, String> {
     }
     let mut offset = 4;
     let mut fonts = Vec::with_capacity(count);
+    let mut pitches = BTreeMap::new();
+    let mut conflicting = BTreeSet::new();
     for _ in 0..count {
         let size = *bytes
             .get(offset)
@@ -832,13 +841,35 @@ fn read_fonts(bytes: &[u8]) -> Result<Vec<String>, String> {
         if units.is_empty() || units.len() * 2 + 2 > name.len() {
             return Err(unsupported("unterminated or empty Word font name"));
         }
-        fonts.push(
-            String::from_utf16(&units)
-                .map_err(|_| unsupported("invalid Unicode Word font name"))?,
-        );
+        let family = String::from_utf16(&units)
+            .map_err(|_| unsupported("invalid Unicode Word font name"))?;
+        // [MS-DOC] 2.9.80 FFID.prq is the low two bits of FFN.ffid:
+        // 0=default, 1=fixed, 2=variable. 3 is reserved; preserve the
+        // family name for run resolution but leave its pitch unknown.
+        let pitch = match font[0] & 0x03 {
+            0 => Some("default"),
+            1 => Some("fixed"),
+            2 => Some("variable"),
+            _ => None,
+        };
+        if !conflicting.contains(&family) {
+            if let Some(pitch) = pitch {
+                match pitches.get(&family) {
+                    Some(previous) if previous != pitch => {
+                        pitches.remove(&family);
+                        conflicting.insert(family.clone());
+                    }
+                    None => {
+                        pitches.insert(family.clone(), pitch.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fonts.push(family);
         offset += size;
     }
-    Ok(fonts)
+    Ok((fonts, pitches))
 }
 
 fn read_styles(bytes: &[u8]) -> Result<(Properties, Vec<Option<Style<'_>>>), String> {
@@ -954,14 +985,48 @@ mod tests {
     fn reads_font_names_after_ffn_metadata_not_as_latin1() {
         let mut bytes = vec![1, 0, 0, 0];
         let mut font = vec![0; 39];
+        font[0] = 0x3d; // FFID.prq=fixed, FFID.ff=modern.
         for unit in "日本語 Font\0".encode_utf16() {
             font.extend(unit.to_le_bytes());
         }
         bytes.push(font.len() as u8);
         bytes.extend(font);
-        assert_eq!(read_fonts(&bytes).unwrap(), ["日本語 Font"]);
+        let (names, pitches) = read_fonts(&bytes).unwrap();
+        assert_eq!(names, ["日本語 Font"]);
+        assert_eq!(
+            pitches.get("日本語 Font").map(String::as_str),
+            Some("fixed")
+        );
         bytes.pop();
         assert!(read_fonts(&bytes).is_err());
+    }
+
+    #[test]
+    fn retains_ffid_pitch_boundaries_without_guessing_reserved_values() {
+        let mut bytes = vec![4, 0, 0, 0];
+        for (name, ffid) in [
+            ("Default", 0),
+            ("Fixed", 1),
+            ("Variable", 2),
+            ("Reserved", 3),
+        ] {
+            let mut font = vec![0; 39];
+            font[0] = ffid;
+            for unit in format!("{name}\0").encode_utf16() {
+                font.extend(unit.to_le_bytes());
+            }
+            bytes.push(font.len() as u8);
+            bytes.extend(font);
+        }
+        let (names, pitches) = read_fonts(&bytes).unwrap();
+        assert_eq!(names, ["Default", "Fixed", "Variable", "Reserved"]);
+        assert_eq!(pitches.get("Default").map(String::as_str), Some("default"));
+        assert_eq!(pitches.get("Fixed").map(String::as_str), Some("fixed"));
+        assert_eq!(
+            pitches.get("Variable").map(String::as_str),
+            Some("variable")
+        );
+        assert!(!pitches.contains_key("Reserved"));
     }
 
     fn empty() -> Formatting<'static> {
@@ -969,6 +1034,7 @@ mod tests {
             characters: Index::default(),
             paragraphs: Index::default(),
             fonts: vec![],
+            font_pitches: BTreeMap::new(),
             defaults: Properties::default(),
             styles: vec![],
             paragraph_cache: BTreeMap::new(),

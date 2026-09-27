@@ -97,6 +97,7 @@ import {
   wordUseFeLayoutInheritedGridHeightPx,
   wordCandidateFitWidthPx,
   wordIsOverflowPunctuation,
+  wordPullsClosingParenthesisPair,
   wordDocumentCharacterCompressionApplies,
   RTL_PRIMARY_SUBTAGS,
   wordJapanesePunctuationRetainedExtentPt,
@@ -301,6 +302,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
    *  `ctx.letterSpacing` delta on BOTH measure and paint (measure==paint), on top
    *  of any docGrid / justify delta. Absent ⇒ 0. */
   charSpacing?: number;
+  /** §17.8.3.14 fontTable declares the resolved East Asian face fixed-pitch.
+   * Word's observed Japanese spacing projection is bounded to this class. */
+  eastAsianFixedPitch?: true;
   /** ECMA-376 §17.15.1.18 document-level full-width character compression.
    * Each entry belongs to one shaped grapheme and adjusts the advance after its
    * UTF-16 end offset. Keeping the complete list preserves contextual shaping
@@ -734,6 +738,8 @@ export interface LineLayoutEnvironment {
   /** §17.15.3.3 w:balanceSingleByteDoubleByteWidth document compatibility switch. */
   readonly balanceSingleByteDoubleByteWidth?: boolean;
   readonly resolvedLocalFonts?: Readonly<Record<string, ResolvedFontMetric>>;
+  /** ECMA-376 §17.8.3.14 per-family pitch from fontTable.xml. */
+  readonly fontFamilyPitches?: Readonly<Record<string, string>>;
   readonly layoutServices?: LayoutServices;
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   /** ECMA-376 §17.15.1.18 document-wide full-width character compression. */
@@ -1202,10 +1208,19 @@ export function charSpacingDeltaPx(seg: LayoutTextSeg, scale: number): number {
 }
 
 /** The uniform paint/measure pitch contributed by run-authored `w:spacing`.
- * Document-level punctuation compression is a one-time trailing-cell advance
- * adjustment, not a per-glyph Canvas letter-spacing value. */
+ * ECMA-376 §17.3.2.35 defines one authored pitch per character. Word's
+ * Japanese fixed-pitch route instead paints twice that pitch: Word-created
+ * controls at -0.4, -0.2, 0 and +0.2 pt moved glyph origins by -0.8, -0.4,
+ * 0 and +0.4 pt against the zero control, even with the grid disabled.
+ * Variable-pitch and non-Japanese runs retain the specified pitch.
+ * Document-level punctuation compression remains a one-time trailing-cell
+ * advance adjustment, not per-glyph Canvas letter spacing. */
 export function effectiveCharacterSpacingPt(seg: LayoutTextSeg): number {
-  return seg.charSpacing ?? 0;
+  const authoredPt = seg.charSpacing ?? 0;
+  return seg.script === 'eastAsia' && seg.eastAsianFixedPitch === true
+    && /^ja(?:-|$)/iu.test(seg.eastAsiaLanguage ?? '')
+    ? authoredPt * 2
+    : authoredPt;
 }
 
 export function punctuationCompressionTotalPt(seg: LayoutTextSeg): number {
@@ -3555,6 +3570,10 @@ export function buildSegments(
       segs.push({
         text,
         script: resolvedScript,
+        ...(resolvedScript === 'eastAsia' && eaFontFamily && environment.fontFamilyPitches
+          && fontTableFact(environment.fontFamilyPitches, eaFontFamily) === 'fixed'
+          ? { eastAsianFixedPitch: true as const }
+          : {}),
         ...(widthBalanceGridDeltaFactor !== undefined
           ? {
               // §17.15.3.3 defines the SBCS:DBCS width ratio as 1:2; the
@@ -6660,22 +6679,37 @@ export function layoutLines(
       // paragraph extents. The isolated compatibility projection resolves the
       // language-specific set and its precedence over kinsoku at this internal
       // CJK split.
+      const isHangingPunctuation = (index: number): boolean => wordIsOverflowPunctuation(
+        allChars[index],
+        s.eastAsiaLanguage,
+        s.overflowPunctuationEastAsianRun === true,
+        s.script === 'ascii' || s.script === 'highAnsi',
+        s.script === 'complexScript',
+        s.overflowPunctuationBidiLanguage,
+      );
       const hangingSplit = overflowPunct
         && rawSplit < allChars.length
         && (currentLine.length > 0 || rawSplit > 0)
-        && wordIsOverflowPunctuation(
-          allChars[rawSplit],
-          s.eastAsiaLanguage,
-          s.overflowPunctuationEastAsianRun === true,
-          s.script === 'ascii' || s.script === 'highAnsi',
-          s.script === 'complexScript',
-          s.overflowPunctuationBidiLanguage,
-        )
+        && isHangingPunctuation(rawSplit)
           ? rawSplit + 1
+          : null;
+      // The Office-observed pair boundary is isolated in line-compatibility;
+      // this branch supplies its measured line and ideographic-cell advances.
+      const pairedHangingSplit = overflowPunct && hangingSplit === null
+        && rawSplit > 0 && rawSplit + 1 < allChars.length
+        && !isHangingPunctuation(rawSplit) && isHangingPunctuation(rawSplit + 1)
+        && wordPullsClosingParenthesisPair({
+          overflowPunct,
+          fixedPitch: s.eastAsianFixedPitch === true,
+          punctuation: allChars[rawSplit + 1],
+          excessPx: strAdvance(s, allChars.slice(0, rawSplit + 2).join('')) - available,
+          ideographicCellPx: strAdvance(s, '一'),
+        })
+          ? rawSplit + 2
           : null;
       const proposedSplit = extendThroughTrailingIdeographicSpaces(
         allChars,
-        hangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
+        hangingSplit ?? pairedHangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
         paragraphFinalIdeographicSpaceTail && maximumIdeographicSpaceHang === 0
           ? 0
           : maximumIdeographicSpaceHang,

@@ -256,6 +256,9 @@ pub(super) fn build(
         headers: final_headers.unwrap_or_default(),
         footers: final_footers.unwrap_or_default(),
         settings,
+        // [MS-DOC] 2.9.80/2.9.82: preserve FFID.prq so the shared DOCX
+        // layout can distinguish fixed from variable East Asian faces.
+        font_family_pitches: facts.formatting.direct_font_family_pitches(),
         document_typography_settings,
         footnotes,
         endnotes,
