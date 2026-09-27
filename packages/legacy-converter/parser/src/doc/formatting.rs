@@ -1350,6 +1350,51 @@ mod tests {
     }
 
     #[test]
+    fn conditional_table_style_explicit_character_toggles_reach_run_and_direct_wins() {
+        let mut formatting = observed_table_style_formatting();
+        formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(
+            table_style_condition::FIRST_ROW,
+            &[
+                0x35, 0x08, 1, // bold
+                0x36, 0x08, 1, // italic
+                0x5c, 0x08, 1, // complex-script bold
+                0x5d, 0x08, 0, // complex-script italic
+            ],
+        ));
+        let key = TableFormattingKey {
+            selected_style: 0,
+            matches: [
+                None,
+                None,
+                None,
+                Some(table_style_condition::FIRST_ROW),
+                None,
+            ],
+        };
+        let styled = formatting
+            .direct_text_run(7, Some(key), 0, 0, &[], "x".into())
+            .unwrap()
+            .unwrap();
+        assert!(styled.bold);
+        assert!(styled.italic);
+        assert_eq!(styled.bold_cs, Some(true));
+        assert_eq!(styled.italic_cs, Some(false));
+
+        let direct = formatting
+            .direct_text_run(7, Some(key), 0, 1, &[&[0x35, 0x08, 0]], "x".into())
+            .unwrap()
+            .unwrap();
+        assert!(!direct.bold);
+        assert!(!formatting.unsupported_character_properties);
+    }
+
+    #[test]
     fn table_chpx_ascii_and_high_ansi_fonts_inherit_and_direct_fonts_win() {
         fn font_axes(index: u16) -> Vec<u8> {
             [

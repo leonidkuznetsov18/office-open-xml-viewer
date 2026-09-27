@@ -719,6 +719,18 @@ fn parse_conditional(
             let baseline = patch.clone();
             patch.apply(code, value, &baseline)?;
             has_supported_character = true;
+        } else if matches!(code, 0x0835 | 0x0836 | 0x085c | 0x085d) {
+            // [MS-DOC] 2.6.1 and 2.9.327: these are ordinary character
+            // toggles even when carried by a table-style CCnf. Explicit
+            // 0/1 operands set their respective Latin/complex-script axes;
+            // style-relative 0x80/0x81 requires a separate cascade control.
+            if !matches!(value, [0] | [1]) {
+                profile.unsupported_character = true;
+                continue;
+            }
+            let baseline = patch.clone();
+            patch.apply(code, value, &baseline)?;
+            has_supported_character = true;
         } else if matches!(code, 0x4a4f | 0x4a50 | 0x4a51 | 0x4a5e) {
             // Word 16.112.4 controls with seven reordered FFN records leave
             // conditional font markers fixed while unconditional CRgFtc values
