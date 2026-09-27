@@ -205,6 +205,9 @@ fn range_to_a1(range: &CellRange) -> String {
 fn cell_display(cell: &Cell) -> String {
     match &cell.value {
         CellValue::Text { text, .. } => text.clone(),
+        // The previous JSON projection turned non-finite numbers into null,
+        // which displayed as empty and could not match a text search.
+        CellValue::Number { number } if !number.is_finite() => String::new(),
         CellValue::Number { number } => {
             if number.fract() == 0.0 && number.abs() < 1e15 {
                 format!("{}", *number as i64)
@@ -582,6 +585,93 @@ mod sample_tests {
     use super::*;
     use std::io::{Cursor, Read, Write};
     use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
+
+    #[test]
+    fn numeric_cells_keep_blank_non_finite_values_and_exact_finite_display() {
+        let source = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../xlsx/public/demo/sample-1.xlsx"
+        ));
+        let mut archive = ZipArchive::new(Cursor::new(source.as_slice())).unwrap();
+        let mut output = ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut part = archive.by_index(index).unwrap();
+            let name = part.name().to_string();
+            let mut bytes = Vec::new();
+            if name == "xl/worksheets/sheet1.xml" {
+                bytes.extend_from_slice(
+                    br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1">
+    <c r="A1"><v>NaN</v></c><c r="B1"><f>1/0</f><v>inf</v></c>
+    <c r="C1"><v>-inf</v></c><c r="D1"><v>123456789012345.67</v></c>
+  </row></sheetData>
+</worksheet>"#,
+                );
+            } else {
+                part.read_to_end(&mut bytes).unwrap();
+            }
+            output
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            output.write_all(&bytes).unwrap();
+        }
+        let path = std::env::temp_dir().join(format!(
+            "ooxml-mcp-numeric-{}-{}.xlsx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, output.finish().unwrap().into_inner()).unwrap();
+        let path = path.to_str().unwrap();
+
+        let range: Value = serde_json::from_str(&XlsxTools::xlsx_get_cell_range(Parameters(
+            XlsxCellRangeParam {
+                path: path.into(),
+                sheet: "0".into(),
+                range: "A1:D1".into(),
+            },
+        )))
+        .unwrap();
+        let cells = range["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[0]["value"], "");
+        assert_eq!(cells[1]["value"], "");
+        assert_eq!(cells[2]["value"], "");
+        assert_eq!(cells[3]["value"], "123456789012345.67");
+
+        let formulas: Value =
+            serde_json::from_str(&XlsxTools::xlsx_get_formulas(Parameters(XlsxSheetParam {
+                path: path.into(),
+                sheet: "0".into(),
+            })))
+            .unwrap();
+        assert_eq!(formulas["formulas"][0]["ref"], "B1");
+        assert_eq!(formulas["formulas"][0]["cachedValue"], "");
+
+        for query in ["nan", "inf"] {
+            let found: Value =
+                serde_json::from_str(&XlsxTools::xlsx_search_cells(Parameters(XlsxSearchParam {
+                    path: path.into(),
+                    sheet: Some("0".into()),
+                    query: query.into(),
+                })))
+                .unwrap();
+            assert_eq!(found["matchCount"], 0, "unexpected match for {query}");
+        }
+        let found: Value =
+            serde_json::from_str(&XlsxTools::xlsx_search_cells(Parameters(XlsxSearchParam {
+                path: path.into(),
+                sheet: Some("0".into()),
+                query: "123456789012345.67".into(),
+            })))
+            .unwrap();
+        assert_eq!(found["matches"][0]["ref"], "D1");
+        assert_eq!(found["matches"][0]["value"], "123456789012345.67");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn sheet_errors_keep_single_and_all_sheet_wording() {
