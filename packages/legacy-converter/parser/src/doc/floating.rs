@@ -316,7 +316,7 @@ impl<'a> Store<'a> {
                 return Ok(Some(drawing));
             }
             let align = direct_alignment(anchor, &placement)?;
-            if matches!(anchor.wrapping, 0 | 4 | 5) {
+            if anchor.wrapping == 0 {
                 return Err(unsupported(
                     "Word drawing shape uses an unsupported wrap contour",
                 ));
@@ -356,7 +356,7 @@ impl<'a> Store<'a> {
             // SPA provides an explicit, host-defined coordinate origin; aligned
             // positions are accepted only through `direct_alignment`.
             || (align.is_none() && (placement.horizontal != 0 || placement.vertical != 0))
-            || matches!(anchor.wrapping, 0 | 4 | 5)
+            || anchor.wrapping == 0
         {
             self.omitted = true;
             return Ok(None);
@@ -1200,7 +1200,7 @@ mod tests {
 
         for horizontal in 0u16..=2 {
             for vertical in 0u16..=2 {
-                for wrapping in 1u16..=3 {
+                for wrapping in 1u16..=5 {
                     let (word, mut table) = drawing_input(0xa00, 0);
                     let flags = (horizontal << 1) | (vertical << 3) | (wrapping << 5);
                     table[28..30].copy_from_slice(&flags.to_le_bytes());
@@ -1223,8 +1223,25 @@ mod tests {
                     assert_eq!(image.anchor_y_from_para, vertical == 2);
                     assert_eq!(
                         image.wrap_mode.as_deref(),
-                        Some(["", "topAndBottom", "square", "none"][wrapping as usize])
+                        Some(
+                            ["", "topAndBottom", "square", "none", "tight", "through"]
+                                [wrapping as usize]
+                        )
                     );
+                    let wrap = &image.anchor_acquisition.as_ref().unwrap().wrap;
+                    if wrapping >= 4 {
+                        assert!(matches!(
+                            wrap.kind,
+                            docx_model::AnchorWrapKindWire::Tight
+                                | docx_model::AnchorWrapKindWire::Through
+                        ));
+                        let polygon = wrap.polygon.as_ref().unwrap();
+                        assert_eq!(polygon.points.len(), 5);
+                        assert_eq!(polygon.points[0].x, Some(0));
+                        assert_eq!(polygon.points[2].x, Some(21600));
+                    } else {
+                        assert!(wrap.polygon.is_none());
+                    }
                 }
             }
         }

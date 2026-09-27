@@ -5,9 +5,10 @@ use super::{shape, unsupported, Content, Part, ResolvedDrawing, Store};
 use crate::doc::pictures::DirectPictureResource;
 use docx_model::{
     AnchorAcquisitionWire, AnchorAxisChoiceWire, AnchorAxisWire, AnchorBehaviorWire,
-    AnchorEdgesWire, AnchorExtentWire, AnchorGroupWire, AnchorResolvedChildFrameWire,
-    AnchorSimplePositionWire, AnchorValueStatusWire, AnchorWrapKindWire, AnchorWrapWire, ImageRun,
-    LineEnd, PathCmd, ShapeFill, ShapeRun,
+    AnchorEdgesWire, AnchorExtentWire, AnchorGroupWire, AnchorPointWire, AnchorPolygonSpaceWire,
+    AnchorPolygonWire, AnchorResolvedChildFrameWire, AnchorSimplePositionWire,
+    AnchorValueStatusWire, AnchorWrapKindWire, AnchorWrapWire, ImageRun, LineEnd, PathCmd,
+    ShapeFill, ShapeRun,
 };
 
 #[cfg(test)]
@@ -56,7 +57,39 @@ fn wrap_mode(wrapping: u8) -> &'static str {
         1 => "topAndBottom",
         2 => "square",
         3 => "none",
+        4 => "tight",
+        5 => "through",
         _ => unreachable!("unsupported wrap modes are rejected during resolution"),
+    }
+}
+
+fn implicit_wrap_polygon() -> AnchorPolygonWire {
+    // MS-ODRAW leaves a pWrapPolygonVertices-absent contour unspecified.
+    // Word controls with no authored vertices make tight and through
+    // pixel-identical where adjacent-text square differs (pages 3-4 of
+    // d10-vml-{tight,through,square}-text). The original and 0/1/13 anchor
+    // boundary controls keep the same drawn group and page count. Their
+    // placement is consistent with the full object envelope, used here as a
+    // bounded Word-compatibility inference for absent vertices. This does not
+    // define authored polygons or a generic OOXML default. Explicit
+    // pWrapPolygonVertices (MS-ODRAW 2.3.4.7, property 0x0383) remains gated
+    // by shape/group property validation until its points are decoded.
+    AnchorPolygonWire {
+        edited: false,
+        coordinate_space: AnchorPolygonSpaceWire {
+            width: 21600,
+            height: 21600,
+        },
+        points: [(0, 0), (21600, 0), (21600, 21600), (0, 21600), (0, 0)]
+            .into_iter()
+            .map(|(x, y)| AnchorPointWire {
+                x: Some(x),
+                y: Some(y),
+                raw_x: None,
+                raw_y: None,
+            })
+            .collect(),
+        invalid_point_count: 0,
     }
 }
 
@@ -274,7 +307,7 @@ impl Store<'_> {
             dist_bottom: facts.distances[3] as f64 / 12_700.0,
             dist_left: facts.distances[0] as f64 / 12_700.0,
             dist_right: facts.distances[2] as f64 / 12_700.0,
-            wrap_side: (facts.wrapping == 2).then(|| facts.side.into()),
+            wrap_side: matches!(facts.wrapping, 2 | 4 | 5).then(|| facts.side.into()),
             allow_overlap: facts.overlap,
             anchor_x_align: facts.align[0].map(str::to_owned),
             anchor_y_align: facts.align[1].map(str::to_owned),
@@ -475,15 +508,20 @@ fn acquisition(
             kind: match f.wrapping {
                 1 => AnchorWrapKindWire::TopAndBottom,
                 2 => AnchorWrapKindWire::Square,
+                4 => AnchorWrapKindWire::Tight,
+                5 => AnchorWrapKindWire::Through,
                 _ => AnchorWrapKindWire::None,
             },
             authored_kinds: vec![match f.wrapping {
                 1 => "wrapTopAndBottom",
                 2 => "wrapSquare",
+                4 => "wrapTight",
+                5 => "wrapThrough",
                 _ => "wrapNone",
             }
             .into()],
-            side: (f.wrapping == 2).then(|| f.side.into()),
+            side: matches!(f.wrapping, 2 | 4 | 5).then(|| f.side.into()),
+            polygon: matches!(f.wrapping, 4 | 5).then(implicit_wrap_polygon),
             ..AnchorWrapWire::default()
         },
         behavior: AnchorBehaviorWire {
@@ -562,6 +600,15 @@ impl Payload {
                 .ok_or("OUTPUT_TOO_LARGE")?,
         )?;
         self.strings(facts.wrap.authored_kinds.iter().map(Some))?;
+        if let Some(polygon) = &facts.wrap.polygon {
+            self.add(
+                polygon
+                    .points
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<AnchorPointWire>())
+                    .ok_or("OUTPUT_TOO_LARGE")?,
+            )?;
+        }
         if let Some(group) = &facts.group {
             self.add(group.child_source_id.capacity())?;
         }
@@ -689,7 +736,7 @@ fn direct_shape(
         dist_bottom: pt(facts.distances[3]),
         dist_left: pt(facts.distances[0]),
         dist_right: pt(facts.distances[2]),
-        wrap_side: (facts.wrapping == 2).then(|| facts.side.into()),
+        wrap_side: matches!(facts.wrapping, 2 | 4 | 5).then(|| facts.side.into()),
         anchor_acquisition: Some(acquisition),
         ..ShapeRun::default()
     };
