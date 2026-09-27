@@ -53,6 +53,7 @@
     "./internal/slot-scroller": "./src/viewer/slot-scroller.ts",
     "./internal/comment-margin-controller": "./src/viewer/comment-margin-controller.ts",
     "./internal/scroll-zoom-controller": "./src/viewer/scroll-zoom-controller.ts",
+    "./internal/selection-context-controller": "./src/viewer/selection-context-controller.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"

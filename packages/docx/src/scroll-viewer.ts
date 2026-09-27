@@ -20,6 +20,7 @@ import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/do
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
+import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { DocxDocument } from './document';
 import type { LoadOptions } from './document';
@@ -356,6 +357,42 @@ export class DocxScrollViewer implements ZoomableViewer {
     onExistingSlot: (index, slot, reportErrors) => this._renderSlot(index, slot, reportErrors),
   });
   private readonly _slots = this._scroller.slots;
+  private readonly _selection = new SelectionContextController<DocxSelectionContext, DocxElementContext, DocxDocument, PageSlot>({
+    wrapper: () => this._wrapper,
+    scrollHost: () => this._scrollHost,
+    slots: () => this._slots,
+    resource: () => this._doc,
+    destroyed: () => this._destroyed,
+    textSelectionEnabled: () => this._opts.enableTextSelection === true,
+    elementSelectionEnabled: () => this._opts.enableElementSelection === true,
+    textSelected: () => readDocxTextSelectionContext(
+      this._wrapper, this._wrapper.ownerDocument?.getSelection?.() ?? null,
+    ) !== null,
+    getContext: () => this.getSelectionContext(),
+    hitTest: (doc, pageIndex, xRatio, yRatio) => {
+      const size = doc.pageSize(pageIndex);
+      return doc.getElementContextAt(pageIndex, {
+        xPt: xRatio * size.widthPt, yPt: yRatio * size.heightPt,
+      }, {
+        currentDate: this._currentDate,
+        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
+        maxTextCharacters: MAX_DOCX_ELEMENT_TEXT_CHARACTERS,
+      });
+    },
+    outline: (doc, pageIndex, context) => {
+      if (context.pageIndex !== pageIndex) return null;
+      const size = doc.pageSize(pageIndex);
+      return {
+        x: context.bounds.xPt / size.widthPt,
+        y: context.bounds.yPt / size.heightPt,
+        width: context.bounds.widthPt / size.widthPt,
+        height: context.bounds.heightPt / size.heightPt,
+      };
+    },
+    onChange: (context) => this._opts.onSelectionContextChange?.(context),
+    onContextMenu: (event, getContext) => this._opts.onContextMenu?.({ originalEvent: event, getContext }),
+    reportError: (error) => this._reportRenderError(error),
+  });
   /** Cached per-page heights in px at the current scale (index-aligned). */
   private _heights: number[] = [];
   /** Prefix offsets rebuilt only when scale/page geometry changes. Pure scroll
@@ -375,12 +412,7 @@ export class DocxScrollViewer implements ZoomableViewer {
   /** Page prefix currently represented by the native scroll extent. */
   private _presentedPageCount = 0;
   private _scrollListener: (() => void) | null = null;
-  private _selectionChangeListener: (() => void) | null = null;
-  private _selectionContextKey = 'null';
-  private _elementClickListener: ((event: MouseEvent) => void) | null = null;
-  private _contextMenuListener: ((event: MouseEvent) => void) | null = null;
   private _commentOutsidePointerListener: ((event: PointerEvent) => void) | null = null;
-  private _elementContext: DocxElementContext | null = null;
   private _activeCommentId: string | null = null;
   private _activeCommentPage: number | null = null;
   private _commentUi: DocxCommentUiRuntime | null = null;
@@ -422,7 +454,6 @@ export class DocxScrollViewer implements ZoomableViewer {
     readonly slot: PageSlot;
     readonly connectorsOnly: boolean;
   }>();
-  private _elementHitGeneration = 0;
   /** Set by `destroy()`. Async render callbacks (main + worker) check it before
    *  reporting an error so a rejection that lands after teardown is swallowed
    *  rather than surfaced to a `onError` on a dead viewer. */
@@ -572,20 +603,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       }).catch((error) => this._reportRenderError(error));
     }
 
-    if (opts.enableTextSelection && (opts.onSelectionContextChange || opts.enableElementSelection)) {
-      this._selectionChangeListener = () => this._emitSelectionContextChange();
-      this._wrapper.ownerDocument.addEventListener('selectionchange', this._selectionChangeListener);
-    }
-    if (opts.enableElementSelection) {
-      this._elementClickListener = (event) => {
-        void this._onElementClick(event).catch((error) => this._reportRenderError(error));
-      };
-      this._scrollHost.addEventListener('click', this._elementClickListener);
-    }
-    if (opts.onContextMenu) {
-      this._contextMenuListener = (event) => this._onContextMenu(event);
-      this._scrollHost.addEventListener('contextmenu', this._contextMenuListener);
-    }
+    this._selection.bind(!!opts.onSelectionContextChange, !!opts.onContextMenu);
 
     this._scrollListener = () => this._onScroll();
     this._scrollHost.addEventListener('scroll', this._scrollListener);
@@ -597,7 +615,7 @@ export class DocxScrollViewer implements ZoomableViewer {
         this._activeCommentId = null;
         this._activeCommentPage = null;
         for (const [page, slot] of this._slots) this._redrawSlotComments(page, slot);
-        this._emitSelectionContextChange();
+        this._selection.emitChange();
       };
       this._wrapper.ownerDocument.addEventListener('pointerdown', this._commentOutsidePointerListener);
     }
@@ -670,7 +688,7 @@ export class DocxScrollViewer implements ZoomableViewer {
         onLayoutPartial: this._opts.onLayoutPartial,
         onLayoutComplete: this._opts.onLayoutComplete,
       }), (ownedDocument) => {
-        this._invalidateElementContext(false);
+        this._selection.invalidateElementContext(false);
         elementInvalidated = true;
         this._findRequestGeneration++;
         this._find.invalidate();
@@ -714,7 +732,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
       throw err instanceof Error ? err : new Error(String(err));
     }
-    if (elementInvalidated && !this._destroyed) this._emitSelectionContextChange();
+    if (elementInvalidated && !this._destroyed) this._selection.emitChange();
   }
 
   get pageCount(): number {
@@ -1210,7 +1228,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       slot.commentDecorationLayer.style.width = `${wpx + marginExtent}px`;
       slot.commentDecorationLayer.style.height = `${hpx}px`;
     }
-    this._redrawElementOutlineForSlot(i, slot);
+    this._selection.redrawOutlineForSlot(i, slot);
     // Horizontal placement (replaces the old CSS `left:0;right:0;margin:0 auto`
     // auto-centering, which cannot honour a left gutter). Centre the page in the
     // scroll viewport, but never let its left edge cross the left gutter: when the
@@ -2043,12 +2061,12 @@ export class DocxScrollViewer implements ZoomableViewer {
 
     this._activeCommentId = commentId;
     this._activeCommentPage = page;
-    this._elementContext = null;
+    this._selection.clearElementContext();
     this._scrollToPageTarget(page, targetRun, opts);
     for (const [mountedPage, slot] of this._slots) {
       this._redrawSlotComments(mountedPage, slot);
     }
-    this._emitSelectionContextChange();
+    this._selection.emitChange();
     return true;
   }
 
@@ -2177,11 +2195,11 @@ export class DocxScrollViewer implements ZoomableViewer {
         if (next === this._activeCommentId) return;
         this._activeCommentId = next;
         this._activeCommentPage = next ? page : null;
-        this._elementContext = null;
+        this._selection.clearElementContext();
         for (const [mountedPage, mountedSlot] of this._slots) {
           this._redrawSlotComments(mountedPage, mountedSlot);
         }
-        this._emitSelectionContextChange();
+        this._selection.emitChange();
       },
       this._commentMargin.zoom(),
       READ_ONLY_COMMENT_MARGIN_WIDTH_PX,
@@ -2402,121 +2420,9 @@ export class DocxScrollViewer implements ZoomableViewer {
           options,
         )
       : null;
-    return text ?? (this._elementContext
-      ? limitDocxElementContext(this._elementContext, options.maxTextCharacters)
+    return text ?? (this._selection.elementContext
+      ? limitDocxElementContext(this._selection.elementContext, options.maxTextCharacters)
       : null);
-  }
-
-  private _emitSelectionContextChange(): void {
-    const context = this.getSelectionContext();
-    if (context?.kind === 'text') {
-      this._elementHitGeneration++;
-      this._elementContext = null;
-      this._redrawElementOutlines();
-    }
-    const key = JSON.stringify(context);
-    if (key === this._selectionContextKey) return;
-    this._selectionContextKey = key;
-    this._opts.onSelectionContextChange?.(context ? structuredClone(context) : null);
-  }
-
-  private _setElementContext(context: DocxElementContext | null): void {
-    this._elementContext = context ? structuredClone(context) : null;
-    this._redrawElementOutlines();
-    this._emitSelectionContextChange();
-  }
-
-  private _invalidateElementContext(notify = true): void {
-    this._elementHitGeneration++;
-    this._elementContext = null;
-    this._redrawElementOutlines();
-    if (notify) this._emitSelectionContextChange();
-  }
-
-  private _redrawElementOutlines(): void {
-    for (const [page, slot] of this._slots) this._redrawElementOutlineForSlot(page, slot);
-  }
-
-  private _redrawElementOutlineForSlot(pageIndex: number, slot: PageSlot): void {
-    const context = this._elementContext;
-    const doc = this._doc;
-    if (!context || !doc || context.pageIndex !== pageIndex) {
-      renderCanvasElementOutline(slot.elementLayer, null);
-      return;
-    }
-    const page = doc.pageSize(pageIndex);
-    renderCanvasElementOutline(slot.elementLayer, {
-      x: context.bounds.xPt / page.widthPt,
-      y: context.bounds.yPt / page.heightPt,
-      width: context.bounds.widthPt / page.widthPt,
-      height: context.bounds.heightPt / page.heightPt,
-    });
-  }
-
-  private async _onElementClick(event: MouseEvent): Promise<void> {
-    if (this._destroyed || event.defaultPrevented || event.button !== 0) return;
-    await this._resolveContextAt(event);
-  }
-
-  private _onContextMenu(event: MouseEvent): void {
-    let context: Promise<DocxSelectionContext | null> | undefined;
-    this._opts.onContextMenu?.({
-      originalEvent: event,
-      getContext: () => context ??= this._resolveContextAt(event),
-    });
-  }
-
-  private async _resolveContextAt(event: MouseEvent): Promise<DocxSelectionContext | null> {
-    const doc = this._doc;
-    if (this._destroyed || !doc) return null;
-    if (this._opts.enableTextSelection && readDocxTextSelectionContext(
-      this._wrapper,
-      this._wrapper.ownerDocument?.getSelection?.() ?? null,
-    )) {
-      this._emitSelectionContextChange();
-      return this._destroyed ? null : this.getSelectionContext();
-    }
-    if (!this._opts.enableElementSelection) return this.getSelectionContext();
-    const target = event.target as Node | null;
-    const entry = [...this._slots].find(([, slot]) =>
-      target !== null && slot.wrapper.contains(target));
-    if (!entry) {
-      this._invalidateElementContext();
-      return null;
-    }
-    const [pageIndex, slot] = entry;
-    const rect = slot.canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
-      this._invalidateElementContext();
-      return null;
-    }
-    const localX = event.clientX - rect.left;
-    const localY = event.clientY - rect.top;
-    if (localX < 0 || localY < 0 || localX > rect.width || localY > rect.height) {
-      this._invalidateElementContext();
-      return null;
-    }
-    const generation = ++this._elementHitGeneration;
-    const pageSize = doc.pageSize(pageIndex);
-    let context: DocxElementContext | null;
-    try {
-      context = await doc.getElementContextAt(pageIndex, {
-        xPt: localX / rect.width * pageSize.widthPt,
-        yPt: localY / rect.height * pageSize.heightPt,
-      }, {
-        currentDate: this._currentDate,
-        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
-        maxTextCharacters: MAX_DOCX_ELEMENT_TEXT_CHARACTERS,
-      });
-    } catch (error) {
-      if (this._destroyed || generation !== this._elementHitGeneration || doc !== this._doc) {
-        return null;
-      }
-      throw error;
-    }
-    if (this._destroyed || generation !== this._elementHitGeneration || doc !== this._doc) return null;
-    this._setElementContext(context);
-    return this._destroyed ? null : this.getSelectionContext();
   }
 
   /**
@@ -2534,19 +2440,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._resetCommentNavigation();
     this._find.invalidate();
     this._findActive = false;
-    if (this._selectionChangeListener) {
-      this._wrapper.ownerDocument.removeEventListener('selectionchange', this._selectionChangeListener);
-      this._selectionChangeListener = null;
-    }
-    this._elementHitGeneration++;
-    if (this._elementClickListener) {
-      this._scrollHost.removeEventListener('click', this._elementClickListener);
-      this._elementClickListener = null;
-    }
-    if (this._contextMenuListener) {
-      this._scrollHost.removeEventListener('contextmenu', this._contextMenuListener);
-      this._contextMenuListener = null;
-    }
+    this._selection.destroy();
     if (this._commentOutsidePointerListener) {
       this._wrapper.ownerDocument.removeEventListener(
         'pointerdown',
@@ -2560,7 +2454,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     }
     this._commentGeometryScheduled = false;
     this._pendingCommentGeometry.clear();
-    this._elementContext = null;
+    this._selection.clearElementContext();
     if (this._scrollListener) {
       this._scrollHost.removeEventListener('scroll', this._scrollListener);
       this._scrollListener = null;
