@@ -1,5 +1,6 @@
 import type {
   BodyLayoutInput,
+  BodyLayoutSequenceEntryFor,
   BodyParagraphSourceInput,
 } from './body-layout-input.js';
 import { defineCompatibilityRule } from './compatibility.js';
@@ -264,7 +265,7 @@ export function wordEmptyKeepNextBridgesSuccessor(input: Readonly<{
 
 /** Compatibility projection governed by {@link WORD_CONTINUOUS_SECTION_MARK_SPACING}. */
 export function wordContinuousSectionRole(
-  sequence: BodyLayoutInput['sequence'],
+  sequence: readonly BodyLayoutSequenceEntryFor<Readonly<{ startType: string }>>[],
   index: number,
 ): BodyParagraphSourceInput['continuousSectionRole'] {
   const entry = sequence[index];

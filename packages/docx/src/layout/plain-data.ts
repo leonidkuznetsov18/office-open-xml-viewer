@@ -77,6 +77,10 @@ export function deepFreezePlainData<T>(
   value: T,
   seen = new WeakSet<object>(),
 ): DeepReadonly<T> {
+  return freezePlainDataGraph(value, seen, 0);
+}
+
+function freezePlainDataGraph<T>(value: T, seen: WeakSet<object>, depth: number): DeepReadonly<T> {
   if (value === null || typeof value !== 'object' || seen.has(value)) {
     // Non-finite geometry is fatal state; the check rides the walk that always
     // runs so it cannot be disabled with the development-only pre-pass.
@@ -94,25 +98,29 @@ export function deepFreezePlainData<T>(
   // array-per-node is pure garbage on a hot path.
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
-      deepFreezePlainData(value[index], seen);
+      freezePlainDataGraph(value[index], seen, depth + 1);
     }
     // Plain-data arrays carry index properties only; walking any stray extra
     // property too (rather than assuming the contract) means its subgraph can
     // never be left unfrozen when the development pre-pass did not run.
     for (const key in value) {
       if (String(Number(key)) !== key && Object.prototype.hasOwnProperty.call(value, key)) {
-        deepFreezePlainData((value as unknown as Record<string, unknown>)[key], seen);
+        freezePlainDataGraph((value as unknown as Record<string, unknown>)[key], seen, depth + 1);
       }
     }
   } else {
     for (const key in value) {
       if (Object.prototype.hasOwnProperty.call(value, key)) {
-        deepFreezePlainData((value as Record<string, unknown>)[key], seen);
+        freezePlainDataGraph((value as Record<string, unknown>)[key], seen, depth + 1);
       }
     }
   }
   Object.freeze(value);
-  frozenPlainData.add(value);
+  // Line and paragraph roots are reused across pagination passes, and their
+  // immediate children include placements. Deeper glyph geometry is generally
+  // unique to one root; branding every leaf drives WeakSet memory and GC on
+  // long documents without avoiding a later walk.
+  if (depth <= 2) frozenPlainData.add(value);
   return value as DeepReadonly<T>;
 }
 

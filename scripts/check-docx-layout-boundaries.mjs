@@ -2193,7 +2193,7 @@ function hasExactInvariantImports(source) {
     const elements = statement.importClause.namedBindings.elements;
     return elements.length === 1
       && elements.every((element) => !element.isTypeOnly && !element.propertyName)
-      && elements[0]?.name.text === 'assertAndDeepFreezeDocumentLayout';
+      && elements[0]?.name.text === 'assertAndDeepFreezeDocumentLayoutSteps';
   });
 }
 
@@ -2581,11 +2581,15 @@ function assertCanonicalCutoverBoundaries(root) {
       fail('CANONICAL_LAYOUT_PRODUCER', producerLabel);
     }
     const returned = producer.body.statements.at(-1);
-    const frozenCall = returned && ts.isReturnStatement(returned)
-      ? callOf(returned.expression, 'assertAndDeepFreezeDocumentLayout')
+    const frozenExpression = returned && ts.isReturnStatement(returned)
+      ? unwrapStaticExpression(returned.expression)
+      : null;
+    const frozenCall = frozenExpression && ts.isYieldExpression(frozenExpression)
+      && frozenExpression.asteriskToken
+      ? callOf(frozenExpression.expression, 'assertAndDeepFreezeDocumentLayoutSteps')
       : null;
     if (!hasExactInvariantImports(source)
-      || callsNamed(source, 'assertAndDeepFreezeDocumentLayout').length !== 1
+      || callsNamed(source, 'assertAndDeepFreezeDocumentLayoutSteps').length !== 1
       || frozenCall?.arguments.length !== 1) {
       fail('RETAINED_LAYOUT_IMMUTABILITY', producerLabel);
     }
