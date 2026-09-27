@@ -62,6 +62,23 @@ describe('font layout services', () => {
     expect(resolver.fingerprint).not.toBe(changed.fingerprint);
   });
 
+  it('shares one frozen resolution per exact request without aliasing distinct requests', () => {
+    const routes = { jp: { Meiryo: '"Meiryo JP", sans-serif' }, sc: { Meiryo: '"Meiryo SC", sans-serif' } };
+    const resolver = createFontResolver(faces, { regionalFamilyLists: routes });
+    const first = resolver.resolve({ requestedFamily: 'Meiryo', weight: 700, language: 'ja-JP' });
+    // Value-identical answers share their CSS family list and route instead of
+    // retaining a fresh ~KB copy for every shaped span.
+    expect(resolver.resolve({ requestedFamily: 'Meiryo', weight: 700, language: 'ja-JP' })).toBe(first);
+    expect(Object.isFrozen(first) && Object.isFrozen(first.route)).toBe(true);
+    expect(first.route.familyList).toContain('Meiryo JP');
+    expect(resolver.resolve({ requestedFamily: 'Meiryo', weight: 700, language: 'zh-CN' }).route.familyList)
+      .toContain('Meiryo SC');
+    expect(resolver.resolve({ requestedFamily: 'Meiryo', weight: 400, language: 'ja-JP' }))
+      .toMatchObject({ source: 'local', resolvedFamily: '__ooxml_local_meiryo' });
+    expect(resolver.resolve({ requestedFamily: 'Meiryo', weight: 700, language: 'ja-JP', genericFamily: 'serif' }))
+      .toMatchObject({ genericFamily: 'serif' });
+  });
+
   it('records embedded, local, Google, substitute, and generic resolution', () => {
     const resolver = createFontResolver(faces);
 
