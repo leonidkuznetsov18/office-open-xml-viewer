@@ -1,13 +1,11 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use docx_model::Document;
-use ooxml_common::resource::HARD_MAX_TOTAL_INFLATED_BYTES;
 use pptx_model::Presentation;
 use xlsx_model::{Workbook, Worksheet};
 
@@ -73,8 +71,7 @@ fn identity(path: &str) -> Result<Key, String> {
     let canonical = fs::canonicalize(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
     let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
     if meta.is_dir() {
-        // Preserve the previous fs::read error for directories. This read
-        // fails before returning bytes; regular files still take the size gate.
+        // Preserve the previous fs::read error for directories.
         let detail = fs::read(&canonical).err().map_or_else(
             || "not a regular file".to_string(),
             |error| error.to_string(),
@@ -83,15 +80,6 @@ fn identity(path: &str) -> Result<Key, String> {
     }
     if !meta.is_file() {
         return Err(format!("Cannot read '{}': not a regular file", path));
-    }
-    // The shared hard total-inflated-byte ceiling is also an upper bound on
-    // the compressed package accepted for eager MCP reads. This is MCP input
-    // governance; it does not alter parser or WASM limits.
-    if meta.len() > HARD_MAX_TOTAL_INFLATED_BYTES {
-        return Err(format!(
-            "Cannot read '{}': package exceeds {} bytes",
-            path, HARD_MAX_TOTAL_INFLATED_BYTES
-        ));
     }
     Ok(Key {
         path: canonical,
@@ -103,17 +91,7 @@ fn identity(path: &str) -> Result<Key, String> {
 }
 
 fn read_checked(path: &str, key: &Key) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(&key.path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
-    let mut data = Vec::new();
-    file.take(HARD_MAX_TOTAL_INFLATED_BYTES + 1)
-        .read_to_end(&mut data)
-        .map_err(|e| format!("Cannot read '{}': {}", path, e))?;
-    if data.len() as u64 > HARD_MAX_TOTAL_INFLATED_BYTES {
-        return Err(format!(
-            "Cannot read '{}': package exceeds {} bytes",
-            path, HARD_MAX_TOTAL_INFLATED_BYTES
-        ));
-    }
+    let data = fs::read(&key.path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
     if identity(path)? != *key || data.len() as u64 != key.len {
         return Err(format!("Cannot read '{}': file changed during read", path));
     }
@@ -453,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_reuses_unchanged_model_evicts_old_entries_and_checks_size() {
+    fn cache_reuses_unchanged_model_evicts_old_entries_and_checks_identity() {
         let entries = Mutex::new(CacheState::default());
         let root = std::env::temp_dir().join(format!(
             "ooxml-mcp-cache-{}-{}",
@@ -491,15 +469,11 @@ mod tests {
         assert!(!Arc::ptr_eq(&changed, &reloaded));
         assert_eq!(parses.load(Ordering::Relaxed), CACHE_ENTRIES + 3);
 
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(HARD_MAX_TOTAL_INFLATED_BYTES + 1)
-            .unwrap();
-        assert!(get_in(&entries, path_str, parse)
+        let previous_identity = identity(path_str).unwrap();
+        fs::write(&path, b"changed again").unwrap();
+        assert!(read_checked(path_str, &previous_identity)
             .unwrap_err()
-            .contains("package exceeds"));
+            .contains("file changed during read"));
         assert_eq!(parses.load(Ordering::Relaxed), CACHE_ENTRIES + 3);
         for index in 0..CACHE_ENTRIES {
             fs::remove_file(root.join(format!("other-{index}.bin"))).unwrap();
