@@ -165,11 +165,12 @@ export function resolveFill(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
+  patternPtToUserUnits = 4 / 3,
 ): string | CanvasGradient | CanvasPattern | null {
   if (!fill || fill.fillType === 'none') return null;
   if (fill.fillType === 'solid') return hexToRgba(fill.color);
   if (fill.fillType === 'pattern') {
-    return resolvePatternFill(fill, ctx);
+    return resolvePatternFill(fill, ctx, patternPtToUserUnits);
   }
   if (fill.fillType === 'gradient') {
     const stops = fill.stops;
@@ -242,16 +243,21 @@ export function resolveFill(
  * Falls back to the foreground colour string when the preset name is unknown
  * or the OffscreenCanvas / Canvas environment cannot create a pattern.
  *
- * Cached per (preset, fg, bg) tuple — patterns are immutable bitmaps so the
- * same backing canvas can be reused across many shapes.
+ * Cached per (preset, fg, bg, coordinate-unit scale) tuple. The per-context
+ * bound limits retained tile resources when a document uses many distinct
+ * colours.
  */
 const patternCache = new WeakMap<CanvasRenderingContext2D, Map<string, CanvasPattern>>();
+// 256 8×8 RGBA tiles retain at most 64 KiB of pixel data per context,
+// aside from CanvasPattern/Map bookkeeping; evict oldest colours beyond that.
+const MAX_PATTERN_CACHE_ENTRIES = 256;
 
 function resolvePatternFill(
   fill: PatternFill,
   ctx: CanvasRenderingContext2D,
+  ptToUserUnits: number,
 ): CanvasPattern | string {
-  const key = `${fill.preset}|${fill.fg}|${fill.bg}`;
+  const key = `${fill.preset}|${fill.fg}|${fill.bg}|${ptToUserUnits}`;
   let perCtx = patternCache.get(ctx);
   if (!perCtx) {
     perCtx = new Map();
@@ -264,6 +270,18 @@ function resolvePatternFill(
   if (!bitmap) return hexToRgba(fill.fg);
   const pat = ctx.createPattern(bitmap, 'repeat');
   if (!pat) return hexToRgba(fill.fg);
+  // PowerPoint PDF uses one point per bitmap cell. In CSS-pixel renderers,
+  // 1 pt = 4/3 px; DOCX supplies 1 because its paint coordinates are points.
+  // Zero translation anchors the tile to the caller's coordinate origin.
+  // PPTX and DOCX paint in slide/page coordinates. XLSX translates into a
+  // shape-local frame; its print PDF uses a different phase (see its painter).
+  if (typeof pat.setTransform === 'function') {
+    pat.setTransform({ a: ptToUserUnits, d: ptToUserUnits, e: 0, f: 0 });
+  }
+  if (perCtx.size >= MAX_PATTERN_CACHE_ENTRIES) {
+    const oldest = perCtx.keys().next().value;
+    if (oldest !== undefined) perCtx.delete(oldest);
+  }
   perCtx.set(key, pat);
   return pat;
 }

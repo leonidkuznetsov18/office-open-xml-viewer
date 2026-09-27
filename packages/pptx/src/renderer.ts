@@ -599,8 +599,9 @@ export function resolveShapeFill(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
+  patternPtToUserUnits = 4 / 3,
 ): string | CanvasGradient | CanvasPattern | null {
-  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg);
+  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
 }
 
 // ===== Text layout helpers =====
@@ -2256,7 +2257,7 @@ async function renderBackground(
     }
     return;
   }
-  const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH);
+  const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH, 0, scale * PT_TO_EMU);
   ctx.fillStyle = bg ?? '#FFFFFF';
   ctx.fillRect(0, 0, canvasW, canvasH);
 }
@@ -3779,7 +3780,9 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   }
 
   const geom = el.geometry.toLowerCase();
-  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation);
+  // The slide may render at any requested width. Convert the PDF-measured
+  // one-point pattern cell through this render's EMU-to-canvas scale.
+  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
   const imageFill = el.fill?.fillType === 'image' && shapeImageFillModeIsPaintable(el.fill)
     ? el.fill
     : null;
@@ -3853,7 +3856,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     const tFill = silhouette ??
       (target === ctx && bx === x && by === y && bw === w && bh === h
         ? fillStyle
-        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation));
+        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU));
     const tStroke = silhouette
       ? null
       : el.stroke
@@ -4037,7 +4040,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   const flatBevelEdgePadCss = (el.stroke ? (el.stroke.width * scale) / 2 : 0) + 2;
   const paintLineDecorations = (target: CanvasRenderingContext2D): void => {
     const effectivePaint = el.stroke?.fill
-      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation) ?? undefined
+      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation, scale * PT_TO_EMU) ?? undefined
       : undefined;
     if (el.stroke && (CONNECTOR_GEOMS.has(geom) || CALLOUT_GEOMS.has(geom))) {
       // The preset body deliberately suppresses retractable leader strokes. Paint
@@ -6348,7 +6351,7 @@ async function renderPicture(
       // visible through transparent pixels. Image fills need their own decode
       // and are not painted here.
       const backing = el.fill && el.fill.fillType !== 'none' && el.fill.fillType !== 'image'
-        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation)
+        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU)
         : null;
       if (backing) {
         target.save();
@@ -6730,6 +6733,7 @@ function drawCompoundLine(
         Math.max(1, Math.abs(end.x - start.x)),
         Math.max(1, Math.abs(end.y - start.y)),
         shapeRotationDeg,
+        scale * PT_TO_EMU,
       )
     : null;
   ctx.strokeStyle = strokePaint ?? hexToRgba(stroke.color);
@@ -6763,6 +6767,7 @@ export function applyStroke(
       bounds.w,
       bounds.h,
       shapeRotationDeg,
+      scale * PT_TO_EMU,
     );
     if (paint) ctx.strokeStyle = paint;
   }
@@ -7019,6 +7024,7 @@ export function renderTable(
       cellW,
       cellH,
       el.rotation,
+      scale * PT_TO_EMU,
     );
     if (fillPaint) {
       ctx.fillStyle = fillPaint;

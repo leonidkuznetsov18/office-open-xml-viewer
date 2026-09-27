@@ -104,6 +104,8 @@ export function paintDrawingLayout(node: DrawingLayout, context: CanvasPaintCont
         command.rect.yPt,
         command.rect.widthPt,
         command.rect.heightPt,
+        0,
+        1,
       );
       if (fill === null) continue;
       context.ctx.save();

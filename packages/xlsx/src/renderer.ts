@@ -5446,6 +5446,11 @@ function fillShape(
   const fill = shape.fill ?? (shape.fillColor
     ? { fillType: 'solid' as const, color: shape.fillColor }
     : null);
+  // Excel's direct PDF export uses the same 8 pt tile artwork and cell size
+  // as PowerPoint, but its print pattern matrix starts at each shape's X and
+  // an 8 pt grid measured from the PDF page bottom. The sheet viewer has no
+  // print-page origin, so its phase is anchored to this local shape frame.
+  // One point is 4/3 CSS pixels at the sheet's native 96 dpi.
   const paint = resolveFill(fill, ctx, 0, 0, width, height, shape.rot);
   if (!paint) return false;
   ctx.fillStyle = paint;
