@@ -12,3 +12,5 @@ export { drawingMlLineX, drawingMlLineShouldJustify } from './align.js';
 export { paintDrawingMlLine } from './paint.js';
 export { resolveDrawingMlTabWidths } from './tab.js';
 export type { DrawingMlTabItem, DrawingMlTabStop } from './tab.js';
+export { wrapSpreadsheetCellParagraph, layoutSpreadsheetCellRichLines } from './spreadsheet-cell.js';
+export type { SpreadsheetCellRichSeg, SpreadsheetCellRichLine } from './spreadsheet-cell.js';
