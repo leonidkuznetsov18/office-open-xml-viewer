@@ -1913,6 +1913,13 @@ pub struct CellXf {
     /// 1 = left-to-right, 2 = right-to-left. Drives canvas `direction`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading_order: Option<u32>,
+    /// The cell's font color is its own formatting rather than the Normal
+    /// style's: the cell font's `<color>`, or its cell style's, is authored
+    /// differently from the Normal cell style font's. Excel then draws that
+    /// color over a table style's element font color; otherwise the table
+    /// color applies. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub own_font_color: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

@@ -1135,6 +1135,10 @@ export interface CellXf {
   /** `<alignment readingOrder>` (ECMA-376 §18.8.1) — 0 = context (default),
    *  1 = LTR, 2 = RTL. Drives canvas `direction`. */
   readingOrder?: number;
+  /** The font color is the cell's own formatting: the cell font's `<color>`,
+   *  or its cell style's, is authored differently from the Normal style font's.
+   *  Excel draws it over a table style's element font color. Omitted = false. */
+  ownFontColor?: boolean;
 }
 
 export interface ParsedWorkbook {

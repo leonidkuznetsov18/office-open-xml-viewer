@@ -198,24 +198,53 @@ function assertNoSourceRuntime(code, name) {
 // Baseline: the pre-feature OOXML production build at 776237df. The small
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
-// Rebased DOCX and Node entries against the clean 470743cb build for #1557:
+// Rebased DOCX and Node entries against the clean 470743cb build for #1557
+// (merged by PR #1586):
 // sliced layout, stepwise finalization, and viewer load ownership add 4,728
 // DOCX bytes; shared layout validation/freezing adds 398 Node bytes. The
 // optional model-source runtime remains outside both eager entry graphs.
 // The ordinary DOCX render worker grows by 289 bytes from those same layout
-// changes. Issue #1591's lazy validation, root-only freeze branding,
-// occurrence sharing, and bounded text caches grow the clean aec306b6 worker
-// from 2,047,181 to 2,047,720 bytes; keep its exact zero-allowance baseline.
+// changes. PR #1590's projection consolidation then brings the measured main
+// graph at aec306b6 to 2,533,239 DOCX, 2,579,716 Node, and 2,047,181 worker
+// bytes (+200, -20, and -54 respectively versus the #1557 guard values).
+// Issue #1591 then makes validation paths lazy, brands only frozen plain-data
+// roots, shares verified occurrence-independent data, and bounds text caches.
+// Against clean aec306b6, that grew the DOCX worker from 2,047,181 to
+// 2,047,720 bytes (+539) while keeping its zero-allowance guard.
+// The combined 546160b1 + #1591 production build measures 2,563,637 DOCX,
+// 1,845,156 XLSX, 1,839,481 PPTX, and 2,598,519 Node static bytes. This
+// rebases exact measured entries after the DOCX heap work and merged XLSX
+// formatting changes; the dispatch allowances remain unchanged.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_533_039, inline: 31_624, budget: 2_800 },
+  // #1566's explicit-state line-breaker and table measurement add 18,002
+  // DOCX bytes against aec306b6 (2,533,239 -> 2,551,241) in 36 chunks:
+  // 18,953 and 2,501 rendered module bytes respectively, offset by minification.
+  // That main (036ddd31) also includes #1586 sliced layout and #1590 projection
+  // consolidation. #1561 adds another 11,595
+  // static bytes after moving scroll/find behavior into core collaborators:
+  // 44,570 bytes in new shared/adapter modules offset 28,748 removed bytes
+  // from the old viewer/find modules; other graph changes account for the rest.
+  // The static chunk count remains 36 and the dispatch allowance is unchanged.
+  docx: { entry: 2_563_637, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
-  xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
-  pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_579_736, budget: 3_600 },
+  xlsx: { entry: 1_845_156, inline: 39_902, budget: 2_500 },
+  // PPTX #1561 adds 13,299 static bytes against main (036ddd31): 48,632
+  // bytes in shared/adapter modules offset 30,988 removed viewer/find bytes,
+  // with the remaining graph changes preserving the 38 static chunks.
+  // The dispatch allowance is unchanged.
+  pptx: { entry: 1_839_481, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_598_519, budget: 3_600 },
 });
-// The XLSX render worker adds 536 bytes for explicit worksheet eviction.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_047_720];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction and
+// 51 bytes for table-style font color precedence. The DOCX worker includes
+// PRs #1586 and #1590 plus the #1566 line-breaker split (+19,183 bytes
+// against aec306b6). Rounding Excel serials to the nearest millisecond adds
+// 24 bytes to every worker, and per-section date/time format detection with
+// text-section exclusion another 618 to the XLSX worker. Workers retain zero
+// allowance.
+// Issue #1591 adds 539 measured bytes to the combined DOCX worker.
+const OOXML_RENDER_WORKERS = [1_417_641, 1_458_548, 2_066_927];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
