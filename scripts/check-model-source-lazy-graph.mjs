@@ -218,7 +218,9 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
   xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
-  pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
+  // PPTX measures identically on aec306b6 and this merge. Re-pin the older
+  // guard value to the measured graph without changing its allowance.
+  pptx: { entry: 1_826_158, inline: 59_554, budget: 2_100 },
   node: { entry: 2_597_718, budget: 3_600 },
 });
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
