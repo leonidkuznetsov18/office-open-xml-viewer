@@ -1260,6 +1260,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     return { page: point.unit, frac: point.frac };
   }
 
+  /** @internal test hook: inverse of contentAtViewportYForTest. */
   viewportYOfForTest(page: number, frac: number): number {
     return this._navigation.viewportYOf(page, frac);
   }

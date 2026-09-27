@@ -1250,6 +1250,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     return { slide: point.unit, frac: point.frac };
   }
 
+  /** @internal test hook: inverse of contentAtViewportYForTest. */
   viewportYOfForTest(slide: number, frac: number): number {
     return this._navigation.viewportYOf(slide, frac);
   }
