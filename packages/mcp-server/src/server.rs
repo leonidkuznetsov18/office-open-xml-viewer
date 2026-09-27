@@ -4,6 +4,8 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ServerHandler,
 };
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 
 use crate::tools::docx::{
     DocxImagesParam, DocxIndexParam, DocxPathParam, DocxSearchParam, DocxTableIndexParam,
@@ -19,10 +21,24 @@ use crate::tools::xlsx::{
 };
 use crate::tools::{docx::DocxTools, pptx::PptxTools, xlsx::XlsxTools};
 
+// Two package parses may be active at once. The parser can retain substantial
+// decoded data, so admit work before spawning a blocking thread. Move the
+// permit into the closure so cancellation cannot release it during a parse.
+const MAX_BLOCKING_TASKS: usize = 2;
+static BLOCKING_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
 async fn run_blocking(work: impl FnOnce() -> String + Send + 'static) -> String {
-    tokio::task::spawn_blocking(work)
-        .await
-        .unwrap_or_else(|e| format!("Error: {e}"))
+    let permits = BLOCKING_PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)));
+    let permit = match Arc::clone(permits).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return format!("Error: {error}"),
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .unwrap_or_else(|e| format!("Error: {e}"))
 }
 
 #[derive(Clone)]
@@ -413,6 +429,34 @@ impl ServerHandler for OoxmlServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_admission_limits_concurrent_parses() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut requests = Vec::new();
+        for _ in 0..16 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            requests.push(tokio::spawn(async move {
+                run_blocking(move || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    "parsed".into()
+                })
+                .await
+            }));
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap(), "parsed");
+        }
+        assert!(peak.load(Ordering::SeqCst) <= MAX_BLOCKING_TASKS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn advertises_only_the_active_context_tool_as_read_only() {

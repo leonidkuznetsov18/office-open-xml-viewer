@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
@@ -13,7 +13,7 @@ use xlsx_model::{Workbook, Worksheet};
 
 const CACHE_ENTRIES: usize = 8;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct Key {
     path: PathBuf,
     modified: SystemTime,
@@ -27,6 +27,35 @@ struct Entry {
     markdown: HashMap<MarkdownKind, Arc<String>>,
 }
 
+type Flight = Arc<OnceLock<Result<CachedModel, String>>>;
+
+#[derive(Default)]
+struct CacheState {
+    entries: VecDeque<Entry>,
+    model_flights: HashMap<(Key, TypeId), Flight>,
+    markdown_flights: HashMap<(Key, MarkdownKind), Flight>,
+}
+
+impl CacheState {
+    fn upsert(&mut self, key: Key, update: impl FnOnce(&mut Entry)) {
+        let mut entry = self
+            .entries
+            .iter()
+            .position(|entry| entry.key == key)
+            .and_then(|position| self.entries.remove(position))
+            .unwrap_or_else(|| Entry {
+                key,
+                model: None,
+                markdown: HashMap::new(),
+            });
+        update(&mut entry);
+        self.entries.push_back(entry);
+        while self.entries.len() > CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownKind {
     Docx,
@@ -34,15 +63,24 @@ pub enum MarkdownKind {
     Pptx,
 }
 
-static CACHE: OnceLock<Mutex<VecDeque<Entry>>> = OnceLock::new();
+static CACHE: OnceLock<Mutex<CacheState>> = OnceLock::new();
 
-fn cache() -> &'static Mutex<VecDeque<Entry>> {
-    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+fn cache() -> &'static Mutex<CacheState> {
+    CACHE.get_or_init(|| Mutex::new(CacheState::default()))
 }
 
 fn identity(path: &str) -> Result<Key, String> {
     let canonical = fs::canonicalize(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
     let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
+    if meta.is_dir() {
+        // Preserve the previous fs::read error for directories. This read
+        // fails before returning bytes; regular files still take the size gate.
+        let detail = fs::read(&canonical).err().map_or_else(
+            || "not a regular file".to_string(),
+            |error| error.to_string(),
+        );
+        return Err(format!("Cannot read '{}': {}", path, detail));
+    }
     if !meta.is_file() {
         return Err(format!("Cannot read '{}': not a regular file", path));
     }
@@ -90,53 +128,63 @@ fn get<T: Any + Send + Sync>(
 }
 
 fn get_in<T: Any + Send + Sync>(
-    entries_lock: &Mutex<VecDeque<Entry>>,
+    entries_lock: &Mutex<CacheState>,
     path: &str,
     parse: impl FnOnce(&[u8], &Key) -> Result<T, String>,
 ) -> Result<Arc<T>, String> {
     let key = identity(path)?;
-    if let Some(found) = {
-        let mut entries = entries_lock
+    let flight_key = (key.clone(), TypeId::of::<T>());
+    let (found, flight) = {
+        let mut state = entries_lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        entries
+        let found = state
+            .entries
             .iter()
             .position(|entry| {
                 entry.key == key && entry.model.as_ref().is_some_and(|model| model.is::<T>())
             })
-            .and_then(|position| entries.remove(position))
+            .and_then(|position| state.entries.remove(position))
             .map(|entry| {
                 let found = Arc::clone(entry.model.as_ref().expect("matched model"));
-                entries.push_back(entry);
+                state.entries.push_back(entry);
                 found
-            })
-    } {
+            });
+        let flight = if found.is_none() {
+            Some(Arc::clone(
+                state.model_flights.entry(flight_key.clone()).or_default(),
+            ))
+        } else {
+            None
+        };
+        (found, flight)
+    };
+    if let Some(found) = found {
         return found
             .downcast::<T>()
             .map_err(|_| "cache type mismatch".to_string());
     }
-
-    // Parse outside the lock. Concurrent misses may parse twice.
-    let data = read_checked(path, &key)?;
-    let model = Arc::new(parse(&data, &key)?);
-    let mut entries = entries_lock
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let mut entry = entries
-        .iter()
-        .position(|entry| entry.key == key)
-        .and_then(|position| entries.remove(position))
-        .unwrap_or_else(|| Entry {
-            key,
-            model: None,
-            markdown: HashMap::new(),
-        });
-    entry.model = Some(Arc::clone(&model) as CachedModel);
-    entries.push_back(entry);
-    while entries.len() > CACHE_ENTRIES {
-        entries.pop_front();
-    }
-    Ok(model)
+    let flight = flight.expect("miss registered an in-flight parse");
+    // OnceLock makes all callers of this key share the same parse and result.
+    // A failed parse is removed from the flight map and is never cached.
+    let result = flight.get_or_init(|| {
+        let result = read_checked(path, &key)
+            .and_then(|data| parse(&data, &key))
+            .map(|model| Arc::new(model) as CachedModel);
+        let mut state = entries_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Ok(model) = &result {
+            state.upsert(key.clone(), |entry| entry.model = Some(Arc::clone(model)));
+        }
+        state.model_flights.remove(&flight_key);
+        result
+    });
+    result.clone().and_then(|model| {
+        model
+            .downcast::<T>()
+            .map_err(|_| "cache type mismatch".into())
+    })
 }
 
 pub fn docx(path: &str) -> Result<Arc<Document>, String> {
@@ -149,15 +197,23 @@ pub fn pptx(path: &str) -> Result<Arc<Presentation>, String> {
 
 pub struct XlsxDocument {
     pub workbook: Workbook,
-    sheets: Mutex<VecDeque<(u32, Arc<Worksheet>)>>,
+    sheets: Mutex<SheetCache>,
     key: Key,
 }
+
+#[derive(Default)]
+struct SheetCache {
+    entries: VecDeque<(u32, Arc<Worksheet>)>,
+    flights: HashMap<u32, SheetFlight>,
+}
+
+type SheetFlight = Arc<OnceLock<Result<Arc<Worksheet>, String>>>;
 
 pub fn xlsx(path: &str) -> Result<Arc<XlsxDocument>, String> {
     get(path, |bytes, key| {
         Ok(XlsxDocument {
             workbook: xlsx_parser::parse_workbook_model_native(bytes)?,
-            sheets: Mutex::new(VecDeque::new()),
+            sheets: Mutex::new(SheetCache::default()),
             key: key.clone(),
         })
     })
@@ -173,35 +229,52 @@ pub fn xlsx_sheet(
     if key != document.key {
         return Err(format!("Cannot read '{}': file changed during read", path));
     }
-    if let Some(sheet) = {
-        let mut sheets = document
+    let (found, flight) = {
+        let mut cache = document
             .sheets
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        sheets
+        let found = cache
+            .entries
             .iter()
             .position(|(candidate, _)| *candidate == index)
-            .and_then(|position| sheets.remove(position))
+            .and_then(|position| cache.entries.remove(position))
             .map(|entry| {
                 let sheet = Arc::clone(&entry.1);
-                sheets.push_back(entry);
+                cache.entries.push_back(entry);
                 sheet
-            })
-    } {
+            });
+        let flight = if found.is_none() {
+            Some(Arc::clone(cache.flights.entry(index).or_default()))
+        } else {
+            None
+        };
+        (found, flight)
+    };
+    if let Some(sheet) = found {
         return Ok(sheet);
     }
-    let bytes = read_checked(path, &key)?;
-    let sheet = Arc::new(xlsx_parser::parse_sheet_model_native(&bytes, index, name)?);
-    let mut sheets = document
-        .sheets
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    sheets.retain(|(candidate, _)| *candidate != index);
-    sheets.push_back((index, Arc::clone(&sheet)));
-    while sheets.len() > CACHE_ENTRIES {
-        sheets.pop_front();
-    }
-    Ok(sheet)
+    let flight = flight.expect("miss registered an in-flight sheet parse");
+    flight
+        .get_or_init(|| {
+            let result = read_checked(path, &key)
+                .and_then(|bytes| xlsx_parser::parse_sheet_model_native(&bytes, index, name))
+                .map(Arc::new);
+            let mut cache = document
+                .sheets
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Ok(sheet) = &result {
+                cache.entries.retain(|(candidate, _)| *candidate != index);
+                cache.entries.push_back((index, Arc::clone(sheet)));
+                while cache.entries.len() > CACHE_ENTRIES {
+                    cache.entries.pop_front();
+                }
+            }
+            cache.flights.remove(&index);
+            result
+        })
+        .clone()
 }
 
 pub fn markdown(
@@ -210,48 +283,178 @@ pub fn markdown(
     render: impl FnOnce(&[u8]) -> Result<String, String>,
 ) -> Result<String, String> {
     let key = identity(path)?;
-    if let Some(found) = {
-        let mut entries = cache().lock().unwrap_or_else(|poison| poison.into_inner());
-        entries
+    let flight_key = (key.clone(), kind);
+    let (found, flight) = {
+        let mut state = cache().lock().unwrap_or_else(|poison| poison.into_inner());
+        let found = state
+            .entries
             .iter()
             .position(|entry| entry.key == key && entry.markdown.contains_key(&kind))
-            .and_then(|position| entries.remove(position))
+            .and_then(|position| state.entries.remove(position))
             .map(|entry| {
                 let found = Arc::clone(entry.markdown.get(&kind).expect("matched markdown"));
-                entries.push_back(entry);
+                state.entries.push_back(entry);
                 found
-            })
-    } {
+            });
+        let flight = if found.is_none() {
+            Some(Arc::clone(
+                state
+                    .markdown_flights
+                    .entry(flight_key.clone())
+                    .or_default(),
+            ))
+        } else {
+            None
+        };
+        (found, flight)
+    };
+    if let Some(found) = found {
         return Ok((*found).clone());
     }
-    let bytes = read_checked(path, &key)?;
-    let output = render(&bytes)?;
-    let mut entries = cache().lock().unwrap_or_else(|poison| poison.into_inner());
-    let mut entry = entries
-        .iter()
-        .position(|entry| entry.key == key)
-        .and_then(|position| entries.remove(position))
-        .unwrap_or_else(|| Entry {
-            key,
-            model: None,
-            markdown: HashMap::new(),
-        });
-    entry.markdown.insert(kind, Arc::new(output.clone()));
-    entries.push_back(entry);
-    while entries.len() > CACHE_ENTRIES {
-        entries.pop_front();
-    }
-    Ok(output)
+    let flight = flight.expect("miss registered an in-flight markdown parse");
+    let result = flight.get_or_init(|| {
+        let result = read_checked(path, &key)
+            .and_then(|bytes| render(&bytes))
+            .map(|output| Arc::new(output) as CachedModel);
+        let mut state = cache().lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Ok(output) = &result {
+            let output = output
+                .clone()
+                .downcast::<String>()
+                .expect("markdown flight type");
+            state.upsert(key.clone(), |entry| {
+                entry.markdown.insert(kind, output);
+            });
+        }
+        state.markdown_flights.remove(&flight_key);
+        result
+    });
+    result
+        .clone()
+        .and_then(|output| {
+            output
+                .downcast::<String>()
+                .map_err(|_| "cache type mismatch".into())
+        })
+        .map(|output| (*output).clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    #[test]
+    fn concurrent_identical_misses_share_one_parse_and_failure_is_retryable() {
+        let entries = Mutex::new(CacheState::default());
+        let root = std::env::temp_dir().join(format!(
+            "ooxml-mcp-flight-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("model.bin");
+        fs::write(&path, b"model").unwrap();
+        let path = path.to_str().unwrap();
+        let calls = AtomicUsize::new(0);
+        let start = Barrier::new(17);
+        std::thread::scope(|scope| {
+            let requests: Vec<_> = (0..16)
+                .map(|_| {
+                    let start = &start;
+                    let calls = &calls;
+                    let entries = &entries;
+                    scope.spawn(move || {
+                        start.wait();
+                        get_in(entries, path, |bytes, _| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            Ok::<_, String>(bytes.to_vec())
+                        })
+                        .unwrap()
+                    })
+                })
+                .collect();
+            start.wait();
+            let results: Vec<_> = requests
+                .into_iter()
+                .map(|request| request.join().unwrap())
+                .collect();
+            assert!(results
+                .iter()
+                .all(|result| Arc::ptr_eq(result, &results[0])));
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        fs::write(path, b"invalid model").unwrap();
+        let failed_calls = AtomicUsize::new(0);
+        let start = Barrier::new(17);
+        std::thread::scope(|scope| {
+            let requests: Vec<_> = (0..16)
+                .map(|_| {
+                    let start = &start;
+                    let calls = &failed_calls;
+                    let entries = &entries;
+                    scope.spawn(move || {
+                        start.wait();
+                        get_in::<Vec<u8>>(entries, path, |_, _| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            Err("invalid model".into())
+                        })
+                    })
+                })
+                .collect();
+            start.wait();
+            for request in requests {
+                assert_eq!(request.join().unwrap().unwrap_err(), "invalid model");
+            }
+        });
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+        let retried = get_in(&entries, path, |bytes, _| {
+            failed_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(bytes.to_vec())
+        })
+        .unwrap();
+        assert_eq!(*retried, b"invalid model");
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 2);
+
+        let markdown_calls = AtomicUsize::new(0);
+        let start = Barrier::new(17);
+        std::thread::scope(|scope| {
+            let requests: Vec<_> = (0..16)
+                .map(|_| {
+                    let start = &start;
+                    let calls = &markdown_calls;
+                    scope.spawn(move || {
+                        start.wait();
+                        markdown(path, MarkdownKind::Docx, |bytes| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            Ok(String::from_utf8(bytes.to_vec()).unwrap())
+                        })
+                        .unwrap()
+                    })
+                })
+                .collect();
+            start.wait();
+            for request in requests {
+                assert_eq!(request.join().unwrap(), "invalid model");
+            }
+        });
+        assert_eq!(markdown_calls.load(Ordering::SeqCst), 1);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn cache_reuses_unchanged_model_evicts_old_entries_and_checks_size() {
-        let entries = Mutex::new(VecDeque::new());
+        let entries = Mutex::new(CacheState::default());
         let root = std::env::temp_dir().join(format!(
             "ooxml-mcp-cache-{}-{}",
             std::process::id(),
