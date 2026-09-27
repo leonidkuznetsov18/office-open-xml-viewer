@@ -56,6 +56,13 @@ pub(super) fn build(
         .as_ref()
         .map(|settings| DocumentSettings {
             default_tab_stop: Some(f64::from(settings.default_tab_twips) / 20.0),
+            // Current Word emits w:useFELayout when saving binary DOC as DOCX.
+            // Word-save controls with Dop2000 fDontAdjustLineHeightInTable
+            // both set and cleared retain useFELayout, while only the latter
+            // emits adjustLineHeightInTable. The flags are independent: leaving
+            // useFELayout absent shortens Far East-grid table rows and can
+            // collapse a page of following content.
+            use_fe_layout: Some(true),
             adjust_line_height_in_table: Some(settings.adjust_line_height_in_table),
             balance_single_byte_double_byte_width: Some(
                 settings.balance_single_byte_double_byte_width,
