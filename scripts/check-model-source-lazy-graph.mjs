@@ -204,7 +204,10 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
   node: { entry: 2_575_997, budget: 3_600 },
 });
-const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
+// Ordinary workers carry renderer code: a renderer fix rebases its worker
+// here to the measured production size, with the reason in its commit.
+// Worker 0 (XLSX): +51 bytes for table-style font color precedence.
+const OOXML_RENDER_WORKERS = [1_416_463, 1_458_524, 2_046_946];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
