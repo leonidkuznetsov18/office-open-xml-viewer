@@ -41,6 +41,12 @@ export default defineConfig({
         '@silurus/ooxml-core/internal/model-source': fileURLToPath(
           new URL('../packages/core/src/source/model-source.ts', import.meta.url),
         ),
+        '@silurus/ooxml-core/internal/drawingml-text': fileURLToPath(
+          new URL('../packages/core/src/drawingml-text/index.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/bidi-line': fileURLToPath(
+          new URL('../packages/core/src/text/bidi/segment-line.ts', import.meta.url),
+        ),
         '@silurus/ooxml-core/internal/resource-measurement': fileURLToPath(
           new URL('../packages/core/src/internal/resource-measurement.ts', import.meta.url),
         ),
