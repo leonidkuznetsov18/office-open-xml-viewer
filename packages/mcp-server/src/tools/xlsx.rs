@@ -111,16 +111,33 @@ fn target_sheets(
         .collect())
 }
 
-fn load_sheet(path: &str, identifier: &str) -> Result<(String, std::sync::Arc<Worksheet>), String> {
-    let doc = workbook(path)?;
-    let (idx, name) = resolve_sheet(&doc.workbook, identifier)?;
-    let sheet = parsed_cache::xlsx_sheet(path, &doc, idx, &name)?;
+enum LoadError {
+    General(String),
+    Sheet { name: String, source: String },
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::General(error) => write!(f, "Error: {error}"),
+            Self::Sheet { name, source } => write!(f, "Error parsing sheet '{name}': {source}"),
+        }
+    }
+}
+
+fn load_sheet(
+    path: &str,
+    identifier: &str,
+) -> Result<(String, std::sync::Arc<Worksheet>), LoadError> {
+    let doc = workbook(path).map_err(LoadError::General)?;
+    let (idx, name) = resolve_sheet(&doc.workbook, identifier).map_err(LoadError::General)?;
+    let sheet = parsed_cache::xlsx_sheet(path, &doc, idx, &name).map_err(LoadError::General)?;
     Ok((name, sheet))
 }
 
-fn load_targets(path: &str, identifier: Option<&str>) -> Result<TargetSheets, String> {
-    let doc = workbook(path)?;
-    let targets = target_sheets(&doc.workbook, identifier)?;
+fn load_targets(path: &str, identifier: Option<&str>) -> Result<TargetSheets, LoadError> {
+    let doc = workbook(path).map_err(LoadError::General)?;
+    let targets = target_sheets(&doc.workbook, identifier).map_err(LoadError::General)?;
     Ok(TargetSheets {
         path: path.into(),
         doc,
@@ -135,13 +152,13 @@ struct TargetSheets {
 }
 
 impl Iterator for TargetSheets {
-    type Item = Result<(String, std::sync::Arc<Worksheet>), String>;
+    type Item = Result<(String, std::sync::Arc<Worksheet>), LoadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.targets.next().map(|(idx, name)| {
             parsed_cache::xlsx_sheet(&self.path, &self.doc, idx, &name)
                 .map(|sheet| (name.clone(), sheet))
-                .map_err(|error| format!("Error parsing sheet '{}': {}", name, error))
+                .map_err(|source| LoadError::Sheet { name, source })
         })
     }
 }
@@ -242,7 +259,7 @@ impl XlsxTools {
     pub fn xlsx_get_sheet_dimensions(Parameters(p): Parameters<XlsxSheetParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let max_row = ws.rows.iter().map(|row| row.index).max().unwrap_or(0);
         let max_col = ws
@@ -261,7 +278,7 @@ impl XlsxTools {
     pub fn xlsx_get_cell_range(Parameters(p): Parameters<XlsxCellRangeParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let parts: Vec<&str> = p.range.split(':').collect();
         if parts.len() != 2 {
@@ -292,7 +309,7 @@ impl XlsxTools {
     pub fn xlsx_get_formulas(Parameters(p): Parameters<XlsxSheetParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let formulas: Vec<Value> = ws.rows.iter().flat_map(|row| row.cells.iter().filter_map(move |cell| cell.formula.as_ref().map(|formula| {
             serde_json::json!({ "ref": format!("{}{}", col_to_letter(cell.col), row.index), "formula": formula, "cachedValue": cell_display(cell) })
@@ -306,14 +323,14 @@ impl XlsxTools {
     pub fn xlsx_search_cells(Parameters(p): Parameters<XlsxSearchParam>) -> String {
         let sheets = match load_targets(&p.path, p.sheet.as_deref()) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let query_lower = p.query.to_lowercase();
         let mut matches = Vec::new();
         for sheet in sheets {
             let (name, ws) = match sheet {
                 Ok(sheet) => sheet,
-                Err(e) => return format!("Error: {e}"),
+                Err(e) => return e.to_string(),
             };
             for row in &ws.rows {
                 for cell in &row.cells {
@@ -341,13 +358,13 @@ impl XlsxTools {
     pub fn xlsx_get_charts(Parameters(p): Parameters<XlsxOptSheetParam>) -> String {
         let sheets = match load_targets(&p.path, p.sheet.as_deref()) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let mut all_charts = Vec::new();
         for sheet in sheets {
             let (name, ws) = match sheet {
                 Ok(sheet) => sheet,
-                Err(e) => return format!("Error: {e}"),
+                Err(e) => return e.to_string(),
             };
             for (chart_idx, anchor) in ws.charts.iter().enumerate() {
                 let chart = &anchor.chart;
@@ -381,7 +398,7 @@ impl XlsxTools {
     pub fn xlsx_get_chart_series(Parameters(p): Parameters<XlsxChartIndexParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let Some(anchor) = ws.charts.get(p.chart_index) else {
             return format!(
@@ -412,13 +429,13 @@ impl XlsxTools {
     pub fn xlsx_get_named_ranges(Parameters(p): Parameters<XlsxPathParam>) -> String {
         let sheets = match load_targets(&p.path, None) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let mut seen: Vec<(String, String, String)> = Vec::new();
         for sheet in sheets {
             let (name, ws) = match sheet {
                 Ok(sheet) => sheet,
-                Err(e) => return format!("Error: {e}"),
+                Err(e) => return e.to_string(),
             };
             for dn in &ws.defined_names {
                 if !seen
@@ -446,13 +463,13 @@ impl XlsxTools {
     pub fn xlsx_get_tables(Parameters(p): Parameters<XlsxOptSheetParam>) -> String {
         let sheets = match load_targets(&p.path, p.sheet.as_deref()) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let mut tables = Vec::new();
         for sheet in sheets {
             let (name, ws) = match sheet {
                 Ok(sheet) => sheet,
-                Err(e) => return format!("Error: {e}"),
+                Err(e) => return e.to_string(),
             };
             for table in &ws.tables {
                 tables.push(serde_json::json!({
@@ -471,7 +488,7 @@ impl XlsxTools {
     pub fn xlsx_get_merged_cells(Parameters(p): Parameters<XlsxSheetParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let merges: Vec<String> = ws.merge_cells.iter().map(merge_to_a1).collect();
         serde_json::json!({ "sheet": name, "merges": merges }).to_string()
@@ -483,7 +500,7 @@ impl XlsxTools {
     pub fn xlsx_get_conditional_formats(Parameters(p): Parameters<XlsxSheetParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let formats: Vec<Value> = ws.conditional_formats.iter().map(|cf| serde_json::json!({
             "ranges": cf.sqref.iter().map(range_to_a1).collect::<Vec<_>>(), "rules": cf.rules,
@@ -497,7 +514,7 @@ impl XlsxTools {
     pub fn xlsx_get_data_validations(Parameters(p): Parameters<XlsxSheetParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         serde_json::json!({ "sheet": name, "validations": ws.data_validations }).to_string()
     }
@@ -508,13 +525,13 @@ impl XlsxTools {
     pub fn xlsx_get_comments(Parameters(p): Parameters<XlsxOptSheetParam>) -> String {
         let sheets = match load_targets(&p.path, p.sheet.as_deref()) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let mut comments = Vec::new();
         for sheet in sheets {
             let (name, ws) = match sheet {
                 Ok(sheet) => sheet,
-                Err(e) => return format!("Error: {e}"),
+                Err(e) => return e.to_string(),
             };
             for comment in &ws.comments {
                 comments.push(serde_json::json!({
@@ -531,7 +548,7 @@ impl XlsxTools {
     pub fn xlsx_get_sheet_layout(Parameters(p): Parameters<XlsxSheetParam>) -> String {
         let (name, ws) = match load_sheet(&p.path, &p.sheet) {
             Ok(x) => x,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return e.to_string(),
         };
         let cols: Vec<Value> = ws
             .col_widths
@@ -563,6 +580,56 @@ impl XlsxTools {
 #[cfg(test)]
 mod sample_tests {
     use super::*;
+    use std::io::{Cursor, Read, Write};
+    use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
+
+    #[test]
+    fn sheet_errors_keep_single_and_all_sheet_wording() {
+        let source = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../xlsx/public/demo/sample-1.xlsx"
+        ));
+        let mut archive = ZipArchive::new(Cursor::new(source.as_slice())).unwrap();
+        let mut output = ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut part = archive.by_index(index).unwrap();
+            if part.name() == "xl/_rels/workbook.xml.rels" {
+                continue;
+            }
+            let name = part.name().to_string();
+            let mut bytes = Vec::new();
+            part.read_to_end(&mut bytes).unwrap();
+            output
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            output.write_all(&bytes).unwrap();
+        }
+        let path = std::env::temp_dir().join(format!(
+            "ooxml-mcp-missing-rels-{}-{}.xlsx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, output.finish().unwrap().into_inner()).unwrap();
+        let path = path.to_str().unwrap();
+        let single = XlsxTools::xlsx_get_cell_range(Parameters(XlsxCellRangeParam {
+            path: path.into(),
+            sheet: "0".into(),
+            range: "A1:C10".into(),
+        }));
+        assert_eq!(single, "Error: entry not found: xl/_rels/workbook.xml.rels");
+        let all = XlsxTools::xlsx_get_charts(Parameters(XlsxOptSheetParam {
+            path: path.into(),
+            sheet: None,
+        }));
+        assert_eq!(
+            all,
+            "Error parsing sheet 'Dashboard': entry not found: xl/_rels/workbook.xml.rels"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn sample_path() -> String {
         format!(

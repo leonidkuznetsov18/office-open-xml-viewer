@@ -1,5 +1,5 @@
 use crate::parsed_cache;
-use docx_model::{BodyElement, DocRun};
+use docx_model::{BodyElement, DocRun, ShapeRun};
 use rmcp::{handler::server::wrapper::Parameters, tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -99,6 +99,25 @@ fn body_structure(body: &[BodyElement]) -> Vec<Value> {
             _ => serde_json::to_value(element).unwrap_or(Value::Null),
         })
         .collect()
+}
+
+fn shape_summary(shape: &ShapeRun, paragraph_index: usize, run_index: usize) -> Value {
+    // The previous JSON-backed projection returned null when these fields
+    // were omitted by ShapeRun's serializer. Preserve that public tool output
+    // while reading the remaining fields directly from the typed model.
+    serde_json::json!({
+        "paragraphIndex": paragraph_index, "runIndex": run_index,
+        "presetGeometry": shape.preset_geometry, "widthPt": shape.width_pt,
+        "heightPt": shape.height_pt, "anchorXPt": shape.anchor_x_pt,
+        "anchorYPt": shape.anchor_y_pt,
+        "rotation": (shape.rotation != 0.0).then_some(shape.rotation),
+        "fill": shape.fill, "stroke": shape.stroke,
+        "strokeWidth": (shape.stroke_width != 0.0).then_some(shape.stroke_width),
+        "textBlocks": (!shape.text_blocks.is_empty()).then_some(&shape.text_blocks),
+        "wrapMode": shape.wrap_mode,
+        "behindDoc": shape.behind_doc.then_some(true),
+        "zOrder": shape.z_order,
+    })
 }
 
 pub struct DocxTools;
@@ -296,16 +315,7 @@ impl DocxTools {
             if let BodyElement::Paragraph(para) = element {
                 for (run_idx, run) in para.runs.iter().enumerate() {
                     if let DocRun::Shape(shape) = run {
-                        shapes.push(serde_json::json!({
-                            "paragraphIndex": para_idx, "runIndex": run_idx,
-                            "presetGeometry": shape.preset_geometry, "widthPt": shape.width_pt,
-                            "heightPt": shape.height_pt, "anchorXPt": shape.anchor_x_pt,
-                            "anchorYPt": shape.anchor_y_pt, "rotation": shape.rotation,
-                            "fill": shape.fill, "stroke": shape.stroke,
-                            "strokeWidth": shape.stroke_width, "textBlocks": shape.text_blocks,
-                            "wrapMode": shape.wrap_mode, "behindDoc": shape.behind_doc,
-                            "zOrder": shape.z_order,
-                        }));
+                        shapes.push(shape_summary(shape, para_idx, run_idx));
                     }
                 }
             }
@@ -366,6 +376,56 @@ impl DocxTools {
 #[cfg(test)]
 mod sample_tests {
     use super::*;
+    use std::io::{Cursor, Read, Write};
+    use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
+
+    #[test]
+    fn minimal_shape_keeps_omitted_defaults_null_in_summary() {
+        let source = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docx/public/demo/sample-1.docx"
+        ));
+        let mut archive = ZipArchive::new(Cursor::new(source.as_slice())).unwrap();
+        let mut output = ZipWriter::new(Cursor::new(Vec::new()));
+        let minimal_document = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body><w:p><w:r><w:drawing><wp:inline><wp:extent cx="2540000" cy="635000"/><wp:docPr id="1" name="Minimal rectangle"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="317500"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:body></w:document>"#;
+        for index in 0..archive.len() {
+            let mut part = archive.by_index(index).unwrap();
+            let name = part.name().to_string();
+            let mut bytes = Vec::new();
+            part.read_to_end(&mut bytes).unwrap();
+            output
+                .start_file(&name, SimpleFileOptions::default())
+                .unwrap();
+            output
+                .write_all(if name == "word/document.xml" {
+                    minimal_document.as_bytes()
+                } else {
+                    &bytes
+                })
+                .unwrap();
+        }
+        let bytes = output.finish().unwrap().into_inner();
+        let document = docx_parser::parse_docx_model_native(&bytes).unwrap();
+        let shape = document
+            .body
+            .iter()
+            .find_map(|element| match element {
+                BodyElement::Paragraph(paragraph) => {
+                    paragraph.runs.iter().find_map(|run| match run {
+                        DocRun::Shape(shape) => Some(shape.as_ref()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("synthetic rectangle must parse");
+        let summary = shape_summary(shape, 0, 1);
+        for field in ["rotation", "strokeWidth", "behindDoc", "textBlocks"] {
+            assert!(summary[field].is_null(), "{field} must remain null");
+        }
+        assert_eq!(summary["presetGeometry"], "rect");
+        assert_eq!(summary["widthPt"], 200.0);
+    }
 
     fn sample_path() -> String {
         format!(

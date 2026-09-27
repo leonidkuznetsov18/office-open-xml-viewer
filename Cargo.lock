@@ -530,6 +530,7 @@ dependencies = [
  "tracing-subscriber",
  "xlsx-model",
  "xlsx-parser",
+ "zip",
 ]
 
 [[package]]

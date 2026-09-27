@@ -26,3 +26,6 @@ docx-model = { path = "../docx/model" }
 xlsx-model = { path = "../xlsx/model" }
 pptx-model = { path = "../pptx/model" }
 ooxml-common = { path = "../ooxml-common" }
+
+[dev-dependencies]
+zip = { workspace = true }
