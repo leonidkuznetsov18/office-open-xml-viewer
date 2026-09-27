@@ -171,10 +171,12 @@ impl Facts {
         };
         // MS-ODRAW 2.2.40 FSP flags: group members, patriarchs, deleted,
         // OLE and master-linked shapes need facts this projection lacks.
-        // fConnector is accepted only for the straight connector preset,
-        // whose static path is kept without endpoint rerouting.
+        // [MS-ODRAW] 2.2.40 fConnector marks connection semantics, while
+        // MSOSPT 20/32 are both straight line paths. Word's DOCX save of a
+        // line-connector group preserves these as static VML lines/shapes;
+        // keep the authored path without endpoint rerouting.
         let membership = if child { 0x2 } else { 0 };
-        if flags & 0x43f != membership || (flags & 0x100 != 0 && kind != 32) {
+        if flags & 0x43f != membership || (flags & 0x100 != 0 && !matches!(kind, 20 | 32)) {
             return Err(unsupported(
                 "Word drawing shape has unsupported shape flags",
             ));
@@ -724,6 +726,18 @@ mod tests {
     fn read(kind: u16, flags: u32, bytes: &[u8], extent: [i64; 2]) -> Result<Facts, String> {
         let (shape, _) = crate::officeart::record_with_end(bytes, 0, &mut 1000, "test").unwrap();
         Facts::read(kind, flags, false, shape, extent, &mut 1000)
+    }
+
+    #[test]
+    fn connector_flag_on_line_preserves_the_static_line_path() {
+        let bytes = container(&[], &[], &[]);
+        for flags in [0xb02, 0xb82] {
+            let (shape, _) =
+                crate::officeart::record_with_end(&bytes, 0, &mut 1000, "test").unwrap();
+            let facts = Facts::read(20, flags, true, shape, [9000, 0], &mut 1000).unwrap();
+            assert_eq!(facts.preset, Some("line"));
+        }
+        assert!(read(1, 0xb00, &bytes, [9000, 3000]).is_err());
     }
 
     #[test]
