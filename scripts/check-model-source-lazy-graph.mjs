@@ -195,16 +195,22 @@ function assertNoSourceRuntime(code, name) {
   }
 }
 
-// Baseline: the pre-feature OOXML production build at 776237df. The small
-// entry allowance covers the modelSources presence dispatch and its Vite
-// dynamic-chunk factoring; ordinary worker payloads have no allowance.
+// Baseline: the post-#1562 OOXML production build. The shared DrawingML text
+// breaker and bidi segment kernel increased the static XLSX/PPTX entries and
+// ordinary render workers, while keeping model-source loads behind their
+// existing dynamic boundary. Reset the measured sizes here so the original
+// small dispatch budgets still guard future eager coupling; ordinary workers
+// retain zero growth allowance. Before #1562 the corresponding clean build
+// measured 2528311/1837981/1826158/2579338 static bytes
+// (DOCX/XLSX/PPTX/Node) and 1416412/1458524/2046946 ordinary-worker
+// bytes (XLSX/PPTX/DOCX in ascending size order).
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
-  xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
-  pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_575_997, budget: 3_600 },
+  docx: { entry: 2_528_427, inline: 31_624, budget: 2_800 },
+  xlsx: { entry: 1_846_390, inline: 39_902, budget: 2_500 },
+  pptx: { entry: 1_827_238, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_579_083, budget: 3_600 },
 });
-const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
+const OOXML_RENDER_WORKERS = [1_422_039, 1_458_891, 2_047_039];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
