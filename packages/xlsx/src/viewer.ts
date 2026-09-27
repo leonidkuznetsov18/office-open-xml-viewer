@@ -1357,8 +1357,9 @@ class XlsxViewerEngine implements ZoomableViewer {
       const lease = await acquireXlsxWorksheet(workbook, index);
       sourceWorksheet = lease.worksheet;
       releaseNewWorksheet = lease.release;
-      worksheet = this.sheetViews.get(index) ?? this.createVisibleSheetView(sourceWorksheet);
-      if (!this.sheetViews.has(index)) this.restoreSheetViewState(index, worksheet);
+      const cachedView = this.sheetViews.get(index);
+      worksheet = cachedView ?? this.createVisibleSheetView(sourceWorksheet);
+      if (!cachedView) this.restoreSheetViewState(index, worksheet);
       const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
       if (typeof prepareRowHeights === 'function') {
         const measureCanvas = this.hostDocument.createElement('canvas');

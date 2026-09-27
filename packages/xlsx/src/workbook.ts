@@ -770,7 +770,7 @@ export class XlsxWorkbook {
   }
 
   private completePendingEvictions(): void {
-    for (const pending of new Set(this.evictingSheets.values())) pending.complete();
+    for (const pending of this.evictingSheets.values()) pending.complete();
     this.evictingSheets.clear();
   }
 
