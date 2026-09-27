@@ -21,7 +21,7 @@ import {
   type BodyPaginationState,
   type CanonicalPageDraft,
 } from './body-pagination.js';
-import { assertAndDeepFreezeDocumentLayout } from './invariants.js';
+import { assertAndDeepFreezeDocumentLayoutSteps } from './invariants.js';
 import {
   bodyLayoutKernelOf,
   createFieldAcquisitionServicesView,
@@ -2650,9 +2650,9 @@ export function* paginateBodySteps(
     identity: (pass) => paginationFieldPageContexts(pass.layout),
     requiresConvergence: seed.session.hasPaginationFields,
   })).result;
-  return assertAndDeepFreezeDocumentLayout(
+  return (yield* assertAndDeepFreezeDocumentLayoutSteps(
     composeBodyPaginationResult(converged, input, owners, options, true),
-  ) as DocumentLayout;
+  )) as DocumentLayout;
 }
 
 export function paginateBody(

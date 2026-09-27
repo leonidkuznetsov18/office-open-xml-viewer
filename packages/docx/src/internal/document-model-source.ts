@@ -101,7 +101,7 @@ import {
 } from '../document-layout-view.js';
 
 
-import { DocxDocument, type LoadOptions } from '../document.js';
+import { DocxDocument, type DocxViewerLoadControl, type LoadOptions } from '../document.js';
 import { selectModelSource, beginModelSourceLoad } from '@silurus/ooxml-core/internal/model-source';
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
@@ -147,7 +147,14 @@ function adoptSourceView(doc: SourceDocxFriend, showTrackedChanges: boolean | un
     }
 }
 
-export async function loadDocxModelSource(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+export async function loadDocxModelSource(
+  source: string | ArrayBuffer,
+  opts: LoadOptions = {},
+  control?: DocxViewerLoadControl,
+): Promise<DocxDocument> {
+    const signal = control?.signal;
+    const checkAbort = () => { if (signal?.aborted) throw new PaginationAbortError(); };
+    checkAbort();
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const defaultCurrentDateMs = Date.now();
@@ -166,12 +173,13 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
     }
     let buffer: ArrayBuffer;
     if (typeof source === 'string') {
-      const res = await fetch(source);
+      const res = await fetch(source, { signal });
       if (!res.ok) throw new Error(`Failed to fetch: ${res.status} ${res.statusText}`);
       buffer = await res.arrayBuffer();
     } else {
       buffer = source;
     }
+    checkAbort();
     // An application-supplied model source claims its input from the raw bytes
     // before OOXML container resolution; without `modelSources` nothing here
     // runs and the OOXML path below is unchanged.
@@ -191,6 +199,12 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
       : new (await import('../worker-source.ts?worker&inline')).default();
     let doc: SourceDocxFriend | undefined;
     let publicDoc: DocxDocument | undefined;
+    let disposed = false;
+    const abortDocument = () => {
+      if (disposed || !doc) return;
+      disposed = true;
+      doc.destroy();
+    };
     const wiredWorker = sourceWorker(worker, sourceLoad, opts, (view) => { if (doc) adoptSourceView(doc, view); });
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
@@ -199,6 +213,8 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
       // TypeScript's private members have no cross-module friend access;
       // the constructor above creates the real public class instance.
       doc = publicDoc as unknown as SourceDocxFriend;
+      signal?.addEventListener('abort', abortDocument, { once: true });
+      checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
       // The variant the caller will actually render, recorded for BOTH render
@@ -332,7 +348,7 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
         // Worker mode must build this layout to return parsedMeta. Main mode does
         // the same work here so layout failures reject load() in both modes.
         //
-        // Sliced when asked: the same pagination generator, drained across
+        // Sliced by default in main mode: the same pagination generator, drained across
         // event-loop turns instead of in one blocking call, then deposited in
         // the variant store so every later synchronous render selects it
         // normally. The layout is identical either way.
@@ -477,14 +493,40 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
             );
           });
           await firstPublication.promise;
-        } else if (deferrable && (opts.sliceLayout || opts.onLayoutProgress)) {
-          const layout = await layoutDocumentInputAsync(
-            doc._source.bodyLayoutInput,
-            services,
-            layoutOptions,
-            scheduler,
-          );
-          retained.layoutVariants.prime(layoutOptions, layout);
+        } else if (deferrable && (opts.sliceLayout !== false || opts.onLayoutProgress)) {
+          for (;;) {
+            checkAbort();
+            const requestedView = control?.requestedView();
+            const currentOptions = requestedView === undefined
+              ? layoutOptions
+              : normalizeLayoutOptions(opts.currentDate, runtime.defaultCurrentDateMs, requestedView);
+            runtime.activeLayoutOptions = currentOptions;
+            const abort = new AbortController();
+            let viewChanged = false;
+            const unsubscribe = control?.subscribeViewChange(() => {
+              viewChanged = true;
+              abort.abort();
+            });
+            doc._layoutAbort = abort;
+            try {
+              const layout = await layoutDocumentInputAsync(
+                doc._source.bodyLayoutInput,
+                services,
+                currentOptions,
+                { ...scheduler, signal: abort.signal },
+              );
+              checkAbort();
+              if (viewChanged) continue;
+              retained.layoutVariants.prime(currentOptions, layout);
+              break;
+            } catch (error) {
+              if (error instanceof PaginationAbortError && viewChanged && !signal?.aborted) continue;
+              throw error;
+            } finally {
+              unsubscribe?.();
+              doc._layoutAbort = null;
+            }
+          }
         } else {
           // Build the variant that will be rendered, not the default one.
           retained.layoutVariants.layoutFor(layoutOptions);
@@ -501,13 +543,15 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
         () => undefined,
       );
       metrics.checkpoint('model and layout ready');
+      checkAbort();
       metrics.succeed({ pages: doc.pageCount });
       sourceLoad.release();
       return publicDoc;
     } catch (error) {
-      const rejectedDocument = doc;
-      disposeRejectedLoad(worker, rejectedDocument ? () => rejectedDocument.destroy() : undefined);
+      disposeRejectedLoad(worker, doc ? abortDocument : undefined);
       throw error;
+    } finally {
+      signal?.removeEventListener('abort', abortDocument);
     }
     } finally {
       sourceLoad.release();

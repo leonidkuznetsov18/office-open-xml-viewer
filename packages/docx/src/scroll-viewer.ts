@@ -18,8 +18,8 @@ import {
 import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/read-only-comment-contract';
 import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/dom-interaction-boundary';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
-import { DocxDocument } from './document';
-import type { LoadOptions } from './document';
+import { DocxDocument, docxViewerLoadSignal } from './document';
+import type { DocxViewerLoadControl, LoadOptions } from './document';
 import {
   activeDocxLayoutViewOf,
   selectDocxLayoutView,
@@ -285,6 +285,9 @@ interface PageSlot {
 }
 
 export class DocxScrollViewer implements ZoomableViewer {
+  private _pendingLoadAbort: AbortController | null = null;
+  private _pendingRequestedView: boolean | undefined;
+  private _pendingViewChanged: (() => void) | null = null;
   private readonly _documentOwner: TerminalResourceOwner<DocxDocument>;
   private get _doc(): DocxDocument | null { return this._documentOwner.current; }
   private readonly _borrowed: boolean;
@@ -647,6 +650,12 @@ export class DocxScrollViewer implements ZoomableViewer {
     // (The borrowed path returned above can never reach here, so this only ever
     // frees an engine we created.)
     let elementInvalidated = false;
+    const inheritedRequestedView = this._pendingRequestedView;
+    const requestedViewAtStart = inheritedRequestedView ?? this._showTrackedChanges;
+    this._pendingLoadAbort?.abort();
+    const loadAbort = new AbortController();
+    this._pendingLoadAbort = loadAbort;
+    this._pendingRequestedView = inheritedRequestedView;
     try {
       const doc = await this._documentOwner.replace(() => DocxDocument.load(source, {
         password: this._opts.password,
@@ -669,21 +678,33 @@ export class DocxScrollViewer implements ZoomableViewer {
         // paint pays a full synchronous repagination.
         // An explicit choice (including `false`) is forwarded; otherwise the
         // document's own view default applies.
-        ...(this._opts.modelSources === undefined
-          ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
-          : (this._requestedShowTrackedChanges === undefined
-            ? undefined
-            : { showTrackedChanges: this._requestedShowTrackedChanges })),
+        ...(inheritedRequestedView !== undefined
+          ? { showTrackedChanges: inheritedRequestedView }
+          : this._opts.modelSources === undefined
+            ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
+            : (this._requestedShowTrackedChanges === undefined
+              ? undefined
+              : { showTrackedChanges: this._requestedShowTrackedChanges })),
         ...(this._currentDate === undefined
           ? {}
           : { currentDate: this._currentDate }),
         ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
         ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
-        ...(this._opts.sliceLayout ? { sliceLayout: true } : {}),
+        ...(this._opts.sliceLayout === undefined ? {} : { sliceLayout: this._opts.sliceLayout }),
+        [docxViewerLoadSignal]: {
+          signal: loadAbort.signal,
+          requestedView: () => this._pendingRequestedView,
+          subscribeViewChange: (listener: () => void) => {
+            this._pendingViewChanged = listener;
+            return () => {
+              if (this._pendingViewChanged === listener) this._pendingViewChanged = null;
+            };
+          },
+        } satisfies DocxViewerLoadControl,
         onLayoutProgress: this._opts.onLayoutProgress,
         onLayoutPartial: this._opts.onLayoutPartial,
         onLayoutComplete: this._opts.onLayoutComplete,
-      }), (ownedDocument) => {
+      } as LoadOptions), (ownedDocument) => {
         this._invalidateElementContext(false);
         elementInvalidated = true;
         this._findRequestGeneration++;
@@ -704,6 +725,16 @@ export class DocxScrollViewer implements ZoomableViewer {
       });
       if (!doc) return;
       if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
+      if (this._pendingRequestedView !== undefined) {
+        this._showTrackedChanges = this._pendingRequestedView;
+        this._requestedShowTrackedChanges = this._pendingRequestedView;
+      }
+      if (requestedViewAtStart !== this._showTrackedChanges) {
+        await selectDocxLayoutView(doc, {
+          showTrackedChanges: this._showTrackedChanges,
+          currentDate: this._currentDate,
+        }, this);
+      }
       // The loaded document's active view is authoritative (it may come from
       // the document's own view default).
       if (this._opts.modelSources !== undefined) {
@@ -727,6 +758,12 @@ export class DocxScrollViewer implements ZoomableViewer {
       // is the outcome the caller awaits; swallow this stale rejection.
       if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
       throw err instanceof Error ? err : new Error(String(err));
+    } finally {
+      if (this._pendingLoadAbort === loadAbort) {
+        this._pendingLoadAbort = null;
+        this._pendingRequestedView = undefined;
+        this._pendingViewChanged = null;
+      }
     }
     if (elementInvalidated && !this._destroyed) this._emitSelectionContextChange();
   }
@@ -2228,6 +2265,10 @@ export class DocxScrollViewer implements ZoomableViewer {
    */
   async setShowTrackedChanges(value: boolean): Promise<void> {
     const generation = ++this._layoutViewGeneration;
+    if (this._pendingLoadAbort) {
+      this._pendingRequestedView = value;
+      this._pendingViewChanged?.();
+    }
     const doc = this._doc;
     // Explicitness is independent of the current value: false before load
     // must win over a model source's true view default.
@@ -3026,6 +3067,9 @@ export class DocxScrollViewer implements ZoomableViewer {
   destroy(): void {
     if (this._destroyed) return;
     this._destroyed = true;
+    this._pendingLoadAbort?.abort();
+    this._pendingLoadAbort = null;
+    this._pendingViewChanged = null;
     this._findRequestGeneration++;
     this._errorRouter.close();
     this._unbindLayoutDocument();

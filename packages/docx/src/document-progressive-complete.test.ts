@@ -1,6 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { OoxmlResourceUsageSnapshot, WorkerLike } from '@silurus/ooxml-core';
-import { DocxDocument } from './document.js';
+import { DocxDocument, docxViewerLoadSignal, type DocxViewerLoadControl, type LoadOptions } from './document.js';
+import { activeDocxLayoutViewOf } from './document-layout-view.js';
+import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { layoutSourceStore } from './layout-source-model-adapter.js';
 import { installStubCanvas, syntheticDocxModel } from './testing/synthetic-document.js';
 
@@ -131,5 +133,50 @@ describe('main-mode progressive load: onLayoutComplete contract', () => {
     expect(completions).toEqual([undefined]);
     expect(doc.layoutComplete).toBe(true);
     doc.destroy();
+  }, 300_000);
+});
+
+describe('ordinary main-mode sliced load ownership', () => {
+  it('cancels the active layout and resolves the original load with the latest tracked view', async () => {
+    installMainModeParse(60);
+    let requested: boolean | undefined;
+    let listener: (() => void) | null = null;
+    let changed = false;
+    const control: DocxViewerLoadControl = {
+      signal: new AbortController().signal,
+      requestedView: () => requested,
+      subscribeViewChange: (next) => {
+        listener = next;
+        return () => { if (listener === next) listener = null; };
+      },
+    };
+    const opts = {
+      [docxViewerLoadSignal]: control,
+      onLayoutProgress: () => {
+        if (changed) return;
+        changed = true;
+        requested = true;
+        listener?.();
+      },
+    } as LoadOptions;
+    const doc = await DocxDocument.load(new ArrayBuffer(0), opts);
+    expect(changed).toBe(true);
+    expect(activeDocxLayoutViewOf(doc).showTrackedChanges).toBe(true);
+    expect(doc.layoutComplete).toBe(true);
+    doc.destroy();
+  }, 300_000);
+
+  it('rejects a destroyed viewer-owned layout instead of installing a stale result', async () => {
+    installMainModeParse(60);
+    const abort = new AbortController();
+    const control: DocxViewerLoadControl = {
+      signal: abort.signal,
+      requestedView: () => undefined,
+      subscribeViewChange: () => () => undefined,
+    };
+    await expect(DocxDocument.load(new ArrayBuffer(0), {
+      [docxViewerLoadSignal]: control,
+      onLayoutProgress: () => abort.abort(),
+    } as LoadOptions)).rejects.toBeInstanceOf(PaginationAbortError);
   }, 300_000);
 });
