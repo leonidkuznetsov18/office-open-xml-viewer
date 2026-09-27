@@ -605,6 +605,12 @@ export class DocxDocument {
           doc._document,
           (p) => loadingDocument.getFontBytes(p),
         );
+        // destroy() may have run while FontFace.load() was pending. A late
+        // acquisition is not in the document's arrays that destroy() drained.
+        if (signal?.aborted) {
+          unregisterEmbeddedFonts(loadedEmbedded.faces);
+          throw new PaginationAbortError();
+        }
         doc._embeddedFontFaces = loadedEmbedded.faces;
         embeddedMetrics = loadedEmbedded.metrics;
         embeddedRoutes = loadedEmbedded.routes;
@@ -614,13 +620,22 @@ export class DocxDocument {
             !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
+      if (signal?.aborted) {
+        unloadOfficeFontFallbacks(officeFonts.faces);
+        throw new PaginationAbortError();
+      }
       doc._officeFontFaces = officeFonts.faces;
       if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
         // A proven local Calibri face already resolves this authored family;
         // avoid the optional Google Fonts substitution for the same request.
         const names = docxFontPreloadNames(doc._document, cjkFallback).filter((name) =>
           name?.toLowerCase() !== 'calibri' || !('calibri' in officeFonts.routes));
-        doc._googleFontFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        const googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        if (signal?.aborted) {
+          unloadGoogleFonts(googleFaces);
+          throw new PaginationAbortError();
+        }
+        doc._googleFontFaces = googleFaces;
       }
       // Equations are converted + rasterized before pagination (which reads their
       // extents synchronously). Requires the opt-in `math` engine; without it,
@@ -630,6 +645,7 @@ export class DocxDocument {
       if (doc._mode === 'main' && opts.math && doc._document && documentHasMath(doc._document)) {
         preparedMath = await prepareMathRuns(doc._document, opts.math);
       }
+      checkAbort();
       if (doc._mode === 'main' && doc._document && doc._source) {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
@@ -848,6 +864,7 @@ export class DocxDocument {
       // after the parse response. Telemetry is strictly best-effort: a worker
       // failure or a silent worker may omit the newest counters, but must not
       // turn an otherwise successful load into a rejection or an endless wait.
+      checkAbort();
       await doc._resourceUsage(
         opts.workerTimeoutMs ?? OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS,
       ).then(

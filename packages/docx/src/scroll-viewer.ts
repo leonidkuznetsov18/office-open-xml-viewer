@@ -651,60 +651,89 @@ export class DocxScrollViewer implements ZoomableViewer {
     // frees an engine we created.)
     let elementInvalidated = false;
     const inheritedRequestedView = this._pendingRequestedView;
-    const requestedViewAtStart = inheritedRequestedView ?? this._showTrackedChanges;
     this._pendingLoadAbort?.abort();
     const loadAbort = new AbortController();
     this._pendingLoadAbort = loadAbort;
     this._pendingRequestedView = inheritedRequestedView;
     try {
-      const doc = await this._documentOwner.replace(() => DocxDocument.load(source, {
-        password: this._opts.password,
-        useGoogleFonts: this._opts.useGoogleFonts,
-        cjkFallback: this._opts.cjkFallback,
-        maxZipEntryBytes: this._opts.maxZipEntryBytes,
-        resourceLimits: this._opts.resourceLimits,
-        debug: this._opts.debug,
-        onResourceMetrics: this._opts.onResourceMetrics,
-        workerTimeoutMs: this._opts.workerTimeoutMs,
-        wasmUrl: this._opts.wasmUrl,
-        math: this._opts.math,
-        threeD: this._opts.threeD,
-        regionMap: this._opts.regionMap,
-        chartEx: this._opts.chartEx,
-        tiff: this._opts.tiff,
-        mode: this._mode,
-        // The variant the viewer will render. Without these, load builds the
-        // final view while every render asks for the markup view, and the first
-        // paint pays a full synchronous repagination.
-        // An explicit choice (including `false`) is forwarded; otherwise the
-        // document's own view default applies.
-        ...(inheritedRequestedView !== undefined
-          ? { showTrackedChanges: inheritedRequestedView }
-          : this._opts.modelSources === undefined
-            ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
-            : (this._requestedShowTrackedChanges === undefined
-              ? undefined
-              : { showTrackedChanges: this._requestedShowTrackedChanges })),
-        ...(this._currentDate === undefined
-          ? {}
-          : { currentDate: this._currentDate }),
-        ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
-        ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
-        ...(this._opts.sliceLayout === undefined ? {} : { sliceLayout: this._opts.sliceLayout }),
-        [docxViewerLoadSignal]: {
-          signal: loadAbort.signal,
-          requestedView: () => this._pendingRequestedView,
-          subscribeViewChange: (listener: () => void) => {
-            this._pendingViewChanged = listener;
-            return () => {
-              if (this._pendingViewChanged === listener) this._pendingViewChanged = null;
-            };
-          },
-        } satisfies DocxViewerLoadControl,
-        onLayoutProgress: this._opts.onLayoutProgress,
-        onLayoutPartial: this._opts.onLayoutPartial,
-        onLayoutComplete: this._opts.onLayoutComplete,
-      } as LoadOptions), (ownedDocument) => {
+      const doc = await this._documentOwner.replace(async () => {
+        const loaded = await DocxDocument.load(source, {
+          password: this._opts.password,
+          useGoogleFonts: this._opts.useGoogleFonts,
+          cjkFallback: this._opts.cjkFallback,
+          maxZipEntryBytes: this._opts.maxZipEntryBytes,
+          resourceLimits: this._opts.resourceLimits,
+          debug: this._opts.debug,
+          onResourceMetrics: this._opts.onResourceMetrics,
+          workerTimeoutMs: this._opts.workerTimeoutMs,
+          wasmUrl: this._opts.wasmUrl,
+          math: this._opts.math,
+          threeD: this._opts.threeD,
+          regionMap: this._opts.regionMap,
+          chartEx: this._opts.chartEx,
+          tiff: this._opts.tiff,
+          mode: this._mode,
+          // The variant the viewer will render. Without these, load builds the
+          // final view while every render asks for the markup view, and the first
+          // paint pays a full synchronous repagination.
+          // An explicit choice (including `false`) is forwarded; otherwise the
+          // document's own view default applies.
+          ...(inheritedRequestedView !== undefined
+            ? { showTrackedChanges: inheritedRequestedView }
+            : this._opts.modelSources === undefined
+              ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
+              : (this._requestedShowTrackedChanges === undefined
+                ? undefined
+                : { showTrackedChanges: this._requestedShowTrackedChanges })),
+          ...(this._currentDate === undefined
+            ? {}
+            : { currentDate: this._currentDate }),
+          ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
+          ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
+          ...(this._opts.sliceLayout === undefined ? {} : { sliceLayout: this._opts.sliceLayout }),
+          [docxViewerLoadSignal]: {
+            signal: loadAbort.signal,
+            requestedView: () => this._pendingRequestedView,
+            subscribeViewChange: (listener: () => void) => {
+              this._pendingViewChanged = listener;
+              return () => {
+                if (this._pendingViewChanged === listener) this._pendingViewChanged = null;
+              };
+            },
+          } satisfies DocxViewerLoadControl,
+          onLayoutProgress: this._opts.onLayoutProgress,
+          onLayoutPartial: this._opts.onLayoutPartial,
+          onLayoutComplete: this._opts.onLayoutComplete,
+        } as LoadOptions);
+        // The final probe can outlive a view change. Reconcile against the
+        // active document view before replace() commits this candidate; its
+        // generation guard also absorbs a superseded worker rejection.
+        let disposed = false;
+        const disposePending = () => {
+          if (disposed) return;
+          disposed = true;
+          loaded.destroy();
+        };
+        try {
+          while (!loadAbort.signal.aborted) {
+            const requested = this._pendingRequestedView;
+            if (requested === undefined || activeDocxLayoutViewOf(loaded).showTrackedChanges === requested) break;
+            loadAbort.signal.addEventListener('abort', disposePending, { once: true });
+            try {
+              await selectDocxLayoutView(loaded, {
+                showTrackedChanges: requested,
+                currentDate: this._currentDate,
+              }, this);
+            } finally {
+              loadAbort.signal.removeEventListener('abort', disposePending);
+            }
+          }
+          return loaded;
+        } catch (error) {
+          disposePending();
+          throw error;
+        }
+      }, (ownedDocument) => {
         this._invalidateElementContext(false);
         elementInvalidated = true;
         this._findRequestGeneration++;
@@ -725,15 +754,10 @@ export class DocxScrollViewer implements ZoomableViewer {
       });
       if (!doc) return;
       if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
+      if (this._pendingLoadAbort !== loadAbort) return;
       if (this._pendingRequestedView !== undefined) {
         this._showTrackedChanges = this._pendingRequestedView;
         this._requestedShowTrackedChanges = this._pendingRequestedView;
-      }
-      if (requestedViewAtStart !== this._showTrackedChanges) {
-        await selectDocxLayoutView(doc, {
-          showTrackedChanges: this._showTrackedChanges,
-          currentDate: this._currentDate,
-        }, this);
       }
       // The loaded document's active view is authoritative (it may come from
       // the document's own view default).
@@ -753,10 +777,12 @@ export class DocxScrollViewer implements ZoomableViewer {
       const initialRenders: Promise<void>[] = [];
       this._relayout(initialRenders);
       await Promise.all(initialRenders);
+      if (this._pendingLoadAbort !== loadAbort) return;
     } catch (err) {
       // Superseded loads own no error reporting — the winning load (or destroy())
       // is the outcome the caller awaits; swallow this stale rejection.
       if (this._destroyed) throw new Error('DocxScrollViewer is destroyed');
+      if (this._pendingLoadAbort !== loadAbort) return;
       throw err instanceof Error ? err : new Error(String(err));
     } finally {
       if (this._pendingLoadAbort === loadAbort) {

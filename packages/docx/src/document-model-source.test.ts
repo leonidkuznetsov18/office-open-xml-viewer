@@ -1,8 +1,10 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ModelSource, ModelSourceModuleDescriptor } from '@silurus/ooxml-core';
+import * as core from '@silurus/ooxml-core';
 import { buildCfbFixture } from '@silurus/ooxml-core/testing';
-import { DocxDocument } from './document.js';
+import { DocxDocument, docxViewerLoadSignal, type LoadOptions } from './document.js';
 import { activeDocxLayoutViewOf } from './document-layout-view.js';
+import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import {
   DocumentPullWorker,
   isDocumentPullCommand,
@@ -138,6 +140,7 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   globals.Worker = originals.Worker;
   globals.location = originals.location;
   ProtocolWorker.instances = [];
@@ -184,6 +187,34 @@ describe('DocxDocument.load with model sources', () => {
     expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(false);
     expect(release).toHaveBeenCalledOnce();
     document.destroy();
+  });
+
+  it('releases an office font acquired after a canceled model-source load', async () => {
+    install(parseWorkerScript(undefined));
+    const { source } = fakeSource();
+    let finish!: (result: Awaited<ReturnType<typeof core.loadOfficeFontFallbacks>>) => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    vi.spyOn(core, 'loadOfficeFontFallbacks').mockImplementation(() => {
+      entered();
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    const unload = vi.spyOn(core, 'unloadOfficeFontFallbacks').mockImplementation(() => undefined);
+    const abort = new AbortController();
+    const loading = DocxDocument.load(cfbBytes(), {
+      modelSources: [source],
+      [docxViewerLoadSignal]: {
+        signal: abort.signal,
+        requestedView: () => undefined,
+        subscribeViewChange: () => () => undefined,
+      },
+    } as LoadOptions);
+    await started;
+    abort.abort();
+    const face = { family: 'Pending local font' } as FontFace;
+    finish({ faces: [face], routes: {}, checked: [] });
+    await expect(loading).rejects.toBeInstanceOf(PaginationAbortError);
+    expect(unload).toHaveBeenCalledWith([face]);
   });
 
   it('terminates an opened worker when release throws after a successful parse', async () => {

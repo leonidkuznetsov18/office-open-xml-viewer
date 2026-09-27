@@ -5,6 +5,8 @@ import { activeDocxLayoutViewOf } from './document-layout-view.js';
 import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { layoutSourceStore } from './layout-source-model-adapter.js';
 import { installStubCanvas, syntheticDocxModel } from './testing/synthetic-document.js';
+import { DocxViewer } from './viewer.js';
+import { installDom, makeEl } from './scroll-viewer-test-dom.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The `onLayoutComplete` terminal-callback contract for main-mode progressive
@@ -51,12 +53,13 @@ beforeAll(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   globals.Worker = originals.Worker;
   globals.location = originals.location;
 });
 
 /** Stub the WASM parse with a synthetic document of `paragraphs` body entries. */
-function installMainModeParse(paragraphs: number): void {
+function installMainModeParse(paragraphs: number, kind: 'plain' | 'tracked' = 'plain'): void {
   globals.Worker = SilentWorker;
   globals.location = { href: 'http://localhost/' };
   vi.spyOn(
@@ -78,7 +81,7 @@ function installMainModeParse(paragraphs: number): void {
       _source: unknown;
       _meta: unknown;
     };
-    const model = syntheticDocxModel('plain', { paragraphs });
+    const model = syntheticDocxModel(kind, { paragraphs, wordsPerParagraph: 120 });
     doc._document = model;
     doc._source = layoutSourceStore(model);
     doc._meta = null;
@@ -137,6 +140,75 @@ describe('main-mode progressive load: onLayoutComplete contract', () => {
 });
 
 describe('ordinary main-mode sliced load ownership', () => {
+  it('reconciles the active view when toggles return to their initial value during the final probe', async () => {
+    installDom();
+    installMainModeParse(100, 'tracked');
+    vi.spyOn(DocxViewer.prototype as unknown as { _render(): Promise<void> }, '_render')
+      .mockResolvedValue(undefined);
+    let finishProbe!: (usage: OoxmlResourceUsageSnapshot) => void;
+    let enteredProbe!: () => void;
+    let loadedDoc!: DocxDocument;
+    const probing = new Promise<void>((resolve) => { enteredProbe = resolve; });
+    vi.spyOn(DocxDocument.prototype as unknown as {
+      _resourceUsage(timeoutMs: number): Promise<OoxmlResourceUsageSnapshot>;
+    }, '_resourceUsage').mockImplementation(function (this: DocxDocument) {
+      loadedDoc = this;
+      enteredProbe();
+      return new Promise((resolve) => { finishProbe = resolve; });
+    });
+    let changed = false;
+    const viewer = new DocxViewer(makeEl('canvas') as unknown as HTMLCanvasElement, {
+      onLayoutProgress: () => {
+        if (changed) return;
+        changed = true;
+        void viewer.setShowTrackedChanges(true);
+      },
+    });
+    vi.stubGlobal('document', undefined);
+    const loading = viewer.load(new ArrayBuffer(0));
+    await probing;
+    expect(activeDocxLayoutViewOf(loadedDoc).showTrackedChanges).toBe(true);
+    await viewer.setShowTrackedChanges(false);
+    finishProbe(USAGE);
+    await loading;
+    expect(activeDocxLayoutViewOf(loadedDoc).showTrackedChanges).toBe(false);
+    expect(viewer.pageCount).toBe(loadedDoc.pageCount);
+    viewer.destroy();
+  }, 300_000);
+
+  it('releases a font registered after a viewer-owned load is aborted', async () => {
+    installMainModeParse(3);
+    const faces = new Set<FontFace>();
+    let finish!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    vi.stubGlobal('document', { fonts: faces });
+    vi.stubGlobal('FontFace', class {
+      status = 'unloaded';
+      constructor(public family: string) {}
+      load(): Promise<this> {
+        entered();
+        return new Promise((resolve) => {
+          finish = () => { this.status = 'loaded'; resolve(this); };
+        });
+      }
+    });
+    const abort = new AbortController();
+    const loading = DocxDocument.load(new ArrayBuffer(0), {
+      [docxViewerLoadSignal]: {
+        signal: abort.signal,
+        requestedView: () => undefined,
+        subscribeViewChange: () => () => undefined,
+      },
+    } as LoadOptions);
+    await started;
+    expect(faces.size).toBe(1);
+    abort.abort();
+    finish();
+    await expect(loading).rejects.toBeInstanceOf(PaginationAbortError);
+    expect(faces.size).toBe(0);
+  });
+
   it('cancels the active layout and resolves the original load with the latest tracked view', async () => {
     installMainModeParse(60);
     let requested: boolean | undefined;

@@ -231,4 +231,32 @@ describe('DocxViewer.load() — concurrent-load latch', () => {
     expect(viewer.pageCount).toBe(2);
     viewer.destroy();
   });
+
+  it('settles a superseded view selection without surfacing its worker rejection', async () => {
+    const { canvas } = mount();
+    const first = new FakeDocxEngine(2, A4);
+    const second = new FakeDocxEngine(3, A4);
+    let finishLoad!: (doc: DocxDocument) => void;
+    let rejectView!: (error: Error) => void;
+    let startedView!: () => void;
+    const selecting = new Promise<void>((resolve) => { startedView = resolve; });
+    first.setLayoutView = (async () => {
+      startedView();
+      await new Promise<void>((_resolve, reject) => { rejectView = reject; });
+    }) as typeof first.setLayoutView;
+    const originalDestroy = first.destroy.bind(first);
+    first.destroy = () => { originalDestroy(); rejectView(new Error('Worker terminated')); };
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce(() => new Promise((resolve) => { finishLoad = resolve; }))
+      .mockResolvedValueOnce(second.asDoc());
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement);
+    const loading = viewer.load('first.docx');
+    await viewer.setShowTrackedChanges(true);
+    finishLoad(first.asDoc());
+    await selecting;
+    await viewer.load('second.docx');
+    await expect(loading).resolves.toBeUndefined();
+    expect(viewer.pageCount).toBe(3);
+    viewer.destroy();
+  });
 });

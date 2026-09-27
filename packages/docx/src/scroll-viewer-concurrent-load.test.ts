@@ -181,4 +181,47 @@ describe('DocxScrollViewer.load() — concurrent-load latch', () => {
     expect(v.pageCount).toBe(4);
     v.destroy();
   });
+
+  it('settles a superseded view selection without surfacing its worker rejection', async () => {
+    const { v } = build();
+    const first = new FakeDocxEngine(2, SIZE);
+    const second = new FakeDocxEngine(3, SIZE);
+    let finishLoad!: (doc: DocxDocument) => void;
+    let rejectView!: (error: Error) => void;
+    let startedView!: () => void;
+    const selecting = new Promise<void>((resolve) => { startedView = resolve; });
+    first.setLayoutView = (async () => {
+      startedView();
+      await new Promise<void>((_resolve, reject) => { rejectView = reject; });
+    }) as typeof first.setLayoutView;
+    const originalDestroy = first.destroy.bind(first);
+    first.destroy = () => { originalDestroy(); rejectView(new Error('Worker terminated')); };
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce(() => new Promise((resolve) => { finishLoad = resolve; }))
+      .mockResolvedValueOnce(second.asDoc());
+    const loading = v.load('first.docx');
+    await v.setShowTrackedChanges(true);
+    finishLoad(first.asDoc());
+    await selecting;
+    await v.load('second.docx');
+    await expect(loading).resolves.toBeUndefined();
+    expect(v.pageCount).toBe(3);
+    v.destroy();
+  });
+
+  it('reconciles a pending toggle back to the initial view against the loaded document', async () => {
+    const { v } = build();
+    const engine = new FakeDocxEngine(4, SIZE);
+    engine.layoutView = { showTrackedChanges: true, currentDate: 0 };
+    const pending = deferredLoad(engine);
+    vi.spyOn(DocxDocument, 'load').mockImplementation(() => pending.promise);
+    const loading = v.load('pending.docx');
+    await v.setShowTrackedChanges(true);
+    await v.setShowTrackedChanges(false);
+    pending.resolve();
+    await loading;
+    expect(engine.layoutView.showTrackedChanges).toBe(false);
+    expect(v.pageCount).toBe(4);
+    v.destroy();
+  });
 });
