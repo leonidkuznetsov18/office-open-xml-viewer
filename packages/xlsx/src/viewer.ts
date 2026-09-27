@@ -1358,7 +1358,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     let worksheet: Worksheet;
     let sourceWorksheet: Worksheet;
     let releaseNewWorksheet: (() => void) | undefined;
-    let releaseFirstPaint: (() => void) | undefined;
     let previewCompletion: Promise<Worksheet> | null = null;
     let previewPreparedViewport: { width: number; height: number; scale: number } | null = null;
     try {
@@ -1373,49 +1372,73 @@ class XlsxViewerEngine implements ZoomableViewer {
       const lease = await acquireXlsxWorksheetPreview(workbook, index);
       sourceWorksheet = lease.worksheet;
       releaseNewWorksheet = lease.release;
-      releaseFirstPaint = lease.releaseFirstPaint;
       let eligiblePreview = lease.partial;
+      const cachedView = this.sheetViews.get(index);
+      const prepareView = (model: Worksheet): Worksheet => {
+        const view = cachedView ?? this.createVisibleSheetView(model);
+        if (cachedView || lease.partial) view.rows = model.rows;
+        if (!cachedView) this.restoreSheetViewState(index, view);
+        return view;
+      };
+      const prepareHeights = (view: Worksheet, refresh: boolean): void => {
+        if (refresh) invalidateAutoRowHeights(view);
+        const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
+        if (typeof prepareRowHeights === 'function') {
+          const measureCanvas = this.hostDocument.createElement('canvas');
+          const measureCtx = measureCanvas.getContext('2d');
+          if (measureCtx) prepareRowHeights.call(workbook, view, measureCtx);
+        }
+        this.syncAutomaticRowOverrides(index, view);
+      };
+      worksheet = prepareView(sourceWorksheet);
       if (lease.partial) {
-        previewPreparedViewport = {
+        const preparedViewport = {
           width: this.canvasArea.clientWidth,
           height: this.canvasArea.clientHeight,
           scale: this.viewport.scale,
         };
-        const visible = getGridGeometryForWorksheet(sourceWorksheet).visibleRange({
-          width: previewPreparedViewport.width,
-          height: previewPreparedViewport.height,
-          scale: this.viewport.scale,
-          scrollX: 0,
-          scrollY: 0,
-          headerWidth: HEADER_W,
-          headerHeight: HEADER_H,
-          buffer: 2,
+        previewPreparedViewport = preparedViewport;
+        const visibleRange = () => getGridGeometryForWorksheet(worksheet).visibleRange({
+          width: preparedViewport.width,
+          height: preparedViewport.height,
+          scale: preparedViewport.scale,
+          scrollX: 0, scrollY: 0,
+          headerWidth: HEADER_W, headerHeight: HEADER_H, buffer: 2,
         });
-        const coveringRow = Math.max(
-          visible.range.row + visible.range.rows - 1,
-          sourceWorksheet.freezeRows,
-        );
-        await (lease.waitForRows?.(coveringRow) ?? Promise.resolve());
-        this.previewFallbackReason = viewportPreviewBlocker(sourceWorksheet, visible.range, coveringRow);
+        let visible = visibleRange();
+        let coveringRow = 0;
+        for (;;) {
+          const needed = Math.max(visible.range.row + visible.range.rows - 1, worksheet.freezeRows ?? 0);
+          if (needed > coveringRow) {
+            await (lease.waitForRows?.(needed) ?? Promise.resolve());
+            coveringRow = needed;
+          }
+          // Rows that arrived while waiting can change display-derived height
+          // and therefore bring additional rows into the first viewport.
+          prepareHeights(worksheet, true);
+          visible = visibleRange();
+          if (Math.max(visible.range.row + visible.range.rows - 1, worksheet.freezeRows ?? 0) <= coveringRow) break;
+        }
+        // Paint includes the frozen corner, frozen row/column strips, and the
+        // scrollable quadrant. Use their union for both row coverage and every
+        // dependency check; the renderer can also spill text horizontally from
+        // cells outside the visible column band in these rows.
+        const painted = {
+          row: (worksheet.freezeRows ?? 0) > 0 ? 1 : visible.range.row,
+          col: (worksheet.freezeCols ?? 0) > 0 ? 1 : visible.range.col,
+          rows: visible.range.row + visible.range.rows - ((worksheet.freezeRows ?? 0) > 0 ? 1 : visible.range.row),
+          cols: visible.range.col + visible.range.cols - ((worksheet.freezeCols ?? 0) > 0 ? 1 : visible.range.col),
+        };
+        this.previewFallbackReason = viewportPreviewBlocker(worksheet, painted, coveringRow);
         if (this.previewFallbackReason) {
-          releaseFirstPaint?.();
           sourceWorksheet = await lease.completion;
           eligiblePreview = false;
           previewPreparedViewport = null;
+          worksheet = prepareView(sourceWorksheet);
+          prepareHeights(worksheet, true);
         }
-      }
+      } else prepareHeights(worksheet, false);
       previewCompletion = eligiblePreview ? lease.completion : null;
-      const cachedView = this.sheetViews.get(index);
-      worksheet = cachedView ?? this.createVisibleSheetView(sourceWorksheet);
-      if (eligiblePreview) worksheet.rows = sourceWorksheet.rows;
-      if (!cachedView) this.restoreSheetViewState(index, worksheet);
-      const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
-      if (typeof prepareRowHeights === 'function') {
-        const measureCanvas = this.hostDocument.createElement('canvas');
-        const measureCtx = measureCanvas.getContext('2d');
-        if (measureCtx) prepareRowHeights.call(workbook, worksheet, measureCtx);
-      }
-      this.syncAutomaticRowOverrides(index, worksheet);
     } catch (error) {
       releaseNewWorksheet?.();
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
@@ -1533,14 +1556,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     // for LTR sheets the start is scrollLeft=0. updateSpacerSize must run first
     // so scrollWidth reflects the new sheet before we read the max offset.
     this.resetHorizontalScroll();
-    let paintedEarly = false;
-    try {
-      const frameBefore = this.committedFrameCount;
-      await this.renderCurrentSheet();
-      paintedEarly = this.committedFrameCount > frameBefore;
-    } finally {
-      releaseFirstPaint?.();
-    }
+    const frameBefore = this.committedFrameCount;
+    await this.renderCurrentSheet();
+    const paintedEarly = this.committedFrameCount > frameBefore;
     if (previewCompletion && !paintedEarly && this.isCurrentSheetRequest(generation, workbook)) {
       await previewCompletion;
       if (!this.isCurrentSheetRequest(generation, workbook)) return;

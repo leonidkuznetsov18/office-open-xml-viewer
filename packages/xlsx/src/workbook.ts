@@ -802,14 +802,15 @@ export class XlsxWorkbook {
   }
 
   /** Viewer lease may resolve at the first exact row-local viewport. Public
-   * worksheet and find callers continue to wait for terminal cache admission. */
+   * worksheet and find callers continue to wait for terminal cache admission.
+   * Row pulling is independent of painting: a render may itself need a later
+   * row, so waiting for the paint here would create a mutual wait. */
   private async acquireWorksheetPreviewLease(sheetIndex: number): Promise<{
     worksheet: Worksheet;
     release: () => void;
     partial: boolean;
     completion: Promise<Worksheet>;
     waitForRows: (row: number) => Promise<void>;
-    releaseFirstPaint: () => void;
   }> {
     const pending = this.evictingSheets.get(sheetIndex);
     if (pending) {
@@ -817,20 +818,14 @@ export class XlsxWorkbook {
       return this.acquireWorksheetPreviewLease(sheetIndex);
     }
     const releasePin = this.pinWorksheet(sheetIndex);
-    let releaseFirstPaint: () => void = () => undefined;
-    const release = () => { releaseFirstPaint(); releasePin(); };
+    const release = () => { releasePin(); };
     try {
       const completion = this.getOrLoadWorksheet(sheetIndex);
       const progress = this.sheetPreviews?.get(sheetIndex);
-      const viewerId = progress?.registerViewer();
-      if (progress && viewerId) releaseFirstPaint = () => progress.finishViewer(viewerId);
       const worksheet = progress ? await progress.ready : await completion;
-      if (!progress?.worksheet || progress.complete) releaseFirstPaint();
       return {
         worksheet, release, partial: !!progress?.worksheet && !progress.complete, completion,
-        waitForRows: (row) => progress && viewerId
-          ? progress.waitForViewer(viewerId, row) : Promise.resolve(),
-        releaseFirstPaint,
+        waitForRows: (row) => progress ? progress.waitFor(row) : Promise.resolve(),
       };
     } catch (error) {
       release();
@@ -916,7 +911,6 @@ export class XlsxWorkbook {
           );
           progress.append(unit.rows);
           modelUsage = nextUsage;
-          await progress.pauseForViewerPaint();
           continue;
         }
         const worksheet = unit.worksheet;
@@ -1532,7 +1526,6 @@ export function acquireXlsxWorksheetPreview(workbook: XlsxWorkbook, sheetIndex: 
   partial: boolean;
   completion: Promise<Worksheet>;
   waitForRows?: (row: number) => Promise<void>;
-  releaseFirstPaint?: () => void;
 }> {
   const acquire = workbook['acquireWorksheetPreviewLease'];
   if (typeof acquire === 'function') return acquire.call(workbook, sheetIndex);

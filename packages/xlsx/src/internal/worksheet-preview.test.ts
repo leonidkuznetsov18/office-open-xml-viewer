@@ -47,20 +47,15 @@ describe('provisional worksheet coverage', () => {
     await expect(waiting).rejects.toBe(error);
   });
 
-  it('lets a worker first-frame request overtake later row pulls', async () => {
+  it('lets a covering-row waiter resolve while later chunks keep arriving', async () => {
     const progress = new WorksheetPreview([]);
-    const viewer = progress.registerViewer();
     progress.preview(worksheet(), null, 70_000, 1);
     progress.append([row(128)]);
     await progress.ready;
-    const covering = progress.waitForViewer(viewer, 40);
-    const paused = progress.pauseForViewerPaint();
-    let resumed = false;
-    void paused.then(() => { resumed = true; });
+    const covering = progress.waitFor(40);
+    const later = progress.waitFor(256);
     await covering;
-    await Promise.resolve();
-    expect(resumed).toBe(false);
-    progress.finishViewer(viewer);
-    await paused;
+    progress.append([row(256)]);
+    await expect(later).resolves.toBeUndefined();
   });
 });

@@ -2,13 +2,6 @@ import type { Row, Worksheet } from '../types.js';
 import type { WorksheetPreviewBlocker } from '../worksheet-pull-codec.js';
 
 type Waiter = { row: number; resolve: () => void; reject: (reason: unknown) => void };
-type ViewerDemand = {
-  row: number | null;
-  known: Promise<void>;
-  tell: () => void;
-  painted: Promise<void>;
-  finish: () => void;
-};
 
 /** One provisional model for a worksheet pull. A fallback has no provisional
  * model and makes viewers wait for the existing full-model completion path.
@@ -20,7 +13,6 @@ export class WorksheetPreview {
   private rejectReady!: (reason: unknown) => void;
   private settledReady = false;
   private waiters: Waiter[] = [];
-  private viewerDemands = new Map<symbol, ViewerDemand>();
   worksheet: Worksheet | null = null;
   reason: WorksheetPreviewBlocker | null = null;
   maxRow = 0;
@@ -57,45 +49,6 @@ export class WorksheetPreview {
     this.flush();
   }
 
-  /** A viewer claims the first frame before it awaits the preview. The pull
-   * yields at the covering chunk so a render-worker bitmap can overtake later
-   * row pulls without a timer or a guessed chunk count. */
-  registerViewer(): symbol {
-    const id = Symbol('xlsx-first-viewport');
-    let tell!: () => void;
-    let finish!: () => void;
-    const known = new Promise<void>((resolve) => { tell = resolve; });
-    const painted = new Promise<void>((resolve) => { finish = resolve; });
-    this.viewerDemands.set(id, { row: null, known, tell, painted, finish });
-    return id;
-  }
-
-  waitForViewer(id: symbol, row: number): Promise<void> {
-    const demand = this.viewerDemands.get(id);
-    if (demand) {
-      demand.row = row;
-      demand.tell();
-    }
-    return this.waitFor(row);
-  }
-
-  finishViewer(id: symbol): void {
-    const demand = this.viewerDemands.get(id);
-    if (!demand) return;
-    this.viewerDemands.delete(id);
-    demand.tell();
-    demand.finish();
-  }
-
-  async pauseForViewerPaint(): Promise<void> {
-    if (!this.worksheet || this.viewerDemands.size === 0) return;
-    const demands = [...this.viewerDemands.values()];
-    await Promise.all(demands.map((demand) => demand.known));
-    await Promise.all(demands.filter((demand) =>
-      demand.row !== null && demand.row <= this.coveredThrough,
-    ).map((demand) => demand.painted));
-  }
-
   finish(worksheet: Worksheet): void {
     this.complete = true;
     this.coveredThrough = Number.MAX_SAFE_INTEGER;
@@ -110,7 +63,6 @@ export class WorksheetPreview {
       this.rejectReady(reason);
     }
     for (const waiter of this.waiters.splice(0)) waiter.reject(reason);
-    for (const id of this.viewerDemands.keys()) this.finishViewer(id);
   }
 
   waitFor(row: number): Promise<void> {

@@ -2,6 +2,7 @@ import type { ViewportRange, Worksheet, WorksheetCellRange } from '../types.js';
 
 export type ViewportPreviewBlocker =
   | 'conditional-format-range'
+  | 'merge-range'
   | 'drawing-dependency'
   | 'sparkline-dependency';
 
@@ -35,8 +36,21 @@ export function viewportPreviewBlocker(
   viewport: ViewportRange,
   coveredThrough: number,
 ): ViewportPreviewBlocker | null {
+  // A merged perimeter can take a border from its bottom/right cells even
+  // when only the anchor is visible. Metadata supplies the range, but the
+  // cell styles are row data and must all have arrived before painting.
+  // Formula spill values are cached per cell and are not recalculated by this
+  // renderer; their visible cells arrive with their own complete rows.
+  if ((worksheet.mergeCells ?? []).some((merge) =>
+    intersects(merge, viewport) && merge.bottom > coveredThrough)) {
+    return 'merge-range';
+  }
   for (const format of worksheet.conditionalFormats ?? []) {
-    const ranges = format.sqref.filter((range) => intersects(range, viewport));
+    // An unwrapped value in any painted row can overflow horizontally into
+    // the viewport from an off-screen column. Its CF can alter text metrics,
+    // so column-only culling here would accept an incomplete first frame.
+    const ranges = format.sqref.filter((range) =>
+      range.top <= viewport.row + viewport.rows - 1 && range.bottom >= viewport.row);
     if (ranges.length === 0) continue;
     for (const rule of format.rules) {
       if (rule.type === 'other') continue;
