@@ -14139,6 +14139,19 @@ describe('classic chart data table (CT_DTable)', () => {
     expect(rec.arcs.length).toBeGreaterThan(0); // line-series key marker
   });
 
+  it('formats data table values in the chart date system', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'line',
+      categories: ['Q1'],
+      date1904: true,
+      series: [series({ name: 'North', values: [43465], valFormatCode: 'yyyy-mm-dd', seriesType: 'line' })],
+      dataTable: { showHorizontalBorder: false, showVerticalBorder: false, showOutline: false, showKeys: false },
+    }), RECT, 1);
+    // 1904-system serial 43465 is 2023-01-01 (the 1900 system reads 2018-12-31).
+    expect(rec.texts.some(text => text.text === '2023-01-01')).toBe(true);
+  });
+
   it('honors each authored border switch and an explicit noFill line independently', () => {
     const render = (over: Partial<NonNullable<ChartModel['dataTable']>>) => {
       const rec = recordingCtx();
