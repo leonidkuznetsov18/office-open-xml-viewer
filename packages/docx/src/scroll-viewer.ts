@@ -1,4 +1,4 @@
-import { openExternalHyperlink, PT_TO_PX, zoomStepScale, anchoredZoomOffset, nextZoomStep, prevZoomStep, fitScale } from '@silurus/ooxml-core';
+import { openExternalHyperlink, PT_TO_PX } from '@silurus/ooxml-core';
 import type { FindHighlightColors, FindMatch, FindMatchesOptions, HyperlinkTarget, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
 import {
   computeVisibleWindow,
@@ -19,6 +19,7 @@ import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/
 import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/dom-interaction-boundary';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
+import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { DocxDocument } from './document';
 import type { LoadOptions } from './document';
@@ -302,26 +303,39 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  loading, `opts.mode` decides and `load()` passes it to `DocxDocument.load`. */
   private _mode: 'main' | 'worker';
 
-  /** px-per-pt zoom multiplier. Base fit maps the widest page's width to the
-   *  container width (or opts.width). Zoom multiplies this (design §7). */
-  private _scale = 1;
-  /** Whether the base fit scale has been established. Set true the first time
-   *  `relayout()` resolves a positive base scale. We use an explicit flag rather
-   *  than a `_scale === 1` sentinel because a fit scale of exactly 1 is a valid
-   *  established state (a 1× fit would otherwise be re-fit forever). */
-  private _scaleEstablished = false;
-  /**
-   * IX9 F1 — a `setScale` factor requested BEFORE the base fit is established
-   * (pre-load, or a zero-width container), already clamped to
-   * `[zoomMin, zoomMax]`, or `null` when none is pending. The single-canvas
-   * viewers latch a pre-load `setScale` and honour it on the first render; the
-   * scroll viewers used to silently DROP it — the family-unified semantics are
-   * "latch and apply once the layout establishes". `relayout()` applies (and
-   * clears) this right after establishing the base, firing `onScaleChange` at
-   * application time; `getScale()` reports it while pending so the caller sees
-   * the same value a single-canvas viewer would show.
-   */
-  private _pendingScale: number | null = null;
+  private readonly _zoom = new ScrollZoomController({
+    scrollHost: () => this._scrollHost,
+    spacer: () => this._spacer,
+    count: () => this._doc?.pageCount ?? 0,
+    zoomMin: () => this._opts.zoomMin ?? 0.1,
+    zoomMax: () => this._opts.zoomMax ?? 4,
+    baseScale: () => this._baseScale(),
+    fitWidthPx: () => this._fitWidthPx(),
+    fitContentSize: (mode) => {
+      if (!this._doc) return null;
+      const size = this._doc.pageSize(0);
+      return {
+        width: (mode === 'width' ? this._widestPageWidthPt() : size.widthPt) * PT_TO_PX,
+        height: size.heightPt * PT_TO_PX,
+      };
+    },
+    indexAt: (y) => this._pageIndexAtOffset(this._range(), y),
+    offset: (index) => this._scrollGeometry.offsets[index] ?? 0,
+    height: (index) => this._heights[index] || 0,
+    totalHeight: () => this._scrollGeometry.totalHeight,
+    recomputeHeights: () => this._recomputeHeights(),
+    syncSpacerWidth: () => this._syncSpacerWidth(),
+    padLeft: () => this._padH().left,
+    invalidateRender: () => { this._renderEpoch++; },
+    preview: () => this._previewVisible(),
+    scheduleSettle: () => this._scheduleSettle(),
+    onScaleChange: (scale) => this._opts.onScaleChange?.(scale),
+    relayout: () => this.relayout(),
+    mountVisible: () => this._mountVisible(),
+    refitOnResize: () => this._opts.refitOnResize !== false,
+  });
+  private get _scale(): number { return this._zoom.scale; }
+  private get _scaleEstablished(): boolean { return this._zoom.established; }
   private readonly _scroller = new SlotScroller<PageSlot, VisibleRange>({
     spacer: () => this._spacer,
     count: () => this._doc?.pageCount ?? 0,
@@ -441,26 +455,8 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  build; the engine's per-canvas token already discards the stale pixels. */
   private get _renderEpoch(): number { return this._scroller.renderEpoch; }
   private set _renderEpoch(value: number) { this._scroller.renderEpoch = value; }
-  private _wheelListener: ((e: WheelEvent) => void) | null = null;
-  /** Gesture-only pointer anchor for the NEXT `setScale`, in scrollHost-viewport
-   *  px (`{ x, y }` from the wheel event, relative to the scroll host's top-left).
-   *  Set by the Ctrl/⌘+wheel handler right before it calls `setScale` so the zoom
-   *  pivots on the cursor ("zoom toward the pointer") in BOTH axes; consumed and
-   *  cleared by `setScale`. `null` for every non-gesture source (the public
-   *  `setScale`, the +/- steppers, `fitWidth`/`fitPage`, the resize re-fit), which
-   *  keep the historical viewport-TOP re-anchor so their behaviour is unchanged. */
-  private _pendingZoomAnchor: { x: number; y: number } | null = null;
-  /** Observes the container so a width change re-fits the base scale. Disconnected
-   *  in `destroy()`. */
-  private _resizeObserver: ResizeObserver | null = null;
-  /** The base fit scale at the last established/re-fit layout. `_onResize` divides
-   *  `_scale` by this to recover the current zoom multiplier so a width change
-   *  re-fits the base while preserving the user's zoom (design §11). */
-  private _prevBase = 0;
-  /** The fit width (px) the base scale was last established at. Lets `_onResize`
-   *  skip the re-fit when only the height changed (a ResizeObserver fires on ANY
-   *  box change, but only a WIDTH change alters the fit-to-width base scale). */
-  private _lastFitWidth = 0;
+  private get _prevBase(): number { return this._zoom.prevBase; }
+  private set _prevBase(value: number) { this._zoom.prevBase = value; }
   /** Resolved page-canvas `box-shadow` (design: the recipe drop shadow by
    *  default). Resolved ONCE with `??` — NOT `||` — so `pageShadow: false`
    *  survives as the "no shadow" sentinel (a `||` would treat `false` as absent
@@ -606,40 +602,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._wrapper.ownerDocument.addEventListener('pointerdown', this._commentOutsidePointerListener);
     }
 
-    // Ctrl/Cmd+wheel zoom (design §7). Bare wheel is left untouched so the
-    // scrollHost scrolls natively. `enableZoom:false` installs no handler at all.
-    // `{ passive: false }` is required because we call preventDefault() to stop
-    // the browser's own ctrl+wheel page zoom.
-    if (this._opts.enableZoom !== false) {
-      this._wheelListener = (e: WheelEvent) => {
-        if (!(e.ctrlKey || e.metaKey)) return; // bare wheel scrolls natively
-        e.preventDefault();
-        if (e.deltaY === 0) return;
-        // Pointer-anchored zoom: pivot on the cursor, not the viewport top. Record
-        // the pointer in scrollHost-viewport px (subtract the host's on-screen
-        // origin) so `setScale` can keep the content point under the cursor fixed.
-        // A malformed event (no clientX/Y) yields a non-finite anchor; drop it so
-        // `setScale` falls back to the historical viewport-top re-anchor.
-        const rect = this._scrollHost.getBoundingClientRect();
-        const ax = e.clientX - rect.left;
-        const ay = e.clientY - rect.top;
-        this._pendingZoomAnchor =
-          Number.isFinite(ax) && Number.isFinite(ay) ? { x: ax, y: ay } : null;
-        this.setScale(zoomStepScale(this._scale, e.deltaY, e.deltaMode));
-      };
-      this._scrollHost.addEventListener('wheel', this._wheelListener as EventListener, {
-        passive: false,
-      });
-    }
-
-    // Re-fit the base scale on a container resize (design §11). A container that
-    // is 0-wide at construction (a common flexbox/tab layout) establishes its
-    // scale on the first non-zero resize — the zero-width deferral is completed
-    // here. `ResizeObserver` may be absent in a non-DOM host; guard for it.
-    if (typeof ResizeObserver !== 'undefined') {
-      this._resizeObserver = new ResizeObserver(() => this._onResize());
-      this._resizeObserver.observe(this._container);
-    }
+    this._zoom.bind(this._container, this._scrollHost, this._opts.enableZoom !== false);
 
     if (this._borrowed) {
       this._bindLayoutDocument(borrowedDocument!);
@@ -1000,36 +963,8 @@ export class DocxScrollViewer implements ZoomableViewer {
     if (this._doc.layoutComplete !== false) {
       this._presentedPageCount = this._doc.pageCount;
     }
-    // Establish the base fit scale on the first layout that has a positive
-    // width. Zoom (T4) layers its own multiplier on top of this; here we only
-    // set the base. An explicit `_scaleEstablished` flag (NOT a `_scale === 1`
-    // sentinel) so a legitimate 1× fit is not re-fit on every relayout.
     if (!this._scaleEstablished) {
-      const base = this._baseScale();
-      if (base > 0) {
-        this._scale = base;
-        this._prevBase = base;
-        this._lastFitWidth = this._fitWidthPx();
-        this._scaleEstablished = true;
-        // IX9 F1: apply a setScale latched BEFORE establishment (pre-load / a
-        // zero-width container), now that the base exists. Applied here — before
-        // heights/spacer/mount below — so the first window renders directly at
-        // the requested factor (no intermediate base-scale frame). `_prevBase`
-        // stays the true base so a later resize re-fit preserves the implied
-        // zoom multiplier. onScaleChange fires at application time (the latch
-        // itself was silent), and only when the pending factor actually moved
-        // the scale off the base fit.
-        if (this._pendingScale !== null) {
-          const pending = this._pendingScale;
-          this._pendingScale = null;
-          if (pending !== this._scale) {
-            this._scale = pending;
-            this._opts.onScaleChange?.(pending);
-          }
-        }
-      } else {
-        return; // container has no width yet — retry on the next resize
-      }
+      if (!this._zoom.establishBase()) return;
     } else {
       // Progressive pagination or a layout-view switch can reveal a page wider
       // than the one(s) used for the previous base. Re-fit even when the
@@ -1656,227 +1591,13 @@ export class DocxScrollViewer implements ZoomableViewer {
     }
   }
 
-  /**
-   * Set the absolute px-per-pt zoom scale, clamped inline to
-   * `[zoomMin ?? 0.1, zoomMax ?? 4]` (absolute bounds, XlsxViewer convention — NOT
-   * multiples of the base fit; design §3 keeps the clamp in the viewer, not core),
-   * then re-anchor VERTICALLY so the page currently under the viewport top stays
-   * fixed. A no-op when the clamped scale is unchanged. Called BEFORE the doc is
-   * loaded / the base fit is established, the clamped factor is LATCHED (IX9 F1,
-   * family-unified with the single-canvas viewers) and applied by `relayout()`
-   * once the layout establishes — `onScaleChange` fires then.
-   *
-   * FLICKER-FREE (design §7): this does NOT re-render the visible pages inline.
-   * It shows an immediate CSS preview (stretch the existing bitmaps, scale the
-   * overlays) and DEBOUNCES a full-resolution settle re-render for ZOOM_SETTLE_MS,
-   * so a wheel/pinch burst never blanks a page and coalesces into one crisp render.
-   *
-   * Re-anchor (written from scratch — XlsxViewer only re-anchors horizontally):
-   * capture `top = topIndex` and the intra-page fraction `intraFrac` from the
-   * CURRENT range BEFORE rescale; after recomputing heights at the new scale,
-   * `newScrollTop = offsets'[top] + intraFrac × heights'[top]`, clamped to
-   * `[0, totalHeight' − viewportHeight]`. Because a page's height scales linearly
-   * with `_scale`, the same fractional position maps exactly to the new geometry.
-   *
-   * When the width-fit base is below `zoomMin` (for example a poster-sized page
-   * in a narrow container), that fit becomes the effective floor. The opening
-   * view already permits the smaller scale, so keeping it reachable avoids a
-   * one-way zoom ratchet after the user zooms in.
-   */
-  setScale(scale: number): void {
-    const zoomMin = this._effectiveZoomMin();
-    const zoomMax = this._opts.zoomMax ?? 4;
-    const next = Math.min(zoomMax, Math.max(zoomMin, scale));
-    // Consume the gesture-only pointer anchor (Ctrl/⌘+wheel set it just above)
-    // FIRST — before every early return — so a gesture whose setScale ends up a
-    // NO-OP (already pinned at zoomMin/zoomMax) or latches pre-establishment can
-    // never leak a stale anchor into a later non-gesture setScale (slider,
-    // steppers, fitWidth/fitPage, resize re-fit, public API), which must keep
-    // the historical viewport-TOP anchoring. `null` for every non-gesture source.
-    const gestureAnchor = this._pendingZoomAnchor;
-    this._pendingZoomAnchor = null;
-    if (!this._doc || this._doc.pageCount === 0 || !this._scaleEstablished) {
-      // IX9 F1 (family-unified pre-load semantics): a setScale before the doc is
-      // loaded / before the base fit is established is LATCHED, not dropped —
-      // matching the single-canvas viewers, which honour a pre-load setScale on
-      // their first render. relayout() applies it right after establishing the
-      // base and fires onScaleChange there (at application time).
-      this._pendingScale = next;
-      return;
-    }
-    if (next === this._scale) return;
-    const prevScale = this._scale;
-    const anchorY = gestureAnchor ? gestureAnchor.y : 0;
-
-    // Capture the VERTICAL anchor from the CURRENT layout, before rescale, as a
-    // (page index, intra-page fraction) pair. Anchoring on a page — not on the raw
-    // scrollTop — is what keeps the re-anchor exact despite the scale-INVARIANT
-    // desk padding and inter-page gaps (only the page heights scale, so a whole-
-    // scroll linear rescale would drift by the padding). The point we pin is the
-    // content under the pointer: content-y = scrollTop + anchorY (anchorY 0 ⇒ the
-    // viewport top, the historical behaviour).
-    const r0 = this._range();
-    const scrollTop0 = this._scrollHost.scrollTop;
-    const anchorContentY = scrollTop0 + anchorY;
-    // Which page does that content-y fall in? `computeVisibleRange` attributes a
-    // point in the trailing gap to the page ABOVE it, so clamp the fraction to
-    // [0,1] to pin the page rather than drift into the gap.
-    const top = this._pageIndexAtOffset(r0, anchorContentY);
-    const h0 = this._heights[top] || 0;
-    let intraFrac = h0 > 0 ? (anchorContentY - r0.offsets[top]) / h0 : 0;
-    intraFrac = Math.min(1, Math.max(0, intraFrac));
-
-    // HORIZONTAL anchor (gesture only — a non-gesture setScale leaves scrollLeft
-    // untouched, matching the historical behaviour). The page's left edge sits at
-    // the scale-INVARIANT left gutter `padL` when it overflows the viewport (see
-    // `_positionSlot`): screen-x of content pixel c is `padL + c − scrollLeft`,
-    // so the pointer's offset INTO the scaling region is `x − padL` and the
-    // scroll offset itself already lives in the region's own px.
-    const padL = this._padH().left;
-    const scrollLeft0 = this._scrollHost.scrollLeft || 0;
-
-    // Bump the render epoch BEFORE recycling/re-dispatching so any in-flight
-    // render dispatched at the old scale is recognised as stale on resolution.
-    this._renderEpoch++;
-
-    // Rescale, recompute heights, resize the spacer to the new total height.
-    this._scale = next;
-    this._recomputeHeights();
-    const r1 = computeVisibleWindow(
-      this._scrollGeometry,
-      0,
-      this._scrollHost.clientHeight,
-      this._overscan(),
-    );
-    this._spacer.style.height = `${r1.totalHeight}px`;
-    // The page px width changed with the scale, so the horizontal extent moves too.
-    this._syncSpacerWidth();
-
-    // Pin the same fractional position of the same page under the pointer (or the
-    // viewport top for a non-gesture zoom): the on-screen y of that content point
-    // must stay at `anchorY`, so newScrollTop = newContentY − anchorY.
-    const maxTop = Math.max(0, r1.totalHeight - this._scrollHost.clientHeight);
-    const newContentY = (r1.offsets[top] ?? 0) + intraFrac * (this._heights[top] || 0);
-    // The leading desk padding is fixed viewport space: none of it scales. If the
-    // anchor is still inside that padding, keep the native scroll offset instead
-    // of snapping to page 0's offset and hiding the margin after a programmatic
-    // zoom at scrollTop 0.
-    const reanchoredTop = anchorContentY < (r0.offsets[0] ?? 0)
-      ? scrollTop0
-      : newContentY - anchorY;
-    this._scrollHost.scrollTop = Math.min(maxTop, Math.max(0, reanchoredTop));
-
-    // Re-anchor horizontally for a gesture zoom. `padL` is a FIXED (non-scaling)
-    // gutter, so it is subtracted from the ANCHOR only — the scroll offset stays
-    // in NATIVE space with the browser's own [0, maxLeft] clamp. (Shifting the
-    // scroll by ±padL as well would run the fixed gutter through the zoom ratio
-    // and over-compensate by padL·(ratio−1) per step: with `screen = padL + c −
-    // scrollLeft`, pinning c·ratio under the pointer x gives exactly
-    // `scrollLeft' = ratio·(scrollLeft + (x−padL)) − (x−padL)`.) Skipped entirely
-    // for a non-gesture setScale so slider/stepper/API/resize is unchanged.
-    if (gestureAnchor) {
-      const maxLeft = Math.max(0, (this._spacer.offsetWidth || 0) - this._scrollHost.clientWidth);
-      this._scrollHost.scrollLeft = anchoredZoomOffset(
-        scrollLeft0,
-        gestureAnchor.x - padL,
-        prevScale,
-        next,
-        { maxScroll: maxLeft },
-      );
-    }
-
-    // FLICKER-FREE ZOOM (design §7). Do NOT recycle + re-render in-window slots
-    // (that blanks each visible page to white every tick). Instead:
-    //  1. CSS-PREVIEW the currently-mounted slots at the new geometry — reposition
-    //     the wrapper, stretch the existing canvas bitmap via style.width/height
-    //     (soft but never blank), and scale the text overlay by the ratio between
-    //     the new scale and the scale the overlay was built at.
-    //  2. DEBOUNCE a full-resolution settle re-render: schedule it ZOOM_SETTLE_MS
-    //     after the LAST setScale so a wheel/pinch burst coalesces into one render.
-    this._previewVisible();
-    this._scheduleSettle();
-    // IX9 change notification. Only reached when `next` differs from the prior
-    // scale (early-returned above), so every source — the public setScale, the
-    // ladder steppers, fitWidth/fitPage, Ctrl-wheel, and the _onResize re-fit
-    // (which routes through here) — notifies through this one hook.
-    this._opts.onScaleChange?.(next);
-  }
-
-  // ─── IX9 zoom contract (ZoomableViewer) ───────────────────────────────────
-
-  /** IX9 {@link ZoomableViewer} — the current zoom factor, where `1` = 100% (a
-   *  page at its natural pt→px width). This is the viewer's absolute `_scale`
-   *  (`widthPt × PT_TO_PX × _scale` is the drawn width), so it reads `1` at true
-   *  100% and, after the initial fit-to-width, the base fit factor. Before the
-   *  fit is established it reports a latched pre-load `setScale` (IX9 F1) if one
-   *  is pending — matching what a single-canvas viewer would show — else `1`. */
-  getScale(): number {
-    if (this._scaleEstablished) return this._scale;
-    return this._pendingScale ?? 1;
-  }
-
-  /** IX9 {@link ZoomableViewer} — step up to the next rung of the shared zoom
-   *  ladder above the current factor (clamped to `zoomMax` by {@link setScale}). */
-  zoomIn(): void {
-    this.setScale(nextZoomStep(this.getScale()));
-  }
-
-  /** IX9 {@link ZoomableViewer} — step down to the next lower ladder rung. */
-  zoomOut(): void {
-    this.setScale(prevZoomStep(this.getScale(), this._effectiveZoomMin()));
-  }
-
-  /** The configured floor, extended down to the current width fit when needed.
-   * Before layout establishes there is no fit exception, so pre-load requests
-   * retain the documented `[zoomMin, zoomMax]` clamp. */
-  private _effectiveZoomMin(): number {
-    const configured = this._opts.zoomMin ?? 0.1;
-    return this._scaleEstablished && this._prevBase > 0
-      ? Math.min(configured, this._prevBase)
-      : configured;
-  }
-
-  /**
-   * IX9 {@link ZoomableViewer} — fit a page's WIDTH to the container (the classic
-   * continuous-scroll "fit width"). Sets the scale to the width-fit base for the
-   * current container and the widest page, then re-anchors + re-renders via
-   * {@link setScale}. Defers (no-op) while the container is unlaid-out. A width
-   * fit below `zoomMin` becomes the effective floor so it remains reachable.
-   */
-  fitWidth(): void {
-    this._fit('width');
-  }
-
-  /**
-   * IX9 {@link ZoomableViewer} — fit a WHOLE page (width and height) inside the
-   * container so one page is visible without scrolling; takes the tighter of the
-   * width/height fit. Uses the FIRST page's size; unlike document-wide
-   * `fitWidth()`, this is a one-page fit target. Defers while unlaid-out.
-   */
-  fitPage(): void {
-    this._fit('page');
-  }
-
-  /** Shared fit for {@link fitWidth}/{@link fitPage}: width fit uses the widest
-   *  page so it agrees with the horizontal spacer; page fit continues to target
-   *  the first page's own width and height. Applies via {@link setScale} so the
-   *  flicker-free re-anchor / settle path and `onScaleChange` all run. */
-  private _fit(mode: 'width' | 'page'): void {
-    if (!this._doc || this._doc.pageCount === 0) return;
-    const size = this._doc.pageSize(0);
-    const widthPt = mode === 'width' ? this._widestPageWidthPt() : size.widthPt;
-    const scale = fitScale(
-      {
-        contentWidth: widthPt * PT_TO_PX,
-        contentHeight: size.heightPt * PT_TO_PX,
-        containerWidth: this._fitWidthPx(),
-        containerHeight: this._scrollHost.clientHeight,
-      },
-      mode,
-    );
-    if (scale <= 0) return; // unlaid-out — defer
-    this.setScale(scale);
-  }
+  /** Keep the public zoom facade while core owns scale, fit and anchoring. */
+  setScale(scale: number): void { this._zoom.setScale(scale); }
+  getScale(): number { return this._zoom.getScale(); }
+  zoomIn(): void { this._zoom.zoomIn(); }
+  zoomOut(): void { this._zoom.zoomOut(); }
+  fitWidth(): void { this._zoom.fit('width'); }
+  fitPage(): void { this._zoom.fit('page'); }
 
   /**
    * CSS preview of the visible window at the current `_scale` (design §7
@@ -2601,54 +2322,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    * after it we call `_mountVisible` again to cover the case where the clamp made
    * `setScale` no-op yet the viewport still grew.
    */
-  private _onResize(): void {
-    if (!this._doc || this._doc.pageCount === 0) return;
-    // Zero-width recovery: first non-zero layout establishes the base scale.
-    if (!this._scaleEstablished) {
-      this.relayout();
-      return;
-    }
-    if (this._opts.refitOnResize === false) {
-      // Fixed-scale hosts (for example VS Code previews) must not turn a pane
-      // resize into an implicit zoom. Recompute the visible window and horizontal
-      // centering only; page geometry and rendered bitmaps remain valid.
-      this._lastFitWidth = this._fitWidthPx();
-      this._mountVisible();
-      return;
-    }
-    const newBase = this._baseScale();
-    if (newBase <= 0) return; // still unlaid-out — wait for the next resize
-    const newFitWidth = this._fitWidthPx();
-    if (newFitWidth === this._lastFitWidth) {
-      // Height-only change (or any resize that leaves the fit-width identical):
-      // the base scale is unchanged, so there is no re-fit to do — but a taller
-      // viewport now exposes rows that were below the fold. `_mountVisible`
-      // recomputes the visible range from the CURRENT clientHeight and mounts the
-      // newly-revealed pages; without it those rows stay blank until the user
-      // scrolls (which recomputes the range). No epoch bump — the geometry
-      // (and every mounted slot's px size) is unchanged, so cached canvases are
-      // still valid; we only add the missing slots.
-      this._mountVisible();
-      return;
-    }
-    this._lastFitWidth = newFitWidth;
-    // Preserve the zoom multiplier across the re-fit: newScale = newBase × mult.
-    const mult = this._prevBase > 0 ? this._scale / this._prevBase : 1;
-    this._prevBase = newBase;
-    // Route through setScale so the epoch bumps and the re-anchor/force-re-render
-    // path runs identically to a zoom.
-    //
-    // `_prevBase` is updated before `setScale`, so a newly smaller width fit also
-    // becomes the effective floor for this resize. That preserves the multiplier
-    // without ratcheting an initially fitted oversized page up to zoomMin.
-    this.setScale(newBase * mult);
-    // `setScale` no-ops when the clamped scale is unchanged (e.g. already pinned at
-    // a clamp boundary), which would skip its preview + settle. A width+height
-    // growth that ends up clamped to the same scale must still reveal the taller
-    // viewport's rows, so mount here too. Idempotent when `setScale` ran: the
-    // window is already mounted and every present slot is a re-position no-op.
-    this._mountVisible();
-  }
+  private _onResize(): void { this._zoom.onResize(); }
 
   get topVisiblePage(): number {
     return this._scroller.lastRange?.topIndex ?? 0;
@@ -2891,17 +2565,12 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._scrollHost.removeEventListener('scroll', this._scrollListener);
       this._scrollListener = null;
     }
-    if (this._wheelListener) {
-      this._scrollHost.removeEventListener('wheel', this._wheelListener as EventListener);
-      this._wheelListener = null;
-    }
-    this._resizeObserver?.disconnect();
-    this._resizeObserver = null;
     // Cancel a pending settle so no re-render is dispatched after teardown
     // (design §7 mechanism 2). `_destroyed` also guards `_settleRender`, but
     // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
     // deterministic.
     this._scroller.destroy();
+    this._zoom.destroy();
     this._commentMargin.destroy();
     this._documentOwner.close();
     this._wrapper.remove();
