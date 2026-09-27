@@ -2563,6 +2563,12 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
     let root = doc.root_element();
 
     let kinsoku = bool_prop(root, "kinsoku");
+    let auto_hyphenation = bool_prop(root, "autoHyphenation");
+    let hyphenation_zone = root
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "hyphenationZone")
+        .and_then(|n| attr_w(n, "val"))
+        .map(|value| twips_to_pt(&value));
 
     let collect = |tag: &str| -> Option<String> {
         let mut found = false;
@@ -2648,6 +2654,8 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         });
 
     if kinsoku.is_none()
+        && auto_hyphenation.is_none()
+        && hyphenation_zone.is_none()
         && no_line_breaks_before.is_none()
         && no_line_breaks_after.is_none()
         && math_def_jc.is_none()
@@ -2663,6 +2671,8 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
     }
     Some(crate::types::DocumentSettings {
         kinsoku,
+        auto_hyphenation,
+        hyphenation_zone,
         no_line_breaks_before,
         no_line_breaks_after,
         math_def_jc,
@@ -6323,6 +6333,7 @@ fn resolved_run_font_facts(fmt: &RunFmt, theme: &ThemeColors) -> RunFontFacts {
         bold_cs: fmt.bold_cs,
         italic_cs: fmt.italic_cs,
         lang_bidi: fmt.lang_bidi.clone(),
+        lang_val: fmt.lang_val.clone(),
         lang_east_asia: fmt.lang_east_asia.clone(),
         kerning: fmt.kerning,
     }
@@ -6529,6 +6540,7 @@ fn make_field_run(
         bold_cs: fmt.bold_cs,
         italic_cs: fmt.italic_cs,
         lang_bidi: fmt.lang_bidi.clone(),
+        lang_val: fmt.lang_val.clone(),
         lang_east_asia: fmt.lang_east_asia.clone(),
         background: fmt.background.clone(),
         vert_align: fmt.vert_align.clone(),
@@ -6630,6 +6642,7 @@ fn text_runs_mergeable(a: &TextRun, b: &TextRun) -> bool {
         && a.bold_cs == b.bold_cs
         && a.italic_cs == b.italic_cs
         && a.lang_bidi == b.lang_bidi
+        && a.lang_val == b.lang_val
         && a.lang_east_asia == b.lang_east_asia
         && a.snap_to_grid == b.snap_to_grid
         // Character metrics change measured or painted geometry, so every one
@@ -6841,6 +6854,7 @@ fn parse_run_inner(
     let bold_cs = fmt.bold_cs;
     let italic_cs = fmt.italic_cs;
     let lang_bidi = fmt.lang_bidi.clone();
+    let lang_val = fmt.lang_val.clone();
     let lang_east_asia = fmt.lang_east_asia.clone();
     let font_hint = fmt.font_hint.clone();
     let snap_to_grid = fmt.snap_to_grid;
@@ -6934,6 +6948,7 @@ fn parse_run_inner(
                         bold_cs,
                         italic_cs,
                         lang_bidi: lang_bidi.clone(),
+                        lang_val: lang_val.clone(),
                         lang_east_asia: lang_east_asia.clone(),
                         snap_to_grid,
                         char_spacing,
@@ -7041,6 +7056,7 @@ fn parse_run_inner(
                         bold_cs,
                         italic_cs,
                         lang_bidi: lang_bidi.clone(),
+                        lang_val: lang_val.clone(),
                         lang_east_asia: lang_east_asia.clone(),
                         snap_to_grid,
                         char_spacing,
@@ -7099,6 +7115,7 @@ fn parse_run_inner(
                     bold_cs,
                     italic_cs,
                     lang_bidi: lang_bidi.clone(),
+                    lang_val: lang_val.clone(),
                     lang_east_asia: lang_east_asia.clone(),
                     snap_to_grid,
                     char_spacing,
@@ -7205,6 +7222,7 @@ fn parse_run_inner(
                     bold_cs,
                     italic_cs,
                     lang_bidi: lang_bidi.clone(),
+                    lang_val: lang_val.clone(),
                     lang_east_asia: lang_east_asia.clone(),
                     snap_to_grid,
                     char_spacing,
@@ -7444,6 +7462,7 @@ fn parse_run_inner(
                     bold_cs,
                     italic_cs,
                     lang_bidi: lang_bidi.clone(),
+                    lang_val: lang_val.clone(),
                     lang_east_asia: lang_east_asia.clone(),
                     snap_to_grid,
                     char_spacing,
@@ -17314,6 +17333,25 @@ mod math_jc_tests {
 
         let empty = r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         assert!(parse_document_settings(empty).is_none());
+    }
+
+    #[test]
+    fn settings_auto_hyphenation_and_zone_surface() {
+        let xml = format!(
+            r#"<w:settings xmlns:w="{w}"><w:autoHyphenation/><w:hyphenationZone w:val="432"/></w:settings>"#,
+            w = W_NS,
+        );
+        let settings = parse_document_settings(&xml).unwrap();
+        assert_eq!(settings.auto_hyphenation, Some(true));
+        assert_eq!(settings.hyphenation_zone, Some(21.6));
+        let disabled = format!(
+            r#"<w:settings xmlns:w="{w}"><w:autoHyphenation w:val="0"/></w:settings>"#,
+            w = W_NS,
+        );
+        assert_eq!(
+            parse_document_settings(&disabled).unwrap().auto_hyphenation,
+            Some(false)
+        );
     }
 
     // ECMA-376 Part 1 §17.15.1.18 / §17.15.3.3 and Part 4 §14.8.3.50 — East

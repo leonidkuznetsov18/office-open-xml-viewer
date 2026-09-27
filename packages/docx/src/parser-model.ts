@@ -125,6 +125,7 @@ export interface InternalRunSlotMetadata {
   boldCs?: boolean;
   italicCs?: boolean;
   langBidi?: string;
+  langVal?: string;
   langEastAsia?: string;
 }
 

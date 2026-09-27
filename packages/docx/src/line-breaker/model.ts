@@ -213,6 +213,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Effective `w:lang/@w:eastAsia` consumed by the isolated
    *  {@link wordIsOverflowPunctuation} compatibility projection. */
   eastAsiaLanguage?: string;
+  /** §17.15.1.10/§17.3.2.20: effective Latin language for discretionary word breaks. */
+  hyphenationLanguage?: string;
+  /** §17.15.1.43 maximum line-end whitespace before automatic hyphenation (pt). */
+  hyphenationZonePt?: number;
   /** The originating parent run contains East Asian-script content. When that
    * run has no effective East-Asian language, this provides the bounded union
    * fallback independently of the observed Latin-parent compatibility rule. */
@@ -569,6 +573,8 @@ export interface LineLayoutEnvironment {
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   /** ECMA-376 §17.15.1.18 document-wide full-width character compression. */
   readonly characterSpacingControl?: string;
+  readonly autoHyphenation?: boolean;
+  readonly hyphenationZonePt?: number;
   /** §17.15.3.31: use full character width when deciding line fit. */
   readonly lineWrapLikeWord6?: boolean;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */

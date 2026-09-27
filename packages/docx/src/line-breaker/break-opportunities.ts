@@ -1,4 +1,5 @@
 import { justifiedCandidateFitWidth } from './justify-fit.js';
+import { frenchHyphenationOffsets } from '../hyphenation.js';
 import {
   DEFAULT_KINSOKU_RULES,
   kinsokuAdjustedSplit,
@@ -711,6 +712,87 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
       queueEmergencyTail(s, split);
     }
   } else {
+    // A Word run boundary inside a word is not a lexical boundary. Word-saved
+    // controls include identical-format runs split around one letter; Word
+    // can hyphenate at that seam. Reconstruct only the bounded adjacent word,
+    // confirm the seam against the language dictionary, and then emit a
+    // displayed hyphen with zero source length before re-queuing this run.
+    if (s.src && s.hardJoinPrev !== true
+      && s.hyphenationLanguage?.split('-')[0]?.toLowerCase() === 'fr'
+      && /^\p{L}/u.test(s.text)) {
+      let before = '';
+      let beforeWidth = 0;
+      let lastPiece: LayoutTextSeg | undefined;
+      for (let i = breakerState.currentLine.length - 1; i >= 0; i -= 1) {
+        const part = breakerState.currentLine[i]!;
+        if (!('text' in part) || part.hyphenationLanguage !== s.hyphenationLanguage) break;
+        const tail = /\p{L}+$/u.exec(part.text)?.[0];
+        if (!tail) break;
+        before = tail + before;
+        if (before.length > 128) break;
+        beforeWidth += strNaturalAdvance(part, tail);
+        lastPiece ??= part;
+        if (tail.length !== part.text.length) break;
+      }
+      if (lastPiece && before.length > 1 && before.length < 128) {
+        let after = /^\p{L}+/u.exec(s.text)?.[0] ?? '';
+        if (after.length === s.text.length) {
+          for (const queued of breakerState.queue) {
+            if (!('text' in queued) || queued.hyphenationLanguage !== s.hyphenationLanguage) break;
+            const head = /^\p{L}+/u.exec(queued.text)?.[0] ?? '';
+            after += head;
+            if (head.length !== queued.text.length || before.length + after.length > 128) break;
+          }
+        }
+        const remainingAtSeam = availW() - breakerState.currentWidth;
+        const hyphenWidth = strNaturalAdvance(lastPiece, '-');
+        if (before.length + after.length <= 128
+          && frenchHyphenationOffsets(before + after, s.hyphenationLanguage).includes(before.length)
+          && remainingAtSeam >= hyphenWidth
+          && remainingAtSeam + beforeWidth > (s.hyphenationZonePt ?? 0)) {
+          addToLine({
+            ...lastPiece, ...RESET_SLICED_TEXT_MEASUREMENT, text: '-',
+            measuredWidth: hyphenWidth, hyphenationLanguage: undefined,
+            punctuationCompressions: undefined, noBreakRanges: undefined,
+            externalLinkBreakOffsets: undefined,
+            src: s.src,
+          }, hyphenWidth, h, asc, desc);
+          flush(undefined, false, s.src);
+          breakerState.queue.unshift(s);
+          return;
+        }
+      }
+    }
+    // ECMA-376 §17.15.1.10/.43: a dictionary break is discretionary. It is
+    // legal only in an overflowing Latin word and when the unused line end
+    // would exceed the authored hyphenation zone. Retain a zero-length source
+    // boundary for the displayed hyphen so the suffix keeps its original CP.
+    const remaining = availW() - breakerState.currentWidth;
+    if (!s.joinPrev && !s.hardJoinPrev && remaining > (s.hyphenationZonePt ?? 0)) {
+      const candidates = frenchHyphenationOffsets(s.text, s.hyphenationLanguage);
+      const hyphenWidth = strNaturalAdvance(s, '-');
+      const split = candidates.reverse().find((at) =>
+        strNaturalAdvance(s, s.text.slice(0, at)) + hyphenWidth <= remaining,
+      );
+      if (split !== undefined && s.src) {
+        const prefix = s.text.slice(0, split);
+        const prefixWidth = strNaturalAdvance(s, prefix);
+        addToLine({
+          ...s, ...RESET_SLICED_TEXT_MEASUREMENT, text: prefix,
+          measuredWidth: prefixWidth, ...slicedTextMetadata(s, 0, split),
+        }, prefixWidth, h, asc, desc);
+        addToLine({
+          ...s, ...RESET_SLICED_TEXT_MEASUREMENT, text: '-',
+          measuredWidth: hyphenWidth, hyphenationLanguage: undefined,
+          punctuationCompressions: undefined, noBreakRanges: undefined,
+          externalLinkBreakOffsets: undefined,
+          src: { segIndex: s.src.segIndex, charOffset: s.src.charOffset + split },
+        }, hyphenWidth, h, asc, desc);
+        queueEmergencyTail(s, split);
+        flush(undefined, false, { segIndex: s.src.segIndex, charOffset: s.src.charOffset + split });
+        return;
+      }
+    }
     const semanticSplit = externalLinkSyntaxSplit(s, availW() - breakerState.currentWidth);
     if (semanticSplit > 0 && semanticSplit < s.text.length) {
       const prefix = s.text.slice(0, semanticSplit);
@@ -873,7 +955,38 @@ function prepareAtomicTextFit(
       breakerState.currentWidth + fitWidthFor(groupW, groupTrail, breakerState.queue[groupEnd]) >
       availW()
     ) {
-      flush(undefined, false, s.src);
+      // The atomic source-run group is a layout convenience, not a Word
+      // no-hyphenation instruction. A French word may be split across runs
+      // (including a one-letter run at the printed hyphen). Keep the group on
+      // this line only when the dictionary proves a seam that fits; the
+      // overflowing follower then emits the visible hyphen at that seam.
+      const language = s.hyphenationLanguage;
+      const remaining = availW() - breakerState.currentWidth;
+      let canHyphenateAtSeam = false;
+      if (groupEnd > 0 && groupEnd <= 128
+        && language?.split('-')[0]?.toLowerCase() === 'fr'
+        && remaining > (s.hyphenationZonePt ?? 0)) {
+        const pieces = [s, ...breakerState.queue.slice(0, groupEnd)];
+        if (pieces.every((part) => 'text' in part
+          && part.hyphenationLanguage === language && part.text.length <= 128)) {
+          const typedPieces = pieces as LayoutTextSeg[];
+          const word = typedPieces.map((part) => /^\p{L}+/u.exec(part.text)?.[0] ?? '').join('');
+          if (word.length <= 128) {
+            const candidates = frenchHyphenationOffsets(word, language);
+            let offset = 0;
+            let prefixWidth = 0;
+            canHyphenateAtSeam = typedPieces.some((part, index) => {
+              const letters = /^\p{L}+/u.exec(part.text)?.[0] ?? '';
+              if (!letters) return false;
+              offset += letters.length;
+              prefixWidth += strAdvance(part, letters);
+              return index < typedPieces.length - 1 && candidates.includes(offset)
+                && prefixWidth + strAdvance(part, '-') <= remaining;
+            });
+          }
+        }
+      }
+      if (!canHyphenateAtSeam) flush(undefined, false, s.src);
     }
   }
 

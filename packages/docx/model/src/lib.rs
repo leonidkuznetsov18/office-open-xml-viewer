@@ -290,6 +290,12 @@ pub struct DocumentSettings {
     /// `None` and `Some(true)` identically. `Some(false)` disables kinsoku.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kinsoku: Option<bool>,
+    /// ECMA-376 §17.15.1.10. Absent or false leaves words whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_hyphenation: Option<bool>,
+    /// ECMA-376 §17.15.1.43. Maximum whitespace at a line end in points.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyphenation_zone: Option<f64>,
     /// §17.15.1.60 `w:noLineBreaksBefore@w:val` — custom set of characters that
     /// cannot begin a line (行頭禁則). When present it REPLACES the application
     /// default set. Multiple per-`w:lang` elements are concatenated.
@@ -2145,6 +2151,9 @@ pub struct RunFontFacts {
     pub italic_cs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang_bidi: Option<String>,
+    /// Effective §17.3.2.20 w:lang/@w:val for Latin-script hyphenation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang_val: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang_east_asia: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2340,6 +2349,9 @@ pub struct FieldRun {
     pub italic_cs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang_bidi: Option<String>,
+    /// Effective §17.3.2.20 w:lang/@w:val for Latin-script hyphenation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang_val: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang_east_asia: Option<String>,
     pub background: Option<String>,
@@ -2519,6 +2531,9 @@ pub struct TextRun {
     /// Arabic/Hebrew digit ordering). `None` when unspecified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang_bidi: Option<String>,
+    /// Effective §17.3.2.20 w:lang/@w:val for Latin-script hyphenation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang_val: Option<String>,
     /// Resolved ECMA-376 §17.3.2.20 w:lang/@w:eastAsia.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang_east_asia: Option<String>,

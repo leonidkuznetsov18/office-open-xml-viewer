@@ -94,6 +94,8 @@ export interface LayoutSourceDocumentFacts {
   }>;
   readonly defaultTabPt: number;
   readonly characterSpacingControl?: string;
+  readonly autoHyphenation: boolean;
+  readonly hyphenationZonePt?: number;
   readonly mathDefJc?: string;
   readonly documentHasEastAsianText: boolean;
   readonly normalStyleFontSizePt: number;

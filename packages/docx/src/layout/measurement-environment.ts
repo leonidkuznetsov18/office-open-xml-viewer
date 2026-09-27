@@ -89,6 +89,8 @@ export function paragraphMeasurementEnvironment(
     balanceSingleByteDoubleByteWidth:
       state.layoutSettings.compat.balanceSingleByteDoubleByteWidth,
     characterSpacingControl: state.layoutSettings.characterSpacingControl,
+    autoHyphenation: state.layoutSettings.autoHyphenation,
+    hyphenationZonePt: state.layoutSettings.hyphenationZonePt,
     lineWrapLikeWord6: state.layoutSettings.compat.lineWrapLikeWord6,
     enableOpenTypeFeatures: state.layoutSettings.compat.enableOpenTypeFeatures,
     resolvedLocalFonts: state.resolvedLocalFonts,
@@ -103,6 +105,7 @@ export function segmentEnvironmentOf(
   state: BodyMeasurementContext,
 ): LineLayoutEnvironment {
   if (!state.verticalAllRotated
+    && !state.layoutSettings.autoHyphenation
     && state.layoutSettings.characterSpacingControl === undefined
     && !state.layoutSettings.compat.lineWrapLikeWord6
     && !state.layoutSettings.compat.enableOpenTypeFeatures
@@ -111,6 +114,8 @@ export function segmentEnvironmentOf(
     ...state,
     ...(state.verticalAllRotated ? { verticalCJK: false } : {}),
     characterSpacingControl: state.layoutSettings.characterSpacingControl,
+    autoHyphenation: state.layoutSettings.autoHyphenation,
+    hyphenationZonePt: state.layoutSettings.hyphenationZonePt,
     lineWrapLikeWord6: state.layoutSettings.compat.lineWrapLikeWord6,
     enableOpenTypeFeatures: state.layoutSettings.compat.enableOpenTypeFeatures,
     balanceSingleByteDoubleByteWidth:

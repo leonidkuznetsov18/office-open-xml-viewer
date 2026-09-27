@@ -1328,6 +1328,8 @@ function emitResolvedTextSegment(
     charSpacing: effectiveCharacterSpacing,
     punctuationCompressions,
     eastAsiaLanguage: r.langEastAsia,
+    hyphenationLanguage: environment.autoHyphenation && !cs ? r.langVal : undefined,
+    hyphenationZonePt: environment.hyphenationZonePt,
     overflowPunctuationEastAsianRun,
     overflowPunctuationBidiLanguage: r.langBidi,
     charScale: effectiveCharacterScale,

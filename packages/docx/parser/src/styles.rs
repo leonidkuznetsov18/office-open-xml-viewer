@@ -130,6 +130,8 @@ pub struct RunFmt {
     /// ECMA-376 §17.3.2.20 w:lang/@w:bidi — complex-script (RTL) language tag,
     /// lower-cased (e.g. "ar-sa", "ae-ar"). Drives Word's AN digit ordering.
     pub lang_bidi: Option<String>,
+    /// Effective §17.3.2.20 w:lang/@w:val, lower-cased.
+    pub lang_val: Option<String>,
     /// ECMA-376 §17.3.2.20 w:lang/@w:eastAsia, lower-cased.
     pub lang_east_asia: Option<String>,
     /// ECMA-376 §17.3.2.35 `<w:spacing w:val>` — character-spacing adjustment,
@@ -1242,6 +1244,9 @@ pub(crate) fn apply_run(dst: &mut RunFmt, src: &RunFmt) {
     if src.lang_bidi.is_some() {
         dst.lang_bidi = src.lang_bidi.clone();
     }
+    if src.lang_val.is_some() {
+        dst.lang_val = src.lang_val.clone();
+    }
     if src.lang_east_asia.is_some() {
         dst.lang_east_asia = src.lang_east_asia.clone();
     }
@@ -2013,6 +2018,9 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
     // Complex-script language tag (ECMA-376 §17.3.2.20 w:lang/@w:bidi). Lower-
     // cased; its primary subtag later decides European-digit AN classification.
     if let Some(lang) = child_w(rpr, "lang") {
+        if let Some(value) = attr_w(lang, "val").filter(|value| !value.is_empty()) {
+            fmt.lang_val = Some(value.to_lowercase());
+        }
         if let Some(bidi) = attr_w(lang, "bidi") {
             if !bidi.is_empty() {
                 fmt.lang_bidi = Some(bidi.to_lowercase());
@@ -2993,6 +3001,15 @@ mod tests {
         apply_run(&mut dst, &src);
         assert_eq!(dst.font_hint.as_deref(), Some("eastAsia"));
         assert_eq!(dst.lang_east_asia.as_deref(), Some("zh-cn"));
+    }
+
+    #[test]
+    fn latin_language_inherits_and_direct_run_overrides_for_hyphenation() {
+        let mut inherited = run_fmt_from(r#"<w:lang w:val="fr-CA"/>"#);
+        apply_run(&mut inherited, &run_fmt_from(r#"<w:b/>"#));
+        assert_eq!(inherited.lang_val.as_deref(), Some("fr-ca"));
+        apply_run(&mut inherited, &run_fmt_from(r#"<w:lang w:val="en-US"/>"#));
+        assert_eq!(inherited.lang_val.as_deref(), Some("en-us"));
     }
 
     #[test]

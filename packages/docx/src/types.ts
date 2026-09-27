@@ -92,6 +92,10 @@ export interface DocSettings {
   /** §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `undefined`
    *  means the element is absent; the spec default is ON (treated as `true`). */
   kinsoku?: boolean;
+  /** §17.15.1.10 automatic hyphenation; absent defaults off. */
+  autoHyphenation?: boolean;
+  /** §17.15.1.43 maximum right-edge whitespace before considering a break (pt). */
+  hyphenationZone?: number;
   /** §17.15.1.60 `w:noLineBreaksBefore@w:val` — custom set of characters that
    *  cannot begin a line (行頭禁則). When present it REPLACES the application
    *  default set. Word's per-`w:lang` sets are merged into one string. */
@@ -1257,6 +1261,8 @@ export interface DocxTextRun {
   /** ECMA-376 §17.3.2.20 `<w:lang w:bidi>` — complex-script (RTL) language tag,
    *  lower-cased (e.g. "ar-sa", "ae-ar"). Drives Word's AN digit ordering. */
   langBidi?: string;
+  /** Effective §17.3.2.20 Latin language. */
+  langVal?: string;
   /** ECMA-376 §17.3.2.34 `<w:snapToGrid>` — false opts this run out of the
    *  section character grid; absent inherits participation. */
   snapToGrid?: boolean;
