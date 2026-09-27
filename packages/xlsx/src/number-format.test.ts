@@ -231,6 +231,34 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(fmt(5, '0_""hours"')).toBe('5 hours');
   });
 
+  it('reads Japanese era codes as dates, scientific exponents as numbers', () => {
+    expect(fmt(45292, '[$-411]ggge')).toBe('令和6');
+    // ja-JP locale codes (§18.8.30): r → ee, rr → gggee.
+    expect(fmt(45292, '[$-411]r')).toBe('06');
+    expect(fmt(45292, '[$-411]rr')).toBe('令和06');
+    expect(fmt(1234, '0.00E+00')).toBe('1.23E+03');
+    // An E after a numeric placeholder stays on the numeric path, as before.
+    expect(fmt(1234, '0.0E0')).toBe('1234.0E0');
+  });
+
+  it('ignores a quoted elapsed bracket', () => {
+    expect(fmt(-0.25, 'h:mm "[h]"')).toBe('18:00 [h]');
+  });
+
+  it('keeps a quoted AM/PM literal on the 24-hour clock', () => {
+    expect(fmt(45292.54166666667, 'h:mm "AM/PM"')).toBe('13:00 AM/PM');
+  });
+
+  it('reads era codes as the Japanese era only under [$-411], as Excel does', () => {
+    // Measured in Excel (ja-JP macOS): other LCIDs and no LCID render no era
+    // name and the four-digit year for e / ee / r / rr.
+    for (const code of ['[$-409]e', '[$-409]ee', '[$-409]rr', '[$-404]ggge', '[$-404]rr', 'ggge', 'ee', 'r']) {
+      expect(fmt(45292, code), code).toBe('2024');
+    }
+    expect(fmt(45292, '[$-411]ggge"/"m"/"d')).toBe('令和6/1/1');
+    expect(fmt(1, '[$-411]ggge"/"m"/"d')).toBe('明治33/1/1');
+  });
+
   it('decides number vs time from the section the value selects', () => {
     expect(fmt(5, '0.00;h:mm')).toBe('5.00');
     expect(fmt(-0.5, '0.00;h:mm')).toBe('12:00');

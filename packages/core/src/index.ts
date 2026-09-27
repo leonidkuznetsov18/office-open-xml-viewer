@@ -674,6 +674,12 @@ export type { VerticalGlyphCellMetrics } from './text/vertical-vert-feature';
 // with the 1900 Lotus leap-year-bug compat and 1900/1904 date-system select.
 // Used by the xlsx cell formatter and the core chart date formatter.
 export { excelSerialToUtcDate, utcDateToExcelSerial } from './excel-date';
+export {
+  formatExcelDateTime,
+  isDateFormatSection,
+  splitFormatSections,
+  textSectionIndex,
+} from './excel-number-format';
 export { highlightBox } from './text/highlight-box';
 export {
   distributeLineSlack,

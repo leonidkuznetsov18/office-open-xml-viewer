@@ -97,6 +97,7 @@ function startFontLoad(parsed: ParsedWorkbook, useGoogleFonts: boolean): void {
   });
 }
 const sheetCache = new Map<number, Worksheet>();
+const provisionalSheets = new Map<number, Worksheet>();
 const viewProjectionCache = new WorksheetViewProjectionCache();
 const sheetCacheUsage = new Map<number, WorksheetCacheUsage>();
 let retainedSheetUsage: WorksheetCacheUsage = {
@@ -150,6 +151,17 @@ const worksheetPull = new WorksheetPullWorker(
   },
   (rows) => {
     if (workbook) resolveSharedStringRows(rows, workbook.sharedStrings);
+  },
+  {
+    preview: (sheetIndex, worksheet) => {
+      provisionalSheets.set(sheetIndex, worksheet);
+      sheetCache.set(sheetIndex, worksheet);
+    },
+    stop: (sheetIndex) => {
+      const preview = provisionalSheets.get(sheetIndex);
+      provisionalSheets.delete(sheetIndex);
+      if (preview && sheetCache.get(sheetIndex) === preview) sheetCache.delete(sheetIndex);
+    },
   },
 );
 
@@ -230,7 +242,7 @@ self.onmessage = async (e: MessageEvent<
     if (req.type === 'parse' || req.type === 'parseDelimitedText') {
       await worksheetPull.reset();
     }
-    await worksheetPull.run(async () => {
+    const runRequest = async (): Promise<void> => {
     if (req.type === 'parse' || archiveBacked) await host.ensureReady();
     if (req.type !== 'parse' && req.type !== 'parseDelimitedText' && host.archive) {
       const retained = host.archive;
@@ -403,7 +415,15 @@ self.onmessage = async (e: MessageEvent<
       post({ type: 'markdownRendered', id, markdown });
       return;
     }
-    });
+    };
+    // The provisional sheet has no archive-backed paint dependencies. Render
+    // its first frame while the cursor owns the unacknowledged covering chunk;
+    // the main-thread viewer releases that chunk after receiving the bitmap.
+    if (req.type === 'renderViewport' && provisionalSheets.has(req.sheetIndex)) {
+      await runRequest();
+    } else {
+      await worksheetPull.run(runRequest);
+    }
   } catch (err) {
     if (req.type === 'openSheetSession') worksheetPull.abandonOpen(req.sessionId);
     try {

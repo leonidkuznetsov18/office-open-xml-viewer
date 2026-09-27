@@ -261,7 +261,7 @@ export function drawChartDataTable(
     }
     for (let categoryIndex = 0; categoryIndex < categories.length; categoryIndex++) {
       const value = series.values[categoryIndex];
-      const text = value == null ? '' : formatChartValWithCode(value, series.valFormatCode);
+      const text = value == null ? '' : formatChartValWithCode(value, series.valFormatCode, chart.date1904);
       drawBodyText(text, plotX + (categoryIndex + 0.5) * categoryWidth, rowCenter);
     }
   }

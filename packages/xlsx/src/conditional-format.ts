@@ -91,8 +91,14 @@ function collectNumericValuesInRanges(worksheet: Worksheet, ranges: WorksheetCel
 }
 
 function resolveCfvoValue(cfv: CfValue | CfStop, samples: number[]): number {
-  const minv = samples.length ? Math.min(...samples) : 0;
-  const maxv = samples.length ? Math.max(...samples) : 0;
+  // A full-column CF range can exceed the JS argument stack. Scan in place;
+  // this keeps the same extrema without spreading the whole range.
+  let minv = samples.length ? Infinity : 0;
+  let maxv = samples.length ? -Infinity : 0;
+  for (const sample of samples) {
+    if (sample < minv) minv = sample;
+    if (sample > maxv) maxv = sample;
+  }
   const n = cfv.value != null ? parseFloat(cfv.value) : NaN;
   switch (cfv.kind) {
     case 'min': return minv;

@@ -96,7 +96,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       return;
     }
     if (req.type === 'parse') await worksheetPull.reset();
-    await worksheetPull.run(async () => {
+    await (req.type === 'extractImage' ? worksheetPull.runDuringPull : worksheetPull.run).call(worksheetPull, async () => {
     if (req.type === 'parse' ? !req.source : !source) await host.ensureReady();
     if (req.type !== 'parse' && (source?.cursor() ?? host.archive)) {
       if (source) source.execute((archive) => archive.assert_healthy());
