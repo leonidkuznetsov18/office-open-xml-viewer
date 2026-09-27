@@ -101,7 +101,7 @@ import {
 } from '../document-layout-view.js';
 
 
-import { DocxDocument, type LoadOptions } from '../document.js';
+import { DocxDocument, type DocxViewerLoadControl, type LoadOptions } from '../document.js';
 import { selectModelSource, beginModelSourceLoad } from '@silurus/ooxml-core/internal/model-source';
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
@@ -147,7 +147,14 @@ function adoptSourceView(doc: SourceDocxFriend, showTrackedChanges: boolean | un
     }
 }
 
-export async function loadDocxModelSource(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+export async function loadDocxModelSource(
+  source: string | ArrayBuffer,
+  opts: LoadOptions = {},
+  control?: DocxViewerLoadControl,
+): Promise<DocxDocument> {
+    const signal = control?.signal;
+    const checkAbort = () => { if (signal?.aborted) throw new PaginationAbortError(); };
+    checkAbort();
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const defaultCurrentDateMs = Date.now();
@@ -166,12 +173,13 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
     }
     let buffer: ArrayBuffer;
     if (typeof source === 'string') {
-      const res = await fetch(source);
+      const res = await fetch(source, { signal });
       if (!res.ok) throw new Error(`Failed to fetch: ${res.status} ${res.statusText}`);
       buffer = await res.arrayBuffer();
     } else {
       buffer = source;
     }
+    checkAbort();
     // An application-supplied model source claims its input from the raw bytes
     // before OOXML container resolution; without `modelSources` nothing here
     // runs and the OOXML path below is unchanged.
@@ -191,6 +199,12 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
       : new (await import('../worker-source.ts?worker&inline')).default();
     let doc: SourceDocxFriend | undefined;
     let publicDoc: DocxDocument | undefined;
+    let disposed = false;
+    const abortDocument = () => {
+      if (disposed || !doc) return;
+      disposed = true;
+      doc.destroy();
+    };
     const wiredWorker = sourceWorker(worker, sourceLoad, opts, (view) => { if (doc) adoptSourceView(doc, view); });
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
@@ -199,6 +213,8 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
       // TypeScript's private members have no cross-module friend access;
       // the constructor above creates the real public class instance.
       doc = publicDoc as unknown as SourceDocxFriend;
+      signal?.addEventListener('abort', abortDocument, { once: true });
+      checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
       // The variant the caller will actually render, recorded for BOTH render
@@ -285,6 +301,12 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
           doc._document,
           (p) => loadingDocument.getFontBytes(p),
         );
+        // A canceled load may finish registering faces after destroy() has
+        // already drained this document's earlier acquisitions.
+        if (signal?.aborted) {
+          unregisterEmbeddedFonts(loadedEmbedded.faces);
+          throw new PaginationAbortError();
+        }
         doc._embeddedFontFaces = loadedEmbedded.faces;
         embeddedMetrics = loadedEmbedded.metrics;
         embeddedRoutes = loadedEmbedded.routes;
@@ -294,13 +316,22 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
             !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
+      if (signal?.aborted) {
+        unloadOfficeFontFallbacks(officeFonts.faces);
+        throw new PaginationAbortError();
+      }
       doc._officeFontFaces = officeFonts.faces;
       if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
         // A proven local Calibri face already resolves this authored family;
         // avoid the optional Google Fonts substitution for the same request.
         const names = docxFontPreloadNames(doc._document, cjkFallback).filter((name) =>
           name?.toLowerCase() !== 'calibri' || !('calibri' in officeFonts.routes));
-        doc._googleFontFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        const googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        if (signal?.aborted) {
+          unloadGoogleFonts(googleFaces);
+          throw new PaginationAbortError();
+        }
+        doc._googleFontFaces = googleFaces;
       }
       // Equations are converted + rasterized before pagination (which reads their
       // extents synchronously). Requires the opt-in `math` engine; without it,
@@ -310,6 +341,7 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
       if (doc._mode === 'main' && opts.math && doc._document && documentHasMath(doc._document)) {
         preparedMath = await prepareMathRuns(doc._document, opts.math);
       }
+      checkAbort();
       if (doc._mode === 'main' && doc._document && doc._source) {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
@@ -332,7 +364,7 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
         // Worker mode must build this layout to return parsedMeta. Main mode does
         // the same work here so layout failures reject load() in both modes.
         //
-        // Sliced when asked: the same pagination generator, drained across
+        // Sliced by default in main mode: the same pagination generator, drained across
         // event-loop turns instead of in one blocking call, then deposited in
         // the variant store so every later synchronous render selects it
         // normally. The layout is identical either way.
@@ -477,14 +509,45 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
             );
           });
           await firstPublication.promise;
-        } else if (deferrable && (opts.sliceLayout || opts.onLayoutProgress)) {
-          const layout = await layoutDocumentInputAsync(
-            doc._source.bodyLayoutInput,
-            services,
-            layoutOptions,
-            scheduler,
-          );
-          retained.layoutVariants.prime(layoutOptions, layout);
+        } else if (deferrable && (opts.sliceLayout !== false || opts.onLayoutProgress)) {
+          for (;;) {
+            checkAbort();
+            const requestedView = control?.requestedView();
+            const currentOptions = requestedView === undefined
+              ? layoutOptions
+              : normalizeLayoutOptions(opts.currentDate, runtime.defaultCurrentDateMs, requestedView);
+            runtime.activeLayoutOptions = currentOptions;
+            const abort = new AbortController();
+            let viewChanged = false;
+            const unsubscribe = control?.subscribeViewChange(() => {
+              // Re-sending the in-flight view during progress is not a layout
+              // change. A distinct request still cancels this slice once.
+              const requested = control.requestedView();
+              if (viewChanged || requested === undefined
+                || (requested === true) === (currentOptions.showTrackedChanges === true)) return;
+              viewChanged = true;
+              abort.abort();
+            });
+            doc._layoutAbort = abort;
+            try {
+              const layout = await layoutDocumentInputAsync(
+                doc._source.bodyLayoutInput,
+                services,
+                currentOptions,
+                { ...scheduler, signal: abort.signal },
+              );
+              checkAbort();
+              if (viewChanged) continue;
+              retained.layoutVariants.prime(currentOptions, layout);
+              break;
+            } catch (error) {
+              if (error instanceof PaginationAbortError && viewChanged && !signal?.aborted) continue;
+              throw error;
+            } finally {
+              unsubscribe?.();
+              doc._layoutAbort = null;
+            }
+          }
         } else {
           // Build the variant that will be rendered, not the default one.
           retained.layoutVariants.layoutFor(layoutOptions);
@@ -494,6 +557,7 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
       // after the parse response. Telemetry is strictly best-effort: a worker
       // failure or a silent worker may omit the newest counters, but must not
       // turn an otherwise successful load into a rejection or an endless wait.
+      checkAbort();
       await doc._resourceUsage(
         opts.workerTimeoutMs ?? OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS,
       ).then(
@@ -501,13 +565,15 @@ export async function loadDocxModelSource(source: string | ArrayBuffer, opts: Lo
         () => undefined,
       );
       metrics.checkpoint('model and layout ready');
+      checkAbort();
       metrics.succeed({ pages: doc.pageCount });
       sourceLoad.release();
       return publicDoc;
     } catch (error) {
-      const rejectedDocument = doc;
-      disposeRejectedLoad(worker, rejectedDocument ? () => rejectedDocument.destroy() : undefined);
+      disposeRejectedLoad(worker, doc ? abortDocument : undefined);
       throw error;
+    } finally {
+      signal?.removeEventListener('abort', abortDocument);
     }
     } finally {
       sourceLoad.release();

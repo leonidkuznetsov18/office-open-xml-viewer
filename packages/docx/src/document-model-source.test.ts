@@ -1,14 +1,17 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ModelSource, ModelSourceModuleDescriptor } from '@silurus/ooxml-core';
+import * as core from '@silurus/ooxml-core';
 import { buildCfbFixture } from '@silurus/ooxml-core/testing';
-import { DocxDocument } from './document.js';
+import { DocxDocument, docxViewerLoadSignal, type LoadOptions } from './document.js';
 import { activeDocxLayoutViewOf } from './document-layout-view.js';
+import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import {
   DocumentPullWorker,
   isDocumentPullCommand,
   MaterializedDocumentCursorArchive,
 } from './document-pull-worker.js';
 import { installStubCanvas, syntheticDocxModel } from './testing/synthetic-document.js';
+import { installDeterministicPaginationHost } from './testing/deterministic-pagination-host.js';
 import type { DocumentMeta } from './worker-protocol.js';
 
 vi.mock('@silurus/ooxml-core', async (load) => ({
@@ -112,13 +115,13 @@ function renderWorkerScript(sourceDefault: boolean | undefined, options: { parti
 }
 
 /** Parse-worker script: open a pull session over a materialized model. */
-function parseWorkerScript(viewDefaults: Record<string, boolean> | undefined): Script {
+function parseWorkerScript(viewDefaults: Record<string, boolean> | undefined, paragraphs = 6): Script {
   let pull: DocumentPullWorker | undefined;
   return async (worker, message) => {
     if (isDocumentPullCommand(message)) {
       await pull!.dispatch(message, (response) => worker.reply(response));
     } else if (message.type === 'parse') {
-      const archive = new MaterializedDocumentCursorArchive(syntheticDocxModel('tracked', { paragraphs: 6 }));
+      const archive = new MaterializedDocumentCursorArchive(syntheticDocxModel('tracked', { paragraphs }));
       pull = new DocumentPullWorker(() => archive);
       const identity = { sessionId: 1, operationId: 1, generation: 1 };
       pull.open(identity);
@@ -138,6 +141,8 @@ beforeAll(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   globals.Worker = originals.Worker;
   globals.location = originals.location;
   ProtocolWorker.instances = [];
@@ -184,6 +189,104 @@ describe('DocxDocument.load with model sources', () => {
     expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(false);
     expect(release).toHaveBeenCalledOnce();
     document.destroy();
+  });
+
+  it('keeps a sliced model-source load moving when its view is re-applied on progress', async () => {
+    install(parseWorkerScript(undefined, 20));
+    const yields = installDeterministicPaginationHost();
+    const { source } = fakeSource();
+    const abort = new AbortController();
+    let viewChanged: (() => void) | null = null;
+    let progress = 0;
+    const document = await DocxDocument.load(cfbBytes(), {
+      modelSources: [source],
+      [docxViewerLoadSignal]: {
+        signal: abort.signal,
+        requestedView: () => false,
+        subscribeViewChange: (listener: () => void) => {
+          viewChanged = listener;
+          return () => { if (viewChanged === listener) viewChanged = null; };
+        },
+      },
+      onLayoutProgress: () => {
+        progress++;
+        viewChanged?.();
+        // A no-op request used to restart the first slice forever. Bound that
+        // failure without assuming a particular page count or host speed.
+        if (progress === 200) abort.abort();
+      },
+    } as LoadOptions);
+    try {
+      expect(progress).toBeGreaterThan(0);
+      expect(yields()).toBeGreaterThan(0);
+      expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(false);
+    } finally {
+      document.destroy();
+    }
+  }, 30_000);
+
+  it('restarts a sliced model-source load for one real view change', async () => {
+    install(parseWorkerScript(undefined, 20));
+    const yields = installDeterministicPaginationHost();
+    const { source } = fakeSource();
+    let requested: boolean | undefined;
+    let viewChanged: (() => void) | null = null;
+    let changed = false;
+    let progress = 0;
+    const document = await DocxDocument.load(cfbBytes(), {
+      modelSources: [source],
+      [docxViewerLoadSignal]: {
+        signal: new AbortController().signal,
+        requestedView: () => requested,
+        subscribeViewChange: (listener: () => void) => {
+          viewChanged = listener;
+          return () => { if (viewChanged === listener) viewChanged = null; };
+        },
+      },
+      onLayoutProgress: () => {
+        progress++;
+        if (changed) return;
+        changed = true;
+        requested = true;
+        viewChanged?.();
+        viewChanged?.();
+      },
+    } as LoadOptions);
+    try {
+      expect(progress).toBeGreaterThan(0);
+      expect(yields()).toBeGreaterThan(0);
+      expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(true);
+    } finally {
+      document.destroy();
+    }
+  }, 30_000);
+
+  it('releases an office font acquired after a canceled model-source load', async () => {
+    install(parseWorkerScript(undefined));
+    const { source } = fakeSource();
+    let finish!: (result: Awaited<ReturnType<typeof core.loadOfficeFontFallbacks>>) => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    vi.spyOn(core, 'loadOfficeFontFallbacks').mockImplementation(() => {
+      entered();
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    const unload = vi.spyOn(core, 'unloadOfficeFontFallbacks').mockImplementation(() => undefined);
+    const abort = new AbortController();
+    const loading = DocxDocument.load(cfbBytes(), {
+      modelSources: [source],
+      [docxViewerLoadSignal]: {
+        signal: abort.signal,
+        requestedView: () => undefined,
+        subscribeViewChange: () => () => undefined,
+      },
+    } as LoadOptions);
+    await started;
+    abort.abort();
+    const face = { family: 'Pending local font' } as FontFace;
+    finish({ faces: [face], routes: {}, checked: [] });
+    await expect(loading).rejects.toBeInstanceOf(PaginationAbortError);
+    expect(unload).toHaveBeenCalledWith([face]);
   });
 
   it('terminates an opened worker when release throws after a successful parse', async () => {

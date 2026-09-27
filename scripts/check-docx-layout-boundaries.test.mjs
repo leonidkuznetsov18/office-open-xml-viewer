@@ -33,7 +33,7 @@ function expectDiagnostic(root, diagnostic, message, ...args) {
 }
 
 const canonicalBodyPaginator =
-  "import { assertAndDeepFreezeDocumentLayout } from './invariants.js';\n"
+  "import { assertAndDeepFreezeDocumentLayoutSteps } from './invariants.js';\n"
   + 'export type PaginationSteps<T> = Generator<number, T, void>;\n'
   + 'export function drainPagination(steps) {\n'
   + '  let step = steps.next();\n'
@@ -43,7 +43,7 @@ const canonicalBodyPaginator =
   + 'export function* paginateBodySteps(input, services, options) {\n'
   + '  const layout = { pages: [], diagnostics: [], input, services, options };\n'
   + '  yield 0;\n'
-  + '  return assertAndDeepFreezeDocumentLayout(layout);\n'
+  + '  return (yield* assertAndDeepFreezeDocumentLayoutSteps(layout));\n'
   + '}\n'
   + 'export function paginateBody(input, services, options) {\n'
   + '  return drainPagination(paginateBodySteps(input, services, options));\n'
@@ -212,7 +212,7 @@ function production(state, table, para, group) {
       + 'export const pageFactory = [coordinate, PAGE_LAYER_IDS] satisfies unknown;\n'
       + 'export type Destination = BodyOccurrenceDestination;\n');
   write(root, 'packages/docx/src/layout/invariants.ts',
-    'export function assertAndDeepFreezeDocumentLayout(value) { return Object.freeze(value); }\n');
+    'export function assertAndDeepFreezeDocumentLayoutSteps(value) { return Object.freeze(value); }\n');
   write(root, 'packages/docx/src/layout/body-paginator.ts', canonicalBodyPaginator);
   write(root, 'packages/docx/src/layout/document.ts',
     "import { paginateBody } from './body-paginator.js';\n"
@@ -1524,7 +1524,7 @@ test('canonical producer must validate and deeply freeze its retained document l
     ['eager route bypasses the generator',
       canonicalBodyPaginator.replace(
         'return drainPagination(paginateBodySteps(input, services, options));',
-        'return assertAndDeepFreezeDocumentLayout({ pages: [], diagnostics: [] });',
+        'return assertAndDeepFreezeDocumentLayoutSteps({ pages: [], diagnostics: [] });',
       ),
       'CANONICAL_LAYOUT_PRODUCER'],
     ['eager route drains an impostor generator',
@@ -1543,14 +1543,14 @@ test('canonical producer must validate and deeply freeze its retained document l
       'CANONICAL_LAYOUT_PRODUCER'],
     ['missing validation',
       canonicalBodyPaginator.replace(
-        'return assertAndDeepFreezeDocumentLayout(layout);',
-        'return deepFreezeDocumentLayout(layout);',
+        'return (yield* assertAndDeepFreezeDocumentLayoutSteps(layout));',
+        'return (yield* deepFreezeDocumentLayoutSteps(layout));',
       ),
       'RETAINED_LAYOUT_IMMUTABILITY'],
     ['mutable return',
       canonicalBodyPaginator.replace(
-        'return assertAndDeepFreezeDocumentLayout(layout);',
-        'assertAndDeepFreezeDocumentLayout(layout);\n  return layout;',
+        'return (yield* assertAndDeepFreezeDocumentLayoutSteps(layout));',
+        '(yield* assertAndDeepFreezeDocumentLayoutSteps(layout));\n  return layout;',
       ),
       'RETAINED_LAYOUT_IMMUTABILITY'],
   ]) {
@@ -1771,9 +1771,9 @@ test('retained layout validation and freezing must wrap the returned value', () 
   const root = initializeCanonicalFixture('docx-layout-boundary-immutability-identity-');
   write(root, 'packages/docx/src/layout/body-paginator.ts',
     canonicalBodyPaginator.replace(
-      '  return assertAndDeepFreezeDocumentLayout(layout);\n',
+      '  return (yield* assertAndDeepFreezeDocumentLayoutSteps(layout));\n',
       '  const returned = { pages: [], diagnostics: [] };\n'
-        + '  assertAndDeepFreezeDocumentLayout(layout);\n'
+        + '  (yield* assertAndDeepFreezeDocumentLayoutSteps(layout));\n'
         + '  return returned;\n',
     ));
   expectDiagnostic(root, 'RETAINED_LAYOUT_IMMUTABILITY', 'unvalidated returned value', '--final');
@@ -1783,8 +1783,8 @@ test('retained layout validation uses the reviewed invariants import', () => {
   const root = initializeCanonicalFixture('docx-layout-boundary-immutability-impostor-');
   write(root, 'packages/docx/src/layout/body-paginator.ts',
     canonicalBodyPaginator.replace(
-      "import { assertAndDeepFreezeDocumentLayout } from './invariants.js';\n",
-      'function assertAndDeepFreezeDocumentLayout(value) { return Object.freeze(value); }\n',
+      "import { assertAndDeepFreezeDocumentLayoutSteps } from './invariants.js';\n",
+      'function assertAndDeepFreezeDocumentLayoutSteps(value) { return Object.freeze(value); }\n',
     ));
   expectDiagnostic(root, 'RETAINED_LAYOUT_IMMUTABILITY', 'local impostor invariants', '--final');
 });
