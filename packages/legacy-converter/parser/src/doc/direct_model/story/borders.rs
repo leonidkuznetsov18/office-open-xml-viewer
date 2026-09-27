@@ -205,8 +205,16 @@ fn active_conditional(
 fn supported_edge_combination(mask: u16) -> bool {
     let columns = mask & (table_style_condition::FIRST_COLUMN | table_style_condition::LAST_COLUMN);
     let rows = mask & (table_style_condition::FIRST_ROW | table_style_condition::LAST_ROW);
+    // [MS-DOC] 2.4.6.6 orders first/last row conditions. Word OOXML controls
+    // with a three-row table paint distinct first and last edges; a one-row
+    // control with both flags paints only the first-row edge. `select` below
+    // already suppresses LAST_ROW on that singleton. Same-family columns
+    // still lack that Word boundary control, and three patches exceed the
+    // fixed two-condition mapping.
     mask.count_ones() <= 1
-        || (mask.count_ones() == 2 && columns.count_ones() == 1 && rows.count_ones() == 1)
+        || (mask.count_ones() == 2
+            && ((columns.count_ones() == 1 && rows.count_ones() == 1)
+                || rows == (table_style_condition::FIRST_ROW | table_style_condition::LAST_ROW)))
 }
 
 fn selected_edge_conditions(mask: u16) -> [Option<u16>; 2] {
@@ -588,6 +596,19 @@ pub(super) fn materialize_border(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_and_last_row_edges_share_the_bounded_conditional_mapper() {
+        let first = table_style_condition::FIRST_ROW;
+        let last = table_style_condition::LAST_ROW;
+        let column = table_style_condition::FIRST_COLUMN;
+        assert!(supported_edge_combination(first | last));
+        assert_eq!(
+            selected_edge_conditions(first | last),
+            [Some(first), Some(last)]
+        );
+        assert!(!supported_edge_combination(first | last | column));
+    }
 
     #[test]
     fn source_span_mapping_is_fixed_size_and_rejects_malformed_chains() {
