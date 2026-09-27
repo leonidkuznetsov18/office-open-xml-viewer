@@ -105,10 +105,10 @@ function assertNoSourceRuntime(code, name) {
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_525_541, inline: 31_624, budget: 2_600 },
-  xlsx: { entry: 1_835_565, inline: 39_902, budget: 2_600 },
-  pptx: { entry: 1_824_157, inline: 59_554, budget: 2_200 },
-  node: { entry: 2_575_709, budget: 3_900 },
+  docx: { entry: 2_525_646, inline: 31_624, budget: 2_500 },
+  xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
+  pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_575_997, budget: 3_600 },
 });
 const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
 
