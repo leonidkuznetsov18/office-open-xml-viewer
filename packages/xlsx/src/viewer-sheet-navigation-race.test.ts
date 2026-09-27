@@ -79,7 +79,7 @@ describe('XlsxViewer sheet acquisition generation', () => {
     progress.preview(model, null, 1_000, 1);
     progress.append(Array.from({ length: 128 }, (_, i) => ({ index: i + 1, height: null, cells: [] })));
     const completion = deferred<Worksheet>();
-    const sizes = engine.sizeOverrideStore as Map<number, unknown>;
+    const sizes = (engine.viewEdits as { sizeOverrideStore: Map<number, unknown> }).sizeOverrideStore;
     sizes.set(0, {
       rows: new Map(Array.from({ length: 200 }, (_, i) => [i + 1, 0])),
       automaticRows: new Map(), cols: new Map(), revision: 1,
@@ -372,8 +372,12 @@ describe('XlsxViewer sheet acquisition generation', () => {
     requests[1].resolve(worksheet('B'));
     await engine.showSheet(0);
     engine.scheduleRender = vi.fn();
-    engine.resizeDrag = { kind: 'row', index: 1, originScaled: 0, mdw: 7 };
-    (engine.applyResize as (x: number, y: number) => void)(0, 120);
+    const input = engine.selectionInput as {
+      resizeDrag: unknown;
+      applyResize(x: number, y: number): void;
+    };
+    input.resizeDrag = { kind: 'row', index: 1, originScaled: 0, mdw: 7 };
+    input.applyResize(0, 120);
     const resized = (engine.currentWorksheet as Worksheet).rowHeights[1];
     expect(resized).toBeGreaterThan(20);
 
@@ -391,8 +395,12 @@ describe('XlsxViewer sheet acquisition generation', () => {
     requests[1].resolve(worksheet('B'));
     await engine.showSheet(0);
     engine.scheduleRender = vi.fn();
-    engine.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
-    (engine.applyResize as (x: number, y: number) => void)(120, 0);
+    const input = engine.selectionInput as {
+      resizeDrag: unknown;
+      applyResize(x: number, y: number): void;
+    };
+    input.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
+    input.applyResize(120, 0);
     const resized = (engine.currentWorksheet as Worksheet).colWidths[2];
     expect(resized).toBeGreaterThan(0);
 
