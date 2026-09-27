@@ -22,6 +22,7 @@ import { DocxDocument, docxViewerLoadSignal } from './document';
 import type { DocxViewerLoadControl, LoadOptions } from './document';
 import {
   activeDocxLayoutViewOf,
+  reconcilePendingDocxLayoutView,
   selectDocxLayoutView,
   subscribeDocxLayoutView,
   type DocxLayoutViewPublication,
@@ -708,31 +709,11 @@ export class DocxScrollViewer implements ZoomableViewer {
         // The final probe can outlive a view change. Reconcile against the
         // active document view before replace() commits this candidate; its
         // generation guard also absorbs a superseded worker rejection.
-        let disposed = false;
-        const disposePending = () => {
-          if (disposed) return;
-          disposed = true;
-          loaded.destroy();
-        };
-        try {
-          while (!loadAbort.signal.aborted) {
-            const requested = this._pendingRequestedView;
-            if (requested === undefined || activeDocxLayoutViewOf(loaded).showTrackedChanges === requested) break;
-            loadAbort.signal.addEventListener('abort', disposePending, { once: true });
-            try {
-              await selectDocxLayoutView(loaded, {
-                showTrackedChanges: requested,
-                currentDate: this._currentDate,
-              }, this);
-            } finally {
-              loadAbort.signal.removeEventListener('abort', disposePending);
-            }
-          }
-          return loaded;
-        } catch (error) {
-          disposePending();
-          throw error;
-        }
+        await reconcilePendingDocxLayoutView(
+          loaded, loadAbort.signal, () => this._pendingRequestedView,
+          () => this._currentDate, this,
+        );
+        return loaded;
       }, (ownedDocument) => {
         this._invalidateElementContext(false);
         elementInvalidated = true;

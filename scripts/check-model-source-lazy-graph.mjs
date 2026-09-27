@@ -198,13 +198,19 @@ function assertNoSourceRuntime(code, name) {
 // Baseline: the pre-feature OOXML production build at 776237df. The small
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
+// Rebased DOCX and Node entries against the clean 470743cb build for #1557:
+// sliced layout, stepwise finalization, and viewer load ownership add 4,728
+// DOCX bytes; shared layout validation/freezing adds 398 Node bytes. The
+// optional model-source runtime remains outside both eager entry graphs.
+// The ordinary DOCX render worker grows by 289 bytes from those same layout
+// changes; its exact zero-allowance baseline is rebased with the entries.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
+  docx: { entry: 2_533_039, inline: 31_624, budget: 2_800 },
   xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
   pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_575_997, budget: 3_600 },
+  node: { entry: 2_579_736, budget: 3_600 },
 });
-const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
+const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_047_235];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

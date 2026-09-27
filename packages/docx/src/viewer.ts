@@ -2,6 +2,7 @@ import { DocxDocument, docxViewerLoadSignal } from './document';
 import type { DocxViewerLoadControl, LoadOptions } from './document';
 import {
   activeDocxLayoutViewOf,
+  reconcilePendingDocxLayoutView,
   selectDocxLayoutView,
   subscribeDocxLayoutView,
   type DocxLayoutViewPublication,
@@ -346,33 +347,11 @@ export class DocxViewer implements ZoomableViewer {
         // during the final resource probe. Compare with the document's actual
         // view, and keep this awaited reconciliation inside replace() so a
         // superseded selection cannot surface its worker-termination error.
-        let disposed = false;
-        const disposePending = () => {
-          if (disposed) return;
-          disposed = true;
-          loaded.destroy();
-        };
-        try {
-          while (!loadAbort.signal.aborted) {
-            const requested = this._pendingRequestedView;
-            if (requested === undefined || activeDocxLayoutViewOf(loaded).showTrackedChanges === requested) break;
-            // Until replace() commits, this document is callback-owned. Abort
-            // must terminate an in-flight worker selection and settle its await.
-            loadAbort.signal.addEventListener('abort', disposePending, { once: true });
-            try {
-              await selectDocxLayoutView(loaded, {
-                showTrackedChanges: requested,
-                currentDate: this._opts.currentDate,
-              }, this);
-            } finally {
-              loadAbort.signal.removeEventListener('abort', disposePending);
-            }
-          }
-          return loaded;
-        } catch (error) {
-          disposePending();
-          throw error;
-        }
+        await reconcilePendingDocxLayoutView(
+          loaded, loadAbort.signal, () => this._pendingRequestedView,
+          () => this._opts.currentDate, this,
+        );
+        return loaded;
       }, () => {
         // Invalidate operations owned by the old document before its worker is
         // terminated, so their expected rejection cannot surface as a reload
