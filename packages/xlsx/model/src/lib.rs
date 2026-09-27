@@ -1756,12 +1756,6 @@ pub struct Styles {
     pub cell_xfs: Vec<CellXf>,
     pub num_fmts: Vec<NumFmt>,
     pub dxfs: Vec<Dxf>,
-    /// `<fonts>` index of the Normal cell style's font
-    /// (`<cellStyleXfs>[0].fontId`, ECMA-376 §18.8.9). A cell font whose
-    /// color differs from this font's color carries cell-level formatting
-    /// that Excel draws over a table style's font color.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub normal_font_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1919,6 +1913,13 @@ pub struct CellXf {
     /// 1 = left-to-right, 2 = right-to-left. Drives canvas `direction`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading_order: Option<u32>,
+    /// The cell's font color is its own formatting rather than the Normal
+    /// style's: the cell font's `<color>`, or its cell style's, is authored
+    /// differently from the Normal cell style font's. Excel then draws that
+    /// color over a table style's element font color; otherwise the table
+    /// color applies. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub own_font_color: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

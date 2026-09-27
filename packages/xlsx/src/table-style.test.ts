@@ -73,33 +73,33 @@ describe('tableOverlayBorder', () => {
 });
 
 /**
- * Font color precedence between a custom table style and the cell's own font
- * (ECMA-376 §18.8.83, §18.8.9). Excel draws a cell font color that differs
- * from the Normal style's over the table element's font color (a white header
- * cell under a black headerRow dxf color stays white), while a cell left at the
- * Normal color takes the table color.
+ * Font color precedence between a custom table style (ECMA-376 §18.8.40
+ * tableStyle / §18.8.41 tableStyleElement) and the cell font, as measured in
+ * Excel: a cell whose font color is its own formatting (`ownFontColor`, set by
+ * the parser) keeps that color, including an automatic one; any other cell
+ * takes the table element's font color.
  */
 describe('custom table style font color vs the cell font', () => {
   const font = (color: string | null): CellFont => ({
     bold: false, italic: false, underline: false, strike: false, size: 11, color, name: 'Arial',
   });
+  const xf = (fontId: number, ownFontColor: boolean) => ({
+    fontId, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false,
+    ...(ownFontColor ? { ownFontColor } : {}),
+  });
   const styles: Styles = {
-    // fonts[1] is the Normal style's font (cellStyleXfs[0].fontId = 1).
-    fonts: [font('#FF0000'), font('#000000'), font('#FFFFFF'), font(null)],
+    fonts: [font('#000000'), font('#FFFFFF'), font(null)],
     fills: [],
     borders: [],
-    cellXfs: [1, 2, 3].map((fontId) => ({
-      fontId, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false,
-    })),
+    cellXfs: [xf(0, false), xf(1, true), xf(2, true)],
     numFmts: [],
     dxfs: [{ font: font('#00B050'), fill: null, border: null }],
-    normalFontId: 1,
   };
   const text = (col: number, styleIndex: number, value: string) =>
     ({ row: 1, col, styleIndex, value: { type: 'text' as const, text: value } });
   const ws = {
     name: 'T',
-    rows: [{ index: 1, height: null, cells: [text(1, 0, 'normal'), text(2, 1, 'explicit'), text(3, 2, 'auto')] }],
+    rows: [{ index: 1, height: null, cells: [text(1, 0, 'inherited'), text(2, 1, 'own'), text(3, 2, 'own auto')] }],
     colWidths: {}, rowHeights: {}, defaultColWidth: 8.43, defaultRowHeight: 15,
     mergeCells: [], freezeRows: 0, freezeCols: 0, conditionalFormats: [], images: [], charts: [],
     tables: [{
@@ -109,7 +109,7 @@ describe('custom table style font color vs the cell font', () => {
     }],
   } as unknown as Worksheet;
 
-  it('keeps an explicit non-Normal cell color and applies the table color otherwise', () => {
+  it('keeps a cell-owned color and applies the table color to inherited ones', () => {
     let fillStyle = '';
     const drawn = new Map<string, string>();
     const noop = () => {};
@@ -126,8 +126,8 @@ describe('custom table style font color vs the cell font', () => {
     }) as unknown as CanvasRenderingContext2D;
     renderViewport(ctx, ws, styles, { row: 1, col: 1, rows: 1, cols: 3 });
     const color = (t: string) => drawn.get(t)?.replace(/\s/g, '').toLowerCase();
-    expect(color('normal')).toMatch(/^(#00b050|rgba\(0,176,80,1\))$/);
-    expect(color('explicit')).toMatch(/^(#ffffff|rgba\(255,255,255,1\))$/);
-    expect(color('auto')).toMatch(/^(#00b050|rgba\(0,176,80,1\))$/);
+    expect(color('inherited')).toMatch(/^(#00b050|rgba\(0,176,80,1\))$/);
+    expect(color('own')).toMatch(/^(#ffffff|rgba\(255,255,255,1\))$/);
+    expect(color('own auto')).toMatch(/^(#000000|rgba\(0,0,0,1\))$/);
   });
 });
