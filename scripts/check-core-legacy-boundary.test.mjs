@@ -77,16 +77,25 @@ test('TypeScript module resolution catches a path alias into the legacy package'
 test('built chunk graph rejects a resolved legacy module even after aliasing', () => {
   const hook = legacyBundleBoundary().generateBundle;
   assert.equal(typeof hook, 'function');
-  const invoke = (moduleId) => hook.call(
+  const invoke = (moduleId, fileName = 'entry.js') => hook.call(
     { error(message) { throw new Error(message); } },
     {},
-    { 'entry.js': { type: 'chunk', modules: { [moduleId]: {} } } },
+    { [fileName]: { type: 'chunk', fileName, isEntry: true, imports: [], modules: { [moduleId]: {} } } },
   );
   assert.doesNotThrow(() => invoke('/repo/packages/core/src/index.ts'));
   assert.throws(
     () => invoke('/repo/packages/legacy-converter/src/index.ts'),
     /forbidden legacy module/,
   );
+  assert.doesNotThrow(() => invoke('/repo/packages/legacy-converter/src/index.ts', 'legacy-ppt.mjs'));
+  assert.throws(() => hook.call(
+    { error(message) { throw new Error(message); } },
+    {},
+    {
+      'docx.mjs': { type: 'chunk', fileName: 'docx.mjs', isEntry: true, imports: ['shared.js'], modules: {} },
+      'shared.js': { type: 'chunk', fileName: 'shared.js', isEntry: false, imports: [], modules: { '/repo/packages/legacy-converter/src/index.ts': {} } },
+    },
+  ), /forbidden legacy module/);
 });
 
 test('guards source, parser and manifest files but not generated or private output', () => {
