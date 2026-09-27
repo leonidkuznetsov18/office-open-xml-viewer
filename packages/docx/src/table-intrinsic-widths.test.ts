@@ -195,6 +195,42 @@ describe('table intrinsic content widths', () => {
     )).toEqual({ minWidthPt: 26.6, maxWidthPt: 26.6 });
   });
 
+  it('uses full unbroken content as the AutoFit minimum for auto-width noWrap cells', () => {
+    const source = paragraph([textRun('words with spaces')]);
+    const content = { ...cell([source as CellElement]), noWrap: true, widthPt: null };
+    const dependencies = {
+      paragraph: () => ({ minWidthPt: 20, maxWidthPt: 100, noWrapWidthPt: 80 }),
+      nestedTable: () => ({ minWidthPt: 0, maxWidthPt: 0 }),
+    };
+    expect(measureTableCellIntrinsicWidths(
+      content,
+      { left: 5, right: 5 },
+      dependencies,
+      'autofit',
+    )).toEqual({ minWidthPt: 90, maxWidthPt: 110 });
+    expect(measureTableCellIntrinsicWidths(
+      content,
+      { left: 5, right: 5 },
+      dependencies,
+      'fixed',
+    )).toEqual({ minWidthPt: 30, maxWidthPt: 110 });
+  });
+
+  it('excludes first-line indent from the noWrap width request', () => {
+    const first = (text: string, indentFirst: number): DocTableCell => ({
+      ...cell([paragraph([textRun(text)], { indentFirst }) as CellElement]),
+      noWrap: true,
+      widthPct: 1750,
+    });
+    const makeTable = (text: string, indentFirst: number) => ({
+      ...table([row([first(text, indentFirst), cell([paragraph([textRun('Other')]) as CellElement])])], [70, 130]),
+      widthPct: 5000,
+    });
+    const state = columnState(measuringContext());
+    expect(resolveColumnWidths(makeTable('City or Town', 20), 200, state)).toEqual([70, 130]);
+    expect(resolveColumnWidths(makeTable('City or Town Name', 20), 200, state)[0]).toBeGreaterThan(70);
+  });
+
   it('retains numbering-marker intrinsic width on an otherwise empty cell paragraph', () => {
     const source = paragraph([], {
       numbering: { numId: 1, level: 0 } as DocParagraph['numbering'],

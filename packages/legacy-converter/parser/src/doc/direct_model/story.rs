@@ -3425,12 +3425,11 @@ mod tests {
     }
 
     #[test]
-    fn native_story_rejects_row_preferences_it_cannot_represent() {
-        // fNoWrap without an ftsDxa preferred cell width changes wrapping.
-        let error = try_default_styled_table(&[], &sprm(0xd639, &[3, 0, 1, 1]))
-            .err()
-            .unwrap();
-        assert!(error.contains("no-wrap"), "{error}");
+    fn native_story_retains_no_wrap_and_rejects_unrepresentable_row_preferences() {
+        // [MS-DOC] 2.9.28 fNoWrap is retained on the shared cell model even
+        // without a dxa preferred width.
+        let projected = try_default_styled_table(&[], &sprm(0xd639, &[3, 0, 1, 1])).unwrap();
+        assert!(!projected.unsupported_table);
         // A leading preferred width without a matching physical grid slot.
         let error = try_default_styled_table(&[], &sprm(0xf617, &[3, 0x7c, 0]))
             .err()

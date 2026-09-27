@@ -226,14 +226,6 @@ fn project_table(
                     ));
                 }
             };
-            if source.no_wrap && !matches!(source.preferred, Some(PreferredWidth::Dxa(_))) {
-                // [MS-DOC] 2.9.28: fNoWrap is ignored only when the cell's
-                // preferred width is ftsDxa. Otherwise it changes autofit
-                // wrapping, which the shared cell model does not represent.
-                return Err(unsupported(
-                    "direct DOC model cannot retain no-wrap cells without an absolute preferred width",
-                ));
-            }
             if source.flags & ((1 << 12) | (1 << 14)) != 0 {
                 return Err(unsupported(
                     "direct DOC model cannot retain cell fit/hide facts",
@@ -355,6 +347,10 @@ fn project_table(
                     PreferredWidth::Percent(value) => Some(f64::from(value)),
                     _ => None,
                 }),
+                // [MS-DOC] 2.9.28 fNoWrap projects to ECMA-376 17.4.29.
+                // The shared AutoFit model applies it to auto/pct cells;
+                // absolute preferred widths retain their own width priority.
+                no_wrap: source.no_wrap.then_some(true),
                 margin_top: Some(f64::from(margins[0]) / 20.0),
                 margin_left: Some(f64::from(margins[1]) / 20.0),
                 margin_bottom: Some(f64::from(margins[2]) / 20.0),
@@ -858,6 +854,29 @@ mod tests {
         assert_eq!(table.rows[0].cells[0].width_pct, None);
         assert_eq!(table.rows[0].cells[1].width_pt, None);
         assert_eq!(table.rows[0].cells[1].width_pct, Some(1250.0));
+    }
+
+    #[test]
+    fn no_wrap_reaches_the_shared_cell_model_for_auto_and_percent_widths() {
+        for preferred in [None, Some(PreferredWidth::Percent(1250))] {
+            let mut end = row(1, &[1000]);
+            end.row.cells[0].preferred = preferred;
+            end.row.cells[0].no_wrap = true;
+            let mut sequence = 0;
+            let mut writer = Writer::new(&mut sequence);
+            let mut budget = ModelBudget::new(1_000_000);
+            writer
+                .push(cell(1), '\u{7}', paragraph("words in a cell"), &mut budget)
+                .unwrap();
+            writer
+                .push(end, '\u{7}', Blocks::default(), &mut budget)
+                .unwrap();
+            let body = writer.finish(&mut budget).unwrap();
+            let Block::Table(table) = &body.0[0] else {
+                panic!()
+            };
+            assert_eq!(table.rows[0].cells[0].no_wrap, Some(true));
+        }
     }
 
     #[test]

@@ -305,6 +305,8 @@ pub struct RawTblBorders {
 #[derive(Debug, Default, Clone)]
 pub struct CondFmt {
     pub shd: Option<String>,
+    /// ECMA-376 17.4.29, including explicit false to clear a base style.
+    pub no_wrap: Option<bool>,
     pub borders: RawTblBorders,
     /// ECMA-376 §17.7.6: the conditional block's `<w:rPr>` — run defaults that
     /// apply to runs in cells covered by this condition (e.g. Calendar 3's
@@ -343,6 +345,9 @@ pub fn merge_cond_layers(layers: &[&CondFmt]) -> CondFmt {
         if layer.shd.is_some() {
             out.shd = layer.shd.clone();
         }
+        if layer.no_wrap.is_some() {
+            out.no_wrap = layer.no_wrap;
+        }
         merge_raw_borders(&mut out.borders, &layer.borders);
         if let Some(r) = &layer.run {
             apply_run(out.run.get_or_insert_with(RunFmt::default), r);
@@ -370,6 +375,7 @@ pub struct TableStyleDef {
     pub based_on: Option<String>,
     pub borders: RawTblBorders,
     pub cell_shd: Option<String>,
+    pub cell_no_wrap: Option<bool>,
     pub cell_valign: Option<String>,
     /// ECMA-376 §17.7.6: the table style's whole-table `<w:rPr>` — run defaults
     /// applied to every cell (e.g. Calendar 3's `<w:color w:val="7F7F7F"/>`
@@ -628,6 +634,9 @@ impl StyleMap {
             if def.cell_shd.is_some() {
                 out.cell_shd = def.cell_shd.clone();
             }
+            if def.cell_no_wrap.is_some() {
+                out.cell_no_wrap = def.cell_no_wrap;
+            }
             if def.cell_valign.is_some() {
                 out.cell_valign = def.cell_valign.clone();
             }
@@ -680,6 +689,9 @@ impl StyleMap {
                 let slot = out.cond.entry(k.clone()).or_default();
                 if v.shd.is_some() {
                     slot.shd = v.shd.clone();
+                }
+                if v.no_wrap.is_some() {
+                    slot.no_wrap = v.no_wrap;
                 }
                 merge_raw_borders(&mut slot.borders, &v.borders);
                 if let Some(r) = &v.run {
@@ -2489,6 +2501,7 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
     }
     if let Some(tc_pr) = child_w(style_node, "tcPr") {
         def.cell_shd = shd_fill(tc_pr);
+        def.cell_no_wrap = bool_prop(tc_pr, "noWrap");
         def.cell_valign = child_w(tc_pr, "vAlign").and_then(|v| attr_w(v, "val"));
     }
     if let Some(tr_pr) = child_w(style_node, "trPr") {
@@ -2515,6 +2528,7 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
         let mut cf = CondFmt::default();
         if let Some(tc_pr) = child_w(sp, "tcPr") {
             cf.shd = shd_fill(tc_pr);
+            cf.no_wrap = bool_prop(tc_pr, "noWrap");
             if let Some(borders) = child_w(tc_pr, "tcBorders") {
                 cf.borders = parse_raw_tbl_borders(borders);
             }

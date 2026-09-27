@@ -41,6 +41,8 @@ export interface ParagraphIntrinsicWidths {
 export interface TableCellIntrinsicWidths {
   readonly minWidthPt: number;
   readonly maxWidthPt: number;
+  /** Intrinsic text width without first-line positioning, for w:noWrap. */
+  readonly noWrapWidthPt?: number;
 }
 
 export interface TableCellIntrinsicWidthDependencies {
@@ -61,9 +63,11 @@ export function measureTableCellIntrinsicWidths(
   cell: DeepReadonly<DocTableCell>,
   margins: Readonly<{ left: number; right: number }>,
   dependencies: TableCellIntrinsicWidthDependencies,
+  tableLayout: 'autofit' | 'fixed' = 'autofit',
 ): TableCellIntrinsicWidths {
   let minContentWidthPt = 0;
   let maxContentWidthPt = 0;
+  let noWrapContentWidthPt = 0;
   for (const element of cell.content) {
     // ECMA-376 §17.18.87 defines AutoFit minima from cell contents. The
     // registered Word observation refines the otherwise-unspecified empty-mark
@@ -76,10 +80,23 @@ export function measureTableCellIntrinsicWidths(
       : dependencies.nestedTable(element);
     minContentWidthPt = Math.max(minContentWidthPt, intrinsic.minWidthPt);
     maxContentWidthPt = Math.max(maxContentWidthPt, intrinsic.maxWidthPt);
+    noWrapContentWidthPt = Math.max(
+      noWrapContentWidthPt,
+      intrinsic.noWrapWidthPt ?? intrinsic.maxWidthPt,
+    );
   }
   const horizontalMarginsPt = Math.max(0, margins.left) + Math.max(0, margins.right);
+  // ECMA-376 §17.4.29: for AutoFit auto/pct tcW, measure cell contents as
+  // one unbroken string. This changes column constraints, not line breaking.
+  // The noWrap content width excludes first-line paragraph positioning:
+  // controlled Word documents with 0/432-twip first-line indent give the same
+  // noWrap column width, even though the indented text still wraps in the cell.
+  // Hanging indents and numbering markers have not been measured here.
+  const unbrokenMinimum = tableLayout === 'autofit'
+    && cell.noWrap === true
+    && cell.widthPt == null;
   return {
-    minWidthPt: minContentWidthPt + horizontalMarginsPt,
+    minWidthPt: (unbrokenMinimum ? noWrapContentWidthPt : minContentWidthPt) + horizontalMarginsPt,
     maxWidthPt: Math.max(minContentWidthPt, maxContentWidthPt) + horizontalMarginsPt,
   };
 }

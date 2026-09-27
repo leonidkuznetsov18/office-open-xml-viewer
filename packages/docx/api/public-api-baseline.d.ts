@@ -1173,6 +1173,7 @@ export interface DocTableCell {
     vAlign: 'top' | 'center' | 'bottom';
     widthPt: number | null;
     widthPct?: number;
+    noWrap?: boolean;
     marginTop?: number | null;
     marginBottom?: number | null;
     marginLeft?: number | null;

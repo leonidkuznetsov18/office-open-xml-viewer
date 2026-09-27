@@ -13465,6 +13465,9 @@ fn parse_table_with_diagnostics(
                     .clone()
                     .unwrap_or_else(|| "top".to_string());
             }
+            if cell.no_wrap.is_none() {
+                cell.no_wrap = eff.no_wrap.or(tstyle.cell_no_wrap);
+            }
         }
     }
 
@@ -13809,6 +13812,9 @@ fn parse_table_cell(
             }
         })
         .unwrap_or((None, None));
+    // ECMA-376 17.4.29: retain explicit false so it can cancel a style's
+    // noWrap; AutoFit uses only a resolved true in its width constraints.
+    let no_wrap = tc_pr.and_then(|p| bool_prop(p, "noWrap"));
 
     // Per-cell margins (ECMA-376 §17.4.42 `<w:tcPr><w:tcMar>`). Each edge,
     // when present, overrides the table-level `<w:tblCellMar>` default; absent
@@ -13907,6 +13913,7 @@ fn parse_table_cell(
         v_align,
         width_pt,
         width_pct,
+        no_wrap,
         margin_top,
         margin_bottom,
         margin_left,
@@ -14755,6 +14762,41 @@ mod tests {
         let cell = &t.rows[0].cells[0];
         assert_eq!(cell.width_pt, None);
         assert_eq!(cell.width_pct, Some(2500.0));
+    }
+
+    #[test]
+    fn cell_no_wrap_preserves_explicit_on_and_off_values() {
+        let table = parse_tbl(
+            r#"<w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid>
+               <w:tr><w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/><w:noWrap/></w:tcPr><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/><w:noWrap w:val="0"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+        assert_eq!(table.rows[0].cells[0].no_wrap, Some(true));
+        assert_eq!(table.rows[1].cells[0].no_wrap, Some(false));
+    }
+
+    #[test]
+    fn cell_no_wrap_layers_table_style_condition_and_inline_clearing() {
+        let styles = format!(
+            r#"<w:styles xmlns:w="{ns}">
+              <w:style w:type="table" w:styleId="Base"><w:tcPr><w:noWrap/></w:tcPr></w:style>
+              <w:style w:type="table" w:styleId="Derived"><w:basedOn w:val="Base"/>
+                <w:tblStylePr w:type="firstRow"><w:tcPr><w:noWrap w:val="0"/></w:tcPr></w:tblStylePr>
+              </w:style>
+            </w:styles>"#,
+            ns = W_NS
+        );
+        let table = parse_tbl_with_styles(
+            r#"<w:tblPr><w:tblStyle w:val="Derived"/><w:tblLook w:firstRow="1"/></w:tblPr>
+               <w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:noWrap w:val="0"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+            &styles,
+        );
+        assert_eq!(table.rows[0].cells[0].no_wrap, Some(false));
+        assert_eq!(table.rows[1].cells[0].no_wrap, Some(true));
+        assert_eq!(table.rows[2].cells[0].no_wrap, Some(false));
     }
 
     // ECMA-376 §17.4.52 — absent `<w:tblLayout>` ⇒ None (renderer default autofit).
