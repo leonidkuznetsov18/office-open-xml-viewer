@@ -483,7 +483,7 @@ fn typed<T: std::str::FromStr>(value: Option<&str>) -> Option<Typed<T>> {
 /// same as none.
 #[derive(Debug, Clone, PartialEq)]
 struct AuthoredColor {
-    auto: bool,
+    auto: Typed<bool>,
     rgb: Option<String>,
     theme: Option<Typed<u32>>,
     indexed: Option<Typed<u32>>,
@@ -513,14 +513,23 @@ fn authored_font_colors(doc: &roxmltree::Document) -> Vec<Option<AuthoredColor>>
                 }
             });
             Some(AuthoredColor {
-                // xsd:boolean (§22.9.2.1 ST_OnOff-like): "1" / "true".
-                auto: color
-                    .attribute("auto")
-                    .is_some_and(|v| matches!(v.trim(), "1" | "true")),
+                // xsd:boolean: 1/true and 0/false; omitted means false.
+                auto: match color.attribute("auto").map(str::trim) {
+                    None | Some("0" | "false") => Typed::Value(false),
+                    Some("1" | "true") => Typed::Value(true),
+                    Some(other) => Typed::Invalid(other.to_string()),
+                },
                 rgb,
                 theme: typed(color.attribute("theme")),
                 indexed: typed(color.attribute("indexed")),
-                tint: typed::<f64>(color.attribute("tint")).filter(|t| *t != Typed::Value(0.0)),
+                // A non-finite tint stays text so equality remains reflexive.
+                tint: match typed::<f64>(color.attribute("tint")) {
+                    Some(Typed::Value(0.0)) => None,
+                    Some(Typed::Value(t)) if !t.is_finite() => color
+                        .attribute("tint")
+                        .map(|v| Typed::Invalid(v.trim().to_string())),
+                    other => other,
+                },
             })
         })
         .collect()
@@ -551,8 +560,8 @@ fn own_font_color_flags(doc: &roxmltree::Document) -> Vec<bool> {
                     .map(|xf| {
                         let font_id = xf
                             .attribute("fontId")
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0);
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(0) as usize;
                         let xf_id = match xf.attribute("xfId") {
                             None => Some(0),
                             Some(v) => v.trim().parse().ok(),
@@ -574,21 +583,26 @@ fn own_font_color_flags(doc: &roxmltree::Document) -> Vec<bool> {
         })
         .and_then(|n| n.attribute("xfId"))
         .and_then(|v| v.trim().parse::<usize>().ok());
-    // Outer None: unresolvable reference; inner None: no `<color>`.
-    let color_of = |font_id: usize| colors.get(font_id).cloned();
-    let style_color = |xf_id: Option<usize>| {
+    // Normal's authored color, then one "differs from Normal" answer per font
+    // (None: the font index does not resolve), so each xf is a lookup.
+    let Some(normal) = normal_xf
+        .and_then(|id| style_xfs.get(id))
+        .and_then(|&(font_id, _)| colors.get(font_id))
+    else {
+        return Vec::new();
+    };
+    let differs: Vec<bool> = colors.iter().map(|color| color != normal).collect();
+    let font_differs = |font_id: usize| differs.get(font_id).copied();
+    let style_differs = |xf_id: Option<usize>| {
         xf_id
             .and_then(|id| style_xfs.get(id))
-            .and_then(|&(font_id, _)| color_of(font_id))
-    };
-    let Some(normal) = style_color(normal_xf) else {
-        return Vec::new();
+            .and_then(|&(font_id, _)| font_differs(font_id))
     };
     xfs_in("cellXfs")
         .into_iter()
         .map(
-            |(font_id, xf_id)| match (color_of(font_id), style_color(xf_id)) {
-                (Some(own), Some(style)) => own != normal || style != normal,
+            |(font_id, xf_id)| match (font_differs(font_id), style_differs(xf_id)) {
+                (Some(own), Some(style)) => own || style,
                 _ => false,
             },
         )
@@ -858,6 +872,17 @@ mod strict_namespace_tests {
             "",
         ))
         .is_empty());
+        // A non-finite tint compares equal to itself; auto spellings
+        // normalize, while an invalid auto value stays distinct.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1" tint="NaN" auto="0"/></font><font><color theme="1" tint=" NaN " auto="false"/></font><font><color theme="1" tint="NaN" auto="no"/></font>"#,
+                r#"<xf fontId="0"/>"#,
+                r#"<xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/><xf fontId="2" xfId="0"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [false, false, true]
+        );
         // An unresolvable font or parent style keeps the table color.
         assert_eq!(
             flags(sheet(
