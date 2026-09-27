@@ -497,6 +497,16 @@ impl Properties {
                 }
                 return Ok(u16_at(operand, 0)? == 1252);
             }
+            0x484e => {
+                // [MS-DOC] 2.9.118 HresiOperand: hresNormal with a zero
+                // replacement character is the default word-breaking method.
+                // Other methods alter the displayed hyphenated line and need
+                // a generic line-breaking representation before projection.
+                if operand.len() != 2 {
+                    return Err(unsupported("invalid Word hyphenation operand"));
+                }
+                return Ok(operand == [1, 0]);
+            }
             0x2879 => {
                 // MS-DOC 2.6.1 sprmCLbcCRJ / 2.9.129 LBCOperand: where text
                 // resumes after a U+000B line break (lbrNone/Left/Right/Both).
@@ -975,6 +985,17 @@ mod tests {
         assert!(base.clone().apply(0x6887, &[0, 0, 0, 0x80], &base).is_err());
         assert!(base.clone().apply(0x6887, &[0, 0, 0], &base).is_err());
         assert!(base.clone().apply(0x4888, &[0], &base).is_err());
+    }
+
+    #[test]
+    fn normal_word_breaking_is_the_default_and_nondefault_forms_stay_gated() {
+        let base = Properties::default();
+        let mut value = base.clone();
+        assert!(value.apply(0x484e, &[1, 0], &base).unwrap());
+        assert_eq!(value, base);
+        assert!(!value.apply(0x484e, &[2, b'e'], &base).unwrap());
+        assert!(!value.apply(0x484e, &[0, 1], &base).unwrap());
+        assert!(value.apply(0x484e, &[1], &base).is_err());
     }
 
     #[test]
