@@ -78,6 +78,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
   fontSize: number;  // pt
   color: string | null;
   fontFamily: string | null;
+  /** Family requested by the run before a registered canvas face replaces it. */
+  authoredFontFamily?: string | null;
   fontRoute?: CanvasFontRoute;
   /** Selected-route line ratio. It may come from parsed font bytes or a bounded
    * Canvas measurement; the latter does not reveal OpenType table identity. */
@@ -252,6 +254,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Whether shifted ink contributes to this retained segment's line extent.
    * False only for the fixed-line-count drop-cap compatibility projection. */
   positionExtendsLineBox?: boolean;
+  /** Word-observed mixed symbol/text line: keep this segment's glyph advance
+   * and paint, while the following text face supplies the line box. Set only
+   * during a line-breaking pass after the following glyph is known to fit. */
+  leadingSymbolUsesTextLineMetrics?: boolean;
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
    *  font size ≥ the threshold. Absent at every style level disables kerning

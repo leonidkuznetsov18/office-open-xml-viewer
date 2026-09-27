@@ -592,6 +592,11 @@ export function performAddToLine(
     materializeLatinSpaceCompression();
     breakerState.latinLineHomogeneous = false;
   }
+  if ('text' in s && s.leadingSymbolUsesTextLineMetrics) {
+    // Width and paint were retained above. Word's mixed leading symbol lines
+    // take their vertical allocation from the following ordinary text face.
+    return;
+  }
   if (h > breakerState.lineHeight) breakerState.lineHeight = h;
   if ('imagePath' in s && s.inlinePicture === true) {
     breakerState.lineHasInlinePicture = true;
@@ -897,6 +902,8 @@ export function performTextSegmentBox(
     scale,
     fontFamilyClasses,
     characterGrid,
+    breakerState,
+    availW,
   } = operationState;
 
   const measured = measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
@@ -907,6 +914,40 @@ export function performTextSegmentBox(
     scale,
   );
   s.snapGridNaturalWidthPx = width;
+
+  // Word-produced mixed lines with a leading Segoe UI Symbol or Apple Color
+  // Emoji text-presentation glyph use the following text face for line height
+  // while retaining the symbol's own advance and paint. The measured controls
+  // include filled/open squares in table cells; a standalone symbol, a symbol
+  // after text, and a color-presentation emoji are outside this rule. Require
+  // an ordinary following glyph to fit the same line before excluding metrics.
+  s.leadingSymbolUsesTextLineMetrics = false;
+  const requestedFamily = s.authoredFontFamily ?? s.fontFamily;
+  if (
+    breakerState.currentLine.length === 0 &&
+    ((requestedFamily === 'Segoe UI Symbol' && s.text === '❑') ||
+      (requestedFamily === 'Apple Color Emoji' && s.text === '◼︎')) &&
+    characterGrid?.type == null &&
+    !s.ruby && !s.vertAlign && !s.verticalRun &&
+    s.fitTextRegionIndex === undefined
+  ) {
+    let followingWidth = 0;
+    for (const queued of breakerState.queue.slice(0, 2)) {
+      if (!('text' in queued) || (queued.authoredFontFamily ?? queued.fontFamily) === requestedFamily ||
+        queued.position !== s.position || queued.ruby || queued.vertAlign ||
+        queued.verticalRun || queued.fitTextRegionIndex !== undefined) break;
+      const firstVisible = /\S/u.exec(queued.text)?.[0];
+      const probe = firstVisible == null ? queued.text : queued.text.slice(0, queued.text.indexOf(firstVisible) + firstVisible.length);
+      followingWidth += operationState.strAdvance(queued, probe);
+      if (firstVisible != null) {
+        s.leadingSymbolUsesTextLineMetrics = breakerState.currentWidth + width + followingWidth <= availW();
+        break;
+      }
+    }
+  }
+  if (s.leadingSymbolUsesTextLineMetrics) {
+    return { width, height: 0, ascent: 0, descent: 0 };
+  }
 
   const fullPx = s.fontSize * scale;
   let metricMeasurement = measured;

@@ -157,8 +157,16 @@ export function appendTextPiece(
     value: import('../layout/typography-input.js').TypographyValueInput<T> | undefined,
     fallback: T | undefined,
   ): T | undefined => (value?.status === 'valid' && value.value !== null ? value.value : fallback);
-  const effectiveVertAlign =
-    acquiredValue(acquiredTypography?.verticalAlign, vertAlign ?? undefined) ?? null;
+  const acquiredVertAlign = acquiredValue(
+    acquiredTypography?.verticalAlign,
+    vertAlign ?? undefined,
+  );
+  // ECMA-376 §17.3.2.42 `baseline` is a valid run-level reset of an
+  // inherited super/subscript. It is not a third paint transform: only the
+  // two raised/lowered values enter the retained line geometry.
+  const effectiveVertAlign = acquiredVertAlign === 'super' || acquiredVertAlign === 'sub'
+    ? acquiredVertAlign
+    : null;
   const effectivePosition = acquiredValue(acquiredTypography?.positionPt, r.position);
   const effectiveCharacterSpacing = acquiredTypography?.characterSpacingPt ?? r.charSpacing;
   // ECMA-376 §17.3.2.35 gives an authored run an explicit character pitch.
@@ -1254,6 +1262,7 @@ function emitResolvedTextSegment(
     fontSize: cs ? csFontSize : base.fontSize,
     color: base.color,
     fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
+    authoredFontFamily: fontFamily,
     fontRoute: resolvedSpan?.fontRoute,
     resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
     ...(resourceFamilyLineMetric?.lineHeightRatio != null
