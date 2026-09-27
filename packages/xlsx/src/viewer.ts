@@ -68,24 +68,8 @@ import {
 } from './validation-list.js';
 import { withViewerRenderContext } from './worker-protocol.js';
 import { SheetViewEdits } from './internal/viewer/sheet-view-edits.js';
-import {
-  buildOutlineLayout,
-  toggleGroupHidden,
-  levelButtonHidden,
-  rowBands,
-  colBands,
-  summaryAfterFor,
-  gutterExtentPx,
-  outlineBracketSegments,
-  outlineLevelButtonCenterPx,
-  outlinePaneClipRect,
-  OUTLINE_BUTTON_PX,
-  OUTLINE_LANE_PX,
-  type BandOutline,
-  type OutlineGroup,
-  type OutlineLayout,
-  type OutlineAxis,
-} from './outline.js';
+import { OutlineGutter } from './internal/viewer/outline-gutter.js';
+import type { OutlineAxis } from './outline.js';
 import {
   GridGeometry,
   MAX_WORKSHEET_COL,
@@ -652,23 +636,8 @@ class XlsxViewerEngine implements ZoomableViewer {
    *  When the active sheet has no outlining the gutters collapse to 0 px and this
    *  is a transparent pass-through, so an outline-free sheet lays out identically. */
   private gridRegion!: HTMLDivElement;
-  /** Left gutter canvas: row group brackets + toggles (XL4). */
-  private rowGutter!: HTMLCanvasElement;
-  /** Top gutter canvas: column group brackets + toggles (XL4). */
-  private colGutter!: HTMLCanvasElement;
-  /** Top-left corner canvas: numbered level buttons (XL4). */
-  private cornerGutter!: HTMLCanvasElement;
-  /** Cached extents (unscaled CSS px) of the current sheet's gutters; both 0 for
-   *  an outline-free sheet. `w` insets {@link canvasArea} from the left, `h` from
-   *  the top. */
-  private gutter = { w: 0, h: 0 };
-  /** Per-axis outline layout (group brackets + toggles) for the current sheet,
-   *  recomputed on sheet switch and after each collapse/expand. `null` axis ⇒ no
-   *  outlining on that axis. */
-  private rowOutline: OutlineLayout | null = null;
-  private colOutline: OutlineLayout | null = null;
-  private rowOutlineBands: BandOutline[] = [];
-  private colOutlineBands: BandOutline[] = [];
+  /** Row/column grouping gutters (XL4) beside the grid. */
+  private readonly outlineGutter: OutlineGutter;
   /** View-only outline/resize edits, replayed onto every sheet projection. */
   private readonly viewEdits = new SheetViewEdits();
   private readonly projectionId = nextViewerProjectionId++;
@@ -912,23 +881,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.gridRegion = this.hostDocument.createElement('div');
     this.gridRegion.style.cssText = `position:relative;flex:1;min-height:0;overflow:hidden;`;
 
-    // Outline gutter canvases. Absolutely positioned inside gridRegion; sized /
-    // shown per sheet in `layoutGutters`. `pointer-events:auto` on the gutters so
-    // +/- toggles and level buttons are clickable; they are painted on the main
-    // thread even in worker mode (cheap chrome, independent of the grid bitmap).
-    const gutterStyle =
-      `position:absolute;top:0;left:0;z-index:3;display:none;` +
-      `background:var(--ooxml-xlsx-chrome-background,#f5f5f5);`;
-    this.cornerGutter = this.hostDocument.createElement('canvas');
-    this.cornerGutter.style.cssText = gutterStyle;
-    this.cornerGutter.setAttribute('data-xlsx-outline', 'corner');
-    this.colGutter = this.hostDocument.createElement('canvas');
-    this.colGutter.style.cssText = gutterStyle;
-    this.colGutter.setAttribute('data-xlsx-outline', 'col');
-    this.rowGutter = this.hostDocument.createElement('canvas');
-    this.rowGutter.style.cssText = gutterStyle;
-    this.rowGutter.setAttribute('data-xlsx-outline', 'row');
-
     this.canvasArea = this.hostDocument.createElement('div');
     this.canvasArea.style.cssText = `position:absolute;inset:0;overflow:hidden;`;
 
@@ -975,6 +927,19 @@ class XlsxViewerEngine implements ZoomableViewer {
       this.commentPopupResizeObserver.observe(this.commentPopup);
     }
     this.validationPanel = this.overlayHost.validation;
+    this.outlineGutter = new OutlineGutter({
+      gridRegion: this.gridRegion,
+      canvasArea: this.canvasArea,
+      surface: this.surface,
+      worksheet: () => this.currentWorksheet,
+      scale: () => this.viewport.scale,
+      chromeColors: () => this.chromeColors,
+      cellRect: (row, col) => this._cellRect(row, col),
+      screenX: (x, w) => this.screenX(x, w),
+      setBandHidden: (axis, index, hidden) => this.setBandHidden(axis, index, hidden),
+      setBandCollapsed: (axis, index, collapsed) => this.setBandCollapsed(axis, index, collapsed),
+      afterOutlineMutation: (ws, anchor) => this.afterOutlineMutation(ws, anchor),
+    });
     // Inject the shared viewer stylesheet once per module (idempotent). Both
     // mounts use it; the composite footer also hides its tab-strip scrollbar.
     ensureViewerStyleInjected(this.hostDocument);
@@ -1045,8 +1010,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     // Gutter click handling (XL4): +/- toggles and the numbered level banks
     // (each in its own gutter's header strip; the corner is inert background).
     // Registered once; no-op when a sheet has no gutter (extents 0 ⇒ hidden).
-    this.rowGutter.addEventListener('pointerdown', (e) => this.onGutterPointerDown(e, 'row'));
-    this.colGutter.addEventListener('pointerdown', (e) => this.onGutterPointerDown(e, 'col'));
+    this.outlineGutter.installListeners();
 
     if (this._nativeScrollbars) this.surface.on('scroll', () => {
       // Any scroll cancels a deferred tap: the press that started it was a
@@ -1557,400 +1521,21 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   // ─── Outline gutter (XL4: row/column grouping) ────────────────────────────
 
-  /** Recompute the per-axis outline layout for `ws` and cache the band lists.
-   *  Both axes are `null` (gutters collapse to 0) when the sheet has no
-   *  outlining, so an outline-free sheet is untouched. */
+  /** Recompute the per-axis outline layout for `ws` and bind the sheet's
+   *  view-edit stashes. An outline-free sheet collapses both gutters to 0. */
   private buildOutline(ws: Worksheet): void {
     this.viewEdits.bindSheet(this.currentSheet);
-    this.rowOutlineBands = rowBands(ws);
-    this.colOutlineBands = colBands(ws);
-    const rowLayout = buildOutlineLayout(this.rowOutlineBands, summaryAfterFor(ws, 'row'));
-    const colLayout = buildOutlineLayout(this.colOutlineBands, summaryAfterFor(ws, 'col'));
-    this.rowOutline = rowLayout.maxLevel > 0 ? rowLayout : null;
-    this.colOutline = colLayout.maxLevel > 0 ? colLayout : null;
+    this.outlineGutter.rebuild(ws);
   }
 
-  /** Size and place the three gutter canvases (corner / col / row) from the
-   *  current outline, and inset {@link canvasArea} by the gutter extents. When
-   *  neither axis is grouped both extents are 0 and canvasArea covers the whole
-   *  region — pixel-identical to a viewer built before XL4. */
+  /** Place the gutters and inset canvasArea by their extents. */
   private layoutGutters(): void {
-    const cs = this.viewport.scale;
-    const gw = this.rowOutline ? Math.round(gutterExtentPx(this.rowOutline.maxLevel) * cs) : 0;
-    const gh = this.colOutline ? Math.round(gutterExtentPx(this.colOutline.maxLevel) * cs) : 0;
-    this.gutter = { w: gw, h: gh };
-
-    // Attach the gutter canvases only while an outline exists; detach them
-    // entirely for outline-free sheets. A hidden-but-attached canvas is NOT
-    // neutral — DOM consumers that count/index `<canvas>` elements (e.g. the
-    // layouts smoke's `page.locator('canvas').count()`) see it — so element
-    // parity with the pre-outline viewer requires absence, not `display:none`.
-    // The elements (and their pointer listeners) are constructed once and
-    // survive detach/reattach across sheet switches.
-    if (gw > 0 || gh > 0) {
-      if (!this.colGutter.parentElement) {
-        this.gridRegion.appendChild(this.colGutter);
-        this.gridRegion.appendChild(this.rowGutter);
-        this.gridRegion.appendChild(this.cornerGutter);
-      }
-    } else {
-      this.colGutter.remove();
-      this.rowGutter.remove();
-      this.cornerGutter.remove();
-    }
-
-    // Inset canvasArea so the grid (and every geometry read that keys off its
-    // client rect) starts after the gutters.
-    this.canvasArea.style.left = `${gw}px`;
-    this.canvasArea.style.top = `${gh}px`;
-
-    const show = (el: HTMLCanvasElement, x: number, y: number, w: number, h: number) => {
-      if (w <= 0 || h <= 0) { el.style.display = 'none'; return; }
-      el.style.display = 'block';
-      el.style.left = `${x}px`;
-      el.style.top = `${y}px`;
-      el.style.width = `${w}px`;
-      el.style.height = `${h}px`;
-    };
-    const regionW = this.gridRegion.clientWidth;
-    const regionH = this.gridRegion.clientHeight;
-    // Corner holds the numbered level buttons; only meaningful where both a
-    // horizontal and vertical gutter exist, but we always paint it to cover the
-    // intersection so the two strips meet cleanly.
-    show(this.cornerGutter, 0, 0, gw, gh);
-    show(this.colGutter, gw, 0, Math.max(0, regionW - gw), gh);
-    show(this.rowGutter, 0, gh, gw, Math.max(0, regionH - gh));
+    this.outlineGutter.layout();
   }
 
-  /** Paint all visible gutter strips for the current scroll offset. Called at the
-   *  end of every grid render so the brackets track scroll / zoom exactly. */
+  /** Repaint the gutters for the current scroll offset (after every frame). */
   private renderGutters(): void {
-    const ws = this.currentWorksheet;
-    if (!ws) return;
-    if (this.gutter.h > 0 && this.colOutline) this.paintAxisGutter('col');
-    if (this.gutter.w > 0 && this.rowOutline) this.paintAxisGutter('row');
-    if (this.gutter.w > 0 || this.gutter.h > 0) this.paintCornerGutter();
-  }
-
-  /** Draw one axis's group brackets and +/- toggles into its gutter canvas,
-   *  aligned to the on-screen band positions via {@link getCellRect}. */
-  private paintAxisGutter(axis: OutlineAxis): void {
-    const ws = this.currentWorksheet;
-    if (!ws) return;
-    const cs = this.viewport.scale;
-    const isRow = axis === 'row';
-    const canvas = isRow ? this.rowGutter : this.colGutter;
-    const layout = isRow ? this.rowOutline : this.colOutline;
-    if (!layout) return;
-    const cssW = parseFloat(canvas.style.width) || 0;
-    const cssH = parseFloat(canvas.style.height) || 0;
-    if (cssW <= 0 || cssH <= 0) return;
-    // Backing-store size at DPR; CSS size stays as laid out.
-    const dpr = this.surface.sizeCanvas(canvas, cssW, cssH);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssW, cssH);
-    ctx.fillStyle = this.chromeColors.background ?? '#f5f5f5';
-    ctx.fillRect(0, 0, cssW, cssH);
-
-    const lanePx = OUTLINE_LANE_PX * cs;
-    // The gutter canvas's cross-axis origin (0) sits at the grid's cell-area
-    // origin: for the row gutter, y=0 aligns with the top of the row header +
-    // gutter; getCellRect returns coordinates in canvasArea space, which is
-    // offset from the gutter canvas by exactly `gutter.h` (col gutter is above).
-    // The gutter canvas top is at gridRegion y = gutter.h, and canvasArea top is
-    // also at gutter.h — so a band's canvasArea-space y maps 1:1 to gutter-canvas
-    // y. Likewise x for the col gutter (offset by gutter.w).
-    ctx.strokeStyle = this.chromeColors.border ?? '#808080';
-    ctx.lineWidth = 1;
-    ctx.fillStyle = this.chromeColors.text ?? '#404040';
-
-    // Outline gutter geometry participates in the same header/frozen-pane split
-    // as the worksheet canvas. Clip every logical run to its own pane so a
-    // scrolled detail rail cannot leak upward into the column-letter header or
-    // through the frozen-row boundary (and mirror the equivalent rule for RTL
-    // frozen columns).
-    const geometry = getGridGeometryForWorksheet(ws);
-    const effective = geometry.effectiveFrozenBands({
-      scale: cs,
-      width: this.canvasArea.clientWidth,
-      height: this.canvasArea.clientHeight,
-      headerWidth: HEADER_W,
-      headerHeight: HEADER_H,
-      rows: ws.freezeRows ?? 0,
-      cols: ws.freezeCols ?? 0,
-    });
-    const axes = geometry.axesAtScale(cs);
-    const frozenBandCount = isRow ? effective.rows : effective.cols;
-    const frozenExtent = isRow
-      ? axes.row.offsetOf(effective.rows + 1)
-      : axes.col.offsetOf(effective.cols + 1);
-    const headerExtent = (isRow ? HEADER_H : HEADER_W) * cs;
-    const paneClip = (start: number, end: number) => outlinePaneClipRect(
-      axis,
-      start,
-      end,
-      frozenBandCount,
-      headerExtent,
-      frozenExtent,
-      cssW,
-      cssH,
-      !isRow && ws.rightToLeft === true,
-    );
-    const clipContext = (start: number, end: number): boolean => {
-      const clip = paneClip(start, end);
-      if (clip.w <= 0 || clip.h <= 0) return false;
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(clip.x, clip.y, clip.w, clip.h);
-      ctx.clip();
-      return true;
-    };
-
-    for (const g of layout.groups) {
-      // Lane index for this level: lane 0 is the outermost (level 1). Buttons and
-      // the outermost bracket sit nearest the grid edge? Excel draws level 1 in
-      // the lane FARTHEST from the grid, deeper levels closer. We place level L in
-      // lane (L-1) counted from the sheet-far edge.
-      const laneFromFar = g.level - 1;
-      const laneCenterCross = (laneFromFar + 0.5) * lanePx;
-
-      // Detail run extent along the band axis, from on-screen cell rects.
-      const startRect = isRow ? this._cellRect(g.start, 1) : this._cellRect(1, g.start);
-      const endRect = isRow ? this._cellRect(g.end, 1) : this._cellRect(1, g.end);
-      if (!startRect || !endRect) continue;
-      const a = isRow ? startRect.y : this.screenX(startRect.x, startRect.w);
-      const b = isRow ? endRect.y + endRect.h : this.screenX(endRect.x, endRect.w) + endRect.w;
-      const runStart = Math.min(a, b);
-      const runEnd = Math.max(a, b);
-
-      // A collapsed group's detail run is hidden (zero visible extent) — Excel
-      // draws only the +/- toggle, no bracket. Skip the bracket when the run has
-      // negligible length.
-      if (!g.collapsed && runEnd - runStart > 1) {
-        if (clipContext(g.start, g.end)) {
-          ctx.beginPath();
-          for (const segment of outlineBracketSegments(axis, laneCenterCross, a, b, lanePx)) {
-            ctx.moveTo(segment.x1, segment.y1);
-            ctx.lineTo(segment.x2, segment.y2);
-          }
-          ctx.stroke();
-          ctx.restore();
-        }
-      }
-
-      // +/- toggle box on the summary band.
-      if (g.summary != null) {
-        const sRect = isRow ? this._cellRect(g.summary, 1) : this._cellRect(1, g.summary);
-        if (sRect) {
-          const along = isRow
-            ? sRect.y + sRect.h / 2
-            : this.screenX(sRect.x, sRect.w) + sRect.w / 2;
-          if (clipContext(g.summary, g.summary)) {
-            this.drawToggleBox(ctx, isRow ? laneCenterCross : along, isRow ? along : laneCenterCross, g.collapsed, cs);
-            ctx.restore();
-          }
-        }
-      }
-    }
-
-    // Numbered level buttons (1..maxLevel+1), one per lane, in this gutter's
-    // header strip: the row bank sits beside the column-letter header (the
-    // gutter's top HEADER_H band — no bracket ever draws there because band
-    // y-coordinates start at the header edge), the column bank above the
-    // row-number header (leftmost HEADER_W band). Placing each bank in its own
-    // gutter (Excel's layout) keeps the two banks from ever sharing a cell —
-    // the old corner placement collided at the shared bottom-right lane and
-    // made the row expand-all button unreachable.
-    const bankCross = isRow ? (HEADER_H * cs) / 2 : (HEADER_W * cs) / 2;
-    for (let l = 1; l <= layout.maxLevel + 1; l++) {
-      const buttonCenter = outlineLevelButtonCenterPx(l) * cs;
-      if (buttonCenter + (OUTLINE_BUTTON_PX * cs) / 2 > (isRow ? cssW : cssH) + 0.5) break;
-      this.drawLevelButton(
-        ctx,
-        isRow ? buttonCenter : bankCross,
-        isRow ? bankCross : buttonCenter,
-        String(l),
-        cs,
-      );
-    }
-
-    // Paint the pane separator last so it visibly cuts the outline rail at the
-    // same coordinate as the main grid's separator. This also extends the line
-    // through the outline gutter, making the frozen-row boundary continuous
-    // from the gutter through the row-number header and cells.
-    if (frozenBandCount > 0) {
-      const divider = isRow
-        ? headerExtent + frozenExtent
-        : ws.rightToLeft === true
-          ? cssW - headerExtent - frozenExtent
-          : headerExtent + frozenExtent;
-      ctx.save();
-      ctx.strokeStyle = this.chromeColors.border ?? '#7a7a7a';
-      ctx.lineWidth = 0.5;
-      ctx.beginPath();
-      if (isRow) {
-        ctx.moveTo(0, divider);
-        ctx.lineTo(cssW, divider);
-      } else {
-        ctx.moveTo(divider, 0);
-        ctx.lineTo(divider, cssH);
-      }
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  /** Draw a small square +/- toggle centered at (cx, cy) in gutter-canvas CSS px. */
-  private drawToggleBox(
-    ctx: CanvasRenderingContext2D,
-    cx: number,
-    cy: number,
-    collapsed: boolean,
-    cs: number,
-  ): void {
-    const s = Math.round(9 * cs);
-    const x = Math.round(cx - s / 2);
-    const y = Math.round(cy - s / 2);
-    ctx.save();
-    ctx.fillStyle = this.chromeColors.surface ?? '#ffffff';
-    ctx.strokeStyle = this.chromeColors.border ?? '#808080';
-    ctx.lineWidth = 1;
-    ctx.fillRect(x + 0.5, y + 0.5, s, s);
-    ctx.strokeRect(x + 0.5, y + 0.5, s, s);
-    ctx.strokeStyle = this.chromeColors.text ?? '#404040';
-    ctx.beginPath();
-    // horizontal stroke (present for both + and -)
-    ctx.moveTo(x + 2.5, y + s / 2 + 0.5);
-    ctx.lineTo(x + s - 1.5, y + s / 2 + 0.5);
-    if (collapsed) {
-      // vertical stroke makes it a "+"
-      ctx.moveTo(x + s / 2 + 0.5, y + 2.5);
-      ctx.lineTo(x + s / 2 + 0.5, y + s - 1.5);
-    }
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  /** Draw one numbered level button centered at (cx, cy) in gutter-canvas CSS
-   *  px. Shared by the row bank (in the row gutter's top strip) and the column
-   *  bank (in the column gutter's left strip). */
-  private drawLevelButton(
-    ctx: CanvasRenderingContext2D,
-    cx: number,
-    cy: number,
-    label: string,
-    cs: number,
-  ): void {
-    const s = Math.round(OUTLINE_BUTTON_PX * cs);
-    const x = Math.round(cx - s / 2);
-    const y = Math.round(cy - s / 2);
-    ctx.save();
-    ctx.font = `${Math.round(9 * cs)}px sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = this.chromeColors.surface ?? '#ffffff';
-    ctx.strokeStyle = this.chromeColors.border ?? '#808080';
-    ctx.lineWidth = 1;
-    ctx.fillRect(x + 0.5, y + 0.5, s, s);
-    ctx.strokeRect(x + 0.5, y + 0.5, s, s);
-    ctx.fillStyle = this.chromeColors.text ?? '#404040';
-    ctx.fillText(label, cx, cy + 0.5);
-    ctx.restore();
-  }
-
-  /** Paint the corner (intersection of the two gutters) as plain background.
-   *  The numbered level banks live in each axis gutter's own header strip
-   *  (see paintAxisGutter), so the corner carries no interactive content. */
-  private paintCornerGutter(): void {
-    const canvas = this.cornerGutter;
-    const cssW = parseFloat(canvas.style.width) || 0;
-    const cssH = parseFloat(canvas.style.height) || 0;
-    if (cssW <= 0 || cssH <= 0) { return; }
-    const dpr = this.surface.sizeCanvas(canvas, cssW, cssH);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssW, cssH);
-    ctx.fillStyle = this.chromeColors.background ?? '#f5f5f5';
-    ctx.fillRect(0, 0, cssW, cssH);
-  }
-
-  /** Handle a click in a row/col gutter: hit-test the +/- toggles and toggle the
-   *  matching group's collapse state. */
-  private onGutterPointerDown(e: PointerEvent, axis: OutlineAxis): void {
-    const ws = this.currentWorksheet;
-    if (!ws) return;
-    const isRow = axis === 'row';
-    const layout = isRow ? this.rowOutline : this.colOutline;
-    if (!layout) return;
-    const canvas = isRow ? this.rowGutter : this.colGutter;
-    const rect = canvas.getBoundingClientRect();
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
-    const cs = this.viewport.scale;
-    const lanePx = OUTLINE_LANE_PX * cs;
-    const hitR = 7 * cs; // generous grab radius around a +/- button center
-
-    // Numbered level bank first: it lives in this gutter's header strip (row
-    // bank beside the column-letter header, column bank above the row-number
-    // header — mirrors paintAxisGutter), where no +/- toggle can be.
-    const bankCross = isRow ? (HEADER_H * cs) / 2 : (HEADER_W * cs) / 2;
-    const inBankStrip = (isRow ? py : px) <= (isRow ? HEADER_H : HEADER_W) * cs;
-    if (inBankStrip) {
-      for (let l = 1; l <= layout.maxLevel + 1; l++) {
-        const buttonCenter = outlineLevelButtonCenterPx(l) * cs;
-        const cx = isRow ? buttonCenter : bankCross;
-        const cy = isRow ? bankCross : buttonCenter;
-        const buttonHitR = (OUTLINE_BUTTON_PX * cs) / 2;
-        if (Math.abs(px - cx) <= buttonHitR && Math.abs(py - cy) <= buttonHitR) {
-          e.preventDefault();
-          this.applyLevelButton(l, axis);
-          return;
-        }
-      }
-      return; // header strip carries no toggles — don't fall through
-    }
-
-    for (const g of layout.groups) {
-      if (g.summary == null) continue;
-      const laneCenterCross = (g.level - 1 + 0.5) * lanePx;
-      const sRect = isRow ? this._cellRect(g.summary, 1) : this._cellRect(1, g.summary);
-      if (!sRect) continue;
-      const along = isRow
-        ? sRect.y + sRect.h / 2
-        : this.screenX(sRect.x, sRect.w) + sRect.w / 2;
-      const cx = isRow ? laneCenterCross : along;
-      const cy = isRow ? along : laneCenterCross;
-      if (Math.abs(px - cx) <= hitR && Math.abs(py - cy) <= hitR) {
-        e.preventDefault();
-        this.applyGroupToggle(g, axis);
-        return;
-      }
-    }
-  }
-
-  /** Flip a single group's collapse state in the in-memory model, then rebuild
-   *  the outline + repaint. View-only: the file is never written. */
-  private applyGroupToggle(group: OutlineGroup, axis: OutlineAxis): void {
-    const ws = this.currentWorksheet;
-    if (!ws) return;
-    const bands = axis === 'row' ? this.rowOutlineBands : this.colOutlineBands;
-    const { hide, show, nowCollapsed } = toggleGroupHidden(group, bands);
-    for (const i of hide) this.setBandHidden(axis, i, true);
-    for (const i of show) this.setBandHidden(axis, i, false);
-    // Reflect the new collapsed state on the summary band so the next toggle
-    // reads the correct direction and the +/- glyph flips.
-    if (group.summary != null) this.setBandCollapsed(axis, group.summary, nowCollapsed);
-    // Collapsing removes the detail bands before the summary. Anchor that
-    // surviving summary band at the viewport start after geometry has been
-    // rebuilt; otherwise the browser clamps the shortened scroll extent and
-    // leaves an unrelated partial row at the top.
-    this.afterOutlineMutation(
-      ws,
-      nowCollapsed && group.summary != null ? { axis, summary: group.summary } : undefined,
-    );
+    this.outlineGutter.render();
   }
 
   /** Align an outline summary band to the scrollable viewport's start without
@@ -1975,27 +1560,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     );
     if (axis === 'row') this.viewportTop = offset.y;
     else this.setViewportLeft(offset.x);
-  }
-
-  /** Collapse/expand the whole sheet to `level` on one axis. */
-  private applyLevelButton(level: number, axis: OutlineAxis): void {
-    const ws = this.currentWorksheet;
-    if (!ws) return;
-    const bands = axis === 'row' ? this.rowOutlineBands : this.colOutlineBands;
-    const { hide, show } = levelButtonHidden(bands, level);
-    for (const i of hide) this.setBandHidden(axis, i, true);
-    for (const i of show) this.setBandHidden(axis, i, false);
-    // Update each group's summary-band collapsed flag from the new state: a group
-    // at lane L is collapsed exactly when its detail (level >= L) is now hidden,
-    // i.e. `L >= level`. Driving this off the layout's groups (rather than the
-    // band list) also reaches level-0 summary bands, which are not in `bands`.
-    const layout = axis === 'row' ? this.rowOutline : this.colOutline;
-    if (layout) {
-      for (const g of layout.groups) {
-        if (g.summary != null) this.setBandCollapsed(axis, g.summary, g.level >= level);
-      }
-    }
-    this.afterOutlineMutation(ws);
   }
 
   private setBandHidden(axis: OutlineAxis, index: number, hidden: boolean): void {
@@ -2024,24 +1588,13 @@ class XlsxViewerEngine implements ZoomableViewer {
     anchor?: { axis: OutlineAxis; summary: number },
   ): void {
     GridGeometry.invalidate(ws);
-    this.buildOutlineLayoutOnly(ws);
+    this.outlineGutter.rebuild(ws);
     this.updateSpacerSize(ws);
     if (anchor) this.scrollOutlineSummaryToStart(anchor.axis, anchor.summary);
     this.updateSelectionOverlay();
     this.updateFindOverlay();
     this.scheduleRender();
     if (anchor) this.emitViewportChange();
-  }
-
-  /** Rebuild only the layout + band lists (not the stashes) after a collapse
-   *  state change, so the +/- glyphs and bracket set stay in sync. */
-  private buildOutlineLayoutOnly(ws: Worksheet): void {
-    this.rowOutlineBands = rowBands(ws);
-    this.colOutlineBands = colBands(ws);
-    const rowLayout = buildOutlineLayout(this.rowOutlineBands, summaryAfterFor(ws, 'row'));
-    const colLayout = buildOutlineLayout(this.colOutlineBands, summaryAfterFor(ws, 'col'));
-    this.rowOutline = rowLayout.maxLevel > 0 ? rowLayout : null;
-    this.colOutline = colLayout.maxLevel > 0 ? colLayout : null;
   }
 
   /** True when the current sheet's grid is laid out right-to-left. */
@@ -5187,10 +4740,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.commentMap.clear();
     this.hyperlinkMap.clear();
     this.preparedWorkbook = null;
-    this.rowOutlineBands = [];
-    this.colOutlineBands = [];
-    this.rowOutline = null;
-    this.colOutline = null;
+    this.outlineGutter.destroy();
     this.elementContext = null;
     this.pendingElementClick = null;
     this.selectionController.reset();
