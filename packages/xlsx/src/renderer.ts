@@ -4845,10 +4845,13 @@ export function drawShapeText(
       render?: MathRender;
       ascent?: number;
       descent?: number;
+      /** m:oMathPara display equation (own line, no first-line indent). */
+      display?: boolean;
+      /** Authored face of a text run, for an empty line's fallback ascent. */
+      face?: string;
     };
     const input: DrawingMlInputRun<ShapeStyle>[] = [];
     let lastTextPt = 0;
-    let lastTextFace: string | undefined;
     for (const run of p.runs) {
       if (run.type === 'break') { input.push({ type: 'break' }); continue; }
       if (run.type === 'math') {
@@ -4859,16 +4862,15 @@ export function drawShapeText(
         const descent = render.descentEm * pxSize;
         const style: ShapeStyle = {
           kind: 'math', font: '', color: run.color ?? '#000000', pxSize,
-          render, ascent, descent,
+          render, ascent, descent, display: run.display === true,
         };
         input.push({ type: 'object', width: render.widthEm * pxSize, style, payload: style, display: run.display });
         continue;
       }
       lastTextPt = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
-      lastTextFace = run.fontFace;
       const { font, px } = textFont(run);
       input.push({ type: 'text', text: run.text,
-        style: { kind: 'text', font, color: run.color ?? '#000000', pxSize: px } });
+        style: { kind: 'text', font, color: run.color ?? '#000000', pxSize: px, face: run.fontFace } });
     }
     const broken = breakDrawingMlText(input, {
       maxWidth: wrap ? paraW : Infinity,
@@ -4886,13 +4888,54 @@ export function drawShapeText(
       defaultTabSize: (p.defTabSz ?? 914400) / EMU_PER_PX * cs,
       tabStartPen: (index) => marLpx + (index === 0 ? firstLineIndent : 0),
     });
-    let fallbackPt = 0;
-    let fallbackFace: string | undefined;
+    // A display equation always closes the pending line first. When nothing
+    // is pending (paragraph start, after <a:br>, a line feed or another display
+    // equation) that closed line is empty but still reserves one line height.
+    // An empty run is already a (blank) line of its own in the break phase.
+    const blankBeforeDisplay: boolean[] = [];
+    let pending = false;
+    for (const item of input) {
+      if (item.type === 'break') { pending = false; continue; }
+      if (item.type === 'object') {
+        if (item.display) { blankBeforeDisplay.push(!pending); pending = false; } else pending = true;
+        continue;
+      }
+      if (item.text === '') { pending = true; continue; }
+      item.text.split('\n').forEach((piece, s) => {
+        if (s > 0) pending = false;
+        if (piece.replace(/\r/gu, '') !== '') pending = true;
+      });
+    }
+    let displayIndex = 0;
+    // Empty lines take the nearest preceding text run's size and face.
+    const runIndexOf = new Map<ShapeStyle, number>();
+    input.forEach((item, idx) => { if (item.type === 'text') runIndexOf.set(item.style, idx); });
+    let fallback: ShapeStyle | undefined;
+    let fallbackIndex = -1;
+    const noteText = (style: ShapeStyle): void => {
+      const idx = runIndexOf.get(style) ?? -1;
+      if (idx >= fallbackIndex) { fallback = style; fallbackIndex = idx; }
+    };
+    const emptyLineBox = (): { height: number; ascent: number } => {
+      const pxSize = fallback?.pxSize ?? DEFAULT_FONT_SIZE * PT_TO_PX * cs;
+      const face = fallback?.face;
+      return {
+        height: pxSize * 1.2,
+        ascent: measuredAscent(`${pxSize}px ${fontStackFor(face, undefined, '',
+          officeRoute(ctx, face), googleSubstitutesByContext.get(ctx) === true,
+          undefined, contextRegularAlias(ctx, face))}`, pxSize),
+      };
+    };
+    const lineHeightOf = (natural: number): number => drawingMlLineHeight(
+      natural, p.spaceLine, PT_TO_PX * cs,
+      txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0,
+    );
     for (const [index, brokenLine] of broken.entries()) {
       const segs: Seg[] = [];
       let naturalHeight = 0;
       let ascent = 0;
       let hasMath = false;
+      let displayMath = false;
       for (const part of brokenLine.segments) {
         if (part.type === 'tab') {
           segs.push({ kind: 'tab', w: part.width });
@@ -4908,6 +4951,7 @@ export function drawShapeText(
           naturalHeight = Math.max(naturalHeight, mathAscent + mathDescent);
           ascent = Math.max(ascent, mathAscent);
           hasMath = true;
+          if (style.display) displayMath = true;
           continue;
         }
         const style = part.style;
@@ -4915,23 +4959,27 @@ export function drawShapeText(
           color: style.color, w: part.width });
         naturalHeight = Math.max(naturalHeight, style.pxSize * 1.2);
         ascent = Math.max(ascent, measuredAscent(style.font, style.pxSize));
-        fallbackPt = style.pxSize / (PT_TO_PX * cs);
+        noteText(style);
       }
-      if (naturalHeight === 0) {
-        const pxSize = (fallbackPt || lastTextPt || DEFAULT_FONT_SIZE) * PT_TO_PX * cs;
-        naturalHeight = pxSize * 1.2;
-        const face = fallbackFace ?? lastTextFace;
-        ascent = measuredAscent(`${pxSize}px ${fontStackFor(face, undefined, '',
-          officeRoute(ctx, face), googleSubstitutesByContext.get(ctx) === true,
-          undefined, contextRegularAlias(ctx, face))}`, pxSize);
+      if (displayMath && blankBeforeDisplay[displayIndex++]) {
+        const blank = emptyLineBox();
+        lines.push({ segs: [], align, height: lineHeightOf(blank.height), ascent: blank.ascent,
+          hasMath: false, leftInset: marLpx, availW: paraW });
       }
-      if (brokenLine.segments.some((part) => part.type === 'text')) fallbackFace = lastTextFace;
-      const height = drawingMlLineHeight(
-        naturalHeight, p.spaceLine, PT_TO_PX * cs,
-        txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0,
-      );
-      const isDisplayMath = segs.length === 1 && segs[0].kind === 'math'
-        && input.some((item) => item.type === 'object' && item.display);
+      // Runs that paint nothing (trimmed or wrapped spaces) still size their line.
+      for (const idx of brokenLine.hiddenRuns ?? []) {
+        const item = input[idx];
+        if (item.type !== 'text') continue;
+        naturalHeight = Math.max(naturalHeight, item.style.pxSize * 1.2);
+        ascent = Math.max(ascent, measuredAscent(item.style.font, item.style.pxSize));
+        noteText(item.style);
+      }
+      if (naturalHeight === 0) ({ height: naturalHeight, ascent } = emptyLineBox());
+      const height = lineHeightOf(naturalHeight);
+      // Classify this line by its own equation: an inline equation on a
+      // paragraph's first line keeps the first-line indent even when a later
+      // equation in the paragraph is display math.
+      const isDisplayMath = displayMath;
       lines.push({
         segs, align, height, ascent, hasMath,
         leftInset: isDisplayMath ? marLpx : marLpx + (index === 0 ? firstLineIndent : 0),

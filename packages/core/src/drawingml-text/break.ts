@@ -19,6 +19,12 @@ export interface DrawingMlBrokenLine<T> {
   width: number;
   /** The line ended at an authored `<a:br>` or LF, not a soft wrap. */
   endsWithBreak?: boolean;
+  /**
+   * Indexes of input text runs that paint nothing (empty, or only trimmed or
+   * wrapped spaces) but sit on this line. Their run properties (for example
+   * the font size) still take part in the line's metrics.
+   */
+  hiddenRuns?: number[];
 }
 
 export interface DrawingMlBreakOptions<T> {
@@ -37,6 +43,18 @@ export interface DrawingMlBreakOptions<T> {
   defaultTabSize?: number;
   /** Pen position relative to the leading inset; includes paragraph margin. */
   tabStartPen?(lineIndex: number): number;
+  /**
+   * `a:pPr@eaLnBrk` (ECMA-376 §21.1.2.2.7, default true). When false, an East
+   * Asian word — a whitespace-delimited token of one authored run containing
+   * CJK — is never split: its CJK, SEA and ZWSP opportunities are withdrawn
+   * and an overwide word overflows instead of taking an emergency break.
+   */
+  eastAsianLineBreak?: boolean;
+  /**
+   * Whether two input runs come from one authored run (an adapter may split a
+   * run where only its font changes). Defaults to identity of the input run.
+   */
+  sameSourceRun?(left: T, right: T): boolean;
   /**
    * Negative tracking can make a longer prefix narrower. Every prefix is then
    * a fit candidate; widths are accumulated from segment heads and
@@ -77,8 +95,11 @@ export function breakDrawingMlText<T>(
 ): DrawingMlBrokenLine<T>[] {
   const sameStyle = options.sameStyle ?? ((a: T, b: T) => a === b);
   const regions: Atom<T>[][] = [[]];
+  /** Region in which each input run starts. */
+  const runRegion: number[] = [];
   let runIndex = 0;
   for (const run of runs) {
+    runRegion.push(regions.length - 1);
     if (run.type === 'break') {
       regions.push([]);
       runIndex++;
@@ -105,8 +126,12 @@ export function breakDrawingMlText<T>(
   }
 
   const lines: DrawingMlBrokenLine<T>[] = [];
+  const regionFirstLine: number[] = [];
+  const regionAtomLine: Int32Array[] = [];
+  const emitted = new Uint8Array(runs.length);
   for (let regionIndex = 0; regionIndex < regions.length; regionIndex++) {
     const atoms = regions[regionIndex];
+    regionFirstLine.push(lines.length);
     // Office C05/C06: paragraph-terminal U+0020 spaces do not create a
     // continuation line, even across authored runs. An authored <a:br> is a
     // line ending inside the paragraph: preserve its preceding spaces because
@@ -130,8 +155,35 @@ export function breakDrawingMlText<T>(
       for (let i = 1; i < atomOffsets.length; i++) if (offsets.has(atomOffsets[i])) seaBreaks.add(i);
     }
 
+    // eaLnBrk=false: mark seams inside an East Asian word of one authored run.
+    const keepEastAsianWords = options.eastAsianLineBreak === false;
+    const inEastAsianWord = new Uint8Array(end + 1);
+    // A seam between authored runs before such a word stays an opportunity:
+    // the word moves whole to the next line when it does not fit.
+    const beforeEastAsianWord = new Uint8Array(end + 1);
+    /** End of the East Asian word containing each atom, else -1. */
+    const eastAsianWordEnd = new Int32Array(end).fill(-1);
+    if (keepEastAsianWords) {
+      const delimits = (atom: Atom<T>): boolean => atom.type !== 'text' || /^\s+$/u.test(atom.text);
+      let from = 0;
+      for (let i = 0; i <= end; i++) {
+        const boundary = i === end || delimits(atoms[i]) || (i > from && atoms[i].run !== atoms[i - 1].run
+          && !(options.sameSourceRun?.(atoms[i - 1].style, atoms[i].style) ?? false));
+        if (!boundary) continue;
+        let hasCjk = false;
+        for (let k = from; k < i; k++) if (isCjk(atoms[k])) { hasCjk = true; break; }
+        if (hasCjk) {
+          for (let k = from + 1; k < i; k++) inEastAsianWord[k] = 1;
+          for (let k = from; k < i; k++) eastAsianWordEnd[k] = i;
+          if (from > 0 && !delimits(atoms[from - 1])) beforeEastAsianWord[from] = 1;
+        }
+        from = i < end && delimits(atoms[i]) ? i + 1 : i;
+      }
+    }
+
     const mayBreakAt = (index: number): boolean => {
       if (index <= 0 || index >= end) return false;
+      const eastAsianWord = inEastAsianWord[index] === 1;
       const prev = atoms[index - 1];
       const next = atoms[index];
       // A tab is a break-before opportunity, not break-after: C11 carries
@@ -139,19 +191,20 @@ export function breakDrawingMlText<T>(
       if (next.type === 'tab') return true;
       if (prev.type === 'tab') return false;
       if (isSpace(prev) || isSpace(next)) return true;
-      if (seaBreaks.has(index)) return true;
+      if (beforeEastAsianWord[index]) return true;
+      if (!eastAsianWord && seaBreaks.has(index)) return true;
       if (prev.type === 'object' || next.type === 'object') return true;
       const prevCp = [...prev.text].at(-1)?.codePointAt(0);
       const nextCp = next.text.codePointAt(0);
       if (prevCp === undefined || nextCp === undefined) return false;
-      if (prevCp === 0x200b) return true;
+      if (!eastAsianWord && prevCp === 0x200b) return true;
       // Observed PowerPoint table controls T00–T08: NBSP binds the adjacent
       // words. At a narrow width Office moves the whole "and NBSP Partner"
       // group after the preceding ordinary space; once that group fits, it
       // stays on the first line. The matching Arial controls bound the rule
       // independently of Segoe UI's host-only font metrics.
       if (isUax14NoBreakPair(prevCp, nextCp)) return false;
-      if (isCjk(prev) || isCjk(next)) return true;
+      if (!eastAsianWord && (isCjk(prev) || isCjk(next))) return true;
       if (index > 1 && (lineBreakClass(prevCp) === 'HY' || lineBreakClass(prevCp) === 'HH')) {
         const before = atoms[index - 2];
         if (before.type === 'text' && latin.test([...before.text].at(-1) ?? '')
@@ -607,6 +660,14 @@ export function breakDrawingMlText<T>(
       ? firstSegmentWidth(m, lineStart, stop)
       : firstSegmentWidth(m, segFirst, stop);
 
+    const atomLine = new Int32Array(end).fill(-1);
+    regionAtomLine.push(atomLine);
+    const markLine = (from: number, to: number): void => {
+      for (let i = from; i < to; i++) {
+        atomLine[i] = lines.length - 1;
+        emitted[atoms[i].run] = 1;
+      }
+    };
     let start = 0;
     if (end === 0) {
       lines.push({ segments: [], width: 0, ...(regionIndex + 1 < regions.length ? { endsWithBreak: true } : {}) });
@@ -655,6 +716,7 @@ export function breakDrawingMlText<T>(
         const line = makeSegments(start, end, lineIndex);
         if (regionIndex + 1 < regions.length) line.endsWithBreak = true;
         lines.push(line);
+        markLine(start, end);
         break;
       }
 
@@ -694,6 +756,8 @@ export function breakDrawingMlText<T>(
               && styleSeams[nextOpportunity] > styleSeams[start + 1]) {
             split = nextOpportunity;
           }
+          // eaLnBrk=false: an overwide East Asian word overflows whole.
+          if (keepEastAsianWords && eastAsianWordEnd[start] >= 0) split = nextOpportunity;
         }
       }
 
@@ -715,9 +779,33 @@ export function breakDrawingMlText<T>(
       // the visible word break, but cannot identify the advance of invisible
       // trailing spaces; retaining them preserves that unresolved paint detail.
       lines.push(makeSegments(start, split, lineIndex));
+      markLine(start, split);
       start = split;
       while (start < end && isSpace(atoms[start])) start++;
     }
+  }
+
+  // A text run that paints nothing sits on the line holding the preceding
+  // emitted atom of its region, else on the region's first line.
+  for (let index = 0; index < runs.length; index++) {
+    if (runs[index].type !== 'text' || emitted[index]) continue;
+    const region = runRegion[index];
+    const atoms = regions[region];
+    const atomLine = regionAtomLine[region];
+    // Atoms are in run order: find the first atom of a later run, then the
+    // nearest emitted atom before it.
+    let lo = 0;
+    let hi = atoms.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (atoms[mid].run < index) lo = mid + 1;
+      else hi = mid;
+    }
+    let line = regionFirstLine[region];
+    for (let i = lo - 1; i >= 0; i--) {
+      if (atomLine[i] >= 0) { line = atomLine[i]; break; }
+    }
+    (lines[line].hiddenRuns ??= []).push(index);
   }
   return lines;
 }

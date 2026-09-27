@@ -1504,6 +1504,8 @@ export function layoutParagraph(
     tabStartPen: (lineIndex) => para.rtl
       ? marRPx : marLPx + (lineIndex === 0 ? firstLineIndentPx : 0),
     nonMonotoneMeasure: input.some((item) => item.type === 'text' && (item.style.letterSpacingPx ?? 0) < 0),
+    eastAsianLineBreak: para.eaLnBrk !== false,
+    sameSourceRun: (left, right) => left.sourceRunId === right.sourceRunId,
   });
   return broken.map((line) => ({
     segments: line.segments.map((part, index): LayoutSegment => {
