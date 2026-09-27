@@ -36,18 +36,8 @@
       const main = await PptxPresentation.load(buf.slice(0), { useGoogleFonts: true, ...renderers });
       const wk = await PptxPresentation.load(buf.slice(0), { mode: 'worker', useGoogleFonts: true, ...renderers });
       const renderBoth = async (slideIndex) => {
-        const paintBoth = async () => {
-          paint('main-canvas', await main.renderSlideToBitmap(slideIndex, { width, dpr }));
-          // Worker renderSlideToBitmap awaits its embedded/web/Office font loads
-          // and returns only after the OffscreenCanvas paint has completed.
-          paint('worker-canvas', await wk.renderSlideToBitmap(slideIndex, { width, dpr }));
-        };
-        await paintBoth();
-        await document.fonts.ready;
-        await paintBoth();
-        await document.fonts.ready;
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-        await new Promise((resolve) => requestAnimationFrame(resolve));
+        paint('main-canvas', await main.renderSlideToBitmap(slideIndex, { width, dpr }));
+        paint('worker-canvas', await wk.renderSlideToBitmap(slideIndex, { width, dpr }));
       };
       await renderBoth(slide);
       window.renderPptxWorkerVrtSlide = renderBoth;

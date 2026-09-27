@@ -79,20 +79,8 @@
       if (slideIdx !== 0) {
         await viewer.goToSlide(slideIdx);
       }
-      const settleSlide = async (slideIndex) => {
-        // The first Canvas paint may discover another font face. Waiting for
-        // that load leaves the original fallback pixels intact, so repaint via
-        // the viewer's paint-completion promise before advertising readiness.
-        await document.fonts.ready;
-        await viewer.goToSlide(slideIndex);
-        await document.fonts.ready;
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-      };
-      await settleSlide(slideIdx);
       window.renderPptxVrtSlide = async (slideIndex) => {
         await viewer.goToSlide(slideIndex);
-        await settleSlide(slideIndex);
       };
       document.body.dataset.status = 'ready';
     } catch (err) {
