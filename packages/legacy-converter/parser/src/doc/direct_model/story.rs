@@ -158,12 +158,11 @@ pub(super) fn project(
                 {
                     // The positioned table itself carries this placement.
                     paragraph.frame_pr = None;
-                } else {
-                    // The DOCX renderer positions frames only in the body
-                    // flow; a framed cell paragraph would silently lay out in
-                    // flow.
-                    formatting.unsupported_paragraph_properties = true;
                 }
+                // [MS-DOC] 2.4.3: a nonmatching frame is a distinct paragraph
+                // placement fact. The shared DOCX cell-frame layout owns its
+                // grouping, fragment/page anchor and cell-local wrap behavior;
+                // retain the resolved framePr.
             }
             _ if direct.frame_gap => formatting.unsupported_paragraph_properties = true,
             _ => {}
@@ -1126,6 +1125,7 @@ mod tests {
         text_directions: Vec<Option<String>>,
         diagonals: Vec<[Option<(String, f64, Option<String>)>; 2]>,
         hide_marks: Vec<bool>,
+        frames: Vec<docx_model::FramePr>,
         unsupported_table: bool,
         unsupported_character: bool,
         unsupported_paragraph: bool,
@@ -1775,6 +1775,7 @@ mod tests {
             let mut text_directions = Vec::new();
             let mut diagonals = Vec::new();
             let mut hide_marks = Vec::new();
+            let mut frames = Vec::new();
             let mut indents = Vec::new();
             for element in &body {
                 let BodyElement::Table(table) = element else {
@@ -1784,6 +1785,12 @@ mod tests {
                 for row in &table.rows {
                     row_cell_counts.push(row.cells.len());
                     for cell in &row.cells {
+                        frames.extend(cell.content.iter().filter_map(|block| match block {
+                            docx_model::CellElement::Paragraph(paragraph) => {
+                                paragraph.frame_pr.as_deref().cloned()
+                            }
+                            _ => None,
+                        }));
                         col_spans.push(cell.col_span);
                         text_directions.push(cell.text_direction.clone());
                         diagonals.push([&cell.borders.tl2br, &cell.borders.tr2bl].map(|b| {
@@ -1862,6 +1869,7 @@ mod tests {
                 text_directions,
                 diagonals,
                 hide_marks,
+                frames,
                 unsupported_table: facts.formatting.unsupported_table_properties,
                 unsupported_character: facts.formatting.unsupported_character_properties,
                 unsupported_paragraph: facts.formatting.unsupported_paragraph_properties,
@@ -3759,9 +3767,13 @@ mod tests {
         let same = project(framed_cell(0x60, 159));
         assert!(!same.unsupported_paragraph);
         assert!(!same.unsupported_table);
-        // A frame that disagrees with the table position stays gated.
-        assert!(project(framed_cell(0x60, 200)).unsupported_paragraph);
-        assert!(project(framed_cell(0x50, 159)).unsupported_paragraph);
+        // A frame that differs from the table position remains a distinct
+        // paragraph placement fact for the generic cell-frame layout.
+        for changed in [framed_cell(0x60, 200), framed_cell(0x50, 159)] {
+            let projected = project(changed);
+            assert!(!projected.unsupported_paragraph);
+            assert_eq!(projected.frames.len(), 1);
+        }
     }
 
     #[test]
@@ -3809,6 +3821,8 @@ mod tests {
         assert!(!mirrored.unsupported_paragraph);
         assert!(!mirrored.unsupported_table);
         // A no-overlap flag that differs from the table's is not a mirror.
-        assert!(project(framed_cell(0)).unsupported_paragraph);
+        let distinct = project(framed_cell(0));
+        assert!(!distinct.unsupported_paragraph);
+        assert_eq!(distinct.frames.len(), 1);
     }
 }
