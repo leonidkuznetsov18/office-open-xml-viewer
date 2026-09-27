@@ -82,6 +82,19 @@ describe('chart date1904 (c:date1904 §21.2.2.38 / §18.17.4.1)', () => {
   });
 });
 
+describe('chart time fields (§18.17.4.2 time fraction)', () => {
+  it('rounds the stored fraction to the millisecond instead of truncating', () => {
+    // 8:00 is stored a hair under 28 800 000 ms.
+    expect(formatChartValWithCode(45292.33333333333, 'hh:mm')).toBe('08:00');
+    expect(formatChartValWithCode(0.33333333333333331, 'h:mm:ss')).toBe('8:00:00');
+  });
+  it('carries a rounded midnight into the next day', () => {
+    // 1 ms short of 2024-01-02 00:00 rounds up to it.
+    const serial = 45293 - 0.4 / 86_400_000;
+    expect(formatChartValWithCode(serial, 'yyyy-mm-dd hh:mm')).toBe('2024-01-02 00:00');
+  });
+});
+
 describe('formatCategoryLabel — category-axis numFmt (§21.2.2.71)', () => {
   it('formats a numeric serial category through a date code', () => {
     // 44927 = 2023-01-01 in the 1900 date system.
