@@ -1259,8 +1259,10 @@ export class XlsxWorkbook {
       ));
       this.assertResourceHealthy();
       const ws = extracted.worksheet;
-      // Eligible previews have no media dependencies, so this render needs no
-      // archive operation while the cursor owns its package decoder lease.
+      // Visible images may be fetched during the provisional paint. Their
+      // requests use the pull owner's image path while the cursor holds the
+      // package operation, so the render itself must not queue behind that
+      // operation.
       await renderWorksheetViewport(
         {
           ws, styles, cjkFallback: this.cjkFallback, math: this.math,

@@ -3541,6 +3541,9 @@ fn cursor_preview_blocker(
     if !ordered_rows {
         return Ok(Some("unordered-rows"));
     }
+    // Outline levels anywhere on the sheet set the viewer's gutter width and
+    // therefore shift even the first viewport; row bands are not complete
+    // until the terminal model exists.
     if has_row_outline || !worksheet.col_outline_levels.is_empty() {
         return Ok(Some("outline"));
     }
