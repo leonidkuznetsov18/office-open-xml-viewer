@@ -101,6 +101,30 @@ describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
     expect(elapsedMs).toBeLessThan(100);
   });
 
+  it('bounds tab resolution for a densely tabbed negative-tracking paragraph', () => {
+    let measuredCharacters = 0;
+    let tabResolutions = 0;
+    const start = performance.now();
+    const result = breakDrawingMlText([{ type: 'text', text: 'ab\t'.repeat(1067), style: 'same' }], {
+      maxWidth: 9,
+      defaultTabSize: 72,
+      nonMonotoneMeasure: true,
+      tabStartPen() { tabResolutions++; return 0; },
+      measureText(value) {
+        measuredCharacters += value.length;
+        const glyphs = [...value].length;
+        return glyphs * 9 - 1.5 * Math.max(0, glyphs - 1);
+      },
+    });
+    const elapsedMs = performance.now() - start;
+    expect(result.length).toBeGreaterThan(1000);
+    // One pen per line for the fit and one for the closed line's paint width;
+    // re-resolving every candidate prefix would call this per candidate.
+    expect(tabResolutions).toBeLessThanOrEqual(2 * result.length);
+    expect(measuredCharacters).toBeLessThan(100_000);
+    expect(elapsedMs).toBeLessThan(100);
+  });
+
   it('keeps the last fitting prefix past a shaping window under negative tracking', () => {
     // 'a' advances 9px and 'b' 30px with -10px tracking: each 'a' after the
     // first narrows the line, so the 20th-glyph prefix fits after the first

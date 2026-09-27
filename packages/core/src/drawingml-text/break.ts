@@ -291,7 +291,14 @@ export function breakDrawingMlText<T>(
       /** Line width of atoms [0, i) with segments coalesced from atom 0. */
       natural: Float64Array;
       naturalBlockMin: Float64Array;
+      /** min(natural[i..end]): a lower bound for tabbed prefixes (tabs never narrow). */
+      naturalSuffixMin: Float64Array;
+      /** min(tailSum[i..segment end]) for a stop i inside a text segment. */
+      tailSuffixMin: Float64Array;
       tabsBefore: Int32Array;
+      /** Index into gapValues of each tab atom's no-stop gap (`measureText(' ')`). */
+      tabGap: Int32Array;
+      gapValues: number[];
     }
     let model: NonMonotoneModel | null = null;
     const atomText = (from: number, to: number): string => {
@@ -360,12 +367,37 @@ export function breakDrawingMlText<T>(
         tailSum[t + 1] = tailSum[t] + tail[t];
       }
       close(end);
+      const naturalSuffixMin = new Float64Array(end + 1);
+      naturalSuffixMin[end] = natural[end];
+      for (let i = end - 1; i >= 0; i--) naturalSuffixMin[i] = Math.min(natural[i], naturalSuffixMin[i + 1]);
+      const tailSuffixMin = new Float64Array(end + 1).fill(Infinity);
+      for (let i = end; i >= 1; i--) {
+        if (atoms[i - 1].type !== 'text') continue;
+        tailSuffixMin[i] = i === segEnd[i - 1] ? tailSum[i] : Math.min(tailSum[i], tailSuffixMin[i + 1]);
+      }
+      // A tab's no-stop gap only applies without a default grid. The last tab
+      // of a prefix supplies the gap for every tab in it (measureSegments).
+      const tabGap = new Int32Array(end);
+      const gapValues: number[] = [];
+      for (let t = 0; t < end; t++) {
+        const atom = atoms[t];
+        if (atom.type !== 'tab' || (options.defaultTabSize ?? 0) > 0) continue;
+        const gap = options.measureText(' ', atom.style);
+        let index = gapValues.indexOf(gap);
+        if (index < 0) index = gapValues.push(gap) - 1;
+        tabGap[t] = index;
+      }
+      if (gapValues.length === 0) gapValues.push(0);
       return {
         segStart, segEnd, head, tail, tailSum,
         tailBlockMin: blockMins(tailSum),
         natural,
         naturalBlockMin: blockMins(natural),
+        naturalSuffixMin,
+        tailSuffixMin,
         tabsBefore,
+        tabGap,
+        gapValues,
       };
     };
 
@@ -437,17 +469,57 @@ export function breakDrawingMlText<T>(
       return lineStart;
     };
 
-    // Tabs make each prefix's width depend on its stop resolution. Resolve the
-    // cached segment widths per candidate instead of re-measuring text.
-    const tabGaps = new Map<number, number>();
+    // Tabs make each prefix's width depend on its stop resolution. A stop
+    // depends only on the pen before its tab, and only the last tab of a
+    // prefix still depends on the (open) cell after it, so the resolved pen is
+    // carried along the scan instead of re-resolving every candidate. One
+    // state is kept per distinct no-stop gap, because the prefix's last tab
+    // supplies that gap to all of its tabs. Tabs never narrow a line, so the
+    // scan stops once the tab-free width of every later prefix overflows.
     const tabbedNonMonotoneFit = (
       m: NonMonotoneModel, lineStart: number, lineIndex: number, budget: number,
     ): number => {
-      const items: { isTab: boolean; width: number }[] = [];
-      let fit = lineStart;
-      let noStopGap = 0;
+      const startPen = options.tabStartPen?.(lineIndex) ?? (lineIndex === 0 ? options.firstLineIndent ?? 0 : 0);
+      const stops = options.tabStops ?? [];
+      const defaultTab = options.defaultTabSize ?? 0;
+      const gaps = m.gapValues;
+      const states = gaps.length;
+      const closed = new Float64Array(states);
+      const pen = new Float64Array(states).fill(startPen);
+      const tabPen = new Float64Array(states);
+      const stopPos = new Float64Array(states);
+      const fraction = new Float64Array(states);
+      const gapTab = new Uint8Array(states);
+      const cell = new Float64Array(states);
       let hasTab = false;
-      let closedSum = 0;
+      let lastGap = 0;
+      let open = 0;
+      let openIsItem = false;
+
+      const first = atoms[lineStart];
+      const firstEnd = first.type === 'text' ? m.segEnd[lineStart] : lineStart + 1;
+      const firstWidth = first.type === 'text' ? firstSegmentWidth(m, lineStart, firstEnd)
+        : first.type === 'object' ? first.width : 0;
+      const next = atoms[firstEnd];
+      const seam = firstEnd < end && first.type === 'text' && next.type === 'text' && options.boundaryAdvance
+        ? options.boundaryAdvance(first.style, next.style)
+          - options.boundaryAdvance(atoms[m.segStart[lineStart]].style, next.style)
+        : 0;
+      const restOffset = firstWidth + seam - m.natural[firstEnd];
+      const headStop = lineStart + SHAPING_CONTEXT + 1;
+      const tailOffset = first.type === 'text' && firstEnd > headStop
+        ? firstSegmentWidth(m, lineStart, headStop) - m.tailSum[headStop] : 0;
+      const prunable = gaps.every((gap) => gap >= 0);
+      const slack = 1e-9 * Math.max(1, Math.abs(budget));
+      const noLaterFit = (i: number): boolean => {
+        if (!prunable || i < headStop && i < firstEnd) return false;
+        let bound = Infinity;
+        if (i < firstEnd) bound = tailOffset + m.tailSuffixMin[i + 1];
+        if (firstEnd < end) bound = Math.min(bound, restOffset + m.naturalSuffixMin[Math.max(i + 1, firstEnd + 1)]);
+        return bound > budget + slack;
+      };
+
+      let fit = lineStart;
       let segFirst = -1;
       let boundary: number | null = null;
       for (let i = lineStart + 1; i <= end; i++) {
@@ -455,43 +527,76 @@ export function breakDrawingMlText<T>(
         const atom = atoms[index];
         if (atom.type === 'text' && segFirst >= 0 && m.segStart[index] === m.segStart[index - 1]) {
           const text = firstSegmentWidthFrom(m, segFirst, lineStart, i);
-          items[items.length - 1].width = boundary === null ? text : text + boundary;
+          open = boundary === null ? text : text + boundary;
         } else {
-          if (items.length > 0) closedSum += items[items.length - 1].width;
-          if (atom.type === 'text') {
+          if (openIsItem) {
+            for (let g = 0; g < states; g++) {
+              if (hasTab) cell[g] += open;
+              else { closed[g] += open; pen[g] += open; }
+            }
+          }
+          if (atom.type === 'tab') {
+            for (let g = 0; g < states; g++) {
+              if (hasTab) {
+                // The previous tab's cell is now complete.
+                const followingWidth = cell[g];
+                let target = tabPen[g] + gaps[g];
+                if (!gapTab[g]) {
+                  target = stopPos[g] - followingWidth * fraction[g];
+                  if (target < tabPen[g]) target = tabPen[g];
+                }
+                closed[g] += target - tabPen[g] + followingWidth;
+                pen[g] = target + followingWidth;
+              }
+              tabPen[g] = pen[g];
+              let stop: DrawingMlTabStop | null = null;
+              for (const candidate of stops) {
+                if (candidate.pos > pen[g] && (stop === null || candidate.pos < stop.pos)) stop = candidate;
+              }
+              if (stop === null && defaultTab > 0) {
+                stop = { pos: (Math.floor(pen[g] / defaultTab) + 1) * defaultTab, algn: 'l' };
+              }
+              gapTab[g] = stop === null ? 1 : 0;
+              stopPos[g] = stop?.pos ?? 0;
+              fraction[g] = stop?.algn === 'ctr' ? 0.5 : stop?.algn === 'r' || stop?.algn === 'dec' ? 1 : 0;
+              cell[g] = 0;
+            }
+            hasTab = true;
+            lastGap = m.tabGap[index];
+            segFirst = -1;
+            open = 0;
+            openIsItem = false;
+          } else if (atom.type === 'text') {
             const previous = segFirst >= 0 ? atoms[segFirst] : undefined;
             boundary = previous?.type === 'text' ? options.boundaryAdvance?.(previous.style, atom.style) ?? 0 : null;
             segFirst = index;
             const text = firstSegmentWidthFrom(m, segFirst, lineStart, i);
-            items.push({ isTab: false, width: boundary === null ? text : text + boundary });
+            open = boundary === null ? text : text + boundary;
+            openIsItem = true;
           } else {
             segFirst = -1;
-            if (atom.type === 'tab') {
-              hasTab = true;
-              let gap = tabGaps.get(index);
-              if (gap === undefined) {
-                gap = options.measureText(' ', atom.style);
-                tabGaps.set(index, gap);
-              }
-              noStopGap = gap;
-              items.push({ isTab: true, width: 0 });
-            } else {
-              items.push({ isTab: false, width: atom.width });
-            }
+            open = atom.width;
+            openIsItem = true;
           }
         }
-        const width = hasTab
-          ? resolveDrawingMlTabWidths(
-            items,
-            options.tabStops ?? [],
-            options.tabStartPen?.(lineIndex) ?? (lineIndex === 0 ? options.firstLineIndent ?? 0 : 0),
-            Infinity,
-            noStopGap,
-            options.defaultTabSize ?? 0,
-          ).reduce((sum, value) => sum + value, 0)
-          : closedSum + items[items.length - 1].width;
-        if (i === end && width <= budget) return end;
-        if (i < end && width <= budget) fit = i;
+        let width: number;
+        if (!hasTab) {
+          width = closed[lastGap] + open;
+        } else {
+          const followingWidth = cell[lastGap] + open;
+          let tabWidth = gaps[lastGap];
+          if (!gapTab[lastGap]) {
+            let target = stopPos[lastGap] - followingWidth * fraction[lastGap];
+            if (target < tabPen[lastGap]) target = tabPen[lastGap];
+            tabWidth = target - tabPen[lastGap];
+          }
+          width = closed[lastGap] + tabWidth + followingWidth;
+        }
+        if (width <= budget) {
+          if (i === end) return end;
+          fit = i;
+        }
+        if (i < end && noLaterFit(i)) break;
       }
       return fit;
     };
