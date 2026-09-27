@@ -1,13 +1,13 @@
+import { isWasmTrap, type WasmParserHost } from '@silurus/ooxml-core';
 import {
+  copyModelSourceBytes,
   hasModelSourceCapability,
-  isWasmTrap,
   openModelSourceModule,
   requireModelSourceArchiveMethods,
   unsupportedModelSourceCapability,
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
-  type WasmParserHost,
-} from '@silurus/ooxml-core';
+} from '@silurus/ooxml-core/internal/model-source';
 import type { DocxDocumentCursorArchive } from '../document-pull-worker.js';
 
 export interface WorkerDocumentArchive extends DocxDocumentCursorArchive {
@@ -92,6 +92,14 @@ interface OwnedModelSource {
 export class WorkerDocumentSourceOwner<TArchive extends OoxmlWorkerDocumentArchive> {
   private modelSource: OwnedModelSource | undefined;
   private pending: object | undefined;
+
+  copyBytes(value: Uint8Array): ArrayBuffer {
+    return copyModelSourceBytes(value);
+  }
+
+  extractImage(path: string): ArrayBuffer {
+    return this.execute((archive) => this.copyBytes(archive.extract_image(path)));
+  }
 
   constructor(
     private readonly ooxmlHost: WasmParserHost<TArchive>,

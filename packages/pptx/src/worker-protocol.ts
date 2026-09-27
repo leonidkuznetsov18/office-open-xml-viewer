@@ -53,6 +53,7 @@ export type PptxWorkerRequest =
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       /** Resolved regional Han fallback. PPTX derives its font-preload set from
        *  the preflight built inside this worker, so the region Window resolved
@@ -101,6 +102,7 @@ export type RenderWorkerRequest =
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       useGoogleFonts?: boolean;
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;

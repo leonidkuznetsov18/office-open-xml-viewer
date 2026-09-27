@@ -36,6 +36,9 @@ export default defineConfig({
         // Keep core subpaths ahead of the package-root prefix alias; otherwise
         // Vite appends them to the root entry file (for example,
         // `src/index.ts/internal/resource-measurement`).
+        '@silurus/ooxml-core/internal/model-source': fileURLToPath(
+          new URL('../packages/core/src/source/model-source.ts', import.meta.url),
+        ),
         '@silurus/ooxml-core/internal/resource-measurement': fileURLToPath(
           new URL('../packages/core/src/internal/resource-measurement.ts', import.meta.url),
         ),

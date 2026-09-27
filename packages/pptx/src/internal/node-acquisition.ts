@@ -9,23 +9,28 @@ import {
   type WasmArchiveHandle,
   type WasmModuleRuntime,
 } from '@silurus/ooxml-core/internal/wasm-runtime-generation';
-import {
-  acquirePptxSessionFromArchive,
-  type PptxNodeAcquisition,
-  type PptxNodeAcquisitionOptions,
-  type PptxNodeArchive,
-} from './node-session-acquisition.js';
+import { normalizePresentationBootstrap } from '../presentation-preflight.js';
+import type { PptxSlideCursorArchive } from '../slide-cursor-operation.js';
+import type { PresentationBootstrap } from '../worker-protocol.js';
 // @ts-ignore wasm-pack generated module has no declaration entry
 import * as pptxWasm from '../wasm/pptx_parser.js';
 
-export {
-  acquirePptxSessionFromArchive,
-  type PptxNodeAcquisition,
-  type PptxNodeAcquisitionOptions,
-  type PptxNodeArchive,
-  type PptxNodeSessionArchive,
-  type PptxOwnedArchiveSource,
-} from './node-session-acquisition.js';
+export interface PptxNodeAcquisitionOptions {
+  readonly resourceLimits?: import('@silurus/ooxml-core').OoxmlResourceLimits;
+  readonly maxZipEntryBytes?: number;
+  readonly debug?: boolean;
+  readonly onResourceMetrics?: (metrics: import('@silurus/ooxml-core').OoxmlResourceMetrics) => void;
+  readonly signal?: AbortSignal;
+}
+
+export interface PptxNodeArchive extends PptxSlideCursorArchive {
+  free(): void;
+  assert_healthy(): void;
+  presentation_bootstrap(): Uint8Array;
+  resource_usage(): Uint8Array;
+  extract_image(path: string): Uint8Array;
+  extract_media(path: string): Uint8Array;
+}
 
 interface PptxArchiveConstructor {
   new (
@@ -52,6 +57,13 @@ function formatRuntime(module: WebAssembly.Module): WasmRuntimeGenerationHost<Pp
   return runtimeHost;
 }
 
+export interface PptxNodeAcquisition {
+  readonly archive: PptxNodeArchive;
+  readonly bootstrap: PresentationBootstrap;
+  readonly metrics: OoxmlResourceMetricsSession;
+  closeArchive(): void;
+}
+
 /** Format-owned archive acquisition and bootstrap projection for Node. */
 export async function acquirePptxNodeSession(
   bytes: Uint8Array,
@@ -70,7 +82,6 @@ export async function acquirePptxNodeSession(
   });
   metrics.setSourceBytes(bytes.byteLength);
   let handle: WasmArchiveHandle<PptxNodeArchive> | undefined;
-  let admissionOwnsFailure = false;
   try {
     throwIfAborted(options.signal);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
@@ -85,16 +96,20 @@ export async function acquirePptxNodeSession(
     );
     throwIfAborted(options.signal);
     const archive = handle.proxy;
-    admissionOwnsFailure = true;
-    return acquirePptxSessionFromArchive({
+    const bootstrap = normalizePresentationBootstrap(JSON.parse(
+      new TextDecoder().decode(archive.presentation_bootstrap()),
+    ) as PresentationBootstrap);
+    metrics.checkpoint('presentation bootstrap ready');
+    return {
       archive,
-      sourceByteLength: bytes.byteLength,
+      bootstrap,
+      metrics,
       closeArchive: () => handle?.close((current: PptxNodeArchive) => current.free()),
-    }, options, metrics);
+    };
   } catch (error) {
     try { handle?.close((archive: PptxNodeArchive) => archive.free()); } catch {}
     const normalized = parseTypedParserError(error) ?? error;
-    if (!admissionOwnsFailure) metrics.fail(normalized);
+    metrics.fail(normalized);
     throw normalized;
   }
 }

@@ -11,7 +11,6 @@ import {
 // internal entry point rather than reconstructing XLSX orchestration here.
 import {
   acquireXlsxNodeSession,
-  acquireXlsxSessionFromArchive,
   GridGeometry,
   addWorksheetCacheUsage,
   addWorksheetUsage,
@@ -22,9 +21,6 @@ import {
   measureRows,
   XlsxWorksheetPullClient,
   WorksheetPullWorker,
-  configureHostLayout,
-  validateXlsxModelSourceArchive,
-  validateXlsxModelSourceViewDefaults,
   type WorksheetCacheUsage,
   type WorksheetModelUsage,
   type XlsxNodeSessionArchive,
@@ -34,7 +30,7 @@ import type { OoxmlNodeSessionOptions } from './session-options.ts';
 import type { NodeCanvasFactory } from './render.ts';
 import { createLazyWasmModule, resolveWasm } from './wasm-loader.ts';
 import { usingOwnedSession } from '@silurus/ooxml-core/internal/owned-session';
-import { resolveNodeSessionInput } from './model-source.ts';
+import type { acquireXlsxSessionFromArchive } from '@silurus/ooxml-xlsx/internal/model-source-session';
 
 const getXlsxWasmModule = createLazyWasmModule(() => resolveWasm(
     import.meta.url,
@@ -114,6 +110,15 @@ export async function openXlsxWorkbook(
       acquired.metrics, acquired.usage, options.signal,
     );
   }
+  const [{ resolveNodeSessionInput }, {
+    acquireXlsxSessionFromArchive: acquireSourceArchive,
+    configureHostLayout,
+    validateXlsxModelSourceArchive,
+    validateXlsxModelSourceViewDefaults,
+  }] = await Promise.all([
+    import('./model-source.ts'),
+    import('@silurus/ooxml-xlsx/internal/model-source-session'),
+  ]);
   const input = await resolveNodeSessionInput(
     buffer,
     'xlsx',
@@ -141,7 +146,7 @@ export async function openXlsxWorkbook(
       try { opened.close(); } catch {}
       throw error;
     }
-    acquired = acquireXlsxSessionFromArchive({
+    acquired = acquireSourceArchive({
       archive: opened.archive,
       sourceByteLength: input.sourceByteLength,
       ...(maximumDigitWidth === undefined ? {} : { layoutMetrics: { maximumDigitWidth } }),

@@ -48,7 +48,10 @@ describe('VS Code webview math engine bundle', () => {
       plugins: [mainThreadOnlyWorkerStubs],
     });
 
-    expect(result.warnings).toEqual([]);
+    // The optional model-source sidecars use import.meta.url only when a
+    // source is selected. This IIFE webview never selects one; esbuild still
+    // warns when it scans the source-only URL construction.
+    expect(result.warnings.filter((warning) => warning.id !== 'empty-import-meta')).toEqual([]);
     const bundle = result.outputFiles.find((file) => file.path.endsWith('/bootstrap.js'))?.text
       ?? result.outputFiles.find((file) => file.path.endsWith('.js'))?.text
       ?? '';

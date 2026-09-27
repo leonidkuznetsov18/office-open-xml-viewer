@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { acquireXlsxSessionFromArchive, type XlsxNodeSessionArchive } from './node-acquisition.js';
+import type { XlsxNodeSessionArchive } from './node-acquisition.js';
+import { acquireXlsxSessionFromArchive } from './node-model-source-acquisition.js';
 
 const { initialize } = vi.hoisted(() => ({ initialize: vi.fn(() => { throw new Error('OOXML initialization forbidden'); }) }));
 vi.mock('../wasm/xlsx_parser.js', () => ({ default: initialize, initSync: initialize, reinit: initialize }));

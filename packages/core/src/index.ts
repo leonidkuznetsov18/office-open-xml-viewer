@@ -128,26 +128,19 @@ export { assertNotCfbContainer, resolveOoxmlContainer, toArrayBuffer } from './e
 // Application-supplied model sources (LoadOptions.modelSources): a
 // format-generic contract for opening non-OOXML input into a renderer's own
 // model archive. Core and the format packages never name a concrete source.
-export {
-  MODEL_SOURCE_MODULE_PROTOCOL,
-  beginModelSourceLoad,
-  copyModelSourceBytes,
-  hasModelSourceCapability,
-  openModelSourceModule,
-  requireModelSourceArchiveMethods,
-  selectModelSource,
-  unsupportedModelSourceCapability,
-  validateModelSourceModuleDescriptor,
-  type AdmittedModelSourceLoad,
-  type ModelSource,
-  type ModelSourceConfig,
-  type ModelSourceConfigValue,
-  type ModelSourceLoad,
-  type ModelSourceModule,
-  type ModelSourceModuleDescriptor,
-  type ModelSourceTarget,
-  type OpenedModelSource,
-  type OpenedModelSourceModule,
+// A type-only root export keeps the optional source runtime out of every
+// ordinary OOXML entry. Selected sources load it through the internal subpath.
+export type {
+  AdmittedModelSourceLoad,
+  ModelSource,
+  ModelSourceConfig,
+  ModelSourceConfigValue,
+  ModelSourceLoad,
+  ModelSourceModule,
+  ModelSourceModuleDescriptor,
+  ModelSourceTarget,
+  OpenedModelSource,
+  OpenedModelSourceModule,
 } from './source/model-source';
 // Agile Encryption decryption ([MS-OFFCRYPTO]): `decryptOoxml` turns an
 // encrypted CFB + password into plaintext ZIP bytes. Lower-level primitives

@@ -13,7 +13,6 @@ import { xlsxCjkFallback } from './google-fonts.js';
  */
 import init, { XlsxArchive, reinit } from './wasm/xlsx_parser.js';
 import {
-  copyModelSourceBytes,
   decodeDataUrl,
   preloadGoogleFonts,
   loadOfficeFontFallbacks,
@@ -51,7 +50,7 @@ import {
 } from './worksheet-resource-limits.js';
 import type { ParsedWorkbook, Worksheet } from './types.js';
 import { WorksheetViewProjectionCache } from './worker-protocol.js';
-import { readXlsxArchiveBootstrap } from './internal/archive-bootstrap.js';
+import { readXlsxArchiveBootstrap, type XlsxArchiveBootstrap } from './internal/archive-bootstrap.js';
 import type { RenderWorkerRequest, RenderWorkerResponse } from './worker-protocol.js';
 import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-worker.js';
 import type { WorkerWorksheetSourceOwner, WorkerWorksheetArchive } from './internal/worker-worksheet-source.js';
@@ -287,14 +286,17 @@ self.onmessage = async (e: MessageEvent<
       archiveBacked = true;
       source?.closeModelSource();
       source = undefined;
+      let bootstrap: XlsxArchiveBootstrap<ParsedWorkbook>;
       if (req.source) {
         host.disposeArchive();
-        const { WorkerWorksheetSourceOwner } = await import('./internal/worker-worksheet-source.js');
-        source = new WorkerWorksheetSourceOwner(host);
+        if (!req.sourceOwnerUrl) throw new TypeError('XLSX source owner URL is missing');
+        const { WorkerWorksheetSourceOwner } = await import(/* @vite-ignore */ req.sourceOwnerUrl) as typeof import('./internal/worker-worksheet-source.js');
+        const owner = new WorkerWorksheetSourceOwner(host);
+        source = owner;
         // This worker owns the renderer, so it measures the model source's
         // Normal font with the same computeMdw that sizes the painted grid.
         const { computeMdw } = await rendererModule;
-        await source.openModelSource(
+        await owner.openModelSource(
           new Uint8Array(req.data),
           req.source,
           (font) => computeMdw(
@@ -307,26 +309,27 @@ self.onmessage = async (e: MessageEvent<
           ),
           req.sourceTransfer,
         );
+        bootstrap = readXlsxArchiveBootstrap(
+          () => JSON.parse(new TextDecoder().decode(
+            owner.execute((archive) => archive.parse()),
+          )) as ParsedWorkbook,
+          () => owner.resourceUsage(),
+        );
       } else {
         const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
-        host.run(() => {
-          const archive = new XlsxArchive(
-            new Uint8Array(req.data), maxEntry, maxTotal, maxEntries,
-          );
-          host.setArchive(archive);
-        });
+        // Keep construction and parse in the same host.run as the ordinary
+        // OOXML worker on main. Both operations share one trap boundary.
+        bootstrap = readXlsxArchiveBootstrap(
+          () => host.run(() => {
+            const archive = new XlsxArchive(
+              new Uint8Array(req.data), maxEntry, maxTotal, maxEntries,
+            );
+            host.setArchive(archive);
+            return JSON.parse(new TextDecoder().decode(archive.parse())) as ParsedWorkbook;
+          }),
+          () => host.run(() => host.archive!.resource_usage()),
+        );
       }
-      // Construction + `parse()` run under `host.run` so a trap in EITHER poisons
-      // + recycles the instance (and frees the archive). `setArchive` frees any
-      // prior handle first — the re-parse dispose. `parse()` returns UTF-8 JSON
-      // bytes (Result<Vec<u8>, JsValue>); decode + parse the workbook index here
-      // (consumed in-worker, then a light copy is sent to the proxy as an object).
-      const bootstrap = readXlsxArchiveBootstrap(
-        () => JSON.parse(new TextDecoder().decode(
-          executeArchive((archive) => archive.parse()),
-        )) as ParsedWorkbook,
-        () => sourceUsage(),
-      );
       workbook = bootstrap.workbook;
       const maximumDigitWidth = source?.maximumDigitWidth;
       if (maximumDigitWidth !== undefined) workbook.layoutMetrics = { maximumDigitWidth };
@@ -409,7 +412,7 @@ self.onmessage = async (e: MessageEvent<
       // wasm-bindgen returns an owned full-span Uint8Array; transfer its
       // standalone buffer directly, matching the parse worker contract.
       const bytes = executeArchive((current) => source
-        ? copyModelSourceBytes(current.extract_image(req.path))
+        ? source.copyBytes(current.extract_image(req.path))
         : current.extract_image(req.path).buffer as ArrayBuffer);
       post({ type: 'imageExtracted', id, bytes }, [bytes]);
       return;

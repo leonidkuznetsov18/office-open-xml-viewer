@@ -1,13 +1,13 @@
+import { isWasmTrap, type WasmParserHost } from '@silurus/ooxml-core';
 import {
+  copyModelSourceBytes,
   hasModelSourceCapability,
-  isWasmTrap,
   openModelSourceModule,
   requireModelSourceArchiveMethods,
   unsupportedModelSourceCapability,
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
-  type WasmParserHost,
-} from '@silurus/ooxml-core';
+} from '@silurus/ooxml-core/internal/model-source';
 import type { PptxSlideCursorArchive } from '../slide-cursor-operation.js';
 
 export interface WorkerCursorArchive extends PptxSlideCursorArchive {
@@ -77,6 +77,14 @@ interface OwnedModelSource {
 /** Owns exactly one worker-local presentation archive: PPTX parser or model source. */
 export class WorkerPresentationSourceOwner<TArchive extends OoxmlWorkerArchive> {
   private modelSource: OwnedModelSource | undefined;
+
+  copyBytes(value: Uint8Array): ArrayBuffer {
+    return copyModelSourceBytes(value);
+  }
+
+  extractImage(path: string): ArrayBuffer {
+    return this.execute((archive) => this.copyBytes(archive.extract_image(path)));
+  }
 
   constructor(
     private readonly ooxmlHost: WasmParserHost<TArchive>,

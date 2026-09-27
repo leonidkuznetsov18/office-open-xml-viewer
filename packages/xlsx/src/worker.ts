@@ -1,6 +1,5 @@
 import init, { XlsxArchive, reinit } from './wasm/xlsx_parser.js';
 import {
-  copyModelSourceBytes,
   decodeDataUrl,
   WasmParserHost,
 } from '@silurus/ooxml-core';
@@ -14,7 +13,6 @@ import type { WorkerRequest, WorkerResponse } from './types.js';
 import { readXlsxArchiveBootstrap } from './internal/archive-bootstrap.js';
 import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-worker.js';
 import type { WorkerWorksheetSourceOwner } from './internal/worker-worksheet-source.js';
-import { isHostLayoutResult, requestHostLayoutFromPage } from './internal/host-layout.js';
 
 // RB6: a `panic = "abort"` build traps (not unwinds) on a Rust panic / OOM /
 // stack overflow, poisoning this worker's single WASM instance so every LATER
@@ -57,7 +55,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
 
   // A model source's host-layout reply is consumed by its own listener
   // (requestHostLayoutFromPage) and never enters the request-id dispatcher.
-  if (isHostLayoutResult(req)) return;
+  if (source?.isHostLayoutResult(req)) return;
 
   if (isWorksheetPullCommand(req)) {
     await worksheetPull.dispatchSafely(req, (response, transfer) =>
@@ -110,13 +108,15 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       source = undefined;
       if (req.source) {
         host.disposeArchive();
-        const { WorkerWorksheetSourceOwner } = await import('./internal/worker-worksheet-source.js');
-        source = new WorkerWorksheetSourceOwner(host);
+        if (!req.sourceOwnerUrl) throw new TypeError('XLSX source owner URL is missing');
+        const { WorkerWorksheetSourceOwner } = await import(/* @vite-ignore */ req.sourceOwnerUrl) as typeof import('./internal/worker-worksheet-source.js');
+        const owner = new WorkerWorksheetSourceOwner(host);
+        source = owner;
         // The renderer lives on the page in this mode, so the page measures.
-        await source.openModelSource(
+        await owner.openModelSource(
           new Uint8Array(req.data),
           req.source,
-          (font) => requestHostLayoutFromPage(self as unknown as Parameters<typeof requestHostLayoutFromPage>[0], font),
+          (font) => owner.requestHostLayoutFromPage(self as unknown as Parameters<typeof owner.requestHostLayoutFromPage>[0], font),
           req.sourceTransfer,
         );
       } else {
@@ -144,7 +144,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
           : host.run(() => host.archive!.resource_usage()),
       );
       const workbookJson = source
-        ? copyModelSourceBytes(json)
+        ? source.copyBytes(json)
         : json.buffer as ArrayBuffer;
       const maximumDigitWidth = source?.maximumDigitWidth;
       const res: WorkerResponse = {
@@ -167,7 +167,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       // transfer it directly. A second `new Uint8Array(bytes).slice()` would just
       // re-copy the whole entry for nothing.
       const out = source
-        ? source.execute((current) => copyModelSourceBytes(current.extract_image(req.path)))
+        ? source.extractImage(req.path)
         : host.run(() => archive.extract_image(req.path).buffer as ArrayBuffer);
       const res: WorkerResponse = { type: 'imageExtracted', id, bytes: out };
       (self.postMessage as (message: unknown, transfer: Transferable[]) => void)(res, [out]);

@@ -25,16 +25,8 @@ export {
 } from '../worksheet-resource-limits.js';
 export {
   acquireXlsxNodeSession,
-  acquireXlsxSessionFromArchive,
   type XlsxNodeAcquisition,
   type XlsxNodeAcquisitionOptions,
   type XlsxNodeArchive,
   type XlsxNodeSessionArchive,
-  type XlsxOwnedArchiveSource,
 } from './node-acquisition.js';
-export {
-  validateXlsxModelSourceArchive,
-  validateXlsxModelSourceViewDefaults,
-  type XlsxModelSourceArchive,
-} from './worker-worksheet-source.js';
-export { configureHostLayout, type HostLayoutFont } from './host-layout.js';

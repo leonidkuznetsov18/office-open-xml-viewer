@@ -65,6 +65,9 @@ vi.mock('./wasm/pptx_parser.js', () => ({
 }));
 vi.mock('@silurus/ooxml-core', async (load) => ({
   ...await load<typeof import('@silurus/ooxml-core')>(),
+}));
+vi.mock('@silurus/ooxml-core/internal/model-source', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core/internal/model-source')>(),
   openModelSourceModule: (...args: unknown[]) => openSourceMock(...args),
 }));
 
@@ -136,7 +139,7 @@ describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
     openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close: vi.fn() });
     const fake = await loadWorker();
     fake.onmessage?.({ data: {
-      kind: 'parse', id: 40, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource,
+      kind: 'parse', id: 40, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
     } } as MessageEvent);
     await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationOpened', id: 40 })));
     for (const [kind, response, id, expected] of [
@@ -156,7 +159,7 @@ describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
     openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close });
     const fake = await loadWorker();
     fake.onmessage?.({ data: {
-      kind: 'parse', id: 30, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource,
+      kind: 'parse', id: 30, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
     } } as MessageEvent);
     await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
       kind: 'presentationOpened', id: 30,
@@ -192,7 +195,7 @@ describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
     openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close });
     const fake = await loadWorker();
     fake.onmessage?.({ data: {
-      kind: 'parse', id: 33, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource,
+      kind: 'parse', id: 33, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
     } } as MessageEvent);
     await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
       kind: 'error', id: 33, message: expect.stringContaining('bootstrap trap'),

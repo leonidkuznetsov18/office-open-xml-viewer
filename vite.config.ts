@@ -76,11 +76,29 @@ export function wasmAssetUrl(): Plugin {
       // asset URLs for CJS. Restore the Node entry's own file URL for static
       // sidecars; otherwise importing the CJS package throws immediately.
       const restored = code.replace(
-        /new URL\((["'`])([^"'`]+\.(?:wasm|ttf))\1,\s*\{\}\.url\)\.href/g,
+        /new URL\((["'`])([^"'`]+\.(?:wasm|ttf|mjs))\1,\s*\{\}\.url\)\.href/g,
         (_match, _quote, file) =>
           `new URL(${JSON.stringify(file)}, require('node:url').pathToFileURL(__filename)).href`,
       );
       return restored === code ? null : { code: restored, map: null };
+    },
+  };
+}
+
+/** Resolve the emitted chunk graph, including aliases, before publishing. */
+export function legacyBundleBoundary(): Plugin {
+  return {
+    name: 'legacy-bundle-boundary',
+    generateBundle(_options, bundle) {
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (output.type !== 'chunk') continue;
+        for (const moduleId of Object.keys(output.modules)) {
+          if (/(?:^|[\\/])packages[\\/]legacy-converter(?:[\\/]|$)/.test(moduleId)
+            || moduleId.includes('@silurus/ooxml-legacy-converter')) {
+            this.error(`${fileName} contains forbidden legacy module ${moduleId}`);
+          }
+        }
+      }
     },
   };
 }
@@ -94,6 +112,7 @@ export default defineConfig(({ command, mode }) => ({
   plugins: [
     wasmAssetUrl(),
     wasm(),
+    legacyBundleBoundary(),
     // Storybook loads the root Vite config in serve mode. The declaration
     // plugins are build-only: their Rolldown buildStart hooks expect library
     // inputs and fail against Storybook's dev-server graph.
@@ -163,7 +182,7 @@ export default defineConfig(({ command, mode }) => ({
     // Built-in worker renderers lazy-import the same optional math engine. Keep
     // its ~3 MB `?url` asset external in nested worker builds too; otherwise
     // library mode base64-inlines one copy into every format worker chunk.
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
       output: {
         assetFileNames: '[name][extname]',

@@ -11,7 +11,6 @@ import { PptxSlideRepository } from './slide-repository';
 import { loadPptxSlideFromCursor, readPptxSlideCursorUsage } from './slide-cursor-operation';
 import { SlidePullWorker } from './slide-pull-worker';
 import {
-  copyModelSourceBytes,
   preloadGoogleFonts,
   loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
@@ -306,7 +305,8 @@ function executeArchiveFromNew(
   if (request.source) {
     const descriptor = request.source;
     return (async () => {
-      const { WorkerPresentationSourceOwner } = await import('./internal/worker-presentation-source');
+      if (!request.sourceOwnerUrl) throw new TypeError('PPTX source owner URL is missing');
+      const { WorkerPresentationSourceOwner } = await import(/* @vite-ignore */ request.sourceOwnerUrl) as typeof import('./internal/worker-presentation-source.js');
       source = new WorkerPresentationSourceOwner(host);
       await source.openModelSource(new Uint8Array(request.buffer), descriptor, request.sourceTransfer);
       return JSON.parse(new TextDecoder().decode(
@@ -470,7 +470,7 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
     if (request.kind === 'extractFont') {
       const font = await getFontBytes(request.path);
       const bytes = source
-        ? copyModelSourceBytes(font)
+        ? source.copyBytes(font)
         : font.buffer as ArrayBuffer;
       post({ kind: 'fontExtracted', id: request.id, bytes }, [bytes]);
       return;

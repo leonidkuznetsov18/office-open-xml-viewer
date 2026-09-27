@@ -1247,6 +1247,7 @@ export type WorkerRequest =
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
     }
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } &
       PullSessionIdentity<number>)

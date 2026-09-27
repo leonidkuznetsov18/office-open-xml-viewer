@@ -1,4 +1,4 @@
-import { resolveCjkFallback, unsupportedModelSourceCapability, type CjkFallback, type CjkLang } from '@silurus/ooxml-core';
+import { resolveCjkFallback, type CjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import {
   dropDecodedBitmapCache,
   dropSvgImageCache,
@@ -20,20 +20,16 @@ import { usingOwnedSession } from '@silurus/ooxml-core/internal/owned-session';
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 import {
   acquirePptxNodeSession,
-  acquirePptxSessionFromArchive,
-  validatePptxModelSourceArchive,
-  validatePptxModelSourceViewDefaults,
   PptxSlidePullClient,
   readPptxSlideCursorUsage,
   SlidePullWorker,
   type PresentationBootstrap,
-  type PptxNodeSessionArchive as PptxNodeArchive,
 } from '@silurus/ooxml-pptx/internal/session';
+import type { PptxNodeSessionArchive as PptxNodeArchive, acquirePptxSessionFromArchive } from '@silurus/ooxml-pptx/internal/model-source-session';
 import { InProcessPullTransport } from '@silurus/ooxml-core/internal/in-process-pull-transport';
 import type { OoxmlNodeSessionOptions } from './session-options.ts';
 import type { NodeCanvasFactory, NodeCanvasLike } from './render.ts';
 import { createLazyWasmModule, resolveWasm } from './wasm-loader.ts';
-import { resolveNodeSessionInput } from './model-source.ts';
 
 const getPptxWasmModule = createLazyWasmModule(() => resolveWasm(
     import.meta.url,
@@ -98,6 +94,14 @@ async function openPptxPresentationImpl(
       acquired.metrics, options.signal, cjkFallback,
     );
   }
+  const [{ resolveNodeSessionInput }, {
+    acquirePptxSessionFromArchive: acquireSourceArchive,
+    validatePptxModelSourceArchive,
+    validatePptxModelSourceViewDefaults,
+  }] = await Promise.all([
+    import('./model-source.ts'),
+    import('@silurus/ooxml-pptx/internal/model-source-session'),
+  ]);
   const input = await resolveNodeSessionInput(
     buffer,
     'pptx',
@@ -114,7 +118,7 @@ async function openPptxPresentationImpl(
       try { input.opened.close(); } catch {}
       throw error;
     }
-    acquired = acquirePptxSessionFromArchive({
+    acquired = acquireSourceArchive({
       archive: input.opened.archive,
       sourceByteLength: input.sourceByteLength,
       closeArchive: input.opened.close,
@@ -377,7 +381,7 @@ export async function materializePptxPresentation(
 
 /** Media reads are an optional model-source capability. */
 function extractMedia(archive: PptxNodeArchive, path: string): Uint8Array {
-  if (!archive.extract_media) throw unsupportedModelSourceCapability('media extraction');
+  if (!archive.extract_media) throw new Error('media extraction is unsupported for this source');
   return archive.extract_media(path);
 }
 

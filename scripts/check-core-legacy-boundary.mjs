@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import nodePath from 'node:path';
 import { parse } from '@babel/parser';
+import ts from 'typescript-compiler-api';
 
 export const GUARDED_ROOTS = [
   'packages/core/',
@@ -50,7 +51,81 @@ export const RULES = [
   { id: 'docx-lang-default', pattern: /langDefault|lang_default/ },
 ];
 
-export function findViolations(files) {
+// The only computed imports in production source are the six worker-realm
+// sidecars. The main thread supplies these absolute URLs after it selects a
+// model source; document bytes cannot choose them. Keep this list exact so a
+// new computed import or require cannot evade module resolution.
+export const ALLOWED_COMPUTED_IMPORTS = new Map([
+  ['packages/core/src/math/engine-runtime.ts', ['src']],
+  ['packages/core/src/source/model-source.ts', ['module.moduleUrl']],
+  ['packages/docx/src/worker.ts', ['req.sourceOwnerUrl']],
+  ['packages/docx/src/render-worker.ts', ['req.sourceOwnerUrl']],
+  ['packages/xlsx/src/worker.ts', ['req.sourceOwnerUrl']],
+  ['packages/xlsx/src/render-worker.ts', ['req.sourceOwnerUrl']],
+  ['packages/pptx/src/worker.ts', ['request.sourceOwnerUrl']],
+  ['packages/pptx/src/render-worker.ts', ['request.sourceOwnerUrl']],
+  // Local benchmark CLIs load the caller-specified build they are measuring.
+  ['packages/node/src/bench-handle.mjs', ['jsPath']],
+  ['packages/node/src/bench-parse.mjs', ['resolve(HERE, relJs)']],
+  // Tests load a selected fixture or module after setting up mocks. These
+  // files are never package entries, but the allowance is still path/expression
+  // specific so a new computed import is reviewed.
+  ['packages/core/src/source/model-source.test.ts', ['url']],
+  ['packages/node/src/docx-find-highlight.test.ts', ['FIND_PATH', 'HIGHLIGHT_PATH']],
+  ['packages/node/src/docx-vertical-tr-ink-overlap.probe.test.ts', ['PLAYWRIGHT', 'ESBUILD']],
+  ['packages/node/src/pptx-find-highlight.test.ts', ['RENDERER_PATH', 'FIND_PATH', 'HIGHLIGHT_PATH']],
+  ['packages/node/src/verify-chart-regressions.probe.test.ts', ['CORE_RENDERER']],
+  ['packages/node/src/xlsx-blip-duotone-alpha.probe.test.ts', ['ORCH_PATH']],
+  ['packages/node/src/xlsx-border-crisp.probe.test.ts', ['ORCH_PATH']],
+  ['packages/node/src/xlsx-find.test.ts', ['FIND_PATH', 'NUMFMT_PATH']],
+  ['packages/node/src/xlsx-merge-border-zorder.probe.test.ts', ['ORCH_PATH']],
+]);
+
+function expressionName(node) {
+  if (node?.type === 'Identifier') return node.name;
+  if (node?.type === 'MemberExpression' && !node.computed && node.property.type === 'Identifier') {
+    const owner = expressionName(node.object);
+    return owner && `${owner}.${node.property.name}`;
+  }
+  if (node?.type === 'CallExpression' && node.callee.type === 'Identifier'
+    && node.callee.name === 'resolve' && node.arguments.length === 2
+    && node.arguments.every((argument) => argument.type === 'Identifier')) {
+    return `resolve(${node.arguments.map((argument) => argument.name).join(', ')})`;
+  }
+  return undefined;
+}
+
+function literalValue(node) {
+  if (node?.type === 'StringLiteral') return node.value;
+  if (node?.type === 'TemplateLiteral' && node.expressions.length === 0) {
+    return node.quasis[0].value.cooked;
+  }
+  return undefined;
+}
+
+function isLegacyModule(path) {
+  return /ooxml-legacy-converter|(?:^|[\\/])legacy-converter(?:[\\/]|$)/.test(path);
+}
+
+/** Use the same compiler options and module resolver as TypeScript's program. */
+export function createTypeScriptResolver(root = process.cwd()) {
+  const configs = new Map();
+  return (importer, specifier) => {
+    const absolute = nodePath.resolve(root, importer);
+    const packageName = importer.split('/')[1];
+    const configPath = nodePath.resolve(root, 'packages', packageName, 'tsconfig.json');
+    let options = configs.get(configPath);
+    if (!options) {
+      const config = ts.readConfigFile(configPath, ts.sys.readFile);
+      if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
+      options = ts.parseJsonConfigFileContent(config.config, ts.sys, nodePath.dirname(configPath)).options;
+      configs.set(configPath, options);
+    }
+    return ts.resolveModuleName(specifier, absolute, options, ts.sys).resolvedModule?.resolvedFileName;
+  };
+}
+
+export function findViolations(files, { resolveModule } = {}) {
   const violations = [];
   for (const { path, text } of files) {
     const lines = text.split('\n');
@@ -63,30 +138,46 @@ export function findViolations(files) {
     });
     if (/\.[cm]?[jt]sx?$/.test(path)) {
       const source = parse(text, { sourceType: 'unambiguous', errorRecovery: true, plugins: ['typescript', 'jsx'] });
+      const allowedExpressions = ALLOWED_COMPUTED_IMPORTS.get(path) ?? [];
+      const usedExpressions = new Set();
       const inspect = (node) => {
         let literal;
+        let dynamic = false;
         if (['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type)) {
           literal = node.source;
         } else if (node.type === 'TSImportEqualsDeclaration'
           && node.moduleReference?.type === 'TSExternalModuleReference') {
           literal = node.moduleReference.expression;
-        } else if (node.type === 'CallExpression' && node.arguments.length === 1
+        } else if (node.type === 'TSImportType') {
+          literal = node.argument?.type === 'TSLiteralType' ? node.argument.literal : node.argument;
+        } else if (node.type === 'CallExpression'
           && (node.callee.type === 'Import'
             || (node.callee.type === 'Identifier' && node.callee.name === 'require'))) {
           [literal] = node.arguments;
+          dynamic = true;
         }
-        if (literal?.type === 'StringLiteral'
-          || (literal?.type === 'TemplateLiteral' && literal.expressions.length === 0)) {
+        const specifier = literalValue(literal);
+        if (dynamic && specifier === undefined) {
+          const expression = expressionName(literal);
+          const approved = expression !== undefined
+            && node.callee.type === 'Import'
+            && node.arguments.length === 1
+            && allowedExpressions.includes(expression)
+            && !usedExpressions.has(expression);
+          if (approved) usedExpressions.add(expression);
+          if (!approved) {
+            violations.push({ path, line: node.loc.start.line, rule: 'computed-module', text: text.split('\n')[node.loc.start.line - 1].trim().slice(0, 160) });
+          }
+        }
+        if (typeof specifier === 'string') {
           // The parser has already decoded string escapes here. Normalize
-          // relative paths as well as package names before checking the import.
-          const specifier = literal.type === 'StringLiteral'
-            ? literal.value
-            : literal.quasis[0].value.cooked;
-          if (typeof specifier !== 'string') return;
+          // relative paths, then also check TypeScript's actual resolution for
+          // aliases, package exports, and type-only imports.
           const resolved = specifier.startsWith('.')
             ? nodePath.posix.normalize(nodePath.posix.join(nodePath.posix.dirname(path), specifier))
             : specifier;
-          if (/ooxml-legacy-converter|(?:^|\/)legacy-converter(?:\/|$)/.test(resolved)) {
+          const compilerResolved = resolveModule?.(path, specifier);
+          if (isLegacyModule(resolved) || (compilerResolved && isLegacyModule(compilerResolved))) {
             const line = literal.loc.start.line;
             if (!violations.some((entry) => entry.path === path && entry.line === line && entry.rule === 'legacy-package')) {
               violations.push({ path, line, rule: 'legacy-package', text: specifier.slice(0, 160) });
@@ -134,7 +225,9 @@ function trackedFiles(ref) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const refIndex = process.argv.indexOf('--ref');
   const ref = refIndex >= 0 ? process.argv[refIndex + 1] : undefined;
-  const violations = findViolations(trackedFiles(ref));
+  // --ref checks lexical/AST rules at that revision. The live compiler graph
+  // is checked for the working tree, where its tsconfig and dependencies exist.
+  const violations = findViolations(trackedFiles(ref), ref ? {} : { resolveModule: createTypeScriptResolver() });
   if (violations.length > 0) {
     for (const violation of violations.slice(0, 200)) {
       console.error(`${violation.path}:${violation.line} [${violation.rule}] ${violation.text}`);

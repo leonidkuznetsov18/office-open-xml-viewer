@@ -26,8 +26,6 @@ import {
   resolveOoxmlContainer,
   toArrayBuffer,
   OoxmlResourceLimitError,
-  beginModelSourceLoad,
-  selectModelSource,
   type AdmittedModelSourceLoad,
   type LoadOptions as CoreLoadOptions,
   type ProgressiveLayoutPartial,
@@ -380,6 +378,7 @@ export class PptxPresentation {
     // runs and the OOXML path is unchanged.
     let sourceLoad: AdmittedModelSourceLoad | undefined;
     if (opts.modelSources !== undefined) {
+      const { selectModelSource, beginModelSourceLoad } = await import('@silurus/ooxml-core/internal/model-source');
       const selected = selectModelSource(opts.modelSources, 'pptx', new Uint8Array(buffer));
       if (selected) sourceLoad = beginModelSourceLoad(selected, 'pptx');
     }
@@ -1542,8 +1541,12 @@ export class PptxPresentation {
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
   load: AdmittedModelSourceLoad,
-): { source?: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[] } {
+): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
+  const sourceOwnerUrl = new URL(
+    import.meta.env.DEV ? './internal/worker-presentation-source.ts' : './pptx-source-worker.mjs',
+    import.meta.url,
+  ).href;
   return load.transfer.length > 0
-    ? { source: load.module, sourceTransfer: load.transfer }
-    : { source: load.module };
+    ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
+    : { source: load.module, sourceOwnerUrl };
 }

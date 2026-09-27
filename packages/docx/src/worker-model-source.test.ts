@@ -21,9 +21,12 @@ vi.mock('@silurus/ooxml-core', async (load) => {
   return {
     ...actual,
     WasmParserHost: Host,
-    openModelSourceModule: (...args: unknown[]) => state.openSource(...args),
   };
 });
+vi.mock('@silurus/ooxml-core/internal/model-source', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core/internal/model-source')>(),
+  openModelSourceModule: (...args: unknown[]) => state.openSource(...args),
+}));
 
 vi.mock('./wasm/docx_parser.js', () => ({
   default: state.init,
@@ -67,7 +70,7 @@ describe('DOCX parse worker with a model source', () => {
     await import('./worker.js');
     const dispatch = harness.scope.onmessage!;
     const policy = { maxArchiveEntryBytes: 1, maxTotalInflatedBytes: 1, maxArchiveEntries: 1 };
-    const parse = (id: number, extra: object = { source }) => dispatch({
+    const parse = (id: number, extra: object = { source, sourceOwnerUrl: './internal/worker-document-source.js' }) => dispatch({
       data: { type: 'parse', id, data: new ArrayBuffer(3), resourcePolicy: policy, ...extra },
     } as MessageEvent);
     const response = (id: number) => harness.posts.find((message) => (message as { id?: number }).id === id);
