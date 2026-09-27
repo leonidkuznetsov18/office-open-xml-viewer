@@ -131,68 +131,99 @@ export function createFontResolver(
   };
   const fingerprint = stableFingerprint('fonts', { faces, nativeFamilyLists, regionalFamilyLists });
 
-  return Object.freeze({
-    fingerprint,
-    resolve(request: Readonly<FontRequest>): FontResolution {
-      const requestedFamily = request.requestedFamily?.trim() || request.genericFamily || 'sans-serif';
-      const weight = normalizedWeight(request.weight);
-      const style = request.style ?? 'normal';
-      const candidates = byFamily.get(normalizeFamily(requestedFamily)) ?? [];
-      const face = candidates.find((candidate) => candidate.weight === weight && candidate.style === style);
-      if (face) {
-        const diagnostics: LayoutDiagnostic[] = face.source === 'substitute'
-          ? [{
-              code: 'UNSUPPORTED_FEATURE',
-              severity: 'warning',
-              message: `ECMA-376 §17.8.2 implementation-dependent font substitution: ${requestedFamily} resolved to ${face.resolvedFamily}`,
-            }]
-          : [];
-        const fallbackList = familyListFor(requestedFamily, request.language, request.cjkFallback);
-        const familyList = fallbackList
-          ? `${quoteCssFamily(face.resolvedFamily)}, ${fallbackList}`
-          : cssFamilyList(face.resolvedFamily, request.genericFamily ?? 'sans-serif');
-        return freezeResolution({
-          requestedFamily,
-          resolvedFamily: face.resolvedFamily,
-          route: createCanvasFontRoute(familyList, 'registered'),
-          source: face.source,
-          ...(face.resourceIdentity === undefined ? {} : { resourceIdentity: face.resourceIdentity }),
-          weight,
-          style,
-          diagnostics,
-          genericFamily: request.genericFamily ?? 'sans-serif',
-        });
-      }
-
-      const generic = request.genericFamily ?? 'sans-serif';
-      const authored = request.requestedFamily?.trim();
-      if (authored) {
-        const familyList = familyListFor(authored, request.language, request.cjkFallback)
-          ?? cssFamilyList(authored, generic);
-        return freezeResolution({
-          requestedFamily,
-          resolvedFamily: authored,
-          route: createCanvasFontRoute(familyList, 'native'),
-          source: 'native',
-          weight,
-          style,
-          diagnostics: [],
-          genericFamily: generic,
-        });
-      }
+  // Every shaped script span, line segment and east-Asian line floor asks for a
+  // resolution, and each fresh answer carried its own copy of the complete CSS
+  // family list plus a percent-encoded route fingerprint (together ~1.7 KB for
+  // a registered local face). A long document retained hundreds of thousands
+  // of value-identical copies across the text caches and the retained layout.
+  // `resolve` is a pure function of the request fields below and this
+  // resolver's immutable snapshot, and every resolution is deep-frozen, so
+  // equal requests share one answer. The raw fields are the key (not their
+  // normalized forms), so each entry is exactly what that request computed.
+  // The bound only caps pathological documents; a miss recomputes.
+  const resolutionMemoLimit = 4096;
+  const resolutions = new Map<string, FontResolution>();
+  const resolveUncached = (request: Readonly<FontRequest>): FontResolution => {
+    const requestedFamily = request.requestedFamily?.trim() || request.genericFamily || 'sans-serif';
+    const weight = normalizedWeight(request.weight);
+    const style = request.style ?? 'normal';
+    const candidates = byFamily.get(normalizeFamily(requestedFamily)) ?? [];
+    const face = candidates.find((candidate) => candidate.weight === weight && candidate.style === style);
+    if (face) {
+      const diagnostics: LayoutDiagnostic[] = face.source === 'substitute'
+        ? [{
+            code: 'UNSUPPORTED_FEATURE',
+            severity: 'warning',
+            message: `ECMA-376 §17.8.2 implementation-dependent font substitution: ${requestedFamily} resolved to ${face.resolvedFamily}`,
+          }]
+        : [];
+      const fallbackList = familyListFor(requestedFamily, request.language, request.cjkFallback);
+      const familyList = fallbackList
+        ? `${quoteCssFamily(face.resolvedFamily)}, ${fallbackList}`
+        : cssFamilyList(face.resolvedFamily, request.genericFamily ?? 'sans-serif');
       return freezeResolution({
         requestedFamily,
-        resolvedFamily: generic,
-        route: createCanvasFontRoute(
-          familyListFor(generic, request.language, request.cjkFallback) ?? generic,
-          'generic',
-        ),
-        source: 'generic',
+        resolvedFamily: face.resolvedFamily,
+        route: createCanvasFontRoute(familyList, 'registered'),
+        source: face.source,
+        ...(face.resourceIdentity === undefined ? {} : { resourceIdentity: face.resourceIdentity }),
+        weight,
+        style,
+        diagnostics,
+        genericFamily: request.genericFamily ?? 'sans-serif',
+      });
+    }
+
+    const generic = request.genericFamily ?? 'sans-serif';
+    const authored = request.requestedFamily?.trim();
+    if (authored) {
+      const familyList = familyListFor(authored, request.language, request.cjkFallback)
+        ?? cssFamilyList(authored, generic);
+      return freezeResolution({
+        requestedFamily,
+        resolvedFamily: authored,
+        route: createCanvasFontRoute(familyList, 'native'),
+        source: 'native',
         weight,
         style,
         diagnostics: [],
         genericFamily: generic,
       });
+    }
+    return freezeResolution({
+      requestedFamily,
+      resolvedFamily: generic,
+      route: createCanvasFontRoute(
+        familyListFor(generic, request.language, request.cjkFallback) ?? generic,
+        'generic',
+      ),
+      source: 'generic',
+      weight,
+      style,
+      diagnostics: [],
+      genericFamily: generic,
+    });
+  };
+
+  return Object.freeze({
+    fingerprint,
+    resolve(request: Readonly<FontRequest>): FontResolution {
+      const key = JSON.stringify([
+        request.requestedFamily ?? null,
+        request.genericFamily ?? null,
+        request.weight ?? null,
+        request.style ?? null,
+        request.language ?? null,
+        request.cjkFallback ?? null,
+      ]);
+      const retained = resolutions.get(key);
+      if (retained) return retained;
+      const resolution = resolveUncached(request);
+      resolutions.set(key, resolution);
+      if (resolutions.size > resolutionMemoLimit) {
+        resolutions.delete(resolutions.keys().next().value as string);
+      }
+      return resolution;
     },
   });
 }

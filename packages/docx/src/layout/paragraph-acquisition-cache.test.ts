@@ -476,4 +476,37 @@ describe('paragraph acquisition cache', () => {
 
     expect(new Set(keys)).toHaveLength(keys.length);
   });
+
+  it('keys service identities and kinsoku sets by exact session ordinals', () => {
+    const services = scopedServices();
+    const cache = paragraphAcquisitionCacheOf(services)!;
+    const input = paragraphAcquisitionInput(textParagraph(), source);
+    const base = options(services);
+    const key = (overrides: Partial<ParagraphAcquisitionOptions>) =>
+      paragraphAcquisitionCacheKey(cache, input, { ...base, ...overrides });
+    // A production text-service fingerprint spells out the document's whole
+    // font-metric snapshot; every retained key used to repeat it.
+    const withText = (fingerprint: string) => ({
+      environment: {
+        ...base.environment,
+        layoutServices: { ...services, text: { ...services.text, fingerprint } },
+      },
+    });
+    const large = `text:${'m'.repeat(60_000)}`;
+    const largeKey = key(withText(large));
+    expect(largeKey.length).toBeLessThan(4_096);
+    expect(key(withText(`${large.slice(0, -1)}n`))).not.toBe(largeKey);
+    expect(key(withText(large.slice()))).toBe(largeKey);
+
+    // A value-equal rule set from another object must still hit, or the
+    // session miss budget would be spent on a spurious re-acquisition.
+    const kinsoku = {
+      enabled: DEFAULT_KINSOKU_RULES.enabled,
+      lineStartForbidden: new Set([...DEFAULT_KINSOKU_RULES.lineStartForbidden].reverse()),
+      lineEndForbidden: new Set(DEFAULT_KINSOKU_RULES.lineEndForbidden),
+    };
+    expect(key({ context: { ...base.context, kinsoku } })).toBe(key({}));
+    expect(key({ context: { ...base.context, kinsoku: { ...kinsoku, enabled: !kinsoku.enabled } } }))
+      .not.toBe(key({}));
+  });
 });
