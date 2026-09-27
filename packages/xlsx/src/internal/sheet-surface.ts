@@ -123,7 +123,7 @@ export class SheetOverlayHost {
   }
 
   clearSelection(): void { this.selection.textContent = ''; }
-  appendSelection(element: HTMLElement): void { this.selection.appendChild(element); }
+  appendSelection(element: Element): void { this.selection.appendChild(element); }
   clearFind(): void { this.find.textContent = ''; }
   appendFind(element: HTMLElement): void { this.find.appendChild(element); }
 
