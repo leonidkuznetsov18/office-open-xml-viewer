@@ -30,11 +30,19 @@ pub enum ParaPiece {
 /// hints are removed. Run payloads and field boundaries move once; only the
 /// paragraph metadata, with its owning vectors emptied, is cloned per chunk.
 pub fn split_para_on_page_breaks(para: DocParagraph) -> Vec<ParaPiece> {
+    split_para_on_page_breaks_with_trailing_mark(para, false)
+}
+
+pub fn split_para_on_page_breaks_with_trailing_mark(
+    para: DocParagraph,
+    split_pg_break_and_para_mark: bool,
+) -> Vec<ParaPiece> {
     let mut pieces = Vec::new();
-    let result = visit_para_on_page_breaks(para, |piece| {
-        pieces.push(piece);
-        Ok::<(), std::convert::Infallible>(())
-    });
+    let result =
+        visit_para_on_page_breaks_with_trailing_mark(para, split_pg_break_and_para_mark, |piece| {
+            pieces.push(piece);
+            Ok::<(), std::convert::Infallible>(())
+        });
     match result {
         Ok(()) => pieces,
         Err(never) => match never {},
@@ -42,7 +50,19 @@ pub fn split_para_on_page_breaks(para: DocParagraph) -> Vec<ParaPiece> {
 }
 
 pub fn visit_para_on_page_breaks<E>(
+    para: DocParagraph,
+    emit: impl FnMut(ParaPiece) -> Result<(), E>,
+) -> Result<(), E> {
+    visit_para_on_page_breaks_with_trailing_mark(para, false, emit)
+}
+
+/// ECMA-376 Part 4 §14.8.3.38 `splitPgBreakAndParaMark`: when the final
+/// character before a paragraph mark is a hard page break, Word places the
+/// mark on the following page. Preserve it as an empty paragraph so its line
+/// box participates in the next page's ordinary flow and table admission.
+pub fn visit_para_on_page_breaks_with_trailing_mark<E>(
     mut para: DocParagraph,
+    split_pg_break_and_para_mark: bool,
     mut emit: impl FnMut(ParaPiece) -> Result<(), E>,
 ) -> Result<(), E> {
     let is_hard_break = |run: &DocRun| {
@@ -199,6 +219,7 @@ pub fn visit_para_on_page_breaks<E>(
         emit(ParaPiece::Para(chunk))?;
         emitted = true;
     }
+    let trailing_page_break = matches!(trailing.last(), Some(ParaPiece::PageBreak { .. }));
     for sep in trailing {
         emit(match sep {
             ParaPiece::ColumnBreak => ParaPiece::ColumnBreak,
@@ -207,6 +228,12 @@ pub fn visit_para_on_page_breaks<E>(
             },
         })?;
         emitted = true;
+    }
+    if split_pg_break_and_para_mark && trailing_page_break {
+        // `para.runs` was taken above. The remaining metadata is the source
+        // paragraph mark's formatting, not a new default-style paragraph.
+        emit(ParaPiece::Para(para))?;
+        return Ok(());
     }
     if !emitted {
         emit(ParaPiece::Para(para))?;
@@ -217,6 +244,53 @@ pub fn visit_para_on_page_breaks<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_page_break_moves_only_a_trailing_paragraph_mark() {
+        let text = || {
+            DocRun::Text(Box::new(crate::TextRun {
+                text: "body".into(),
+                ..Default::default()
+            }))
+        };
+        let page_break = || DocRun::Break {
+            break_type: BreakType::Page,
+        };
+        let trailing = DocParagraph {
+            runs: vec![text(), page_break()],
+            ..Default::default()
+        };
+        let ordinary = split_para_on_page_breaks(trailing.clone());
+        let compatible = split_para_on_page_breaks_with_trailing_mark(trailing, true);
+        assert_eq!(ordinary.len(), 2);
+        assert_eq!(compatible.len(), 3);
+        assert!(matches!(&compatible[1], ParaPiece::PageBreak { .. }));
+        assert!(matches!(&compatible[2], ParaPiece::Para(p) if p.runs.is_empty()));
+
+        // A following text run already carries the paragraph mark to the
+        // destination page. A column break has no page-break compatibility.
+        let internal = DocParagraph {
+            runs: vec![text(), page_break(), text()],
+            ..Default::default()
+        };
+        assert_eq!(
+            split_para_on_page_breaks_with_trailing_mark(internal, true).len(),
+            3
+        );
+        let column = DocParagraph {
+            runs: vec![
+                text(),
+                DocRun::Break {
+                    break_type: BreakType::Column,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            split_para_on_page_breaks_with_trailing_mark(column, true).len(),
+            2
+        );
+    }
 
     fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize) {
         WORK.with(|value| value.set(0));

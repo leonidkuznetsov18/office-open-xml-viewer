@@ -341,6 +341,11 @@ pub struct DocumentSettings {
     /// document-grid line pitch to text in table cells.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adjust_line_height_in_table: Option<bool>,
+    /// ECMA-376 Part 4 §14.8.3.38 `w:splitPgBreakAndParaMark`: put the
+    /// paragraph mark following a hard page break on the next page. Absence
+    /// retains the ordinary same-page paragraph mark behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_pg_break_and_para_mark: Option<bool>,
 }
 
 /// Single track-changes event extracted from a body revision wrapper.
