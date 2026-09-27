@@ -199,16 +199,24 @@ function assertNoSourceRuntime(code, name) {
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
+  // DOCX and the Node entry include the explicit-state line-breaker and body
+  // table modules from #1566. Against fed37873, the DOCX static graph grew
+  // 18,002 bytes (2,528,311 → 2,546,313) in the same 36 chunks: the moved
+  // line-breaker contributes 18,953 rendered module bytes and table measurement
+  // 2,501, offset by minification. The old implementations are absent, and
+  // Rolldown still tree-shakes the modules; state access and named call
+  // boundaries account for the retained code. The dispatch allowance is unchanged.
+  docx: { entry: 2_546_313, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
   xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
   pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_575_997, budget: 3_600 },
+  node: { entry: 2_597_340, budget: 3_600 },
 });
-// The XLSX render worker adds 536 bytes for explicit worksheet eviction;
-// DOCX and PPTX worker payloads are unchanged.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_046_946];
+// The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
+// DOCX worker includes the same #1566 line-breaker split (2,046,946 → 2,066,129
+// bytes against fed37873); PPTX is unchanged. Workers retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_066_129];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
