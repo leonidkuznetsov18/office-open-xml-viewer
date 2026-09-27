@@ -30,6 +30,8 @@ export interface DrawingMlBreakOptions<T> {
   measureText(text: string, style: T): number;
   /** Adjacent authored runs may shape together only when all paint metadata agrees. */
   sameStyle?(left: T, right: T): boolean;
+  /** Advance at a style seam within one authored run (for `rPr@spc`). */
+  boundaryAdvance?(left: T, right: T): number;
   tabStops?: readonly DrawingMlTabStop[];
   /** `a:pPr@defTabSz` in canvas px; Office's ordinary fallback is 1 inch. */
   defaultTabSize?: number;
@@ -97,9 +99,15 @@ export function breakDrawingMlText<T>(
   const lines: DrawingMlBrokenLine<T>[] = [];
   for (let regionIndex = 0; regionIndex < regions.length; regionIndex++) {
     const atoms = regions[regionIndex];
-    // Office C05/C06: terminal U+0020 spaces do not create a continuation
-    // line, even when the suffix crosses an authored run boundary. NBSP stays.
-    while (atoms.length > 0 && isSpace(atoms.at(-1)!)) atoms.pop();
+    // Office C05/C06: paragraph-terminal U+0020 spaces do not create a
+    // continuation line, even across authored runs. An authored <a:br> is a
+    // line ending inside the paragraph: preserve its preceding spaces because
+    // they still advance a centred/right-aligned line (observed in an Office
+    // PDF with a space before <a:br>).
+    // NBSP stays in either case.
+    if (regionIndex === regions.length - 1) {
+      while (atoms.length > 0 && isSpace(atoms.at(-1)!)) atoms.pop();
+    }
 
     const end = atoms.length;
     const seaBreaks = new Set<number>();
@@ -144,6 +152,16 @@ export function breakDrawingMlText<T>(
       return false;
     };
 
+    const isSingleExplicitTabCell = (index: number): boolean => {
+      const tab = atoms[index];
+      const first = atoms[index + 1];
+      return tab?.type === 'tab' && !!options.tabStops?.length
+        && first?.type === 'text'
+        && /^[\p{Script_Extensions=Latin}\p{Number}]$/u.test(first.text)
+        && atoms.slice(index + 1).every((atom) => atom.type === 'text'
+          && !isSpace(atom) && !isCjk(atom));
+    };
+
     const makeSegments = (start: number, stop: number, lineIndex: number): DrawingMlBrokenLine<T> => {
       const segments: DrawingMlLineSegment<T>[] = [];
       for (let i = start; i < stop; i++) {
@@ -162,8 +180,14 @@ export function breakDrawingMlText<T>(
         }
       }
       let noStopGap = 0;
-      const items = segments.map((seg) => {
-        if (seg.type === 'text') seg.width = options.measureText(seg.text, seg.style);
+      const items = segments.map((seg, i) => {
+        if (seg.type === 'text') {
+          seg.width = options.measureText(seg.text, seg.style);
+          const previous = segments[i - 1];
+          if (previous?.type === 'text') {
+            seg.width += options.boundaryAdvance?.(previous.style, seg.style) ?? 0;
+          }
+        }
         if (seg.type === 'tab') noStopGap = options.measureText(' ', seg.style);
         return { isTab: seg.type === 'tab', width: seg.width };
       });
@@ -217,12 +241,52 @@ export function breakDrawingMlText<T>(
 
       let split = 0;
       for (let i = start + 1; i <= fit; i++) if (mayBreakAt(i)) split = i;
-      if (split === 0) split = Math.max(start + 1, fit); // overwide word: grapheme-safe emergency break
+      if (split > start && isSingleExplicitTabCell(split)) {
+        // Office keeps the tab and following Latin cell on the authored line
+        // for an explicit stop, even when the cell passes the box edge. The
+        // control C11 uses the default grid and wraps before its tab instead.
+        split = end;
+      }
+      if (isSingleExplicitTabCell(start)) {
+        // An authored stop makes the next Latin cell one visual unit even if
+        // that cell contains a hyphen or another soft opportunity. PowerPoint
+        // keeps this cell together in its explicit-stop paragraphs; C11 has
+        // only the default grid and still breaks within the following word.
+        split = start + 2;
+        while (split < end && !isSpace(atoms[split]) && atoms[split].type !== 'tab') split++;
+      }
+      if (split === 0) {
+        if (atoms[start].type === 'tab' && fit <= start + 1) {
+          // A stop beyond the box still carries its next cell. A CJK cell
+          // contributes at least one glyph; an indivisible Latin cell stays
+          // together. The painter can clamp an explicit off-box stop.
+          split = start + 1;
+          if (split < end && atoms[split].type === 'text') {
+            split++;
+            while (split < end && !mayBreakAt(split)) split++;
+          }
+        } else {
+          split = Math.max(start + 1, fit); // overwide word: grapheme-safe emergency break
+          // A mixed-font/style Latin word has no shaping-preserving emergency
+          // break: retaining the old overflow avoids inventing a run seam as a
+          // break. The matched C01 control has identical styles and does split.
+          let nextOpportunity = end;
+          for (let i = start + 1; i < end; i++) {
+            if (mayBreakAt(i)) { nextOpportunity = i; break; }
+          }
+          const styledWord = atoms.slice(start, nextOpportunity);
+          if (styledWord.every((atom) => atom.type === 'text' && !isCjk(atom))
+              && styledWord.some((atom, i) => i > 0 && !sameStyle(styledWord[i - 1].style, atom.style))) {
+            split = nextOpportunity;
+          }
+        }
+      }
 
       // Kinsoku (§17.15.1.58–.60) adjusts an in-run CJK boundary. The Office
       // C08 control is a counterexample at an authored run seam, so leave that
       // boundary intact instead of inferring a cross-run retraction rule.
-      if (split < end && atoms[split - 1].run === atoms[split].run) {
+      if (split < end && atoms[split - 1].run === atoms[split].run
+          && (isCjk(atoms[split - 1]) || isCjk(atoms[split]))) {
         const left = atoms.slice(start, split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
         const right = atoms.slice(split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
         if (left.length > 1 && right.length > 0) {
@@ -232,10 +296,10 @@ export function breakDrawingMlText<T>(
         }
       }
 
-      let visibleEnd = split;
-      while (visibleEnd > start && isSpace(atoms[visibleEnd - 1])) visibleEnd--;
-      if (visibleEnd === start) visibleEnd = split; // authored leading space
-      lines.push(makeSegments(start, visibleEnd, lineIndex));
+      // Keep authored spaces on the closed line. The controlled PDFs establish
+      // the visible word break, but cannot identify the advance of invisible
+      // trailing spaces; retaining them preserves that unresolved paint detail.
+      lines.push(makeSegments(start, split, lineIndex));
       start = split;
       while (start < end && isSpace(atoms[start])) start++;
     }

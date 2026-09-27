@@ -9,8 +9,10 @@ export function drawingMlLineX(
   regionWidth: number,
   naturalWidth: number,
   rtl = false,
+  /** PowerPoint preserves negative slack when text overflows a centred/right box. */
+  allowOverflow = false,
 ): number {
-  const slack = Math.max(0, regionWidth - naturalWidth);
+  const slack = allowOverflow ? regionWidth - naturalWidth : Math.max(0, regionWidth - naturalWidth);
   if (alignment === 'ctr') return regionLeft + slack / 2;
   if (alignment === 'r' || (rtl && (alignment === 'l' || alignment == null))) {
     return regionLeft + slack;

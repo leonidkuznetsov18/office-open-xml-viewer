@@ -14,7 +14,7 @@ function lines(parts: readonly string[], width: number, defaultTabSize = 72): st
     sameStyle: (a, b) => a === b,
     defaultTabSize,
   }).map((line) => line.segments.map((segment) => segment.type === 'text'
-    ? segment.text : segment.type === 'tab' ? '\t' : '').join(''));
+    ? segment.text : segment.type === 'tab' ? '\t' : '').join('').replace(/ +$/u, ''));
 }
 
 describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
@@ -35,6 +35,21 @@ describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
     expect(lines(['abc', '  '], 35)).toEqual(['abc']);
   });
 
+  it('retains the advance of spaces before an authored line break for alignment', () => {
+    const result = breakDrawingMlText<string>([
+      { type: 'text', text: 'Analyze & ', style: 'same' },
+      { type: 'break' },
+      { type: 'text', text: 'Control', style: 'same' },
+    ], { maxWidth: 200, measureText: measure });
+    expect(result.map((line) => ({
+      text: line.segments.map((segment) => segment.type === 'text' ? segment.text : '').join(''),
+      width: line.width,
+    }))).toEqual([
+      { text: 'Analyze & ', width: 100 },
+      { text: 'Control', width: 70 },
+    ]);
+  });
+
   it('keeps the observed authored punctuation seam and NBSP behavior (C08/C10)', () => {
     expect(lines(['日本語', '、次'], 60)).toEqual(['日本語', '、次']);
     expect(lines(['abc\u00a0def'], 50)).toEqual(['abc\u00a0d', 'ef']);
@@ -47,4 +62,5 @@ describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
   it('carries an overflowing tab to the next line and seats one glyph after its stop (C11)', () => {
     expect(lines(['abc\tdef'], 85)).toEqual(['abc', '\td', 'ef']);
   });
+
 });
