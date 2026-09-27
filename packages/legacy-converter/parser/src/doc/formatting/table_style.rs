@@ -4,7 +4,7 @@
 
 use super::{cnf, tapx};
 use super::{Formatting, Properties, Sprms, MAX_TABLE_AWARE_CACHE_ENTRIES};
-use crate::doc::{paragraph, sprm, table, u16_at, unsupported};
+use crate::doc::{border::ICO_COLORS, paragraph, sprm, table, u16_at, unsupported};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -382,6 +382,21 @@ impl Formatting<'_> {
                             profile.condition_presence |= condition;
                             Ok(interpret_table_styles)
                         }
+                        0xd685 | 0xd686 => {
+                            // [MS-DOC] 2.6.3 diagonal table-style borders are
+                            // separate from the six edge borders. A selected
+                            // border with BrcType=0 is explicitly cleared and
+                            // contributes no ink or layout; other diagonals
+                            // still need a generic cell-diagonal capability.
+                            if !matches!(scope, tapx::Scope::Conditional(_))
+                                || operand.len() != 9
+                                || operand[0] != 8
+                            {
+                                return Ok(false);
+                            }
+                            let border = table::PreparedBorder::read(&operand[1..], false)?;
+                            Ok(border.decode()?.is_cleared())
+                        }
                         0xd613 => {
                             if scope != tapx::Scope::Unconditional {
                                 return Ok(false);
@@ -626,11 +641,14 @@ impl Formatting<'_> {
         }
         if inherited {
             let borders = profile.conditional_table_borders;
-            let unsupported_inherited_border = borders.present & !0b0101 != 0;
+            let unsupported_inherited_border = borders.present & !0b1101 != 0;
             if unsupported_inherited_border {
-                // Inherited native controls cover complete FIRST_ROW and
-                // FIRST_COLUMN patches with per-side child replacement. Keep
-                // other inherited edge conditions gated.
+                // [MS-DOC] 2.4.6.6 applies the selected row/column edges
+                // after the base style. Word's saved table-style control has
+                // a LAST_ROW top edge inherited through its selected style;
+                // the same per-side patch representation covers it as well
+                // as FIRST_ROW and FIRST_COLUMN. LAST_COLUMN still lacks an
+                // inherited native control.
                 profile.unsupported_table = true;
                 profile.conditional_table_borders = ConditionalTableBorders::default();
             }
@@ -688,6 +706,7 @@ fn parse_conditional(
         .cloned()
         .unwrap_or_else(Properties::sparse);
     let mut has_supported_character = false;
+    let mut complex_color = None;
     let mut nested = Sprms::new(operand.grpprl);
     while let Some((code, value)) = nested.next(budget)? {
         if matches!(code, 0x2a42 | 0x4a43 | 0x6870) {
@@ -706,6 +725,15 @@ fn parse_conditional(
             let baseline = patch.clone();
             patch.apply(code, value, &baseline)?;
             has_supported_character = true;
+        } else if code == 0x4a60 {
+            // [MS-DOC] 2.6.1 sprmCIcoBi has a separate complex-script
+            // palette. The DOCX run model has one w:color; the Word saved
+            // table-style control collapses matching CIco/CIcoBi=9 to that
+            // color. A divergent complex-script color cannot be projected.
+            if value.len() != 2 {
+                return Err(unsupported("invalid Word complex-script text color index"));
+            }
+            complex_color = Some(u16_at(value, 0)?);
         } else if matches!(code, 0x4a4f | 0x4a50 | 0x4a51 | 0x4a5e) {
             // Word 16.112.4 controls with seven reordered FFN records leave
             // conditional font markers fixed while unconditional CRgFtc values
@@ -715,6 +743,16 @@ fn parse_conditional(
         } else {
             // This includes nested CNF records. They are parsed only as one
             // bounded operand and are never recursively expanded.
+            profile.unsupported_character = true;
+        }
+    }
+    if let Some(index) = complex_color {
+        let expected = ICO_COLORS.get(usize::from(index));
+        if expected.is_none_or(|color| {
+            patch
+                .text_color()
+                .is_none_or(|ordinary| !ordinary.eq_ignore_ascii_case(color))
+        }) {
             profile.unsupported_character = true;
         }
     }

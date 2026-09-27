@@ -209,6 +209,12 @@ impl Default for Properties {
 }
 
 impl Properties {
+    /// Resolved common text color for comparing a legacy complex-script axis
+    /// before a table-style patch enters the single-color DOCX run model.
+    pub(in crate::doc) fn text_color(&self) -> Option<&str> {
+        self.values.get("color").map(String::as_str)
+    }
+
     /// The CP is relative to the Bullet Pictures document, not an FC in the
     /// Data stream. A picture bullet without its companion CP is malformed.
     pub(in crate::doc) fn direct_picture_bullet(&self) -> Result<Option<(usize, bool)>, String> {

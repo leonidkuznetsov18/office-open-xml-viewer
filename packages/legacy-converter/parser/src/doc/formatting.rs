@@ -1395,6 +1395,39 @@ mod tests {
     }
 
     #[test]
+    fn conditional_complex_color_requires_the_same_projected_color() {
+        for (complex_index, unsupported) in [(9, false), (1, true)] {
+            let mut formatting = observed_table_style_formatting();
+            formatting.styles[0]
+                .as_mut()
+                .unwrap()
+                .table
+                .as_mut()
+                .unwrap()
+                .chpx = leaked(ccnf(
+                table_style_condition::FIRST_ROW,
+                &[0x42, 0x2a, 9, 0x60, 0x4a, complex_index, 0],
+            ));
+            let key = TableFormattingKey {
+                selected_style: 0,
+                matches: [
+                    None,
+                    None,
+                    None,
+                    Some(table_style_condition::FIRST_ROW),
+                    None,
+                ],
+            };
+            let run = formatting
+                .direct_text_run(7, Some(key), 0, 0, &[], "x".into())
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.color.as_deref(), Some("000080"));
+            assert_eq!(formatting.unsupported_character_properties, unsupported);
+        }
+    }
+
+    #[test]
     fn table_chpx_ascii_and_high_ansi_fonts_inherit_and_direct_fonts_win() {
         fn font_axes(index: u16) -> Vec<u8> {
             [
@@ -1662,6 +1695,47 @@ mod tests {
                 assert_eq!(spec.style, "single");
             }
         }
+        assert!(!formatting.unsupported_table_properties);
+    }
+
+    #[test]
+    fn inherited_last_row_top_border_replaces_its_base_side_only() {
+        let mut formatting = observed_table_style_formatting();
+        formatting.configure_table_styles(0x0112, true);
+        let last_row = table_style_condition::LAST_ROW;
+        let edge = |code, color: [u8; 3]| {
+            test_prl(code, &[8, color[0], color[1], color[2], 0, 8, 1, 0, 0])
+        };
+        formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .tapx = leaked(cnf(0xd66a, last_row, &edge(0xd680, [255, 0, 0])));
+        formatting.styles[1]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .tapx = leaked(cnf(0xd66a, last_row, &edge(0xd680, [0, 0, 255])));
+
+        let (borders, presence) = formatting
+            .conditional_table_borders(Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(presence & last_row, last_row);
+        assert_eq!(
+            borders.sides[3][2]
+                .unwrap()
+                .decode()
+                .unwrap()
+                .direct_spec()
+                .color
+                .as_deref(),
+            Some("0000ff")
+        );
         assert!(!formatting.unsupported_table_properties);
     }
 
