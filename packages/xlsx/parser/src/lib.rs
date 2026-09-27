@@ -3489,15 +3489,138 @@ pub struct XlsxArchive {
 
 struct ActiveWorksheetCursor {
     source: ActiveWorksheetSource,
+    preview: Option<Vec<u8>>,
     sheet_index: u32,
     name: String,
     sheet_path: String,
     reference_index: Option<WorksheetCellLookupBuilder>,
 }
 
+fn serialize_cursor_preview(
+    worksheet: Option<&Worksheet>,
+    reason: Option<&'static str>,
+    max_row: u32,
+    max_col: u32,
+    reporter: &PackageLimitReporter,
+    part: &str,
+) -> Result<Vec<u8>, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Preview<'a> {
+        kind: &'static str,
+        worksheet: Option<&'a Worksheet>,
+        reason: Option<&'static str>,
+        max_row: u32,
+        max_col: u32,
+    }
+    serialize_json_with_limit(
+        &Preview {
+            kind: "preview",
+            worksheet,
+            reason,
+            max_row,
+            max_col,
+        },
+        Some(reporter),
+        HardResourceLimitKind::WorksheetJsonBytes,
+        Some(part),
+        HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
+        "worksheet preview JSON exceeds its hard ceiling",
+    )
+}
+
+/// ECMA-376 §18.3.1.99 places mergeCells, conditionalFormatting, drawings and
+/// extensions after sheetData. A metadata-only pass reaches these before any
+/// bounded row pull. Cross-row or ancillary content stays on the full-model
+/// path until its dependencies can be proven independent of unloaded cells.
+fn cursor_preview_blocker(
+    has_row_outline: bool,
+    ordered_rows: bool,
+    worksheet: &Worksheet,
+    shell_xml: &str,
+) -> Result<Option<&'static str>, String> {
+    if !ordered_rows {
+        return Ok(Some("unordered-rows"));
+    }
+    if has_row_outline || !worksheet.col_outline_levels.is_empty() {
+        return Ok(Some("outline"));
+    }
+    if !worksheet.merge_cells.is_empty() {
+        return Ok(Some("merge"));
+    }
+    if !worksheet.conditional_formats.is_empty() {
+        return Ok(Some("conditional-format"));
+    }
+    let doc = parse_guarded(shell_xml).map_err(|error| error.to_string())?;
+    if doc.descendants().any(|node| {
+        node.is_element()
+            && matches!(
+                node.tag_name().name(),
+                "drawing" | "oleObjects" | "controls" | "tableParts" | "extLst"
+            )
+    }) {
+        return Ok(Some("ancillary-content"));
+    }
+    Ok(None)
+}
+
+fn build_cursor_preview(
+    zip: &mut XlsxZip,
+    shared: &WorkbookShared,
+    sheet_index: u32,
+    name: &str,
+    sheet_path: &str,
+    part: &str,
+) -> Result<Vec<u8>, String> {
+    let scanned = zip.scan_worksheet_preview(
+        part,
+        Rc::clone(&shared.shared_strings),
+        Rc::clone(&shared.theme_colors),
+    )?;
+    let max_row = scanned.max_row;
+    let max_col = scanned.max_col;
+    let has_row_outline = scanned.has_row_outline;
+    let ordered_rows = scanned.ordered_rows;
+    let parsed = parse_projected_worksheet_tail(scanned.tail, shared.theme_colors.as_ref(), name)?;
+    let reporter = zip.active_operation()?.limit_reporter()?;
+    if let Some(reason) =
+        cursor_preview_blocker(has_row_outline, ordered_rows, &parsed.0, &parsed.2)?
+    {
+        return serialize_cursor_preview(None, Some(reason), max_row, max_col, &reporter, part);
+    }
+    let worksheet = finalize_projected_sheet(
+        zip,
+        shared,
+        sheet_index,
+        name,
+        sheet_path,
+        parsed,
+        CurrentSheetLookup::Seed(None),
+    )?;
+    if !worksheet.images.is_empty()
+        || !worksheet.charts.is_empty()
+        || !worksheet.shape_groups.is_empty()
+        || !worksheet.slicers.is_empty()
+        || !worksheet.sparkline_groups.is_empty()
+    {
+        return serialize_cursor_preview(
+            None,
+            Some("ancillary-content"),
+            max_row,
+            max_col,
+            &reporter,
+            part,
+        );
+    }
+    serialize_cursor_preview(Some(&worksheet), None, max_row, max_col, &reporter, part)
+}
+
 enum ActiveWorksheetSource {
     Streaming(Box<WorksheetCursor>),
     Ready(Box<Worksheet>),
+    /// A metadata scan crossed a package limit. The first pull reports the
+    /// latched error, preserving the cursor-open contract.
+    Poisoned(String),
     /// A sheet part that could not be opened; pulled as a part-tagged placeholder.
     DeferredFailure(String),
     Prepared,
@@ -3647,6 +3770,7 @@ impl XlsxArchive {
             let part = format!("xl/{sheet_path}");
             let zip = &mut self.archive;
             let sheet_part_kind = resolve_sheet_part_kind(&rels_doc, &sheet.r_id);
+            let mut preview = None;
             let source = match sheet_part_kind {
                 SheetPartKind::ChartSheet => {
                     match parse_chart_sheet_shell(zip, &part, name).and_then(|parsed| {
@@ -3674,20 +3798,44 @@ impl XlsxArchive {
                         ActiveWorksheetSource::DeferredFailure(error)
                     }
                 },
-                SheetPartKind::Worksheet => match zip.open_worksheet_cursor(
-                    &part,
-                    Rc::clone(&shared.shared_strings),
-                    Rc::clone(&shared.theme_colors),
-                ) {
-                    Ok(cursor) => ActiveWorksheetSource::Streaming(Box::new(cursor)),
-                    Err(error) => {
-                        zip.assert_healthy()?;
-                        ActiveWorksheetSource::DeferredFailure(error)
+                SheetPartKind::Worksheet => {
+                    let preview_result =
+                        build_cursor_preview(zip, shared, sheet_index, name, &sheet_path, &part);
+                    match preview_result {
+                        Ok(bytes) => preview = Some(bytes),
+                        Err(_) if zip.assert_healthy().is_ok() => {
+                            let reporter = zip.active_operation()?.limit_reporter()?;
+                            preview = Some(serialize_cursor_preview(
+                                None,
+                                Some("metadata-unavailable"),
+                                0,
+                                0,
+                                &reporter,
+                                &part,
+                            )?);
+                        }
+                        Err(_) => {}
                     }
-                },
+                    if let Err(resource_error) = zip.assert_healthy() {
+                        ActiveWorksheetSource::Poisoned(resource_error)
+                    } else {
+                        match zip.open_worksheet_cursor(
+                            &part,
+                            Rc::clone(&shared.shared_strings),
+                            Rc::clone(&shared.theme_colors),
+                        ) {
+                            Ok(cursor) => ActiveWorksheetSource::Streaming(Box::new(cursor)),
+                            Err(error) => {
+                                zip.assert_healthy()?;
+                                ActiveWorksheetSource::DeferredFailure(error)
+                            }
+                        }
+                    }
+                }
             };
             Ok(ActiveWorksheetCursor {
                 source,
+                preview,
                 sheet_index,
                 name: name.to_string(),
                 sheet_path,
@@ -3721,6 +3869,25 @@ impl XlsxArchive {
             );
         }
         self.last_cursor_pull_terminal = false;
+        if let Some(preview) = self
+            .active_worksheet
+            .as_mut()
+            .and_then(|active| active.preview.take())
+        {
+            return Ok(preview);
+        }
+        if let Some(error) =
+            self.active_worksheet
+                .as_ref()
+                .and_then(|active| match &active.source {
+                    ActiveWorksheetSource::Poisoned(error) => Some(error.clone()),
+                    _ => None,
+                })
+        {
+            self.active_worksheet.take();
+            self.archive.cancel_operation();
+            return Err(error);
+        }
         let deferred = match &self
             .active_worksheet
             .as_ref()
@@ -3729,6 +3896,7 @@ impl XlsxArchive {
         {
             ActiveWorksheetSource::DeferredFailure(error) => Some(error.clone()),
             ActiveWorksheetSource::Streaming(_) | ActiveWorksheetSource::Ready(_) => None,
+            ActiveWorksheetSource::Poisoned(_) => unreachable!("poison handled above"),
             ActiveWorksheetSource::Prepared => {
                 return Err("worksheet terminal product is prepared".to_string());
             }
@@ -5796,8 +5964,11 @@ mod dialogsheet_tests {
         let mut archive = XlsxArchive::new(bytes, None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Dialog").unwrap();
 
-        let bytes = archive.pull_sheet_cursor_inner(1).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        if value["kind"] == "preview" {
+            value = serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        }
         let worksheet = value.get("worksheet").expect("terminal worksheet model");
         assert!(worksheet.get("isDialogSheet").is_none());
         assert!(worksheet["parseError"]
@@ -6843,6 +7014,9 @@ mod rb7_partial_degradation_tests {
                 rows.append(envelope["rows"].as_array_mut().unwrap());
                 continue;
             }
+            if envelope["kind"] == "preview" {
+                continue;
+            }
             let mut worksheet = envelope["worksheet"].take();
             if worksheet["parseError"].is_null() {
                 worksheet["rows"] = serde_json::Value::Array(rows);
@@ -6936,6 +7110,42 @@ mod rb7_partial_degradation_tests {
     }
 
     #[test]
+    fn cursor_preview_has_final_shell_and_implicit_scroll_bounds_before_rows() {
+        let mut archive =
+            XlsxArchive::new(build_implicit_ref_workbook(), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(first["kind"], "preview");
+        assert!(first["reason"].is_null());
+        assert_eq!(first["maxRow"], 2);
+        assert_eq!(first["maxCol"], 3);
+        let mut terminal = loop {
+            let unit: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+            if unit["kind"] == "finished" {
+                break unit;
+            }
+        };
+        assert_eq!(first["worksheet"], terminal["worksheet"].take());
+        archive.acknowledge_sheet_cursor_terminal_inner().unwrap();
+    }
+
+    #[test]
+    fn cursor_preview_falls_back_for_whole_range_conditional_formatting() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1:A3"><cfRule type="top10" rank="1" priority="1"/></conditionalFormatting></worksheet>"#;
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(first["kind"], "preview");
+        assert_eq!(first["reason"], "conditional-format");
+        assert!(first["worksheet"].is_null());
+        archive.cancel_sheet_cursor();
+    }
+
+    #[test]
     fn full_parse_after_sheet_cursor_matches_fresh_styles_and_chart_formats() {
         let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Series</t></is></c></row><row r="2"><c r="A2" s="1"><v>1.25</v></c><c r="B2"><v>10</v></c></row><row r="3"><c r="A3" s="1"><v>2.5</v></c><c r="B3"><v>20</v></c></row></sheetData><drawing r:id="rDrawing"/></worksheet>"#;
         let chart = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:strRef><c:f>Sheet1!A1</c:f></c:strRef></c:tx><c:cat><c:numRef><c:f>Sheet1!A2:A3</c:f></c:numRef></c:cat><c:val><c:numRef><c:f>Sheet1!B2:B3</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
@@ -6995,8 +7205,13 @@ mod rb7_partial_degradation_tests {
         let mut archive =
             XlsxArchive::new(build_missing_sheet_workbook(), None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Sheet1").unwrap();
-        let payload = archive.pull_sheet_cursor(128).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let value: serde_json::Value = loop {
+            let payload = archive.pull_sheet_cursor(128).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            if value["kind"] == "finished" {
+                break value;
+            }
+        };
         assert_eq!(value["kind"], "finished");
         assert!(value["worksheet"]["parseError"]
             .as_str()
@@ -7037,7 +7252,7 @@ mod rb7_partial_degradation_tests {
             match archive.pull_sheet_cursor_inner(128) {
                 Ok(payload) => {
                     let envelope: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-                    assert_eq!(envelope["kind"], "rows");
+                    assert!(envelope["kind"] == "rows" || envelope["kind"] == "preview");
                 }
                 Err(error) => break error,
             }

@@ -62,6 +62,10 @@ export class WorksheetPullWorker {
     private readonly executeArchive: <T>(operation: (archive: WorksheetCursorArchive) => T) => T =
       (operation) => operation(this.requireArchive()),
     private readonly prepareRows?: (rows: Row[]) => void,
+    private readonly provisional?: {
+      preview: (sheetIndex: number, worksheet: Worksheet) => void;
+      stop: (sheetIndex: number) => void;
+    },
   ) {}
 
   /** Register synchronously before a worker handler's first await. */
@@ -114,7 +118,12 @@ export class WorksheetPullWorker {
             if (this.acceptWorksheet) {
               const decoded = decodeWorksheetPullChunk(bytes, done, undefined, this.prepareRows);
               try {
-                if (decoded.kind === 'rows') {
+                if (decoded.kind === 'preview') {
+                  if (decoded.worksheet) {
+                    decoded.worksheet.rows = rows;
+                    this.provisional?.preview(sheetIndex, decoded.worksheet);
+                  }
+                } else if (decoded.kind === 'rows') {
                   const next = addWorksheetUsage(modelUsage, measureRows(decoded.rows));
                   assertWorksheetModelUsage(
                     next,
@@ -124,7 +133,7 @@ export class WorksheetPullWorker {
                   );
                   rows.push(...decoded.rows);
                   modelUsage = next;
-                } else terminal = decoded.worksheet;
+                } else if (decoded.kind === 'finished') terminal = decoded.worksheet;
               } catch (error) {
                 if (error instanceof OoxmlResourceLimitError) this.resourceFailure ??= error;
                 throw error;
@@ -181,6 +190,7 @@ export class WorksheetPullWorker {
             }
             terminalPending = false;
             this.sessions.delete(identity.sessionId);
+            this.provisional?.stop(sheetIndex);
             completeOperation();
           },
           cancel: () => {
@@ -190,6 +200,7 @@ export class WorksheetPullWorker {
               }
             } finally {
               this.sessions.delete(identity.sessionId);
+              this.provisional?.stop(sheetIndex);
               completeOperation();
             }
           },
@@ -200,6 +211,7 @@ export class WorksheetPullWorker {
               }
             } finally {
               this.sessions.delete(identity.sessionId);
+              this.provisional?.stop(sheetIndex);
               completeOperation();
             }
           },

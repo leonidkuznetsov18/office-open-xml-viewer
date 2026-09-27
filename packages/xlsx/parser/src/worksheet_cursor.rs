@@ -39,6 +39,16 @@ pub(super) struct WorksheetCursorTail {
     pub(super) row_heights: BTreeMap<u32, f64>,
 }
 
+/// Facts that the viewer needs before accepting an exact provisional frame.
+/// The scan observes the MCE-processed infoset and keeps no cell values.
+pub(super) struct WorksheetCursorPreview {
+    pub(super) tail: WorksheetCursorTail,
+    pub(super) max_row: u32,
+    pub(super) max_col: u32,
+    pub(super) has_row_outline: bool,
+    pub(super) ordered_rows: bool,
+}
+
 #[derive(Debug)]
 pub(super) enum WorksheetCursorPull {
     Rows {
@@ -197,6 +207,48 @@ impl WorksheetCursor {
 }
 
 impl XlsxZip {
+    pub(super) fn scan_worksheet_preview(
+        &mut self,
+        part: &str,
+        shared_strings: Rc<[SharedString]>,
+        theme_colors: Rc<[String]>,
+    ) -> Result<WorksheetCursorPreview, String> {
+        let entry = self.active_operation()?.open_entry(part)?;
+        let mut projector = WorksheetRowProjector::from_package_entry_metadata(
+            entry,
+            shared_strings,
+            theme_colors,
+        )?;
+        let mut max_row = 0;
+        let mut max_col = 0;
+        let mut has_row_outline = false;
+        let mut ordered_rows = true;
+        let mut previous_row = 0;
+        loop {
+            match projector.next_item().map_err(|error| error.to_string())? {
+                WorksheetProjectorItem::Row(projected) => {
+                    ordered_rows &= projected.row.index > previous_row;
+                    previous_row = projected.row.index;
+                    max_row = max_row.max(projected.row.index);
+                    max_col = max_col.max(projected.max_col);
+                    has_row_outline |= projected.row.outline_level != 0 || projected.row.collapsed;
+                }
+                WorksheetProjectorItem::Finished(tail) => {
+                    return Ok(WorksheetCursorPreview {
+                        tail: WorksheetCursorTail {
+                            shell_xml: tail.shell_xml,
+                            row_heights: tail.row_heights,
+                        },
+                        max_row,
+                        max_col,
+                        has_row_outline,
+                        ordered_rows,
+                    });
+                }
+            }
+        }
+    }
+
     /// Open a persistent worksheet cursor only inside an explicitly-started
     /// package operation. This makes operation ownership visible at the factory
     /// boundary and prevents the lazy compatibility operation from escaping

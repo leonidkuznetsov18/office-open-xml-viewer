@@ -409,6 +409,7 @@ fn flush_streamed_rows(
     prev_row_idx: &mut u32,
     shared_strings: &[SharedString],
     theme_colors: &[String],
+    metadata_only: bool,
 ) -> Result<Vec<ProjectedWorksheetRow>, String> {
     if pending.is_empty() {
         return Ok(Vec::new());
@@ -441,8 +442,36 @@ fn flush_streamed_rows(
                     && is_x_ns(node.tag_name().namespace())
             })
             .ok_or_else(|| "streamed worksheet row lost its SpreadsheetML namespace".to_string())?;
+        let row = parse_row_node(
+            &row_node,
+            prev_row_idx,
+            shared_strings,
+            theme_colors,
+            metadata_only,
+        )?;
+        // CT_Cell@r is optional (§18.3.1.4). Resolve explicit and implicit
+        // columns exactly as parse_row_cells does, even in the metadata pass.
+        let max_col = if metadata_only {
+            let mut previous = 0;
+            let mut maximum = 0;
+            for cell in row_node.children().filter(|node| {
+                node.tag_name().name() == "c" && is_x_ns(node.tag_name().namespace())
+            }) {
+                let explicit = cell
+                    .attribute("r")
+                    .map(|reference| crate::parse_cell_ref_checked(reference).map(|(col, _)| col))
+                    .transpose()?;
+                let col =
+                    resolve_implicit_ordinal(explicit, &mut previous, SpreadsheetOrdinal::Column)?;
+                maximum = maximum.max(col);
+            }
+            maximum
+        } else {
+            row.cells.iter().map(|cell| cell.col).max().unwrap_or(0)
+        };
         rows.push(ProjectedWorksheetRow {
-            row: parse_row_node(&row_node, prev_row_idx, shared_strings, theme_colors)?,
+            row,
+            max_col,
             projected_bytes: source.projected_arena_bytes(),
         });
     }
@@ -458,6 +487,7 @@ fn parse_row_node(
     prev_row_idx: &mut u32,
     shared_strings: &[SharedString],
     theme_colors: &[String],
+    metadata_only: bool,
 ) -> Result<Row, String> {
     // ECMA-376 §18.3.1.73 makes `@r` optional; honor an explicit value when
     // present. When omitted, take the running previous row + 1 (implicit
@@ -490,7 +520,11 @@ fn parse_row_node(
         .min(7);
     let collapsed = attr_bool(node, "collapsed").unwrap_or(false);
     let row_ph = attr_bool(node, "ph").unwrap_or(false);
-    let cells = parse_row_cells(node, row_idx, row_ph, shared_strings, theme_colors)?;
+    let cells = if metadata_only {
+        Vec::new()
+    } else {
+        parse_row_cells(node, row_idx, row_ph, shared_strings, theme_colors)?
+    };
     Ok(Row {
         index: row_idx,
         height,
@@ -835,6 +869,12 @@ struct StreamedRowBatch {
     heights: BTreeMap<u32, f64>,
 }
 
+struct RowProjectionInputs<'a> {
+    shared_strings: &'a [SharedString],
+    theme_colors: &'a [String],
+    metadata_only: bool,
+}
+
 impl StreamedRowBatch {
     fn push(&mut self, row: PendingStreamedRow) {
         if self.pending.is_empty() {
@@ -867,6 +907,7 @@ impl StreamedRowBatch {
         &mut self,
         shared_strings: &[SharedString],
         theme_colors: &[String],
+        metadata_only: bool,
         ready_rows: &mut VecDeque<ProjectedWorksheetRow>,
     ) -> Result<(), WorksheetProjectorError> {
         for row in flush_streamed_rows(
@@ -874,6 +915,7 @@ impl StreamedRowBatch {
             &mut self.previous_index,
             shared_strings,
             theme_colors,
+            metadata_only,
         )? {
             if let Some(height) = row.row.height {
                 self.heights.insert(row.row.index, height);
@@ -889,8 +931,7 @@ impl StreamedRowBatch {
         row: PendingStreamedRow,
         row_projection_limit: usize,
         part: Option<&str>,
-        shared_strings: &[SharedString],
-        theme_colors: &[String],
+        inputs: RowProjectionInputs<'_>,
         ready_rows: &mut VecDeque<ProjectedWorksheetRow>,
     ) -> Result<(), WorksheetProjectorError> {
         let projected_bytes = row.projected_arena_bytes();
@@ -907,11 +948,21 @@ impl StreamedRowBatch {
         // batch-arena ceiling. A single row may exceed that batching target but
         // has already passed the separate hard row-projection invariant above.
         if self.would_exceed_byte_ceiling(&row) {
-            self.dispatch(shared_strings, theme_colors, ready_rows)?;
+            self.dispatch(
+                inputs.shared_strings,
+                inputs.theme_colors,
+                inputs.metadata_only,
+                ready_rows,
+            )?;
         }
         self.push(row);
         if self.should_dispatch() {
-            self.dispatch(shared_strings, theme_colors, ready_rows)?;
+            self.dispatch(
+                inputs.shared_strings,
+                inputs.theme_colors,
+                inputs.metadata_only,
+                ready_rows,
+            )?;
         }
         Ok(())
     }
@@ -936,6 +987,7 @@ pub(super) enum WorksheetProjectorItem {
 #[derive(Debug)]
 pub(super) struct ProjectedWorksheetRow {
     pub(super) row: Row,
+    pub(super) max_col: u32,
     /// Exact bytes retained for the row's standalone internal projection,
     /// including inherited namespace wrapper overhead.
     pub(super) projected_bytes: usize,
@@ -970,6 +1022,7 @@ where
     finished_tail: Option<StreamedWorksheetRows>,
     shared_strings: Option<S>,
     theme_colors: Option<T>,
+    metadata_only: bool,
     part: Option<String>,
     limit_reporter: Option<PackageLimitReporter>,
     row_projection_limit: usize,
@@ -1047,6 +1100,7 @@ where
             finished_tail: None,
             shared_strings: Some(shared_strings),
             theme_colors: Some(theme_colors),
+            metadata_only: false,
             part,
             limit_reporter,
             row_projection_limit,
@@ -1088,14 +1142,19 @@ where
             row,
             self.row_projection_limit,
             self.part.as_deref(),
-            self.shared_strings
-                .as_ref()
-                .expect("active projector owns shared strings")
-                .as_ref(),
-            self.theme_colors
-                .as_ref()
-                .expect("active projector owns theme colors")
-                .as_ref(),
+            RowProjectionInputs {
+                shared_strings: self
+                    .shared_strings
+                    .as_ref()
+                    .expect("active projector owns shared strings")
+                    .as_ref(),
+                theme_colors: self
+                    .theme_colors
+                    .as_ref()
+                    .expect("active projector owns theme colors")
+                    .as_ref(),
+                metadata_only: self.metadata_only,
+            },
             &mut self.ready_rows,
         )
     }
@@ -1499,6 +1558,7 @@ where
                 .as_ref()
                 .expect("active projector owns theme colors")
                 .as_ref(),
+            self.metadata_only,
             &mut self.ready_rows,
         )?;
         self.reader.take();
@@ -1643,6 +1703,18 @@ where
             Some(part),
             Some(reporter),
         ))
+    }
+
+    /// Scan the MCE-processed shell and row coordinates before the cursor's
+    /// bounded row pull. This pass does not decode cell values or retain rows.
+    pub(super) fn from_package_entry_metadata(
+        entry: PackageEntryStream,
+        shared_strings: S,
+        theme_colors: T,
+    ) -> Result<Self, String> {
+        let mut projector = Self::from_package_entry(entry, shared_strings, theme_colors)?;
+        projector.metadata_only = true;
+        Ok(projector)
     }
 }
 
@@ -1807,8 +1879,14 @@ mod worksheet_streaming_tests {
                     && is_x_ns(node.tag_name().namespace())
             })
             .map(|node| {
-                let row = parse_row_node(&node, &mut previous_row, shared_strings, theme_colors)
-                    .expect("reference worksheet row parses");
+                let row = parse_row_node(
+                    &node,
+                    &mut previous_row,
+                    shared_strings,
+                    theme_colors,
+                    false,
+                )
+                .expect("reference worksheet row parses");
                 if let Some(height) = row.height {
                     heights.insert(row.index, height);
                 }
@@ -2209,8 +2287,11 @@ mod worksheet_streaming_tests {
                 },
                 row_limit,
                 None,
-                &[],
-                &[],
+                RowProjectionInputs {
+                    shared_strings: &[],
+                    theme_colors: &[],
+                    metadata_only: false,
+                },
                 &mut VecDeque::new(),
             )
             .expect_err("row batch independently enforces the row cap");

@@ -3321,6 +3321,7 @@ function renderQuadrant(
  *  frame and only misses on a sheet switch / re-parse — avoiding a full-sheet
  *  cell-Map rebuild and a conditional-formatting recompile per frame. */
 interface SheetRenderCache {
+  rowCount: number;
   cellMap: Map<string, Cell>;
   nonEmptyColsByRow: Map<number, readonly number[]>;
   cfContext: CfContext;
@@ -3335,6 +3336,12 @@ interface SheetRenderCache {
 }
 const sheetRenderCache = new WeakMap<Worksheet, SheetRenderCache>();
 
+/** @internal A provisional row graph grows between renders; its coordinate
+ * indexes must be rebuilt after every accepted chunk. */
+export function invalidateSheetRenderCache(worksheet: Worksheet): void {
+  sheetRenderCache.delete(worksheet);
+}
+
 function coordinateIndexIdentity(
   resource: string,
   operation: string,
@@ -3344,7 +3351,7 @@ function coordinateIndexIdentity(
 
 export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   const cached = sheetRenderCache.get(worksheet);
-  if (cached) return cached;
+  if (cached && cached.rowCount === worksheet.rows.length) return cached;
 
   const cellIdentity = coordinateIndexIdentity('worksheet-cell-index', 'index-worksheet-cells');
   const cellMap = buildCellCoordinateIndex(worksheet.rows, cellIdentity);
@@ -3416,6 +3423,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   }
 
   const entry: SheetRenderCache = {
+    rowCount: worksheet.rows.length,
     cellMap,
     nonEmptyColsByRow,
     cfContext: compileCf(worksheet, cellMap),

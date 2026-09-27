@@ -200,15 +200,18 @@ function assertNoSourceRuntime(code, name) {
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
   docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
-  // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
-  // viewer state restoration. The optional model-source runtime stays lazy.
-  xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
+  // XLSX entry now includes worksheet LRU/leases, viewer restoration, and the
+  // exact first-viewport preview coordinator/wire handling. The optional
+  // model-source runtime stays lazy; the dispatch allowance is unchanged.
+  xlsx: { entry: 1_854_626, inline: 40_608, budget: 2_500 },
   pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_575_997, budget: 3_600 },
+  // The Node static graph shares the XLSX cursor decoder and skips preview
+  // metadata before yielding its existing rows/terminal stream.
+  node: { entry: 2_580_317, budget: 3_600 },
 });
-// The XLSX render worker adds 536 bytes for explicit worksheet eviction;
-// DOCX and PPTX worker payloads are unchanged.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_046_946];
+// The XLSX render worker includes provisional sheet ownership and the first
+// bitmap handoff. DOCX and PPTX worker payloads are unchanged.
+const OOXML_RENDER_WORKERS = [1_417_957, 1_458_524, 2_046_946];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

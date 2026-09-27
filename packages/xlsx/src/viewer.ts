@@ -1,6 +1,7 @@
 import {
   XlsxWorkbook,
   acquireXlsxWorksheet,
+  acquireXlsxWorksheetPreview,
   retainXlsxWorksheetReference,
   loadXlsxSheetSource,
   prepareXlsxViewerRowHeights,
@@ -23,12 +24,14 @@ import {
   pxToColWidth,
   pxToRowHeight,
   invalidateAutoRowHeights,
+  invalidateSheetRenderCache,
   derivedAutoRowHeights,
   getGridGeometryForWorksheet,
   rtlMirrorX,
 } from './renderer.js';
 import { findListValidationAt } from './data-validation.js';
 import { formatA1, parseA1 } from './a1.js';
+import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
 import { resolveXlsxInternalHyperlink } from './internal-hyperlink.js';
 import type {
   CellAddress,
@@ -728,6 +731,9 @@ class XlsxViewerEngine implements ZoomableViewer {
    * its lease is released. It can briefly coexist with the incoming graph,
    * so viewer memory can peak at two worksheet models until the swap. */
   private currentWorksheet: Worksheet | null = null;
+  private previewCompletion: Promise<Worksheet> | null = null;
+  private firstPreviewRender = false;
+  private previewPreparedViewport: { width: number; height: number; scale: number } | null = null;
   private releaseCurrentWorksheet: (() => void) | null = null;
   /** Authored comments for the selected sheet. Presentation filtering must not
    * erase the application-owned data and selection-context contracts. */
@@ -1345,6 +1351,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     let worksheet: Worksheet;
     let sourceWorksheet: Worksheet;
     let releaseNewWorksheet: (() => void) | undefined;
+    let releaseFirstPaint: (() => void) | undefined;
+    let previewCompletion: Promise<Worksheet> | null = null;
+    let previewPreparedViewport: { width: number; height: number; scale: number } | null = null;
     try {
       if (!await this.ensureHostFonts(workbook)) return;
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
@@ -1354,11 +1363,35 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.releaseCurrentWorksheet?.();
         this.releaseCurrentWorksheet = null;
       }
-      const lease = await acquireXlsxWorksheet(workbook, index);
+      const lease = await acquireXlsxWorksheetPreview(workbook, index);
       sourceWorksheet = lease.worksheet;
       releaseNewWorksheet = lease.release;
+      releaseFirstPaint = lease.releaseFirstPaint;
+      previewCompletion = lease.partial ? lease.completion : null;
+      if (lease.partial) {
+        previewPreparedViewport = {
+          width: this.canvasArea.clientWidth,
+          height: this.canvasArea.clientHeight,
+          scale: this.viewport.scale,
+        };
+        const visible = getGridGeometryForWorksheet(sourceWorksheet).visibleRange({
+          width: previewPreparedViewport.width,
+          height: previewPreparedViewport.height,
+          scale: this.viewport.scale,
+          scrollX: 0,
+          scrollY: 0,
+          headerWidth: HEADER_W,
+          headerHeight: HEADER_H,
+          buffer: 2,
+        });
+        await (lease.waitForRows?.(Math.max(
+          visible.range.row + visible.range.rows - 1,
+          sourceWorksheet.freezeRows,
+        )) ?? Promise.resolve());
+      }
       const cachedView = this.sheetViews.get(index);
       worksheet = cachedView ?? this.createVisibleSheetView(sourceWorksheet);
+      if (lease.partial) worksheet.rows = sourceWorksheet.rows;
       if (!cachedView) this.restoreSheetViewState(index, worksheet);
       const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
       if (typeof prepareRowHeights === 'function') {
@@ -1386,6 +1419,65 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.sheetViews.set(index, worksheet);
     this.currentSheet = index;
     this.currentWorksheet = worksheet;
+    this.previewCompletion = previewCompletion;
+    this.firstPreviewRender = previewCompletion !== null;
+    this.previewPreparedViewport = previewPreparedViewport;
+    if (previewCompletion) {
+      void previewCompletion.then((completed) => {
+        if (!this.isCurrentSheetRequest(generation, workbook) || this.currentWorksheet !== worksheet) return;
+        this.previewCompletion = null;
+        this.firstPreviewRender = false;
+        this.previewPreparedViewport = null;
+        if (completed.parseError) {
+          // A later row may make the cursor produce the normal degraded-sheet
+          // placeholder. Replace the provisional graph before the next frame.
+          const placeholder = this.createVisibleSheetView(completed);
+          this.currentWorksheet = placeholder;
+          this.sheetViews.set(index, placeholder);
+          this.currentSourceComments = [];
+          this.sourceCommentMap.clear();
+          this.selectionController.reset();
+          this.emitSelectionChange();
+          this.updateSelectionOverlay();
+          this.buildCommentMap(placeholder);
+          this.buildHyperlinkMap(placeholder);
+          this.buildOutline(placeholder);
+          this.layoutGutters();
+          this.updateSpacerSize(placeholder);
+          this.scheduleRender();
+          return;
+        }
+        invalidateSheetRenderCache(worksheet);
+        invalidateAutoRowHeights(worksheet);
+        const measureCtx = this.hostDocument.createElement('canvas').getContext('2d');
+        if (measureCtx) workbook[prepareXlsxViewerRowHeights](worksheet, measureCtx);
+        this.syncAutomaticRowOverrides(index, worksheet);
+        this.updateSpacerSize(worksheet);
+        this.scheduleRender();
+        this.scheduleSelectionContextNotification();
+      }).catch((error: unknown) => {
+        if (!this.isCurrentSheetRequest(generation, workbook) || this.currentWorksheet !== worksheet) return;
+        this.previewCompletion = null;
+        this.firstPreviewRender = false;
+        this.previewPreparedViewport = null;
+        this.currentWorksheet = null;
+        this.releaseCurrentWorksheet?.();
+        this.releaseCurrentWorksheet = null;
+        this.renderDispatcher.begin();
+        if (this._mode === 'worker') {
+          // A bitmaprenderer canvas has no 2D context, and resizing it can
+          // retain the last transferred frame. Replace it with an empty bitmap.
+          const surface = new OffscreenCanvas(1, 1);
+          surface.getContext('2d');
+          const blank = surface.transferToImageBitmap();
+          this.canvas.getContext('bitmaprenderer')?.transferFromImageBitmap(blank);
+          blank.close();
+        } else {
+          this.canvas.getContext('2d')?.clearRect?.(0, 0, this.canvas.width, this.canvas.height);
+        }
+        this._reportRenderError(error);
+      });
+    }
     this.currentSourceComments = sourceWorksheet.comments ?? [];
     if (this.opts.comments !== false && this.currentSourceComments.length > 0) {
       void this.loadCommentUi().catch((error) => this._reportRenderError(error));
@@ -1415,7 +1507,18 @@ class XlsxViewerEngine implements ZoomableViewer {
     // for LTR sheets the start is scrollLeft=0. updateSpacerSize must run first
     // so scrollWidth reflects the new sheet before we read the max offset.
     this.resetHorizontalScroll();
-    await this.renderCurrentSheet();
+    let paintedEarly = false;
+    try {
+      await this.renderCurrentSheet();
+      paintedEarly = !this.firstPreviewRender;
+    } finally {
+      releaseFirstPaint?.();
+    }
+    if (previewCompletion && !paintedEarly && this.isCurrentSheetRequest(generation, workbook)) {
+      await previewCompletion;
+      if (!this.isCurrentSheetRequest(generation, workbook)) return;
+      await this.renderCurrentSheet();
+    }
     if (!this.isCurrentSheetRequest(generation, workbook)) return;
     // Redraw find highlights for the newly shown sheet (the find state survives
     // a sheet switch; only the visible sheet's boxes are drawn).
@@ -2262,6 +2365,7 @@ class XlsxViewerEngine implements ZoomableViewer {
   ): Promise<void> {
     const cell = parseA1(ref);
     if (!cell || !this.currentWorksheet) return;
+    if (this.previewCompletion) await this.previewCompletion;
     this._scrollCellIntoView(cell.row, cell.col, options.align ?? 'nearest');
     await this.renderCurrentSheet();
     this.updateSelectionOverlay();
@@ -2489,6 +2593,9 @@ class XlsxViewerEngine implements ZoomableViewer {
    */
   getSelectionContext(options: XlsxSelectionContextOptions = {}): XlsxSelectionContext | null {
     this.assertOpen();
+    // This synchronous data API cannot await an unloaded selection. Geometry
+    // remains selectable; a fresh context notification follows completion.
+    if (this.previewCompletion) return null;
     if (this.elementContext) {
       return limitXlsxElementContext(this.elementContext, options.maxTextCharacters);
     }
@@ -2956,6 +3063,7 @@ class XlsxViewerEngine implements ZoomableViewer {
    */
   async copySelection(): Promise<XlsxCopyResult> {
     this.assertOpen();
+    if (this.previewCompletion) await this.previewCompletion;
     const ws = this.currentWorksheet;
     const state = this.selectionState;
     if (!ws || !state) return { status: 'empty-selection' };
@@ -3663,7 +3771,9 @@ class XlsxViewerEngine implements ZoomableViewer {
   private createVisibleSheetView(source: Worksheet): Worksheet {
     const worksheet = createSheetViewModel(source);
     if (this.opts.comments === false) {
-      return { ...worksheet, commentRefs: [], comments: [] };
+      const hidden = { ...worksheet, commentRefs: [], comments: [] };
+      inheritWorksheetPreviewBounds(worksheet, hidden);
+      return hidden;
     }
     // Keep the pre-customization behavior: XLSX historically exposed resolved
     // threaded comments. Consumers may explicitly hide them.
@@ -3677,11 +3787,13 @@ class XlsxViewerEngine implements ZoomableViewer {
         .map((comment) => comment.cellRef),
     );
     if (resolved.size === 0) return worksheet;
-    return {
+    const unresolved = {
       ...worksheet,
       commentRefs: worksheet.commentRefs?.filter((ref) => !resolved.has(ref)),
       comments: worksheet.comments?.filter((comment) => !resolved.has(comment.cellRef)),
     };
+    inheritWorksheetPreviewBounds(worksheet, unresolved);
+    return unresolved;
   }
 
   /** IX1 — index the current sheet's hyperlinks by `"row:col"` (1-based, first
@@ -5020,6 +5132,16 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   private async _renderCurrentSheet(seq: number): Promise<void> {
     if (!this.currentWorksheet) return;
+    if (this.previewCompletion) {
+      if (this.firstPreviewRender) {
+        const prepared = this.previewPreparedViewport;
+        if (!prepared || this.canvasArea.clientWidth !== prepared.width ||
+            this.canvasArea.clientHeight !== prepared.height ||
+            this.viewport.scale !== prepared.scale ||
+            this.viewportTop !== 0 || this.effectiveScrollLeft !== 0) return;
+      } else await this.previewCompletion;
+      if (!this.renderDispatcher.isCurrent(seq) || this._destroyed) return;
+    }
     const ws = this.currentWorksheet;
     const w = this.canvasArea.clientWidth;
     const h = this.canvasArea.clientHeight;
@@ -5105,6 +5227,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     // XL4: repaint the outline gutters over the fresh grid frame, aligned to the
     // same scroll offset. No-op when the sheet has no outlining.
     this.renderGutters();
+    this.firstPreviewRender = false;
   }
 
   private computeHeaderHighlight(): {

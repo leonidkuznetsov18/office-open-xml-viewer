@@ -85,6 +85,8 @@ import {
   type XlsxSheetLoadOptions,
 } from './delimited-text.js';
 import { readDelimitedTextResponse } from './delimited-text-source.js';
+import { WorksheetPreview } from './internal/worksheet-preview.js';
+import { setWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
 import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
@@ -148,6 +150,7 @@ export class XlsxWorkbook {
    * for the bounded worksheet cursor: concurrent callers share one cursor and
    * one eventual mutable compatibility object instead of doubling peak work. */
   private sheetLoads = new Map<number, Promise<Worksheet>>();
+  private sheetPreviews = new Map<number, WorksheetPreview>();
   /** Cache of fetched image *bytes* (as Blobs) keyed by zip path, populated by
    *  {@link XlsxWorkbook.getImage}. Twin of pptx/docx's per-instance
    *  raw-part owner; decoded sources are owned separately by core. */
@@ -743,12 +746,16 @@ export class XlsxWorkbook {
     }
     const active = this.sheetLoads.get(sheetIndex);
     if (active) return active;
-    const load = this.loadWorksheet(sheetIndex);
+    const progress = new WorksheetPreview([]);
+    (this.sheetPreviews ??= new Map()).set(sheetIndex, progress);
+    const load = this.loadWorksheet(sheetIndex, progress);
+    void load.catch((error: unknown) => progress.fail(error));
     this.sheetLoads.set(sheetIndex, load);
     try {
       return await load;
     } finally {
       if (this.sheetLoads.get(sheetIndex) === load) this.sheetLoads.delete(sheetIndex);
+      if (this.sheetPreviews?.get(sheetIndex) === progress) this.sheetPreviews.delete(sheetIndex);
     }
   }
 
@@ -794,6 +801,43 @@ export class XlsxWorkbook {
     }
   }
 
+  /** Viewer lease may resolve at the first exact row-local viewport. Public
+   * worksheet and find callers continue to wait for terminal cache admission. */
+  private async acquireWorksheetPreviewLease(sheetIndex: number): Promise<{
+    worksheet: Worksheet;
+    release: () => void;
+    partial: boolean;
+    completion: Promise<Worksheet>;
+    waitForRows: (row: number) => Promise<void>;
+    releaseFirstPaint: () => void;
+  }> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.acquireWorksheetPreviewLease(sheetIndex);
+    }
+    const releasePin = this.pinWorksheet(sheetIndex);
+    let releaseFirstPaint: () => void = () => undefined;
+    const release = () => { releaseFirstPaint(); releasePin(); };
+    try {
+      const completion = this.getOrLoadWorksheet(sheetIndex);
+      const progress = this.sheetPreviews?.get(sheetIndex);
+      const viewerId = progress?.registerViewer();
+      if (progress && viewerId) releaseFirstPaint = () => progress.finishViewer(viewerId);
+      const worksheet = progress ? await progress.ready : await completion;
+      if (!progress?.worksheet || progress.complete) releaseFirstPaint();
+      return {
+        worksheet, release, partial: !!progress?.worksheet && !progress.complete, completion,
+        waitForRows: (row) => progress && viewerId
+          ? progress.waitForViewer(viewerId, row) : Promise.resolve(),
+        releaseFirstPaint,
+      };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   /** Detached comments for one worksheet, in authored order. Worksheet models
    * are materialized lazily, so this accessor is asynchronous. */
   async getComments(sheetIndex: number): Promise<readonly Readonly<XlsxComment>[]> {
@@ -825,7 +869,7 @@ export class XlsxWorkbook {
     });
   }
 
-  private async loadWorksheet(sheetIndex: number): Promise<Worksheet> {
+  private async loadWorksheet(sheetIndex: number, progress: WorksheetPreview): Promise<Worksheet> {
     // The worker retained its transferred archive at parse time; loaded state
     // is represented by the workbook bootstrap, not a duplicate source buffer.
     if (!this.parsedWorkbook) {
@@ -834,12 +878,12 @@ export class XlsxWorkbook {
     const sheetMeta = this.parsedWorkbook.workbook.sheets[sheetIndex];
     if (!sheetMeta) throw new Error(`Sheet index ${sheetIndex} out of range`);
 
-    return this.runArchiveOperation(() => this.loadWorksheetStream(sheetIndex, sheetMeta.name));
+    return this.runArchiveOperation(() => this.loadWorksheetStream(sheetIndex, sheetMeta.name, progress));
   }
 
-  private async loadWorksheetStream(sheetIndex: number, sheetName: string): Promise<Worksheet> {
+  private async loadWorksheetStream(sheetIndex: number, sheetName: string, progress: WorksheetPreview): Promise<Worksheet> {
     const client = this.ensureWorksheetPullClient();
-    const rows: Worksheet['rows'] = [];
+    const rows = progress.rows;
     let modelUsage: WorksheetModelUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0 };
     let terminal: Worksheet | undefined;
     let nextCacheUsage: WorksheetCacheUsage | undefined;
@@ -851,6 +895,17 @@ export class XlsxWorkbook {
     const part = undefined;
     try {
       for await (const unit of client.stream(sheetIndex, sheetName)) {
+        if (unit.kind === 'preview') {
+          progress.preview(unit.worksheet, unit.reason, unit.maxRow, unit.maxCol);
+          if (unit.worksheet) {
+            setWorksheetPreviewBounds(unit.worksheet, { maxRow: unit.maxRow, maxCol: unit.maxCol });
+            await this.retainWorksheetOfficeFonts(unit.worksheet);
+            const mainOffice = typeof document !== 'undefined'
+              ? this.retainedFontSets.get(document.fonts)?.loaded?.office : undefined;
+            bindXlsxWorksheetOfficeFontRoutes(unit.worksheet, mainOffice?.routes, this.googleSubstitutes);
+          }
+          continue;
+        }
         if (unit.kind === 'rows') {
           const nextUsage = addWorksheetUsage(modelUsage, measureRows(unit.rows));
           assertWorksheetModelUsage(
@@ -859,8 +914,9 @@ export class XlsxWorkbook {
             part,
             unit.usage,
           );
-          rows.push(...unit.rows);
+          progress.append(unit.rows);
           modelUsage = nextUsage;
+          await progress.pauseForViewerPaint();
           continue;
         }
         const worksheet = unit.worksheet;
@@ -974,6 +1030,7 @@ export class XlsxWorkbook {
       const mainOffice = typeof document !== 'undefined'
         ? this.retainedFontSets.get(document.fonts)?.loaded?.office : undefined;
       bindXlsxWorksheetOfficeFontRoutes(terminal, mainOffice?.routes, this.googleSubstitutes);
+      progress.finish(terminal);
       return terminal;
     } catch (error) {
       // Terminal ACK may have committed on the worker even when its reply was
@@ -981,6 +1038,7 @@ export class XlsxWorkbook {
       // and discard all local models before another operation can read it.
       if (this._mode === 'worker' && terminal && !terminalAcknowledged) this.destroy();
       this.latchFatalResourceFailure(error);
+      progress.fail(error);
       throw error;
     }
   }
@@ -1190,6 +1248,34 @@ export class XlsxWorkbook {
     const targetFontSet = isHTMLCanvas(target)
       ? target.ownerDocument.fonts
       : (typeof document !== 'undefined' ? document.fonts : null);
+    const preview = this.sheetPreviews?.get(sheetIndex);
+    if (preview?.worksheet && extracted.worksheet) {
+      await preview.waitFor(Math.max(
+        viewport.row + viewport.rows - 1,
+        renderOpts.freezeRows ?? 0,
+      ));
+      this.assertResourceHealthy();
+      const ws = extracted.worksheet;
+      // Eligible previews have no media dependencies, so this render needs no
+      // archive operation while the cursor owns its package decoder lease.
+      await renderWorksheetViewport(
+        {
+          ws, styles, cjkFallback: this.cjkFallback, math: this.math,
+          threeD: this.threeD, regionMap: this.regionMap,
+          chartEx: this.chartEx, tiff: this.tiff,
+        }, target, viewport,
+        {
+          ...renderOpts,
+          authoritativeMdw: extracted.layoutMetrics?.maximumDigitWidth,
+          officeFontRoutes: targetFontSet
+            ? this.retainedFontSets.get(targetFontSet)?.loaded?.office.routes
+            : undefined,
+          googleSubstitutes: this.googleSubstitutes,
+          fetchImage: this._fetchImage,
+        },
+      );
+      return;
+    }
     return this.withWorksheetArchiveOperation(sheetIndex, (source) => {
       const ws = extracted.worksheet ?? createSizeOverriddenWorksheet(source, sizeOverrides);
       if (ws !== source) inheritSheetRenderCache(source, ws);
@@ -1251,8 +1337,7 @@ export class XlsxWorkbook {
       if (!Number.isInteger(sheetIndex) || sheetIndex < 0 || sheetIndex >= this.sheetCount) {
         throw new Error(`Sheet index ${sheetIndex} out of range (count: ${this.sheetCount})`);
       }
-      const res = await this.withWorksheetArchiveOperation(sheetIndex, () =>
-        this.requireBridge().request(
+      const request = () => this.requireBridge().request(
           (id) => ({
             type: 'renderViewport',
             id,
@@ -1262,7 +1347,19 @@ export class XlsxWorkbook {
             layoutMetrics: extracted.layoutMetrics,
             viewProjection: extracted.projection,
           }) satisfies RenderWorkerRequest,
+        );
+      const preview = this.sheetPreviews?.get(sheetIndex);
+      let res;
+      if (preview?.worksheet && extracted.worksheet) {
+        await preview.waitFor(Math.max(
+          viewport.row + viewport.rows - 1,
+          wireOpts.freezeRows ?? 0,
         ));
+        this.assertResourceHealthy();
+        res = await request();
+      } else {
+        res = await this.withWorksheetArchiveOperation(sheetIndex, request);
+      }
       return (res as Extract<RenderWorkerResponse, { type: 'viewportRendered' }>).bitmap;
     }
     const off = new OffscreenCanvas(1, 1);
@@ -1329,9 +1426,11 @@ export class XlsxWorkbook {
     // leave this coordination promise as an unhandled rejection.
     void load.catch(() => undefined);
     this.sheetLoads.set(sheetIndex, load);
+    const progress = new WorksheetPreview([]);
+    (this.sheetPreviews ??= new Map()).set(sheetIndex, progress);
     const combined = this.runArchiveOperation(async () => {
       try {
-        const worksheet = await this.loadWorksheetStream(sheetIndex, sheetMeta.name);
+        const worksheet = await this.loadWorksheetStream(sheetIndex, sheetMeta.name, progress);
         resolveLoad(worksheet);
         return await operation(worksheet);
       } catch (error) {
@@ -1339,6 +1438,7 @@ export class XlsxWorkbook {
         throw error;
       } finally {
         if (this.sheetLoads.get(sheetIndex) === load) this.sheetLoads.delete(sheetIndex);
+        if (this.sheetPreviews?.get(sheetIndex) === progress) this.sheetPreviews.delete(sheetIndex);
       }
     });
     return combined;
@@ -1357,6 +1457,10 @@ export class XlsxWorkbook {
     this.completePendingEvictions();
     this.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
     this.sheetLoads.clear();
+    for (const progress of this.sheetPreviews?.values() ?? []) {
+      progress.fail(new Error('XLSX workbook has been destroyed'));
+    }
+    this.sheetPreviews?.clear();
     this.fontsDestroyed = true;
     for (const retained of this.retainedFontSets.values()) {
       if (retained.loaded) {
@@ -1413,6 +1517,23 @@ export function acquireXlsxWorksheet(workbook: XlsxWorkbook, sheetIndex: number)
   release: () => void;
 }> {
   return workbook['acquireWorksheetLease'](sheetIndex);
+}
+
+/** @internal Fast viewer acquisition. Structural test doubles retain the
+ * established full-model contract. */
+export function acquireXlsxWorksheetPreview(workbook: XlsxWorkbook, sheetIndex: number): Promise<{
+  worksheet: Worksheet;
+  release: () => void;
+  partial: boolean;
+  completion: Promise<Worksheet>;
+  waitForRows?: (row: number) => Promise<void>;
+  releaseFirstPaint?: () => void;
+}> {
+  const acquire = workbook['acquireWorksheetPreviewLease'];
+  if (typeof acquire === 'function') return acquire.call(workbook, sheetIndex);
+  return acquireXlsxWorksheet(workbook, sheetIndex).then((lease) => ({
+    ...lease, partial: false, completion: Promise.resolve(lease.worksheet),
+  }));
 }
 
 /** @internal Restore the active viewer lease for a displayed worksheet even
