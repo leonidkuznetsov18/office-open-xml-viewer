@@ -71,15 +71,34 @@ pub fn parse_standalone_shape_part(
             || theme_style_has_relationship(root, &theme);
         let placeholder = is_placeholder(root);
         let element = match (root.tag_name().name(), is_p_ns(root.tag_name().namespace())) {
-            ("sp", true) => parse_shape(
-                root,
-                &LayoutPlaceholders::default(),
-                &theme,
-                &rels,
-                base,
-                None,
-                zip,
-            ),
+            ("sp", true) => {
+                let mut element = parse_shape(
+                    root,
+                    &LayoutPlaceholders::default(),
+                    &theme,
+                    &rels,
+                    base,
+                    None,
+                    zip,
+                );
+                // In slide trees an image-filled p:sp is converted to a
+                // PictureElement before parse_shape. A standalone caller needs
+                // its image fill on the ShapeElement instead, retaining the
+                // same relationship-resolved source and srcRect.
+                if let Some(blip) = child(root, "spPr").and_then(|sp| child(sp, "blipFill")) {
+                    let mut resolve = |id: &str| {
+                        let target = rels.get(id)?;
+                        let path = resolve_path(base, target);
+                        zip.index_for_name(&path).map(|_| path)
+                    };
+                    if let Some(fill) = parse_blip_fill(blip, &theme, &mut resolve) {
+                        if let Some(shape) = &mut element {
+                            shape.fill = Some(fill);
+                        }
+                    }
+                }
+                element
+            }
             ("cxnSp", true) => parse_connector(root, &theme, &rels),
             _ => None,
         };
@@ -189,6 +208,40 @@ mod tests {
             assert!(parse(&shape(Some(namespace), "pic", ""), "", None)
                 .unwrap()
                 .is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_shape_keeps_relationship_backed_image_fill() {
+        use std::io::Write;
+        let xml = format!(
+            "<p:sp xmlns:p=\"{P}\" xmlns:a=\"{A}\" xmlns:r=\"{R}\"><p:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:blipFill><a:blip r:embed=\"rId1\"/><a:srcRect l=\"35000\"/><a:stretch><a:fillRect/></a:stretch></a:blipFill></p:spPr></p:sp>"
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("shape.xml", xml.as_bytes()),
+            ("_rels/shape.xml.rels", b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image.png\"/></Relationships>".as_slice()),
+            ("media/image.png", b"image".as_slice()),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        let package = zip.finish().unwrap().into_inner();
+        let parsed =
+            parse_standalone_shape_part(&package, "shape.xml", "", None, 100_000, 1_000_000)
+                .unwrap()
+                .unwrap();
+        match parsed.element.fill {
+            Some(Fill::Image {
+                image_path,
+                src_rect,
+                ..
+            }) => {
+                assert_eq!(image_path, "media/image.png");
+                assert_eq!(src_rect.unwrap().l, 0.35);
+            }
+            other => panic!("image fill lost: {other:?}"),
         }
     }
 
