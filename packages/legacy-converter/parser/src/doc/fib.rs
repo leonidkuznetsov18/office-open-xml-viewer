@@ -70,7 +70,18 @@ pub(super) fn effective_version(word: &[u8]) -> Result<u16, String> {
     } else {
         u16_at(&word[start..end], 0)?
     };
-    if !matches!(version, 0x00c1 | 0x00d9 | 0x0101 | 0x010c | 0x0112)
+    // [MS-DOC] 2.5.1 lists no 0x00C3 layout: it is undefined by the spec.
+    // Word controls changing only nFibNew C2/C3/C4/D9 all open and print the
+    // same 13 pages when cbRgFcLcb=0x6C; a Word save rewrites the C3 source
+    // as 0x0112 without changing those pages. The 0x6C count is the published
+    // FibRgFcLcb2000 layout, so admit this observed C3 envelope only. The
+    // older 12-page reference uses a different font fallback (Sylfaen versus
+    // the current Word's Times New Roman), not a different FIB interpretation.
+    let observed_c3 = version == 0x00c3
+        && u16_at(word, 2)? == 0x00c1
+        && u16_at(word, CB_RG_FC_LCB_OFFSET)? == 0x006c
+        && count == 4;
+    if !matches!(version, 0x00c1 | 0x00d9 | 0x0101 | 0x010c | 0x0112) && !observed_c3
         || (count != 0 && version == 0x00c1)
     {
         return Err(unsupported("unsupported Word FIB version"));
@@ -89,7 +100,11 @@ mod tests {
             bytes.extend(count.to_le_bytes());
             bytes.resize(bytes.len() + usize::from(count) * unit, 0xa5);
         }
-        let count = extension.map_or(0u16, |version| if version == 0x0112 { 5 } else { 2 });
+        let count = extension.map_or(0u16, |version| match version {
+            0x0112 => 5,
+            0x00c3 => 4,
+            _ => 2,
+        });
         bytes.extend(count.to_le_bytes());
         if let Some(version) = extension {
             bytes.extend(version.to_le_bytes());
@@ -118,6 +133,20 @@ mod tests {
             effective_version(&fib(0xd9, None, [14, 22, 0x6c])).unwrap(),
             0xd9
         );
+    }
+
+    #[test]
+    fn observed_c3_uses_the_2000_fc_lcb_envelope_only() {
+        assert_eq!(
+            effective_version(&fib(0xc1, Some(0xc3), [14, 22, 0x6c])).unwrap(),
+            0xc3
+        );
+        for (base, count) in [(0xc1, 0x5d), (0xc1, 0x88), (0xd9, 0x6c)] {
+            assert!(effective_version(&fib(base, Some(0xc3), [14, 22, count])).is_err());
+        }
+        for neighbour in [0xc2, 0xc4] {
+            assert!(effective_version(&fib(0xc1, Some(neighbour), [14, 22, 0x6c])).is_err());
+        }
     }
 
     #[test]
