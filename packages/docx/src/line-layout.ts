@@ -1,4 +1,5 @@
 import type { CjkLang } from '@silurus/ooxml-core';
+import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 // DOCX line-layout engine — the pure segmentation + line-breaking + measurement
 // kernel that both the paginator and the paint pass call to turn a paragraph's
 // runs into laid-out lines and line-box heights (ECMA-376 §17.3.1.x line
@@ -3043,6 +3044,977 @@ function mayUseAuthoredReferenceVerticalMetric(
     || mayUseExactLocalReferenceWidthMetric(selected);
 }
 
+interface SegmentBuildContext {
+  readonly runs: readonly ParagraphLayoutRun[];
+  readonly environment: LineLayoutEnvironment;
+  readonly segs: LayoutSeg[];
+  readonly fitTextFragmentEntryByKey: Map<string, number>;
+  readonly fitTextRegionByEntry: Map<number, number>;
+  readonly selectedMetric: (selected: FontResolution | undefined, probeText: string) => ResolvedFontMetric | undefined;
+  readonly selectedAverageWidth: (selected: FontResolution | undefined, probeText: string) => number | undefined;
+}
+
+function appendTextPiece(
+  state: SegmentBuildContext,
+  text: string,
+  base: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
+  vertAlign: 'super' | 'sub' | null,
+  sourceRunIndex: number,
+  sourceFragmentIndex?: number,
+  joinPreviousRun = false,
+): void {
+  const {
+    runs,
+    environment,
+    segs,
+    fitTextFragmentEntryByKey,
+    fitTextRegionByEntry,
+    selectedMetric,
+    selectedAverageWidth,
+  } = state;
+  const r: ParagraphTextBearingRun = base;
+  const overflowPunctuationEastAsianRun = EAST_ASIAN_RE.test(text) ? true : undefined;
+  const acquiredTypography = (
+    r as ParagraphTextBearingRun &
+      Readonly<{
+        typographyInput?: import('./layout/typography-input.js').RunTypographyAcquisitionInput;
+      }>
+  ).typographyInput;
+  // ECMA-376 §17.16.18 stores a complex field's instruction/result across
+  // several physical runs. The parser rebuilds recomputed PAGE/NUMPAGES as a
+  // single FieldRun, while its complete effective §17.3.2 run properties live
+  // on the immutable typography acquisition sidecar. Consume those effective
+  // facts exactly like an ordinary text run so the field result does not lose
+  // baseline position or the core character-metric axes used by measure/paint.
+  const acquiredValue = <T,>(
+    value: import('./layout/typography-input.js').TypographyValueInput<T> | undefined,
+    fallback: T | undefined,
+  ): T | undefined => (value?.status === 'valid' && value.value !== null ? value.value : fallback);
+  const effectiveVertAlign =
+    acquiredValue(acquiredTypography?.verticalAlign, vertAlign ?? undefined) ?? null;
+  const effectivePosition = acquiredValue(acquiredTypography?.positionPt, r.position);
+  const effectiveCharacterSpacing = acquiredTypography?.characterSpacingPt ?? r.charSpacing;
+  // ECMA-376 §17.3.2.35 gives an authored run an explicit character pitch.
+  // Word observation: a positive `w:spacing` owns that expanded pitch and suppresses
+  // document-level §17.15.1.18 punctuation whitespace compression for the
+  // run. Combining both adjustments collapses consecutive Japanese closing
+  // punctuation even though Word preserves the authored spacing.
+  const documentCharacterCompressionApplies =
+    wordDocumentCharacterCompressionApplies(effectiveCharacterSpacing);
+  const effectiveCharacterScale = acquiredTypography?.characterScale ?? r.charScale;
+  // WORD_OPENTYPE_FEATURES_COMPAT_KERNING: the exact compatSetting enables
+  // kerning for unqualified runs. Authored/style-resolved w:kern wins.
+  const effectiveKerningThreshold =
+    acquiredTypography?.kerningThresholdPt ??
+    r.kerning ??
+    (environment.enableOpenTypeFeatures ? 0 : undefined);
+  const effectiveSnapToGrid = acquiredTypography?.snapToGrid ?? r.snapToGrid;
+  // §17.3.2.33 small caps are sized per character: lowercase LETTERS render two
+  // points smaller, uppercase letters and non-alphabetic characters at the full
+  // run size. `reduced` (set per case-piece in the loop below) carries that onto
+  // each emitted segment; calcEffectiveFontPx shrinks only the reduced ones.
+  // allCaps (§17.3.2.5) and non-caps runs are a single, non-reduced piece.
+  let reduced = false;
+  // Ruby annotation rides with the WHOLE base text (typically 1-2 chars).
+  // Splitting on word boundaries would lose the association, so attach
+  // the annotation only to the first emitted segment.
+  const baseRuby = r.ruby;
+  const ruby = baseRuby
+    ? {
+        text: baseRuby.text,
+        fontSizePt: baseRuby.fontSizePt,
+        ...(baseRuby.hpsRaisePt != null ? { hpsRaisePt: baseRuby.hpsRaisePt } : {}),
+      }
+    : undefined;
+  const revision = r.revision;
+  const rtl = r.rtl === true ? true : undefined;
+  const fitTextFragmentEntryIndex =
+    sourceFragmentIndex === undefined
+      ? undefined
+      : fitTextFragmentEntryByKey.get(`${sourceRunIndex}:${sourceFragmentIndex}`);
+  const fitTextRegionIndex =
+    fitTextFragmentEntryIndex === undefined
+      ? undefined
+      : fitTextRegionByEntry.get(fitTextFragmentEntryIndex);
+
+  // IX1 — resolve the run's hyperlink target ONCE (§17.16.22 external URL /
+  // §17.16.23 internal anchor). An external URL (`r.hyperlink`) wins over the
+  // internal `w:anchor` when both are present, matching the parser's rule. A
+  // FieldRun carries neither field, so the `as DocxTextRun` guards yield
+  // undefined. Purely a callback payload — it does not touch measurement.
+  const hyperlink: HyperlinkTarget | undefined = r.hyperlink
+    ? { kind: 'external', url: r.hyperlink }
+    : r.hyperlinkAnchor
+      ? { kind: 'internal', ref: r.hyperlinkAnchor }
+      : undefined;
+
+  // ECMA-376 §17.3.2.26 content classification. w:rtl/w:cs selects the cs
+  // axis except for a character assigned eastAsia while rFonts@hint=eastAsia;
+  // that protected span keeps the non-cs East Asian formatting axis.
+  // NOTE rFonts@cs (fontFamilyCs) alone is just a font SLOT and must NOT
+  // force cs — e.g. sample-1's Heading1 (Latin) has cstheme + szCs=52 but
+  // renders at w:sz=24; forcing cs blew its size up to 26pt.
+  const forceCs = r.rtl === true || r.cs === true;
+
+  // Complex-script (cs) formatting sources. SIZE (§17.3.2.39 szCs) and TYPEFACE
+  // (§17.3.2.26 rFonts@cs) fall back to their Latin counterpart when absent —
+  // the parser resolves szCs through the full style chain, mirroring a
+  // directly-set `w:sz` per §17.3.2.18. But BOLD (§17.3.2.3 bCs) and ITALIC
+  // (§17.3.2.17 iCs) are independent toggles: absent `bCs`/`iCs` defaults off
+  // and must not inherit Latin-axis `w:b`/`w:i`, which govern only non-complex
+  // content.
+  const csFontSize = r.fontSizeCs ?? base.fontSize;
+  const csFontFamily = r.fontFamilyCs ?? base.fontFamily;
+  const highAnsiFontFamily = r.fontFamilyHighAnsi ?? base.fontFamily;
+  const csBold = r.boldCs ?? false;
+  const csItalic = r.italicCs ?? false;
+
+  // ECMA-376 §17.3.2.26 eastAsia axis. Within a non-complex-script slice, CJK
+  // code points take the eastAsia face while Latin/digits keep the ascii face
+  // (`base.fontFamily`). Only `DocxTextRun` carries the axis; absent (field
+  // runs / single-axis parser output) ⇒ fall back to ascii. Text-box runs feed
+  // this same builder (via `shapeRunToDocRun`), so a text box's per-script face
+  // is picked here too. Bold/italic/size are NOT axis-specific here — eastAsia
+  // shares the Latin (non-cs) toggles, so only the family differs.
+  const eaFontFamily = r.fontFamilyEastAsia ?? base.fontFamily;
+
+  // `word-rtl-complex-script-european-digits-an`: use the bidi language's
+  // primary subtag when present, otherwise fall back to an rtl-marked run.
+  const digitsAsAN = (forceCs || Boolean(r.rtl)) && isRtlBidiLang(r.langBidi, Boolean(r.rtl));
+
+  let firstSeg = true;
+  // True while the next emitted segment should be GLUED to the previous one
+  // (a small-caps case-piece that continues the same word). Consumed by the
+  // first pushSeg of the piece so only that segment carries joinPrev.
+  let gluePending = false;
+  // Script slot for an emitted segment (§17.3.2.26): 'cs' = complex-script
+  // (Arabic/Hebrew/...), 'ea' = East-Asian (CJK → eastAsia face), 'latin' =
+  // Latin/digits/neutral (ascii face). Each segment stays SINGLE-FONT — one
+  // family for its whole `.text` — so the measure==draw / docGrid char-grid
+  // invariant holds and the draw loop needs no per-segment font switching.
+  const pushSeg = (
+    text: string,
+    cs: boolean,
+    fontFamily: string | null,
+    authoritativeSpan?: TextShapeSpan,
+    compressCharacterWhitespace = false,
+    mappedSymbolUnicode = false,
+  ) => {
+    if (
+      environment.balanceSingleByteDoubleByteWidth &&
+      !cs &&
+      text.includes('\u3000') &&
+      [...text].some((character) => character !== '\u3000')
+    ) {
+      // The registered width-balance projection treats U+3000 as a half-delta space while
+      // other East-Asian glyphs receive the full delta. Split only at that
+      // semantic boundary so Canvas can retain one uniform letterSpacing per
+      // segment (measure == paint); the space itself has no contextual shape.
+      for (const part of text.split(/(\u3000+)/u).filter(Boolean)) {
+        pushSeg(part, cs, fontFamily, undefined, compressCharacterWhitespace, mappedSymbolUnicode);
+      }
+      return;
+    }
+    // ECMA-376 §17.15.1.18 / §17.18.7 — dispatch the exact
+    // ST_CharacterSpacing value and split each eligible full-width character
+    // so its selected face's tight ink bounds can define the removable
+    // whitespace. Non-eligible text retains contextual shaping.
+    if (
+      !compressCharacterWhitespace &&
+      documentCharacterCompressionApplies &&
+      fitTextRegionIndex === undefined
+    ) {
+      const boundaries = [0, ...graphemeClusterOffsets(text), text.length];
+      const graphemes = boundaries
+        .slice(0, -1)
+        .map((start, index) => text.slice(start, boundaries[index + 1]));
+      if (
+        graphemes.some((grapheme) =>
+          characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
+        )
+      ) {
+        pushSeg(text, cs, fontFamily, undefined, true, mappedSymbolUnicode);
+        return;
+      }
+    }
+    const bold = cs ? csBold : base.bold;
+    const italic = cs ? csItalic : base.italic;
+    const weight = bold ? 700 : 400;
+    const style = italic ? ('italic' as const) : ('normal' as const);
+    const textShapeRequest: TextShapeRequest = Object.freeze({
+      text,
+      fontSizePt: cs ? csFontSize : base.fontSize,
+      // A successfully decoded Symbol/Wingdings code point is Unicode text,
+      // not a request for the legacy font encoding. Clear every authored
+      // slot so the text service resolves a Unicode-capable generic route;
+      // otherwise its §17.3.2.26 slot resolver selects Symbol again and the
+      // mapped character can still be drawn with the wrong cmap.
+      fonts: mappedSymbolUnicode
+        ? { ascii: null, highAnsi: null, eastAsia: null, complexScript: null }
+        : (r.fontSlots?.direct ?? {
+            ascii: base.fontFamily,
+            highAnsi: highAnsiFontFamily,
+            eastAsia: eaFontFamily,
+            complexScript: csFontFamily,
+          }),
+      themeFonts: mappedSymbolUnicode ? undefined : r.fontSlots?.theme,
+      themeFontPresence: mappedSymbolUnicode ? undefined : r.fontSlots?.themePresent,
+      weight,
+      style,
+      complexScript: cs,
+      fontHint: r.fontHint,
+      eastAsiaLanguage: r.langEastAsia,
+      kerning:
+        effectiveKerningThreshold != null &&
+        (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
+      measure: false,
+    });
+    const shaped = authoritativeSpan
+      ? { spans: [authoritativeSpan] }
+      : environment.layoutServices?.text.shape(textShapeRequest);
+    const punctuationCompressions =
+      compressCharacterWhitespace && documentCharacterCompressionApplies
+        ? (() => {
+            const boundaries = [0, ...graphemeClusterOffsets(text), text.length];
+            const compressions: Array<{ end: number; adjustmentPt: number }> = [];
+            for (let index = 0; index < boundaries.length - 1; index += 1) {
+              const start = boundaries[index]!;
+              const end = boundaries[index + 1]!;
+              const compressedGrapheme = text.slice(start, end);
+              if (
+                !characterSpacingControlCompresses(
+                  compressedGrapheme,
+                  environment.characterSpacingControl,
+                )
+              )
+                continue;
+              const measured = environment.layoutServices?.text.shape({
+                ...textShapeRequest,
+                text: compressedGrapheme,
+                measure: true,
+                clusterGeometry: false,
+              });
+              // ECMA-376 §17.15.1.18 defines only compression eligibility. The
+              // registered Word observation retains half of the selected route's
+              // ideographic cell for punctuation; this is not assumed to be half
+              // of a proportional punctuation glyph's own advance. Kana in
+              // `compressPunctuationAndJapaneseKana` has no observed cell floor,
+              // so only its measured trailing sidebearing is removed.
+              const removableUnscaledPt =
+                measured?.inkBounds && measured.horizontalInkBoundsAreTight === true
+                  ? (() => {
+                      const trailingWhitespacePt = Math.max(
+                        0,
+                        Math.min(
+                          measured.advancePt,
+                          measured.advancePt - measured.inkBounds.xMaxPt,
+                        ),
+                      );
+                      if (!COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(compressedGrapheme)) {
+                        return trailingWhitespacePt;
+                      }
+                      const punctuationRoute = measured.spans[0]?.fontRoute.fingerprint;
+                      const ideographicCell = environment.layoutServices?.text.shape({
+                        ...textShapeRequest,
+                        // U+3000 is semantically an ideographic space, but several
+                        // proportional East Asian faces expose it to Canvas with
+                        // the same narrow advance as their punctuation. The grid's
+                        // full-width character cell is represented by an
+                        // ideograph, not by that platform-specific space metric.
+                        text: '\u4e00',
+                        fontHint: 'eastAsia',
+                        measure: true,
+                        clusterGeometry: false,
+                      });
+                      const cellRoute = ideographicCell?.spans[0]?.fontRoute.fingerprint;
+                      const cellAdvancePt = ideographicCell?.advancePt;
+                      if (
+                        !punctuationRoute ||
+                        cellRoute !== punctuationRoute ||
+                        cellAdvancePt === undefined ||
+                        !Number.isFinite(cellAdvancePt) ||
+                        cellAdvancePt <= 0
+                      ) {
+                        return 0;
+                      }
+                      const retainedExtentPt = wordJapanesePunctuationRetainedExtentPt({
+                        punctuationAdvancePt: measured.advancePt,
+                        punctuationInkEndPt: measured.inkBounds.xMaxPt,
+                        ideographicCellAdvancePt: cellAdvancePt,
+                      });
+                      return Math.max(
+                        0,
+                        Math.min(trailingWhitespacePt, measured.advancePt - retainedExtentPt),
+                      );
+                    })()
+                  : 0;
+              // §17.3.2.43 w:w scales the glyph and both of its sidebearings;
+              // trim in the same post-scale coordinate space as segAdvanceWidth.
+              const removablePt = removableUnscaledPt * (effectiveCharacterScale ?? 1);
+              if (removablePt > 0) {
+                compressions.push({ end, adjustmentPt: -removablePt });
+              }
+            }
+            return compressions.length === 0
+              ? undefined
+              : Object.freeze(compressions.map((compression) => Object.freeze(compression)));
+          })()
+        : undefined;
+    const resolvedAxisDiffers =
+      shaped?.spans.some((span) => (span.script === 'complexScript') !== cs) ?? false;
+    if (shaped && (shaped.spans.length > 1 || resolvedAxisDiffers)) {
+      for (let spanIndex = 0; spanIndex < shaped.spans.length; spanIndex += 1) {
+        const span = shaped.spans[spanIndex]!;
+        const spanCs = span.script === 'complexScript';
+        const spanFamily = spanCs
+          ? csFontFamily
+          : span.script === 'eastAsia'
+            ? eaFontFamily
+            : span.script === 'highAnsi'
+              ? highAnsiFontFamily
+              : base.fontFamily;
+        const compressedSpan =
+          documentCharacterCompressionApplies &&
+          compressCharacterWhitespace &&
+          [...span.text].some((grapheme) =>
+            characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
+          );
+        pushSeg(span.text, spanCs, spanFamily, span, compressedSpan);
+      }
+      return;
+    }
+    const resolvedSpan = shaped?.spans[0];
+    const localFont = resolvedSpan ? selectedMetric(resolvedSpan.font, text) : undefined;
+    const eaResolution = environment.layoutServices?.text.resolve({
+      fonts: textShapeRequest.fonts,
+      themeFonts: textShapeRequest.themeFonts,
+      themeFontPresence: textShapeRequest.themeFontPresence,
+      slot: 'eastAsia',
+      weight,
+      style,
+    });
+    // A DrawingML/WPS text-body floor is reserved by its independently
+    // selected eastAsia slot, even when this run paints Latin glyphs through
+    // ascii. Empty coverage here means "no glyph is borrowed from this face";
+    // the selected resource contributes vertical geometry only. Ordinary
+    // segments still require coverage of their actual text.
+    const eaFloorProbe = (r as DocxTextRun & { textBoxLineFloor?: boolean }).textBoxLineFloor
+      ? ''
+      : text;
+    const localEaFloor = eaResolution ? selectedMetric(eaResolution, eaFloorProbe) : undefined;
+    // Once a service selected a face, do not re-admit metrics by the authored
+    // family name after the selected-face lookup failed (e.g. a substitute).
+    // §17.3.1.33 atLeast is max(normal single-line height, authored minimum).
+    // The Word OpenType projection supplies that normal box by inference;
+    // exact spacing instead suppresses it.
+    const naturalMetricAllowed = environment.lineSpacing?.rule !== 'exact';
+    const resourceFamilyLineMetric =
+      (naturalMetricAllowed || localFont?.designAscentRatio == null) &&
+      (localFont?.lineHeightRatio != null ||
+        localFont?.designAscentRatio != null ||
+        localFont?.eastAsianLineHeightRatio != null)
+        ? localFont
+        : undefined;
+    const referenceLineMetric =
+      naturalMetricAllowed &&
+      !resourceFamilyLineMetric &&
+      mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font)
+        ? referenceFontLineMetrics(
+            resolvedSpan.font.requestedFamily,
+            resolvedSpan.font.weight,
+            resolvedSpan.font.style,
+          )
+        : undefined;
+    const familyLineMetric = resourceFamilyLineMetric ?? referenceLineMetric;
+    const resourceEaLineMetric =
+      (naturalMetricAllowed || localEaFloor?.designAscentRatio == null) &&
+      (localEaFloor?.lineHeightRatio != null ||
+        localEaFloor?.designAscentRatio != null ||
+        localEaFloor?.eastAsianLineHeightRatio != null)
+        ? localEaFloor
+        : undefined;
+    const referenceEaLineMetric =
+      naturalMetricAllowed &&
+      !resourceEaLineMetric &&
+      mayUseAuthoredReferenceVerticalMetric(eaResolution)
+        ? referenceFontLineMetrics(
+            eaResolution.requestedFamily,
+            eaResolution.weight,
+            eaResolution.style,
+          )
+        : undefined;
+    const eaLineMetric = resourceEaLineMetric ?? referenceEaLineMetric;
+    const resolvedEaFloorFamily =
+      eaResolution?.resolvedFamily ?? localEaFloor?.family ?? eaFontFamily;
+    // WORD_USE_FE_LAYOUT_INHERITED_GRID_MINIMUM was observed for an active
+    // document line grid. ECMA-376 §17.6.5 disables an omitted/default grid
+    // type and excludes table-cell line pitch unless §17.15.3.1
+    // adjustLineHeightInTable is enabled. An inherited eastAsia font axis
+    // alone must not raise a Latin-only non-grid line's normal-line floor.
+    const useFeEastAsianMetric =
+      environment.useFeLayout &&
+      environment.lineGridActive &&
+      (r.fontHint === 'eastAsia' || Boolean(resolvedEaFloorFamily?.trim()));
+    const resolvedScript =
+      resolvedSpan?.script ??
+      authoritativeSpan?.script ??
+      (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
+    const latinSpaceCompressionEligible =
+      environment.characterSpacingControl === 'compressPunctuation' &&
+      // MS-OE376 §2.1.472 requires full advance for fit with this
+      // compatibility switch, even if display uses compression. This gate
+      // covers the measured Latin fit behavior; display-space placement
+      // under the switch has not yet been established.
+      environment.lineWrapLikeWord6 !== true &&
+      // The xAvg floor was measured for horizontal Latin words; upright
+      // vertical runs and tate-chu-yoko use distinct advance allocation.
+      environment.verticalCJK !== true &&
+      documentCharacterCompressionApplies &&
+      (resolvedScript === 'ascii' || resolvedScript === 'highAnsi') &&
+      !reduced &&
+      effectiveVertAlign == null &&
+      (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
+      (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
+      effectiveKerningThreshold == null;
+    const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
+      ? selectedAverageWidth(resolvedSpan?.font, text)
+      : undefined;
+    const widthBalanceGridDeltaFactor = environment.balanceSingleByteDoubleByteWidth
+      ? wordBalancedLinesAndCharsGridDeltaFactor(text, resolvedScript)
+      : undefined;
+    segs.push({
+      text,
+      script: resolvedScript,
+      ...(widthBalanceGridDeltaFactor !== undefined
+        ? {
+            // §17.15.3.3 defines the SBCS:DBCS width ratio as 1:2; the
+            // registered Word matrix defines how that setting projects onto
+            // linesAndChars charSpace. Production shaping has already split
+            // the segment at §17.3.2.26 script-slot boundaries.
+            widthBalanceGridDeltaFactor,
+          }
+        : {}),
+      ...(useFeEastAsianMetric ? { metricEastAsian: true as const } : {}),
+      bold,
+      italic,
+      underline: base.underline,
+      // §17.3.2.40 underline style / colour — carried only on DocxTextRun (a
+      // FieldRun draws single). Kept raw ST_Underline; the renderer normalizes
+      // to DrawingML §20.1.10.82 at draw time.
+      underlineStyle: r.underlineStyle,
+      underlineColor: r.underlineColor,
+      strikethrough: base.strikethrough,
+      fontSize: cs ? csFontSize : base.fontSize,
+      color: base.color,
+      fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
+      fontRoute: resolvedSpan?.fontRoute,
+      resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
+      ...(resourceFamilyLineMetric?.lineHeightRatio != null
+        ? {
+            resolvedResourceVerticalMetric: true as const,
+            resolvedDesignAscentRatio: resourceFamilyLineMetric.designAscentRatio,
+            resolvedDesignDescentRatio: resourceFamilyLineMetric.designDescentRatio,
+          }
+        : {}),
+      ...(referenceLineMetric
+        ? {
+            referenceFontVerticalMetric: true as const,
+            resolvedDesignAscentRatio: referenceLineMetric.designAscentRatio,
+            resolvedDesignDescentRatio: referenceLineMetric.designDescentRatio,
+          }
+        : {}),
+      resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
+      ...(latinSpaceAverageWidthRatio != null && latinSpaceAverageWidthRatio > 0
+        ? { latinSpaceAverageWidthRatio, latinSpaceCompressionEligible: true as const }
+        : {}),
+      vertAlign: effectiveVertAlign,
+      measuredWidth: 0,
+      textLayoutService: environment.layoutServices?.text,
+      textShapeRequest,
+      breakBefore: resolvedSpan?.breakBefore ?? authoritativeSpan?.breakBefore ?? true,
+      smallCaps: reduced,
+      joinPrev:
+        (firstSeg && (r.noBreakBefore === true || joinPreviousRun)) ||
+        gluePending ||
+        authoritativeSpan?.breakBefore === false
+          ? true
+          : undefined,
+      hardJoinPrev: firstSeg && (r.noBreakBefore === true || joinPreviousRun) ? true : undefined,
+      doubleStrikethrough: base.doubleStrikethrough ?? false,
+      highlight: base.highlight ?? null,
+      // §17.3.2.12 w:em — carried on both DocxTextRun and FieldRun (a field's
+      // resolved/fallback text stamps the mark the same as a plain run).
+      emphasisMark: base.emphasisMark,
+      background: base.background ?? null,
+      colorAuto: r.colorAuto ?? false,
+      border: r.border ?? null,
+      ruby: firstSeg ? ruby : undefined,
+      revision,
+      ...(revision && environment.showTrackedChanges === true
+        ? {
+            trackChangesMarkup: {
+              kind: revision.kind,
+              authorColor: environment.revisionAuthorColor?.(revision.author) ?? '#C00000',
+            },
+          }
+        : {}),
+      rtl,
+      digitsAsAN: digitsAsAN ? true : undefined,
+      // §17.3.2.26 declared eastAsia axis — used by text-box line floors and
+      // the compatibility-owned useFELayout body metric path.
+      eaFloorFamily: resolvedEaFloorFamily,
+      eaFloorRoute: eaResolution?.route,
+      resolvedEaFloorLineHeightRatio: eaLineMetric?.lineHeightRatio,
+      resolvedEaFloorEastAsianLineHeightRatio: eaLineMetric?.eastAsianLineHeightRatio,
+      textBoxLineFloor: (r as DocxTextRun & { textBoxLineFloor?: boolean }).textBoxLineFloor,
+      textBoxVertical: (r as DocxTextRun & { textBoxVertical?: boolean }).textBoxVertical,
+      // IX1 — resolved hyperlink target of the originating run, for the
+      // text-layer clickable overlay and URL-aware line-break opportunities.
+      // It does not change glyph measurement or drawing.
+      hyperlink,
+      snapToCharacterGrid: effectiveSnapToGrid !== false,
+      // WD4 — run character metrics (§17.3.2.35 spacing / §17.3.2.43 w /
+      // §17.3.2.24 position / §17.3.2.19 kern). Uniform across the run, so
+      // every emitted segment carries the same values; the measure and paint
+      // passes apply them identically (measure==paint).
+      charSpacing: effectiveCharacterSpacing,
+      punctuationCompressions,
+      eastAsiaLanguage: r.langEastAsia,
+      overflowPunctuationEastAsianRun,
+      overflowPunctuationBidiLanguage: r.langBidi,
+      charScale: effectiveCharacterScale,
+      fitTextVal: fitTextRegionIndex === undefined ? undefined : r.fitTextVal,
+      fitTextId: fitTextRegionIndex === undefined ? undefined : r.fitTextId,
+      fitTextRegionIndex,
+      fitTextRunIndex: fitTextRegionIndex === undefined ? undefined : fitTextFragmentEntryIndex,
+      position: effectivePosition,
+      positionExtendsLineBox: environment.positionExtendsLineBox !== false,
+      kerning: effectiveKerningThreshold,
+      // ECMA-376 §17.3.2.10 eastAsianLayout — 縦中横 is meaningful ONLY in a
+      // vertical (tbRl) page, so fold the vertical gate in HERE at build time
+      // (buildSegments receives it through LineLayoutEnvironment). Measure/paint then read a single
+      // pre-gated flag. `vertCompress` rides only when `vert` is set (spec: it
+      // is ignored otherwise).
+      tateChuYoko: environment.verticalCJK && r.eastAsianVert === true ? true : undefined,
+      tateChuYokoCompress:
+        environment.verticalCJK && r.eastAsianVert === true && r.eastAsianVertCompress === true
+          ? true
+          : undefined,
+      // #1014 — an upright-vertical (tbRl) per-glyph segment (NOT a 縦中横 cell,
+      // which is one drawTateChuYokoRun cell). Marks the segment for the vo=Tr
+      // rotate-fallback ink-extent advance correction in the measure passes.
+      verticalRun: environment.verticalCJK && r.eastAsianVert !== true ? true : undefined,
+    });
+    firstSeg = false;
+    gluePending = false; // glue applies only to a piece's FIRST segment
+  };
+  const emit = (word: string, slot: 'cs' | 'ea' | 'latin') => {
+    const cs = slot === 'cs';
+    const fontFamily =
+      slot === 'cs' ? csFontFamily : slot === 'ea' ? eaFontFamily : base.fontFamily;
+    // ECMA-376 §17.3.2.26 + §17.3.3.30: a run whose rFonts axis is Symbol or
+    // Wingdings stores glyphs as the FONT's own (private) code points — Word
+    // commonly in the PUA (U+F020–U+F0FF). Those render as tofu in any
+    // fallback face, so normalize each character to its Unicode equivalent
+    // (core `symbolTextToUnicodeSegments`, the same table the list marker uses
+    // via `symbolFontToUnicode`). The string is split at mapped/unmapped
+    // boundaries: a MAPPED run is drawn in a generic fallback (fontFamily=null
+    // → sans tail with the dingbat glyphs; keeping the symbol family would let
+    // an installed Symbol/Wingdings re-interpret the Unicode code point as the
+    // WRONG glyph), while an UNMAPPED run keeps the symbol family so a host
+    // that ships Symbol/Wingdings still draws its native glyph. Done once at
+    // build time so measure==draw (the seg.text is never transformed later).
+    if (isSymbolFontFamily(fontFamily)) {
+      for (const part of symbolTextToUnicodeSegments(word, fontFamily)) {
+        pushSeg(part.text, cs, part.mapped ? null : fontFamily, undefined, false, part.mapped);
+      }
+      return;
+    }
+    pushSeg(word, cs, fontFamily);
+  };
+
+  // A non-complex-script slice still mixes scripts at the CJK boundary: emit
+  // its maximal CJK runs on the 'ea' (eastAsia) slot and the rest on 'latin'
+  // (ascii). Keeps each emitted segment single-font (so a serif ascii digit
+  // sits next to a gothic eastAsia title) without changing the cs path.
+  const emitNonCs = (slice: string) => {
+    if (environment.layoutServices?.text) {
+      // `w:sym` is parsed as a one-run private-encoding character carrying
+      // its own Symbol/Wingdings family (§17.3.3.30). Keep normalization in
+      // front of the service-backed script splitter as well as the legacy
+      // path; otherwise a PUA code point such as Symbol F0B0 reaches Canvas
+      // unchanged and renders as tofu.
+      if (isSymbolFontFamily(base.fontFamily)) {
+        emit(slice, 'latin');
+        return;
+      }
+      pushSeg(slice, false, base.fontFamily);
+      return;
+    }
+    for (const part of splitByEastAsia(slice)) emit(part.text, part.ea ? 'ea' : 'latin');
+  };
+
+  // Small caps split the run into full-size (uppercase-origin / non-cased) and
+  // reduced (lowercase-origin) case-pieces; everything else is one piece. Each
+  // piece is still UPPERCASED for display (allCaps or smallCaps), and `reduced`
+  // drives its segments' size — see splitSmallCapsCase / calcEffectiveFontPx.
+  const casePieces = base.smallCaps ? splitSmallCapsCase(text) : [{ text, reduced: false }];
+  let prevPieceText = '';
+  for (const piece of casePieces) {
+    reduced = piece.reduced;
+    // Glue this piece's FIRST segment to the previous piece when they continue
+    // the same word (the previous piece did not end at a space) — so a
+    // small-caps word's full-cap initial and reduced remainder stay on one line.
+    gluePending = prevPieceText.length > 0 && !/\s$/.test(prevPieceText);
+    prevPieceText = piece.text;
+    const displayText = base.allCaps || base.smallCaps ? piece.text.toUpperCase() : piece.text;
+    for (const word of splitTextForLayout(displayText)) {
+      if (forceCs) {
+        // When the run's digits are AN-classified, split a token into maximal
+        // digit-groups and the surrounding separators so the per-line bidi pass
+        // (which reorders at SEGMENT granularity) can place the groups in Word's
+        // order — e.g. "28-02-2026" → segments [28][-][02][-][2026] reordered to
+        // 2026-02-28. Canvas only reorders WITHIN a fillText using EN semantics,
+        // so a single-segment date would otherwise stay 28-02-2026.
+        if (digitsAsAN) {
+          for (const slice of splitDigitGroups(word)) emit(slice, 'cs');
+        } else {
+          emit(word, 'cs');
+        }
+      } else {
+        // Mixed Arabic+Latin word (no w:rtl / w:cs): split at script boundaries
+        // so each side gets its own (cs vs Latin) size and typeface; the non-cs
+        // side then sub-splits at CJK boundaries for the eastAsia face.
+        // ECMA-376 §17.3.2.26 selects the cs axis only when w:cs/w:rtl
+        // forces the run. Arabic/Hebrew code points in an ordinary run stay
+        // on ascii/hAnsi; the text service performs the remaining grapheme-
+        // safe East Asian slot split.
+        emitNonCs(word);
+      }
+    }
+  }
+}
+
+/** Resolve source-level no-break ownership and adjacent UAX14/fitText seams
+ * after every display segment has been emitted. */
+function finalizeBuiltSegments(
+  runs: readonly ParagraphLayoutRun[],
+  environment: LineLayoutEnvironment,
+  segs: LayoutSeg[],
+): void {
+  // Project acquisition-owned no-break ranges through the display case
+  // transform and onto the single-font layout segments produced above.
+  for (const [runIndex, run] of runs.entries()) {
+    if (run.type !== 'text') continue;
+    const textRun = run as Extract<ParagraphTextBearingRun, { type: 'text' }>;
+    const sourceRanges = textRun.noBreakRanges;
+    if (!sourceRanges || sourceRanges.length === 0) continue;
+    const displayedRanges = sourceRanges.map((range) => {
+      const transformOffset = (offset: number) => {
+        const prefix = textRun.text.slice(0, offset);
+        return textRun.allCaps || textRun.smallCaps ? prefix.toUpperCase().length : prefix.length;
+      };
+      return { start: transformOffset(range.start), end: transformOffset(range.end) };
+    });
+    let displayedCursor = 0;
+    for (const candidate of segs) {
+      if (candidate.sourceRunIndex !== runIndex) continue;
+      if (!('text' in candidate)) {
+        if ('isTab' in candidate) displayedCursor += 1;
+        continue;
+      }
+      const segmentEnd = displayedCursor + candidate.text.length;
+      if (
+        displayedCursor > 0 &&
+        displayedRanges.some(
+          (range) => range.start === displayedCursor || range.end === displayedCursor,
+        )
+      ) {
+        candidate.joinPrev = true;
+        candidate.hardJoinPrev = true;
+      }
+      const local = displayedRanges
+        .filter((range) => range.start >= displayedCursor && range.end <= segmentEnd)
+        .map((range) =>
+          Object.freeze({
+            start: range.start - displayedCursor,
+            end: range.end - displayedCursor,
+          }),
+        );
+      if (local.length > 0) candidate.noBreakRanges = Object.freeze(local);
+      displayedCursor = segmentEnd;
+    }
+  }
+
+  // Project the registered `word-external-link-syntax-breaks` opportunities
+  // across the complete semantic link and all formatting seams first, then
+  // distribute them onto the existing segments.
+  // Segments stay intact unless a real overflow selects one of those offsets,
+  // preserving contextual shaping, decoration geometry, and paint identity on
+  // lines that do not wrap.
+  for (let groupStart = 0; groupStart < segs.length; ) {
+    const first = segs[groupStart];
+    if (!('text' in first) || first.hyperlink?.kind !== 'external') {
+      groupStart += 1;
+      continue;
+    }
+    const target = first.hyperlink.url;
+    let groupEnd = groupStart;
+    const group: LayoutTextSeg[] = [];
+    while (groupEnd < segs.length) {
+      const candidate = segs[groupEnd];
+      if (
+        !('text' in candidate) ||
+        candidate.hyperlink?.kind !== 'external' ||
+        candidate.hyperlink.url !== target
+      )
+        break;
+      group.push(candidate);
+      groupEnd += 1;
+    }
+    const groupText = group.map((segment) => segment.text).join('');
+    const protectedOffsets = new Set<number>();
+    let cursor = 0;
+    for (const segment of group) {
+      for (const range of segment.noBreakRanges ?? []) {
+        const offsets = [range.start, range.end];
+        for (const offset of offsets) {
+          protectedOffsets.add(cursor + offset);
+        }
+      }
+      cursor += segment.text.length;
+    }
+    const legalOffsets = new Set<number>();
+    for (const match of groupText.matchAll(/\S+/gu)) {
+      const token = match[0];
+      const tokenStart = match.index;
+      const graphemeBoundaries = new Set(
+        graphemeClusterOffsets(token).map((offset) => tokenStart + offset),
+      );
+      const tokenProtected = new Set(
+        [...protectedOffsets]
+          .filter((offset) => offset > tokenStart && offset <= tokenStart + token.length)
+          .map((offset) => offset - tokenStart),
+      );
+      const tokenGraphemes = new Set([...graphemeBoundaries].map((offset) => offset - tokenStart));
+      for (const offset of wordExternalLinkSyntaxBreakOffsets(
+        token,
+        tokenGraphemes,
+        tokenProtected,
+      ))
+        legalOffsets.add(tokenStart + offset);
+    }
+    if (legalOffsets.size === 0) {
+      groupStart = groupEnd;
+      continue;
+    }
+    cursor = 0;
+    for (let index = 0; index < group.length; index += 1) {
+      const segment = group[index]!;
+      const segmentStart = cursor;
+      const segmentEnd = segmentStart + segment.text.length;
+      const localBreaks = [...legalOffsets]
+        .filter((offset) => offset > segmentStart && offset < segmentEnd)
+        .map((offset) => offset - segmentStart)
+        .sort((a, b) => a - b);
+      if (localBreaks.length > 0) {
+        segment.externalLinkBreakOffsets = Object.freeze(localBreaks);
+      }
+      if (index > 0 && legalOffsets.has(segmentStart)) {
+        segment.joinPrev = undefined;
+        segment.externalLinkBreakBefore = true;
+      }
+      cursor = segmentEnd;
+    }
+    groupStart = groupEnd;
+  }
+
+  if (environment.balanceSingleByteDoubleByteWidth) {
+    // ECMA-376 §17.15.3.3 normatively requests a 1:2 SBCS/DBCS width balance,
+    // but does not define how a proportional inter-word separator becomes a
+    // fixed-pitch half-width cell. The registered Word observation limits that
+    // projection to two-or-more explicitly authored U+0020 spaces. One normal
+    // separator remains at its natural proportional advance.
+    const metricCache = new Map<string, number>();
+    const adjustmentFor = (segment: LayoutTextSeg): number | undefined => {
+      const service = segment.textLayoutService;
+      const request = segment.textShapeRequest;
+      if (!service || !request) return undefined;
+      const effectiveFontSizePt = calcEffectiveFontPx(segment, 1);
+      const key = [
+        service.fingerprint,
+        segment.fontRoute?.fingerprint ?? 'implicit-latin',
+        segment.eaFloorRoute?.fingerprint ?? 'implicit-east-asia',
+        effectiveFontSizePt,
+        segment.bold ? 700 : 400,
+        segment.italic ? 'italic' : 'normal',
+        segment.kerning ?? 'none',
+      ].join('|');
+      const cached = metricCache.get(key);
+      if (cached !== undefined) return cached;
+      const naturalSpace = service.shape({
+        ...request,
+        text: ' ',
+        fontSizePt: effectiveFontSizePt,
+        measure: true,
+        clusterGeometry: false,
+      }).advancePt;
+      const ideographicCell = service.shape({
+        ...request,
+        text: '\u4e00',
+        fontSizePt: effectiveFontSizePt,
+        fontHint: 'eastAsia',
+        measure: true,
+        clusterGeometry: false,
+      }).advancePt;
+      if (
+        !Number.isFinite(naturalSpace) ||
+        !Number.isFinite(ideographicCell) ||
+        naturalSpace < 0 ||
+        ideographicCell <= 0
+      )
+        return undefined;
+      const adjustmentPt = ideographicCell / 2 - naturalSpace;
+      metricCache.set(key, adjustmentPt);
+      return adjustmentPt;
+    };
+    let sequence: LayoutTextSeg[] = [];
+    let sequenceCount = 0;
+    const flushSequence = () => {
+      if (wordBalancedConsecutiveSpaceCellApplies(sequenceCount)) {
+        for (const segment of sequence) {
+          segment.widthBalanceSpaceSequence = true;
+          const adjustmentPt = adjustmentFor(segment);
+          if (adjustmentPt !== undefined) {
+            segment.widthBalanceSpaceAdjustmentPt = adjustmentPt;
+          }
+        }
+      }
+      sequence = [];
+      sequenceCount = 0;
+    };
+    for (const candidate of segs) {
+      if (!('text' in candidate) || candidate.script === 'complexScript') {
+        flushSequence();
+        continue;
+      }
+      const trailingSpaces = candidate.text.length - candidate.text.replace(/ +$/u, '').length;
+      const spaceOnly = trailingSpaces > 0 && trailingSpaces === candidate.text.length;
+      if (!spaceOnly) flushSequence();
+      if (trailingSpaces > 0) {
+        sequence.push(candidate);
+        sequenceCount += trailingSpaces;
+      } else {
+        flushSequence();
+      }
+    }
+    flushSequence();
+  }
+
+  // ── UAX#14 LB13 / ECMA-376 §17.15.1.59 (行頭禁則 — line-start-forbidden) ──────
+  // A closing / mid-punctuation code point (comma, period, ; : ! ? ) ] } and
+  // their CJK forms) carries NO line-break opportunity before it, so it may
+  // never BEGIN a line. When such a char OPENS a segment that is glued to the
+  // previous text segment — no intervening whitespace, e.g. a comma authored in
+  // its own run as in sample-12's "…detection system" | ", metadata" — mark it
+  // `joinPrev` so the group machinery in layoutLines keeps it with the preceding
+  // word and wraps "system," together instead of orphaning "," at the next
+  // line's head.
+  //
+  // This is a UNIVERSAL Latin/Western rule (UAX#14 LB13), NOT the East-Asian
+  // kinsoku feature, so it consults the application's DEFAULT forbidden table
+  // UNCONDITIONALLY — independent of the document's §17.3.1.16 `w:kinsoku`
+  // toggle and of any custom §17.15.1.59 `w:noLineBreaksBefore` set (which
+  // REPLACES the default East-Asian table for a language and so must NOT be able
+  // to drop the ASCII non-starters and re-orphan a Latin comma). The document's
+  // kinsoku settings still govern the separate per-character CJK retract paths
+  // (kinsokuAdjustedSplit / crossRunKinsokuRetract), which read the layout kinsoku argument.
+  // The ASCII non-starters (!),.:;?]}) live in that default table (core
+  // rules.ts), so one membership test covers Latin and (incidentally) CJK forms.
+  for (let i = 1; i < segs.length; i++) {
+    const cur = segs[i];
+    if (!('text' in cur) || cur.joinPrev) continue;
+    const firstCp = cur.text.codePointAt(0);
+    if (firstCp === undefined || !DEFAULT_KINSOKU_RULES.lineStartForbidden.has(firstCp)) continue;
+    const prev = segs[i - 1];
+    // Only glue across a boundary that is NOT already a break opportunity: the
+    // preceding unit must be text that does not end in whitespace (a trailing
+    // space is a legal break, so the mark may legitimately start the line).
+    if (!('text' in prev) || /\s$/.test(prev.text)) continue;
+    cur.joinPrev = true;
+  }
+
+  // Preserve the established Word/JLReq line-end allowance for U+3000 across
+  // internal script/font/width-balance shaping seams. U+3000 is BA in UAX #14,
+  // so the break opportunity is after the space; splitting the space into its
+  // own internal segment must not invent an opportunity before it. A real
+  // U+0020 source-run boundary is delegated to
+  // wordSourceRunSpaceContinuesSequence below.
+  for (let i = 1; i < segs.length; i++) {
+    const cur = segs[i];
+    if (!('text' in cur) || cur.joinPrev || (cur.text[0] !== ' ' && cur.text[0] !== '\u3000'))
+      continue;
+    const prev = segs[i - 1];
+    if (!('text' in prev)) continue;
+    const trailingSpaceFromSameRun = cur.sourceRunIndex === prev.sourceRunIndex;
+    const compatibleSourceBoundary = wordSourceRunSpaceContinuesSequence(prev.text, cur.text);
+    if (!trailingSpaceFromSameRun && !compatibleSourceBoundary) continue;
+    cur.joinPrev = true;
+  }
+
+  // ── UAX #14 no-break pairs (LB14/LB23/LB23a/LB24/LB25/LB28/LB30) ──
+  // buildSegments intentionally splits at run / font-script boundaries, but
+  // those formatting seams are not line-break opportunities. Mark the following
+  // segment so layoutLines' existing atomic-group pre-flush selects the previous
+  // real opportunity instead. The shared predicate is deliberately one-way:
+  // false means unsupported/deferred, never "break allowed".
+  for (let i = 1; i < segs.length; i++) {
+    const cur = segs[i];
+    if (!('text' in cur) || cur.joinPrev || cur.externalLinkBreakBefore || cur.text.length === 0)
+      continue;
+    const prev = segs[i - 1];
+    if (!('text' in prev) || prev.text.length === 0) continue;
+
+    // Whitespace is an actual wrap boundary. Check both sides because source
+    // runs may start with whitespace even though ASCII spaces normally remain
+    // attached to the preceding splitTextForLayout token.
+    if (/\s$/u.test(prev.text) || /^\s/u.test(cur.text)) continue;
+
+    const prevChar = [...prev.text].at(-1);
+    const nextChar = [...cur.text][0];
+    const prevCp = prevChar?.codePointAt(0);
+    const nextCp = nextChar?.codePointAt(0);
+    if (prevCp === undefined || nextCp === undefined) continue;
+
+    // U+200B is the explicit zero-width-space opportunity from LB8 and is not
+    // included in JavaScript's \s character class.
+    if (prevCp === 0x200b || nextCp === 0x200b) continue;
+
+    // SEA uses the application's dictionary tailoring, so the LB1 SA→AL default
+    // must not suppress a real word boundary. CJK keeps its established
+    // per-character split / kinsoku path and sparse-line safeguards.
+    if (containsSeaScript(prev.text) || containsSeaScript(cur.text)) continue;
+    if (hasCJKBreakOpportunity(prev.text) || hasCJKBreakOpportunity(cur.text)) continue;
+
+    if (isUax14NoBreakPair(prevCp, nextCp)) cur.joinPrev = true;
+  }
+
+  // §17.3.2.14 fitText is a fixed-width, non-wrapping unit. Glue every segment
+  // after the first in the RUN-grouped region, including script/small-caps
+  // pieces emitted from the same source run.
+  const seenFitTextRegions = new Set<number>();
+  for (const seg of segs) {
+    if (!('text' in seg) || seg.fitTextRegionIndex === undefined) continue;
+    if (seenFitTextRegions.has(seg.fitTextRegionIndex)) seg.joinPrev = true;
+    else {
+      seg.fitTextRegionStart = true;
+      seenFitTextRegions.add(seg.fitTextRegionIndex);
+    }
+  }
+
+  retainHorizontalPunctuationInkClearance(segs);
+}
+
 export function buildSegments(
   runs: readonly ParagraphLayoutRun[],
   environment: LineLayoutEnvironment,
@@ -3120,651 +4092,9 @@ export function buildSegments(
       fitTextRegionByEntry.set(entryIndex, regionIndex);
     }
   });
-  const pushTextPiece = (
-    text: string,
-    base: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
-    vertAlign: 'super' | 'sub' | null,
-    sourceRunIndex: number,
-    sourceFragmentIndex?: number,
-    joinPreviousRun = false,
-  ) => {
-    const r: ParagraphTextBearingRun = base;
-    const overflowPunctuationEastAsianRun = EAST_ASIAN_RE.test(text) ? true : undefined;
-    const acquiredTypography = (r as ParagraphTextBearingRun & Readonly<{
-      typographyInput?: import('./layout/typography-input.js').RunTypographyAcquisitionInput;
-    }>).typographyInput;
-    // ECMA-376 §17.16.18 stores a complex field's instruction/result across
-    // several physical runs. The parser rebuilds recomputed PAGE/NUMPAGES as a
-    // single FieldRun, while its complete effective §17.3.2 run properties live
-    // on the immutable typography acquisition sidecar. Consume those effective
-    // facts exactly like an ordinary text run so the field result does not lose
-    // baseline position or the core character-metric axes used by measure/paint.
-    const acquiredValue = <T>(
-      value: import('./layout/typography-input.js').TypographyValueInput<T> | undefined,
-      fallback: T | undefined,
-    ): T | undefined => value?.status === 'valid' && value.value !== null
-      ? value.value
-      : fallback;
-    const effectiveVertAlign = acquiredValue(
-      acquiredTypography?.verticalAlign,
-      vertAlign ?? undefined,
-    ) ?? null;
-    const effectivePosition = acquiredValue(
-      acquiredTypography?.positionPt,
-      r.position,
-    );
-    const effectiveCharacterSpacing = acquiredTypography?.characterSpacingPt ?? r.charSpacing;
-    // ECMA-376 §17.3.2.35 gives an authored run an explicit character pitch.
-    // Word observation: a positive `w:spacing` owns that expanded pitch and suppresses
-    // document-level §17.15.1.18 punctuation whitespace compression for the
-    // run. Combining both adjustments collapses consecutive Japanese closing
-    // punctuation even though Word preserves the authored spacing.
-    const documentCharacterCompressionApplies =
-      wordDocumentCharacterCompressionApplies(effectiveCharacterSpacing);
-    const effectiveCharacterScale = acquiredTypography?.characterScale ?? r.charScale;
-    // WORD_OPENTYPE_FEATURES_COMPAT_KERNING: the exact compatSetting enables
-    // kerning for unqualified runs. Authored/style-resolved w:kern wins.
-    const effectiveKerningThreshold = acquiredTypography?.kerningThresholdPt
-      ?? r.kerning
-      ?? (environment.enableOpenTypeFeatures ? 0 : undefined);
-    const effectiveSnapToGrid = acquiredTypography?.snapToGrid ?? r.snapToGrid;
-    // §17.3.2.33 small caps are sized per character: lowercase LETTERS render two
-    // points smaller, uppercase letters and non-alphabetic characters at the full
-    // run size. `reduced` (set per case-piece in the loop below) carries that onto
-    // each emitted segment; calcEffectiveFontPx shrinks only the reduced ones.
-    // allCaps (§17.3.2.5) and non-caps runs are a single, non-reduced piece.
-    let reduced = false;
-    // Ruby annotation rides with the WHOLE base text (typically 1-2 chars).
-    // Splitting on word boundaries would lose the association, so attach
-    // the annotation only to the first emitted segment.
-    const baseRuby = r.ruby;
-    const ruby = baseRuby
-      ? {
-          text: baseRuby.text,
-          fontSizePt: baseRuby.fontSizePt,
-          ...(baseRuby.hpsRaisePt != null ? { hpsRaisePt: baseRuby.hpsRaisePt } : {}),
-        }
-      : undefined;
-    const revision = r.revision;
-    const rtl = r.rtl === true ? true : undefined;
-    const fitTextFragmentEntryIndex = sourceFragmentIndex === undefined
-      ? undefined
-      : fitTextFragmentEntryByKey.get(`${sourceRunIndex}:${sourceFragmentIndex}`);
-    const fitTextRegionIndex = fitTextFragmentEntryIndex === undefined
-      ? undefined
-      : fitTextRegionByEntry.get(fitTextFragmentEntryIndex);
-
-    // IX1 — resolve the run's hyperlink target ONCE (§17.16.22 external URL /
-    // §17.16.23 internal anchor). An external URL (`r.hyperlink`) wins over the
-    // internal `w:anchor` when both are present, matching the parser's rule. A
-    // FieldRun carries neither field, so the `as DocxTextRun` guards yield
-    // undefined. Purely a callback payload — it does not touch measurement.
-    const hyperlink: HyperlinkTarget | undefined = r.hyperlink
-      ? { kind: 'external', url: r.hyperlink }
-      : r.hyperlinkAnchor
-        ? { kind: 'internal', ref: r.hyperlinkAnchor }
-        : undefined;
-
-    // ECMA-376 §17.3.2.26 content classification. w:rtl/w:cs selects the cs
-    // axis except for a character assigned eastAsia while rFonts@hint=eastAsia;
-    // that protected span keeps the non-cs East Asian formatting axis.
-    // NOTE rFonts@cs (fontFamilyCs) alone is just a font SLOT and must NOT
-    // force cs — e.g. sample-1's Heading1 (Latin) has cstheme + szCs=52 but
-    // renders at w:sz=24; forcing cs blew its size up to 26pt.
-    const forceCs = r.rtl === true || r.cs === true;
-
-    // Complex-script (cs) formatting sources. SIZE (§17.3.2.39 szCs) and TYPEFACE
-    // (§17.3.2.26 rFonts@cs) fall back to their Latin counterpart when absent —
-    // the parser resolves szCs through the full style chain, mirroring a
-    // directly-set `w:sz` per §17.3.2.18. But BOLD (§17.3.2.3 bCs) and ITALIC
-    // (§17.3.2.17 iCs) are independent toggles: absent `bCs`/`iCs` defaults off
-    // and must not inherit Latin-axis `w:b`/`w:i`, which govern only non-complex
-    // content.
-    const csFontSize = r.fontSizeCs ?? base.fontSize;
-    const csFontFamily = r.fontFamilyCs ?? base.fontFamily;
-    const highAnsiFontFamily = r.fontFamilyHighAnsi ?? base.fontFamily;
-    const csBold = r.boldCs ?? false;
-    const csItalic = r.italicCs ?? false;
-
-    // ECMA-376 §17.3.2.26 eastAsia axis. Within a non-complex-script slice, CJK
-    // code points take the eastAsia face while Latin/digits keep the ascii face
-    // (`base.fontFamily`). Only `DocxTextRun` carries the axis; absent (field
-    // runs / single-axis parser output) ⇒ fall back to ascii. Text-box runs feed
-    // this same builder (via `shapeRunToDocRun`), so a text box's per-script face
-    // is picked here too. Bold/italic/size are NOT axis-specific here — eastAsia
-    // shares the Latin (non-cs) toggles, so only the family differs.
-    const eaFontFamily = r.fontFamilyEastAsia ?? base.fontFamily;
-
-    // `word-rtl-complex-script-european-digits-an`: use the bidi language's
-    // primary subtag when present, otherwise fall back to an rtl-marked run.
-    const digitsAsAN =
-      (forceCs || Boolean(r.rtl)) && isRtlBidiLang(r.langBidi, Boolean(r.rtl));
-
-    let firstSeg = true;
-    // True while the next emitted segment should be GLUED to the previous one
-    // (a small-caps case-piece that continues the same word). Consumed by the
-    // first pushSeg of the piece so only that segment carries joinPrev.
-    let gluePending = false;
-    // Script slot for an emitted segment (§17.3.2.26): 'cs' = complex-script
-    // (Arabic/Hebrew/...), 'ea' = East-Asian (CJK → eastAsia face), 'latin' =
-    // Latin/digits/neutral (ascii face). Each segment stays SINGLE-FONT — one
-    // family for its whole `.text` — so the measure==draw / docGrid char-grid
-    // invariant holds and the draw loop needs no per-segment font switching.
-    const pushSeg = (
-      text: string,
-      cs: boolean,
-      fontFamily: string | null,
-      authoritativeSpan?: TextShapeSpan,
-      compressCharacterWhitespace = false,
-      mappedSymbolUnicode = false,
-    ) => {
-      if (
-        environment.balanceSingleByteDoubleByteWidth
-        && !cs
-        && text.includes('\u3000')
-        && [...text].some((character) => character !== '\u3000')
-      ) {
-        // The registered width-balance projection treats U+3000 as a half-delta space while
-        // other East-Asian glyphs receive the full delta. Split only at that
-        // semantic boundary so Canvas can retain one uniform letterSpacing per
-        // segment (measure == paint); the space itself has no contextual shape.
-        for (const part of text.split(/(\u3000+)/u).filter(Boolean)) {
-          pushSeg(part, cs, fontFamily, undefined, compressCharacterWhitespace, mappedSymbolUnicode);
-        }
-        return;
-      }
-      // ECMA-376 §17.15.1.18 / §17.18.7 — dispatch the exact
-      // ST_CharacterSpacing value and split each eligible full-width character
-      // so its selected face's tight ink bounds can define the removable
-      // whitespace. Non-eligible text retains contextual shaping.
-      if (
-        !compressCharacterWhitespace
-        && documentCharacterCompressionApplies
-        && fitTextRegionIndex === undefined
-      ) {
-        const boundaries = [0, ...graphemeClusterOffsets(text), text.length];
-        const graphemes = boundaries.slice(0, -1).map(
-          (start, index) => text.slice(start, boundaries[index + 1]),
-        );
-        if (graphemes.some((grapheme) =>
-          characterSpacingControlCompresses(
-            grapheme,
-            environment.characterSpacingControl,
-          ))) {
-          pushSeg(text, cs, fontFamily, undefined, true, mappedSymbolUnicode);
-          return;
-        }
-      }
-      const bold = cs ? csBold : base.bold;
-      const italic = cs ? csItalic : base.italic;
-      const weight = bold ? 700 : 400;
-      const style = italic ? 'italic' as const : 'normal' as const;
-      const textShapeRequest: TextShapeRequest = Object.freeze({
-        text,
-        fontSizePt: cs ? csFontSize : base.fontSize,
-        // A successfully decoded Symbol/Wingdings code point is Unicode text,
-        // not a request for the legacy font encoding. Clear every authored
-        // slot so the text service resolves a Unicode-capable generic route;
-        // otherwise its §17.3.2.26 slot resolver selects Symbol again and the
-        // mapped character can still be drawn with the wrong cmap.
-        fonts: mappedSymbolUnicode
-          ? { ascii: null, highAnsi: null, eastAsia: null, complexScript: null }
-          : r.fontSlots?.direct ?? {
-              ascii: base.fontFamily,
-              highAnsi: highAnsiFontFamily,
-              eastAsia: eaFontFamily,
-              complexScript: csFontFamily,
-            },
-        themeFonts: mappedSymbolUnicode ? undefined : r.fontSlots?.theme,
-        themeFontPresence: mappedSymbolUnicode ? undefined : r.fontSlots?.themePresent,
-        weight,
-        style,
-        complexScript: cs,
-        fontHint: r.fontHint,
-        eastAsiaLanguage: r.langEastAsia,
-        kerning: effectiveKerningThreshold != null
-          && (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
-        measure: false,
-      });
-      const shaped = authoritativeSpan
-        ? { spans: [authoritativeSpan] }
-        : environment.layoutServices?.text.shape(textShapeRequest);
-      const punctuationCompressions =
-        compressCharacterWhitespace
-          && documentCharacterCompressionApplies
-        ? (() => {
-            const boundaries = [0, ...graphemeClusterOffsets(text), text.length];
-            const compressions: Array<{ end: number; adjustmentPt: number }> = [];
-            for (let index = 0; index < boundaries.length - 1; index += 1) {
-              const start = boundaries[index]!;
-              const end = boundaries[index + 1]!;
-              const compressedGrapheme = text.slice(start, end);
-              if (!characterSpacingControlCompresses(
-                compressedGrapheme,
-                environment.characterSpacingControl,
-              )) continue;
-            const measured = environment.layoutServices?.text.shape({
-              ...textShapeRequest,
-              text: compressedGrapheme,
-              measure: true,
-              clusterGeometry: false,
-            });
-            // ECMA-376 §17.15.1.18 defines only compression eligibility. The
-            // registered Word observation retains half of the selected route's
-            // ideographic cell for punctuation; this is not assumed to be half
-            // of a proportional punctuation glyph's own advance. Kana in
-            // `compressPunctuationAndJapaneseKana` has no observed cell floor,
-            // so only its measured trailing sidebearing is removed.
-            const removableUnscaledPt = measured?.inkBounds
-              && measured.horizontalInkBoundsAreTight === true
-              ? (() => {
-                  const trailingWhitespacePt = Math.max(
-                    0,
-                    Math.min(
-                      measured.advancePt,
-                      measured.advancePt - measured.inkBounds.xMaxPt,
-                    ),
-                  );
-                  if (!COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(
-                    compressedGrapheme,
-                  )) {
-                    return trailingWhitespacePt;
-                  }
-                  const punctuationRoute = measured.spans[0]?.fontRoute.fingerprint;
-                  const ideographicCell = environment.layoutServices?.text.shape({
-                    ...textShapeRequest,
-                    // U+3000 is semantically an ideographic space, but several
-                    // proportional East Asian faces expose it to Canvas with
-                    // the same narrow advance as their punctuation. The grid's
-                    // full-width character cell is represented by an
-                    // ideograph, not by that platform-specific space metric.
-                    text: '\u4e00',
-                    fontHint: 'eastAsia',
-                    measure: true,
-                    clusterGeometry: false,
-                  });
-                  const cellRoute = ideographicCell?.spans[0]?.fontRoute.fingerprint;
-                  const cellAdvancePt = ideographicCell?.advancePt;
-                  if (
-                    !punctuationRoute
-                    || cellRoute !== punctuationRoute
-                    || cellAdvancePt === undefined
-                    || !Number.isFinite(cellAdvancePt)
-                    || cellAdvancePt <= 0
-                  ) {
-                    return 0;
-                  }
-                  const retainedExtentPt = wordJapanesePunctuationRetainedExtentPt({
-                    punctuationAdvancePt: measured.advancePt,
-                    punctuationInkEndPt: measured.inkBounds.xMaxPt,
-                    ideographicCellAdvancePt: cellAdvancePt,
-                  });
-                  return Math.max(
-                    0,
-                    Math.min(
-                      trailingWhitespacePt,
-                      measured.advancePt - retainedExtentPt,
-                    ),
-                  );
-                })()
-              : 0;
-            // §17.3.2.43 w:w scales the glyph and both of its sidebearings;
-            // trim in the same post-scale coordinate space as segAdvanceWidth.
-            const removablePt = removableUnscaledPt * (effectiveCharacterScale ?? 1);
-              if (removablePt > 0) {
-                compressions.push({ end, adjustmentPt: -removablePt });
-              }
-            }
-            return compressions.length === 0
-              ? undefined
-              : Object.freeze(compressions.map((compression) =>
-                  Object.freeze(compression)));
-          })()
-        : undefined;
-      const resolvedAxisDiffers = shaped?.spans.some((span) =>
-        (span.script === 'complexScript') !== cs,
-      ) ?? false;
-      if (shaped && (shaped.spans.length > 1 || resolvedAxisDiffers)) {
-        for (let spanIndex = 0; spanIndex < shaped.spans.length; spanIndex += 1) {
-          const span = shaped.spans[spanIndex]!;
-          const spanCs = span.script === 'complexScript';
-          const spanFamily = spanCs
-            ? csFontFamily
-            : span.script === 'eastAsia'
-              ? eaFontFamily
-              : span.script === 'highAnsi'
-                ? highAnsiFontFamily
-                : base.fontFamily;
-          const compressedSpan = documentCharacterCompressionApplies
-            && compressCharacterWhitespace
-            && [...span.text].some((grapheme) =>
-              characterSpacingControlCompresses(
-                grapheme,
-                environment.characterSpacingControl,
-              ));
-          pushSeg(
-            span.text,
-            spanCs,
-            spanFamily,
-            span,
-            compressedSpan,
-          );
-        }
-        return;
-      }
-      const resolvedSpan = shaped?.spans[0];
-      const localFont = resolvedSpan
-        ? selectedMetric(resolvedSpan.font, text)
-        : undefined;
-      const eaResolution = environment.layoutServices?.text.resolve({
-        fonts: textShapeRequest.fonts,
-        themeFonts: textShapeRequest.themeFonts,
-        themeFontPresence: textShapeRequest.themeFontPresence,
-        slot: 'eastAsia',
-        weight,
-        style,
-      });
-      // A DrawingML/WPS text-body floor is reserved by its independently
-      // selected eastAsia slot, even when this run paints Latin glyphs through
-      // ascii. Empty coverage here means "no glyph is borrowed from this face";
-      // the selected resource contributes vertical geometry only. Ordinary
-      // segments still require coverage of their actual text.
-      const eaFloorProbe = (r as DocxTextRun & { textBoxLineFloor?: boolean }).textBoxLineFloor
-        ? '' : text;
-      const localEaFloor = eaResolution
-        ? selectedMetric(eaResolution, eaFloorProbe)
-        : undefined;
-      // Once a service selected a face, do not re-admit metrics by the authored
-      // family name after the selected-face lookup failed (e.g. a substitute).
-      // §17.3.1.33 atLeast is max(normal single-line height, authored minimum).
-      // The Word OpenType projection supplies that normal box by inference;
-      // exact spacing instead suppresses it.
-      const naturalMetricAllowed = environment.lineSpacing?.rule !== 'exact';
-      const resourceFamilyLineMetric = (naturalMetricAllowed
-        || localFont?.designAscentRatio == null)
-        && (localFont?.lineHeightRatio != null
-          || localFont?.designAscentRatio != null
-          || localFont?.eastAsianLineHeightRatio != null)
-        ? localFont : undefined;
-      const referenceLineMetric = naturalMetricAllowed
-        && !resourceFamilyLineMetric && mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font)
-        ? referenceFontLineMetrics(
-            resolvedSpan.font.requestedFamily,
-            resolvedSpan.font.weight,
-            resolvedSpan.font.style,
-          )
-        : undefined;
-      const familyLineMetric = resourceFamilyLineMetric ?? referenceLineMetric;
-      const resourceEaLineMetric = (naturalMetricAllowed
-        || localEaFloor?.designAscentRatio == null)
-        && (localEaFloor?.lineHeightRatio != null
-          || localEaFloor?.designAscentRatio != null
-          || localEaFloor?.eastAsianLineHeightRatio != null)
-        ? localEaFloor : undefined;
-      const referenceEaLineMetric = naturalMetricAllowed
-        && !resourceEaLineMetric && mayUseAuthoredReferenceVerticalMetric(eaResolution)
-        ? referenceFontLineMetrics(
-            eaResolution.requestedFamily,
-            eaResolution.weight,
-            eaResolution.style,
-          )
-        : undefined;
-      const eaLineMetric = resourceEaLineMetric ?? referenceEaLineMetric;
-      const resolvedEaFloorFamily = eaResolution?.resolvedFamily
-        ?? localEaFloor?.family
-        ?? eaFontFamily;
-      // WORD_USE_FE_LAYOUT_INHERITED_GRID_MINIMUM was observed for an active
-      // document line grid. ECMA-376 §17.6.5 disables an omitted/default grid
-      // type and excludes table-cell line pitch unless §17.15.3.1
-      // adjustLineHeightInTable is enabled. An inherited eastAsia font axis
-      // alone must not raise a Latin-only non-grid line's normal-line floor.
-      const useFeEastAsianMetric = environment.useFeLayout && environment.lineGridActive
-        && (r.fontHint === 'eastAsia' || Boolean(resolvedEaFloorFamily?.trim()));
-      const resolvedScript = resolvedSpan?.script ?? authoritativeSpan?.script
-        ?? (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
-      const latinSpaceCompressionEligible = environment.characterSpacingControl === 'compressPunctuation'
-        // MS-OE376 §2.1.472 requires full advance for fit with this
-        // compatibility switch, even if display uses compression. This gate
-        // covers the measured Latin fit behavior; display-space placement
-        // under the switch has not yet been established.
-        && environment.lineWrapLikeWord6 !== true
-        // The xAvg floor was measured for horizontal Latin words; upright
-        // vertical runs and tate-chu-yoko use distinct advance allocation.
-        && environment.verticalCJK !== true
-        && documentCharacterCompressionApplies
-        && (resolvedScript === 'ascii' || resolvedScript === 'highAnsi')
-        && !reduced && effectiveVertAlign == null
-        && (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0)
-        && (effectiveCharacterScale == null || effectiveCharacterScale === 1)
-        && effectiveKerningThreshold == null;
-      const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
-        ? selectedAverageWidth(resolvedSpan?.font, text)
-        : undefined;
-      const widthBalanceGridDeltaFactor = environment.balanceSingleByteDoubleByteWidth
-        ? wordBalancedLinesAndCharsGridDeltaFactor(text, resolvedScript)
-        : undefined;
-      segs.push({
-        text,
-        script: resolvedScript,
-        ...(widthBalanceGridDeltaFactor !== undefined
-          ? {
-              // §17.15.3.3 defines the SBCS:DBCS width ratio as 1:2; the
-              // registered Word matrix defines how that setting projects onto
-              // linesAndChars charSpace. Production shaping has already split
-              // the segment at §17.3.2.26 script-slot boundaries.
-              widthBalanceGridDeltaFactor,
-            }
-          : {}),
-        ...(useFeEastAsianMetric
-          ? { metricEastAsian: true as const }
-          : {}),
-        bold,
-        italic,
-        underline: base.underline,
-        // §17.3.2.40 underline style / colour — carried only on DocxTextRun (a
-        // FieldRun draws single). Kept raw ST_Underline; the renderer normalizes
-        // to DrawingML §20.1.10.82 at draw time.
-        underlineStyle: r.underlineStyle,
-        underlineColor: r.underlineColor,
-        strikethrough: base.strikethrough,
-        fontSize: cs ? csFontSize : base.fontSize,
-        color: base.color,
-        fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
-        fontRoute: resolvedSpan?.fontRoute,
-        resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
-        ...(resourceFamilyLineMetric?.lineHeightRatio != null
-          ? {
-              resolvedResourceVerticalMetric: true as const,
-              resolvedDesignAscentRatio: resourceFamilyLineMetric.designAscentRatio,
-              resolvedDesignDescentRatio: resourceFamilyLineMetric.designDescentRatio,
-            }
-          : {}),
-        ...(referenceLineMetric ? {
-          referenceFontVerticalMetric: true as const,
-          resolvedDesignAscentRatio: referenceLineMetric.designAscentRatio,
-          resolvedDesignDescentRatio: referenceLineMetric.designDescentRatio,
-        } : {}),
-        resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
-        ...(latinSpaceAverageWidthRatio != null && latinSpaceAverageWidthRatio > 0
-          ? { latinSpaceAverageWidthRatio, latinSpaceCompressionEligible: true as const }
-          : {}),
-        vertAlign: effectiveVertAlign,
-        measuredWidth: 0,
-        textLayoutService: environment.layoutServices?.text,
-        textShapeRequest,
-        breakBefore: resolvedSpan?.breakBefore ?? authoritativeSpan?.breakBefore ?? true,
-        smallCaps: reduced,
-        joinPrev: (
-          (firstSeg && (
-            r.noBreakBefore === true
-            || joinPreviousRun
-          ))
-          || gluePending
-          || authoritativeSpan?.breakBefore === false
-        ) ? true : undefined,
-        hardJoinPrev: (
-          firstSeg && (r.noBreakBefore === true || joinPreviousRun)
-        ) ? true : undefined,
-        doubleStrikethrough: base.doubleStrikethrough ?? false,
-        highlight: base.highlight ?? null,
-        // §17.3.2.12 w:em — carried on both DocxTextRun and FieldRun (a field's
-        // resolved/fallback text stamps the mark the same as a plain run).
-        emphasisMark: base.emphasisMark,
-        background: base.background ?? null,
-        colorAuto: r.colorAuto ?? false,
-        border: r.border ?? null,
-        ruby: firstSeg ? ruby : undefined,
-        revision,
-        ...(revision && environment.showTrackedChanges === true ? {
-          trackChangesMarkup: {
-            kind: revision.kind,
-            authorColor: environment.revisionAuthorColor?.(revision.author) ?? '#C00000',
-          },
-        } : {}),
-        rtl,
-        digitsAsAN: digitsAsAN ? true : undefined,
-        // §17.3.2.26 declared eastAsia axis — used by text-box line floors and
-        // the compatibility-owned useFELayout body metric path.
-        eaFloorFamily: resolvedEaFloorFamily,
-        eaFloorRoute: eaResolution?.route,
-        resolvedEaFloorLineHeightRatio: eaLineMetric?.lineHeightRatio,
-        resolvedEaFloorEastAsianLineHeightRatio: eaLineMetric?.eastAsianLineHeightRatio,
-        textBoxLineFloor: (r as DocxTextRun & { textBoxLineFloor?: boolean }).textBoxLineFloor,
-        textBoxVertical: (r as DocxTextRun & { textBoxVertical?: boolean }).textBoxVertical,
-        // IX1 — resolved hyperlink target of the originating run, for the
-        // text-layer clickable overlay and URL-aware line-break opportunities.
-        // It does not change glyph measurement or drawing.
-        hyperlink,
-        snapToCharacterGrid: effectiveSnapToGrid !== false,
-        // WD4 — run character metrics (§17.3.2.35 spacing / §17.3.2.43 w /
-        // §17.3.2.24 position / §17.3.2.19 kern). Uniform across the run, so
-        // every emitted segment carries the same values; the measure and paint
-        // passes apply them identically (measure==paint).
-        charSpacing: effectiveCharacterSpacing,
-        punctuationCompressions,
-        eastAsiaLanguage: r.langEastAsia,
-        overflowPunctuationEastAsianRun,
-        overflowPunctuationBidiLanguage: r.langBidi,
-        charScale: effectiveCharacterScale,
-        fitTextVal: fitTextRegionIndex === undefined ? undefined : r.fitTextVal,
-        fitTextId: fitTextRegionIndex === undefined ? undefined : r.fitTextId,
-        fitTextRegionIndex,
-        fitTextRunIndex: fitTextRegionIndex === undefined ? undefined : fitTextFragmentEntryIndex,
-        position: effectivePosition,
-        positionExtendsLineBox: environment.positionExtendsLineBox !== false,
-        kerning: effectiveKerningThreshold,
-        // ECMA-376 §17.3.2.10 eastAsianLayout — 縦中横 is meaningful ONLY in a
-        // vertical (tbRl) page, so fold the vertical gate in HERE at build time
-        // (buildSegments receives it through LineLayoutEnvironment). Measure/paint then read a single
-        // pre-gated flag. `vertCompress` rides only when `vert` is set (spec: it
-        // is ignored otherwise).
-        tateChuYoko: environment.verticalCJK && r.eastAsianVert === true ? true : undefined,
-        tateChuYokoCompress:
-          environment.verticalCJK && r.eastAsianVert === true && r.eastAsianVertCompress === true
-            ? true
-            : undefined,
-        // #1014 — an upright-vertical (tbRl) per-glyph segment (NOT a 縦中横 cell,
-        // which is one drawTateChuYokoRun cell). Marks the segment for the vo=Tr
-        // rotate-fallback ink-extent advance correction in the measure passes.
-        verticalRun:
-          environment.verticalCJK && r.eastAsianVert !== true ? true : undefined,
-      });
-      firstSeg = false;
-      gluePending = false; // glue applies only to a piece's FIRST segment
-    };
-    const emit = (word: string, slot: 'cs' | 'ea' | 'latin') => {
-      const cs = slot === 'cs';
-      const fontFamily = slot === 'cs' ? csFontFamily : slot === 'ea' ? eaFontFamily : base.fontFamily;
-      // ECMA-376 §17.3.2.26 + §17.3.3.30: a run whose rFonts axis is Symbol or
-      // Wingdings stores glyphs as the FONT's own (private) code points — Word
-      // commonly in the PUA (U+F020–U+F0FF). Those render as tofu in any
-      // fallback face, so normalize each character to its Unicode equivalent
-      // (core `symbolTextToUnicodeSegments`, the same table the list marker uses
-      // via `symbolFontToUnicode`). The string is split at mapped/unmapped
-      // boundaries: a MAPPED run is drawn in a generic fallback (fontFamily=null
-      // → sans tail with the dingbat glyphs; keeping the symbol family would let
-      // an installed Symbol/Wingdings re-interpret the Unicode code point as the
-      // WRONG glyph), while an UNMAPPED run keeps the symbol family so a host
-      // that ships Symbol/Wingdings still draws its native glyph. Done once at
-      // build time so measure==draw (the seg.text is never transformed later).
-      if (isSymbolFontFamily(fontFamily)) {
-        for (const part of symbolTextToUnicodeSegments(word, fontFamily)) {
-          pushSeg(
-            part.text,
-            cs,
-            part.mapped ? null : fontFamily,
-            undefined,
-            false,
-            part.mapped,
-          );
-        }
-        return;
-      }
-      pushSeg(word, cs, fontFamily);
-    };
-
-    // A non-complex-script slice still mixes scripts at the CJK boundary: emit
-    // its maximal CJK runs on the 'ea' (eastAsia) slot and the rest on 'latin'
-    // (ascii). Keeps each emitted segment single-font (so a serif ascii digit
-    // sits next to a gothic eastAsia title) without changing the cs path.
-    const emitNonCs = (slice: string) => {
-      if (environment.layoutServices?.text) {
-        // `w:sym` is parsed as a one-run private-encoding character carrying
-        // its own Symbol/Wingdings family (§17.3.3.30). Keep normalization in
-        // front of the service-backed script splitter as well as the legacy
-        // path; otherwise a PUA code point such as Symbol F0B0 reaches Canvas
-        // unchanged and renders as tofu.
-        if (isSymbolFontFamily(base.fontFamily)) {
-          emit(slice, 'latin');
-          return;
-        }
-        pushSeg(slice, false, base.fontFamily);
-        return;
-      }
-      for (const part of splitByEastAsia(slice)) emit(part.text, part.ea ? 'ea' : 'latin');
-    };
-
-    // Small caps split the run into full-size (uppercase-origin / non-cased) and
-    // reduced (lowercase-origin) case-pieces; everything else is one piece. Each
-    // piece is still UPPERCASED for display (allCaps or smallCaps), and `reduced`
-    // drives its segments' size — see splitSmallCapsCase / calcEffectiveFontPx.
-    const casePieces = base.smallCaps
-      ? splitSmallCapsCase(text)
-      : [{ text, reduced: false }];
-    let prevPieceText = '';
-    for (const piece of casePieces) {
-      reduced = piece.reduced;
-      // Glue this piece's FIRST segment to the previous piece when they continue
-      // the same word (the previous piece did not end at a space) — so a
-      // small-caps word's full-cap initial and reduced remainder stay on one line.
-      gluePending = prevPieceText.length > 0 && !/\s$/.test(prevPieceText);
-      prevPieceText = piece.text;
-      const displayText = (base.allCaps || base.smallCaps) ? piece.text.toUpperCase() : piece.text;
-      for (const word of splitTextForLayout(displayText)) {
-        if (forceCs) {
-          // When the run's digits are AN-classified, split a token into maximal
-          // digit-groups and the surrounding separators so the per-line bidi pass
-          // (which reorders at SEGMENT granularity) can place the groups in Word's
-          // order — e.g. "28-02-2026" → segments [28][-][02][-][2026] reordered to
-          // 2026-02-28. Canvas only reorders WITHIN a fillText using EN semantics,
-          // so a single-segment date would otherwise stay 28-02-2026.
-          if (digitsAsAN) {
-            for (const slice of splitDigitGroups(word)) emit(slice, 'cs');
-          } else {
-            emit(word, 'cs');
-          }
-        } else {
-          // Mixed Arabic+Latin word (no w:rtl / w:cs): split at script boundaries
-          // so each side gets its own (cs vs Latin) size and typeface; the non-cs
-          // side then sub-splits at CJK boundaries for the eastAsia face.
-          // ECMA-376 §17.3.2.26 selects the cs axis only when w:cs/w:rtl
-          // forces the run. Arabic/Hebrew code points in an ordinary run stay
-          // on ascii/hAnsi; the text service performs the remaining grapheme-
-          // safe East Asian slot split.
-          emitNonCs(word);
-        }
-      }
-    }
+  const segmentBuildContext: SegmentBuildContext = {
+    runs, environment, segs, fitTextFragmentEntryByKey, fitTextRegionByEntry,
+    selectedMetric, selectedAverageWidth,
   };
 
   let joinNextVisibleText = false;
@@ -3811,7 +4141,7 @@ export function buildSegments(
           )
           : (t.text || '');
         if (label.length > 0) {
-          pushTextPiece(
+          appendTextPiece(segmentBuildContext,
             label,
             t,
             t.vertAlign ?? 'super',
@@ -3829,7 +4159,7 @@ export function buildSegments(
       const parts = t.text.split('\t');
       for (let i = 0; i < parts.length; i++) {
         if (parts[i].length > 0) {
-          pushTextPiece(
+          appendTextPiece(segmentBuildContext,
             parts[i],
             t,
             t.vertAlign,
@@ -3939,7 +4269,7 @@ export function buildSegments(
       const f = run as unknown as FieldRun & { type: 'field' };
       const text = resolveFieldText(f, environment);
       if (text) {
-        pushTextPiece(
+        appendTextPiece(segmentBuildContext,
           text,
           f,
           f.vertAlign,
@@ -4057,328 +4387,2767 @@ export function buildSegments(
     }
   }
 
-  // Project acquisition-owned no-break ranges through the display case
-  // transform and onto the single-font layout segments produced above.
-  for (const [runIndex, run] of runs.entries()) {
-    if (run.type !== 'text') continue;
-    const textRun = run as Extract<ParagraphTextBearingRun, { type: 'text' }>;
-    const sourceRanges = textRun.noBreakRanges;
-    if (!sourceRanges || sourceRanges.length === 0) continue;
-    const displayedRanges = sourceRanges.map((range) => {
-      const transformOffset = (offset: number) => {
-        const prefix = textRun.text.slice(0, offset);
-        return textRun.allCaps || textRun.smallCaps ? prefix.toUpperCase().length : prefix.length;
-      };
-      return { start: transformOffset(range.start), end: transformOffset(range.end) };
-    });
-    let displayedCursor = 0;
-    for (const candidate of segs) {
-      if (candidate.sourceRunIndex !== runIndex) continue;
-      if (!('text' in candidate)) {
-        if ('isTab' in candidate) displayedCursor += 1;
+  finalizeBuiltSegments(runs, environment, segs);
+
+  return segs;
+}
+
+/** Prepare source-anchored break opportunities and the resumable queue.
+ * SEA dictionary boundaries, protected ranges, paragraph-final hanging spaces,
+ * and fitText allocation are resolved once per pass at the requested scale. */
+function prepareBreakQueue(
+  segs: LayoutSeg[],
+  startBoundary: LineBoundary | undefined,
+  kinsoku: KinsokuRules,
+  scale: number,
+  measurement: LineMeasurementAdapter,
+): LayoutSeg[] {
+  const sourcedSegs = segs.map((seg, segIndex) => {
+    seg.src = { segIndex, charOffset: 0 };
+    // Issue #797 / #960 — attach the SEA (Thai/Lao/Khmer) break offsets ONCE per
+    // segment (perf: never per line/char). Only for SEA text; non-SEA segments
+    // keep `seaBreaks` absent so their wrap path is byte-identical. The set now
+    // UNIONS the dictionary word boundaries (#797) with the no-space SEA↔non-SEA
+    // script transitions and, for a mixed CJK+SEA run (a `<w:cs/>` run keeps CJK
+    // in the same cs segment), the CJK per-character opportunities — so each
+    // script keeps its own break rule inside one contiguous segment (#960). The
+    // layout kinsoku set (§17.15.1.58–.60) drops positions that would orphan a
+    // forbidden char at a line head/tail, replacing the CJK path's retract.
+    if ('text' in seg && containsSeaScript(seg.text)) {
+      const protectedOffsets = protectedNoBreakOffsets(seg);
+      seg.seaBreaks = seaMixedBreakOffsets(seg.text, { cjk: true, kinsoku }).filter(
+        (offset) => !protectedOffsets.has(offset),
+      );
+    }
+    return seg;
+  });
+  let queue: LayoutSeg[];
+  if (!startBoundary) {
+    queue = sourcedSegs;
+  } else if (startBoundary.segIndex >= sourcedSegs.length) {
+    queue = [];
+  } else {
+    const first = sourcedSegs[startBoundary.segIndex];
+    if (startBoundary.charOffset > 0) {
+      if (!('text' in first) || startBoundary.charOffset > first.text.length) {
+        queue = [];
+      } else {
+        const text = first.text.slice(startBoundary.charOffset);
+        queue = text
+          ? [
+              {
+                ...first,
+                text,
+                measuredWidth: 0,
+                src: { ...startBoundary },
+                // A retained resume boundary has already consumed the source
+                // seam. Carrying either marker would invent new ownership at
+                // the start of this suffix.
+                joinPrev: undefined,
+                hardJoinPrev: undefined,
+                ...slicedTextMetadata(first, startBoundary.charOffset, first.text.length),
+                // Rebase the SEA break offsets onto the resumed (sliced) text so
+                // a paginated Thai paragraph still breaks at word boundaries.
+                seaBreaks: rebaseSeaBreaks(first.seaBreaks, startBoundary.charOffset),
+              },
+              ...sourcedSegs.slice(startBoundary.segIndex + 1),
+            ]
+          : sourcedSegs.slice(startBoundary.segIndex + 1);
+      }
+    } else {
+      queue = sourcedSegs.slice(startBoundary.segIndex);
+    }
+  }
+
+  // Mark the paragraph-final U+3000 suffix once. A backwards pass avoids the
+  // O(N²) suffix rescans that would result from queue.every/reduce per segment.
+  let paragraphFinalIdeographicSpaceCount = 0;
+  let paragraphFinalIdeographicSpaceTailStartIndex = -1;
+  const markedParagraphFinalTail: Array<
+    Readonly<{
+      index: number;
+      segment: LayoutTextSeg;
+    }>
+  > = [];
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    const candidate = queue[index];
+    if (!candidate || !('text' in candidate) || candidate.text.length === 0) break;
+    // `fitText` (§17.3.2.14) and tate-chu-yoko (§17.3.2.10) are indivisible
+    // layout cells. Ruby owns one base/guide pair. Paragraph-final whitespace
+    // may affect how those cells measure, but must never split or clone them.
+    if (
+      candidate.fitTextRegionIndex !== undefined ||
+      candidate.tateChuYoko === true ||
+      candidate.ruby !== undefined
+    ) {
+      // buildSegments can split an atomic source run before its U+3000 tail
+      // (ruby is retained only on the first emitted segment). Undo any markers
+      // already assigned to trailing pieces from that same authored run.
+      if (candidate.sourceRunIndex !== undefined) {
+        for (
+          let markedIndex = markedParagraphFinalTail.length - 1;
+          markedIndex >= 0;
+          markedIndex -= 1
+        ) {
+          const marked = markedParagraphFinalTail[markedIndex];
+          if (marked.segment.sourceRunIndex !== candidate.sourceRunIndex) continue;
+          marked.segment.paragraphFinalIdeographicSpaceTail = undefined;
+          marked.segment.paragraphFinalIdeographicSpaceLocalCount = undefined;
+          marked.segment.paragraphFinalIdeographicSpaceCount = undefined;
+          marked.segment.paragraphFinalIdeographicSpaceTailStart = undefined;
+          markedParagraphFinalTail.splice(markedIndex, 1);
+        }
+        paragraphFinalIdeographicSpaceTailStartIndex = markedParagraphFinalTail.at(-1)?.index ?? -1;
+      }
+      break;
+    }
+    const trailingSpaces = /^\u3000+$/u.test(candidate.text);
+    const visibleWithTrailingSpaces = /[^\u3000]\u3000+$/u.test(candidate.text);
+    if (!trailingSpaces && !visibleWithTrailingSpaces) break;
+    const localTrailingCount = trailingSpaces
+      ? [...candidate.text].length
+      : [...candidate.text].reverse().findIndex((character) => character !== '\u3000');
+    paragraphFinalIdeographicSpaceCount += localTrailingCount;
+    candidate.paragraphFinalIdeographicSpaceTail = true;
+    candidate.paragraphFinalIdeographicSpaceLocalCount = localTrailingCount;
+    candidate.paragraphFinalIdeographicSpaceCount = paragraphFinalIdeographicSpaceCount;
+    paragraphFinalIdeographicSpaceTailStartIndex = index;
+    markedParagraphFinalTail.push({ index, segment: candidate });
+    if (visibleWithTrailingSpaces) break;
+  }
+  if (paragraphFinalIdeographicSpaceTailStartIndex >= 0) {
+    const start = queue[paragraphFinalIdeographicSpaceTailStartIndex];
+    if (start && 'text' in start) start.paragraphFinalIdeographicSpaceTailStart = true;
+  }
+
+  // Resolve §17.3.2.14 from RAW natural advances at this exact layout scale.
+  // The resulting per-gap is folded into segAdvanceWidth below, so the line
+  // breaker and paint pen use one width authority. Cached w:spacing is ignored.
+  // #1014 — the natural width includes the vo=Tr ink deficit so the resolved gap
+  // (target − natural)/n, plus the ink-grown cell the paint draws, still sums to
+  // the fitText target (measure == paint); 0 for non-under-reporting runs.
+  resolveFitTextSegments(
+    queue.filter((seg): seg is LayoutTextSeg => 'text' in seg),
+    scale,
+    (segment) =>
+      measurement.measureSegment(segment).width +
+      measurement.verticalInkExtra(segment, segment.text),
+  );
+
+  return queue;
+}
+
+type SnapBlockState = {
+    kind: 'latin' | 'complexScript';
+    first: LayoutTextSeg;
+    last: LayoutTextSeg;
+    naturalWidthPx: number;
+    allocatedWidthPx: number;
+  };
+
+function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx) {
+  return {
+    lines: [] as LayoutLine[],
+    currentLine: [] as (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[],
+    currentWidth: 0,
+    latinLineFace: undefined as LayoutTextSeg | undefined,
+    latinLineHomogeneous: true,
+    latinLineGaps: [] as LayoutTextSeg[],
+    latinUniformGapCapacity: undefined as number | undefined,
+    latinAppliedGapCount: 0,
+    latinAppliedPerGap: 0,
+    snapBlock: null as SnapBlockState | null,
+    lineHeight: 0,
+    lineAscent: 0,
+    lineDescent: 0,
+    lineIntendedSingle: 0,
+    lineHasInlinePicture: false,
+    linePictureMarkSingle: 0,
+    lineGridCountSingle: 0,
+    lineVisibleAscent: 0,
+    lineVisibleDescent: 0,
+    lineVisibleIntendedSingle: 0,
+    lineHasVisibleMetrics: false,
+    isFirst: true,
+    lineMaxWidth: maxWidth,
+    lineXOffset: 0,
+    currentLineTopY: wrapCtx?.startPageY ?? 0,
+    lineHasRuby: false,
+    lineEastAsian: false,
+    queue: [] as LayoutSeg[],
+    trailingBreakFontSize: null as number | null,
+  };
+}
+
+interface BidiTabPostPassInput {
+  readonly baseRtl: boolean;
+  readonly currentLine: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[];
+  readonly marginRightPx: number;
+  readonly lineXOffset: number;
+  readonly lineMaxWidth: number;
+  readonly isFirst: boolean;
+  readonly firstIndent: number;
+  readonly tabOriginPx: number;
+  readonly bidiCustomStopsPx: {
+    pos: number;
+    alignment: NonNullable<TabStop['alignment']>;
+    leader?: TabStop['leader'];
+  }[];
+  readonly bidiIntervalPx: number;
+  readonly decimalAlignmentPoint: (segments: readonly LayoutSeg[]) => Readonly<{
+    segmentIndex: number;
+    charOffset: number;
+  }> | null;
+  readonly strAdvance: (segment: LayoutTextSeg, text: string) => number;
+}
+
+/** Resolve bidi tab positions after line content is known, in the visual frame. */
+function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
+  const {
+    baseRtl,
+    currentLine,
+    marginRightPx,
+    lineXOffset,
+    lineMaxWidth,
+    isFirst,
+    firstIndent,
+    tabOriginPx,
+    bidiCustomStopsPx,
+    bidiIntervalPx,
+    decimalAlignmentPoint,
+    strAdvance,
+  } = input;
+  if (!baseRtl) return 0;
+  if (!currentLine.some((s) => 'isTab' in s)) return 0;
+  // LOGICAL order — the reading-frame walk resolves the Nth tab against the
+  // Nth-reachable stop in the logical reading frame. Do not feed the visual
+  // sequence here: UAX#9 L2 reverses cells AND tabs together, so a
+  // visual-order walk assigns the stops in reverse and paints the leader in
+  // the wrong cell gap (the #830 follow-up bug — the TOC underscore leader
+  // appeared between the title and the chapter number instead of between the
+  // page number and the title). Because the reversal is symmetric, each
+  // logical tab's reading-frame gap IS its visual gap, so widths mapped back
+  // by logical index tile correctly under the draw loop's visual walk.
+  const items: BidiTabItem[] = currentLine.map((s) => ({
+    isTab: 'isTab' in s,
+    width: s.measuredWidth,
+  }));
+  for (let tabIndex = 0; tabIndex < currentLine.length; tabIndex += 1) {
+    if (!('isTab' in currentLine[tabIndex]!)) continue;
+    let cellEnd = tabIndex + 1;
+    while (cellEnd < currentLine.length && !('isTab' in currentLine[cellEnd]!)) {
+      cellEnd += 1;
+    }
+    const cell = currentLine.slice(tabIndex + 1, cellEnd);
+    const point = decimalAlignmentPoint(cell);
+    if (!point) continue;
+    const itemIndex = tabIndex + 1 + point.segmentIndex;
+    const segment = currentLine[itemIndex]!;
+    if ('text' in segment) {
+      items[itemIndex]!.decimalOffset = strAdvance(
+        segment,
+        segment.text.slice(0, point.charOffset),
+      );
+    }
+  }
+  // Margin-anchored frame (§17.3.1.37 — stops measure from the TEXT MARGIN):
+  // pen 0 = right text margin. Content starts after the leading indent — the
+  // line window's RIGHT edge is paraX-relative `lineXOffset + lineMaxWidth`
+  // (= maxWidth when no float narrows it), so its margin distance is
+  // marginRightPx minus that — plus the first line's first-line indent
+  // (which narrows the leading edge under an RTL base, mirroring the draw
+  // loop's `effAvailW`). The left text margin sits tabOriginPx past the
+  // paragraph box (its trailing indent).
+  const startPen = marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? firstIndent : 0);
+  const leftLimit = marginRightPx + tabOriginPx;
+  const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx);
+  let delta = 0;
+  for (let i = 0; i < currentLine.length; i++) {
+    const s = currentLine[i];
+    if (!('isTab' in s)) continue;
+    delta += res[i].width - s.measuredWidth;
+    s.measuredWidth = res[i].width;
+    (s as LayoutTabSeg).leader = res[i].leader;
+  }
+  return delta;
+}
+
+type CrossRunKinsokuRetraction =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'blocked' }
+  | { readonly kind: 'retracted'; readonly tail: LayoutTextSeg };
+
+/** Retract one legal suffix without cutting a protected source seam. */
+function retractLeadingKinsoku(
+  breakerState: ReturnType<typeof createLineBreakerState>,
+  kinsoku: KinsokuRules,
+  materializeLatinSpaceCompression: () => void,
+  strAdvance: (
+    segment: LayoutTextSeg,
+    text: string,
+    retainTrailingPunctuationCompression?: boolean,
+  ) => number,
+  next: LayoutTextSeg,
+): CrossRunKinsokuRetraction {
+  const firstCp = next.text.codePointAt(0);
+  const lastSeg = breakerState.currentLine[breakerState.currentLine.length - 1];
+  if (
+    firstCp === undefined ||
+    !kinsoku.lineStartForbidden.has(firstCp) ||
+    lastSeg === undefined ||
+    !('text' in lastSeg)
+  ) {
+    return { kind: 'none' };
+  }
+
+  const lastText = lastSeg as LayoutTextSeg;
+  const chars = [...lastText.text];
+  const minKeep = breakerState.currentLine.length > 1 ? 0 : 1;
+  const retractCount = crossRunKinsokuRetract(chars, kinsoku, minKeep);
+  if (retractCount <= 0) return { kind: 'none' };
+
+  const headText = chars.slice(0, chars.length - retractCount).join('');
+  const split = headText.length;
+  // Moving the whole segment would cut the hard source seam immediately
+  // before it. A protected no-break edge is equally indivisible.
+  if (
+    (split === 0 && lastText.hardJoinPrev === true) ||
+    protectedNoBreakOffsets(lastText).has(split)
+  ) {
+    return { kind: 'blocked' };
+  }
+
+  materializeLatinSpaceCompression();
+  breakerState.latinLineHomogeneous = false;
+
+  const tailText = lastText.text.slice(split);
+  const tail: LayoutTextSeg = {
+    ...lastText,
+    ...RESET_SLICED_TEXT_MEASUREMENT,
+    text: tailText,
+    ...slicedTextMetadata(lastText, split, lastText.text.length),
+    measuredWidth: strAdvance(lastText, tailText, true),
+    // The retraction creates a real line boundary. The old source seam was
+    // either retained in `headText` or was soft; it must not be projected
+    // onto this newly-created suffix.
+    joinPrev: undefined,
+    hardJoinPrev: undefined,
+    src: {
+      segIndex: lastText.src!.segIndex,
+      charOffset: lastText.src!.charOffset + split,
+    },
+    seaBreaks: rebaseSeaBreaks(lastText.seaBreaks, split),
+  };
+
+  if (headText) {
+    const headW = strAdvance(lastText, headText);
+    breakerState.currentWidth -= lastText.measuredWidth - headW;
+    breakerState.currentLine[breakerState.currentLine.length - 1] = {
+      ...lastText,
+      ...RESET_SLICED_TEXT_MEASUREMENT,
+      text: headText,
+      measuredWidth: headW,
+      ...slicedTextMetadata(lastText, 0, split),
+    };
+  } else {
+    breakerState.currentWidth -= lastText.measuredWidth;
+    breakerState.currentLine.pop();
+  }
+  return { kind: 'retracted', tail };
+}
+
+/** Keep a forbidden leader with its owner when retraction is blocked. */
+function keepLeadingKinsoku(
+  breakerState: ReturnType<typeof createLineBreakerState>,
+  strNaturalAdvance: (segment: LayoutTextSeg, text: string) => number,
+  addToLine: (
+    segment: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg,
+    width: number,
+    height: number,
+    ascent: number,
+    descent: number,
+  ) => void,
+  queueEmergencyTail: (segment: LayoutTextSeg, split: number) => void,
+  segment: LayoutTextSeg,
+  h: number,
+  asc: number,
+  desc: number,
+): boolean {
+  const firstEnd = graphemeClusterOffsets(segment.text)[0] ?? segment.text.length;
+  if (firstEnd <= 0) return false;
+  const prefix = segment.text.slice(0, firstEnd);
+  const prefixWidth = strNaturalAdvance(segment, prefix);
+  addToLine(
+    {
+      ...segment,
+      ...RESET_SLICED_TEXT_MEASUREMENT,
+      text: prefix,
+      measuredWidth: prefixWidth,
+      ...slicedTextMetadata(segment, 0, firstEnd),
+    },
+    prefixWidth,
+    h,
+    asc,
+    desc,
+  );
+  if (firstEnd < segment.text.length) queueEmergencyTail(segment, firstEnd);
+  return true;
+}
+
+interface BreakOpportunityIteratorContext {
+  readonly breakerState: ReturnType<typeof createLineBreakerState>;
+  readonly flush: (forceHeight?: number, brTerminated?: boolean, nextStart?: LineBoundary) => void;
+  readonly baseRtl: boolean;
+  readonly addToLine: (segment: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg, width: number, height: number, ascent: number, descent: number) => void;
+  readonly scale: number;
+  readonly firstIndent: number;
+  readonly tabOriginPx: number;
+  readonly maxWidth: number;
+  readonly marginRightPx: number;
+  readonly tabFollowWidth: (segment: LayoutSeg) => number;
+  readonly measureText: (segment: LayoutTextSeg, clusterGeometry?: boolean) => TextMetrics;
+  readonly verticalInkExtra: (segment: LayoutTextSeg, text: string) => number;
+  readonly characterGrid: DocGridCtx | undefined;
+  readonly tabStops: TabStop[];
+  readonly defaultTabPt: number;
+  readonly tabFollowingMetrics: () => Readonly<{ totalWidth: number; decimalPrefixWidth?: number }>;
+  readonly availW: () => number;
+  readonly setMeasureFont: (font: string) => void;
+  readonly fontFamilyClasses: Record<string, string>;
+  readonly measurement: LineMeasurementAdapter;
+  readonly textSegmentBox: (segment: LayoutTextSeg) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
+  readonly prospectiveSnapAdvance: (segment: LayoutTextSeg, naturalWidth: number) => number;
+  readonly segAdvance: (segment: LayoutTextSeg) => number;
+  readonly strAdvance: (segment: LayoutTextSeg, text: string, retainTrailingPunctuationCompression?: boolean) => number;
+  readonly isJustified: boolean;
+  readonly stretchLastLine: boolean;
+  readonly overflowPunct: boolean;
+  readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
+  readonly fitsMeasuredWidth: (used: number, available: number) => boolean;
+  readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
+  readonly appendQueuedIdeographicSpaceSegment: (source: LayoutTextSeg) => void;
+  readonly emergencyTextSplit: (segment: LayoutTextSeg, available: number, forceAtLeastOne?: boolean) => number;
+  readonly effectiveFontPx: (segment: LayoutTextSeg) => number;
+  readonly ctx: MeasurementTextContext;
+  readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
+  readonly kinsoku: KinsokuRules;
+  readonly strNaturalAdvance: (segment: LayoutTextSeg, text: string, retainTrailingPunctuationCompression?: boolean) => number;
+  readonly retractCurrentLineForLeadingKinsoku: (next: LayoutTextSeg) => CrossRunKinsokuRetraction;
+  readonly keepLeadingKinsokuWithCurrentLine: (segment: LayoutTextSeg, height: number, ascent: number, descent: number) => boolean;
+  readonly externalLinkSyntaxSplit: (segment: LayoutTextSeg, available: number) => number;
+  readonly queueEmergencyTail: (segment: LayoutTextSeg, split: number) => void;
+}
+
+/** Consume one prepared queue in source order, applying all legal break paths. */
+function iterateBreakOpportunities(context: BreakOpportunityIteratorContext): void {
+  const {
+    breakerState,
+    flush,
+    baseRtl,
+    addToLine,
+    scale,
+    firstIndent,
+    tabOriginPx,
+    maxWidth,
+    marginRightPx,
+    tabFollowWidth,
+    measureText,
+    verticalInkExtra,
+    characterGrid,
+    tabStops,
+    defaultTabPt,
+    tabFollowingMetrics,
+    availW,
+    setMeasureFont,
+    fontFamilyClasses,
+    measurement,
+    textSegmentBox,
+    prospectiveSnapAdvance,
+    segAdvance,
+    strAdvance,
+    isJustified,
+    stretchLastLine,
+    overflowPunct,
+    sameLatinSpaceFace,
+    fitsMeasuredWidth,
+    fitHomogeneousLatinSpaces,
+    appendQueuedIdeographicSpaceSegment,
+    emergencyTextSplit,
+    effectiveFontPx,
+    ctx,
+    verticalGlyphMeasurement,
+    kinsoku,
+    strNaturalAdvance,
+    retractCurrentLineForLeadingKinsoku,
+    keepLeadingKinsokuWithCurrentLine,
+    externalLinkSyntaxSplit,
+    queueEmergencyTail,
+  } = context;
+  while (breakerState.queue.length > 0) {
+    const seg = breakerState.queue.shift()!;
+
+    // ── Line-break sentinel ──────────────────────────────
+    if ('lineBreak' in seg) {
+      // The line being flushed ends at a MANUAL break (§17.3.3.1) — mark it so a
+      // justified paragraph left-aligns it like its final line (§17.18.44).
+      flush(seg.fontSize, true);
+      breakerState.trailingBreakFontSize = seg.fontSize;
+      continue;
+    }
+    breakerState.trailingBreakFontSize = null;
+
+    // ── Tab segment ──────────────────────────────────────
+    if ('isTab' in seg) {
+      // ── ECMA-376 §17.3.1.6 base-RTL ordinary tab ─────────────────────────
+      // The LTR pen math below resolves stops in LOGICAL order, which mis-places
+      // a bidi paragraph's tab-delimited cells (they reorder visually — see
+      // `layoutBidiTabStops`). Add the tab with a PROVISIONAL width of 0 and do
+      // NOT wrap on it; the per-line post-pass (`applyBidiTabs`, run in `flush`)
+      // recomputes every tab width in the visual frame once the line's content
+      // is known. A `<w:ptab>` (absolute-position tab) keeps the LTR path for
+      // now (no bidi ptab fixture; its own NOTE flags the gap).
+      if (baseRtl && !seg.ptab) {
+        seg.measuredWidth = 0;
+        addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
         continue;
       }
-      const segmentEnd = displayedCursor + candidate.text.length;
-      if (
-        displayedCursor > 0
-        && displayedRanges.some((range) =>
-          range.start === displayedCursor || range.end === displayedCursor)
-      ) {
-        candidate.joinPrev = true;
-        candidate.hardJoinPrev = true;
-      }
-      const local = displayedRanges
-        .filter((range) => range.start >= displayedCursor && range.end <= segmentEnd)
-        .map((range) => Object.freeze({
-          start: range.start - displayedCursor,
-          end: range.end - displayedCursor,
-        }));
-      if (local.length > 0) candidate.noBreakRanges = Object.freeze(local);
-      displayedCursor = segmentEnd;
-    }
-  }
 
-  // Project the registered `word-external-link-syntax-breaks` opportunities
-  // across the complete semantic link and all formatting seams first, then
-  // distribute them onto the existing segments.
-  // Segments stay intact unless a real overflow selects one of those offsets,
-  // preserving contextual shaping, decoration geometry, and paint identity on
-  // lines that do not wrap.
-  for (let groupStart = 0; groupStart < segs.length;) {
-    const first = segs[groupStart];
-    if (!('text' in first) || first.hyperlink?.kind !== 'external') {
-      groupStart += 1;
+      // Absolute position on the line measured from paraX (line origin for continuation lines)
+      const absFromParaX = breakerState.currentWidth + (breakerState.isFirst ? firstIndent : 0);
+
+      // ── ECMA-376 §17.3.3.23 absolute-position tab (<w:ptab>) ──────────────
+      // A ptab ignores the paragraph's custom tab stops and the default-tab
+      // interval; it advances to a fixed position on the line derived from its
+      // `alignment` (§17.18.71) and `relativeTo` (§17.18.73). The `alignment`
+      // ALSO governs how the text after the ptab aligns to that position (left /
+      // centered / right). All coordinates below are paraX-relative px.
+      //
+      // NOTE: the ptab target is resolved in LOGICAL (LTR) coordinates — this
+      // block runs before the per-line bidi reorder pass, so it has no notion
+      // of the paragraph's base direction. Interaction with bidi mirroring in
+      // an RTL paragraph (where "left"/"right" alignment and the box edges
+      // ought to mirror) is unverified; the primary use case (an LTR footer's
+      // centered/right-aligned PAGE field) is correct.
+      if (seg.ptab) {
+        seg.resolvedAlignment = seg.ptab.alignment;
+        // Reference box: "indent" ⇒ the paragraph content box [0, maxWidth];
+        // "margin" ⇒ the text-margin box [-tabOriginPx, marginRightPx].
+        const boxLeft = seg.ptab.relativeTo === 'indent' ? 0 : -tabOriginPx;
+        const boxRight = seg.ptab.relativeTo === 'indent' ? maxWidth : marginRightPx;
+        const target =
+          seg.ptab.alignment === 'left'
+            ? boxLeft
+            : seg.ptab.alignment === 'center'
+              ? (boxLeft + boxRight) / 2
+              : boxRight;
+        // Width of the content that trails the ptab up to the next tab / line end
+        // — needed to right-/center-align it against `target` (the trailing text
+        // is what aligns to the stop, §17.18.71).
+        let followW = 0;
+        for (const q of breakerState.queue) {
+          if ('isTab' in q || 'lineBreak' in q) break;
+          followW += tabFollowWidth(q);
+        }
+        const frac = seg.ptab.alignment === 'center' ? 0.5 : seg.ptab.alignment === 'right' ? 1 : 0;
+        let tabW = target - absFromParaX - followW * frac;
+        // §17.3.3.23: "If the alignment location … cannot be found on the current
+        // line, because the starting location is past that point, then the tab …
+        // shall advance to that location on the next available line." So when the
+        // pen already sits at/after the target, wrap the ptab (and its trailing
+        // content) to a fresh line — unless the line is empty (nowhere to wrap).
+        if (tabW <= 0) {
+          if (breakerState.currentLine.length > 0) {
+            flush(undefined, false, seg.src);
+            breakerState.queue.unshift(seg);
+            continue;
+          }
+          // Empty line: cannot advance backwards; contribute no width but keep the
+          // segment so the line-height reflects the ptab's font.
+          tabW = 0;
+        }
+        seg.measuredWidth = tabW;
+        addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+        // Commit the trailing content onto this line without a wrap re-check, so
+        // it sits exactly at the aligned position (mirrors the custom right/center
+        // tab path below).
+        if (seg.ptab.alignment !== 'left') {
+          while (breakerState.queue.length > 0) {
+            const q = breakerState.queue[0];
+            if ('isTab' in q || 'lineBreak' in q) break;
+            breakerState.queue.shift();
+            if ('imagePath' in q) {
+              const w = q.widthPt * scale;
+              q.measuredWidth = w;
+              addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
+            } else if ('math' in q) {
+              addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
+            } else {
+              const m = measureText(q);
+              // #1014 — fold the vo=Tr ink deficit into the committed advance too.
+              const w = segAdvanceWidth(
+                q,
+                m.width + verticalInkExtra(q, q.text),
+                characterGrid,
+                scale,
+              );
+              q.measuredWidth = w;
+              const asc =
+                m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
+              const desc =
+                m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
+              addToLine(q, w, q.fontSize, asc, desc);
+            }
+          }
+        }
+        continue;
+      }
+      // ECMA-376 §17.3.1.37 / §17.15.1.25 — resolve the next stop in TEXT-MARGIN
+      // coordinates (the same origin as custom stops): the current pen position is
+      // `absFromParaX + tabOriginPx`, custom stops are `pos * scale`, and the
+      // automatic grid interval is `defaultTabPt * scale`. Mixing paraX and margin
+      // coordinates is what diverged leading-tab rows from labeled ones; computing
+      // both in margin space and converting back keeps them aligned.
+      const curMarginPx = absFromParaX + tabOriginPx;
+      const customStopsPx = tabStops.map((t) => ({
+        pos: t.pos * scale,
+        alignment: t.alignment,
+        leader: t.leader,
+      }));
+      const stop = nextTabStop(curMarginPx, customStopsPx, defaultTabPt * scale);
+      seg.resolvedAlignment = stop?.alignment ?? 'left';
+      // Convert the chosen margin-space stop back to paraX-relative px.
+      const stopParaX = stop ? stop.pos - tabOriginPx : absFromParaX;
+      // Right/center/decimal tab: place the tab + its trailing content (up to the next
+      // tab / line end) so the content ends at / centers on the stop, and commit that
+      // content directly so the normal wrap check doesn't push it past the stop
+      // (ECMA-376 §17.3.1.37). This is what makes TOC "heading …… page" lines work.
+      // Automatic stops returned by nextTabStop are left-aligned, so they fall
+      // through to the left-tab path below.
+      const alignmentRole = stop ? tabAlignmentRole(stop.alignment) : 'leading';
+      if (stop && alignmentRole !== 'leading') {
+        const stopX = stopParaX;
+        seg.leader = stop.leader;
+        const following = tabFollowingMetrics();
+        const alignmentWidth =
+          alignmentRole === 'center'
+            ? following.totalWidth / 2
+            : alignmentRole === 'decimal'
+              ? (following.decimalPrefixWidth ?? following.totalWidth)
+              : following.totalWidth;
+        let tabW = stopX - absFromParaX - alignmentWidth;
+        if (tabW <= 0) tabW = 0;
+        seg.measuredWidth = tabW;
+        addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+        // Commit the trailing content onto this line without a wrap re-check.
+        while (breakerState.queue.length > 0) {
+          const q = breakerState.queue[0];
+          if ('isTab' in q || 'lineBreak' in q) break;
+          breakerState.queue.shift();
+          if ('imagePath' in q) {
+            const w = q.widthPt * scale;
+            q.measuredWidth = w;
+            addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
+          } else if ('math' in q) {
+            addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
+          } else {
+            const m = measureText(q);
+            // #1014 — fold the vo=Tr ink deficit into the committed advance too.
+            const w = segAdvanceWidth(
+              q,
+              m.width + verticalInkExtra(q, q.text),
+              characterGrid,
+              scale,
+            );
+            q.measuredWidth = w;
+            const asc =
+              m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
+            const desc =
+              m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
+            addToLine(q, w, q.fontSize, asc, desc);
+          }
+        }
+        continue;
+      }
+
+      // Left-aligned tab (custom 'left'/'bar'/'clear' or an automatic stop): the
+      // pen moves to the stop's paraX. nextTabStop already applied the §17.15.1.25
+      // "after all custom stops" automatic grid, so there is no separate fallback.
+      let tabWidth = stopParaX - absFromParaX;
+      if (stop) seg.leader = stop.leader;
+      // Clamp to avoid negative widths; if tab would overflow the line, wrap instead
+      if (tabWidth <= 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        continue;
+      }
+      if (breakerState.currentWidth + tabWidth > availW() && breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        continue;
+      }
+      seg.measuredWidth = tabWidth;
+      addToLine(
+        seg,
+        tabWidth,
+        seg.fontSize,
+        seg.fontSize * scale * 0.8,
+        seg.fontSize * scale * 0.2,
+      );
       continue;
     }
-    const target = first.hyperlink.url;
-    let groupEnd = groupStart;
-    const group: LayoutTextSeg[] = [];
-    while (groupEnd < segs.length) {
-      const candidate = segs[groupEnd];
-      if (
-        !('text' in candidate)
-        || candidate.hyperlink?.kind !== 'external'
-        || candidate.hyperlink.url !== target
-      ) break;
-      group.push(candidate);
-      groupEnd += 1;
+
+    // ── Image segment ────────────────────────────────────
+    if ('imagePath' in seg) {
+      if (seg.anchor) {
+        seg.measuredWidth = 0;
+        continue;
+      }
+      const w = seg.widthPt * scale;
+      const h = seg.heightPt;
+      const asc = seg.heightPt * scale;
+      seg.measuredWidth = w;
+      if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
+        flush(undefined, false, seg.src);
+      }
+      addToLine(seg, w, h, asc, 0);
+      continue;
     }
-    const groupText = group.map((segment) => segment.text).join('');
-    const protectedOffsets = new Set<number>();
-    let cursor = 0;
-    for (const segment of group) {
-      for (const range of segment.noBreakRanges ?? []) {
-        const offsets = [range.start, range.end];
-        for (const offset of offsets) {
-          protectedOffsets.add(cursor + offset);
+
+    // ── Math segment ─────────────────────────────────────
+    if ('math' in seg) {
+      const render = seg.mathMetadata;
+      if (!render || render.available === false) {
+        const emPx = seg.fontSize * scale;
+        setMeasureFont(buildFont(false, false, emPx, null, fontFamilyClasses));
+        const m = measurement.measureCurrentText(seg.fallbackText);
+        const w = m.width;
+        const asc = m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? emPx * 0.8;
+        const desc = m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? emPx * 0.2;
+        seg.measuredWidth = w;
+        seg.mathAscent = asc;
+        seg.mathDescent = desc;
+        if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
+          flush(undefined, false, seg.src);
+        }
+        addToLine(seg, w, seg.fontSize, Math.max(asc, emPx * 0.8), Math.max(desc, emPx * 0.2));
+        continue;
+      }
+      const emPx = seg.fontSize * scale;
+      const w = render.widthEm * emPx;
+      const asc = render.ascentEm * emPx;
+      const desc = render.descentEm * emPx;
+      seg.measuredWidth = w;
+      // Ink extents (from the MathJax SVG viewBox) position the rasterized
+      // glyph relative to the baseline when drawing.
+      seg.mathAscent = asc;
+      seg.mathDescent = desc;
+      // …but the LINE BOX must reserve at least a normal single line for the
+      // run's font size. A short equation — e.g. a lone "−" — has near-zero ink
+      // height; using that as the line height would collapse the line (and the
+      // table row) and pin the glyph to the very top of the cell. Floor to the
+      // font's natural ascent/descent so math occupies a full line like text
+      // does (tall math — fractions, big operators — keeps its larger ink box).
+      const lineAsc = Math.max(asc, emPx * 0.8);
+      const lineDesc = Math.max(desc, emPx * 0.2);
+      if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
+        flush(undefined, false, seg.src);
+      }
+      addToLine(seg, w, seg.fontSize, lineAsc, lineDesc);
+      continue;
+    }
+
+    // ── Text segment ─────────────────────────────────────
+    const s = seg as LayoutTextSeg;
+    const segmentBox = textSegmentBox(s);
+    const w = segmentBox.width;
+    const prospectiveWidth = prospectiveSnapAdvance(s, w);
+    const h = segmentBox.height;
+    const asc = segmentBox.ascent;
+    const desc = segmentBox.descent;
+    const paragraphFinalIdeographicSpaceTail = s.paragraphFinalIdeographicSpaceTail === true;
+    const paragraphFinalIdeographicSpaceCount = s.paragraphFinalIdeographicSpaceCount ?? 0;
+    const paragraphFinalIdeographicSpaceLocalCount =
+      s.paragraphFinalIdeographicSpaceLocalCount ?? 0;
+    const visibleBeforeParagraphFinalTail = paragraphFinalIdeographicSpaceTail
+      ? s.text.slice(0, Math.max(0, s.text.length - paragraphFinalIdeographicSpaceLocalCount))
+      : s.text;
+    if (
+      paragraphFinalIdeographicSpaceTail &&
+      paragraphFinalIdeographicSpaceCount > 1 &&
+      visibleBeforeParagraphFinalTail.length > 0
+    ) {
+      const visibleSegment: LayoutTextSeg = {
+        ...s,
+        ...RESET_SLICED_TEXT_MEASUREMENT,
+        text: visibleBeforeParagraphFinalTail,
+        paragraphFinalIdeographicSpaceTail: undefined,
+        paragraphFinalIdeographicSpaceLocalCount: undefined,
+        paragraphFinalIdeographicSpaceCount: undefined,
+        paragraphFinalIdeographicSpaceTailStart: undefined,
+        measuredWidth: 0,
+        ...slicedTextMetadata(s, 0, visibleBeforeParagraphFinalTail.length),
+      };
+      const trailingSegment: LayoutTextSeg = {
+        ...s,
+        ...RESET_SLICED_TEXT_MEASUREMENT,
+        text: s.text.slice(visibleBeforeParagraphFinalTail.length),
+        paragraphFinalIdeographicSpaceLocalCount,
+        joinPrev: undefined,
+        hardJoinPrev: undefined,
+        paragraphFinalIdeographicSpaceTailStart: true,
+        measuredWidth: 0,
+        ...slicedTextMetadata(s, visibleBeforeParagraphFinalTail.length, s.text.length),
+        src: s.src
+          ? {
+              segIndex: s.src.segIndex,
+              charOffset: s.src.charOffset + visibleBeforeParagraphFinalTail.length,
+            }
+          : undefined,
+      };
+      breakerState.queue.unshift(trailingSegment);
+      breakerState.queue.unshift(visibleSegment);
+      continue;
+    }
+    if (
+      paragraphFinalIdeographicSpaceTail &&
+      /^\u3000+$/u.test(s.text) &&
+      s.paragraphFinalIdeographicSpaceTailStart === true
+    ) {
+      const currentLineHasVisibleText = breakerState.currentLine.some(
+        (candidate) => 'text' in candidate && /[^\u3000]/u.test(candidate.text),
+      );
+      if (currentLineHasVisibleText) {
+        let trailingTailWidth = w;
+        for (const candidate of breakerState.queue) {
+          if (!('text' in candidate) || candidate.paragraphFinalIdeographicSpaceTail !== true)
+            break;
+          trailingTailWidth += segAdvance(candidate);
+        }
+        if (breakerState.currentWidth + trailingTailWidth > availW()) {
+          flush(undefined, false, s.src);
+          breakerState.queue.unshift(s);
+          continue;
         }
       }
-      cursor += segment.text.length;
     }
-    const legalOffsets = new Set<number>();
-    for (const match of groupText.matchAll(/\S+/gu)) {
-      const token = match[0];
-      const tokenStart = match.index;
-      const graphemeBoundaries = new Set(
-        graphemeClusterOffsets(token).map((offset) => tokenStart + offset),
-      );
-      const tokenProtected = new Set(
-        [...protectedOffsets]
-          .filter((offset) => offset > tokenStart && offset <= tokenStart + token.length)
-          .map((offset) => offset - tokenStart),
-      );
-      const tokenGraphemes = new Set(
-        [...graphemeBoundaries].map((offset) => offset - tokenStart),
-      );
-      for (const offset of wordExternalLinkSyntaxBreakOffsets(
-        token,
-        tokenGraphemes,
-        tokenProtected,
-      )) legalOffsets.add(tokenStart + offset);
-    }
-    if (legalOffsets.size === 0) {
-      groupStart = groupEnd;
+
+    // ECMA-376 §17.3.2.14: a fit region is an atomic fixed-width cell. The
+    // first segment judges the WHOLE resolved region; after an optional flush,
+    // every member is added without entering the CJK/overlong-word split paths.
+    // This also handles a target wider than the line: it overflows as one unit
+    // instead of violating the required internal non-wrap boundary.
+    if (s.fitTextRegionIndex !== undefined) {
+      if (s.fitTextRegionStart) {
+        let regionWidth = w;
+        for (const queued of breakerState.queue) {
+          if (!('text' in queued) || queued.fitTextRegionIndex !== s.fitTextRegionIndex) break;
+          regionWidth += segAdvance(queued);
+        }
+        if (
+          breakerState.currentLine.length > 0 &&
+          breakerState.currentWidth + regionWidth > availW()
+        ) {
+          flush(undefined, false, s.src);
+        }
+      }
+      s.measuredWidth = w;
+      addToLine(s, w, h, asc, desc);
       continue;
     }
-    cursor = 0;
-    for (let index = 0; index < group.length; index += 1) {
-      const segment = group[index]!;
-      const segmentStart = cursor;
-      const segmentEnd = segmentStart + segment.text.length;
-      const localBreaks = [...legalOffsets]
-        .filter((offset) => offset > segmentStart && offset < segmentEnd)
-        .map((offset) => offset - segmentStart)
-        .sort((a, b) => a - b);
-      if (localBreaks.length > 0) {
-        segment.externalLinkBreakOffsets = Object.freeze(localBreaks);
-      }
-      if (index > 0 && legalOffsets.has(segmentStart)) {
-        segment.joinPrev = undefined;
-        segment.externalLinkBreakBefore = true;
-      }
-      cursor = segmentEnd;
-    }
-    groupStart = groupEnd;
-  }
-
-  if (environment.balanceSingleByteDoubleByteWidth) {
-    // ECMA-376 §17.15.3.3 normatively requests a 1:2 SBCS/DBCS width balance,
-    // but does not define how a proportional inter-word separator becomes a
-    // fixed-pitch half-width cell. The registered Word observation limits that
-    // projection to two-or-more explicitly authored U+0020 spaces. One normal
-    // separator remains at its natural proportional advance.
-    const metricCache = new Map<string, number>();
-    const adjustmentFor = (segment: LayoutTextSeg): number | undefined => {
-      const service = segment.textLayoutService;
-      const request = segment.textShapeRequest;
-      if (!service || !request) return undefined;
-      const effectiveFontSizePt = calcEffectiveFontPx(segment, 1);
-      const key = [
-        service.fingerprint,
-        segment.fontRoute?.fingerprint ?? 'implicit-latin',
-        segment.eaFloorRoute?.fingerprint ?? 'implicit-east-asia',
-        effectiveFontSizePt,
-        segment.bold ? 700 : 400,
-        segment.italic ? 'italic' : 'normal',
-        segment.kerning ?? 'none',
-      ].join('|');
-      const cached = metricCache.get(key);
-      if (cached !== undefined) return cached;
-      const naturalSpace = service.shape({
-        ...request,
-        text: ' ',
-        fontSizePt: effectiveFontSizePt,
-        measure: true,
-        clusterGeometry: false,
-      }).advancePt;
-      const ideographicCell = service.shape({
-        ...request,
-        text: '\u4e00',
-        fontSizePt: effectiveFontSizePt,
-        fontHint: 'eastAsia',
-        measure: true,
-        clusterGeometry: false,
-      }).advancePt;
-      if (
-        !Number.isFinite(naturalSpace)
-        || !Number.isFinite(ideographicCell)
-        || naturalSpace < 0
-        || ideographicCell <= 0
-      ) return undefined;
-      const adjustmentPt = ideographicCell / 2 - naturalSpace;
-      metricCache.set(key, adjustmentPt);
-      return adjustmentPt;
+    // A terminal separator may collapse when this word becomes line-final;
+    // visible glyphs still need to fit at their natural measured advance.
+    const trimmed = s.text.replace(/ +$/, '');
+    // Subtract the full-model advance of the trimmed text (not the natural width)
+    // so the grid delta, w:w scale and w:spacing pitch on the retained glyphs all
+    // cancel and trailingSpaceW is the bare trailing-space advance — keeping `w`
+    // and `wForFit` on the one advance model (`strAdvance` == the model behind `w`).
+    const trailingSpaceW = snapToCharsClass(s, characterGrid)
+      ? 0
+      : s.text.endsWith(' ')
+        ? w - strAdvance(s, trimmed)
+        : 0;
+    s.latinNaturalTrailingSpacePx =
+      s.latinSpaceCompressionEligible === true && /^[^ ]+ $/u.test(s.text) && trailingSpaceW > 0
+        ? trailingSpaceW
+        : undefined;
+    s.latinSpaceCompressionPx = undefined;
+    const prospectiveLineWillJustify = (next: LayoutSeg | undefined): boolean => {
+      const closesLogicalLine = next === undefined || 'lineBreak' in next;
+      return isJustified && (!closesLogicalLine || stretchLastLine);
     };
-    let sequence: LayoutTextSeg[] = [];
-    let sequenceCount = 0;
-    const flushSequence = () => {
-      if (wordBalancedConsecutiveSpaceCellApplies(sequenceCount)) {
-        for (const segment of sequence) {
-          segment.widthBalanceSpaceSequence = true;
-          const adjustmentPt = adjustmentFor(segment);
-          if (adjustmentPt !== undefined) {
-            segment.widthBalanceSpaceAdjustmentPt = adjustmentPt;
+    const fitWidthFor = (
+      widthPx: number,
+      trailingSpacePx: number,
+      next: LayoutSeg | undefined,
+    ): number =>
+      wordCandidateFitWidthPx({
+        widthPx,
+        trailingSpacePx,
+        lineWillJustify: prospectiveLineWillJustify(next),
+        wrapNarrowed: breakerState.lineMaxWidth !== maxWidth || breakerState.lineXOffset !== 0,
+      });
+    const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW, breakerState.queue[0]);
+    // ECMA-376 §17.3.1.33 does not prescribe a line-breaking tolerance.
+    // Word-for-Mac controls with Calibri and Arial, left/center/right aligned
+    // 10pt table cells, wrap a trailing Latin word below its natural advance
+    // boundary (including <1pt overflow). Times New Roman differs by a
+    // sub-point at that boundary, so this is a conservative library fit policy,
+    // not a claim that every Office face and script has identical break points.
+    // An earlier global 25%-of-spaces allowance pulled words up even when Word
+    // did not; it also had no proven bound matching paint compression.
+    // Dictionary-SEA candidate (Thai/Lao/Khmer; grapheme-fill Myanmar/Tibetan
+    // stays on its per-cluster greedy path). Per-codepoint scan: a rare segment
+    // mixing both SEA families is not dictionary-SEA, so
+    // it keeps the pre-#991 greedy path instead of moving a grapheme-fill span
+    // inside an atomic chunk.
+    const sDictSea = s.seaBreaks !== undefined && isDictionarySeaText(s.text);
+
+    // Atomic glued group: when THIS segment starts a glued group (its followers
+    // in the queue are `joinPrev` pieces — small-caps case-pieces of the SAME
+    // word like "I" then "NTRODUCTION", or a UAX#14 LB13 non-starter authored in
+    // its own run like a trailing "," / "。"), the per-segment wrap below would
+    // let the group split across lines. Pre-measure it and, if it does not fit on
+    // the current (non-empty) line, flush so it starts fresh.
+    //
+    // ONLY when the lead segment is NOT itself CJK-breakable. A glued group whose
+    // lead is a CJK run (e.g. "…通過する" + "。") is NOT atomic: the run splits at
+    // an inter-CJK boundary and the trailing non-starter stays on its LAST piece
+    // (§17.3.1.16 kinsoku keeps it off the next line's head when enabled — the
+    // default; with kinsoku off it may lead the line, as it did before PR #602).
+    // Pre-flushing the whole run instead leaves the prior line far short, which a
+    // `both` line then stretches wide (sample-9). `joinPrev` stays a pure "this is
+    // a non-starter" marker; the atomic-vs-breakable decision lives HERE. A
+    // non-breakable Latin / small-caps lead is genuinely atomic, so the pre-flush
+    // (and the over-long-word char-break path below) still applies there.
+    if (
+      !s.joinPrev &&
+      breakerState.currentLine.length > 0 &&
+      (breakerState.queue[0] as LayoutTextSeg | undefined)?.joinPrev &&
+      ((breakerState.queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
+        !hasCJKBreakOpportunity(s.text)) &&
+      // A SEA (Thai/Lao/Khmer) lead with usable word breaks is NOT atomic — the
+      // run splits at a dictionary boundary (issue #797), mirroring the CJK gate.
+      ((breakerState.queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
+        !(s.seaBreaks && s.seaBreaks.length > 0))
+    ) {
+      let groupW = w;
+      let groupTrail = trailingSpaceW;
+      let groupEnd = 0;
+      for (
+        ;
+        groupEnd < breakerState.queue.length &&
+        (breakerState.queue[groupEnd] as LayoutTextSeg).joinPrev;
+        groupEnd++
+      ) {
+        const f = breakerState.queue[groupEnd] as LayoutTextSeg;
+        const hardPrefixEnd = hardJoinPrefixEnd(f);
+        if (hardPrefixEnd !== undefined) {
+          const prefix = f.text.slice(0, hardPrefixEnd);
+          const prefixWidth = strAdvance(f, prefix);
+          groupW += prefixWidth;
+          groupTrail = prefix.endsWith(' ')
+            ? prefixWidth - strAdvance(f, prefix.replace(/ +$/, ''))
+            : 0;
+          // A whole hard member can lead into another hard member. Otherwise
+          // the first legal boundary after the seam ends the atomic prefix.
+          if (hardPrefixEnd < f.text.length) break;
+          continue;
+        }
+        const firstExternalBreak = f.externalLinkBreakOffsets?.[0];
+        if (firstExternalBreak !== undefined) {
+          const prefix = f.text.slice(0, firstExternalBreak);
+          const prefixWidth = strAdvance(f, prefix);
+          groupW += prefixWidth;
+          groupTrail = 0;
+          break;
+        }
+        // A CJK-BREAKABLE follower (e.g. "Roman" + "、あるいは…用いる。") is NOT
+        // atomic: only its LEADING run of line-start-forbidden chars would orphan
+        // at a line head (UAX#14 LB13 / §17.3.1.16); the rest splits at an
+        // inter-CJK boundary and wraps on its own. So glue only that prefix's
+        // advance to the lead and STOP summing here — mirror of the CJK-lead
+        // direction handled by the `!hasCJKBreakOpportunity(s.text)` gate above
+        // (sample-9 fb836d6). Summing the whole breakable run instead would
+        // pre-flush "Roman" down alone, leaving a `both` line stretched sparse
+        // (sample-16). A Latin / small-caps follower (no CJK break opportunity —
+        // the "I" + "NTRODUCTION" case) stays fully atomic: keep full-add.
+        if (hasCJKBreakOpportunity(f.text)) {
+          const chars = [...f.text];
+          let p = 0;
+          while (
+            p < chars.length &&
+            DEFAULT_KINSOKU_RULES.lineStartForbidden.has(chars[p].codePointAt(0)!)
+          )
+            p++;
+          if (p < chars.length) {
+            // Breakable rest exists past the leading non-starters: glue only the
+            // prefix (it may be empty — then "Roman" is effectively unglued and
+            // wraps on its own) and end the atomic group here.
+            const prefix = chars.slice(0, p).join('');
+            const prefixWidth = strAdvance(f, prefix);
+            groupW += prefixWidth;
+            groupTrail = 0;
+            break;
+          }
+          // Entirely non-starters (no breakable rest): fall through to full-add.
+        }
+        const fw = segAdvance(f);
+        groupW += fw;
+        const ft = f.text.replace(/ +$/, '');
+        const followerTrail = f.text.endsWith(' ') ? fw - strAdvance(f, ft) : 0;
+        // UAX #14 LB7 makes a consecutive SP sequence one trailing suffix even
+        // when a source-formatting boundary split it into multiple segments.
+        // Accumulate space-only followers so the line-end fit allowance is
+        // invariant to that non-textual boundary. A follower containing visible
+        // text starts a new suffix and therefore replaces the previous value.
+        groupTrail = ft.length === 0 && groupTrail > 0 ? groupTrail + followerTrail : followerTrail;
+      }
+      if (
+        breakerState.currentWidth + fitWidthFor(groupW, groupTrail, breakerState.queue[groupEnd]) >
+        availW()
+      ) {
+        flush(undefined, false, s.src);
+      }
+    }
+
+    // `word-dictionary-sea-atomic-chunk`: ECMA-376 prescribes no SEA
+    // line-breaking algorithm. Treat dictionary boundaries inside a no-space
+    // Thai/Lao/Khmer chunk as secondary opportunities: move a chunk that fits a
+    // full line as a unit; only a full-line-overlong chunk breaks at dictionary
+    // boundaries through the greedy SEA branch below.
+    //
+    // Judged only at chunk START: if the previously committed token is a text
+    // segment glued to `s` (no trailing space), the whole chunk already passed
+    // this judgment when its head was placed, so a mid-chunk segment never
+    // needs it. The chunk spans `s` plus following queue segments while they
+    // stay dictionary-SEA text glued without intervening spaces. Grapheme-fill
+    // scripts (Myanmar/Tibetan) are excluded because their per-cluster path
+    // fills the remaining width.
+    if (
+      sDictSea &&
+      breakerState.currentLine.length > 0 &&
+      (() => {
+        const last = breakerState.currentLine[breakerState.currentLine.length - 1];
+        return !('text' in last) || (last as LayoutTextSeg).text.endsWith(' ');
+      })()
+    ) {
+      let chunkW = w;
+      let chunkTrail = trailingSpaceW;
+      let chunkEnd = 0;
+      if (!s.text.endsWith(' ')) {
+        for (; chunkEnd < breakerState.queue.length; chunkEnd++) {
+          const f = breakerState.queue[chunkEnd];
+          if (!('text' in f) || (f as LayoutTextSeg).seaBreaks === undefined) break;
+          if (!isDictionarySeaText((f as LayoutTextSeg).text)) break;
+          const ft = f as LayoutTextSeg;
+          const fw = segAdvance(ft);
+          const fTrim = ft.text.replace(/ +$/, '');
+          chunkW += fw;
+          chunkTrail = ft.text.endsWith(' ') ? fw - strAdvance(ft, fTrim) : 0;
+          if (ft.text.endsWith(' ')) {
+            chunkEnd++;
+            break;
+          } // a space ends the chunk
+        }
+      }
+      const chunkWForFit = fitWidthFor(chunkW, chunkTrail, breakerState.queue[chunkEnd]);
+      if (
+        breakerState.currentWidth + chunkWForFit > availW() &&
+        chunkWForFit <= breakerState.lineMaxWidth
+      ) {
+        flush(undefined, false, s.src);
+      }
+    }
+
+    // §17.3.1.21 permits one eligible punctuation character past the text
+    // extent. The isolated compatibility predicate owns both the CJK-language
+    // sets and the bounded parent-run extensions owned by
+    // `wordIsOverflowPunctuation`. CJK
+    // segments that need an internal split retain their separate
+    // overflowPunct-vs-kinsoku rule.
+    const visibleSegmentScalars = [...trimmed];
+    const trailingOverflowCharacter = visibleSegmentScalars.at(-1);
+    const textBeforeTrailingOverflow = visibleSegmentScalars.slice(0, -1).join('');
+    const admitsTrailingOverflowPunctuation =
+      overflowPunct &&
+      trailingOverflowCharacter !== undefined &&
+      (breakerState.currentLine.length > 0 || textBeforeTrailingOverflow.length > 0) &&
+      wordIsOverflowPunctuation(
+        trailingOverflowCharacter,
+        s.eastAsiaLanguage,
+        s.overflowPunctuationEastAsianRun === true,
+        s.script === 'ascii' || s.script === 'highAnsi',
+        s.script === 'complexScript',
+        s.overflowPunctuationBidiLanguage,
+      ) &&
+      breakerState.currentWidth + strAdvance(s, textBeforeTrailingOverflow) <= availW();
+
+    // A line already admitted using this homogeneous-face rule cannot lend
+    // that prior compression to a later mixed-face candidate. Its allocation
+    // is finalized here, and the new route starts a fresh line.
+    if (
+      breakerState.latinAppliedPerGap > 0 &&
+      (!breakerState.latinLineHomogeneous ||
+        !breakerState.latinLineFace ||
+        !sameLatinSpaceFace(s, breakerState.latinLineFace))
+    ) {
+      flush(undefined, false, s.src);
+      breakerState.queue.unshift(s);
+      continue;
+    }
+
+    if (
+      (fitsMeasuredWidth(breakerState.currentWidth + wForFit, availW()) &&
+        breakerState.latinAppliedPerGap === 0) ||
+      fitHomogeneousLatinSpaces(s, wForFit) ||
+      fitsMeasuredWidth(breakerState.currentWidth + wForFit, availW())
+    ) {
+      // Fits on current line as-is
+      s.measuredWidth = w;
+      addToLine(s, w, h, asc, desc);
+      appendQueuedIdeographicSpaceSegment(s);
+    } else if (admitsTrailingOverflowPunctuation) {
+      s.measuredWidth = w;
+      addToLine(s, w, h, asc, desc);
+      appendQueuedIdeographicSpaceSegment(s);
+    } else if (
+      hasCJKBreakOpportunity(s.text) &&
+      s.seaBreaks === undefined &&
+      s.hardJoinPrev !== true
+    ) {
+      // CJK overflow: split at the maximum prefix that fits, re-queue the tail.
+      // A segment that ALSO contains SEA (a mixed CJK+SEA `<w:cs/>` run) is routed
+      // to the SEA branch below instead — its `seaBreaks` already merges the CJK
+      // per-character opportunities with the SEA dictionary/transition ones
+      // (issue #960), so both scripts break by their own rule from one offset set.
+      // (pptx's analogous CJK fit is cjk-wrap.ts `fitCjkLine`, kept intentionally
+      //  separate: it sums per-char advances, whereas this path uses substring
+      //  binary-search + the cross-run 追い出し below. Don't naively unify them.)
+      const available = availW() - breakerState.currentWidth;
+      let rawPrefix = '';
+      const maximumIdeographicSpaceHang = paragraphFinalIdeographicSpaceTail
+        ? wordIdeographicSpaceLineEndAllowanceCount(
+            hasEastAsianVisiblePredecessor(s.text),
+            s.paragraphFinalIdeographicSpaceCount ?? 0,
+          )
+        : Number.POSITIVE_INFINITY;
+      if (available > 0) {
+        const nonMonotoneAllocation =
+          charSpacingDeltaPx(s, scale) < 0 || snapToCharsClass(s, characterGrid) === 'latin';
+        if (nonMonotoneAllocation) {
+          rawPrefix = s.text.slice(0, emergencyTextSplit(s, available, false));
+        } else {
+          setMeasureFont(
+            buildFont(
+              s.bold,
+              s.italic,
+              effectiveFontPx(s),
+              s.fontFamily,
+              fontFamilyClasses,
+              s.fontRoute,
+            ),
+          );
+          measurement.withSegmentKerning(s, () => {
+            rawPrefix = fitCJKPrefix(
+              ctx,
+              s.text,
+              available,
+              segmentCharacterGridDeltaPx(s, characterGrid, scale),
+              charScaleFactor(s),
+              charSpacingDeltaPx(s, scale),
+              s.verticalRun === true,
+              verticalGlyphMeasurement,
+              (prefix) => strAdvance(s, prefix),
+              maximumIdeographicSpaceHang,
+            );
+          });
+        }
+      }
+      // Apply kinsoku to the break position: retract leftwards so the tail
+      // never begins with a 行頭禁則 char and the head never ends with a
+      // 行末禁則 char (ECMA-376 §17.15.1.58–.60). When the current line
+      // already has content, retracting to an empty prefix is allowed — the
+      // whole run moves to the next (fresh) line, which is Word's 追い出し.
+      // When the line is empty we keep at least one char (minSplit=1) so we
+      // never lose forward progress.
+      const allChars = [...s.text];
+      const rawSplit = [...rawPrefix].length;
+      const minSplit = breakerState.currentLine.length > 0 ? 0 : 1;
+      // ECMA-376 §17.3.1.21 permits one punctuation character beyond the
+      // paragraph extents. The isolated compatibility projection resolves the
+      // language-specific set and its precedence over kinsoku at this internal
+      // CJK split.
+      const hangingSplit =
+        overflowPunct &&
+        rawSplit < allChars.length &&
+        (breakerState.currentLine.length > 0 || rawSplit > 0) &&
+        wordIsOverflowPunctuation(
+          allChars[rawSplit],
+          s.eastAsiaLanguage,
+          s.overflowPunctuationEastAsianRun === true,
+          s.script === 'ascii' || s.script === 'highAnsi',
+          s.script === 'complexScript',
+          s.overflowPunctuationBidiLanguage,
+        )
+          ? rawSplit + 1
+          : null;
+      const proposedSplit = extendThroughTrailingIdeographicSpaces(
+        allChars,
+        hangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
+        paragraphFinalIdeographicSpaceTail && maximumIdeographicSpaceHang === 0
+          ? 0
+          : maximumIdeographicSpaceHang,
+      );
+      const proposedPrefix = allChars.slice(0, proposedSplit).join('').length;
+      const protectedSplit = legalTextSplitAtOrBefore(s, proposedPrefix, minSplit > 0 ? 1 : 0);
+      const prefix = s.text.slice(0, protectedSplit);
+      if (prefix.length > 0) {
+        // Grid advance for the head piece — the same model as the line box / draw.
+        const pw = strNaturalAdvance(s, prefix);
+        const headSeg: LayoutTextSeg = {
+          ...s,
+          ...RESET_SLICED_TEXT_MEASUREMENT,
+          text: prefix,
+          measuredWidth: pw,
+          ...slicedTextMetadata(s, 0, prefix.length),
+        };
+        addToLine(headSeg, pw, h, asc, desc);
+        const tail = s.text.slice(prefix.length);
+        if (tail) {
+          breakerState.queue.unshift({
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: tail,
+            ...slicedTextMetadata(s, prefix.length, s.text.length),
+            measuredWidth: 0,
+            src: {
+              segIndex: s.src!.segIndex,
+              charOffset: s.src!.charOffset + prefix.length,
+            },
+          });
+        } else {
+          appendQueuedIdeographicSpaceSegment(s);
+        }
+      } else if (breakerState.currentLine.length > 0) {
+        // No prefix of `s` fits. If `s` would lead the next line with a 行頭禁則
+        // char, kinsokuAdjustedSplit can't fix it from within `s` (the offending
+        // char is its first); pull trailing graphemes of the current line's last
+        // text segment down so they lead the next line ahead of `s` — cross-run
+        // 追い出し (§17.3.1.16). See crossRunKinsokuRetract for the bounded,
+        // re-validating, whitespace-guarded retraction count.
+        const retraction = retractCurrentLineForLeadingKinsoku(s);
+        if (retraction.kind === 'blocked') {
+          keepLeadingKinsokuWithCurrentLine(s, h, asc, desc);
+          continue;
+        }
+        flush(undefined, false, retraction.kind === 'retracted' ? retraction.tail.src : s.src);
+        breakerState.queue.unshift(s);
+        if (retraction.kind === 'retracted') breakerState.queue.unshift(retraction.tail);
+      } else {
+        // Empty line and not even one char fits — force-fit one char to guarantee progress
+        const forcedChars = [...s.text];
+        const forcedSplit =
+          forcedChars.length > 0
+            ? extendThroughTrailingIdeographicSpaces(
+                forcedChars,
+                1,
+                s.paragraphFinalIdeographicSpaceTail === true
+                  ? wordIdeographicSpaceLineEndAllowanceCount(
+                      EAST_ASIAN_RE.test(forcedChars[0] ?? ''),
+                      s.paragraphFinalIdeographicSpaceCount ?? 0,
+                    )
+                  : Number.POSITIVE_INFINITY,
+              )
+            : 0;
+        const forcedUtf16 = forcedChars.slice(0, forcedSplit).join('').length;
+        const legalForcedUtf16 =
+          legalTextSplitAtOrBefore(s, forcedUtf16) || emergencyTextSplit(s, availW(), true);
+        const firstChar = s.text.slice(0, legalForcedUtf16);
+        if (firstChar) {
+          const fw = strNaturalAdvance(s, firstChar);
+          const headSeg: LayoutTextSeg = {
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: firstChar,
+            measuredWidth: fw,
+            ...slicedTextMetadata(s, 0, firstChar.length),
+          };
+          addToLine(headSeg, fw, h, asc, desc);
+          const tail = s.text.slice(firstChar.length);
+          if (tail) {
+            breakerState.queue.unshift({
+              ...s,
+              ...RESET_SLICED_TEXT_MEASUREMENT,
+              text: tail,
+              ...slicedTextMetadata(s, firstChar.length, s.text.length),
+              measuredWidth: 0,
+              src: {
+                segIndex: s.src!.segIndex,
+                charOffset: s.src!.charOffset + firstChar.length,
+              },
+            });
+          } else {
+            appendQueuedIdeographicSpaceSegment(s);
           }
         }
       }
-      sequence = [];
-      sequenceCount = 0;
-    };
-    for (const candidate of segs) {
-      if (!('text' in candidate) || candidate.script === 'complexScript') {
-        flushSequence();
+    } else if (s.seaBreaks !== undefined && s.hardJoinPrev !== true) {
+      // No-inter-word-space line wrap: Thai/Lao/Khmer dictionary words (#797) or
+      // Myanmar/Tibetan grapheme clusters (#961). This ONE segment is a whole run;
+      // break it only at a member of `s.seaBreaks` — the UNION (#960) of the
+      // dictionary word (or grapheme-cluster) boundaries, the no-space SEA↔non-SEA
+      // script transitions, and (for a mixed CJK+SEA `<w:cs/>` run) the CJK
+      // per-character opportunities, already kinsoku-filtered by
+      // `seaMixedBreakOffsets`. Entered for ANY such segment (even one with no
+      // interior boundary — a single word/cluster wider than the column, or
+      // Segmenter unavailable) so the emergency split below stays GRAPHEME-safe
+      // instead of falling to the code-point path. Kinsoku 行頭/行末禁則 was applied
+      // when the offsets were built (so a forbidden CJK char never heads/tails a
+      // line); choosing an earlier legal offset is the only remaining adjustment,
+      // which fitSeaWordPrefix already does. The run stays one contiguous draw per
+      // line (measure==paint); the tail re-queues with its offsets rebased.
+      const available = availW() - breakerState.currentWidth;
+      const measureSub = (sub: string): number => strAdvance(s, sub);
+      // Grapheme-fill runs (Myanmar/Tibetan) have DENSE offsets (one per cluster),
+      // so use the monotone binary-search fit — a per-line full scan would be O(n²)
+      // down a long run. Dictionary runs keep the negative-spacing-safe full scan.
+      const monotone =
+        isGraphemeFillText(s.text) &&
+        charSpacingDeltaPx(s, scale) >= 0 &&
+        snapToCharsClass(s, characterGrid) !== 'latin';
+      const split = fitSeaWordPrefix(s.text, s.seaBreaks, 0, available, measureSub, monotone);
+      if (split > 0) {
+        const prefix = s.text.slice(0, split);
+        const pw = strNaturalAdvance(s, prefix);
+        addToLine(
+          {
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: prefix,
+            measuredWidth: pw,
+            ...slicedTextMetadata(s, 0, prefix.length),
+          },
+          pw,
+          h,
+          asc,
+          desc,
+        );
+        const tail = s.text.slice(split);
+        if (tail) {
+          breakerState.queue.unshift({
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: tail,
+            ...slicedTextMetadata(s, split, s.text.length),
+            measuredWidth: 0,
+            src: { segIndex: s.src!.segIndex, charOffset: s.src!.charOffset + split },
+            seaBreaks: rebaseSeaBreaks(s.seaBreaks, split),
+          });
+        }
+      } else if (breakerState.currentLine.length > 0) {
+        // No whole word fits the remaining band — move the run to a fresh line and
+        // re-process (Latin-word style). If `s` would then LEAD the next line with
+        // a 行頭禁則 char (a mixed CJK+SEA run whose first glyph is a forbidden
+        // leader — #960 routes it here, where the offset set cannot fix a
+        // segment-initial char), pull trailing graphemes of the current line's
+        // last text segment down so they lead ahead of `s` — the same cross-run
+        // 追い出し (§17.3.1.16) the CJK branch does.
+        const retraction = retractCurrentLineForLeadingKinsoku(s);
+        if (retraction.kind === 'blocked') {
+          keepLeadingKinsokuWithCurrentLine(s, h, asc, desc);
+          continue;
+        }
+        flush(undefined, false, retraction.kind === 'retracted' ? retraction.tail.src : s.src);
+        breakerState.queue.unshift(s);
+        if (retraction.kind === 'retracted') breakerState.queue.unshift(retraction.tail);
+      } else {
+        // Empty line and the first dictionary word is wider than the whole
+        // column: emergency GRAPHEME-safe split (a code-point split would tear a
+        // base + tone/combining mark, both BMP). Guarantee ≥1 cluster of progress.
+        const firstWordEnd = s.seaBreaks[0] ?? s.text.length;
+        const firstWord = s.text.slice(0, firstWordEnd);
+        const graphemes = graphemeClusterOffsets(firstWord);
+        let gsplit = fitSeaWordPrefix(firstWord, graphemes, 0, available, measureSub, monotone);
+        if (gsplit <= 0) gsplit = graphemes.length > 0 ? graphemes[0] : firstWord.length;
+        gsplit = legalTextSplitAtOrBefore(s, gsplit) || emergencyTextSplit(s, available, true);
+        const prefix = s.text.slice(0, gsplit);
+        const pw = strNaturalAdvance(s, prefix);
+        addToLine(
+          {
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: prefix,
+            measuredWidth: pw,
+            ...slicedTextMetadata(s, 0, prefix.length),
+          },
+          pw,
+          h,
+          asc,
+          desc,
+        );
+        const tail = s.text.slice(gsplit);
+        if (tail) {
+          breakerState.queue.unshift({
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: tail,
+            ...slicedTextMetadata(s, gsplit, s.text.length),
+            measuredWidth: 0,
+            src: { segIndex: s.src!.segIndex, charOffset: s.src!.charOffset + gsplit },
+            seaBreaks: rebaseSeaBreaks(s.seaBreaks, gsplit),
+          });
+        }
+      }
+    } else if (breakerState.currentLine.length === 0) {
+      // `word-overlong-token-emergency-break`: for a single non-CJK token wider
+      // than a full line, fit the widest character prefix (at least one
+      // character), draw it, and re-queue the remainder. Segments are already
+      // space-delimited, so this cannot bypass an ordinary space opportunity.
+      const split = externalLinkSyntaxSplit(s, availW()) || emergencyTextSplit(s, availW());
+      if (split >= s.text.length) {
+        // The visible glyphs actually fit (only a trailing space pushed it over the
+        // fit test) — place the word whole.
+        s.measuredWidth = w;
+        addToLine(s, w, h, asc, desc);
+      } else {
+        const prefix = s.text.slice(0, split);
+        const pw = strNaturalAdvance(s, prefix);
+        addToLine(
+          {
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: prefix,
+            measuredWidth: pw,
+            ...slicedTextMetadata(s, 0, prefix.length),
+          },
+          pw,
+          h,
+          asc,
+          desc,
+        );
+        queueEmergencyTail(s, split);
+      }
+    } else {
+      const semanticSplit = externalLinkSyntaxSplit(s, availW() - breakerState.currentWidth);
+      if (semanticSplit > 0 && semanticSplit < s.text.length) {
+        const prefix = s.text.slice(0, semanticSplit);
+        const pw = strNaturalAdvance(s, prefix);
+        addToLine(
+          {
+            ...s,
+            ...RESET_SLICED_TEXT_MEASUREMENT,
+            text: prefix,
+            measuredWidth: pw,
+            ...slicedTextMetadata(s, 0, prefix.length),
+          },
+          pw,
+          h,
+          asc,
+          desc,
+        );
+        queueEmergencyTail(s, semanticSplit);
         continue;
       }
-      const trailingSpaces = candidate.text.length - candidate.text.replace(/ +$/u, '').length;
-      const spaceOnly = trailingSpaces > 0 && trailingSpaces === candidate.text.length;
-      if (!spaceOnly) flushSequence();
-      if (trailingSpaces > 0) {
-        sequence.push(candidate);
-        sequenceCount += trailingSpaces;
-      } else {
-        flushSequence();
+      if (s.joinPrev) {
+        // LB14 and the other UAX glue rules prohibit a line boundary at this
+        // source seam. If the complete glued group is wider than the fresh
+        // line, split this member at the widest legal grapheme boundary that
+        // fits the actual remaining band. This bases the decision on the group
+        // advance, not on the follower's standalone width.
+        const remaining = availW() - breakerState.currentWidth;
+        const split = emergencyTextSplit(s, remaining, true);
+        if ((remaining > 0 || s.hardJoinPrev === true) && split > 0 && split < s.text.length) {
+          const prefix = s.text.slice(0, split);
+          const pw = strNaturalAdvance(s, prefix);
+          addToLine(
+            {
+              ...s,
+              ...RESET_SLICED_TEXT_MEASUREMENT,
+              text: prefix,
+              measuredWidth: pw,
+              ...slicedTextMetadata(s, 0, prefix.length),
+            },
+            pw,
+            h,
+            asc,
+            desc,
+          );
+          queueEmergencyTail(s, split);
+          continue;
+        }
+        // A scalar span that continues the preceding grapheme (or another
+        // explicitly glued piece) may overflow a pathological narrow line, but
+        // it must never become a new line head and tear the cluster.
+        s.measuredWidth = w;
+        addToLine(s, w, h, asc, desc);
+        continue;
+      }
+      // Latin token does not fit on the current (non-empty) line: move it to a fresh
+      // line and re-process. There it either fits, or — when it is wider than the
+      // whole column — the empty-line branch above breaks it at the character level
+      // (overflow-wrap). Re-queueing rather than force-adding is what lets that
+      // over-long-word path run instead of letting the word spill the column.
+      flush(undefined, false, s.src);
+      breakerState.queue.unshift(s);
+    }
+  }
+}
+
+interface LineBreakerPassInput {
+  readonly ctx: MeasurementTextContext;
+  readonly segs: LayoutSeg[];
+  readonly maxWidth: number;
+  readonly firstIndent: number;
+  readonly scale: number;
+  readonly tabStops: TabStop[];
+  readonly wrapCtx?: WrapLayoutCtx;
+  readonly fontFamilyClasses: Record<string, string>;
+  readonly tabOriginPx: number;
+  readonly kinsoku: KinsokuRules;
+  readonly characterGrid?: DocGridCtx;
+  readonly defaultTabPt: number;
+  readonly marginRightPx: number;
+  readonly baseRtl: boolean;
+  readonly isJustified: boolean;
+  readonly stretchLastLine: boolean;
+  readonly startBoundary?: LineBoundary;
+  readonly widthPolicy: 'bounded' | 'intrinsic';
+  readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
+  readonly overflowPunct: boolean;
+  readonly passContext: Readonly<{
+    probeHeights: readonly number[] | null;
+    preparedFloatWrap?: PreparedFloatWrap;
+  }>;
+}
+
+/** One immutable-input line-break pass; all mutable line state is pass-local. */
+function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
+  const {
+    ctx,
+    segs,
+    maxWidth,
+    firstIndent,
+    scale,
+    tabStops,
+    wrapCtx,
+    fontFamilyClasses,
+    tabOriginPx,
+    kinsoku,
+    characterGrid,
+    defaultTabPt,
+    marginRightPx,
+    baseRtl,
+    isJustified,
+    stretchLastLine,
+    startBoundary,
+    widthPolicy,
+    verticalGlyphMeasurement,
+    overflowPunct,
+    passContext,
+  } = input;
+
+  const { probeHeights, preparedFloatWrap } = passContext;
+  const breakerState = createLineBreakerState(maxWidth, wrapCtx);
+
+  const sameLatinSpaceFace = (candidate: LayoutTextSeg, reference: LayoutTextSeg): boolean =>
+    candidate.latinSpaceCompressionEligible === true &&
+    !candidate.verticalRun &&
+    !reference.verticalRun &&
+    !candidate.tateChuYoko &&
+    !reference.tateChuYoko &&
+    candidate.latinSpaceAverageWidthRatio === reference.latinSpaceAverageWidthRatio &&
+    candidate.fontRoute?.fingerprint === reference.fontRoute?.fingerprint &&
+    candidate.fontFamily === reference.fontFamily &&
+    candidate.fontSize === reference.fontSize &&
+    candidate.bold === reference.bold &&
+    candidate.italic === reference.italic &&
+    (candidate.charScale == null || candidate.charScale === 1) &&
+    (reference.charScale == null || reference.charScale === 1) &&
+    candidate.kerning === reference.kerning &&
+    candidate.widthBalanceGridDeltaFactor === reference.widthBalanceGridDeltaFactor &&
+    !candidate.rtl &&
+    candidate.fitTextRegionIndex === undefined;
+
+  const materializeLatinSpaceCompression = (): void => {
+    for (let index = 0; index < breakerState.latinAppliedGapCount; index += 1) {
+      const gap = breakerState.latinLineGaps[index];
+      gap.measuredWidth -= breakerState.latinAppliedPerGap;
+      gap.latinSpaceCompressionPx = breakerState.latinAppliedPerGap;
+    }
+    breakerState.latinAppliedGapCount = 0;
+    breakerState.latinAppliedPerGap = 0;
+  };
+  const snapPitchPx =
+    characterGrid?.type === 'snapToChars' &&
+    characterGrid.characterPitchPt != null &&
+    characterGrid.characterPitchPt > 0
+      ? characterGrid.characterPitchPt * scale
+      : null;
+
+  // Square-only compatibility side-space (px) a CONTENT line needs before it may
+  // START beside a square object rather than flow below its band.
+  // `word-square-line-start-one-inch` supplies the requirement and tolerance via
+  // wordMinLineStartPx(scale),
+  // tolerance), INDEPENDENT of a content line's text — the same threshold for a
+  // short-token line and a long-word line (a first word that overruns the ≥1-inch
+  // gap is force-broken there by the over-long-word char-break below, matching
+  // Word's "AFTE"/"R-10" wrapping). This replaced a per-line first-atomic-token
+  // width probe that wedged short-token lines into sub-inch gaps and refused
+  // ≥1-inch gaps to long-word lines. See issue #676 (fixtures
+  // private/sample-19/20/22, pdftotext bbox). Shared by the paint pass and the
+  // paginator's two mirror layouts (they call layoutLines with scale 1), so the
+  // flow/beside decision agrees across passes.
+  //
+  // NOTE — this 1-inch rule is the CONTENT-line threshold. A literally-empty
+  // paragraph's pilcrow is placed by resolveEmptyMarkTop / flowMarkLine
+  // (renderer.ts) against the NARROWER pilcrow-em threshold. An anchorHost-only
+  // paragraph still enters layoutLines so its anchor-character metrics size the
+  // mark line, but `isParagraphMarkOnlyFlow` selects the same narrow threshold
+  // for its first line. `word-empty-mark-float-side-gap` supplies that narrower
+  // threshold. #676 over-generalized one inch onto marks; inline
+  // content (including a content paragraph's trailing-break final line) keeps
+  // the square-only 1-inch rule. Tight/through are governed by their polygon
+  // openings (§20.4.2.18/.19), for which there is no corresponding evidence.
+  const minLineStartWidth = (): number => wordMinLineStartPx(scale);
+  const isParagraphMarkOnlyFlow =
+    segs.length > 0 &&
+    segs.every(
+      (segment) =>
+        ('text' in segment && segment.metricOnly === true) ||
+        ('imagePath' in segment && Boolean(segment.anchor)),
+    );
+
+  // Compute wrap constraints for a new line about to start. Mutates
+  // lineXOffset/lineMaxWidth/currentLineTopY. `minWidth` is the smallest clear
+  // square side-space the upcoming line must have to START here. Polygon wraps
+  // receive MIN_LINE_GAP separately so the compatibility policy cannot erase a
+  // through opening explicitly permitted by §20.4.2.18.
+  const startLine = (minWidth: number = 0): void => {
+    breakerState.snapBlock = null;
+    breakerState.lineXOffset = 0;
+    breakerState.lineMaxWidth = maxWidth;
+    if (!wrapCtx) return;
+    const probeH = probeHeights?.[breakerState.lines.length];
+    // The first pass measures this line without a float window. A later pass
+    // resolves it only once that exact line index has an observed line-box
+    // height; newly-created lines are likewise measured before they are probed.
+    if (probeH === undefined) return;
+    const reference = {
+      xLeftPt: wrapCtx.referenceXPt ?? wrapCtx.paraX,
+      xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
+      readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
+    } as const;
+    if (wrapCtx.lineWindow) {
+      const win = wrapCtx.lineWindow({
+        topYPt: breakerState.currentLineTopY,
+        minimumStartWidthPt: MIN_LINE_GAP,
+        squareMinimumStartWidthPt: minWidth,
+        probeHeightPt: probeH,
+        paragraphXPt: wrapCtx.paraX,
+        maximumWidthPt: maxWidth,
+        columnXPt: wrapCtx.columnXPt,
+        columnWidthPt: wrapCtx.columnWidthPt,
+      });
+      breakerState.currentLineTopY = win.topYPt;
+      breakerState.lineXOffset = win.xOffsetPt;
+      breakerState.lineMaxWidth = win.maximumWidthPt;
+    } else {
+      const win = computePreparedLineFloatWindow(
+        breakerState.currentLineTopY,
+        MIN_LINE_GAP,
+        probeH,
+        wrapCtx.paraX,
+        maxWidth,
+        preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
+        wrapCtx.columnXPt,
+        wrapCtx.columnXPt + wrapCtx.columnWidthPt,
+        reference,
+        minWidth,
+      );
+      breakerState.currentLineTopY = win.topY;
+      breakerState.lineXOffset = win.xOffset;
+      breakerState.lineMaxWidth = win.maxWidth;
+    }
+  };
+
+  // Intrinsic acquisition deliberately disables automatic line wrapping while
+  // retaining the real paragraph/anchor width for tab and alignment reference
+  // frames. This is a semantic mode, not a synthetic oversized page.
+  const availW = () =>
+    widthPolicy === 'intrinsic'
+      ? Number.POSITIVE_INFINITY
+      : breakerState.lineMaxWidth - (breakerState.isFirst ? firstIndent : 0);
+
+  // AutoFit can set a table column to the measured text advance plus its
+  // first-line indent and grouped cell insets. Cell acquisition subtracts those
+  // same grouped insets. At exact equality, subtracting the indent from the
+  // line width may round down while adding it to the advance does not. Both
+  // inequalities are equivalent in real arithmetic; check both operation
+  // orders for a finite bounded line. This changes arithmetic order only;
+  // it adds no fixed overflow allowance.
+  const fitsMeasuredWidth = (used: number, available: number): boolean => {
+    if (used <= available) return true;
+    if (
+      widthPolicy === 'intrinsic' ||
+      !Number.isFinite(used) ||
+      !Number.isFinite(breakerState.lineMaxWidth)
+    ) {
+      return false;
+    }
+    return used + (breakerState.isFirst ? firstIndent : 0) <= breakerState.lineMaxWidth;
+  };
+
+  // ECMA-376 §17.3.1.37 tab stops in leading-edge px, for the bidi post-pass.
+  const bidiCustomStopsPx = baseRtl
+    ? tabStops.map((t) => ({ pos: t.pos * scale, alignment: t.alignment, leader: t.leader }))
+    : [];
+  const bidiIntervalPx = defaultTabPt * scale;
+
+  // Rewrite a finalized bidi line's tab widths (+ leaders) in the VISUAL frame
+  // (§17.3.1.6 base RTL). The line's tabs were laid out with provisional width 0
+  // by the tab block below (the LTR pen math does not apply under an RTL base);
+  // here we place each tab-delimited cell at its mirrored stop. No-op for a line
+  // without tabs (LTR paragraphs skip this entirely — `baseRtl` is false).
+
+  const flush = (forceHeight?: number, brTerminated = false, nextStart?: LineBoundary) => {
+    materializeLatinSpaceCompression();
+    breakerState.currentWidth += applyBidiTabPostPass({
+      baseRtl,
+      currentLine: breakerState.currentLine,
+      marginRightPx,
+      lineXOffset: breakerState.lineXOffset,
+      lineMaxWidth: breakerState.lineMaxWidth,
+      isFirst: breakerState.isFirst,
+      firstIndent,
+      tabOriginPx,
+      bidiCustomStopsPx,
+      bidiIntervalPx,
+      decimalAlignmentPoint,
+      strAdvance,
+    });
+    // §17.3.2.24 defines `position` relative to surrounding non-positioned
+    // text. A line whose every metric-bearing item shares the same inherited
+    // position has no differently-positioned peer to pin the resulting line
+    // box to one side. `word-uniform-run-position-leading` owns the compatibility
+    // placement of that box around the glyphs. Keep mixed
+    // lines relative to zero so their authored displacement and ink union
+    // remain unchanged. Images/math
+    // provide a zero-position reference; tabs do not contribute vertical
+    // metrics. The fixed drop-cap path intentionally keeps its paint-only
+    // lowering and therefore opts out of this normalization.
+    let commonPositionPt: number | undefined;
+    let hasPositionReference = false;
+    for (const segment of breakerState.currentLine) {
+      if ('isTab' in segment) continue;
+      const positionPt = 'text' in segment ? (segment.position ?? 0) : 0;
+      if ('text' in segment && segment.positionExtendsLineBox === false) {
+        commonPositionPt = 0;
+        hasPositionReference = true;
+        break;
+      }
+      if (!hasPositionReference) {
+        commonPositionPt = positionPt;
+        hasPositionReference = true;
+      } else if (commonPositionPt !== positionPt) {
+        commonPositionPt = 0;
+        break;
       }
     }
-    flushSequence();
-  }
-
-  // ── UAX#14 LB13 / ECMA-376 §17.15.1.59 (行頭禁則 — line-start-forbidden) ──────
-  // A closing / mid-punctuation code point (comma, period, ; : ! ? ) ] } and
-  // their CJK forms) carries NO line-break opportunity before it, so it may
-  // never BEGIN a line. When such a char OPENS a segment that is glued to the
-  // previous text segment — no intervening whitespace, e.g. a comma authored in
-  // its own run as in sample-12's "…detection system" | ", metadata" — mark it
-  // `joinPrev` so the group machinery in layoutLines keeps it with the preceding
-  // word and wraps "system," together instead of orphaning "," at the next
-  // line's head.
-  //
-  // This is a UNIVERSAL Latin/Western rule (UAX#14 LB13), NOT the East-Asian
-  // kinsoku feature, so it consults the application's DEFAULT forbidden table
-  // UNCONDITIONALLY — independent of the document's §17.3.1.16 `w:kinsoku`
-  // toggle and of any custom §17.15.1.59 `w:noLineBreaksBefore` set (which
-  // REPLACES the default East-Asian table for a language and so must NOT be able
-  // to drop the ASCII non-starters and re-orphan a Latin comma). The document's
-  // kinsoku settings still govern the separate per-character CJK retract paths
-  // (kinsokuAdjustedSplit / crossRunKinsokuRetract), which read the layout kinsoku argument.
-  // The ASCII non-starters (!),.:;?]}) live in that default table (core
-  // rules.ts), so one membership test covers Latin and (incidentally) CJK forms.
-  for (let i = 1; i < segs.length; i++) {
-    const cur = segs[i];
-    if (!('text' in cur) || cur.joinPrev) continue;
-    const firstCp = cur.text.codePointAt(0);
-    if (firstCp === undefined || !DEFAULT_KINSOKU_RULES.lineStartForbidden.has(firstCp)) continue;
-    const prev = segs[i - 1];
-    // Only glue across a boundary that is NOT already a break opportunity: the
-    // preceding unit must be text that does not end in whitespace (a trailing
-    // space is a legal break, so the mark may legitimately start the line).
-    if (!('text' in prev) || /\s$/.test(prev.text)) continue;
-    cur.joinPrev = true;
-  }
-
-  // Preserve the established Word/JLReq line-end allowance for U+3000 across
-  // internal script/font/width-balance shaping seams. U+3000 is BA in UAX #14,
-  // so the break opportunity is after the space; splitting the space into its
-  // own internal segment must not invent an opportunity before it. A real
-  // U+0020 source-run boundary is delegated to
-  // wordSourceRunSpaceContinuesSequence below.
-  for (let i = 1; i < segs.length; i++) {
-    const cur = segs[i];
-    if (
-      !('text' in cur)
-      || cur.joinPrev
-      || (cur.text[0] !== ' ' && cur.text[0] !== '\u3000')
-    ) continue;
-    const prev = segs[i - 1];
-    if (!('text' in prev)) continue;
-    const trailingSpaceFromSameRun = cur.sourceRunIndex === prev.sourceRunIndex;
-    const compatibleSourceBoundary = wordSourceRunSpaceContinuesSequence(
-      prev.text,
-      cur.text,
+    const linePositionReferencePt = hasPositionReference ? (commonPositionPt ?? 0) : 0;
+    if (linePositionReferencePt !== 0) {
+      for (const segment of breakerState.currentLine) {
+        if ('text' in segment) {
+          segment.lineRelativePosition = wordUniformRunPositionPaintPt(
+            segment.position ?? 0,
+            linePositionReferencePt,
+          );
+        }
+      }
+    }
+    // §17.3.3.1 — the break is one run among the line's runs: its own size
+    // participates in the line height but must not override a taller peer.
+    const h =
+      forceHeight !== undefined
+        ? Math.max(breakerState.lineHeight, forceHeight)
+        : breakerState.lineHeight || 10;
+    // If the line has no measured content (empty/line-break line), synthesize
+    // stable ascent/descent from the effective font size so wrap/baseline math
+    // stays consistent with non-empty lines.
+    const hasContent = breakerState.lineAscent > 0 || breakerState.lineDescent > 0;
+    const asc = hasContent ? breakerState.lineAscent : h * scale * 0.8;
+    const desc = hasContent ? breakerState.lineDescent : h * scale * 0.2;
+    const visibleAscent = breakerState.lineHasVisibleMetrics ? breakerState.lineVisibleAscent : asc;
+    const visibleDescent = breakerState.lineHasVisibleMetrics
+      ? breakerState.lineVisibleDescent
+      : desc;
+    const visibleIntendedSingle = breakerState.lineHasVisibleMetrics
+      ? breakerState.lineVisibleIntendedSingle
+      : breakerState.lineIntendedSingle;
+    const gridCountSingle =
+      breakerState.lineGridCountSingle ||
+      (breakerState.lineEastAsian
+        ? eastAsianGridCountSinglePx(breakerState.lineIntendedSingle, h * scale)
+        : asc + desc);
+    const inlinePictureTextSingle = breakerState.lineHasInlinePicture
+      ? Math.max(breakerState.lineIntendedSingle, breakerState.linePictureMarkSingle)
+      : 0;
+    // Only project that registered rule when every metric-bearing item is
+    // visible text in one admitted face tuple. Canvas fallback geometry does
+    // not reveal hhea descent, and mixed styles cannot share one descent
+    // reserve. The rule uses face data, never a family-specific correction.
+    const positionedTexts = breakerState.currentLine.filter(
+      (segment): segment is LayoutTextSeg => 'text' in segment,
     );
+    const firstPositioned = positionedTexts[0];
+    const uniformPositionAuto =
+      linePositionReferencePt !== 0 &&
+      positionedTexts.length > 0 &&
+      breakerState.currentLine.every((segment) => 'isTab' in segment || 'text' in segment) &&
+      firstPositioned?.resolvedDesignDescentRatio != null &&
+      (firstPositioned.referenceFontVerticalMetric ||
+        firstPositioned.resolvedResourceVerticalMetric) &&
+      positionedTexts.every(
+        (segment) =>
+          segment.text.length > 0 &&
+          !segment.metricOnly &&
+          !segment.ruby &&
+          !segment.vertAlign &&
+          segment.positionExtendsLineBox !== false &&
+          segment.position === linePositionReferencePt &&
+          segment.fontFamily === firstPositioned.fontFamily &&
+          segment.fontRoute?.fingerprint === firstPositioned.fontRoute?.fingerprint &&
+          segment.bold === firstPositioned.bold &&
+          segment.italic === firstPositioned.italic &&
+          segment.fontSize === firstPositioned.fontSize &&
+          segment.resolvedDesignDescentRatio === firstPositioned.resolvedDesignDescentRatio &&
+          segment.referenceFontVerticalMetric === firstPositioned.referenceFontVerticalMetric &&
+          segment.resolvedResourceVerticalMetric ===
+            firstPositioned.resolvedResourceVerticalMetric &&
+          (segment.referenceFontVerticalMetric || segment.resolvedResourceVerticalMetric),
+      )
+        ? {
+            normalSinglePx: Math.max(
+              asc + desc - Math.abs(linePositionReferencePt * scale),
+              breakerState.lineIntendedSingle,
+            ),
+            positionPx: linePositionReferencePt * scale,
+            designDescentPx:
+              firstPositioned.resolvedDesignDescentRatio * firstPositioned.fontSize * scale,
+          }
+        : undefined;
+    breakerState.lines.push({
+      segments: breakerState.currentLine,
+      height: h,
+      ascent: asc,
+      descent: desc,
+      visibleAscent,
+      visibleDescent,
+      visibleIntendedSingle,
+      intendedSingle: breakerState.lineIntendedSingle,
+      ...(inlinePictureTextSingle > 0 ? { inlinePictureTextSingle } : {}),
+      uniformPositionAuto,
+      // Empty/synthetic East Asian lines use the same design-height rule as a
+      // text run; their synthesized Canvas box must not reintroduce a
+      // scale-dependent cell count.
+      gridCountSingle,
+      xOffset: breakerState.lineXOffset,
+      availWidth: breakerState.lineMaxWidth,
+      topY: wrapCtx ? breakerState.currentLineTopY : undefined,
+      hasRuby: breakerState.lineHasRuby,
+      eastAsian: breakerState.lineEastAsian,
+      endsWithBreak: brTerminated,
+      consumedEnd: nextStart ?? breakerState.queue[0]?.src ?? endBoundary,
+    });
+    if (wrapCtx) {
+      breakerState.currentLineTopY += wrapCtx.lineBoxH(
+        asc,
+        desc,
+        breakerState.lineHasRuby,
+        breakerState.lineIntendedSingle,
+        breakerState.lineEastAsian,
+        gridCountSingle,
+        uniformPositionAuto,
+        inlinePictureTextSingle,
+      );
+    }
+    breakerState.currentLine = [];
+    breakerState.currentWidth = 0;
+    breakerState.latinLineFace = undefined;
+    breakerState.latinLineHomogeneous = true;
+    breakerState.latinLineGaps = [];
+    breakerState.latinUniformGapCapacity = undefined;
+    breakerState.lineHeight = 0;
+    breakerState.lineAscent = 0;
+    breakerState.lineDescent = 0;
+    breakerState.lineIntendedSingle = 0;
+    breakerState.lineHasInlinePicture = false;
+    breakerState.linePictureMarkSingle = 0;
+    breakerState.lineGridCountSingle = 0;
+    breakerState.lineVisibleAscent = 0;
+    breakerState.lineVisibleDescent = 0;
+    breakerState.lineVisibleIntendedSingle = 0;
+    breakerState.lineHasVisibleMetrics = false;
+    breakerState.lineHasRuby = false;
+    breakerState.lineEastAsian = false;
+    breakerState.isFirst = false;
+    startLine(minLineStartWidth());
+  };
+
+  const prospectiveSnapAdvance = (s: LayoutTextSeg, naturalWidth: number): number => {
+    const kind = snapToCharsClass(s, characterGrid);
+    if (!kind || snapPitchPx == null) return naturalWidth;
+    if (kind === 'eastAsia') {
+      const cells = eastAsianSnapCellCount(s);
+      return snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx, cells);
+    }
+    if (breakerState.snapBlock?.kind === kind) {
+      return (
+        snapToCharsAllocatedWidthPx(
+          breakerState.snapBlock.naturalWidthPx + naturalWidth,
+          kind,
+          snapPitchPx,
+        ) - breakerState.snapBlock.allocatedWidthPx
+      );
+    }
+    return snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx);
+  };
+
+  const addToLine = (
+    s: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg,
+    w: number,
+    h: number,
+    asc: number,
+    desc: number,
+  ) => {
+    let committedWidth = w;
+    if ('text' in s) {
+      const kind = snapToCharsClass(s, characterGrid);
+      const naturalWidth = s.snapGridNaturalWidthPx ?? w;
+      if (kind && snapPitchPx != null) {
+        s.snapGridClass = kind;
+        s.snapGridNaturalWidthPx = naturalWidth;
+        s.snapGridCellPitchPx = snapPitchPx;
+        if (kind === 'eastAsia') {
+          const cellCount = eastAsianSnapCellCount(s);
+          committedWidth = snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx, cellCount);
+          s.snapGridLeadingPadPx = 0;
+          s.snapGridTrailingPadPx = committedWidth - naturalWidth;
+          s.measuredWidth = committedWidth;
+          breakerState.snapBlock = null;
+        } else if (breakerState.snapBlock?.kind === kind) {
+          const previousLeading = breakerState.snapBlock.first.snapGridLeadingPadPx ?? 0;
+          const previousTrailing = breakerState.snapBlock.last.snapGridTrailingPadPx ?? 0;
+          const combinedNatural = breakerState.snapBlock.naturalWidthPx + naturalWidth;
+          const combinedAllocated = snapToCharsAllocatedWidthPx(combinedNatural, kind, snapPitchPx);
+          const slack = combinedAllocated - combinedNatural;
+          const leading = kind === 'latin' ? slack / 2 : 0;
+          const trailing = slack - leading;
+          breakerState.snapBlock.first.measuredWidth -= previousLeading;
+          breakerState.snapBlock.first.snapGridLeadingPadPx = leading;
+          breakerState.snapBlock.first.measuredWidth += leading;
+          breakerState.snapBlock.last.measuredWidth -= previousTrailing;
+          s.snapGridLeadingPadPx = 0;
+          s.snapGridTrailingPadPx = trailing;
+          s.measuredWidth = naturalWidth + trailing;
+          committedWidth = combinedAllocated - breakerState.snapBlock.allocatedWidthPx;
+          breakerState.snapBlock = {
+            kind,
+            first: breakerState.snapBlock.first,
+            last: s,
+            naturalWidthPx: combinedNatural,
+            allocatedWidthPx: combinedAllocated,
+          };
+        } else {
+          const allocated = snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx);
+          const slack = allocated - naturalWidth;
+          const leading = kind === 'latin' ? slack / 2 : 0;
+          const trailing = slack - leading;
+          s.snapGridLeadingPadPx = leading;
+          s.snapGridTrailingPadPx = trailing;
+          s.measuredWidth = allocated;
+          committedWidth = allocated;
+          breakerState.snapBlock = {
+            kind,
+            first: s,
+            last: s,
+            naturalWidthPx: naturalWidth,
+            allocatedWidthPx: allocated,
+          };
+        }
+      } else {
+        s.snapGridClass = undefined;
+        s.snapGridLeadingPadPx = undefined;
+        s.snapGridTrailingPadPx = undefined;
+        s.snapGridCellPitchPx = undefined;
+        s.measuredWidth = w;
+        breakerState.snapBlock = null;
+      }
+    } else {
+      breakerState.snapBlock = null;
+    }
+    breakerState.currentLine.push(s);
+    breakerState.currentWidth += committedWidth;
     if (
-      !trailingSpaceFromSameRun
-      && !compatibleSourceBoundary
-    ) continue;
-    cur.joinPrev = true;
-  }
+      'text' in s &&
+      s.latinSpaceCompressionEligible === true &&
+      s.latinSpaceAverageWidthRatio != null &&
+      s.fontRoute
+    ) {
+      if (breakerState.latinLineFace && !sameLatinSpaceFace(s, breakerState.latinLineFace)) {
+        materializeLatinSpaceCompression();
+        breakerState.latinLineHomogeneous = false;
+      }
+      breakerState.latinLineFace ??= s;
+      if (s.latinNaturalTrailingSpacePx !== undefined) {
+        const floor =
+          ((calcEffectiveFontPx(s, scale) * s.latinSpaceAverageWidthRatio) / 2) *
+            charScaleFactor(s) +
+          segmentCharacterGridDeltaPx(s, characterGrid, scale);
+        const capacity = Math.max(0, s.latinNaturalTrailingSpacePx - floor);
+        if (
+          breakerState.latinUniformGapCapacity !== undefined &&
+          Math.abs(capacity - breakerState.latinUniformGapCapacity) > 1e-6
+        ) {
+          materializeLatinSpaceCompression();
+          breakerState.latinLineHomogeneous = false;
+        }
+        breakerState.latinUniformGapCapacity ??= capacity;
+        breakerState.latinLineGaps.push(s);
+      }
+    } else {
+      materializeLatinSpaceCompression();
+      breakerState.latinLineHomogeneous = false;
+    }
+    if (h > breakerState.lineHeight) breakerState.lineHeight = h;
+    if ('imagePath' in s && s.inlinePicture === true) {
+      breakerState.lineHasInlinePicture = true;
+      breakerState.linePictureMarkSingle = Math.max(
+        breakerState.linePictureMarkSingle,
+        (s.paragraphMarkSinglePx ?? 0) * scale,
+      );
+    }
+    if (asc > breakerState.lineAscent) breakerState.lineAscent = asc;
+    if (desc > breakerState.lineDescent) breakerState.lineDescent = desc;
+    const paintsInlineInk = !('text' in s) || s.metricOnly !== true;
+    if (paintsInlineInk) {
+      breakerState.lineHasVisibleMetrics = true;
+      if (asc > breakerState.lineVisibleAscent) breakerState.lineVisibleAscent = asc;
+      if (desc > breakerState.lineVisibleDescent) breakerState.lineVisibleDescent = desc;
+    }
+    // Grid-count height for docGrid cell allocation (§17.6.5). Only East Asian
+    // TEXT (and tall inline objects) drives the count — a Latin run keeps its
+    // natural height and is NOT cell-rounded, so it must not contribute (its
+    // substituted Canvas box would otherwise inflate the count). An EA text run
+    // counts from its DESIGN height when tabled, else the deterministic Word FE
+    // 1.3em fallback; an image/math object counts its measured box. The line's
+    // value is the max.
+    let segGridCount = 0;
+    if (!('isTab' in s) && !('imagePath' in s) && !('math' in s)) {
+      const ts = s as LayoutTextSeg;
+      if (ts.ruby) breakerState.lineHasRuby = true;
+      const metricEastAsian = ts.metricEastAsian === true || EAST_ASIAN_RE.test(ts.text);
+      if (!breakerState.lineEastAsian && metricEastAsian) breakerState.lineEastAsian = true;
+      // Prefer the selected resource's single-line height. Without admitted
+      // geometry, the generic East Asian grid fallback remains authoritative.
+      // Small caps (non-super/sub) keep the FULL run size here so the line box
+      // follows the run size, not the 2pt-reduced glyphs (§17.3.2.33).
+      const intendedEm = ts.smallCaps && !ts.vertAlign ? ts.fontSize * scale : effectiveFontPx(ts);
+      // The OpenType code-page class selects the general line ratio even for
+      // Latin text. This script hint selects an optional East-Asian-specific
+      // floor and grid-cell counting; ruby keeps its measured annotation box.
+      const segScriptHint = metricEastAsian && !ts.ruby;
+      const nativeRatio =
+        ts.resolvedLineHeightRatio == null
+          ? nativeCanvasLineRatio(
+              ctx,
+              fontFamilyClasses,
+              ts.fontRoute,
+              ts.fontFamily,
+              ts.bold ? 700 : 400,
+              ts.italic ? 'italic' : 'normal',
+              ts.text,
+            )
+          : null;
+      const designIntended =
+        ts.textBoxLineFloor && ts.ruby
+          ? 0
+          : Math.max(
+              segmentIntendedSingleLinePx(ts, intendedEm, segScriptHint),
+              ts.textBoxLineFloor || ts.metricEastAsian === true
+                ? segmentEastAsiaFloorSingleLinePx(ts, intendedEm, segScriptHint)
+                : 0,
+            );
+      const intended = Math.max(designIntended, (nativeRatio ?? 0) * intendedEm);
+      if (intended > breakerState.lineIntendedSingle) breakerState.lineIntendedSingle = intended;
+      if (paintsInlineInk && intended > breakerState.lineVisibleIntendedSingle) {
+        breakerState.lineVisibleIntendedSingle = intended;
+      }
+      // Only East Asian text is cell-rounded. The native Canvas probe can
+      // establish a browser-selected font box for ordinary auto lines, but it
+      // cannot establish Word's Far-East design height or OS/2 code-page class.
+      // For an untabled tuple retain the documented 1.3em grid fallback;
+      // parsed resource/reference design metrics still take precedence.
+      if (segScriptHint) segGridCount = eastAsianGridCountSinglePx(designIntended, intendedEm);
+    } else if (!('isTab' in s)) {
+      // Image/math object: a tall inline object sizes the line's cells too.
+      segGridCount = asc + desc;
+    }
+    if (segGridCount > breakerState.lineGridCountSingle)
+      breakerState.lineGridCountSingle = segGridCount;
+  };
 
-  // ── UAX #14 no-break pairs (LB14/LB23/LB23a/LB24/LB25/LB28/LB30) ──
-  // buildSegments intentionally splits at run / font-script boundaries, but
-  // those formatting seams are not line-break opportunities. Mark the following
-  // segment so layoutLines' existing atomic-group pre-flush selects the previous
-  // real opportunity instead. The shared predicate is deliberately one-way:
-  // false means unsupported/deferred, never "break allowed".
-  for (let i = 1; i < segs.length; i++) {
-    const cur = segs[i];
+  const measurement = new LineMeasurementAdapter(
+    ctx,
+    scale,
+    (segment) =>
+      buildFont(
+        segment.bold,
+        segment.italic,
+        calcEffectiveFontPx(segment, scale),
+        segment.fontFamily,
+        fontFamilyClasses,
+        segment.fontRoute,
+      ),
+    verticalGlyphMeasurement,
+  );
+  const effectiveFontPx = (s: LayoutTextSeg): number => calcEffectiveFontPx(s, scale);
+  const measureText = (s: LayoutTextSeg, clusterGeometry = false): TextMetrics =>
+    measurement.measureSegment(s, clusterGeometry);
+  const verticalInkExtra = (s: LayoutTextSeg, text: string): number =>
+    measurement.verticalInkExtra(s, text);
+  const setMeasureFont = (font: string): void => measurement.setFont(font);
+
+  const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
+  breakerState.queue = prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement);
+
+  // The segment's laid-out ADVANCE (= its measuredWidth): natural width plus the
+  // character-grid delta, the §17.3.2.43 horizontal glyph scale (w:w) and the
+  // §17.3.2.35 character-spacing pitch (w:spacing). This is the SINGLE source of
+  // truth shared with the draw paths (segAdvanceWidth) — every line-break / fit /
+  // tab measurement uses it so line wrapping packs the grid's char count and the
+  // box matches what is drawn (measure==paint). `kerning` (§17.3.2.19) is applied
+  // via `ctx.fontKerning` inside `withSegKerning`, wrapping the measureText call.
+  // The #1014 vo=Tr ink deficit (`verticalInkExtra`, defined above) is folded into
+  // the natural width so measure == paint on an under-reporting vertical run.
+  const segNaturalAdvance = (s: LayoutTextSeg): number =>
+    segAdvanceWidth(s, measureText(s).width + verticalInkExtra(s, s.text), characterGrid, scale);
+  const standaloneSnapAdvance = (s: LayoutTextSeg, naturalWidth: number): number => {
+    const kind = snapToCharsClass(s, characterGrid);
+    if (!kind || snapPitchPx == null || s.text.length === 0) return naturalWidth;
+    return snapToCharsAllocatedWidthPx(
+      naturalWidth,
+      kind,
+      snapPitchPx,
+      kind === 'eastAsia' ? eastAsianSnapCellCount(s) : 1,
+    );
+  };
+  const segAdvance = (s: LayoutTextSeg): number => standaloneSnapAdvance(s, segNaturalAdvance(s));
+  // Grid advance of an arbitrary substring under a segment's font (for split
+  // prefixes/tails). Selects the font (and the run's kerning state), then applies
+  // the same width model as a whole segment BUT with the substring's own
+  // text/length so char-spacing scales with the piece — the split-prefix vs
+  // whole-segment advances must agree.
+  const strNaturalAdvance = (
+    s: LayoutTextSeg,
+    text: string,
+    retainTrailingPunctuationCompression = false,
+  ): number => {
+    const start = retainTrailingPunctuationCompression ? s.text.length - text.length : 0;
+    const measuredSegment = {
+      ...s,
+      text,
+      punctuationCompressions: slicedPunctuationCompressions(
+        s,
+        Math.max(0, start),
+        Math.max(0, start) + text.length,
+      ),
+    };
+    if (s.textLayoutService && s.textShapeRequest) {
+      const shaped = s.textLayoutService.shape({
+        ...s.textShapeRequest,
+        text,
+        fontSizePt: effectiveFontPx(s),
+        measure: true,
+        clusterGeometry: false,
+      });
+      return segAdvanceWidth(
+        measuredSegment,
+        shaped.advancePt + verticalInkExtra(s, text),
+        characterGrid,
+        scale,
+      );
+    }
+    const natural = measurement.measureRunText(s, text).width;
+    return segAdvanceWidth(
+      measuredSegment,
+      natural + verticalInkExtra(s, text),
+      characterGrid,
+      scale,
+    );
+  };
+  const eastAsianSnapCellCount = (s: LayoutTextSeg): number => {
+    if (snapPitchPx == null) return 1;
+    if (s.textLayoutService && s.textShapeRequest && !s.shapedClusters) {
+      measureText(s, true);
+    }
+    const shapedClusters = s.shapedClusters?.length ? s.shapedClusters : null;
+    const boundaries =
+      shapedClusters == null
+        ? [...new Set([0, ...graphemeClusterOffsets(s.text), s.text.length])].sort((a, b) => a - b)
+        : null;
+    const ranges =
+      shapedClusters?.map((cluster) => ({
+        start: cluster.range.start,
+        end: cluster.range.end,
+        advancePx: cluster.advancePt,
+      })) ??
+      boundaries!.slice(0, -1).map((start, index) => ({
+        start,
+        end: boundaries![index + 1]!,
+        advancePx: undefined,
+      }));
+    let cells = 0;
+    for (const range of ranges) {
+      const { start, end } = range;
+      if (end <= start) continue;
+      const text = s.text.slice(start, end);
+      const measuredSegment = {
+        ...s,
+        text,
+        punctuationCompressions: slicedPunctuationCompressions(s, start, end),
+      };
+      let naturalAdvancePx: number;
+      if (range.advancePx != null) {
+        naturalAdvancePx = segAdvanceWidth(
+          measuredSegment,
+          range.advancePx + verticalInkExtra(s, text),
+          characterGrid,
+          scale,
+        );
+      } else {
+        const naturalWidthPx = measurement.measureRunText(s, text).width;
+        naturalAdvancePx = segAdvanceWidth(
+          measuredSegment,
+          naturalWidthPx + verticalInkExtra(s, text),
+          characterGrid,
+          scale,
+        );
+      }
+      cells += wordSnapToCharsEastAsianCellCount(naturalAdvancePx, snapPitchPx);
+    }
+    return Math.max(1, cells);
+  };
+  const strAdvance = (
+    s: LayoutTextSeg,
+    text: string,
+    retainTrailingPunctuationCompression = false,
+  ): number => {
+    const candidate = {
+      ...s,
+      text,
+      shapedClusters: text === s.text ? s.shapedClusters : undefined,
+    };
+    return standaloneSnapAdvance(
+      candidate,
+      strNaturalAdvance(s, text, retainTrailingPunctuationCompression),
+    );
+  };
+
+  /** Compatibility projection governed by WORD_LATIN_INTERWORD_XAVG_FLOOR.
+   * The selected face's OS/2 xAvgCharWidth / 2 is the minimum inter-word
+   * advance. Equal-face gaps share the required deficit uniformly; a natural
+   * space narrower than that minimum retains its natural advance. This is not
+   * an ECMA-376 definition or a replacement for glyph advance.
+   * Mixed faces, authored spacing, and snap-to-character cells are outside
+   * the measured scope and retain their natural widths. The §17.6.5 grid
+   * pitch is additive to the selected-face floor. The Word 6 compatibility
+   * setting excludes the fit projection at segment acquisition. */
+  const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean => {
     if (
-      !('text' in cur)
-      || cur.joinPrev
-      || cur.externalLinkBreakBefore
-      || cur.text.length === 0
-    ) continue;
-    const prev = segs[i - 1];
-    if (!('text' in prev) || prev.text.length === 0) continue;
+      isJustified ||
+      baseRtl ||
+      widthPolicy !== 'bounded' ||
+      characterGrid?.type === 'snapToChars' ||
+      (characterGrid?.type === 'linesAndChars' && next.widthBalanceGridDeltaFactor !== 0.5) ||
+      next.latinSpaceCompressionEligible !== true ||
+      next.latinSpaceAverageWidthRatio == null ||
+      !next.fontRoute ||
+      next.rtl ||
+      next.verticalRun ||
+      next.tateChuYoko ||
+      next.fitTextRegionIndex !== undefined ||
+      !breakerState.latinLineHomogeneous ||
+      !breakerState.latinLineFace ||
+      !sameLatinSpaceFace(next, breakerState.latinLineFace) ||
+      breakerState.latinLineGaps.length === 0
+    )
+      return false;
+    const totalCapacity =
+      (breakerState.latinUniformGapCapacity ?? 0) * breakerState.latinLineGaps.length;
+    if (totalCapacity <= 0) return false;
+    const restored = breakerState.latinAppliedPerGap * breakerState.latinAppliedGapCount;
+    const required = Math.max(0, breakerState.currentWidth + restored + nextFitWidth - availW());
+    if (
+      required > totalCapacity ||
+      !fitsMeasuredWidth(breakerState.currentWidth + restored + nextFitWidth - required, availW())
+    ) {
+      return false;
+    }
+    // Keep aggregate fit width current. Write each retained gap exactly once
+    // when the line is finalized, avoiding quadratic work on long lines.
+    breakerState.currentWidth += restored - required;
+    breakerState.latinAppliedGapCount = breakerState.latinLineGaps.length;
+    breakerState.latinAppliedPerGap = required / breakerState.latinAppliedGapCount;
+    return true;
+  };
 
-    // Whitespace is an actual wrap boundary. Check both sides because source
-    // runs may start with whitespace even though ASCII spaces normally remain
-    // attached to the preceding splitTextForLayout token.
-    if (/\s$/u.test(prev.text) || /^\s/u.test(cur.text)) continue;
+  /** Measure one text segment's canonical advance and vertical contribution.
+   * Every path that commits a complete text segment to a line must use this
+   * authority so font fallback, small-caps, position, ruby and grid metrics do
+   * not diverge at internal segment seams. */
+  const textSegmentBox = (
+    s: LayoutTextSeg,
+  ): Readonly<{
+    width: number;
+    height: number;
+    ascent: number;
+    descent: number;
+  }> => {
+    const measured = measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
+    const width = segAdvanceWidth(
+      s,
+      measured.width + verticalInkExtra(s, s.text),
+      characterGrid,
+      scale,
+    );
+    s.snapGridNaturalWidthPx = width;
 
-    const prevChar = [...prev.text].at(-1);
-    const nextChar = [...cur.text][0];
-    const prevCp = prevChar?.codePointAt(0);
-    const nextCp = nextChar?.codePointAt(0);
-    if (prevCp === undefined || nextCp === undefined) continue;
+    const fullPx = s.fontSize * scale;
+    let metricMeasurement = measured;
+    let metricEmPx = effectiveFontPx(s);
+    if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
+      if (s.textLayoutService && s.textShapeRequest) {
+        const shaped = s.textLayoutService.shape({
+          ...s.textShapeRequest,
+          text: s.text || 'X',
+          fontSizePt: fullPx,
+          measure: true,
+          clusterGeometry: false,
+        });
+        metricMeasurement = {
+          width: shaped.advancePt,
+          actualBoundingBoxAscent: shaped.ascentPt,
+          actualBoundingBoxDescent: shaped.descentPt,
+          fontBoundingBoxAscent: shaped.ascentPt,
+          fontBoundingBoxDescent: shaped.descentPt,
+        } as TextMetrics;
+      } else {
+        metricMeasurement = measurement.measureWithFont(
+          buildFont(s.bold, s.italic, fullPx, s.fontFamily, fontFamilyClasses, s.fontRoute),
+          s.text || 'X',
+        );
+      }
+      metricEmPx = fullPx;
+    }
 
-    // U+200B is the explicit zero-width-space opportunity from LB8 and is not
-    // included in JavaScript's \s character class.
-    if (prevCp === 0x200b || nextCp === 0x200b) continue;
+    const corrected = measuredLineMetrics(metricMeasurement, fullPx);
+    // Selected resource sides come from the same admitted face as the line
+    // height; native reference sides are policy geometry only. Ruby and an
+    // authored baseline position compose additional boxes outside either
+    // simple OpenType projection, so retain measured sides for those inputs.
+    const designOwnsSides =
+      (s.resolvedResourceVerticalMetric || s.referenceFontVerticalMetric) &&
+      !s.ruby &&
+      (s.position ?? 0) === 0 &&
+      s.resolvedDesignAscentRatio != null &&
+      s.resolvedDesignDescentRatio != null;
+    let ascent = designOwnsSides ? s.resolvedDesignAscentRatio! * metricEmPx : corrected.ascent;
+    let descent = designOwnsSides ? s.resolvedDesignDescentRatio! * metricEmPx : corrected.descent;
+    if (s.positionExtendsLineBox !== false) {
+      const positionPx = (s.position ?? 0) * scale;
+      if (positionPx > 0) ascent += positionPx;
+      else if (positionPx < 0) descent -= positionPx;
+    }
+    if (s.ruby && (!s.textBoxLineFloor || s.textBoxVertical)) {
+      ascent += rubyAscentReservePx(
+        s.ruby.fontSizePt,
+        s.ruby.hpsRaisePt,
+        scale,
+        s,
+        ctx,
+        fontFamilyClasses,
+      );
+    }
+    return { width, height: s.fontSize, ascent, descent };
+  };
 
-    // SEA uses the application's dictionary tailoring, so the LB1 SA→AL default
-    // must not suppress a real word boundary. CJK keeps its established
-    // per-character split / kinsoku path and sparse-line safeguards.
-    if (containsSeaScript(prev.text) || containsSeaScript(cur.text)) continue;
-    if (hasCJKBreakOpportunity(prev.text) || hasCJKBreakOpportunity(cur.text)) continue;
+  /** Continue the existing U+3000 line-end hanging rule across an internal
+   * width-balance segment seam. The split space keeps its own font/grid advance
+   * for measure == paint. UAX #14 classifies U+3000 as BA, so an internal seam
+   * before it must not become an authored break opportunity. Restrict
+   * consumption to the same authored run; an actual source boundary remains
+   * independently modeled. */
+  const appendQueuedIdeographicSpaceSegment = (source: LayoutTextSeg): void => {
+    if (
+      /\s$/u.test(source.text) ||
+      source.ruby !== undefined ||
+      source.tateChuYoko === true ||
+      source.fitTextRegionIndex !== undefined
+    )
+      return;
+    const follower = breakerState.queue[0];
+    if (
+      !follower ||
+      !('text' in follower) ||
+      follower.joinPrev !== true ||
+      follower.text.length === 0 ||
+      [...follower.text].some((character) => character !== '\u3000')
+    )
+      return;
+    breakerState.queue.shift();
+    const hangingCount = wordIdeographicSpaceLineEndAllowanceCount(
+      hasEastAsianVisiblePredecessor(source.text),
+      follower.paragraphFinalIdeographicSpaceCount ?? [...follower.text].length,
+    );
+    if (hangingCount === 0) {
+      breakerState.queue.unshift(follower);
+      return;
+    }
+    const hangingText = follower.text.slice(0, hangingCount);
+    const hangingSegment: LayoutTextSeg = {
+      ...follower,
+      ...RESET_SLICED_TEXT_MEASUREMENT,
+      text: hangingText,
+      measuredWidth: 0,
+      ...slicedTextMetadata(follower, 0, hangingText.length),
+    };
+    const followerBox = textSegmentBox(hangingSegment);
+    hangingSegment.measuredWidth = followerBox.width;
+    addToLine(
+      hangingSegment,
+      followerBox.width,
+      followerBox.height,
+      followerBox.ascent,
+      followerBox.descent,
+    );
+    const remainder = follower.text.slice(hangingText.length);
+    if (remainder.length > 0) {
+      breakerState.queue.unshift({
+        ...follower,
+        ...RESET_SLICED_TEXT_MEASUREMENT,
+        text: remainder,
+        measuredWidth: 0,
+        joinPrev: undefined,
+        hardJoinPrev: undefined,
+        ...slicedTextMetadata(follower, hangingText.length, follower.text.length),
+        src: follower.src
+          ? {
+              segIndex: follower.src.segIndex,
+              charOffset: follower.src.charOffset + hangingText.length,
+            }
+          : undefined,
+      });
+    }
+  };
 
-    if (isUax14NoBreakPair(prevCp, nextCp)) cur.joinPrev = true;
-  }
+  // Width of a queued segment, for right/center tab look-ahead.
+  const tabFollowWidth = (q: LayoutSeg): number => {
+    if ('isTab' in q) return q.measuredWidth || 0;
+    if ('imagePath' in q) return q.widthPt * scale;
+    if ('math' in q) return q.measuredWidth || 0;
+    if ('lineBreak' in q) return 0;
+    return segAdvance(q);
+  };
 
-  // §17.3.2.14 fitText is a fixed-width, non-wrapping unit. Glue every segment
-  // after the first in the RUN-grouped region, including script/small-caps
-  // pieces emitted from the same source run.
-  const seenFitTextRegions = new Set<number>();
-  for (const seg of segs) {
-    if (!('text' in seg) || seg.fitTextRegionIndex === undefined) continue;
-    if (seenFitTextRegions.has(seg.fitTextRegionIndex)) seg.joinPrev = true;
-    else {
-      seg.fitTextRegionStart = true;
-      seenFitTextRegions.add(seg.fitTextRegionIndex);
+  /** Resolve the registered decimal alignment point independently of run/style
+   * seams so both LTR and mirrored bidi tab paths consume one source boundary. */
+  const decimalAlignmentPoint = (
+    segments: readonly LayoutSeg[],
+  ): Readonly<{ segmentIndex: number; charOffset: number }> | null => {
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+      const segment = segments[segmentIndex]!;
+      if (!('text' in segment)) continue;
+      const separator = segment.text.indexOf('.');
+      if (separator >= 0) return { segmentIndex, charOffset: separator };
+    }
+
+    let lastDigit: Readonly<{ segmentIndex: number; charOffset: number }> | null = null;
+    let inFirstNumber = false;
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+      const segment = segments[segmentIndex]!;
+      if (!('text' in segment)) {
+        if (inFirstNumber) return lastDigit;
+        continue;
+      }
+      let charOffset = 0;
+      for (const scalar of segment.text) {
+        charOffset += scalar.length;
+        if (/\p{Decimal_Number}/u.test(scalar)) {
+          inFirstNumber = true;
+          lastDigit = { segmentIndex, charOffset };
+        } else if (inFirstNumber) {
+          return lastDigit;
+        }
+      }
+    }
+    return lastDigit;
+  };
+
+  const decimalAlignmentPrefixWidth = (segments: readonly LayoutSeg[]): number | undefined => {
+    const point = decimalAlignmentPoint(segments);
+    if (!point) return undefined;
+    let width = 0;
+    for (let index = 0; index < point.segmentIndex; index += 1) {
+      width += tabFollowWidth(segments[index]!);
+    }
+    const segment = segments[point.segmentIndex]!;
+    if (!('text' in segment)) return width;
+    return width + strAdvance(segment, segment.text.slice(0, point.charOffset));
+  };
+
+  const tabFollowingMetrics = (): Readonly<{
+    totalWidth: number;
+    decimalPrefixWidth?: number;
+  }> => {
+    const following: LayoutSeg[] = [];
+    let totalWidth = 0;
+    for (const q of breakerState.queue) {
+      if ('isTab' in q || 'lineBreak' in q) break;
+      following.push(q);
+      totalWidth += tabFollowWidth(q);
+    }
+    const decimalPrefixWidth = decimalAlignmentPrefixWidth(following);
+    return decimalPrefixWidth === undefined ? { totalWidth } : { totalWidth, decimalPrefixWidth };
+  };
+
+  // A `<w:br/>` always starts a new line (§17.3.3.1) — when it is the LAST
+  // content of the paragraph, the new line is empty but still occupies one line
+  // height. Track the trailing break so it can be flushed after the loop.
+
+  // Establish the first line's wrap window now that the content queue exists.
+  startLine(
+    isParagraphMarkOnlyFlow
+      ? (wrapCtx?.paragraphMarkLineStartWidth ?? minLineStartWidth())
+      : minLineStartWidth(),
+  );
+
+  /**
+   * Return the widest grapheme-safe UTF-16 prefix that fits an emergency
+   * break band. This is the single authority used whether the overlong token
+   * starts on an empty line or consumes the useful remainder of the current
+   * line. Keeping both cases here prevents measurement and retained paint
+   * partitions from drifting apart.
+   */
+  const emergencyTextSplit = (
+    segment: LayoutTextSeg,
+    available: number,
+    forceAtLeastOne = true,
+  ): number => {
+    const protectedOffsets = protectedNoBreakOffsets(segment);
+    const graphemeOffsets = [
+      0,
+      ...graphemeClusterOffsets(segment.text),
+      segment.text.length,
+    ].filter((offset, index, all) => all.indexOf(offset) === index);
+    let split = 0;
+    if (available > 0) {
+      const monotoneAllocation =
+        charSpacingDeltaPx(segment, scale) >= 0 &&
+        snapToCharsClass(segment, characterGrid) !== 'latin';
+      if (monotoneAllocation) {
+        setMeasureFont(
+          buildFont(
+            segment.bold,
+            segment.italic,
+            effectiveFontPx(segment),
+            segment.fontFamily,
+            fontFamilyClasses,
+            segment.fontRoute,
+          ),
+        );
+        measurement.withSegmentKerning(segment, () => {
+          const fitted = fitCJKPrefix(
+            ctx,
+            segment.text,
+            available,
+            segmentCharacterGridDeltaPx(segment, characterGrid, scale),
+            charScaleFactor(segment),
+            charSpacingDeltaPx(segment, scale),
+            segment.verticalRun === true,
+            verticalGlyphMeasurement,
+            (prefix) => strAdvance(segment, prefix),
+          ).length;
+          split =
+            graphemeOffsets
+              .filter((offset) => offset <= fitted && !protectedOffsets.has(offset))
+              .at(-1) ?? 0;
+        });
+      } else {
+        // Signed spacing and a Latin snap block can make prefix advances
+        // non-monotone. Evaluate every legal retained candidate against the
+        // exact prospective line block rather than binary-searching a
+        // standalone approximation.
+        for (const offset of graphemeOffsets) {
+          if (offset <= 0 || protectedOffsets.has(offset)) continue;
+          const natural = strNaturalAdvance(segment, segment.text.slice(0, offset));
+          if (prospectiveSnapAdvance(segment, natural) <= available + 1e-9) split = offset;
+        }
+      }
+    }
+    if (split <= 0 && forceAtLeastOne) {
+      split =
+        graphemeOffsets.find((offset) => offset > 0 && !protectedOffsets.has(offset)) ??
+        segment.text.length;
+    }
+    // Preserve the existing JLReq/Word line-end hanging rule after switching
+    // the emergency splitter from code-point indexes to UTF-16 grapheme offsets.
+    while (segment.text.startsWith('\u3000', split)) split += 1;
+    return split;
+  };
+
+  /** Select the last semantic URL candidate that fits the prospective band.
+   * Every candidate is evaluated independently: signed character spacing can
+   * make prefix advances non-monotone, and snapToChars must include the current
+   * line's active script block rather than treating the prefix in isolation. */
+  const externalLinkSyntaxSplit = (segment: LayoutTextSeg, available: number): number => {
+    if (!(available > 0) || !segment.externalLinkBreakOffsets?.length) return 0;
+    let selected = 0;
+    for (const offset of segment.externalLinkBreakOffsets) {
+      if (offset <= 0 || offset >= segment.text.length) continue;
+      const naturalAdvance = strNaturalAdvance(segment, segment.text.slice(0, offset));
+      const prospectiveAdvance = prospectiveSnapAdvance(segment, naturalAdvance);
+      if (prospectiveAdvance <= available + 1e-9) selected = offset;
+    }
+    return selected;
+  };
+
+  const queueEmergencyTail = (segment: LayoutTextSeg, split: number): void => {
+    breakerState.queue.unshift({
+      ...segment,
+      ...RESET_SLICED_TEXT_MEASUREMENT,
+      text: segment.text.slice(split),
+      ...slicedTextMetadata(segment, split, segment.text.length),
+      seaBreaks: rebaseSeaBreaks(segment.seaBreaks, split),
+      measuredWidth: 0,
+      // The emergency split itself is now the legal line boundary. A source-
+      // boundary glue marker protects only the first retained prefix; carrying
+      // it onto the tail would make the next line overflow again.
+      joinPrev: undefined,
+      hardJoinPrev: undefined,
+      src: {
+        segIndex: segment.src!.segIndex,
+        charOffset: segment.src!.charOffset + split,
+      },
+    });
+  };
+
+  /**
+   * Move a legal suffix of the current line ahead of a segment whose first
+   * glyph is forbidden at line start. This is the single cross-run 追い出し
+   * authority for both the CJK and SEA overflow paths.
+   *
+   * A source seam marked by `hardJoinPrev` is indivisible: moving the complete
+   * following segment would strand its owner on the previous line. Likewise,
+   * a split at either edge of an authored no-break range is not legal. When
+   * either constraint blocks retraction, the caller must keep the forbidden
+   * leader on the current line instead of weakening the authored constraint.
+   */
+  const retractCurrentLineForLeadingKinsoku = (next: LayoutTextSeg): CrossRunKinsokuRetraction =>
+    retractLeadingKinsoku(
+      breakerState,
+      kinsoku,
+      materializeLatinSpaceCompression,
+      strAdvance,
+      next,
+    );
+
+  /** Keep one otherwise-forbidden line-start grapheme with the current line.
+   * This is the only legal fallback when cross-run retraction would split an
+   * authored hard/no-break group. Reprocessing the tail repeats the rule for a
+   * sequence of forbidden leaders while guaranteeing grapheme-safe progress. */
+  const keepLeadingKinsokuWithCurrentLine = (
+    segment: LayoutTextSeg,
+    h: number,
+    asc: number,
+    desc: number,
+  ): boolean =>
+    keepLeadingKinsoku(
+      breakerState,
+      strNaturalAdvance,
+      addToLine,
+      queueEmergencyTail,
+      segment,
+      h,
+      asc,
+      desc,
+    );
+
+  iterateBreakOpportunities({
+    breakerState,
+    flush,
+    baseRtl,
+    addToLine,
+    scale,
+    firstIndent,
+    tabOriginPx,
+    maxWidth,
+    marginRightPx,
+    tabFollowWidth,
+    measureText,
+    verticalInkExtra,
+    characterGrid,
+    tabStops,
+    defaultTabPt,
+    tabFollowingMetrics,
+    availW,
+    setMeasureFont,
+    fontFamilyClasses,
+    measurement,
+    textSegmentBox,
+    prospectiveSnapAdvance,
+    segAdvance,
+    strAdvance,
+    isJustified,
+    stretchLastLine,
+    overflowPunct,
+    sameLatinSpaceFace,
+    fitsMeasuredWidth,
+    fitHomogeneousLatinSpaces,
+    appendQueuedIdeographicSpaceSegment,
+    emergencyTextSplit,
+    effectiveFontPx,
+    ctx,
+    verticalGlyphMeasurement,
+    kinsoku,
+    strNaturalAdvance,
+    retractCurrentLineForLeadingKinsoku,
+    keepLeadingKinsokuWithCurrentLine,
+    externalLinkSyntaxSplit,
+    queueEmergencyTail,
+  });
+
+  if (breakerState.currentLine.length > 0) flush();
+  // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
+  else if (breakerState.trailingBreakFontSize !== null) flush(breakerState.trailingBreakFontSize);
+
+  // A3 acquisition consumes final line pieces, not the pre-wrap source
+  // segments. Prefix/tail objects created by the breakers above may inherit the
+  // source segment's cluster array, whose ranges describe a different string.
+  // Re-shape every final visible piece through the same A2 authority so the
+  // returned LayoutLine contract always carries complete, piece-relative
+  // grapheme geometry. A missing service is deliberately left unshaped; the
+  // retained acquisition boundary rejects that production contract violation.
+  if (widthPolicy === 'bounded') {
+    for (const line of breakerState.lines) {
+      for (const segment of line.segments) {
+        if (!('text' in segment) || segment.metricOnly || segment.text.length === 0) continue;
+        segment.shapedClusters = undefined;
+        if (segment.textLayoutService && segment.textShapeRequest) measureText(segment, true);
+      }
     }
   }
 
-  retainHorizontalPunctuationInkClearance(segs);
-
-  return segs;
+  return breakerState.lines;
 }
 
 export function layoutLines(
@@ -4506,2416 +7275,10 @@ export function layoutLines(
       ),
     );
   }
-  const { probeHeights, preparedFloatWrap } = passContext;
-  const lines: LayoutLine[] = [];
-  let currentLine: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[] = [];
-  let currentWidth = 0;
-  const sameLatinSpaceFace = (candidate: LayoutTextSeg, reference: LayoutTextSeg): boolean =>
-    candidate.latinSpaceCompressionEligible === true
-    && !candidate.verticalRun && !reference.verticalRun
-    && !candidate.tateChuYoko && !reference.tateChuYoko
-    && candidate.latinSpaceAverageWidthRatio === reference.latinSpaceAverageWidthRatio
-    && candidate.fontRoute?.fingerprint === reference.fontRoute?.fingerprint
-    && candidate.fontFamily === reference.fontFamily
-    && candidate.fontSize === reference.fontSize
-    && candidate.bold === reference.bold
-    && candidate.italic === reference.italic
-    && (candidate.charScale == null || candidate.charScale === 1)
-    && (reference.charScale == null || reference.charScale === 1)
-    && candidate.kerning === reference.kerning
-    && candidate.widthBalanceGridDeltaFactor === reference.widthBalanceGridDeltaFactor
-    && !candidate.rtl && candidate.fitTextRegionIndex === undefined;
-  let latinLineFace: LayoutTextSeg | undefined;
-  let latinLineHomogeneous = true;
-  let latinLineGaps: LayoutTextSeg[] = [];
-  let latinUniformGapCapacity: number | undefined;
-  let latinAppliedGapCount = 0;
-  let latinAppliedPerGap = 0;
-  const materializeLatinSpaceCompression = (): void => {
-    for (let index = 0; index < latinAppliedGapCount; index += 1) {
-      const gap = latinLineGaps[index];
-      gap.measuredWidth -= latinAppliedPerGap;
-      gap.latinSpaceCompressionPx = latinAppliedPerGap;
-    }
-    latinAppliedGapCount = 0;
-    latinAppliedPerGap = 0;
-  };
-  const snapPitchPx = characterGrid?.type === 'snapToChars'
-    && characterGrid.characterPitchPt != null
-    && characterGrid.characterPitchPt > 0
-      ? characterGrid.characterPitchPt * scale
-      : null;
-  type SnapBlockState = {
-    kind: 'latin' | 'complexScript';
-    first: LayoutTextSeg;
-    last: LayoutTextSeg;
-    naturalWidthPx: number;
-    allocatedWidthPx: number;
-  };
-  let snapBlock: SnapBlockState | null = null;
-  let lineHeight = 0;   // pt
-  let lineAscent = 0;   // px
-  let lineDescent = 0;  // px
-  let lineIntendedSingle = 0; // px — max intended single-line height on the line
-  let lineHasInlinePicture = false;
-  let linePictureMarkSingle = 0;
-  let lineGridCountSingle = 0; // px — max resolved design height or generic fallback
-  let lineVisibleAscent = 0;
-  let lineVisibleDescent = 0;
-  let lineVisibleIntendedSingle = 0;
-  let lineHasVisibleMetrics = false;
-  let isFirst = true;
-  // Effective width/offset for the current line after float exclusion.
-  let lineMaxWidth = maxWidth;
-  let lineXOffset = 0;
-  let currentLineTopY = wrapCtx?.startPageY ?? 0;
-
-  // Square-only compatibility side-space (px) a CONTENT line needs before it may
-  // START beside a square object rather than flow below its band.
-  // `word-square-line-start-one-inch` supplies the requirement and tolerance via
-  // wordMinLineStartPx(scale),
-  // tolerance), INDEPENDENT of a content line's text — the same threshold for a
-  // short-token line and a long-word line (a first word that overruns the ≥1-inch
-  // gap is force-broken there by the over-long-word char-break below, matching
-  // Word's "AFTE"/"R-10" wrapping). This replaced a per-line first-atomic-token
-  // width probe that wedged short-token lines into sub-inch gaps and refused
-  // ≥1-inch gaps to long-word lines. See issue #676 (fixtures
-  // private/sample-19/20/22, pdftotext bbox). Shared by the paint pass and the
-  // paginator's two mirror layouts (they call layoutLines with scale 1), so the
-  // flow/beside decision agrees across passes.
-  //
-  // NOTE — this 1-inch rule is the CONTENT-line threshold. A literally-empty
-  // paragraph's pilcrow is placed by resolveEmptyMarkTop / flowMarkLine
-  // (renderer.ts) against the NARROWER pilcrow-em threshold. An anchorHost-only
-  // paragraph still enters layoutLines so its anchor-character metrics size the
-  // mark line, but `isParagraphMarkOnlyFlow` selects the same narrow threshold
-  // for its first line. `word-empty-mark-float-side-gap` supplies that narrower
-  // threshold. #676 over-generalized one inch onto marks; inline
-  // content (including a content paragraph's trailing-break final line) keeps
-  // the square-only 1-inch rule. Tight/through are governed by their polygon
-  // openings (§20.4.2.18/.19), for which there is no corresponding evidence.
-  const minLineStartWidth = (): number => wordMinLineStartPx(scale);
-  const isParagraphMarkOnlyFlow = segs.length > 0 && segs.every((segment) =>
-    ('text' in segment && segment.metricOnly === true)
-    || ('imagePath' in segment && Boolean(segment.anchor)),
-  );
-
-  // Compute wrap constraints for a new line about to start. Mutates
-  // lineXOffset/lineMaxWidth/currentLineTopY. `minWidth` is the smallest clear
-  // square side-space the upcoming line must have to START here. Polygon wraps
-  // receive MIN_LINE_GAP separately so the compatibility policy cannot erase a
-  // through opening explicitly permitted by §20.4.2.18.
-  const startLine = (minWidth: number = 0): void => {
-    snapBlock = null;
-    lineXOffset = 0;
-    lineMaxWidth = maxWidth;
-    if (!wrapCtx) return;
-    const probeH = probeHeights?.[lines.length];
-    // The first pass measures this line without a float window. A later pass
-    // resolves it only once that exact line index has an observed line-box
-    // height; newly-created lines are likewise measured before they are probed.
-    if (probeH === undefined) return;
-    const reference = {
-      xLeftPt: wrapCtx.referenceXPt ?? wrapCtx.paraX,
-      xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX)
-        + (wrapCtx.referenceWidthPt ?? maxWidth),
-      readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
-    } as const;
-    if (wrapCtx.lineWindow) {
-      const win = wrapCtx.lineWindow({
-        topYPt: currentLineTopY,
-        minimumStartWidthPt: MIN_LINE_GAP,
-        squareMinimumStartWidthPt: minWidth,
-        probeHeightPt: probeH,
-        paragraphXPt: wrapCtx.paraX,
-        maximumWidthPt: maxWidth,
-        columnXPt: wrapCtx.columnXPt,
-        columnWidthPt: wrapCtx.columnWidthPt,
-      });
-      currentLineTopY = win.topYPt;
-      lineXOffset = win.xOffsetPt;
-      lineMaxWidth = win.maximumWidthPt;
-    } else {
-      const win = computePreparedLineFloatWindow(
-        currentLineTopY,
-        MIN_LINE_GAP,
-        probeH,
-        wrapCtx.paraX,
-        maxWidth,
-        preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
-        wrapCtx.columnXPt,
-        wrapCtx.columnXPt + wrapCtx.columnWidthPt,
-        reference,
-        minWidth,
-      );
-      currentLineTopY = win.topY;
-      lineXOffset = win.xOffset;
-      lineMaxWidth = win.maxWidth;
-    }
-  };
-
-  // Intrinsic acquisition deliberately disables automatic line wrapping while
-  // retaining the real paragraph/anchor width for tab and alignment reference
-  // frames. This is a semantic mode, not a synthetic oversized page.
-  const availW = () => widthPolicy === 'intrinsic'
-    ? Number.POSITIVE_INFINITY
-    : lineMaxWidth - (isFirst ? firstIndent : 0);
-
-  // AutoFit can set a table column to the measured text advance plus its
-  // first-line indent and grouped cell insets. Cell acquisition subtracts those
-  // same grouped insets. At exact equality, subtracting the indent from the
-  // line width may round down while adding it to the advance does not. Both
-  // inequalities are equivalent in real arithmetic; check both operation
-  // orders for a finite bounded line. This changes arithmetic order only;
-  // it adds no fixed overflow allowance.
-  const fitsMeasuredWidth = (used: number, available: number): boolean => {
-    if (used <= available) return true;
-    if (widthPolicy === 'intrinsic' || !Number.isFinite(used) || !Number.isFinite(lineMaxWidth)) {
-      return false;
-    }
-    return used + (isFirst ? firstIndent : 0) <= lineMaxWidth;
-  };
-
-  // ECMA-376 §17.3.1.37 tab stops in leading-edge px, for the bidi post-pass.
-  const bidiCustomStopsPx = baseRtl
-    ? tabStops.map((t) => ({ pos: t.pos * scale, alignment: t.alignment, leader: t.leader }))
-    : [];
-  const bidiIntervalPx = defaultTabPt * scale;
-
-  // Rewrite a finalized bidi line's tab widths (+ leaders) in the VISUAL frame
-  // (§17.3.1.6 base RTL). The line's tabs were laid out with provisional width 0
-  // by the tab block below (the LTR pen math does not apply under an RTL base);
-  // here we place each tab-delimited cell at its mirrored stop. No-op for a line
-  // without tabs (LTR paragraphs skip this entirely — `baseRtl` is false).
-  const applyBidiTabs = (): void => {
-    if (!baseRtl) return;
-    if (!currentLine.some((s) => 'isTab' in s)) return;
-    // LOGICAL order — the reading-frame walk resolves the Nth tab against the
-    // Nth-reachable stop in the logical reading frame. Do not feed the visual
-    // sequence here: UAX#9 L2 reverses cells AND tabs together, so a
-    // visual-order walk assigns the stops in reverse and paints the leader in
-    // the wrong cell gap (the #830 follow-up bug — the TOC underscore leader
-    // appeared between the title and the chapter number instead of between the
-    // page number and the title). Because the reversal is symmetric, each
-    // logical tab's reading-frame gap IS its visual gap, so widths mapped back
-    // by logical index tile correctly under the draw loop's visual walk.
-    const items: BidiTabItem[] = currentLine.map((s) => ({
-      isTab: 'isTab' in s,
-      width: s.measuredWidth,
-    }));
-    for (let tabIndex = 0; tabIndex < currentLine.length; tabIndex += 1) {
-      if (!('isTab' in currentLine[tabIndex]!)) continue;
-      let cellEnd = tabIndex + 1;
-      while (cellEnd < currentLine.length && !('isTab' in currentLine[cellEnd]!)) {
-        cellEnd += 1;
-      }
-      const cell = currentLine.slice(tabIndex + 1, cellEnd);
-      const point = decimalAlignmentPoint(cell);
-      if (!point) continue;
-      const itemIndex = tabIndex + 1 + point.segmentIndex;
-      const segment = currentLine[itemIndex]!;
-      if ('text' in segment) {
-        items[itemIndex]!.decimalOffset = strAdvance(
-          segment,
-          segment.text.slice(0, point.charOffset),
-        );
-      }
-    }
-    // Margin-anchored frame (§17.3.1.37 — stops measure from the TEXT MARGIN):
-    // pen 0 = right text margin. Content starts after the leading indent — the
-    // line window's RIGHT edge is paraX-relative `lineXOffset + lineMaxWidth`
-    // (= maxWidth when no float narrows it), so its margin distance is
-    // marginRightPx minus that — plus the first line's first-line indent
-    // (which narrows the leading edge under an RTL base, mirroring the draw
-    // loop's `effAvailW`). The left text margin sits tabOriginPx past the
-    // paragraph box (its trailing indent).
-    const startPen = marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? firstIndent : 0);
-    const leftLimit = marginRightPx + tabOriginPx;
-    const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx);
-    let delta = 0;
-    for (let i = 0; i < currentLine.length; i++) {
-      const s = currentLine[i];
-      if (!('isTab' in s)) continue;
-      delta += res[i].width - s.measuredWidth;
-      s.measuredWidth = res[i].width;
-      (s as LayoutTabSeg).leader = res[i].leader;
-    }
-    currentWidth += delta;
-  };
-
-  let lineHasRuby = false;
-  let lineEastAsian = false;
-  const flush = (
-    forceHeight?: number,
-    brTerminated = false,
-    nextStart?: LineBoundary,
-  ) => {
-    materializeLatinSpaceCompression();
-    applyBidiTabs();
-    // §17.3.2.24 defines `position` relative to surrounding non-positioned
-    // text. A line whose every metric-bearing item shares the same inherited
-    // position has no differently-positioned peer to pin the resulting line
-    // box to one side. `word-uniform-run-position-leading` owns the compatibility
-    // placement of that box around the glyphs. Keep mixed
-    // lines relative to zero so their authored displacement and ink union
-    // remain unchanged. Images/math
-    // provide a zero-position reference; tabs do not contribute vertical
-    // metrics. The fixed drop-cap path intentionally keeps its paint-only
-    // lowering and therefore opts out of this normalization.
-    let commonPositionPt: number | undefined;
-    let hasPositionReference = false;
-    for (const segment of currentLine) {
-      if ('isTab' in segment) continue;
-      const positionPt = 'text' in segment ? (segment.position ?? 0) : 0;
-      if ('text' in segment && segment.positionExtendsLineBox === false) {
-        commonPositionPt = 0;
-        hasPositionReference = true;
-        break;
-      }
-      if (!hasPositionReference) {
-        commonPositionPt = positionPt;
-        hasPositionReference = true;
-      } else if (commonPositionPt !== positionPt) {
-        commonPositionPt = 0;
-        break;
-      }
-    }
-    const linePositionReferencePt = hasPositionReference ? (commonPositionPt ?? 0) : 0;
-    if (linePositionReferencePt !== 0) {
-      for (const segment of currentLine) {
-        if ('text' in segment) {
-          segment.lineRelativePosition = wordUniformRunPositionPaintPt(
-            segment.position ?? 0,
-            linePositionReferencePt,
-          );
-        }
-      }
-    }
-    // §17.3.3.1 — the break is one run among the line's runs: its own size
-    // participates in the line height but must not override a taller peer.
-    const h = forceHeight !== undefined ? Math.max(lineHeight, forceHeight) : (lineHeight || 10);
-    // If the line has no measured content (empty/line-break line), synthesize
-    // stable ascent/descent from the effective font size so wrap/baseline math
-    // stays consistent with non-empty lines.
-    const hasContent = lineAscent > 0 || lineDescent > 0;
-    const asc = hasContent ? lineAscent : h * scale * 0.8;
-    const desc = hasContent ? lineDescent : h * scale * 0.2;
-    const visibleAscent = lineHasVisibleMetrics ? lineVisibleAscent : asc;
-    const visibleDescent = lineHasVisibleMetrics ? lineVisibleDescent : desc;
-    const visibleIntendedSingle = lineHasVisibleMetrics
-      ? lineVisibleIntendedSingle
-      : lineIntendedSingle;
-    const gridCountSingle = lineGridCountSingle
-      || (lineEastAsian ? eastAsianGridCountSinglePx(lineIntendedSingle, h * scale) : asc + desc);
-    const inlinePictureTextSingle = lineHasInlinePicture
-      ? Math.max(lineIntendedSingle, linePictureMarkSingle)
-      : 0;
-    // Only project that registered rule when every metric-bearing item is
-    // visible text in one admitted face tuple. Canvas fallback geometry does
-    // not reveal hhea descent, and mixed styles cannot share one descent
-    // reserve. The rule uses face data, never a family-specific correction.
-    const positionedTexts = currentLine.filter((segment): segment is LayoutTextSeg => 'text' in segment);
-    const firstPositioned = positionedTexts[0];
-    const uniformPositionAuto = linePositionReferencePt !== 0
-      && positionedTexts.length > 0
-      && currentLine.every((segment) => 'isTab' in segment || 'text' in segment)
-      && firstPositioned?.resolvedDesignDescentRatio != null
-      && (firstPositioned.referenceFontVerticalMetric || firstPositioned.resolvedResourceVerticalMetric)
-      && positionedTexts.every((segment) =>
-        segment.text.length > 0
-        && !segment.metricOnly
-        && !segment.ruby
-        && !segment.vertAlign
-        && segment.positionExtendsLineBox !== false
-        && segment.position === linePositionReferencePt
-        && segment.fontFamily === firstPositioned.fontFamily
-        && segment.fontRoute?.fingerprint === firstPositioned.fontRoute?.fingerprint
-        && segment.bold === firstPositioned.bold
-        && segment.italic === firstPositioned.italic
-        && segment.fontSize === firstPositioned.fontSize
-        && segment.resolvedDesignDescentRatio === firstPositioned.resolvedDesignDescentRatio
-        && segment.referenceFontVerticalMetric === firstPositioned.referenceFontVerticalMetric
-        && segment.resolvedResourceVerticalMetric === firstPositioned.resolvedResourceVerticalMetric
-        && (segment.referenceFontVerticalMetric || segment.resolvedResourceVerticalMetric)
-      )
-      ? {
-          normalSinglePx: Math.max(asc + desc - Math.abs(linePositionReferencePt * scale), lineIntendedSingle),
-          positionPx: linePositionReferencePt * scale,
-          designDescentPx: firstPositioned.resolvedDesignDescentRatio * firstPositioned.fontSize * scale,
-        }
-      : undefined;
-    lines.push({
-      segments: currentLine,
-      height: h,
-      ascent: asc,
-      descent: desc,
-      visibleAscent,
-      visibleDescent,
-      visibleIntendedSingle,
-      intendedSingle: lineIntendedSingle,
-      ...(inlinePictureTextSingle > 0 ? { inlinePictureTextSingle } : {}),
-      uniformPositionAuto,
-      // Empty/synthetic East Asian lines use the same design-height rule as a
-      // text run; their synthesized Canvas box must not reintroduce a
-      // scale-dependent cell count.
-      gridCountSingle,
-      xOffset: lineXOffset,
-      availWidth: lineMaxWidth,
-      topY: wrapCtx ? currentLineTopY : undefined,
-      hasRuby: lineHasRuby,
-      eastAsian: lineEastAsian,
-      endsWithBreak: brTerminated,
-      consumedEnd: nextStart ?? queue[0]?.src ?? endBoundary,
-    });
-    if (wrapCtx) {
-      currentLineTopY += wrapCtx.lineBoxH(
-        asc,
-        desc,
-        lineHasRuby,
-        lineIntendedSingle,
-        lineEastAsian,
-        gridCountSingle,
-        uniformPositionAuto,
-        inlinePictureTextSingle,
-      );
-    }
-    currentLine = [];
-    currentWidth = 0;
-    latinLineFace = undefined;
-    latinLineHomogeneous = true;
-    latinLineGaps = [];
-    latinUniformGapCapacity = undefined;
-    lineHeight = 0;
-    lineAscent = 0;
-    lineDescent = 0;
-    lineIntendedSingle = 0;
-    lineHasInlinePicture = false;
-    linePictureMarkSingle = 0;
-    lineGridCountSingle = 0;
-    lineVisibleAscent = 0;
-    lineVisibleDescent = 0;
-    lineVisibleIntendedSingle = 0;
-    lineHasVisibleMetrics = false;
-    lineHasRuby = false;
-    lineEastAsian = false;
-    isFirst = false;
-    startLine(minLineStartWidth());
-  };
-
-  const prospectiveSnapAdvance = (s: LayoutTextSeg, naturalWidth: number): number => {
-    const kind = snapToCharsClass(s, characterGrid);
-    if (!kind || snapPitchPx == null) return naturalWidth;
-    if (kind === 'eastAsia') {
-      const cells = eastAsianSnapCellCount(s);
-      return snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx, cells);
-    }
-    if (snapBlock?.kind === kind) {
-      return snapToCharsAllocatedWidthPx(
-        snapBlock.naturalWidthPx + naturalWidth,
-        kind,
-        snapPitchPx,
-      ) - snapBlock.allocatedWidthPx;
-    }
-    return snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx);
-  };
-
-  const addToLine = (
-    s: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg,
-    w: number,
-    h: number,
-    asc: number,
-    desc: number,
-  ) => {
-    let committedWidth = w;
-    if ('text' in s) {
-      const kind = snapToCharsClass(s, characterGrid);
-      const naturalWidth = s.snapGridNaturalWidthPx ?? w;
-      if (kind && snapPitchPx != null) {
-        s.snapGridClass = kind;
-        s.snapGridNaturalWidthPx = naturalWidth;
-        s.snapGridCellPitchPx = snapPitchPx;
-        if (kind === 'eastAsia') {
-          const cellCount = eastAsianSnapCellCount(s);
-          committedWidth = snapToCharsAllocatedWidthPx(
-            naturalWidth,
-            kind,
-            snapPitchPx,
-            cellCount,
-          );
-          s.snapGridLeadingPadPx = 0;
-          s.snapGridTrailingPadPx = committedWidth - naturalWidth;
-          s.measuredWidth = committedWidth;
-          snapBlock = null;
-        } else if (snapBlock?.kind === kind) {
-          const previousLeading = snapBlock.first.snapGridLeadingPadPx ?? 0;
-          const previousTrailing = snapBlock.last.snapGridTrailingPadPx ?? 0;
-          const combinedNatural = snapBlock.naturalWidthPx + naturalWidth;
-          const combinedAllocated = snapToCharsAllocatedWidthPx(
-            combinedNatural,
-            kind,
-            snapPitchPx,
-          );
-          const slack = combinedAllocated - combinedNatural;
-          const leading = kind === 'latin' ? slack / 2 : 0;
-          const trailing = slack - leading;
-          snapBlock.first.measuredWidth -= previousLeading;
-          snapBlock.first.snapGridLeadingPadPx = leading;
-          snapBlock.first.measuredWidth += leading;
-          snapBlock.last.measuredWidth -= previousTrailing;
-          s.snapGridLeadingPadPx = 0;
-          s.snapGridTrailingPadPx = trailing;
-          s.measuredWidth = naturalWidth + trailing;
-          committedWidth = combinedAllocated - snapBlock.allocatedWidthPx;
-          snapBlock = {
-            kind,
-            first: snapBlock.first,
-            last: s,
-            naturalWidthPx: combinedNatural,
-            allocatedWidthPx: combinedAllocated,
-          };
-        } else {
-          const allocated = snapToCharsAllocatedWidthPx(naturalWidth, kind, snapPitchPx);
-          const slack = allocated - naturalWidth;
-          const leading = kind === 'latin' ? slack / 2 : 0;
-          const trailing = slack - leading;
-          s.snapGridLeadingPadPx = leading;
-          s.snapGridTrailingPadPx = trailing;
-          s.measuredWidth = allocated;
-          committedWidth = allocated;
-          snapBlock = {
-            kind,
-            first: s,
-            last: s,
-            naturalWidthPx: naturalWidth,
-            allocatedWidthPx: allocated,
-          };
-        }
-      } else {
-        s.snapGridClass = undefined;
-        s.snapGridLeadingPadPx = undefined;
-        s.snapGridTrailingPadPx = undefined;
-        s.snapGridCellPitchPx = undefined;
-        s.measuredWidth = w;
-        snapBlock = null;
-      }
-    } else {
-      snapBlock = null;
-    }
-    currentLine.push(s);
-    currentWidth += committedWidth;
-    if ('text' in s && s.latinSpaceCompressionEligible === true
-      && s.latinSpaceAverageWidthRatio != null && s.fontRoute) {
-      if (latinLineFace && !sameLatinSpaceFace(s, latinLineFace)) {
-        materializeLatinSpaceCompression();
-        latinLineHomogeneous = false;
-      }
-      latinLineFace ??= s;
-      if (s.latinNaturalTrailingSpacePx !== undefined) {
-        const floor = calcEffectiveFontPx(s, scale)
-          * s.latinSpaceAverageWidthRatio / 2 * charScaleFactor(s)
-          + segmentCharacterGridDeltaPx(s, characterGrid, scale);
-        const capacity = Math.max(0, s.latinNaturalTrailingSpacePx - floor);
-        if (latinUniformGapCapacity !== undefined
-          && Math.abs(capacity - latinUniformGapCapacity) > 1e-6) {
-          materializeLatinSpaceCompression();
-          latinLineHomogeneous = false;
-        }
-        latinUniformGapCapacity ??= capacity;
-        latinLineGaps.push(s);
-      }
-    } else {
-      materializeLatinSpaceCompression();
-      latinLineHomogeneous = false;
-    }
-    if (h > lineHeight) lineHeight = h;
-    if ('imagePath' in s && s.inlinePicture === true) {
-      lineHasInlinePicture = true;
-      linePictureMarkSingle = Math.max(
-        linePictureMarkSingle, (s.paragraphMarkSinglePx ?? 0) * scale,
-      );
-    }
-    if (asc > lineAscent) lineAscent = asc;
-    if (desc > lineDescent) lineDescent = desc;
-    const paintsInlineInk = !('text' in s) || s.metricOnly !== true;
-    if (paintsInlineInk) {
-      lineHasVisibleMetrics = true;
-      if (asc > lineVisibleAscent) lineVisibleAscent = asc;
-      if (desc > lineVisibleDescent) lineVisibleDescent = desc;
-    }
-    // Grid-count height for docGrid cell allocation (§17.6.5). Only East Asian
-    // TEXT (and tall inline objects) drives the count — a Latin run keeps its
-    // natural height and is NOT cell-rounded, so it must not contribute (its
-    // substituted Canvas box would otherwise inflate the count). An EA text run
-    // counts from its DESIGN height when tabled, else the deterministic Word FE
-    // 1.3em fallback; an image/math object counts its measured box. The line's
-    // value is the max.
-    let segGridCount = 0;
-    if (!('isTab' in s) && !('imagePath' in s) && !('math' in s)) {
-      const ts = s as LayoutTextSeg;
-      if (ts.ruby) lineHasRuby = true;
-      const metricEastAsian = ts.metricEastAsian === true || EAST_ASIAN_RE.test(ts.text);
-      if (!lineEastAsian && metricEastAsian) lineEastAsian = true;
-      // Prefer the selected resource's single-line height. Without admitted
-      // geometry, the generic East Asian grid fallback remains authoritative.
-      // Small caps (non-super/sub) keep the FULL run size here so the line box
-      // follows the run size, not the 2pt-reduced glyphs (§17.3.2.33).
-      const intendedEm = ts.smallCaps && !ts.vertAlign ? ts.fontSize * scale : effectiveFontPx(ts);
-      // The OpenType code-page class selects the general line ratio even for
-      // Latin text. This script hint selects an optional East-Asian-specific
-      // floor and grid-cell counting; ruby keeps its measured annotation box.
-      const segScriptHint = metricEastAsian && !ts.ruby;
-      const nativeRatio = ts.resolvedLineHeightRatio == null
-        ? nativeCanvasLineRatio(
-            ctx, fontFamilyClasses, ts.fontRoute, ts.fontFamily,
-            ts.bold ? 700 : 400, ts.italic ? 'italic' : 'normal', ts.text,
-          )
-        : null;
-      const designIntended = ts.textBoxLineFloor && ts.ruby
-        ? 0
-        : Math.max(
-            segmentIntendedSingleLinePx(ts, intendedEm, segScriptHint),
-            ts.textBoxLineFloor || ts.metricEastAsian === true
-              ? segmentEastAsiaFloorSingleLinePx(ts, intendedEm, segScriptHint)
-              : 0,
-          );
-      const intended = Math.max(designIntended, (nativeRatio ?? 0) * intendedEm);
-      if (intended > lineIntendedSingle) lineIntendedSingle = intended;
-      if (paintsInlineInk && intended > lineVisibleIntendedSingle) {
-        lineVisibleIntendedSingle = intended;
-      }
-      // Only East Asian text is cell-rounded. The native Canvas probe can
-      // establish a browser-selected font box for ordinary auto lines, but it
-      // cannot establish Word's Far-East design height or OS/2 code-page class.
-      // For an untabled tuple retain the documented 1.3em grid fallback;
-      // parsed resource/reference design metrics still take precedence.
-      if (segScriptHint) segGridCount = eastAsianGridCountSinglePx(designIntended, intendedEm);
-    } else if (!('isTab' in s)) {
-      // Image/math object: a tall inline object sizes the line's cells too.
-      segGridCount = asc + desc;
-    }
-    if (segGridCount > lineGridCountSingle) lineGridCountSingle = segGridCount;
-  };
-
-  const effectiveFontPx = (s: LayoutTextSeg): number => calcEffectiveFontPx(s, scale);
-
-  // Measure-loop font guard: line wrapping calls measureText / strAdvance many
-  // times in a row for the SAME segment (fit search, split prefixes/tails), so
-  // the built font string is usually identical to the previous one. Skip the
-  // redundant `ctx.font =` in that case. This tracker is written by EVERY font
-  // assignment on the measure path (both helpers below route through it), so it
-  // always reflects the context's current measure font — no stale skip. The
-  // draw-path `ctx.font =` sites are separate and left untouched. `buildFont` is
-  // now cheap (normalizeFontFamily is memoized per-doc), so this only elides the
-  // setter call itself.
-  let lastMeasureFont: string | null = null;
-  const setMeasureFont = (font: string): void => {
-    if (font !== lastMeasureFont) {
-      ctx.font = font;
-      lastMeasureFont = font;
-    }
-  };
-
-  // ECMA-376 §17.3.2.19 `<w:kern>` — set `ctx.fontKerning` to match how the PAINT
-  // pass will draw a run, so a kerned run measures exactly as it is drawn
-  // (measure==paint). ISO/IEC 29500 §17.3.2.19: absent `w:kern` at every style
-  // level means no pair kerning. Canvas `auto` may kern even at 10pt: Office
-  // Calibri controls with absent/above-size `w:kern` wrap at a boundary where
-  // `normal` fits; an at-size threshold reverses that result. Set the state
-  // explicitly per run so a caller's Canvas default cannot change WML layout.
-  const setSegKerning = (s: LayoutTextSeg): CanvasFontKerning | null => {
-    const prev = ctx.fontKerning;
-    ctx.fontKerning = s.kerning != null && s.fontSize >= s.kerning ? 'normal' : 'none';
-    return prev;
-  };
-  const restoreKerning = (prev: CanvasFontKerning | null): void => {
-    if (prev != null) ctx.fontKerning = prev;
-  };
-
-  const measureText = (s: LayoutTextSeg, clusterGeometry = false): TextMetrics => {
-    if (s.textLayoutService && s.textShapeRequest) {
-      const shaped = s.textLayoutService.shape({
-        ...s.textShapeRequest,
-        text: s.text,
-        fontSizePt: effectiveFontPx(s),
-        measure: true,
-        clusterGeometry,
-      });
-      if (clusterGeometry) {
-        s.shapedClusters = shaped.clusters;
-        s.selectedFaceFontBox = {
-          ascentPt: shaped.ascentPt,
-          descentPt: shaped.descentPt,
-        };
-        s.selectedFaceInkBounds = shaped.inkBounds ?? {
-          xMinPt: 0,
-          xMaxPt: shaped.advancePt,
-          ascentPt: shaped.ascentPt,
-          descentPt: shaped.descentPt,
-        };
-      }
-      return {
-        width: shaped.advancePt,
-        actualBoundingBoxAscent: shaped.ascentPt,
-        actualBoundingBoxDescent: shaped.descentPt,
-        fontBoundingBoxAscent: shaped.ascentPt,
-        fontBoundingBoxDescent: shaped.descentPt,
-      } as TextMetrics;
-    }
-    setMeasureFont(buildFont(s.bold, s.italic, effectiveFontPx(s), s.fontFamily, fontFamilyClasses, s.fontRoute));
-    const prevKern = setSegKerning(s);
-    const m = ctx.measureText(s.text);
-    restoreKerning(prevKern);
-    return m;
-  };
-  // #1014 — extra along-column advance a vertical (tbRl) run needs so a vo=Tr
-  // rotate-fallback mark (ー 〜 “” ：) whose substitute font UNDER-REPORTS its
-  // advance via measureText keeps its ink inside the ink-sized cell
-  // `drawVerticalRun` paints. Added to the natural advance at EVERY site that
-  // measures a vertical text seg's advance (the main commit, the tab forced-commit
-  // paths, the fitText gap resolver, and the wrap/split look-ahead) so the measured
-  // box tracks the drawn cell (measure == draw). 0 for horizontal runs, 縦中横 cells
-  // (`!verticalRun`), and every font that does not under-report — byte-identical
-  // common path. The run's font must already be selected on `ctx` (the callers
-  // select it via measureText / setMeasureFont immediately before).
-  const verticalInkExtra = (s: LayoutTextSeg, text: string): number => {
-    if (!s.verticalRun) return 0;
-    if (!verticalGlyphMeasurement) {
-      throw new Error('Vertical glyph measurement capability is required for vertical text');
-    }
-    // The format-neutral text service may measure on a different adapter and
-    // restores its Canvas state. The vertical-feature probe is intentionally
-    // paint-context-local, so select the same resolved face explicitly here.
-    setMeasureFont(buildFont(s.bold, s.italic, effectiveFontPx(s), s.fontFamily, fontFamilyClasses, s.fontRoute));
-    const prevKern = setSegKerning(s);
-    try {
-      return verticalGlyphMeasurement.measureRunInkExtra(text);
-    } finally {
-      restoreKerning(prevKern);
-    }
-  };
-
-  const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
-  const sourcedSegs = segs.map((seg, segIndex) => {
-    seg.src = { segIndex, charOffset: 0 };
-    // Issue #797 / #960 — attach the SEA (Thai/Lao/Khmer) break offsets ONCE per
-    // segment (perf: never per line/char). Only for SEA text; non-SEA segments
-    // keep `seaBreaks` absent so their wrap path is byte-identical. The set now
-    // UNIONS the dictionary word boundaries (#797) with the no-space SEA↔non-SEA
-    // script transitions and, for a mixed CJK+SEA run (a `<w:cs/>` run keeps CJK
-    // in the same cs segment), the CJK per-character opportunities — so each
-    // script keeps its own break rule inside one contiguous segment (#960). The
-    // layout kinsoku set (§17.15.1.58–.60) drops positions that would orphan a
-    // forbidden char at a line head/tail, replacing the CJK path's retract.
-    if ('text' in seg && containsSeaScript(seg.text)) {
-      const protectedOffsets = protectedNoBreakOffsets(seg);
-      seg.seaBreaks = seaMixedBreakOffsets(seg.text, { cjk: true, kinsoku })
-        .filter((offset) => !protectedOffsets.has(offset));
-    }
-    return seg;
+  return runLineBreakerPass({
+    ctx, segs, maxWidth, firstIndent, scale, tabStops, wrapCtx,
+    fontFamilyClasses, tabOriginPx, kinsoku, characterGrid, defaultTabPt,
+    marginRightPx, baseRtl, isJustified, stretchLastLine, startBoundary,
+    widthPolicy, verticalGlyphMeasurement, overflowPunct, passContext,
   });
-  let queue: LayoutSeg[];
-  if (!startBoundary) {
-    queue = sourcedSegs;
-  } else if (startBoundary.segIndex >= sourcedSegs.length) {
-    queue = [];
-  } else {
-    const first = sourcedSegs[startBoundary.segIndex];
-    if (startBoundary.charOffset > 0) {
-      if (!('text' in first) || startBoundary.charOffset > first.text.length) {
-        queue = [];
-      } else {
-        const text = first.text.slice(startBoundary.charOffset);
-        queue = text
-          ? [
-              {
-                ...first,
-                text,
-                measuredWidth: 0,
-                src: { ...startBoundary },
-                // A retained resume boundary has already consumed the source
-                // seam. Carrying either marker would invent new ownership at
-                // the start of this suffix.
-                joinPrev: undefined,
-                hardJoinPrev: undefined,
-                ...slicedTextMetadata(first, startBoundary.charOffset, first.text.length),
-                // Rebase the SEA break offsets onto the resumed (sliced) text so
-                // a paginated Thai paragraph still breaks at word boundaries.
-                seaBreaks: rebaseSeaBreaks(first.seaBreaks, startBoundary.charOffset),
-              },
-              ...sourcedSegs.slice(startBoundary.segIndex + 1),
-            ]
-          : sourcedSegs.slice(startBoundary.segIndex + 1);
-      }
-    } else {
-      queue = sourcedSegs.slice(startBoundary.segIndex);
-    }
-  }
-
-  // Mark the paragraph-final U+3000 suffix once. A backwards pass avoids the
-  // O(N²) suffix rescans that would result from queue.every/reduce per segment.
-  let paragraphFinalIdeographicSpaceCount = 0;
-  let paragraphFinalIdeographicSpaceTailStartIndex = -1;
-  const markedParagraphFinalTail: Array<Readonly<{
-    index: number;
-    segment: LayoutTextSeg;
-  }>> = [];
-  for (let index = queue.length - 1; index >= 0; index -= 1) {
-    const candidate = queue[index];
-    if (!candidate || !('text' in candidate) || candidate.text.length === 0) break;
-    // `fitText` (§17.3.2.14) and tate-chu-yoko (§17.3.2.10) are indivisible
-    // layout cells. Ruby owns one base/guide pair. Paragraph-final whitespace
-    // may affect how those cells measure, but must never split or clone them.
-    if (
-      candidate.fitTextRegionIndex !== undefined
-      || candidate.tateChuYoko === true
-      || candidate.ruby !== undefined
-    ) {
-      // buildSegments can split an atomic source run before its U+3000 tail
-      // (ruby is retained only on the first emitted segment). Undo any markers
-      // already assigned to trailing pieces from that same authored run.
-      if (candidate.sourceRunIndex !== undefined) {
-        for (let markedIndex = markedParagraphFinalTail.length - 1; markedIndex >= 0; markedIndex -= 1) {
-          const marked = markedParagraphFinalTail[markedIndex];
-          if (marked.segment.sourceRunIndex !== candidate.sourceRunIndex) continue;
-          marked.segment.paragraphFinalIdeographicSpaceTail = undefined;
-          marked.segment.paragraphFinalIdeographicSpaceLocalCount = undefined;
-          marked.segment.paragraphFinalIdeographicSpaceCount = undefined;
-          marked.segment.paragraphFinalIdeographicSpaceTailStart = undefined;
-          markedParagraphFinalTail.splice(markedIndex, 1);
-        }
-        paragraphFinalIdeographicSpaceTailStartIndex =
-          markedParagraphFinalTail.at(-1)?.index ?? -1;
-      }
-      break;
-    }
-    const trailingSpaces = /^\u3000+$/u.test(candidate.text);
-    const visibleWithTrailingSpaces = /[^\u3000]\u3000+$/u.test(candidate.text);
-    if (!trailingSpaces && !visibleWithTrailingSpaces) break;
-    const localTrailingCount = trailingSpaces
-      ? [...candidate.text].length
-      : [...candidate.text].reverse().findIndex((character) => character !== '\u3000');
-    paragraphFinalIdeographicSpaceCount += localTrailingCount;
-    candidate.paragraphFinalIdeographicSpaceTail = true;
-    candidate.paragraphFinalIdeographicSpaceLocalCount = localTrailingCount;
-    candidate.paragraphFinalIdeographicSpaceCount = paragraphFinalIdeographicSpaceCount;
-    paragraphFinalIdeographicSpaceTailStartIndex = index;
-    markedParagraphFinalTail.push({ index, segment: candidate });
-    if (visibleWithTrailingSpaces) break;
-  }
-  if (paragraphFinalIdeographicSpaceTailStartIndex >= 0) {
-    const start = queue[paragraphFinalIdeographicSpaceTailStartIndex];
-    if (start && 'text' in start) start.paragraphFinalIdeographicSpaceTailStart = true;
-  }
-
-  // Resolve §17.3.2.14 from RAW natural advances at this exact layout scale.
-  // The resulting per-gap is folded into segAdvanceWidth below, so the line
-  // breaker and paint pen use one width authority. Cached w:spacing is ignored.
-  // #1014 — the natural width includes the vo=Tr ink deficit so the resolved gap
-  // (target − natural)/n, plus the ink-grown cell the paint draws, still sums to
-  // the fitText target (measure == paint); 0 for non-under-reporting runs.
-  resolveFitTextSegments(
-    queue.filter((seg): seg is LayoutTextSeg => 'text' in seg),
-    scale,
-    (segment) => measureText(segment).width + verticalInkExtra(segment, segment.text),
-  );
-
-  // The segment's laid-out ADVANCE (= its measuredWidth): natural width plus the
-  // character-grid delta, the §17.3.2.43 horizontal glyph scale (w:w) and the
-  // §17.3.2.35 character-spacing pitch (w:spacing). This is the SINGLE source of
-  // truth shared with the draw paths (segAdvanceWidth) — every line-break / fit /
-  // tab measurement uses it so line wrapping packs the grid's char count and the
-  // box matches what is drawn (measure==paint). `kerning` (§17.3.2.19) is applied
-  // via `ctx.fontKerning` inside `withSegKerning`, wrapping the measureText call.
-  // The #1014 vo=Tr ink deficit (`verticalInkExtra`, defined above) is folded into
-  // the natural width so measure == paint on an under-reporting vertical run.
-  const segNaturalAdvance = (s: LayoutTextSeg): number =>
-    segAdvanceWidth(s, measureText(s).width + verticalInkExtra(s, s.text), characterGrid, scale);
-  const standaloneSnapAdvance = (s: LayoutTextSeg, naturalWidth: number): number => {
-    const kind = snapToCharsClass(s, characterGrid);
-    if (!kind || snapPitchPx == null || s.text.length === 0) return naturalWidth;
-    return snapToCharsAllocatedWidthPx(
-      naturalWidth,
-      kind,
-      snapPitchPx,
-      kind === 'eastAsia' ? eastAsianSnapCellCount(s) : 1,
-    );
-  };
-  const segAdvance = (s: LayoutTextSeg): number =>
-    standaloneSnapAdvance(s, segNaturalAdvance(s));
-  // Grid advance of an arbitrary substring under a segment's font (for split
-  // prefixes/tails). Selects the font (and the run's kerning state), then applies
-  // the same width model as a whole segment BUT with the substring's own
-  // text/length so char-spacing scales with the piece — the split-prefix vs
-  // whole-segment advances must agree.
-  const strNaturalAdvance = (
-    s: LayoutTextSeg,
-    text: string,
-    retainTrailingPunctuationCompression = false,
-  ): number => {
-    const start = retainTrailingPunctuationCompression
-      ? s.text.length - text.length
-      : 0;
-    const measuredSegment = {
-      ...s,
-      text,
-      punctuationCompressions: slicedPunctuationCompressions(
-        s,
-        Math.max(0, start),
-        Math.max(0, start) + text.length,
-      ),
-    };
-    if (s.textLayoutService && s.textShapeRequest) {
-      const shaped = s.textLayoutService.shape({
-        ...s.textShapeRequest,
-        text,
-        fontSizePt: effectiveFontPx(s),
-        measure: true,
-        clusterGeometry: false,
-      });
-      return segAdvanceWidth(
-        measuredSegment,
-        shaped.advancePt + verticalInkExtra(s, text),
-        characterGrid,
-        scale,
-      );
-    }
-    setMeasureFont(buildFont(s.bold, s.italic, effectiveFontPx(s), s.fontFamily, fontFamilyClasses, s.fontRoute));
-    const prevKern = setSegKerning(s);
-    const natural = ctx.measureText(text).width;
-    restoreKerning(prevKern);
-    return segAdvanceWidth(
-      measuredSegment,
-      natural + verticalInkExtra(s, text),
-      characterGrid,
-      scale,
-    );
-  };
-  const eastAsianSnapCellCount = (s: LayoutTextSeg): number => {
-    if (snapPitchPx == null) return 1;
-    if (s.textLayoutService && s.textShapeRequest && !s.shapedClusters) {
-      measureText(s, true);
-    }
-    const shapedClusters = s.shapedClusters?.length
-      ? s.shapedClusters
-      : null;
-    const boundaries = shapedClusters == null
-      ? [...new Set([
-          0,
-          ...graphemeClusterOffsets(s.text),
-          s.text.length,
-        ])].sort((a, b) => a - b)
-      : null;
-    const ranges = shapedClusters?.map((cluster) => ({
-      start: cluster.range.start,
-      end: cluster.range.end,
-      advancePx: cluster.advancePt,
-    })) ?? boundaries!.slice(0, -1).map((start, index) => ({
-      start,
-      end: boundaries![index + 1]!,
-      advancePx: undefined,
-    }));
-    let cells = 0;
-    for (const range of ranges) {
-      const { start, end } = range;
-      if (end <= start) continue;
-      const text = s.text.slice(start, end);
-      const measuredSegment = {
-        ...s,
-        text,
-        punctuationCompressions: slicedPunctuationCompressions(s, start, end),
-      };
-      let naturalAdvancePx: number;
-      if (range.advancePx != null) {
-        naturalAdvancePx = segAdvanceWidth(
-          measuredSegment,
-          range.advancePx + verticalInkExtra(s, text),
-          characterGrid,
-          scale,
-        );
-      } else {
-        setMeasureFont(buildFont(s.bold, s.italic, effectiveFontPx(s), s.fontFamily, fontFamilyClasses, s.fontRoute));
-        const previousKerning = setSegKerning(s);
-        const naturalWidthPx = ctx.measureText(text).width;
-        restoreKerning(previousKerning);
-        naturalAdvancePx = segAdvanceWidth(
-          measuredSegment,
-          naturalWidthPx + verticalInkExtra(s, text),
-          characterGrid,
-          scale,
-        );
-      }
-      cells += wordSnapToCharsEastAsianCellCount(naturalAdvancePx, snapPitchPx);
-    }
-    return Math.max(1, cells);
-  };
-  const strAdvance = (
-    s: LayoutTextSeg,
-    text: string,
-    retainTrailingPunctuationCompression = false,
-  ): number => {
-    const candidate = {
-      ...s,
-      text,
-      shapedClusters: text === s.text ? s.shapedClusters : undefined,
-    };
-    return standaloneSnapAdvance(
-      candidate,
-      strNaturalAdvance(s, text, retainTrailingPunctuationCompression),
-    );
-  };
-
-  /** Compatibility projection governed by WORD_LATIN_INTERWORD_XAVG_FLOOR.
-   * The selected face's OS/2 xAvgCharWidth / 2 is the minimum inter-word
-   * advance. Equal-face gaps share the required deficit uniformly; a natural
-   * space narrower than that minimum retains its natural advance. This is not
-   * an ECMA-376 definition or a replacement for glyph advance.
-   * Mixed faces, authored spacing, and snap-to-character cells are outside
-   * the measured scope and retain their natural widths. The §17.6.5 grid
-   * pitch is additive to the selected-face floor. The Word 6 compatibility
-   * setting excludes the fit projection at segment acquisition. */
-  const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean => {
-    if (isJustified || baseRtl || widthPolicy !== 'bounded'
-      || characterGrid?.type === 'snapToChars'
-      || (characterGrid?.type === 'linesAndChars'
-        && next.widthBalanceGridDeltaFactor !== 0.5)
-      || next.latinSpaceCompressionEligible !== true
-      || next.latinSpaceAverageWidthRatio == null
-      || !next.fontRoute || next.rtl || next.verticalRun || next.tateChuYoko
-      || next.fitTextRegionIndex !== undefined
-      || !latinLineHomogeneous || !latinLineFace
-      || !sameLatinSpaceFace(next, latinLineFace)
-      || latinLineGaps.length === 0) return false;
-    const totalCapacity = (latinUniformGapCapacity ?? 0) * latinLineGaps.length;
-    if (totalCapacity <= 0) return false;
-    const restored = latinAppliedPerGap * latinAppliedGapCount;
-    const required = Math.max(0, currentWidth + restored + nextFitWidth - availW());
-    if (required > totalCapacity
-      || !fitsMeasuredWidth(currentWidth + restored + nextFitWidth - required, availW())) {
-      return false;
-    }
-    // Keep aggregate fit width current. Write each retained gap exactly once
-    // when the line is finalized, avoiding quadratic work on long lines.
-    currentWidth += restored - required;
-    latinAppliedGapCount = latinLineGaps.length;
-    latinAppliedPerGap = required / latinAppliedGapCount;
-    return true;
-  };
-
-  /** Measure one text segment's canonical advance and vertical contribution.
-   * Every path that commits a complete text segment to a line must use this
-   * authority so font fallback, small-caps, position, ruby and grid metrics do
-   * not diverge at internal segment seams. */
-  const textSegmentBox = (s: LayoutTextSeg): Readonly<{
-    width: number;
-    height: number;
-    ascent: number;
-    descent: number;
-  }> => {
-    const measured = measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
-    const width = segAdvanceWidth(
-      s,
-      measured.width + verticalInkExtra(s, s.text),
-      characterGrid,
-      scale,
-    );
-    s.snapGridNaturalWidthPx = width;
-
-    const fullPx = s.fontSize * scale;
-    let metricMeasurement = measured;
-    let metricEmPx = effectiveFontPx(s);
-    if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
-      if (s.textLayoutService && s.textShapeRequest) {
-        const shaped = s.textLayoutService.shape({
-          ...s.textShapeRequest,
-          text: s.text || 'X',
-          fontSizePt: fullPx,
-          measure: true,
-          clusterGeometry: false,
-        });
-        metricMeasurement = {
-          width: shaped.advancePt,
-          actualBoundingBoxAscent: shaped.ascentPt,
-          actualBoundingBoxDescent: shaped.descentPt,
-          fontBoundingBoxAscent: shaped.ascentPt,
-          fontBoundingBoxDescent: shaped.descentPt,
-        } as TextMetrics;
-      } else {
-        const previousFont = ctx.font;
-        ctx.font = buildFont(
-          s.bold,
-          s.italic,
-          fullPx,
-          s.fontFamily,
-          fontFamilyClasses,
-          s.fontRoute,
-        );
-        metricMeasurement = ctx.measureText(s.text || 'X');
-        ctx.font = previousFont;
-      }
-      metricEmPx = fullPx;
-    }
-
-    const corrected = measuredLineMetrics(metricMeasurement, fullPx);
-    // Selected resource sides come from the same admitted face as the line
-    // height; native reference sides are policy geometry only. Ruby and an
-    // authored baseline position compose additional boxes outside either
-    // simple OpenType projection, so retain measured sides for those inputs.
-    const designOwnsSides = (s.resolvedResourceVerticalMetric || s.referenceFontVerticalMetric)
-      && !s.ruby
-      && (s.position ?? 0) === 0
-      && s.resolvedDesignAscentRatio != null
-      && s.resolvedDesignDescentRatio != null;
-    let ascent = designOwnsSides
-      ? s.resolvedDesignAscentRatio! * metricEmPx
-      : corrected.ascent;
-    let descent = designOwnsSides
-      ? s.resolvedDesignDescentRatio! * metricEmPx
-      : corrected.descent;
-    if (s.positionExtendsLineBox !== false) {
-      const positionPx = (s.position ?? 0) * scale;
-      if (positionPx > 0) ascent += positionPx;
-      else if (positionPx < 0) descent -= positionPx;
-    }
-    if (s.ruby && (!s.textBoxLineFloor || s.textBoxVertical)) {
-      ascent += rubyAscentReservePx(
-        s.ruby.fontSizePt,
-        s.ruby.hpsRaisePt,
-        scale,
-        s,
-        ctx,
-        fontFamilyClasses,
-      );
-    }
-    return { width, height: s.fontSize, ascent, descent };
-  };
-
-  /** Continue the existing U+3000 line-end hanging rule across an internal
-   * width-balance segment seam. The split space keeps its own font/grid advance
-   * for measure == paint. UAX #14 classifies U+3000 as BA, so an internal seam
-   * before it must not become an authored break opportunity. Restrict
-   * consumption to the same authored run; an actual source boundary remains
-   * independently modeled. */
-  const appendQueuedIdeographicSpaceSegment = (
-    source: LayoutTextSeg,
-  ): void => {
-    if (
-      /\s$/u.test(source.text)
-      || source.ruby !== undefined
-      || source.tateChuYoko === true
-      || source.fitTextRegionIndex !== undefined
-    ) return;
-    const follower = queue[0];
-    if (
-      !follower
-      || !('text' in follower)
-      || follower.joinPrev !== true
-      || follower.text.length === 0
-      || [...follower.text].some((character) => character !== '\u3000')
-    ) return;
-    queue.shift();
-    const hangingCount = wordIdeographicSpaceLineEndAllowanceCount(
-      hasEastAsianVisiblePredecessor(source.text),
-      follower.paragraphFinalIdeographicSpaceCount ?? [...follower.text].length,
-    );
-    if (hangingCount === 0) {
-      queue.unshift(follower);
-      return;
-    }
-    const hangingText = follower.text.slice(0, hangingCount);
-    const hangingSegment: LayoutTextSeg = {
-      ...follower,
-      ...RESET_SLICED_TEXT_MEASUREMENT,
-      text: hangingText,
-      measuredWidth: 0,
-      ...slicedTextMetadata(follower, 0, hangingText.length),
-    };
-    const followerBox = textSegmentBox(hangingSegment);
-    hangingSegment.measuredWidth = followerBox.width;
-    addToLine(
-      hangingSegment,
-      followerBox.width,
-      followerBox.height,
-      followerBox.ascent,
-      followerBox.descent,
-    );
-    const remainder = follower.text.slice(hangingText.length);
-    if (remainder.length > 0) {
-      queue.unshift({
-        ...follower,
-        ...RESET_SLICED_TEXT_MEASUREMENT,
-        text: remainder,
-        measuredWidth: 0,
-        joinPrev: undefined,
-        hardJoinPrev: undefined,
-        ...slicedTextMetadata(follower, hangingText.length, follower.text.length),
-        src: follower.src
-          ? {
-              segIndex: follower.src.segIndex,
-              charOffset: follower.src.charOffset + hangingText.length,
-            }
-          : undefined,
-      });
-    }
-  };
-
-  // Width of a queued segment, for right/center tab look-ahead.
-  const tabFollowWidth = (q: LayoutSeg): number => {
-    if ('isTab' in q) return q.measuredWidth || 0;
-    if ('imagePath' in q) return q.widthPt * scale;
-    if ('math' in q) return q.measuredWidth || 0;
-    if ('lineBreak' in q) return 0;
-    return segAdvance(q);
-  };
-
-  /** Resolve the registered decimal alignment point independently of run/style
-   * seams so both LTR and mirrored bidi tab paths consume one source boundary. */
-  const decimalAlignmentPoint = (
-    segments: readonly LayoutSeg[],
-  ): Readonly<{ segmentIndex: number; charOffset: number }> | null => {
-    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
-      const segment = segments[segmentIndex]!;
-      if (!('text' in segment)) continue;
-      const separator = segment.text.indexOf('.');
-      if (separator >= 0) return { segmentIndex, charOffset: separator };
-    }
-
-    let lastDigit: Readonly<{ segmentIndex: number; charOffset: number }> | null = null;
-    let inFirstNumber = false;
-    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
-      const segment = segments[segmentIndex]!;
-      if (!('text' in segment)) {
-        if (inFirstNumber) return lastDigit;
-        continue;
-      }
-      let charOffset = 0;
-      for (const scalar of segment.text) {
-        charOffset += scalar.length;
-        if (/\p{Decimal_Number}/u.test(scalar)) {
-          inFirstNumber = true;
-          lastDigit = { segmentIndex, charOffset };
-        } else if (inFirstNumber) {
-          return lastDigit;
-        }
-      }
-    }
-    return lastDigit;
-  };
-
-  const decimalAlignmentPrefixWidth = (segments: readonly LayoutSeg[]): number | undefined => {
-    const point = decimalAlignmentPoint(segments);
-    if (!point) return undefined;
-    let width = 0;
-    for (let index = 0; index < point.segmentIndex; index += 1) {
-      width += tabFollowWidth(segments[index]!);
-    }
-    const segment = segments[point.segmentIndex]!;
-    if (!('text' in segment)) return width;
-    return width + strAdvance(segment, segment.text.slice(0, point.charOffset));
-  };
-
-  const tabFollowingMetrics = (): Readonly<{
-    totalWidth: number;
-    decimalPrefixWidth?: number;
-  }> => {
-    const following: LayoutSeg[] = [];
-    let totalWidth = 0;
-    for (const q of queue) {
-      if ('isTab' in q || 'lineBreak' in q) break;
-      following.push(q);
-      totalWidth += tabFollowWidth(q);
-    }
-    const decimalPrefixWidth = decimalAlignmentPrefixWidth(following);
-    return decimalPrefixWidth === undefined
-      ? { totalWidth }
-      : { totalWidth, decimalPrefixWidth };
-  };
-
-  // A `<w:br/>` always starts a new line (§17.3.3.1) — when it is the LAST
-  // content of the paragraph, the new line is empty but still occupies one line
-  // height. Track the trailing break so it can be flushed after the loop.
-  let trailingBreakFontSize: number | null = null;
-
-  // Establish the first line's wrap window now that the content queue exists.
-  startLine(
-    isParagraphMarkOnlyFlow
-      ? (wrapCtx?.paragraphMarkLineStartWidth ?? minLineStartWidth())
-      : minLineStartWidth(),
-  );
-
-  /**
-   * Return the widest grapheme-safe UTF-16 prefix that fits an emergency
-   * break band. This is the single authority used whether the overlong token
-   * starts on an empty line or consumes the useful remainder of the current
-   * line. Keeping both cases here prevents measurement and retained paint
-   * partitions from drifting apart.
-   */
-  const emergencyTextSplit = (
-    segment: LayoutTextSeg,
-    available: number,
-    forceAtLeastOne = true,
-  ): number => {
-    const protectedOffsets = protectedNoBreakOffsets(segment);
-    const graphemeOffsets = [
-      0,
-      ...graphemeClusterOffsets(segment.text),
-      segment.text.length,
-    ].filter((offset, index, all) => all.indexOf(offset) === index);
-    let split = 0;
-    if (available > 0) {
-      const monotoneAllocation = charSpacingDeltaPx(segment, scale) >= 0
-        && snapToCharsClass(segment, characterGrid) !== 'latin';
-      if (monotoneAllocation) {
-        setMeasureFont(buildFont(
-          segment.bold,
-          segment.italic,
-          effectiveFontPx(segment),
-          segment.fontFamily,
-          fontFamilyClasses,
-          segment.fontRoute,
-        ));
-        const prevKern = setSegKerning(segment);
-        try {
-          const fitted = fitCJKPrefix(
-            ctx,
-            segment.text,
-            available,
-            segmentCharacterGridDeltaPx(segment, characterGrid, scale),
-            charScaleFactor(segment),
-            charSpacingDeltaPx(segment, scale),
-            segment.verticalRun === true,
-            verticalGlyphMeasurement,
-            (prefix) => strAdvance(segment, prefix),
-          ).length;
-          split = graphemeOffsets
-            .filter((offset) => offset <= fitted && !protectedOffsets.has(offset))
-            .at(-1) ?? 0;
-        } finally {
-          restoreKerning(prevKern);
-        }
-      } else {
-        // Signed spacing and a Latin snap block can make prefix advances
-        // non-monotone. Evaluate every legal retained candidate against the
-        // exact prospective line block rather than binary-searching a
-        // standalone approximation.
-        for (const offset of graphemeOffsets) {
-          if (offset <= 0 || protectedOffsets.has(offset)) continue;
-          const natural = strNaturalAdvance(segment, segment.text.slice(0, offset));
-          if (prospectiveSnapAdvance(segment, natural) <= available + 1e-9) split = offset;
-        }
-      }
-    }
-    if (split <= 0 && forceAtLeastOne) {
-      split = graphemeOffsets.find((offset) => offset > 0 && !protectedOffsets.has(offset))
-        ?? segment.text.length;
-    }
-    // Preserve the existing JLReq/Word line-end hanging rule after switching
-    // the emergency splitter from code-point indexes to UTF-16 grapheme offsets.
-    while (segment.text.startsWith('\u3000', split)) split += 1;
-    return split;
-  };
-
-  /** Select the last semantic URL candidate that fits the prospective band.
-   * Every candidate is evaluated independently: signed character spacing can
-   * make prefix advances non-monotone, and snapToChars must include the current
-   * line's active script block rather than treating the prefix in isolation. */
-  const externalLinkSyntaxSplit = (
-    segment: LayoutTextSeg,
-    available: number,
-  ): number => {
-    if (!(available > 0) || !segment.externalLinkBreakOffsets?.length) return 0;
-    let selected = 0;
-    for (const offset of segment.externalLinkBreakOffsets) {
-      if (offset <= 0 || offset >= segment.text.length) continue;
-      const naturalAdvance = strNaturalAdvance(segment, segment.text.slice(0, offset));
-      const prospectiveAdvance = prospectiveSnapAdvance(segment, naturalAdvance);
-      if (prospectiveAdvance <= available + 1e-9) selected = offset;
-    }
-    return selected;
-  };
-
-  const queueEmergencyTail = (segment: LayoutTextSeg, split: number): void => {
-    queue.unshift({
-      ...segment,
-      ...RESET_SLICED_TEXT_MEASUREMENT,
-      text: segment.text.slice(split),
-      ...slicedTextMetadata(segment, split, segment.text.length),
-      seaBreaks: rebaseSeaBreaks(segment.seaBreaks, split),
-      measuredWidth: 0,
-      // The emergency split itself is now the legal line boundary. A source-
-      // boundary glue marker protects only the first retained prefix; carrying
-      // it onto the tail would make the next line overflow again.
-      joinPrev: undefined,
-      hardJoinPrev: undefined,
-      src: {
-        segIndex: segment.src!.segIndex,
-        charOffset: segment.src!.charOffset + split,
-      },
-    });
-  };
-
-  type CrossRunKinsokuRetraction =
-    | { readonly kind: 'none' }
-    | { readonly kind: 'blocked' }
-    | { readonly kind: 'retracted'; readonly tail: LayoutTextSeg };
-
-  /**
-   * Move a legal suffix of the current line ahead of a segment whose first
-   * glyph is forbidden at line start. This is the single cross-run 追い出し
-   * authority for both the CJK and SEA overflow paths.
-   *
-   * A source seam marked by `hardJoinPrev` is indivisible: moving the complete
-   * following segment would strand its owner on the previous line. Likewise,
-   * a split at either edge of an authored no-break range is not legal. When
-   * either constraint blocks retraction, the caller must keep the forbidden
-   * leader on the current line instead of weakening the authored constraint.
-   */
-  const retractCurrentLineForLeadingKinsoku = (
-    next: LayoutTextSeg,
-  ): CrossRunKinsokuRetraction => {
-    const firstCp = next.text.codePointAt(0);
-    const lastSeg = currentLine[currentLine.length - 1];
-    if (
-      firstCp === undefined
-      || !kinsoku.lineStartForbidden.has(firstCp)
-      || lastSeg === undefined
-      || !('text' in lastSeg)
-    ) {
-      return { kind: 'none' };
-    }
-
-    const lastText = lastSeg as LayoutTextSeg;
-    const chars = [...lastText.text];
-    const minKeep = currentLine.length > 1 ? 0 : 1;
-    const retractCount = crossRunKinsokuRetract(chars, kinsoku, minKeep);
-    if (retractCount <= 0) return { kind: 'none' };
-
-    const headText = chars.slice(0, chars.length - retractCount).join('');
-    const split = headText.length;
-    // Moving the whole segment would cut the hard source seam immediately
-    // before it. A protected no-break edge is equally indivisible.
-    if (
-      (split === 0 && lastText.hardJoinPrev === true)
-      || protectedNoBreakOffsets(lastText).has(split)
-    ) {
-      return { kind: 'blocked' };
-    }
-
-    materializeLatinSpaceCompression();
-    latinLineHomogeneous = false;
-
-    const tailText = lastText.text.slice(split);
-    const tail: LayoutTextSeg = {
-      ...lastText,
-      ...RESET_SLICED_TEXT_MEASUREMENT,
-      text: tailText,
-      ...slicedTextMetadata(lastText, split, lastText.text.length),
-      measuredWidth: strAdvance(lastText, tailText, true),
-      // The retraction creates a real line boundary. The old source seam was
-      // either retained in `headText` or was soft; it must not be projected
-      // onto this newly-created suffix.
-      joinPrev: undefined,
-      hardJoinPrev: undefined,
-      src: {
-        segIndex: lastText.src!.segIndex,
-        charOffset: lastText.src!.charOffset + split,
-      },
-      seaBreaks: rebaseSeaBreaks(lastText.seaBreaks, split),
-    };
-
-    if (headText) {
-      const headW = strAdvance(lastText, headText);
-      currentWidth -= lastText.measuredWidth - headW;
-      currentLine[currentLine.length - 1] = {
-        ...lastText,
-        ...RESET_SLICED_TEXT_MEASUREMENT,
-        text: headText,
-        measuredWidth: headW,
-        ...slicedTextMetadata(lastText, 0, split),
-      };
-    } else {
-      currentWidth -= lastText.measuredWidth;
-      currentLine.pop();
-    }
-    return { kind: 'retracted', tail };
-  };
-
-  /** Keep one otherwise-forbidden line-start grapheme with the current line.
-   * This is the only legal fallback when cross-run retraction would split an
-   * authored hard/no-break group. Reprocessing the tail repeats the rule for a
-   * sequence of forbidden leaders while guaranteeing grapheme-safe progress. */
-  const keepLeadingKinsokuWithCurrentLine = (
-    segment: LayoutTextSeg,
-    h: number,
-    asc: number,
-    desc: number,
-  ): boolean => {
-    const firstEnd = graphemeClusterOffsets(segment.text)[0] ?? segment.text.length;
-    if (firstEnd <= 0) return false;
-    const prefix = segment.text.slice(0, firstEnd);
-    const prefixWidth = strNaturalAdvance(segment, prefix);
-    addToLine({
-      ...segment,
-      ...RESET_SLICED_TEXT_MEASUREMENT,
-      text: prefix,
-      measuredWidth: prefixWidth,
-      ...slicedTextMetadata(segment, 0, firstEnd),
-    }, prefixWidth, h, asc, desc);
-    if (firstEnd < segment.text.length) queueEmergencyTail(segment, firstEnd);
-    return true;
-  };
-
-  while (queue.length > 0) {
-    const seg = queue.shift()!;
-
-    // ── Line-break sentinel ──────────────────────────────
-    if ('lineBreak' in seg) {
-      // The line being flushed ends at a MANUAL break (§17.3.3.1) — mark it so a
-      // justified paragraph left-aligns it like its final line (§17.18.44).
-      flush(seg.fontSize, true);
-      trailingBreakFontSize = seg.fontSize;
-      continue;
-    }
-    trailingBreakFontSize = null;
-
-    // ── Tab segment ──────────────────────────────────────
-    if ('isTab' in seg) {
-      // ── ECMA-376 §17.3.1.6 base-RTL ordinary tab ─────────────────────────
-      // The LTR pen math below resolves stops in LOGICAL order, which mis-places
-      // a bidi paragraph's tab-delimited cells (they reorder visually — see
-      // `layoutBidiTabStops`). Add the tab with a PROVISIONAL width of 0 and do
-      // NOT wrap on it; the per-line post-pass (`applyBidiTabs`, run in `flush`)
-      // recomputes every tab width in the visual frame once the line's content
-      // is known. A `<w:ptab>` (absolute-position tab) keeps the LTR path for
-      // now (no bidi ptab fixture; its own NOTE flags the gap).
-      if (baseRtl && !seg.ptab) {
-        seg.measuredWidth = 0;
-        addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-        continue;
-      }
-
-      // Absolute position on the line measured from paraX (line origin for continuation lines)
-      const absFromParaX = currentWidth + (isFirst ? firstIndent : 0);
-
-      // ── ECMA-376 §17.3.3.23 absolute-position tab (<w:ptab>) ──────────────
-      // A ptab ignores the paragraph's custom tab stops and the default-tab
-      // interval; it advances to a fixed position on the line derived from its
-      // `alignment` (§17.18.71) and `relativeTo` (§17.18.73). The `alignment`
-      // ALSO governs how the text after the ptab aligns to that position (left /
-      // centered / right). All coordinates below are paraX-relative px.
-      //
-      // NOTE: the ptab target is resolved in LOGICAL (LTR) coordinates — this
-      // block runs before the per-line bidi reorder pass, so it has no notion
-      // of the paragraph's base direction. Interaction with bidi mirroring in
-      // an RTL paragraph (where "left"/"right" alignment and the box edges
-      // ought to mirror) is unverified; the primary use case (an LTR footer's
-      // centered/right-aligned PAGE field) is correct.
-      if (seg.ptab) {
-        seg.resolvedAlignment = seg.ptab.alignment;
-        // Reference box: "indent" ⇒ the paragraph content box [0, maxWidth];
-        // "margin" ⇒ the text-margin box [-tabOriginPx, marginRightPx].
-        const boxLeft = seg.ptab.relativeTo === 'indent' ? 0 : -tabOriginPx;
-        const boxRight = seg.ptab.relativeTo === 'indent' ? maxWidth : marginRightPx;
-        const target =
-          seg.ptab.alignment === 'left'
-            ? boxLeft
-            : seg.ptab.alignment === 'center'
-              ? (boxLeft + boxRight) / 2
-              : boxRight;
-        // Width of the content that trails the ptab up to the next tab / line end
-        // — needed to right-/center-align it against `target` (the trailing text
-        // is what aligns to the stop, §17.18.71).
-        let followW = 0;
-        for (const q of queue) {
-          if ('isTab' in q || 'lineBreak' in q) break;
-          followW += tabFollowWidth(q);
-        }
-        const frac = seg.ptab.alignment === 'center' ? 0.5 : seg.ptab.alignment === 'right' ? 1 : 0;
-        let tabW = target - absFromParaX - followW * frac;
-        // §17.3.3.23: "If the alignment location … cannot be found on the current
-        // line, because the starting location is past that point, then the tab …
-        // shall advance to that location on the next available line." So when the
-        // pen already sits at/after the target, wrap the ptab (and its trailing
-        // content) to a fresh line — unless the line is empty (nowhere to wrap).
-        if (tabW <= 0) {
-          if (currentLine.length > 0) {
-            flush(undefined, false, seg.src);
-            queue.unshift(seg);
-            continue;
-          }
-          // Empty line: cannot advance backwards; contribute no width but keep the
-          // segment so the line-height reflects the ptab's font.
-          tabW = 0;
-        }
-        seg.measuredWidth = tabW;
-        addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-        // Commit the trailing content onto this line without a wrap re-check, so
-        // it sits exactly at the aligned position (mirrors the custom right/center
-        // tab path below).
-        if (seg.ptab.alignment !== 'left') {
-          while (queue.length > 0) {
-            const q = queue[0];
-            if ('isTab' in q || 'lineBreak' in q) break;
-            queue.shift();
-            if ('imagePath' in q) {
-              const w = q.widthPt * scale;
-              q.measuredWidth = w;
-              addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
-            } else if ('math' in q) {
-              addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
-            } else {
-              const m = measureText(q);
-              // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-              const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
-              q.measuredWidth = w;
-              const asc = m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
-              const desc = m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
-              addToLine(q, w, q.fontSize, asc, desc);
-            }
-          }
-        }
-        continue;
-      }
-      // ECMA-376 §17.3.1.37 / §17.15.1.25 — resolve the next stop in TEXT-MARGIN
-      // coordinates (the same origin as custom stops): the current pen position is
-      // `absFromParaX + tabOriginPx`, custom stops are `pos * scale`, and the
-      // automatic grid interval is `defaultTabPt * scale`. Mixing paraX and margin
-      // coordinates is what diverged leading-tab rows from labeled ones; computing
-      // both in margin space and converting back keeps them aligned.
-      const curMarginPx = absFromParaX + tabOriginPx;
-      const customStopsPx = tabStops.map((t) => ({ pos: t.pos * scale, alignment: t.alignment, leader: t.leader }));
-      const stop = nextTabStop(curMarginPx, customStopsPx, defaultTabPt * scale);
-      seg.resolvedAlignment = stop?.alignment ?? 'left';
-      // Convert the chosen margin-space stop back to paraX-relative px.
-      const stopParaX = stop ? stop.pos - tabOriginPx : absFromParaX;
-      // Right/center/decimal tab: place the tab + its trailing content (up to the next
-      // tab / line end) so the content ends at / centers on the stop, and commit that
-      // content directly so the normal wrap check doesn't push it past the stop
-      // (ECMA-376 §17.3.1.37). This is what makes TOC "heading …… page" lines work.
-      // Automatic stops returned by nextTabStop are left-aligned, so they fall
-      // through to the left-tab path below.
-      const alignmentRole = stop ? tabAlignmentRole(stop.alignment) : 'leading';
-      if (stop && alignmentRole !== 'leading') {
-        const stopX = stopParaX;
-        seg.leader = stop.leader;
-        const following = tabFollowingMetrics();
-        const alignmentWidth = alignmentRole === 'center'
-          ? following.totalWidth / 2
-          : alignmentRole === 'decimal'
-            ? following.decimalPrefixWidth ?? following.totalWidth
-            : following.totalWidth;
-        let tabW = stopX - absFromParaX - alignmentWidth;
-        if (tabW <= 0) tabW = 0;
-        seg.measuredWidth = tabW;
-        addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-        // Commit the trailing content onto this line without a wrap re-check.
-        while (queue.length > 0) {
-          const q = queue[0];
-          if ('isTab' in q || 'lineBreak' in q) break;
-          queue.shift();
-          if ('imagePath' in q) {
-            const w = q.widthPt * scale;
-            q.measuredWidth = w;
-            addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
-          } else if ('math' in q) {
-            addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
-          } else {
-            const m = measureText(q);
-            // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-            const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
-            q.measuredWidth = w;
-            const asc = m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
-            const desc = m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
-            addToLine(q, w, q.fontSize, asc, desc);
-          }
-        }
-        continue;
-      }
-
-      // Left-aligned tab (custom 'left'/'bar'/'clear' or an automatic stop): the
-      // pen moves to the stop's paraX. nextTabStop already applied the §17.15.1.25
-      // "after all custom stops" automatic grid, so there is no separate fallback.
-      let tabWidth = stopParaX - absFromParaX;
-      if (stop) seg.leader = stop.leader;
-      // Clamp to avoid negative widths; if tab would overflow the line, wrap instead
-      if (tabWidth <= 0) {
-        flush(undefined, false, seg.src);
-        queue.unshift(seg);
-        continue;
-      }
-      if (currentWidth + tabWidth > availW() && currentLine.length > 0) {
-        flush(undefined, false, seg.src);
-        queue.unshift(seg);
-        continue;
-      }
-      seg.measuredWidth = tabWidth;
-      addToLine(seg, tabWidth, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-      continue;
-    }
-
-    // ── Image segment ────────────────────────────────────
-    if ('imagePath' in seg) {
-      if (seg.anchor) { seg.measuredWidth = 0; continue; }
-      const w = seg.widthPt * scale;
-      const h = seg.heightPt;
-      const asc = seg.heightPt * scale;
-      seg.measuredWidth = w;
-      if (currentLine.length > 0 && currentWidth + w > availW()) {
-        flush(undefined, false, seg.src);
-      }
-      addToLine(seg, w, h, asc, 0);
-      continue;
-    }
-
-    // ── Math segment ─────────────────────────────────────
-    if ('math' in seg) {
-      const render = seg.mathMetadata;
-      if (!render || render.available === false) {
-        const emPx = seg.fontSize * scale;
-        setMeasureFont(buildFont(false, false, emPx, null, fontFamilyClasses));
-        const m = ctx.measureText(seg.fallbackText);
-        const w = m.width;
-        const asc = m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? emPx * 0.8;
-        const desc = m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? emPx * 0.2;
-        seg.measuredWidth = w;
-        seg.mathAscent = asc;
-        seg.mathDescent = desc;
-        if (currentLine.length > 0 && currentWidth + w > availW()) {
-          flush(undefined, false, seg.src);
-        }
-        addToLine(seg, w, seg.fontSize, Math.max(asc, emPx * 0.8), Math.max(desc, emPx * 0.2));
-        continue;
-      }
-      const emPx = seg.fontSize * scale;
-      const w = render.widthEm * emPx;
-      const asc = render.ascentEm * emPx;
-      const desc = render.descentEm * emPx;
-      seg.measuredWidth = w;
-      // Ink extents (from the MathJax SVG viewBox) position the rasterized
-      // glyph relative to the baseline when drawing.
-      seg.mathAscent = asc;
-      seg.mathDescent = desc;
-      // …but the LINE BOX must reserve at least a normal single line for the
-      // run's font size. A short equation — e.g. a lone "−" — has near-zero ink
-      // height; using that as the line height would collapse the line (and the
-      // table row) and pin the glyph to the very top of the cell. Floor to the
-      // font's natural ascent/descent so math occupies a full line like text
-      // does (tall math — fractions, big operators — keeps its larger ink box).
-      const lineAsc = Math.max(asc, emPx * 0.8);
-      const lineDesc = Math.max(desc, emPx * 0.2);
-      if (currentLine.length > 0 && currentWidth + w > availW()) {
-        flush(undefined, false, seg.src);
-      }
-      addToLine(seg, w, seg.fontSize, lineAsc, lineDesc);
-      continue;
-    }
-
-    // ── Text segment ─────────────────────────────────────
-    const s = seg as LayoutTextSeg;
-    const segmentBox = textSegmentBox(s);
-    const w = segmentBox.width;
-    const prospectiveWidth = prospectiveSnapAdvance(s, w);
-    const h = segmentBox.height;
-    const asc = segmentBox.ascent;
-    const desc = segmentBox.descent;
-    const paragraphFinalIdeographicSpaceTail =
-      s.paragraphFinalIdeographicSpaceTail === true;
-    const paragraphFinalIdeographicSpaceCount =
-      s.paragraphFinalIdeographicSpaceCount ?? 0;
-    const paragraphFinalIdeographicSpaceLocalCount =
-      s.paragraphFinalIdeographicSpaceLocalCount ?? 0;
-    const visibleBeforeParagraphFinalTail = paragraphFinalIdeographicSpaceTail
-      ? s.text.slice(0, Math.max(0, s.text.length - paragraphFinalIdeographicSpaceLocalCount))
-      : s.text;
-    if (
-      paragraphFinalIdeographicSpaceTail
-      && paragraphFinalIdeographicSpaceCount > 1
-      && visibleBeforeParagraphFinalTail.length > 0
-    ) {
-      const visibleSegment: LayoutTextSeg = {
-        ...s,
-        ...RESET_SLICED_TEXT_MEASUREMENT,
-        text: visibleBeforeParagraphFinalTail,
-        paragraphFinalIdeographicSpaceTail: undefined,
-        paragraphFinalIdeographicSpaceLocalCount: undefined,
-        paragraphFinalIdeographicSpaceCount: undefined,
-        paragraphFinalIdeographicSpaceTailStart: undefined,
-        measuredWidth: 0,
-        ...slicedTextMetadata(s, 0, visibleBeforeParagraphFinalTail.length),
-      };
-      const trailingSegment: LayoutTextSeg = {
-        ...s,
-        ...RESET_SLICED_TEXT_MEASUREMENT,
-        text: s.text.slice(visibleBeforeParagraphFinalTail.length),
-        paragraphFinalIdeographicSpaceLocalCount,
-        joinPrev: undefined,
-        hardJoinPrev: undefined,
-        paragraphFinalIdeographicSpaceTailStart: true,
-        measuredWidth: 0,
-        ...slicedTextMetadata(s, visibleBeforeParagraphFinalTail.length, s.text.length),
-        src: s.src
-          ? {
-              segIndex: s.src.segIndex,
-              charOffset: s.src.charOffset + visibleBeforeParagraphFinalTail.length,
-            }
-          : undefined,
-      };
-      queue.unshift(trailingSegment);
-      queue.unshift(visibleSegment);
-      continue;
-    }
-    if (
-      paragraphFinalIdeographicSpaceTail
-      && /^\u3000+$/u.test(s.text)
-      && s.paragraphFinalIdeographicSpaceTailStart === true
-    ) {
-      const currentLineHasVisibleText = currentLine.some((candidate) =>
-        'text' in candidate && /[^\u3000]/u.test(candidate.text));
-      if (currentLineHasVisibleText) {
-        let trailingTailWidth = w;
-        for (const candidate of queue) {
-          if (!('text' in candidate) || candidate.paragraphFinalIdeographicSpaceTail !== true) break;
-          trailingTailWidth += segAdvance(candidate);
-        }
-        if (currentWidth + trailingTailWidth > availW()) {
-          flush(undefined, false, s.src);
-          queue.unshift(s);
-          continue;
-        }
-      }
-    }
-
-    // ECMA-376 §17.3.2.14: a fit region is an atomic fixed-width cell. The
-    // first segment judges the WHOLE resolved region; after an optional flush,
-    // every member is added without entering the CJK/overlong-word split paths.
-    // This also handles a target wider than the line: it overflows as one unit
-    // instead of violating the required internal non-wrap boundary.
-    if (s.fitTextRegionIndex !== undefined) {
-      if (s.fitTextRegionStart) {
-        let regionWidth = w;
-        for (const queued of queue) {
-          if (!('text' in queued) || queued.fitTextRegionIndex !== s.fitTextRegionIndex) break;
-          regionWidth += segAdvance(queued);
-        }
-        if (currentLine.length > 0 && currentWidth + regionWidth > availW()) {
-          flush(undefined, false, s.src);
-        }
-      }
-      s.measuredWidth = w;
-      addToLine(s, w, h, asc, desc);
-      continue;
-    }
-    // A terminal separator may collapse when this word becomes line-final;
-    // visible glyphs still need to fit at their natural measured advance.
-    const trimmed = s.text.replace(/ +$/, '');
-    // Subtract the full-model advance of the trimmed text (not the natural width)
-    // so the grid delta, w:w scale and w:spacing pitch on the retained glyphs all
-    // cancel and trailingSpaceW is the bare trailing-space advance — keeping `w`
-    // and `wForFit` on the one advance model (`strAdvance` == the model behind `w`).
-    const trailingSpaceW = snapToCharsClass(s, characterGrid)
-      ? 0
-      : s.text.endsWith(' ') ? w - strAdvance(s, trimmed) : 0;
-    s.latinNaturalTrailingSpacePx = s.latinSpaceCompressionEligible === true
-      && /^[^ ]+ $/u.test(s.text) && trailingSpaceW > 0
-      ? trailingSpaceW : undefined;
-    s.latinSpaceCompressionPx = undefined;
-    const prospectiveLineWillJustify = (next: LayoutSeg | undefined): boolean => {
-      const closesLogicalLine = next === undefined || 'lineBreak' in next;
-      return isJustified && (!closesLogicalLine || stretchLastLine);
-    };
-    const fitWidthFor = (
-      widthPx: number,
-      trailingSpacePx: number,
-      next: LayoutSeg | undefined,
-    ): number => wordCandidateFitWidthPx({
-      widthPx,
-      trailingSpacePx,
-      lineWillJustify: prospectiveLineWillJustify(next),
-      wrapNarrowed: lineMaxWidth !== maxWidth || lineXOffset !== 0,
-    });
-    const wForFit = fitWidthFor(
-      prospectiveWidth,
-      trailingSpaceW,
-      queue[0],
-    );
-    // ECMA-376 §17.3.1.33 does not prescribe a line-breaking tolerance.
-    // Word-for-Mac controls with Calibri and Arial, left/center/right aligned
-    // 10pt table cells, wrap a trailing Latin word below its natural advance
-    // boundary (including <1pt overflow). Times New Roman differs by a
-    // sub-point at that boundary, so this is a conservative library fit policy,
-    // not a claim that every Office face and script has identical break points.
-    // An earlier global 25%-of-spaces allowance pulled words up even when Word
-    // did not; it also had no proven bound matching paint compression.
-    // Dictionary-SEA candidate (Thai/Lao/Khmer; grapheme-fill Myanmar/Tibetan
-    // stays on its per-cluster greedy path). Per-codepoint scan: a rare segment
-    // mixing both SEA families is not dictionary-SEA, so
-    // it keeps the pre-#991 greedy path instead of moving a grapheme-fill span
-    // inside an atomic chunk.
-    const sDictSea = s.seaBreaks !== undefined && isDictionarySeaText(s.text);
-
-    // Atomic glued group: when THIS segment starts a glued group (its followers
-    // in the queue are `joinPrev` pieces — small-caps case-pieces of the SAME
-    // word like "I" then "NTRODUCTION", or a UAX#14 LB13 non-starter authored in
-    // its own run like a trailing "," / "。"), the per-segment wrap below would
-    // let the group split across lines. Pre-measure it and, if it does not fit on
-    // the current (non-empty) line, flush so it starts fresh.
-    //
-    // ONLY when the lead segment is NOT itself CJK-breakable. A glued group whose
-    // lead is a CJK run (e.g. "…通過する" + "。") is NOT atomic: the run splits at
-    // an inter-CJK boundary and the trailing non-starter stays on its LAST piece
-    // (§17.3.1.16 kinsoku keeps it off the next line's head when enabled — the
-    // default; with kinsoku off it may lead the line, as it did before PR #602).
-    // Pre-flushing the whole run instead leaves the prior line far short, which a
-    // `both` line then stretches wide (sample-9). `joinPrev` stays a pure "this is
-    // a non-starter" marker; the atomic-vs-breakable decision lives HERE. A
-    // non-breakable Latin / small-caps lead is genuinely atomic, so the pre-flush
-    // (and the over-long-word char-break path below) still applies there.
-    if (
-      !s.joinPrev &&
-      currentLine.length > 0 &&
-      (queue[0] as LayoutTextSeg | undefined)?.joinPrev &&
-      (
-        (queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true
-        || !hasCJKBreakOpportunity(s.text)
-      ) &&
-      // A SEA (Thai/Lao/Khmer) lead with usable word breaks is NOT atomic — the
-      // run splits at a dictionary boundary (issue #797), mirroring the CJK gate.
-      (
-        (queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true
-        || !(s.seaBreaks && s.seaBreaks.length > 0)
-      )
-    ) {
-      let groupW = w;
-      let groupTrail = trailingSpaceW;
-      let groupEnd = 0;
-      for (; groupEnd < queue.length && (queue[groupEnd] as LayoutTextSeg).joinPrev; groupEnd++) {
-        const f = queue[groupEnd] as LayoutTextSeg;
-        const hardPrefixEnd = hardJoinPrefixEnd(f);
-        if (hardPrefixEnd !== undefined) {
-          const prefix = f.text.slice(0, hardPrefixEnd);
-          const prefixWidth = strAdvance(f, prefix);
-          groupW += prefixWidth;
-          groupTrail = prefix.endsWith(' ')
-            ? prefixWidth - strAdvance(f, prefix.replace(/ +$/, ''))
-            : 0;
-          // A whole hard member can lead into another hard member. Otherwise
-          // the first legal boundary after the seam ends the atomic prefix.
-          if (hardPrefixEnd < f.text.length) break;
-          continue;
-        }
-        const firstExternalBreak = f.externalLinkBreakOffsets?.[0];
-        if (firstExternalBreak !== undefined) {
-          const prefix = f.text.slice(0, firstExternalBreak);
-          const prefixWidth = strAdvance(f, prefix);
-          groupW += prefixWidth;
-          groupTrail = 0;
-          break;
-        }
-        // A CJK-BREAKABLE follower (e.g. "Roman" + "、あるいは…用いる。") is NOT
-        // atomic: only its LEADING run of line-start-forbidden chars would orphan
-        // at a line head (UAX#14 LB13 / §17.3.1.16); the rest splits at an
-        // inter-CJK boundary and wraps on its own. So glue only that prefix's
-        // advance to the lead and STOP summing here — mirror of the CJK-lead
-        // direction handled by the `!hasCJKBreakOpportunity(s.text)` gate above
-        // (sample-9 fb836d6). Summing the whole breakable run instead would
-        // pre-flush "Roman" down alone, leaving a `both` line stretched sparse
-        // (sample-16). A Latin / small-caps follower (no CJK break opportunity —
-        // the "I" + "NTRODUCTION" case) stays fully atomic: keep full-add.
-        if (hasCJKBreakOpportunity(f.text)) {
-          const chars = [...f.text];
-          let p = 0;
-          while (p < chars.length && DEFAULT_KINSOKU_RULES.lineStartForbidden.has(chars[p].codePointAt(0)!)) p++;
-          if (p < chars.length) {
-            // Breakable rest exists past the leading non-starters: glue only the
-            // prefix (it may be empty — then "Roman" is effectively unglued and
-            // wraps on its own) and end the atomic group here.
-            const prefix = chars.slice(0, p).join('');
-            const prefixWidth = strAdvance(f, prefix);
-            groupW += prefixWidth;
-            groupTrail = 0;
-            break;
-          }
-          // Entirely non-starters (no breakable rest): fall through to full-add.
-        }
-        const fw = segAdvance(f);
-        groupW += fw;
-        const ft = f.text.replace(/ +$/, '');
-        const followerTrail = f.text.endsWith(' ') ? fw - strAdvance(f, ft) : 0;
-        // UAX #14 LB7 makes a consecutive SP sequence one trailing suffix even
-        // when a source-formatting boundary split it into multiple segments.
-        // Accumulate space-only followers so the line-end fit allowance is
-        // invariant to that non-textual boundary. A follower containing visible
-        // text starts a new suffix and therefore replaces the previous value.
-        groupTrail = ft.length === 0 && groupTrail > 0
-          ? groupTrail + followerTrail
-          : followerTrail;
-      }
-      if (
-        currentWidth + fitWidthFor(groupW, groupTrail, queue[groupEnd])
-        > availW()
-      ) {
-        flush(undefined, false, s.src);
-      }
-    }
-
-    // `word-dictionary-sea-atomic-chunk`: ECMA-376 prescribes no SEA
-    // line-breaking algorithm. Treat dictionary boundaries inside a no-space
-    // Thai/Lao/Khmer chunk as secondary opportunities: move a chunk that fits a
-    // full line as a unit; only a full-line-overlong chunk breaks at dictionary
-    // boundaries through the greedy SEA branch below.
-    //
-    // Judged only at chunk START: if the previously committed token is a text
-    // segment glued to `s` (no trailing space), the whole chunk already passed
-    // this judgment when its head was placed, so a mid-chunk segment never
-    // needs it. The chunk spans `s` plus following queue segments while they
-    // stay dictionary-SEA text glued without intervening spaces. Grapheme-fill
-    // scripts (Myanmar/Tibetan) are excluded because their per-cluster path
-    // fills the remaining width.
-    if (
-      sDictSea &&
-      currentLine.length > 0 &&
-      (() => {
-        const last = currentLine[currentLine.length - 1];
-        return !('text' in last) || (last as LayoutTextSeg).text.endsWith(' ');
-      })()
-    ) {
-      let chunkW = w;
-      let chunkTrail = trailingSpaceW;
-      let chunkEnd = 0;
-      if (!s.text.endsWith(' ')) {
-        for (; chunkEnd < queue.length; chunkEnd++) {
-          const f = queue[chunkEnd];
-          if (!('text' in f) || (f as LayoutTextSeg).seaBreaks === undefined) break;
-          if (!isDictionarySeaText((f as LayoutTextSeg).text)) break;
-          const ft = f as LayoutTextSeg;
-          const fw = segAdvance(ft);
-          const fTrim = ft.text.replace(/ +$/, '');
-          chunkW += fw;
-          chunkTrail = ft.text.endsWith(' ') ? fw - strAdvance(ft, fTrim) : 0;
-          if (ft.text.endsWith(' ')) { chunkEnd++; break; } // a space ends the chunk
-        }
-      }
-      const chunkWForFit = fitWidthFor(chunkW, chunkTrail, queue[chunkEnd]);
-      if (
-        currentWidth + chunkWForFit > availW() &&
-        chunkWForFit <= lineMaxWidth
-      ) {
-        flush(undefined, false, s.src);
-      }
-    }
-
-    // §17.3.1.21 permits one eligible punctuation character past the text
-    // extent. The isolated compatibility predicate owns both the CJK-language
-    // sets and the bounded parent-run extensions owned by
-    // `wordIsOverflowPunctuation`. CJK
-    // segments that need an internal split retain their separate
-    // overflowPunct-vs-kinsoku rule.
-    const visibleSegmentScalars = [...trimmed];
-    const trailingOverflowCharacter = visibleSegmentScalars.at(-1);
-    const textBeforeTrailingOverflow = visibleSegmentScalars.slice(0, -1).join('');
-    const admitsTrailingOverflowPunctuation =
-      overflowPunct
-      && trailingOverflowCharacter !== undefined
-      && (currentLine.length > 0 || textBeforeTrailingOverflow.length > 0)
-      && wordIsOverflowPunctuation(
-        trailingOverflowCharacter,
-        s.eastAsiaLanguage,
-        s.overflowPunctuationEastAsianRun === true,
-        s.script === 'ascii' || s.script === 'highAnsi',
-        s.script === 'complexScript',
-        s.overflowPunctuationBidiLanguage,
-      )
-      && currentWidth + strAdvance(s, textBeforeTrailingOverflow)
-        <= availW();
-
-    // A line already admitted using this homogeneous-face rule cannot lend
-    // that prior compression to a later mixed-face candidate. Its allocation
-    // is finalized here, and the new route starts a fresh line.
-    if (latinAppliedPerGap > 0
-      && (!latinLineHomogeneous || !latinLineFace
-        || !sameLatinSpaceFace(s, latinLineFace))) {
-      flush(undefined, false, s.src);
-      queue.unshift(s);
-      continue;
-    }
-
-    if ((fitsMeasuredWidth(currentWidth + wForFit, availW()) && latinAppliedPerGap === 0)
-      || fitHomogeneousLatinSpaces(s, wForFit)
-      || fitsMeasuredWidth(currentWidth + wForFit, availW())) {
-      // Fits on current line as-is
-      s.measuredWidth = w;
-      addToLine(s, w, h, asc, desc);
-      appendQueuedIdeographicSpaceSegment(s);
-    } else if (admitsTrailingOverflowPunctuation) {
-      s.measuredWidth = w;
-      addToLine(s, w, h, asc, desc);
-      appendQueuedIdeographicSpaceSegment(s);
-    } else if (
-      hasCJKBreakOpportunity(s.text)
-      && s.seaBreaks === undefined
-      && s.hardJoinPrev !== true
-    ) {
-      // CJK overflow: split at the maximum prefix that fits, re-queue the tail.
-      // A segment that ALSO contains SEA (a mixed CJK+SEA `<w:cs/>` run) is routed
-      // to the SEA branch below instead — its `seaBreaks` already merges the CJK
-      // per-character opportunities with the SEA dictionary/transition ones
-      // (issue #960), so both scripts break by their own rule from one offset set.
-      // (pptx's analogous CJK fit is cjk-wrap.ts `fitCjkLine`, kept intentionally
-      //  separate: it sums per-char advances, whereas this path uses substring
-      //  binary-search + the cross-run 追い出し below. Don't naively unify them.)
-      const available = availW() - currentWidth;
-      let rawPrefix = '';
-      const maximumIdeographicSpaceHang = paragraphFinalIdeographicSpaceTail
-        ? wordIdeographicSpaceLineEndAllowanceCount(
-            hasEastAsianVisiblePredecessor(s.text),
-            s.paragraphFinalIdeographicSpaceCount ?? 0,
-          )
-        : Number.POSITIVE_INFINITY;
-      if (available > 0) {
-        const nonMonotoneAllocation = charSpacingDeltaPx(s, scale) < 0
-          || snapToCharsClass(s, characterGrid) === 'latin';
-        if (nonMonotoneAllocation) {
-          rawPrefix = s.text.slice(0, emergencyTextSplit(s, available, false));
-        } else {
-          setMeasureFont(buildFont(s.bold, s.italic, effectiveFontPx(s), s.fontFamily, fontFamilyClasses, s.fontRoute));
-          const prevKern = setSegKerning(s);
-          try {
-            rawPrefix = fitCJKPrefix(
-              ctx,
-              s.text,
-              available,
-              segmentCharacterGridDeltaPx(s, characterGrid, scale),
-              charScaleFactor(s),
-              charSpacingDeltaPx(s, scale),
-              s.verticalRun === true,
-              verticalGlyphMeasurement,
-              (prefix) => strAdvance(s, prefix),
-              maximumIdeographicSpaceHang,
-            );
-          } finally {
-            restoreKerning(prevKern);
-          }
-        }
-      }
-      // Apply kinsoku to the break position: retract leftwards so the tail
-      // never begins with a 行頭禁則 char and the head never ends with a
-      // 行末禁則 char (ECMA-376 §17.15.1.58–.60). When the current line
-      // already has content, retracting to an empty prefix is allowed — the
-      // whole run moves to the next (fresh) line, which is Word's 追い出し.
-      // When the line is empty we keep at least one char (minSplit=1) so we
-      // never lose forward progress.
-      const allChars = [...s.text];
-      const rawSplit = [...rawPrefix].length;
-      const minSplit = currentLine.length > 0 ? 0 : 1;
-      // ECMA-376 §17.3.1.21 permits one punctuation character beyond the
-      // paragraph extents. The isolated compatibility projection resolves the
-      // language-specific set and its precedence over kinsoku at this internal
-      // CJK split.
-      const hangingSplit = overflowPunct
-        && rawSplit < allChars.length
-        && (currentLine.length > 0 || rawSplit > 0)
-        && wordIsOverflowPunctuation(
-          allChars[rawSplit],
-          s.eastAsiaLanguage,
-          s.overflowPunctuationEastAsianRun === true,
-          s.script === 'ascii' || s.script === 'highAnsi',
-          s.script === 'complexScript',
-          s.overflowPunctuationBidiLanguage,
-        )
-          ? rawSplit + 1
-          : null;
-      const proposedSplit = extendThroughTrailingIdeographicSpaces(
-        allChars,
-        hangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
-        paragraphFinalIdeographicSpaceTail && maximumIdeographicSpaceHang === 0
-          ? 0
-          : maximumIdeographicSpaceHang,
-      );
-      const proposedPrefix = allChars.slice(0, proposedSplit).join('').length;
-      const protectedSplit = legalTextSplitAtOrBefore(s, proposedPrefix, minSplit > 0 ? 1 : 0);
-      const prefix = s.text.slice(0, protectedSplit);
-      if (prefix.length > 0) {
-        // Grid advance for the head piece — the same model as the line box / draw.
-        const pw = strNaturalAdvance(s, prefix);
-        const headSeg: LayoutTextSeg = {
-          ...s,
-          ...RESET_SLICED_TEXT_MEASUREMENT,
-          text: prefix,
-          measuredWidth: pw,
-          ...slicedTextMetadata(s, 0, prefix.length),
-        };
-        addToLine(headSeg, pw, h, asc, desc);
-        const tail = s.text.slice(prefix.length);
-        if (tail) {
-          queue.unshift({
-            ...s,
-            ...RESET_SLICED_TEXT_MEASUREMENT,
-            text: tail,
-            ...slicedTextMetadata(s, prefix.length, s.text.length),
-            measuredWidth: 0,
-            src: {
-              segIndex: s.src!.segIndex,
-              charOffset: s.src!.charOffset + prefix.length,
-            },
-          });
-        } else {
-          appendQueuedIdeographicSpaceSegment(s);
-        }
-      } else if (currentLine.length > 0) {
-        // No prefix of `s` fits. If `s` would lead the next line with a 行頭禁則
-        // char, kinsokuAdjustedSplit can't fix it from within `s` (the offending
-        // char is its first); pull trailing graphemes of the current line's last
-        // text segment down so they lead the next line ahead of `s` — cross-run
-        // 追い出し (§17.3.1.16). See crossRunKinsokuRetract for the bounded,
-        // re-validating, whitespace-guarded retraction count.
-        const retraction = retractCurrentLineForLeadingKinsoku(s);
-        if (retraction.kind === 'blocked') {
-          keepLeadingKinsokuWithCurrentLine(s, h, asc, desc);
-          continue;
-        }
-        flush(undefined, false, retraction.kind === 'retracted' ? retraction.tail.src : s.src);
-        queue.unshift(s);
-        if (retraction.kind === 'retracted') queue.unshift(retraction.tail);
-      } else {
-        // Empty line and not even one char fits — force-fit one char to guarantee progress
-        const forcedChars = [...s.text];
-        const forcedSplit = forcedChars.length > 0
-          ? extendThroughTrailingIdeographicSpaces(
-              forcedChars,
-              1,
-              s.paragraphFinalIdeographicSpaceTail === true
-                ? wordIdeographicSpaceLineEndAllowanceCount(
-                    EAST_ASIAN_RE.test(forcedChars[0] ?? ''),
-                    s.paragraphFinalIdeographicSpaceCount ?? 0,
-                  )
-                : Number.POSITIVE_INFINITY,
-            )
-          : 0;
-        const forcedUtf16 = forcedChars.slice(0, forcedSplit).join('').length;
-        const legalForcedUtf16 = legalTextSplitAtOrBefore(s, forcedUtf16)
-          || emergencyTextSplit(s, availW(), true);
-        const firstChar = s.text.slice(0, legalForcedUtf16);
-        if (firstChar) {
-          const fw = strNaturalAdvance(s, firstChar);
-          const headSeg: LayoutTextSeg = {
-            ...s,
-            ...RESET_SLICED_TEXT_MEASUREMENT,
-            text: firstChar,
-            measuredWidth: fw,
-            ...slicedTextMetadata(s, 0, firstChar.length),
-          };
-          addToLine(headSeg, fw, h, asc, desc);
-          const tail = s.text.slice(firstChar.length);
-          if (tail) {
-            queue.unshift({
-              ...s,
-              ...RESET_SLICED_TEXT_MEASUREMENT,
-              text: tail,
-              ...slicedTextMetadata(s, firstChar.length, s.text.length),
-              measuredWidth: 0,
-              src: {
-                segIndex: s.src!.segIndex,
-                charOffset: s.src!.charOffset + firstChar.length,
-              },
-            });
-          } else {
-            appendQueuedIdeographicSpaceSegment(s);
-          }
-        }
-      }
-    } else if (s.seaBreaks !== undefined && s.hardJoinPrev !== true) {
-      // No-inter-word-space line wrap: Thai/Lao/Khmer dictionary words (#797) or
-      // Myanmar/Tibetan grapheme clusters (#961). This ONE segment is a whole run;
-      // break it only at a member of `s.seaBreaks` — the UNION (#960) of the
-      // dictionary word (or grapheme-cluster) boundaries, the no-space SEA↔non-SEA
-      // script transitions, and (for a mixed CJK+SEA `<w:cs/>` run) the CJK
-      // per-character opportunities, already kinsoku-filtered by
-      // `seaMixedBreakOffsets`. Entered for ANY such segment (even one with no
-      // interior boundary — a single word/cluster wider than the column, or
-      // Segmenter unavailable) so the emergency split below stays GRAPHEME-safe
-      // instead of falling to the code-point path. Kinsoku 行頭/行末禁則 was applied
-      // when the offsets were built (so a forbidden CJK char never heads/tails a
-      // line); choosing an earlier legal offset is the only remaining adjustment,
-      // which fitSeaWordPrefix already does. The run stays one contiguous draw per
-      // line (measure==paint); the tail re-queues with its offsets rebased.
-      const available = availW() - currentWidth;
-      const measureSub = (sub: string): number => strAdvance(s, sub);
-      // Grapheme-fill runs (Myanmar/Tibetan) have DENSE offsets (one per cluster),
-      // so use the monotone binary-search fit — a per-line full scan would be O(n²)
-      // down a long run. Dictionary runs keep the negative-spacing-safe full scan.
-      const monotone = isGraphemeFillText(s.text)
-        && charSpacingDeltaPx(s, scale) >= 0
-        && snapToCharsClass(s, characterGrid) !== 'latin';
-      const split = fitSeaWordPrefix(s.text, s.seaBreaks, 0, available, measureSub, monotone);
-      if (split > 0) {
-        const prefix = s.text.slice(0, split);
-        const pw = strNaturalAdvance(s, prefix);
-        addToLine({
-          ...s,
-          ...RESET_SLICED_TEXT_MEASUREMENT,
-          text: prefix,
-          measuredWidth: pw,
-          ...slicedTextMetadata(s, 0, prefix.length),
-        }, pw, h, asc, desc);
-        const tail = s.text.slice(split);
-        if (tail) {
-          queue.unshift({
-            ...s,
-            ...RESET_SLICED_TEXT_MEASUREMENT,
-            text: tail,
-            ...slicedTextMetadata(s, split, s.text.length),
-            measuredWidth: 0,
-            src: { segIndex: s.src!.segIndex, charOffset: s.src!.charOffset + split },
-            seaBreaks: rebaseSeaBreaks(s.seaBreaks, split),
-          });
-        }
-      } else if (currentLine.length > 0) {
-        // No whole word fits the remaining band — move the run to a fresh line and
-        // re-process (Latin-word style). If `s` would then LEAD the next line with
-        // a 行頭禁則 char (a mixed CJK+SEA run whose first glyph is a forbidden
-        // leader — #960 routes it here, where the offset set cannot fix a
-        // segment-initial char), pull trailing graphemes of the current line's
-        // last text segment down so they lead ahead of `s` — the same cross-run
-        // 追い出し (§17.3.1.16) the CJK branch does.
-        const retraction = retractCurrentLineForLeadingKinsoku(s);
-        if (retraction.kind === 'blocked') {
-          keepLeadingKinsokuWithCurrentLine(s, h, asc, desc);
-          continue;
-        }
-        flush(undefined, false, retraction.kind === 'retracted' ? retraction.tail.src : s.src);
-        queue.unshift(s);
-        if (retraction.kind === 'retracted') queue.unshift(retraction.tail);
-      } else {
-        // Empty line and the first dictionary word is wider than the whole
-        // column: emergency GRAPHEME-safe split (a code-point split would tear a
-        // base + tone/combining mark, both BMP). Guarantee ≥1 cluster of progress.
-        const firstWordEnd = s.seaBreaks[0] ?? s.text.length;
-        const firstWord = s.text.slice(0, firstWordEnd);
-        const graphemes = graphemeClusterOffsets(firstWord);
-        let gsplit = fitSeaWordPrefix(firstWord, graphemes, 0, available, measureSub, monotone);
-        if (gsplit <= 0) gsplit = graphemes.length > 0 ? graphemes[0] : firstWord.length;
-        gsplit = legalTextSplitAtOrBefore(s, gsplit)
-          || emergencyTextSplit(s, available, true);
-        const prefix = s.text.slice(0, gsplit);
-        const pw = strNaturalAdvance(s, prefix);
-        addToLine({
-          ...s,
-          ...RESET_SLICED_TEXT_MEASUREMENT,
-          text: prefix,
-          measuredWidth: pw,
-          ...slicedTextMetadata(s, 0, prefix.length),
-        }, pw, h, asc, desc);
-        const tail = s.text.slice(gsplit);
-        if (tail) {
-          queue.unshift({
-            ...s,
-            ...RESET_SLICED_TEXT_MEASUREMENT,
-            text: tail,
-            ...slicedTextMetadata(s, gsplit, s.text.length),
-            measuredWidth: 0,
-            src: { segIndex: s.src!.segIndex, charOffset: s.src!.charOffset + gsplit },
-            seaBreaks: rebaseSeaBreaks(s.seaBreaks, gsplit),
-          });
-        }
-      }
-    } else if (currentLine.length === 0) {
-      // `word-overlong-token-emergency-break`: for a single non-CJK token wider
-      // than a full line, fit the widest character prefix (at least one
-      // character), draw it, and re-queue the remainder. Segments are already
-      // space-delimited, so this cannot bypass an ordinary space opportunity.
-      const split = externalLinkSyntaxSplit(s, availW()) || emergencyTextSplit(s, availW());
-      if (split >= s.text.length) {
-        // The visible glyphs actually fit (only a trailing space pushed it over the
-        // fit test) — place the word whole.
-        s.measuredWidth = w;
-        addToLine(s, w, h, asc, desc);
-      } else {
-        const prefix = s.text.slice(0, split);
-        const pw = strNaturalAdvance(s, prefix);
-        addToLine({
-          ...s,
-          ...RESET_SLICED_TEXT_MEASUREMENT,
-          text: prefix,
-          measuredWidth: pw,
-          ...slicedTextMetadata(s, 0, prefix.length),
-        }, pw, h, asc, desc);
-        queueEmergencyTail(s, split);
-      }
-    } else {
-      const semanticSplit = externalLinkSyntaxSplit(
-        s,
-        availW() - currentWidth,
-      );
-      if (semanticSplit > 0 && semanticSplit < s.text.length) {
-        const prefix = s.text.slice(0, semanticSplit);
-        const pw = strNaturalAdvance(s, prefix);
-        addToLine({
-          ...s,
-          ...RESET_SLICED_TEXT_MEASUREMENT,
-          text: prefix,
-          measuredWidth: pw,
-          ...slicedTextMetadata(s, 0, prefix.length),
-        }, pw, h, asc, desc);
-        queueEmergencyTail(s, semanticSplit);
-        continue;
-      }
-      if (s.joinPrev) {
-        // LB14 and the other UAX glue rules prohibit a line boundary at this
-        // source seam. If the complete glued group is wider than the fresh
-        // line, split this member at the widest legal grapheme boundary that
-        // fits the actual remaining band. This bases the decision on the group
-        // advance, not on the follower's standalone width.
-        const remaining = availW() - currentWidth;
-        const split = emergencyTextSplit(s, remaining, true);
-        if ((remaining > 0 || s.hardJoinPrev === true) && split > 0 && split < s.text.length) {
-          const prefix = s.text.slice(0, split);
-          const pw = strNaturalAdvance(s, prefix);
-          addToLine({
-            ...s,
-            ...RESET_SLICED_TEXT_MEASUREMENT,
-            text: prefix,
-            measuredWidth: pw,
-            ...slicedTextMetadata(s, 0, prefix.length),
-          }, pw, h, asc, desc);
-          queueEmergencyTail(s, split);
-          continue;
-        }
-        // A scalar span that continues the preceding grapheme (or another
-        // explicitly glued piece) may overflow a pathological narrow line, but
-        // it must never become a new line head and tear the cluster.
-        s.measuredWidth = w;
-        addToLine(s, w, h, asc, desc);
-        continue;
-      }
-      // Latin token does not fit on the current (non-empty) line: move it to a fresh
-      // line and re-process. There it either fits, or — when it is wider than the
-      // whole column — the empty-line branch above breaks it at the character level
-      // (overflow-wrap). Re-queueing rather than force-adding is what lets that
-      // over-long-word path run instead of letting the word spill the column.
-      flush(undefined, false, s.src);
-      queue.unshift(s);
-    }
-  }
-
-  if (currentLine.length > 0) flush();
-  // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
-  else if (trailingBreakFontSize !== null) flush(trailingBreakFontSize);
-
-  // A3 acquisition consumes final line pieces, not the pre-wrap source
-  // segments. Prefix/tail objects created by the breakers above may inherit the
-  // source segment's cluster array, whose ranges describe a different string.
-  // Re-shape every final visible piece through the same A2 authority so the
-  // returned LayoutLine contract always carries complete, piece-relative
-  // grapheme geometry. A missing service is deliberately left unshaped; the
-  // retained acquisition boundary rejects that production contract violation.
-  if (widthPolicy === 'bounded') {
-    for (const line of lines) {
-      for (const segment of line.segments) {
-        if (!('text' in segment) || segment.metricOnly || segment.text.length === 0) continue;
-        segment.shapedClusters = undefined;
-        if (segment.textLayoutService && segment.textShapeRequest) measureText(segment, true);
-      }
-    }
-  }
-
-  return lines;
 }
