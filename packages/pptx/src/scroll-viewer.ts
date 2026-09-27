@@ -17,6 +17,7 @@ import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-rendere
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
 import { DEFAULT_SCROLL_PAGE_SHADOW, ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
+import { VisibleUnitEvents } from '@silurus/ooxml-core/internal/visible-unit-events';
 import { DEFAULT_ZOOM_SETTLE_MS, SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -352,9 +353,9 @@ export class PptxScrollViewer implements ZoomableViewer {
   /** Uniform slide height at the current scale. Keeping the scalar avoids both
    * the document-length height and offset arrays in every scroll query. */
   private _uniformSlideHeight = 0;
-  private _lastTopIndex = -1;
-  private _lastReportedTotal = -1;
-  private _lastReportedLayoutComplete: boolean | null = null;
+  private readonly _visibleEvents = new VisibleUnitEvents(
+    (index, total, complete) => this._opts.onVisibleSlideChange?.(index, total, complete),
+  );
   private _layoutUnsubscribe: (() => void) | null = null;
   private _activeCommentId: string | null = null;
   private _activeCommentSlide: number | null = null;
@@ -595,7 +596,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         this._unbindLayoutPresentation();
         if (ownedPresentation) {
           for (const [idx, slot] of [...this._slots]) this._recycleSlot(idx, slot);
-          this._lastTopIndex = -1;
+          this._visibleEvents.resetIndex();
         }
       });
       if (!pres) return;
@@ -1059,18 +1060,7 @@ export class PptxScrollViewer implements ZoomableViewer {
   }
 
   private _emitVisibleSlideChange(range: VisibleWindow): void {
-    if (!this._pres) return;
-    const total = this._pres.slideCount;
-    const complete = this.layoutComplete;
-    if (
-      range.topIndex === this._lastTopIndex &&
-      total === this._lastReportedTotal &&
-      complete === this._lastReportedLayoutComplete
-    ) return;
-    this._lastTopIndex = range.topIndex;
-    this._lastReportedTotal = total;
-    this._lastReportedLayoutComplete = complete;
-    this._opts.onVisibleSlideChange?.(range.topIndex, total, complete);
+    if (this._pres) this._visibleEvents.publish(range, this._pres.slideCount, this.layoutComplete);
   }
 
   /**

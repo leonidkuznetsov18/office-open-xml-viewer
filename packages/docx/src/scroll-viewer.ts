@@ -21,6 +21,7 @@ import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-rendere
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
 import { DEFAULT_SCROLL_PAGE_SHADOW, ScrollViewportPolicy } from '@silurus/ooxml-core/internal/scroll-viewport-policy';
+import { VisibleUnitEvents } from '@silurus/ooxml-core/internal/visible-unit-events';
 import { DEFAULT_ZOOM_SETTLE_MS, SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -309,16 +310,9 @@ export class DocxScrollViewer implements ZoomableViewer {
   /** Prefix offsets rebuilt only when scale/page geometry changes. Pure scroll
    * queries binary-search this cache instead of walking every document page. */
   private _scrollGeometry: VirtualScrollGeometry = { offsets: [], totalHeight: 0 };
-  private _lastTopIndex = -1;
-  /** Second half of the visible-page latch: a document that grows under the
-   *  viewport changes `total` without changing `topIndex`. */
-  private _lastReportedTotal = -1;
-  /** Completion is observable callback state too: an authoritative publication
-   * can replace a provisional layout without changing its page count. */
-  private _lastReportedLayoutComplete: boolean | null = null;
-  /** Subscription to the document currently installed by `_documentOwner`.
-   *  Failed and stale acquisitions never replace it, so they cannot revoke the
-   *  retained document's authority to publish background layout progress. */
+  private readonly _visibleEvents = new VisibleUnitEvents(
+    (index, total, complete) => this._opts.onVisiblePageChange?.(index, total, complete),
+  );
   private _layoutUnsubscribe: (() => void) | null = null;
   /** Page prefix currently represented by the native scroll extent. */
   private _presentedPageCount = 0;
@@ -616,9 +610,7 @@ export class DocxScrollViewer implements ZoomableViewer {
           // Recycle before the old worker is terminated. Every captured slot
           // dispatcher then becomes stale before its expected rejection lands.
           for (const [idx, slot] of [...this._slots]) this._recycleSlot(idx, slot);
-          this._lastTopIndex = -1;
-          this._lastReportedTotal = -1;
-          this._lastReportedLayoutComplete = null;
+          this._visibleEvents.reset();
         }
       });
       if (!doc) return;
@@ -974,29 +966,8 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._scroller.mount(initialRenders, repositionExisting);
   }
 
-  /**
-   * Fire `onVisiblePageChange`, but only on an actual change.
-   *
-   * The latch is the (topIndex, total, complete) tuple. Watching the index alone
-   * was enough while a document's page count was fixed at load; under
-   * progressive layout the count can grow while the user sits at the top, and
-   * the authoritative publication can retain the same count while changing
-   * `complete` to true. Every emit path funnels through here so unchanged state
-   * still never double-fires.
-   */
-  private _emitVisiblePageChange(r: VisibleRange): void {
-    if (!this._doc) return;
-    const total = this._doc.pageCount;
-    const complete = this.layoutComplete;
-    if (
-      r.topIndex === this._lastTopIndex &&
-      total === this._lastReportedTotal &&
-      complete === this._lastReportedLayoutComplete
-    ) return;
-    this._lastTopIndex = r.topIndex;
-    this._lastReportedTotal = total;
-    this._lastReportedLayoutComplete = complete;
-    this._opts.onVisiblePageChange?.(r.topIndex, total, complete);
+  private _emitVisiblePageChange(range: VisibleRange): void {
+    if (this._doc) this._visibleEvents.publish(range, this._doc.pageCount, this.layoutComplete);
   }
 
   /** Apply the resolved page-canvas shadow (design: recipe drop shadow by
