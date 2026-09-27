@@ -883,6 +883,17 @@ mod strict_namespace_tests {
             )),
             [false, false, true]
         );
+        // A fontId beyond u32 falls back to font 0, as parse_cell_xfs does,
+        // so the cell is classified by the red font it renders with.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color rgb="FFFF0000"/></font><font><color theme="1"/></font>"#,
+                r#"<xf fontId="1"/>"#,
+                r#"<xf fontId="4294967296" xfId="0"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [true]
+        );
         // An unresolvable font or parent style keeps the table color.
         assert_eq!(
             flags(sheet(
