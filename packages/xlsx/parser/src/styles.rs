@@ -4,37 +4,25 @@ use crate::types::*;
 use ooxml_common::depth::parse_guarded;
 use ooxml_common::ns::is_x_ns;
 
-/// Resolve the workbook's Normal-style font (family, point size, and style) by
-/// following `<cellStyleXfs>[0].fontId` → `<fonts>[fontId]`. Returns `(None,
-/// None)` if `xl/styles.xml` is missing or malformed. The renderer uses this
-/// to compute the Max Digit Width for column-width pixel conversion
-/// (ECMA-376 §18.3.1.13).
+/// Resolve the workbook's default font (family, point size, and style): the
+/// first `<fonts>` entry. Returns `(None, None)` if `xl/styles.xml` is missing
+/// or malformed. The renderer uses this to compute the Max Digit Width for
+/// column-width pixel conversion (ECMA-376 §18.3.1.13).
+///
+/// Measured with Excel-exported control workbooks: column widths follow
+/// `<fonts>[0]` alone. Moving the Normal cell style (`builtinId="0"`) to a
+/// larger font, or giving `<cellStyleXfs>[0]` one, leaves the columns
+/// unchanged, while a larger `<fonts>[0]` widens them.
 pub(crate) type DefaultFont = (Option<String>, Option<f64>, bool, bool);
 
 fn parse_default_font(doc: &roxmltree::Document) -> DefaultFont {
-    let mut font_id: usize = 0;
-    for n in doc.descendants() {
-        if n.tag_name().name() == "cellStyleXfs" && is_x_ns(n.tag_name().namespace()) {
-            if let Some(xf) = n
-                .children()
-                .find(|c| c.is_element() && c.tag_name().name() == "xf")
-            {
-                font_id = xf
-                    .attribute("fontId")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-            }
-            break;
-        }
-    }
     for fonts_node in doc.descendants() {
         if fonts_node.tag_name().name() != "fonts" || !is_x_ns(fonts_node.tag_name().namespace()) {
             continue;
         }
         if let Some(font_node) = fonts_node
             .children()
-            .filter(|c| c.is_element() && c.tag_name().name() == "font")
-            .nth(font_id)
+            .find(|c| c.is_element() && c.tag_name().name() == "font")
         {
             let mut name = None;
             let mut sz = None;
@@ -821,18 +809,21 @@ mod strict_namespace_tests {
     }
 
     #[test]
-    fn normal_font_style_follows_cell_style_font_id() {
+    fn default_font_is_the_first_font_whatever_the_normal_style() {
+        // Excel sizes columns from <fonts>[0] even when the Normal style
+        // (builtinId 0) or <cellStyleXfs>[0] points at another font.
         let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
           <fonts count="2">
+            <font><b/><i/><sz val="20"/><name val="Arial"/></font>
             <font><sz val="11"/><name val="Calibri"/></font>
-            <font><b/><i/><sz val="12"/><name val="Arial"/></font>
           </fonts>
           <cellStyleXfs count="1"><xf fontId="1"/></cellStyleXfs>
+          <cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
         </styleSheet>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
         assert_eq!(
             parse_default_font(&doc),
-            (Some("Arial".into()), Some(12.0), true, true)
+            (Some("Arial".into()), Some(20.0), true, true)
         );
     }
 
