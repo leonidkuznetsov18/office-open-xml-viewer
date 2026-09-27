@@ -174,4 +174,3 @@ export interface DocxScrollViewerOptions extends Omit<RenderPageOptions, 'onText
    *  WASM trap, not a reliably classified OOM. */
   onError?: (err: Error) => void;
 }
-

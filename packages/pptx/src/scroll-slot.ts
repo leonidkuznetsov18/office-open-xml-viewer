@@ -44,4 +44,3 @@ export interface PptxScrollSlot {
    */
   presentationGeneration: number;
 }
-

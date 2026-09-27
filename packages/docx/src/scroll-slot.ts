@@ -28,4 +28,3 @@ export interface DocxScrollSlot {
   /** Shared single-canvas generation and worker-bitmap ownership primitive. */
   dispatcher: StaticCanvasRenderDispatcher;
 }
-

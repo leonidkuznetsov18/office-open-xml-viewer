@@ -153,4 +153,3 @@ export interface PptxScrollViewerOptions extends Pick<RenderSlideOptions, 'width
    *  but are inert, like plain text. */
   enableHyperlinks?: boolean;
 }
-
