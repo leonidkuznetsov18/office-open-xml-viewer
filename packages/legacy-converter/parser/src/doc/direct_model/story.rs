@@ -1014,6 +1014,7 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     struct ProjectedTable {
+        indents: Vec<Option<f64>>,
         markers: Vec<String>,
         row_cell_counts: Vec<usize>,
         col_spans: Vec<u32>,
@@ -1678,10 +1679,12 @@ mod tests {
             let mut text_directions = Vec::new();
             let mut diagonals = Vec::new();
             let mut hide_marks = Vec::new();
+            let mut indents = Vec::new();
             for element in &body {
                 let BodyElement::Table(table) = element else {
                     continue;
                 };
+                indents.push(table.tbl_ind);
                 for row in &table.rows {
                     row_cell_counts.push(row.cells.len());
                     for cell in &row.cells {
@@ -1746,6 +1749,7 @@ mod tests {
             }
             assert!(!margins.is_empty(), "table");
             Ok(ProjectedTable {
+                indents,
                 markers,
                 row_cell_counts,
                 col_spans,
@@ -3571,20 +3575,20 @@ mod tests {
                 .unwrap()
                 .unsupported_table
         );
-        let moved = sprm(0x9601, &200i16.to_le_bytes());
-        let error = try_default_styled_table(&moved, &rtl_inherited)
-            .err()
-            .unwrap();
-        assert!(error.contains("right-to-left"), "{error}");
-
-        // A differing preferred indent is not covered by the LTR evidence.
-        let rtl_indented = [
-            sprm(0x560b, &1u16.to_le_bytes()),
-            sprm(0xf661, &[3, 0x6d, 0]),
-        ]
-        .concat();
-        let error = try_default_styled_table(&[], &rtl_indented).err().unwrap();
-        assert!(error.contains("right-to-left"), "{error}");
+        // Staged Word 16.113.2 DOC controls keep the table width fixed and
+        // move its physical left edge by -dxa for RTL dxa preferences. The
+        // zero variant is pixel-identical to the original, even with a
+        // physical row origin of 5 twips.
+        let moved = sprm(0x9601, &5i16.to_le_bytes());
+        for dxa in [-500i16, 0, 500] {
+            let rtl_indented = [
+                sprm(0x560b, &1u16.to_le_bytes()),
+                sprm(0xf661, &[vec![3], dxa.to_le_bytes().to_vec()].concat()),
+            ]
+            .concat();
+            let projected = try_default_styled_table(&moved, &rtl_indented).unwrap();
+            assert_eq!(projected.indents, [Some(f64::from(dxa) / 20.0)]);
+        }
     }
 
     #[test]

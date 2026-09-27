@@ -149,9 +149,25 @@ fn project_table(
     }
     let (alignment, physical) = first.alignment;
     let first_bidi = first.bidi;
+    let first_preferred_indent = first.preferred_indent;
     let first_autofit = first.autofit;
     let margins = first.margins;
     let table_preferred = first.preferred_width;
+    // [MS-DOC] 2.6.3 sprmTWidthIndent is a leading-edge preference. Word
+    // 16.113.2 controls with a RTL table and identical row geometry at
+    // -500/0/+500 twips move the physical left edge by the *negative* of the
+    // preference; the zero control equals the unmodified table. The DOCX
+    // table model's tblInd applies that same leading-edge rule for bidiVisual.
+    // For LTR native tables, separately controlled TDxaLeft/GapHalf remains
+    // the physical placement source (see PreferredIndent).
+    let table_indent = if first_bidi {
+        match first_preferred_indent {
+            Some(PreferredIndent::Dxa(value)) => i32::from(value),
+            _ => plan.origin,
+        }
+    } else {
+        plan.origin
+    };
     let alignment = if physical && first_bidi {
         2 - alignment
     } else {
@@ -172,6 +188,11 @@ fn project_table(
         charge_cell(remaining, n)
     })?;
     for (row_index, planned) in plan.rows.into_iter().enumerate() {
+        if first_bidi && planned.source.preferred_indent != first_preferred_indent {
+            return Err(unsupported(
+                "direct DOC model cannot reconcile right-to-left row indents",
+            ));
+        }
         if planned.source.shading.is_some() {
             return Err(unsupported(
                 "direct DOC model cannot retain row table-property shading",
@@ -411,7 +432,7 @@ fn project_table(
         cell_margin_bottom: f64::from(margins[2]) / 20.0,
         cell_margin_right: f64::from(margins[3]) / 20.0,
         jc: ["left", "center", "right"][alignment as usize].into(),
-        tbl_ind: Some(f64::from(plan.origin) / 20.0),
+        tbl_ind: Some(f64::from(table_indent) / 20.0),
         layout: Some(if first_autofit { "autofit" } else { "fixed" }.into()),
         width_pt: table_preferred.and_then(|w| match w {
             PreferredWidth::Dxa(value) if value > 0 => Some(f64::from(value) / 20.0),
@@ -456,16 +477,10 @@ fn check_row_preferences(planned: &PlannedRow<Blocks>) -> Result<(), String> {
     let source = &planned.source;
     if source.bidi
         && source.preferred_indent.is_some()
-        && !matches!(
-            source.preferred_indent,
-            Some(PreferredIndent::Dxa(value)) if i32::from(value) == source.origin()
-        )
+        && !matches!(source.preferred_indent, Some(PreferredIndent::Dxa(_)))
     {
-        // The preferred-indent evidence (see table::PreferredIndent) covers
-        // left-to-right tables only. The effective value includes the one
-        // inherited from the selected table style (story::preferences). A
-        // preference equal to the projected origin gives the same placement
-        // under either reading.
+        // Native RTL controls establish signed dxa preferences, not Nil or
+        // Auto. Those values remain gated even though they are valid operands.
         return Err(unsupported(
             "direct DOC model cannot place a right-to-left table with a preferred indent",
         ));

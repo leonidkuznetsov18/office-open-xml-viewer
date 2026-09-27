@@ -246,17 +246,13 @@ pub(in crate::doc) fn cell_text_flow(flags: u16) -> u16 {
 /// [MS-DOC] 2.9.102 FtsWWidth_Indent, the preferred leading indent written by
 /// sprmTWidthIndent.
 ///
-/// The displayed horizontal origin of a DOC table is the physical one given by
-/// sprmTDxaLeft/sprmTDxaGapHalf or the first TDefTable boundary (2.6.3: "the
-/// location of the horizontal origin of the table"), which the direct model
-/// already projects as the table indent. Word's own PDF exports of two
-/// left-to-right documents whose preferred indent differs from that origin
-/// (once by exactly the left default cell margin, once with nil margins) place
-/// the table borders at the physical origin, while the paired OOXML documents
-/// carry the preferred value as `w:tblInd` and display at that value.
-/// The preference is therefore validated and retained, but does not replace
-/// the physical origin. Right-to-left tables are not covered by that evidence
-/// and stay gated at projection.
+/// For LTR native tables, Word PDF controls place the borders at the physical
+/// origin from sprmTDxaLeft/sprmTDxaGapHalf or the first TDefTable boundary
+/// even when the preferred indent differs (with both nonzero and nil margins).
+/// For RTL native tables, bounded Word PDF controls at -500/0/+500 twips show
+/// that a dxa preference moves the physical table by its leading-edge sign:
+/// increasing dxa moves the left edge left, with fixed table width. Projection
+/// keeps the LTR physical-origin policy and uses dxa as `tblInd` for RTL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::doc) enum PreferredIndent {
     Nil,
