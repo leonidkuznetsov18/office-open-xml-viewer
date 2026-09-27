@@ -384,12 +384,8 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
     const margin = slide.children.find((child) => child.style.cssText.includes('overflow-y:auto'))!;
     expect(margin.style.background).toBe('');
     const card = margin.children[0]!.children[0]!;
-    const geometry = vi.spyOn(
-      viewer as unknown as { _scheduleCommentGeometry(slide: number, slot: unknown): void },
-      '_scheduleCommentGeometry',
-    );
     dom.resizeCb()?.();
-    expect(geometry).not.toHaveBeenCalled();
+    expect(margin.children[0]!.children[0]).toBe(card);
     const frame = card.children.find((child) => child.dataset.ooxmlCommentPart === 'frame')!;
     expect(card.className).toBe('ooxml-comment-card');
     expect(card.style.cssText).toContain('--ooxml-comment-author-accent:');
@@ -446,20 +442,10 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
     const marker = markerLayer.children.find((child) =>
       child.dataset.ooxmlCommentMarker !== undefined)!;
     const card = margin.children[0]!.children[0]!;
-    const fullRedraw = vi.spyOn(
-      viewer as unknown as { _redrawSlotComments(slide: number, slot: unknown): void },
-      '_redrawSlotComments',
-    );
-    const connectorRedraw = vi.spyOn(
-      viewer as unknown as { _redrawSlotCommentConnectors(slide: number, slot: unknown): void },
-      '_redrawSlotCommentConnectors',
-    );
     margin.scrollTop = 24;
     margin.dispatch('scroll');
     await Promise.resolve();
 
-    expect(fullRedraw).toHaveBeenCalledTimes(0);
-    expect(connectorRedraw).toHaveBeenCalledTimes(1);
     expect(markerLayer.children.filter((child) =>
       child.dataset.ooxmlCommentMarker !== undefined)).toHaveLength(1);
     expect(markerLayer.children.find((child) =>

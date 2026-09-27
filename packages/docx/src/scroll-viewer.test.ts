@@ -576,12 +576,8 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
     expect(margin.style.background).toBe('');
     expect(margin.dataset.ooxmlCommentUi).toBe('margin');
     const card = margin.children[0]!.children[0]!;
-    const geometry = vi.spyOn(
-      viewer as unknown as { _scheduleCommentGeometry(page: number, slot: unknown): void },
-      '_scheduleCommentGeometry',
-    );
     dom.resizeCb()?.();
-    expect(geometry).not.toHaveBeenCalled();
+    expect(margin.children[0]!.children[0]).toBe(card);
     const frame = card.children.find((child) => child.dataset.ooxmlCommentPart === 'frame')!;
     expect(card.dataset.ooxmlCommentCard).toBe('');
     expect(card.className).toBe('ooxml-comment-card');
@@ -648,20 +644,10 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
     const marker = tintLayer.children.find((child) =>
       child.dataset.ooxmlCommentMarker !== undefined)!;
     const card = margin.children[0]!.children[0]!;
-    const fullRedraw = vi.spyOn(
-      viewer as unknown as { _redrawSlotComments(page: number, slot: unknown): void },
-      '_redrawSlotComments',
-    );
-    const connectorRedraw = vi.spyOn(
-      viewer as unknown as { _redrawSlotCommentConnectors(page: number, slot: unknown): void },
-      '_redrawSlotCommentConnectors',
-    );
     margin.scrollTop = 24;
     margin.dispatch('scroll');
     await Promise.resolve();
 
-    expect(fullRedraw).toHaveBeenCalledTimes(0);
-    expect(connectorRedraw).toHaveBeenCalledTimes(1);
     expect(tintLayer.children.filter((child) =>
       child.dataset.ooxmlCommentHighlight !== undefined)).toHaveLength(1);
     expect(tintLayer.children.find((child) =>

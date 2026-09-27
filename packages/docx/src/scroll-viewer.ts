@@ -21,6 +21,7 @@ import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotL
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
+import { CommentOverlayController } from '@silurus/ooxml-core/internal/comment-overlay-controller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { DocxDocument } from './document';
 import type { LoadOptions } from './document';
@@ -448,12 +449,19 @@ export class DocxScrollViewer implements ZoomableViewer {
     widthPx: READ_ONLY_COMMENT_MARGIN_WIDTH_PX,
     fontSizePx: COMMENT_MARGIN_FONT_SIZE_PX,
   });
-  private _commentGeometryScheduled = false;
-  private _commentGeometryFrame: number | null = null;
-  private readonly _pendingCommentGeometry = new Map<number, {
-    readonly slot: PageSlot;
-    readonly connectorsOnly: boolean;
-  }>();
+  private readonly _commentOverlay = new CommentOverlayController<PageSlot>({
+    slots: () => this._slots,
+    scale: () => this._scale,
+    destroyed: () => this._destroyed,
+    ownerWindow: () => this._wrapper.ownerDocument.defaultView,
+    width: (page) => this._pageWidthPx(page),
+    height: (page) => this._pageHeightPx(page),
+    side: () => this._commentMargin.side(),
+    marginExtent: () => this._commentMargin.extent(),
+    connectorOptions: () => this._commentsOptions()?.connectors,
+    runtime: () => this._commentUi,
+    redrawComments: (page, slot) => this._redrawSlotComments(page, slot),
+  });
   /** Set by `destroy()`. Async render callbacks (main + worker) check it before
    *  reporting an error so a rejection that lands after teardown is swallowed
    *  rather than surfaced to a `onError` on a dead viewer. */
@@ -2206,92 +2214,16 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._commentsOptions()?.markers !== false,
       this._commentsOptions()?.includeResolved === true,
       slot.commentDecorationLayer
-        ? () => this._scheduleCommentGeometry(page, slot, false)
+        ? () => this._commentOverlay.schedule(page, slot, false)
         : undefined,
       slot.commentDecorationLayer
-        ? () => this._scheduleCommentGeometry(page, slot, true)
+        ? () => this._commentOverlay.schedule(page, slot, true)
         : undefined,
     );
-    this._redrawSlotCommentConnectors(page, slot);
+    this._commentOverlay.drawConnectors(page, slot);
   }
 
-  private _redrawSlotCommentConnectors(page: number, slot: PageSlot): void {
-    const layer = slot.commentDecorationLayer;
-    const margin = slot.commentMargin;
-    const geometry = slot.commentGeometry;
-    const connectorOptions = this._commentsOptions()?.connectors;
-    if (!layer || !margin || !geometry || !connectorOptions) return;
-    const width = this._pageWidthPx(page);
-    const height = this._pageHeightPx(page);
-    const side = this._commentMargin.side();
-    const marginExtent = this._commentMargin.extent();
-    const commentUi = this._commentUi;
-    if (!commentUi) return;
-    commentUi.buildReadOnlyCommentDecoration(
-      layer,
-      Object.freeze({
-        surfaceBounds: Object.freeze({
-          x: side === 'left' ? -marginExtent : 0,
-          y: 0,
-          width: width + marginExtent,
-          height,
-        }),
-        contentBounds: Object.freeze({ x: 0, y: 0, width, height }),
-        side,
-        threads: commentUi.projectReadOnlyCommentMarginScroll(geometry, margin.scrollTop),
-      }),
-      {
-        route: connectorOptions.route ?? 'bezier',
-        stroke: connectorOptions.stroke ?? 'solid',
-        color: connectorOptions.color,
-        activeColor: connectorOptions.activeColor,
-      },
-    );
-  }
 
-  /** Coalesce card measurement and scroll-only connector projection into one
-   * geometry refresh per animation frame. A full refresh dominates a pending
-   * connector-only refresh for the same slot. */
-  private _scheduleCommentGeometry(
-    page: number,
-    slot: PageSlot,
-    connectorsOnly = false,
-  ): void {
-    const current = this._pendingCommentGeometry.get(page);
-    this._pendingCommentGeometry.set(page, {
-      slot,
-      connectorsOnly: current?.slot === slot
-        ? current.connectorsOnly && connectorsOnly
-        : connectorsOnly,
-    });
-    if (this._commentGeometryScheduled) return;
-    this._commentGeometryScheduled = true;
-    const flush = (): void => {
-      this._commentGeometryScheduled = false;
-      this._commentGeometryFrame = null;
-      const pending = [...this._pendingCommentGeometry];
-      this._pendingCommentGeometry.clear();
-      if (this._destroyed) return;
-      for (const [pendingPage, entry] of pending) {
-        const { slot: pendingSlot, connectorsOnly: pendingConnectorsOnly } = entry;
-        if (
-          this._slots.get(pendingPage) === pendingSlot &&
-          pendingSlot.renderedScale === this._scale
-        ) {
-          if (pendingConnectorsOnly) {
-            this._redrawSlotCommentConnectors(pendingPage, pendingSlot);
-          } else {
-            this._redrawSlotComments(pendingPage, pendingSlot);
-          }
-        }
-      }
-    };
-    const ownerWindow = this._wrapper.ownerDocument.defaultView;
-    if (ownerWindow?.requestAnimationFrame) {
-      this._commentGeometryFrame = ownerWindow.requestAnimationFrame(flush);
-    }
-    else queueMicrotask(flush);
-  }
 
   private _redrawSlotHighlights(page: number, slot: PageSlot): void {
     if (!this._findActive) {
@@ -2448,12 +2380,7 @@ export class DocxScrollViewer implements ZoomableViewer {
       );
       this._commentOutsidePointerListener = null;
     }
-    if (this._commentGeometryFrame !== null) {
-      this._wrapper.ownerDocument.defaultView?.cancelAnimationFrame?.(this._commentGeometryFrame);
-      this._commentGeometryFrame = null;
-    }
-    this._commentGeometryScheduled = false;
-    this._pendingCommentGeometry.clear();
+    this._commentOverlay.destroy();
     this._selection.clearElementContext();
     if (this._scrollListener) {
       this._scrollHost.removeEventListener('scroll', this._scrollListener);

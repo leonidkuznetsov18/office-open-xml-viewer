@@ -17,6 +17,7 @@ import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotL
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
+import { CommentOverlayController } from '@silurus/ooxml-core/internal/comment-overlay-controller';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import { PptxPresentation, type LoadOptions, type RenderSlideOptions } from './presentation';
 import type { PresentationHandle } from './presentation-handle';
@@ -399,12 +400,6 @@ export class PptxScrollViewer implements ZoomableViewer {
   private _activeCommentSlide: number | null = null;
   private _commentNavigationGeneration = 0;
   private _commentUi: PptxCommentUiRuntime | null = null;
-  private _commentGeometryScheduled = false;
-  private _commentGeometryFrame: number | null = null;
-  private readonly _pendingCommentGeometry = new Map<number, {
-    readonly slot: SlideSlot;
-    readonly connectorsOnly: boolean;
-  }>();
   private _hasComments = false;
   private readonly _commentMargin = new CommentMarginController({
     container: () => this._container,
@@ -418,6 +413,19 @@ export class PptxScrollViewer implements ZoomableViewer {
     gapPx: COMMENT_MARGIN_GAP_PX,
     widthPx: COMMENT_MARGIN_WIDTH_PX,
     fontSizePx: COMMENT_MARGIN_FONT_SIZE_PX,
+  });
+  private readonly _commentOverlay = new CommentOverlayController<SlideSlot>({
+    slots: () => this._slots,
+    scale: () => this._scale,
+    destroyed: () => this._destroyed,
+    ownerWindow: () => this._wrapper.ownerDocument.defaultView,
+    width: () => this._slideWidthPx(),
+    height: () => this._slideHeightPx(),
+    side: () => this._commentMargin.side(),
+    marginExtent: () => this._commentMargin.extent(),
+    connectorOptions: () => this._commentsOptions()?.connectors,
+    runtime: () => this._commentUi,
+    redrawComments: (slide, slot) => this._redrawSlotComments(slide, slot),
   });
   /** Opening prefix already inspected for authored comments. Progressive
    * presentations make metadata authoritative one slide at a time, so a
@@ -2157,48 +2165,15 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._commentsOptions()?.markers !== false,
       this._commentsOptions()?.includeResolved === true,
       slot.commentDecorationLayer
-        ? () => this._scheduleCommentGeometry(slide, slot, false)
+        ? () => this._commentOverlay.schedule(slide, slot, false)
         : undefined,
       slot.commentDecorationLayer
-        ? () => this._scheduleCommentGeometry(slide, slot, true)
+        ? () => this._commentOverlay.schedule(slide, slot, true)
         : undefined,
     );
-    this._redrawSlotCommentConnectors(slide, slot);
+    this._commentOverlay.drawConnectors(slide, slot);
   }
 
-  private _redrawSlotCommentConnectors(slide: number, slot: SlideSlot): void {
-    const layer = slot.commentDecorationLayer;
-    const margin = slot.commentMargin;
-    const geometry = slot.commentGeometry;
-    const connectorOptions = this._commentsOptions()?.connectors;
-    if (!layer || !margin || !geometry || !connectorOptions) return;
-    const width = this._slideWidthPx();
-    const height = this._slideHeightPx();
-    const side = this._commentMargin.side();
-    const marginExtent = this._commentMargin.extent();
-    const commentUi = this._commentUi;
-    if (!commentUi) return;
-    commentUi.buildReadOnlyCommentDecoration(
-      layer,
-      Object.freeze({
-        surfaceBounds: Object.freeze({
-          x: side === 'left' ? -marginExtent : 0,
-          y: 0,
-          width: width + marginExtent,
-          height,
-        }),
-        contentBounds: Object.freeze({ x: 0, y: 0, width, height }),
-        side,
-        threads: commentUi.projectReadOnlyCommentMarginScroll(geometry, margin.scrollTop),
-      }),
-      {
-        route: connectorOptions.route ?? 'bezier',
-        stroke: connectorOptions.stroke ?? 'solid',
-        color: connectorOptions.color,
-        activeColor: connectorOptions.activeColor,
-      },
-    );
-  }
 
   /** Commit comment geometry and reveal every comment layer in one settled frame. */
   private _commitSlotComments(slide: number, slot: SlideSlot): void {
@@ -2237,49 +2212,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     });
   }
 
-  /** Coalesce card measurement and scroll-only connector projection into one
-   * geometry refresh per animation frame. A full refresh dominates a pending
-   * connector-only refresh for the same slot. */
-  private _scheduleCommentGeometry(
-    slide: number,
-    slot: SlideSlot,
-    connectorsOnly = false,
-  ): void {
-    const current = this._pendingCommentGeometry.get(slide);
-    this._pendingCommentGeometry.set(slide, {
-      slot,
-      connectorsOnly: current?.slot === slot
-        ? current.connectorsOnly && connectorsOnly
-        : connectorsOnly,
-    });
-    if (this._commentGeometryScheduled) return;
-    this._commentGeometryScheduled = true;
-    const flush = (): void => {
-      this._commentGeometryScheduled = false;
-      this._commentGeometryFrame = null;
-      const pending = [...this._pendingCommentGeometry];
-      this._pendingCommentGeometry.clear();
-      if (this._destroyed) return;
-      for (const [pendingSlide, entry] of pending) {
-        const { slot: pendingSlot, connectorsOnly: pendingConnectorsOnly } = entry;
-        if (
-          this._slots.get(pendingSlide) === pendingSlot &&
-          pendingSlot.renderedScale === this._scale
-        ) {
-          if (pendingConnectorsOnly) {
-            this._redrawSlotCommentConnectors(pendingSlide, pendingSlot);
-          } else {
-            this._redrawSlotComments(pendingSlide, pendingSlot);
-          }
-        }
-      }
-    };
-    const ownerWindow = this._wrapper.ownerDocument.defaultView;
-    if (ownerWindow?.requestAnimationFrame) {
-      this._commentGeometryFrame = ownerWindow.requestAnimationFrame(flush);
-    }
-    else queueMicrotask(flush);
-  }
 
   private _redrawSlotHighlights(slide: number, slot: SlideSlot): void {
     if (!this._findActive) {
@@ -2505,12 +2437,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       );
       this._commentOutsidePointerListener = null;
     }
-    if (this._commentGeometryFrame !== null) {
-      this._wrapper.ownerDocument.defaultView?.cancelAnimationFrame?.(this._commentGeometryFrame);
-      this._commentGeometryFrame = null;
-    }
-    this._commentGeometryScheduled = false;
-    this._pendingCommentGeometry.clear();
+    this._commentOverlay.destroy();
     this._selection.clearElementContext();
     if (this._scrollListener) {
       this._scrollHost.removeEventListener('scroll', this._scrollListener);
