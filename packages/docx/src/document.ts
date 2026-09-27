@@ -832,6 +832,12 @@ export class DocxDocument {
             const abort = new AbortController();
             let viewChanged = false;
             const unsubscribe = control?.subscribeViewChange(() => {
+              // Viewer callbacks may re-apply their setting on every progress
+              // update. Only a different view invalidates this in-flight
+              // pagination; repeated notifications must not restart it.
+              const requested = control.requestedView();
+              if (viewChanged || requested === undefined
+                || (requested === true) === (currentOptions.showTrackedChanges === true)) return;
               viewChanged = true;
               abort.abort();
             });

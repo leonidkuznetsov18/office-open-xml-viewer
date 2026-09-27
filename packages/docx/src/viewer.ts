@@ -1013,8 +1013,11 @@ export class DocxViewer implements ZoomableViewer {
   async setShowTrackedChanges(value: boolean): Promise<void> {
     const generation = ++this._layoutViewGeneration;
     if (this._pendingLoadAbort) {
+      const changed = this._pendingRequestedView !== value;
       this._pendingRequestedView = value;
-      this._pendingViewChanged?.();
+      // Keep an explicit false even when it matches the default, but avoid
+      // notifying the in-flight paginator again for the same request.
+      if (changed) this._pendingViewChanged?.();
     }
     const doc = this._doc;
     // Compare with the document's active view: it may come from the loaded

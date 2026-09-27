@@ -202,6 +202,7 @@ describe('DocxViewer.load() — concurrent-load latch', () => {
     let changes = 0;
     const unsubscribe = control.subscribeViewChange(() => { changes += 1; });
     await viewer.setShowTrackedChanges(true);
+    await viewer.setShowTrackedChanges(true);
     expect(changes).toBe(1);
     expect(control.requestedView()).toBe(true);
     unsubscribe();

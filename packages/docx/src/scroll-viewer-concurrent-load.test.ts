@@ -152,6 +152,7 @@ describe('DocxScrollViewer.load() — concurrent-load latch', () => {
     let changes = 0;
     controls[1]?.subscribeViewChange(() => { changes += 1; });
     await v.setShowTrackedChanges(true);
+    await v.setShowTrackedChanges(true);
     expect(changes).toBe(1);
     expect(controls[1]?.requestedView()).toBe(true);
     v.destroy();

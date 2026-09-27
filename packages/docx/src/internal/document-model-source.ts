@@ -520,6 +520,11 @@ export async function loadDocxModelSource(
             const abort = new AbortController();
             let viewChanged = false;
             const unsubscribe = control?.subscribeViewChange(() => {
+              // Re-sending the in-flight view during progress is not a layout
+              // change. A distinct request still cancels this slice once.
+              const requested = control.requestedView();
+              if (viewChanged || requested === undefined
+                || (requested === true) === (currentOptions.showTrackedChanges === true)) return;
               viewChanged = true;
               abort.abort();
             });

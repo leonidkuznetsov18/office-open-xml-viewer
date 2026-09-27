@@ -114,13 +114,13 @@ function renderWorkerScript(sourceDefault: boolean | undefined, options: { parti
 }
 
 /** Parse-worker script: open a pull session over a materialized model. */
-function parseWorkerScript(viewDefaults: Record<string, boolean> | undefined): Script {
+function parseWorkerScript(viewDefaults: Record<string, boolean> | undefined, paragraphs = 6): Script {
   let pull: DocumentPullWorker | undefined;
   return async (worker, message) => {
     if (isDocumentPullCommand(message)) {
       await pull!.dispatch(message, (response) => worker.reply(response));
     } else if (message.type === 'parse') {
-      const archive = new MaterializedDocumentCursorArchive(syntheticDocxModel('tracked', { paragraphs: 6 }));
+      const archive = new MaterializedDocumentCursorArchive(syntheticDocxModel('tracked', { paragraphs }));
       pull = new DocumentPullWorker(() => archive);
       const identity = { sessionId: 1, operationId: 1, generation: 1 };
       pull.open(identity);
@@ -188,6 +188,72 @@ describe('DocxDocument.load with model sources', () => {
     expect(release).toHaveBeenCalledOnce();
     document.destroy();
   });
+
+  it('keeps a sliced model-source load moving when its view is re-applied on progress', async () => {
+    install(parseWorkerScript(undefined, 20));
+    const { source } = fakeSource();
+    let requested = false;
+    let viewChanged: (() => void) | null = null;
+    const progress: number[] = [];
+    const document = await DocxDocument.load(cfbBytes(), {
+      modelSources: [source],
+      [docxViewerLoadSignal]: {
+        signal: new AbortController().signal,
+        requestedView: () => requested,
+        subscribeViewChange: (listener: () => void) => {
+          viewChanged = listener;
+          return () => { if (viewChanged === listener) viewChanged = null; };
+        },
+      },
+      onLayoutProgress: ({ committedUnits }) => {
+        progress.push(committedUnits);
+        if (progress.length <= 20) {
+          requested = false;
+          viewChanged?.();
+        }
+      },
+    } as LoadOptions);
+    try {
+      expect(progress.slice(0, 20).some((count) => count > 1)).toBe(true);
+      expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(false);
+    } finally {
+      document.destroy();
+    }
+  }, 30_000);
+
+  it('restarts a sliced model-source load for one real view change', async () => {
+    install(parseWorkerScript(undefined, 20));
+    const { source } = fakeSource();
+    let requested: boolean | undefined;
+    let viewChanged: (() => void) | null = null;
+    let changed = false;
+    const progress: number[] = [];
+    const document = await DocxDocument.load(cfbBytes(), {
+      modelSources: [source],
+      [docxViewerLoadSignal]: {
+        signal: new AbortController().signal,
+        requestedView: () => requested,
+        subscribeViewChange: (listener: () => void) => {
+          viewChanged = listener;
+          return () => { if (viewChanged === listener) viewChanged = null; };
+        },
+      },
+      onLayoutProgress: ({ committedUnits }) => {
+        progress.push(committedUnits);
+        if (changed) return;
+        changed = true;
+        requested = true;
+        viewChanged?.();
+        viewChanged?.();
+      },
+    } as LoadOptions);
+    try {
+      expect(progress.some((count) => count > 1)).toBe(true);
+      expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(true);
+    } finally {
+      document.destroy();
+    }
+  }, 30_000);
 
   it('releases an office font acquired after a canceled model-source load', async () => {
     install(parseWorkerScript(undefined));

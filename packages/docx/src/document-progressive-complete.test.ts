@@ -140,6 +140,59 @@ describe('main-mode progressive load: onLayoutComplete contract', () => {
 });
 
 describe('ordinary main-mode sliced load ownership', () => {
+  it('does not restart pagination when progress re-applies the unchanged view', async () => {
+    // Regression from an onLayoutProgress UI that synchronizes its setting on
+    // every update: the load must advance past its first paginator slice.
+    installDom();
+    installMainModeParse(20);
+    vi.spyOn(DocxViewer.prototype as unknown as { _render(): Promise<void> }, '_render')
+      .mockResolvedValue(undefined);
+    const progress: number[] = [];
+    const viewer = new DocxViewer(makeEl('canvas') as unknown as HTMLCanvasElement, {
+      onLayoutProgress: ({ committedUnits }) => {
+        progress.push(committedUnits);
+        if (progress.length <= 20) void viewer.setShowTrackedChanges(false);
+      },
+    });
+    vi.stubGlobal('document', undefined);
+    try {
+      await viewer.load(new ArrayBuffer(0));
+      expect(progress.slice(0, 20).some((count) => count > 1)).toBe(true);
+    } finally {
+      viewer.destroy();
+    }
+  }, 30_000);
+
+  it('settles on the final view after repeated changes during pagination', async () => {
+    installDom();
+    installMainModeParse(60, 'tracked');
+    let loadedDoc!: DocxDocument;
+    vi.spyOn(DocxDocument.prototype as unknown as {
+      _resourceUsage(timeoutMs: number): Promise<OoxmlResourceUsageSnapshot>;
+    }, '_resourceUsage').mockImplementation(function (this: DocxDocument) {
+      loadedDoc = this;
+      return Promise.resolve(USAGE);
+    });
+    vi.spyOn(DocxViewer.prototype as unknown as { _render(): Promise<void> }, '_render')
+      .mockResolvedValue(undefined);
+    const views = [true, false, true, false, true];
+    let notifications = 0;
+    const viewer = new DocxViewer(makeEl('canvas') as unknown as HTMLCanvasElement, {
+      onLayoutProgress: () => {
+        if (notifications < views.length) void viewer.setShowTrackedChanges(views[notifications]!);
+        notifications++;
+      },
+    });
+    vi.stubGlobal('document', undefined);
+    try {
+      await viewer.load(new ArrayBuffer(0));
+      expect(notifications).toBeGreaterThanOrEqual(views.length);
+      expect(activeDocxLayoutViewOf(loadedDoc).showTrackedChanges).toBe(true);
+    } finally {
+      viewer.destroy();
+    }
+  }, 30_000);
+
   it('reconciles the active view when toggles return to their initial value during the final probe', async () => {
     installDom();
     installMainModeParse(100, 'tracked');
@@ -214,6 +267,7 @@ describe('ordinary main-mode sliced load ownership', () => {
     let requested: boolean | undefined;
     let listener: (() => void) | null = null;
     let changed = false;
+    const progress: number[] = [];
     const control: DocxViewerLoadControl = {
       signal: new AbortController().signal,
       requestedView: () => requested,
@@ -224,15 +278,18 @@ describe('ordinary main-mode sliced load ownership', () => {
     };
     const opts = {
       [docxViewerLoadSignal]: control,
-      onLayoutProgress: () => {
+      onLayoutProgress: ({ committedUnits }) => {
+        progress.push(committedUnits);
         if (changed) return;
         changed = true;
         requested = true;
+        listener?.();
         listener?.();
       },
     } as LoadOptions;
     const doc = await DocxDocument.load(new ArrayBuffer(0), opts);
     expect(changed).toBe(true);
+    expect(progress.some((count) => count > 1)).toBe(true);
     expect(activeDocxLayoutViewOf(doc).showTrackedChanges).toBe(true);
     expect(doc.layoutComplete).toBe(true);
     doc.destroy();
