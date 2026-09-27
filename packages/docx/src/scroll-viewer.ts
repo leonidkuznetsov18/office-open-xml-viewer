@@ -2229,6 +2229,9 @@ export class DocxScrollViewer implements ZoomableViewer {
   async setShowTrackedChanges(value: boolean): Promise<void> {
     const generation = ++this._layoutViewGeneration;
     const doc = this._doc;
+    // Explicitness is independent of the current value: false before load
+    // must win over a model source's true view default.
+    if (this._opts.modelSources !== undefined) this._requestedShowTrackedChanges = value;
     if (this._showTrackedChanges === value) {
       if (doc) await selectDocxLayoutView(doc, {
         showTrackedChanges: value,

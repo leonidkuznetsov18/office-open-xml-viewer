@@ -63,4 +63,15 @@ describe.each([
     expect(new Set(engine.renderCalls.map((call) => call.showTrackedChanges))).toEqual(new Set([renderedView]));
     viewer.destroy();
   });
+
+  it('preserves an explicit false setter call before load over the source default', async () => {
+    const engine = new FakeDocxEngine(1, SIZE);
+    engine.layoutView = { showTrackedChanges: true, currentDate: 0 };
+    const load = vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
+    const viewer = create({ modelSources: [source] });
+    await viewer.setShowTrackedChanges(false);
+    await viewer.load(new ArrayBuffer(1));
+    expect(load.mock.calls[0]![1]).toHaveProperty('showTrackedChanges', false);
+    viewer.destroy();
+  });
 });

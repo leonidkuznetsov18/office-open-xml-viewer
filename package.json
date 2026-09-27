@@ -134,6 +134,7 @@
     "test:docx-package-build": "node --test scripts/check-docx-package-build.test.mjs",
     "check:core-legacy-boundary": "node scripts/check-core-legacy-boundary.mjs",
     "check:model-source-lazy-graph": "node scripts/check-model-source-lazy-graph.mjs",
+    "check:model-source-lazy-runtime": "node scripts/check-model-source-lazy-runtime.mjs",
     "check:model-source-ooxml-path": "node scripts/check-model-source-ooxml-path.mjs"
   },
   "devDependencies": {

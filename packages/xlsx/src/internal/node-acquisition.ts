@@ -48,14 +48,14 @@ interface XlsxArchiveConstructor {
 let runtimeModule: WebAssembly.Module | undefined;
 let runtimeHost: WasmRuntimeGenerationHost<XlsxNodeArchive> | undefined;
 
-function formatRuntime(module: WebAssembly.Module): WasmRuntimeGenerationHost<XlsxNodeArchive> {
+function formatRuntime(wasmModule: WebAssembly.Module): WasmRuntimeGenerationHost<XlsxNodeArchive> {
   if (!runtimeHost) {
-    runtimeModule = module;
+    runtimeModule = wasmModule;
     runtimeHost = new WasmRuntimeGenerationHost(
       xlsxWasm as unknown as WasmModuleRuntime,
-      module,
+      wasmModule,
     );
-  } else if (runtimeModule !== module) {
+  } else if (runtimeModule !== wasmModule) {
     throw new Error('XLSX runtime was already initialized with another WebAssembly.Module');
   }
   return runtimeHost;
@@ -83,7 +83,7 @@ export interface XlsxNodeSessionArchive
 /** Format-owned archive acquisition and workbook-index projection for Node. */
 export async function acquireXlsxNodeSession(
   bytes: Uint8Array,
-  module: WebAssembly.Module,
+  wasmModule: WebAssembly.Module,
   options: XlsxNodeAcquisitionOptions = {},
 ): Promise<XlsxNodeAcquisition> {
   const resourceOptions = normalizeLoadResourceOptions(options);
@@ -102,7 +102,7 @@ export async function acquireXlsxNodeSession(
     throwIfAborted(options.signal);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
     const Archive = (xlsxWasm as unknown as { XlsxArchive: XlsxArchiveConstructor }).XlsxArchive;
-    handle = await formatRuntime(module).open(
+    handle = await formatRuntime(wasmModule).open(
       () => new Archive(bytes, maxEntry, maxTotal, maxEntries),
       {
         signal: options.signal,

@@ -60,14 +60,14 @@ interface DocxArchiveConstructor {
 let runtimeModule: WebAssembly.Module | undefined;
 let runtimeHost: WasmRuntimeGenerationHost<DocxNodeArchive> | undefined;
 
-function formatRuntime(module: WebAssembly.Module): WasmRuntimeGenerationHost<DocxNodeArchive> {
+function formatRuntime(wasmModule: WebAssembly.Module): WasmRuntimeGenerationHost<DocxNodeArchive> {
   if (!runtimeHost) {
-    runtimeModule = module;
+    runtimeModule = wasmModule;
     runtimeHost = new WasmRuntimeGenerationHost(
       docxWasm as unknown as WasmModuleRuntime,
-      module,
+      wasmModule,
     );
-  } else if (runtimeModule !== module) {
+  } else if (runtimeModule !== wasmModule) {
     throw new Error('DOCX runtime was already initialized with another WebAssembly.Module');
   }
   return runtimeHost;
@@ -97,7 +97,7 @@ export interface AcquiredDocxNodeDocument<TResult> {
 /** Format-owned DOCX archive, cursor transport, accounting, and cleanup. */
 export async function acquireDocxNodeDocument<TResult>(
   bytes: Uint8Array,
-  module: WebAssembly.Module,
+  wasmModule: WebAssembly.Module,
   options: DocxNodeAcquisitionOptions,
   consume: (
     transport: DocxNodePullTransport,
@@ -123,7 +123,7 @@ export async function acquireDocxNodeDocument<TResult>(
     throwIfAborted(options.signal);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
     const Archive = (docxWasm as unknown as { DocxArchive: DocxArchiveConstructor }).DocxArchive;
-    handle = await formatRuntime(module).open(
+    handle = await formatRuntime(wasmModule).open(
       () => new Archive(bytes, maxEntry, maxTotal, maxEntries),
       {
         signal: options.signal,

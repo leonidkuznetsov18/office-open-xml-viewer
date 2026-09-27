@@ -13,7 +13,7 @@
   <canvas id="xlsx-chart-ex"></canvas>
   <canvas id="pptx-chart-ex"></canvas>
   <script type="module">
-    import { DocxDocument } from '/dist/docx.mjs';
+    import { DocxDocument, DocxViewer } from '/dist/docx.mjs';
     import { XlsxSheetViewer, XlsxWorkbook } from '/dist/xlsx.mjs';
     import { PptxPresentation } from '/dist/pptx.mjs';
     import { math } from '/dist/math.mjs';
@@ -131,8 +131,23 @@
       paint('pptx-chart-ex', await chartExPptx.renderSlideToBitmap(0, { width: 640, dpr: 1 }));
       chartExPptx.destroy();
 
+      for (const [Loader, url] of [
+        [DocxDocument, '/packages/docx/public/demo/sample-1.docx'],
+        [XlsxWorkbook, '/packages/xlsx/public/demo/sample-1.xlsx'],
+        [PptxPresentation, '/packages/pptx/public/demo/sample-1.pptx'],
+      ]) {
+        const opened = await Loader.load(await bytes(url), { mode: 'main' });
+        opened.destroy();
+      }
+      // Pause after ordinary OOXML main/worker loads, before optional source
+      // stages are allowed to request their chunks.
+      document.body.dataset.ordinaryReady = 'true';
+      if (new URLSearchParams(location.search).has('pause-sources')) {
+        await new Promise((resolve) => { window.resumeSourceStages = resolve; });
+      }
       await runModelSourceStages({
         DocxDocument,
+        DocxViewer,
         XlsxWorkbook,
         PptxPresentation,
         bytes,

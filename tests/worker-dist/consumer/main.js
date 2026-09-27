@@ -1,4 +1,4 @@
-import { DocxDocument } from '@silurus/ooxml/docx';
+import { DocxDocument, DocxViewer } from '@silurus/ooxml/docx';
 import { XlsxSheetViewer, XlsxWorkbook } from '@silurus/ooxml/xlsx';
 import { PptxPresentation } from '@silurus/ooxml/pptx';
 import { math } from '@silurus/ooxml/math';
@@ -116,8 +116,21 @@ try {
   paint('pptx-chart-ex', await chartExPptx.renderSlideToBitmap(0, { width: 640, dpr: 1 }));
   chartExPptx.destroy();
 
+  for (const [Loader, url] of [
+    [DocxDocument, '/packages/docx/public/demo/sample-1.docx'],
+    [XlsxWorkbook, '/packages/xlsx/public/demo/sample-1.xlsx'],
+    [PptxPresentation, '/packages/pptx/public/demo/sample-1.pptx'],
+  ]) {
+    const opened = await Loader.load(await bytes(url), { mode: 'main' });
+    opened.destroy();
+  }
+  document.body.dataset.ordinaryReady = 'true';
+  if (new URLSearchParams(location.search).has('pause-sources')) {
+    await new Promise((resolve) => { window.resumeSourceStages = resolve; });
+  }
   await runModelSourceStages({
     DocxDocument,
+    DocxViewer,
     XlsxWorkbook,
     PptxPresentation,
     bytes,

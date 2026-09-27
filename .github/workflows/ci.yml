@@ -180,6 +180,7 @@ jobs:
         run: |
           pnpm build
           pnpm check:model-source-lazy-graph --packages
+          pnpm check:model-source-lazy-runtime
           pnpm check:production-render-workers
           pnpm check:optional-chart-ex
           pnpm check:optional-tiff
@@ -280,6 +281,7 @@ jobs:
           # rolldown-plugin-dts invocation also keeps this browser job focused.
           pnpm build:runtime
           pnpm check:model-source-lazy-graph
+          pnpm check:model-source-lazy-runtime
           pnpm check:production-render-workers
           pnpm test:production-render-workers
 

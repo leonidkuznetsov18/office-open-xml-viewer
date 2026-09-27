@@ -66,10 +66,32 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-export async function runModelSourceStages({ DocxDocument, XlsxWorkbook, PptxPresentation, bytes }) {
+export async function runModelSourceStages({ DocxDocument, DocxViewer, XlsxWorkbook, PptxPresentation, bytes }) {
   const tracked = await bytes('/consumer/tracked.docx');
   const bordered = await bytes('/consumer/bordered.xlsx');
   const slides = await bytes('/packages/pptx/public/demo/sample-1.pptx');
+  const viewerImage = async (choice) => {
+    const canvas = document.createElement('canvas');
+    document.body.append(canvas);
+    const viewer = new DocxViewer(canvas, {
+      modelSources: [fakeSource('docx', { showTrackedChanges: true, minimal: true })],
+      useGoogleFonts: false,
+      ...(choice === 'setter' ? {} : { showTrackedChanges: choice === 'markup' }),
+    });
+    try {
+      if (choice === 'setter') await viewer.setShowTrackedChanges(false);
+      await viewer.load(tracked.slice(0));
+      return canvas.toDataURL();
+    } finally {
+      viewer.destroy();
+      canvas.remove();
+    }
+  };
+  const viewerFinal = await viewerImage('final');
+  const viewerMarkup = await viewerImage('markup');
+  const viewerSetter = await viewerImage('setter');
+  assert(viewerFinal !== viewerMarkup, 'DOCX viewer views must differ for the tracked fixture');
+  assert(viewerSetter === viewerFinal, 'DOCX viewer pre-load false setter must win over source default');
   for (const mode of ['main', 'worker']) {
     document.body.dataset.stage = `model-source-docx-${mode}`;
     const final = await docxPage(DocxDocument, tracked, { mode });

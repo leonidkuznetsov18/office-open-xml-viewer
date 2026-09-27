@@ -57,7 +57,7 @@ export const RULES = [
 // new computed import or require cannot evade module resolution.
 export const ALLOWED_COMPUTED_IMPORTS = new Map([
   ['packages/core/src/math/engine-runtime.ts', ['src']],
-  ['packages/core/src/source/model-source.ts', ['module.moduleUrl']],
+  ['packages/core/src/source/model-source.ts', ['sourceModule.moduleUrl']],
   ['packages/docx/src/worker-source.ts', ['req.sourceOwnerUrl']],
   ['packages/docx/src/render-worker-source.ts', ['req.sourceOwnerUrl']],
   ['packages/xlsx/src/worker-source.ts', ['req.sourceOwnerUrl']],
@@ -81,11 +81,9 @@ export const ALLOWED_COMPUTED_IMPORTS = new Map([
   ['packages/node/src/xlsx-merge-border-zorder.probe.test.ts', ['ORCH_PATH']],
 ]);
 
-// The Node WASM locator needs resolution only. It never loads a package and
-// its exact call shape is checked below; no other require factory is allowed.
-export const ALLOWED_INDIRECT_REQUIRE = new Map([
-  ['packages/node/src/wasm-loader.ts', 'createRequire(metaUrl).resolve(workspaceSpecifier)'],
-]);
+// No checked source currently needs the CommonJS loader. An exception would
+// require an exact file path here and a justification beside the source use.
+export const ALLOWED_LOADER_IDENTIFIERS = new Set();
 
 function expressionName(node) {
   if (node?.type === 'Identifier') return node.name;
@@ -107,6 +105,18 @@ function literalValue(node) {
     return node.quasis[0].value.cooked;
   }
   return undefined;
+}
+
+function isPropertyName(node, parent) {
+  if (!parent) return false;
+  if (['MemberExpression', 'OptionalMemberExpression'].includes(parent.type)) {
+    return parent.property === node && !parent.computed;
+  }
+  if (['ObjectProperty', 'ObjectMethod', 'ClassMethod', 'ClassProperty',
+    'TSPropertySignature', 'TSMethodSignature'].includes(parent.type)) {
+    return parent.key === node && !parent.computed && !parent.shorthand;
+  }
+  return parent.type === 'LabeledStatement' && parent.label === node;
 }
 
 function isLegacyModule(path) {
@@ -163,47 +173,13 @@ export function findViolations(files, { resolveModule } = {}) {
       const source = parse(text, { sourceType: 'unambiguous', errorRecovery: true, plugins: ['typescript', 'jsx'] });
       const allowedExpressions = ALLOWED_COMPUTED_IMPORTS.get(path) ?? [];
       const usedExpressions = new Set();
-      const indirectAllowed = ALLOWED_INDIRECT_REQUIRE.get(path);
       const inspect = (node, parent, grandparent) => {
         const line = node.loc?.start.line ?? 1;
-        const rejectIndirect = () => violations.push({
-          path, line, rule: 'indirect-require', text: lines[line - 1].trim().slice(0, 160),
-        });
-        if (node.type === 'ImportSpecifier' && node.imported.name === 'createRequire'
-          && (indirectAllowed === undefined || node.local.name !== 'createRequire')) rejectIndirect();
-        if (node.type === 'ObjectProperty' && node.key.type === 'Identifier'
-          && node.key.name === 'createRequire' && parent?.type === 'ObjectPattern') rejectIndirect();
-        if (['MemberExpression', 'OptionalMemberExpression'].includes(node.type) && (
-          (node.object.type === 'Identifier' && node.object.name === 'require')
-          || (node.property.type === 'Identifier' && node.property.name === 'createRequire')
-          || (node.property.type === 'StringLiteral' && node.property.value === 'createRequire')
-          || ((node.object.type === 'Identifier'
-            && ['module', 'globalThis'].includes(node.object.name))
-            && ((node.property.type === 'Identifier' && node.property.name === 'require')
-              || (node.property.type === 'StringLiteral' && node.property.value === 'require')))
-        )) rejectIndirect();
-        if (node.type === 'CallExpression' && node.callee.type === 'Identifier'
-          && node.callee.name === 'createRequire') {
-          const approved = indirectAllowed !== undefined
-            && parent?.type === 'MemberExpression' && parent.object === node
-            && parent.property.type === 'Identifier' && parent.property.name === 'resolve'
-            && grandparent?.type === 'CallExpression' && grandparent.callee === parent
-            && node.arguments.length === 1 && expressionName(node.arguments[0]) === 'metaUrl'
-            && grandparent.arguments.length === 1
-            && expressionName(grandparent.arguments[0]) === 'workspaceSpecifier';
-          if (!approved) rejectIndirect();
+        if (isGuardedPath(path) && ALLOWED_LOADER_IDENTIFIERS.has(path) === false
+          && node.type === 'Identifier' && ['require', 'module'].includes(node.name)
+          && !isPropertyName(node, parent)) {
+          violations.push({ path, line, rule: 'loader-identifier', text: lines[line - 1].trim().slice(0, 160) });
         }
-        if (node.type === 'OptionalCallExpression'
-          && node.callee.type === 'Identifier' && node.callee.name === 'require') rejectIndirect();
-        if (node.type === 'Identifier' && node.name === 'createRequire'
-          && parent?.type !== 'ImportSpecifier'
-          && !(parent?.type === 'CallExpression' && parent.callee === node)
-          && !(parent?.type === 'MemberExpression' && parent.property === node)) rejectIndirect();
-        if (node.type === 'Identifier' && node.name === 'require'
-          && !(parent?.type === 'CallExpression' && parent.callee === node)
-          && !(parent?.type === 'MemberExpression' && (parent.object === node || parent.property === node))
-          && !(parent?.type === 'ClassMethod' && parent.key === node)
-          && !(parent?.type === 'OptionalCallExpression' && parent.callee === node)) rejectIndirect();
         let literal;
         let dynamic = false;
         if (['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type)) {
@@ -220,6 +196,9 @@ export function findViolations(files, { resolveModule } = {}) {
           dynamic = true;
         }
         const specifier = literalValue(literal);
+        if (isGuardedPath(path) && (specifier === 'node:module' || specifier === 'module')) {
+          violations.push({ path, line, rule: 'node-module-import', text: lines[line - 1].trim().slice(0, 160) });
+        }
         if (dynamic && specifier === undefined) {
           const expression = expressionName(literal);
           const approved = expression !== undefined

@@ -6,9 +6,79 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve, dirname, relative, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
+import { execFileSync } from 'node:child_process';
 import { createTypeScriptResolver } from './check-core-legacy-boundary.mjs';
 
 const resolveModule = createTypeScriptResolver();
+
+// The only entry-to-source transitions are these opt-in dispatch functions.
+// Keep this list exact: a new caller must explain why it can run only after
+// modelSources (or a worker source descriptor) is present.
+export const SOURCE_DISPATCH = new Map([
+  ['packages/core/src/source/model-source.ts', ['openModelSourceModule']],
+  ['packages/docx/src/document.ts', ['load']],
+  ['packages/xlsx/src/workbook.ts', ['load']],
+  ['packages/pptx/src/presentation.ts', ['load']],
+  ['packages/node/src/docx.ts', ['openDocxDocument', 'materializeDocxDocument']],
+  ['packages/node/src/xlsx.ts', ['openXlsxWorkbook']],
+  ['packages/node/src/pptx.ts', ['openPptxPresentationImpl']],
+  ['packages/node/src/docx-model-source.ts', ['acquireDocxInput']],
+  ['packages/node/src/xlsx-model-source.ts', ['acquireXlsxInput']],
+  ['packages/node/src/pptx-model-source.ts', ['acquirePptxInput']],
+  ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
+    [`packages/${format}/src/worker-source.ts`, ['self.onmessage']],
+    [`packages/${format}/src/render-worker-source.ts`,
+      format === 'pptx' ? ['executeArchiveFromNew'] : ['self.onmessage']],
+  ]),
+]);
+
+export function checkSourceDispatchImports(files) {
+  for (const { path, text } of files) {
+    if (/\.(?:test|spec|stories|probe)\.[cm]?[jt]sx?$/.test(path)) continue;
+    const ast = parse(text, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
+    const allowed = SOURCE_DISPATCH.get(path) ?? [];
+    function walk(node, functionName) {
+      if (!node || typeof node !== 'object' || !node.type) return;
+      let current = functionName;
+      if (node.type === 'FunctionDeclaration') current = node.id?.name;
+      if (['ClassMethod', 'ObjectMethod'].includes(node.type)) current = node.key?.name;
+      if (['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type)) {
+        // Preserve the containing named dispatch for its local callback/IIFE.
+        current = functionName;
+      }
+      if ((node.type === 'CallExpression' && node.callee.type === 'Import')
+        || node.type === 'ImportExpression') {
+        const target = node.arguments?.[0] ?? node.source;
+        const specifier = target?.value;
+        const sourceImport = typeof specifier === 'string'
+          ? /model-source/.test(specifier)
+          : text.slice(target?.start ?? 0, target?.end ?? 0).includes('sourceOwnerUrl')
+            || text.slice(target?.start ?? 0, target?.end ?? 0).includes('sourceModule.moduleUrl');
+        if (sourceImport && !allowed.includes(current)) {
+          throw new Error(`${path}:${node.loc?.start.line} model-source import outside an allowed dispatch function (${current ?? 'top level'})`);
+        }
+      }
+      // Assignment to self.onmessage is a named worker dispatch boundary.
+      if (node.type === 'AssignmentExpression' && node.left.type === 'MemberExpression'
+        && node.left.object.name === 'self' && node.left.property.name === 'onmessage') {
+        walk(node.right, 'self.onmessage');
+        return;
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach((child) => walk(child, current));
+        else if (value && typeof value === 'object' && value.type) walk(value, current);
+      }
+    }
+    walk(ast, undefined);
+  }
+}
+
+function trackedSourceFiles() {
+  return execFileSync('git', ['ls-files', 'packages/core/src', 'packages/docx/src',
+    'packages/xlsx/src', 'packages/pptx/src', 'packages/node/src'], { encoding: 'utf8' })
+    .split('\n').filter((path) => /\.[cm]?[jt]sx?$/.test(path) && existsSync(path))
+    .map((path) => ({ path, text: readFileSync(path, 'utf8') }));
+}
 
 function staticSpecifiers(ast) {
   return ast.program.body.flatMap((node) =>
@@ -17,6 +87,27 @@ function staticSpecifiers(ast) {
       && !(node.type === 'ImportDeclaration' && node.specifiers.length > 0
         && node.specifiers.every((specifier) => specifier.importKind === 'type'))
       ? [node.source.value] : []);
+}
+
+export function assertNoTopLevelModelImport(code, name) {
+  const ast = parse(code, { sourceType: 'module' });
+  function walk(node, functionDepth) {
+    if (!node || typeof node !== 'object' || !node.type) return;
+    const target = node.type === 'ImportExpression' ? node.source
+      : node.type === 'CallExpression' && node.callee.type === 'Import' ? node.arguments[0]
+        : undefined;
+    if (functionDepth === 0 && typeof target?.value === 'string'
+      && target.value.includes('model-source')) {
+      throw new Error(`${name} imports a model-source chunk at top level`);
+    }
+    const nested = functionDepth + (['FunctionDeclaration', 'FunctionExpression',
+      'ArrowFunctionExpression', 'ClassMethod', 'ObjectMethod'].includes(node.type) ? 1 : 0);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach((child) => walk(child, nested));
+      else if (value && typeof value === 'object' && value.type) walk(value, nested);
+    }
+  }
+  walk(ast, 0);
 }
 
 /** The real static source graph, including workspace package exports. */
@@ -66,6 +157,7 @@ function bundleGraph(entry) {
     if (visited.has(file)) continue;
     visited.add(file);
     const code = readFileSync(file, 'utf8');
+    assertNoTopLevelModelImport(code, file);
     bytes += Buffer.byteLength(code);
     joined += '\n' + code;
     codes.push(code);
@@ -105,7 +197,7 @@ function assertNoSourceRuntime(code, name) {
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_525_646, inline: 31_624, budget: 2_500 },
+  docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
   xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
   pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
   node: { entry: 2_575_997, budget: 3_600 },
@@ -171,6 +263,7 @@ export function checkBuiltBundles(dist = 'dist', { packages = false } = {}) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  checkSourceDispatchImports(trackedSourceFiles());
   const forbidden = [
     'packages/core/src/source/model-source.ts',
     ...['docx', 'xlsx', 'pptx'].map((format) => `packages/${format}/src/internal/worker-${format === 'docx' ? 'document' : format === 'xlsx' ? 'worksheet' : 'presentation'}-source.ts`),

@@ -169,7 +169,7 @@ export function beginModelSourceLoad(
     release.call(load);
   };
   try {
-    const module = validateModelSourceModuleDescriptor(record.module, target);
+    const sourceModule = validateModelSourceModuleDescriptor(record.module, target);
     const transfer = record.transfer === undefined ? [] : record.transfer;
     if (!Array.isArray(transfer)) {
       throw new TypeError('model source load transfer must be an array');
@@ -191,7 +191,7 @@ export function beginModelSourceLoad(
       seen.add(item);
     }
     return Object.freeze({
-      module,
+      module: sourceModule,
       transfer: Object.freeze([...transfer]),
       release: releaseOnce,
     });
@@ -326,9 +326,9 @@ export async function openModelSourceModule<TArchive>(
   signal?: AbortSignal,
   transfer: readonly Transferable[] = [],
 ): Promise<OpenedModelSourceModule<TArchive>> {
-  const module = validateModelSourceModuleDescriptor(descriptor);
+  const sourceModule = validateModelSourceModuleDescriptor(descriptor);
   throwIfAborted(signal);
-  const namespace: unknown = await import(/* @vite-ignore */ module.moduleUrl);
+  const namespace: unknown = await import(/* @vite-ignore */ sourceModule.moduleUrl);
   const open = typeof namespace === 'object' && namespace !== null
     ? (namespace as Partial<ModelSourceModule>).openModelSource
     : undefined;
@@ -336,7 +336,7 @@ export async function openModelSourceModule<TArchive>(
     throw new TypeError('model source module must export openModelSource()');
   }
   throwIfAborted(signal);
-  const opened: unknown = await open(bytes, module.config, signal, transfer);
+  const opened: unknown = await open(bytes, sourceModule.config, signal, transfer);
   if (typeof opened !== 'object' || opened === null) {
     throw new TypeError('openModelSource() must return an object');
   }

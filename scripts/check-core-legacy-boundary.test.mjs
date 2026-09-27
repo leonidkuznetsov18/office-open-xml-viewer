@@ -34,7 +34,7 @@ test('decodes escaped static, dynamic, require and re-export module specifiers',
     "require('@silurus/ooxml-\\u006cegacy-converter');",
     "import x from '../../legacy-\\u0063onverter/src/index.js';",
   ]) {
-    assert.deepEqual(rules(code), ['legacy-package'], code);
+    assert.ok(rules(code).includes('legacy-package'), code);
   }
 });
 
@@ -48,7 +48,8 @@ test('rejects computed imports and requires, import attributes and type-level im
   }
   assert.deepEqual(rules("import('@silurus/ooxml-\\u006cegacy-converter/package.json', { with: { type: 'json' } });"), ['legacy-package']);
   assert.deepEqual(rules("type X = import('@silurus/ooxml-\\u006cegacy-converter').X;"), ['legacy-package']);
-  assert.deepEqual(rules('require(variable);'), ['computed-module']);
+  assert.ok(rules('require(variable);').includes('computed-module'));
+  assert.ok(rules('require(variable);').includes('loader-identifier'));
   assert.deepEqual(rules('import(variable);'), ['computed-module']);
   assert.deepEqual(
     findViolations([{ path: 'packages/docx/src/new-probe.test.ts', text: 'import(variable);' }]).map((v) => v.rule),
@@ -69,7 +70,22 @@ test('rejects indirect Node require forms even with escaped module names', () =>
     "module?.['require'](name);",
     'module?.require?.(name);',
   ]) {
-    assert.ok(rules(code).includes('indirect-require'), code);
+    assert.ok(rules(code).some((rule) => rule === 'node-module-import' || rule === 'loader-identifier'), code);
+  }
+});
+
+test('rejects every Node module import form and loader identifier reference', () => {
+  for (const code of [
+    "import { 'createRequire' as load } from 'node:module'; load(import.meta.url)(name);",
+    "import Module from 'node:module'; const { 'createRequire': load } = Module; load(import.meta.url)(name);",
+    "import Module from 'node:module'; Module['create' + 'Require'](import.meta.url)(name);",
+    "import * as loader from 'module';",
+    "import('node:module');",
+    "const { module } = value;",
+    "module['require'](name);",
+    'require?.(name);',
+  ]) {
+    assert.ok(rules(code).some((rule) => rule === 'node-module-import' || rule === 'loader-identifier'), code);
   }
 });
 
