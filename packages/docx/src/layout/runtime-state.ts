@@ -87,7 +87,12 @@ const layoutVariantStores = new WeakMap<LayoutServices, LayoutVariantStore>();
  * handle through createLayoutServicesRuntimeView. */
 export interface ParagraphAcquisitionRuntimeCache {
   objectIdentity(value: object): number;
-  kinsokuKey(rules: KinsokuRules): readonly [boolean, readonly number[], readonly number[]];
+  /** Session-scoped ordinal that stands for one exact service fingerprint
+   * string inside acquisition keys (equal ordinals iff equal strings). */
+  fingerprintOrdinal(value: string | null): number | null;
+  /** Ordinal of the rule set's exact value (enabled flag plus sorted
+   * forbidden code points); equal values share one ordinal. */
+  kinsokuKey(rules: KinsokuRules): number;
   get(input: object, key: string): unknown;
   set(input: object, key: string, value: unknown): void;
   getLineBreaking(input: object, key: string): unknown;
@@ -113,7 +118,15 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
   const identities = new WeakMap<object, number>();
   const results = new WeakMap<object, Map<string, unknown>>();
   const lineBreaks = new WeakMap<object, Map<string, unknown>>();
-  const kinsokuKeys = new WeakMap<KinsokuRules, readonly [boolean, readonly number[], readonly number[]]>();
+  const kinsokuKeys = new WeakMap<KinsokuRules, number>();
+  const kinsokuOrdinals = new Map<string, number>();
+  // Service fingerprints are exact canonical identities, so they grow with the
+  // data they identify: the text-service fingerprint embeds the document's
+  // complete font-metric snapshot (tens of KB). Spelling it into every
+  // paragraph key made each retained key that large and re-allocated it on
+  // every acquisition. A session sees only a handful of distinct services, and
+  // this map keeps each string itself (no copy), so ordinals stay one-to-one.
+  const fingerprintOrdinals = new Map<string, number>();
   let nextIdentity = 1;
   let missCount = 0;
   return Object.freeze({
@@ -126,17 +139,33 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       }
       return retained;
     },
+    fingerprintOrdinal(value: string | null): number | null {
+      if (value === null) return null;
+      let ordinal = fingerprintOrdinals.get(value);
+      if (ordinal === undefined) {
+        ordinal = fingerprintOrdinals.size;
+        fingerprintOrdinals.set(value, ordinal);
+      }
+      return ordinal;
+    },
     kinsokuKey(rules: KinsokuRules) {
       let key = kinsokuKeys.get(rules);
-      if (!key) {
+      if (key === undefined) {
         // Document layout settings own this §17.3.1.16 / §17.15.1.58-.59
         // rule set for the whole pagination session. Its values are settled
-        // before any paragraph context is made.
-        key = [
+        // before any paragraph context is made. The spelled-out value (about
+        // 1 KB for the default East Asian sets) is kept once per session; keys
+        // carry its value-exact ordinal.
+        const value = JSON.stringify([
           rules.enabled,
           [...rules.lineStartForbidden].sort((left, right) => left - right),
           [...rules.lineEndForbidden].sort((left, right) => left - right),
-        ];
+        ]);
+        key = kinsokuOrdinals.get(value);
+        if (key === undefined) {
+          key = kinsokuOrdinals.size;
+          kinsokuOrdinals.set(value, key);
+        }
         kinsokuKeys.set(rules, key);
       }
       return key;

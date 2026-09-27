@@ -4208,11 +4208,11 @@ function paragraphAcquisitionKey(
       environment.resolvedLocalFonts
         ? cache.objectIdentity(environment.resolvedLocalFonts)
         : null,
-      layoutServices?.text.fingerprint ?? null,
-      layoutServices?.images.fingerprint ?? null,
-      layoutServices?.math.fingerprint ?? null,
-      layoutServices?.verticalGlyphFingerprint ?? null,
-      verticalGlyphMeasurement?.fingerprint ?? null,
+      cache.fingerprintOrdinal(layoutServices?.text.fingerprint ?? null),
+      cache.fingerprintOrdinal(layoutServices?.images.fingerprint ?? null),
+      cache.fingerprintOrdinal(layoutServices?.math.fingerprint ?? null),
+      cache.fingerprintOrdinal(layoutServices?.verticalGlyphFingerprint ?? null),
+      cache.fingerprintOrdinal(verticalGlyphMeasurement?.fingerprint ?? null),
       ...(lineOnly ? [
         environment.showTrackedChanges === true,
         environment.revisionAuthorColor
