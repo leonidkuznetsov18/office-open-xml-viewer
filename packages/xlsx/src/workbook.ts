@@ -334,6 +334,10 @@ export class XlsxWorkbook {
 
   /** Parse an XLSX from a URL or ArrayBuffer. */
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<XlsxWorkbook> {
+    if (opts.modelSources !== undefined) {
+      const { loadXlsxModelSource } = await import('./internal/workbook-model-source.js');
+      return loadXlsxModelSource(source, opts);
+    }
     opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const mode = opts.mode ?? 'main';

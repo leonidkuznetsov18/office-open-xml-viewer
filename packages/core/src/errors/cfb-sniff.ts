@@ -135,7 +135,7 @@ export function sniffCfb(bytes: Uint8Array): CfbKind | null {
  * Walk the directory-stream sector chain via the FAT and collect entry names.
  * Returns `null` if the structure is out of range / unreadable.
  */
-function enumerateDirectoryNames(
+export function enumerateDirectoryNames(
   view: DataView,
   totalLen: number,
   sectorSize: number,

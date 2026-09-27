@@ -475,6 +475,8 @@ describe('worker error wire', () => {
     'preserves %s across the worker wire',
     (original) => {
       const error = deserializeWorkerError(serializeWorkerError(original));
+      // The input is a test-owned built-in error, so its constructor is the
+      // independent expected class for this round-trip assertion.
       expect(error).toBeInstanceOf(original.constructor);
       expect(error.message).toBe(original.message);
     },

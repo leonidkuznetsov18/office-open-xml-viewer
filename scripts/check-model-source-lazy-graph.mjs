@@ -1,0 +1,302 @@
+#!/usr/bin/env node
+// The optional model-source implementation must stay outside every ordinary
+// OOXML entry and worker. Resolve workspace package exports with TypeScript,
+// then inspect the emitted static JS graph and decoded inline worker payloads.
+// This guards accidental eager coupling by maintainers or agents; it is not a
+// security boundary against deliberately adversarial JavaScript.
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { resolve, dirname, relative, extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse } from '@babel/parser';
+import { execFileSync } from 'node:child_process';
+import { createTypeScriptResolver } from './check-core-legacy-boundary.mjs';
+
+const resolveModule = createTypeScriptResolver();
+
+// The only entry-to-source transitions are these opt-in dispatch functions.
+// Keep this list exact: a new caller must explain why it can run only after
+// modelSources (or a worker source descriptor) is present.
+export const SOURCE_DISPATCH = new Map([
+  ['packages/core/src/source/model-source.ts', ['openModelSourceModule']],
+  ['packages/docx/src/document.ts', ['load']],
+  ['packages/xlsx/src/workbook.ts', ['load']],
+  ['packages/pptx/src/presentation.ts', ['load']],
+  ['packages/node/src/docx.ts', ['openDocxDocument', 'materializeDocxDocument']],
+  ['packages/node/src/xlsx.ts', ['openXlsxWorkbook']],
+  ['packages/node/src/pptx.ts', ['openPptxPresentationImpl']],
+  ['packages/node/src/docx-model-source.ts', ['acquireDocxInput']],
+  ['packages/node/src/xlsx-model-source.ts', ['acquireXlsxInput']],
+  ['packages/node/src/pptx-model-source.ts', ['acquirePptxInput']],
+  ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
+    [`packages/${format}/src/worker-source.ts`, ['self.onmessage']],
+    [`packages/${format}/src/render-worker-source.ts`,
+      format === 'pptx' ? ['executeArchiveFromNew'] : ['self.onmessage']],
+  ]),
+]);
+
+export function checkSourceDispatchImports(files) {
+  for (const { path, text } of files) {
+    if (/\.(?:test|spec|stories|probe)\.[cm]?[jt]sx?$/.test(path)) continue;
+    const ast = parse(text, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
+    const allowed = SOURCE_DISPATCH.get(path) ?? [];
+    function walk(node, functionName) {
+      if (!node || typeof node !== 'object' || !node.type) return;
+      let current = functionName;
+      if (node.type === 'FunctionDeclaration') current = node.id?.name;
+      if (['ClassMethod', 'ObjectMethod'].includes(node.type)) current = node.key?.name;
+      if (['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type)) {
+        // Preserve the containing named dispatch for its local callback/IIFE.
+        current = functionName;
+      }
+      if ((node.type === 'CallExpression' && node.callee.type === 'Import')
+        || node.type === 'ImportExpression') {
+        const target = node.arguments?.[0] ?? node.source;
+        const specifier = target?.value;
+        const sourceImport = typeof specifier === 'string'
+          ? /model-source/.test(specifier)
+          : text.slice(target?.start ?? 0, target?.end ?? 0).includes('sourceOwnerUrl')
+            || text.slice(target?.start ?? 0, target?.end ?? 0).includes('sourceModule.moduleUrl');
+        if (sourceImport && !allowed.includes(current)) {
+          throw new Error(`${path}:${node.loc?.start.line} model-source import outside an allowed dispatch function (${current ?? 'top level'})`);
+        }
+      }
+      // Assignment to self.onmessage is a named worker dispatch boundary.
+      if (node.type === 'AssignmentExpression' && node.left.type === 'MemberExpression'
+        && node.left.object.name === 'self' && node.left.property.name === 'onmessage') {
+        walk(node.right, 'self.onmessage');
+        return;
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach((child) => walk(child, current));
+        else if (value && typeof value === 'object' && value.type) walk(value, current);
+      }
+    }
+    walk(ast, undefined);
+  }
+}
+
+function trackedSourceFiles() {
+  return execFileSync('git', ['ls-files', 'packages/core/src', 'packages/docx/src',
+    'packages/xlsx/src', 'packages/pptx/src', 'packages/node/src'], { encoding: 'utf8' })
+    .split('\n').filter((path) => /\.[cm]?[jt]sx?$/.test(path) && existsSync(path))
+    .map((path) => ({ path, text: readFileSync(path, 'utf8') }));
+}
+
+function staticSpecifiers(ast) {
+  return ast.program.body.flatMap((node) =>
+    node.source && ['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type)
+      && node.importKind !== 'type' && node.exportKind !== 'type'
+      && !(node.type === 'ImportDeclaration' && node.specifiers.length > 0
+        && node.specifiers.every((specifier) => specifier.importKind === 'type'))
+      ? [node.source.value] : []);
+}
+
+export function assertNoTopLevelModelImport(code, name) {
+  const ast = parse(code, { sourceType: 'module' });
+  function walk(node, functionDepth) {
+    if (!node || typeof node !== 'object' || !node.type) return;
+    const target = node.type === 'ImportExpression' ? node.source
+      : node.type === 'CallExpression' && node.callee.type === 'Import' ? node.arguments[0]
+        : undefined;
+    if (functionDepth === 0 && typeof target?.value === 'string'
+      && target.value.includes('model-source')) {
+      throw new Error(`${name} imports a model-source chunk at top level`);
+    }
+    const nested = functionDepth + (['FunctionDeclaration', 'FunctionExpression',
+      'ArrowFunctionExpression', 'ClassMethod', 'ObjectMethod'].includes(node.type) ? 1 : 0);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach((child) => walk(child, nested));
+      else if (value && typeof value === 'object' && value.type) walk(value, nested);
+    }
+  }
+  walk(ast, 0);
+}
+
+/** The real static source graph, including workspace package exports. */
+export function eagerModules(entry) {
+  const visited = new Set();
+  const pending = [resolve(entry)];
+  while (pending.length) {
+    const file = pending.pop();
+    if (visited.has(file)) continue;
+    visited.add(file);
+    if (file.includes('/src/wasm/') || !/\.[cm]?[jt]sx?$/.test(file)) continue;
+    // Reparse on each audit. A test or editor can change a file between two
+    // calls in one process; a path-only cache would silently preserve its old
+    // import graph.
+    const ast = parse(readFileSync(file, 'utf8'), { sourceType: 'module', plugins: ['typescript', 'jsx'] });
+    const imports = staticSpecifiers(ast);
+    const importer = relative(process.cwd(), file).replaceAll('\\', '/');
+    for (const specifier of imports) {
+      if (specifier.includes('?')) continue;
+      let target;
+      if (specifier.startsWith('.')) {
+        const stem = resolve(dirname(file), specifier).replace(/\.js$/, '');
+        target = [stem + '.ts', stem + '.tsx', stem + '.js', stem + '.mjs']
+          .find((candidate) => existsSync(candidate));
+      } else if (file.startsWith(process.cwd())) {
+        target = resolveModule(importer, specifier);
+      }
+      if (target) pending.push(resolve(target));
+    }
+  }
+  return visited;
+}
+
+export function assertLazySourceOwner(entry, owner) {
+  const modules = eagerModules(entry);
+  if (modules.has(resolve(owner))) throw new Error(`${entry} statically reaches ${owner}`);
+}
+
+function bundleGraph(entry) {
+  const visited = new Set();
+  const pending = [resolve(entry)];
+  let bytes = 0;
+  let joined = '';
+  const codes = [];
+  while (pending.length) {
+    const file = pending.pop();
+    if (visited.has(file)) continue;
+    visited.add(file);
+    const code = readFileSync(file, 'utf8');
+    assertNoTopLevelModelImport(code, file);
+    bytes += Buffer.byteLength(code);
+    joined += '\n' + code;
+    codes.push(code);
+    const ast = parse(code, { sourceType: 'module' });
+    for (const specifier of staticSpecifiers(ast)) {
+      if (specifier.startsWith('.')) pending.push(resolve(dirname(file), specifier));
+    }
+  }
+  return { bytes, files: visited.size, joined, codes };
+}
+
+function inlineWorkers(code) {
+  const ast = parse(code, { sourceType: 'module' });
+  const outputs = [];
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'StringLiteral' && node.value.length > 10000) {
+      const decoded = node.value.includes('self.') ? node.value : Buffer.from(node.value, 'base64').toString();
+      if (decoded.includes('onmessage')) outputs.push(decoded);
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === 'object' && value.type) walk(value);
+    }
+  }
+  walk(ast);
+  return outputs;
+}
+
+function assertNoSourceRuntime(code, name) {
+  if (code.includes('ooxml-model-source-module/v1') || code.includes('model source view default')) {
+    throw new Error(`${name} includes optional source runtime in its eager OOXML code`);
+  }
+}
+
+// Baseline: the pre-feature OOXML production build at 776237df. The small
+// entry allowance covers the modelSources presence dispatch and its Vite
+// dynamic-chunk factoring; ordinary worker payloads have no allowance.
+const OOXML_BUNDLE_BASELINE = Object.freeze({
+  docx: { entry: 2_525_646, inline: 31_624, budget: 2_800 },
+  xlsx: { entry: 1_835_670, inline: 39_902, budget: 2_500 },
+  pptx: { entry: 1_824_262, inline: 59_554, budget: 2_100 },
+  node: { entry: 2_575_997, budget: 3_600 },
+});
+const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
+
+function assertBudget(actual, baseline, budget, label) {
+  if (actual > baseline + budget) {
+    throw new Error(`${label} exceeds OOXML dispatch budget: ${actual} > ${baseline} + ${budget}`);
+  }
+}
+
+export function checkBuiltBundles(dist = 'dist', { packages = false } = {}) {
+  for (const format of ['docx', 'xlsx', 'pptx', 'node']) {
+    const graph = bundleGraph(join(dist, `${format}.mjs`));
+    const baseline = OOXML_BUNDLE_BASELINE[format];
+    assertBudget(graph.bytes, baseline.entry, baseline.budget, `${format} static entry`);
+    assertNoSourceRuntime(graph.joined, `${format} static entry graph`);
+    console.log(`${format} static JS: ${graph.bytes} bytes (${graph.bytes - baseline.entry} over main; budget ${baseline.budget}) across ${graph.files} files`);
+    if (format !== 'node') {
+      for (const payload of graph.codes.flatMap(inlineWorkers)) {
+        assertNoSourceRuntime(payload, `${format} inline worker`);
+        const bytes = Buffer.byteLength(payload);
+        assertBudget(bytes, baseline.inline, 0, `${format} inline worker`);
+        console.log(`${format} inline worker: ${bytes} decoded bytes`);
+      }
+      const sidecar = join(dist, `${format}-source-worker.mjs`);
+      if (!existsSync(sidecar)) throw new Error(`Missing optional source sidecar ${sidecar}`);
+      const sidecarImports = staticSpecifiers(parse(readFileSync(sidecar, 'utf8'), { sourceType: 'module' }));
+      if (sidecarImports.length > 0) throw new Error(`${sidecar} is not self-contained`);
+      const packageSidecar = join('packages', format, 'dist', `${format}-source-worker.mjs`);
+      if (packages && !existsSync(packageSidecar)) {
+        throw new Error(`Missing optional package source sidecar ${packageSidecar}`);
+      }
+      if (packages && existsSync(packageSidecar)
+        && staticSpecifiers(parse(readFileSync(packageSidecar, 'utf8'), { sourceType: 'module' })).length > 0) {
+        throw new Error(`${packageSidecar} is not self-contained`);
+      }
+      const packageEntry = join('packages', format, 'dist', 'index.mjs');
+      if (packages) {
+        if (!existsSync(packageEntry)) throw new Error(`Missing package entry ${packageEntry}`);
+        const packageGraph = bundleGraph(packageEntry);
+        assertNoSourceRuntime(packageGraph.joined, `${format} package static entry graph`);
+        for (const payload of packageGraph.codes.flatMap(inlineWorkers)) {
+          assertNoSourceRuntime(payload, `${format} package inline worker`);
+        }
+      }
+    }
+  }
+  const ordinaryWorkers = [];
+  for (const file of readdirSync(join(dist, 'assets')).filter((name) => /^render-worker-.*\.js$/.test(name))) {
+    if (!file.startsWith('render-worker-source-')) {
+      ordinaryWorkers.push(Buffer.byteLength(readFileSync(join(dist, 'assets', file))));
+    }
+    assertNoSourceRuntime(readFileSync(join(dist, 'assets', file), 'utf8'), file);
+  }
+  if (ordinaryWorkers.length !== OOXML_RENDER_WORKERS.length) {
+    throw new Error(`Expected ${OOXML_RENDER_WORKERS.length} ordinary render workers, found ${ordinaryWorkers.length}`);
+  }
+  ordinaryWorkers.sort((a, b) => a - b);
+  OOXML_RENDER_WORKERS.forEach((baseline, index) =>
+    assertBudget(ordinaryWorkers[index], baseline, 0, `ordinary render worker ${index}`));
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  checkSourceDispatchImports(trackedSourceFiles());
+  const forbidden = [
+    'packages/core/src/source/model-source.ts',
+    ...['docx', 'xlsx', 'pptx'].map((format) => `packages/${format}/src/internal/worker-${format === 'docx' ? 'document' : format === 'xlsx' ? 'worksheet' : 'presentation'}-source.ts`),
+    ...['docx', 'xlsx'].map((format) => `packages/${format}/src/internal/node-model-source-acquisition.ts`),
+    'packages/pptx/src/internal/node-session-acquisition.ts',
+    ...['docx', 'xlsx', 'pptx'].map((format) => `packages/${format}/src/internal/model-source-session.ts`),
+    'packages/xlsx/src/internal/host-layout-measure.ts',
+    'packages/node/src/model-source.ts',
+    ...['docx', 'xlsx', 'pptx'].map((format) => `packages/node/src/${format}-model-source.ts`),
+    'packages/docx/src/internal/document-model-source.ts',
+    'packages/xlsx/src/internal/workbook-model-source.ts',
+    'packages/pptx/src/internal/presentation-model-source.ts',
+    ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
+      `packages/${format}/src/worker-source.ts`,
+      `packages/${format}/src/render-worker-source.ts`,
+    ]),
+  ];
+  for (const entry of [
+    'packages/core/src/index.ts',
+    ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
+      `packages/${format}/src/index.ts`,
+      `packages/${format}/src/worker.ts`,
+      `packages/${format}/src/render-worker.ts`,
+    ]),
+    'packages/node/src/index.ts',
+  ]) {
+    const graph = eagerModules(entry);
+    for (const module of forbidden) {
+      if (graph.has(resolve(module))) throw new Error(`${entry} statically reaches ${module}`);
+    }
+  }
+  if (existsSync('dist/docx.mjs')) checkBuiltBundles('dist', { packages: process.argv.includes('--packages') });
+  console.log('OOXML entries and workers keep model-source runtime behind dynamic loads.');
+}
