@@ -149,6 +149,7 @@ pub(super) fn project(
         let direct =
             formatting.direct_paragraph(style, table_style, mark_fc, mark_prm, &story.prcs)?;
         let mut paragraph = direct.paragraph;
+        let prior_number_label = direct.prior_number_label;
         match (context, direct.table_frame) {
             (Some(_), Some(frame)) => {
                 if outer_row_positions[paragraph_index]
@@ -172,6 +173,12 @@ pub(super) fn project(
             let bullet = marker.direct_picture_bullet()?;
             let mut info =
                 formatting.direct_numbering(numbering, reference, &marker, &paragraph)?;
+            if prior_number_label
+                .as_deref()
+                .is_some_and(|prior| prior != info.text)
+            {
+                formatting.unsupported_paragraph_properties = true;
+            }
             if let Some((relative_cp, auto_size)) = bullet {
                 if !auto_size {
                     // Word's measured fNoAutoSize control differs from the
@@ -230,6 +237,10 @@ pub(super) fn project(
                 ));
             }
             paragraph.numbering = Some(Box::new(info));
+        } else if prior_number_label.is_some() {
+            // Word can display removal of a formerly numbered paragraph;
+            // without a current marker there is no equality proof.
+            formatting.unsupported_paragraph_properties = true;
         }
         budget.paragraph(&paragraph)?;
 

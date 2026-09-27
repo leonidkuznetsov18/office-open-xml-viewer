@@ -41,6 +41,9 @@ impl AlignmentPatch {
 pub struct Properties {
     pub ilfo: i16,
     pub ilvl: u8,
+    /// [MS-DOC] 2.9.159 prior numbering label, retained until the current
+    /// marker has been resolved and compared in the direct story.
+    prior_number_label: Option<String>,
     protected_list_indent: Option<(i32, i32)>,
     tabs: super::tabs::Stops,
     flags: BTreeMap<&'static str, bool>,
@@ -76,6 +79,7 @@ impl Default for Properties {
         Self {
             ilfo: 0,
             ilvl: 0,
+            prior_number_label: None,
             protected_list_indent: None,
             tabs: super::tabs::Stops::default(),
             flags: BTreeMap::from([
@@ -133,6 +137,10 @@ impl Properties {
         self.alignment = (0, false);
     }
 
+    pub(super) fn prior_number_label(&self) -> Option<&str> {
+        self.prior_number_label.as_deref()
+    }
+
     pub fn apply(&mut self, code: u16, operand: &[u8]) -> Result<bool, String> {
         let flag = match code {
             0x2405 => Some("keepLines"),
@@ -158,16 +166,24 @@ impl Properties {
         }
         match code {
             0xc645 => {
-                // [MS-DOC] 2.6.2 sprmPNumRM / 2.9.159-160: the bounded
-                // no-display class has no prior-number template, placeholder,
-                // format or number value. Word PDFs of fNumRM=0/1 crossed
-                // with fRMPrint=0/1 are identical on every page for this
-                // class. A nonzero display operand remains unsupported;
-                // metadata alone is not an old number to paint.
+                // [MS-DOC] 2.9.159-160: the old-number template is independent
+                // of the current list marker. Word controls crossing fNumRM
+                // and fRMPrint do not display an absent old number. A second
+                // four-way control with nonempty old numbers also has no
+                // numbering-change markup when its old labels equal the
+                // current markers. Changing only pnbr or a literal prefix
+                // makes Word print formatting-change balloons and save six
+                // w:numberingChange elements. Retain the bounded old label
+                // for comparison after the list counter advances; mismatches
+                // stay gated because this model has no change-balloon layout.
                 if operand.len() != 129 || operand[0] != 128 || !matches!(operand[1], 0 | 1) {
                     return Err(unsupported("invalid Word numbering revision operand"));
                 }
-                if operand[9..].iter().any(|byte| *byte != 0) {
+                if operand[1] == 0 || operand[9..].iter().all(|byte| *byte == 0) {
+                    self.prior_number_label = None;
+                } else if let Some(label) = prior_decimal_number_label(operand)? {
+                    self.prior_number_label = Some(label);
+                } else {
                     return Ok(false);
                 }
             }
@@ -399,6 +415,46 @@ fn bool8(value: u8) -> Result<bool, String> {
     }
 }
 
+/// Expand only the one-level decimal NumRM class that can be compared with a
+/// current marker without inventing an old-label font or revision balloon.
+/// [MS-DOC] 2.9.159: rgbxchNums indexes xst (including its length word),
+/// rgnfc chooses the number format, and pnbr supplies that level's value.
+fn prior_decimal_number_label(operand: &[u8]) -> Result<Option<String>, String> {
+    let position = usize::from(operand[9]);
+    let count = usize::from(u16_at(operand, 65)?);
+    if !(1..=31).contains(&count)
+        || !(1..=count).contains(&position)
+        || operand[10..18].iter().any(|byte| *byte != 0)
+        || operand[18..27].iter().any(|byte| *byte != 0)
+        || operand[33..65].iter().any(|byte| *byte != 0)
+    {
+        return Ok(None);
+    }
+    let number = super::u32_at(operand, 29)?;
+    let mut units = Vec::with_capacity(count);
+    for index in 1..=count {
+        let unit = u16_at(operand, 65 + index * 2)?;
+        if index == position {
+            if unit != 0 {
+                return Ok(None);
+            }
+            units.push(None);
+        } else if !(0x20..=0x7e).contains(&unit) {
+            return Ok(None);
+        } else {
+            units.push(Some(unit));
+        }
+    }
+    let mut label = String::new();
+    for unit in units {
+        match unit {
+            Some(value) => label.push(char::from_u32(u32::from(value)).expect("ASCII unit")),
+            None => label.push_str(&number.to_string()),
+        }
+    }
+    Ok(Some(label))
+}
+
 pub fn prm0(prm: u16) -> Option<[u8; 3]> {
     let code: u16 = match (prm >> 1) & 127 {
         0x05 => 0x2461,
@@ -440,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_numbering_revision_has_no_print_marker_but_display_data_stays_gated() {
+    fn prior_decimal_number_label_is_retained_for_current_marker_comparison() {
         let baseline = projected(&Properties::default());
         for prior_numbered in [0, 1] {
             let mut operand = vec![0; 129];
@@ -450,8 +506,23 @@ mod tests {
             let mut properties = Properties::default();
             assert!(properties.apply(0xc645, &operand).unwrap());
             assert_eq!(projected(&properties), baseline);
-            operand[65] = 1; // nonempty old-number text
-            assert!(!properties.apply(0xc645, &operand).unwrap());
+            assert_eq!(properties.prior_number_label(), None);
+            operand[9] = 2;
+            operand[29] = 9;
+            operand[65] = 3;
+            operand[67] = b'[';
+            operand[71] = b']';
+            assert!(properties.apply(0xc645, &operand).unwrap());
+            assert_eq!(
+                properties.prior_number_label(),
+                (prior_numbered == 1).then_some("[9]")
+            );
+            assert_eq!(projected(&properties), baseline);
+            operand[18] = 1; // unsupported old-number format
+            assert_eq!(
+                properties.apply(0xc645, &operand).unwrap(),
+                prior_numbered == 0
+            );
             operand[0] = 127;
             assert!(properties.apply(0xc645, &operand).is_err());
         }

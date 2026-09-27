@@ -8,6 +8,7 @@ use docx_model::{DocParagraph, NumberingInfo, TextRun};
 pub(in crate::doc) struct DirectResolvedParagraph {
     pub(in crate::doc) paragraph: DocParagraph,
     pub(in crate::doc) numbering: Option<(numbering::Reference, Properties)>,
+    pub(in crate::doc) prior_number_label: Option<String>,
     /// The paragraph carries frame properties that `frame_pr` cannot
     /// represent. The caller decides: outside tables this is unsupported; a
     /// table paragraph may instead repeat its table's position.
@@ -116,6 +117,7 @@ impl Formatting<'_> {
         Ok(DirectResolvedParagraph {
             paragraph,
             numbering: resolved.numbering,
+            prior_number_label: resolved.properties.prior_number_label().map(str::to_string),
             frame_gap,
             table_frame,
         })
