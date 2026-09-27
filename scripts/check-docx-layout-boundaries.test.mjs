@@ -154,6 +154,7 @@ function production(state, table, para, group) {
   resolveFrameBox(para, group, state, 12, undefined);
 }
 `);
+  write(root, 'packages/docx/src/layout/body-table-measurement.ts', 'export {};\n');
   write(root, 'packages/docx/src/layout/acquisition-input-projections.ts',
     'export interface BodyAcquisitionInputProjections {\n'
       + '  numberingMarkerShapeInput(): unknown;\n'
@@ -633,6 +634,13 @@ test('production table and frame acquisition cannot regain local fallback measur
     write(root, 'packages/docx/src/layout/production-body-layout.ts', mutate(readFileSync(path, 'utf8')));
     expectDiagnostic(root, 'PRODUCTION_ACQUISITION_AUTHORITY', name, '--final');
   }
+});
+
+test('extracted table measurement cannot import a local line-layout fallback', () => {
+  const root = initializeCanonicalFixture('docx-layout-boundary-table-measurement-fallback-');
+  write(root, 'packages/docx/src/layout/body-table-measurement.ts',
+    "import { layoutLines } from '../line-layout.js';\nexport const fallback = layoutLines;\n");
+  expectDiagnostic(root, 'PRODUCTION_ACQUISITION_AUTHORITY', undefined, '--final');
 });
 
 test('renderer body acquisition cannot bypass its injected parser projections', () => {
