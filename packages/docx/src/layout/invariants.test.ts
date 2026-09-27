@@ -42,6 +42,27 @@ describe('plain-data layout validation paths', () => {
       .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', expected));
   });
 
+  it('validates an aliased node once but still reports cycles and its first bad path', () => {
+    const shared = { xPt: 1, yPt: 2 };
+    const descriptor = vi.spyOn(Object, 'getOwnPropertyDescriptor');
+    try {
+      layoutFingerprint({ pages: [{ a: shared, b: shared, c: [shared, shared] }], diagnostics: [] } as never);
+      const sharedReads = descriptor.mock.calls.filter(([owner]) => owner === shared).length;
+      expect(sharedReads).toBe(2);
+    } finally {
+      descriptor.mockRestore();
+    }
+
+    const cyclic: Record<string, unknown> = { xPt: 1 };
+    cyclic.self = { back: cyclic };
+    expect(() => layoutFingerprint({ pages: [{ a: cyclic, b: cyclic }], diagnostics: [] } as never))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.pages[0].a.self.back contains a cycle'));
+
+    const bad = { xPt: Number.NaN };
+    expect(() => layoutFingerprint({ pages: [{ a: bad, b: bad }], diagnostics: [] } as never))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.pages[0].a.xPt is not finite'));
+  });
+
   it('reports an accessor without invoking it', () => {
     const getter = vi.fn(() => 1);
     const value = { pages: [], diagnostics: [], extra: Object.defineProperty({}, 'value', {
