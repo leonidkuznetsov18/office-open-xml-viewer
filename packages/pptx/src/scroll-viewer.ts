@@ -14,6 +14,7 @@ import {
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
+import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -355,6 +356,44 @@ export class PptxScrollViewer implements ZoomableViewer {
     shouldSettle: (index) => !this._opts.enableMediaPlayback || this._rangeContains(this._mediaRange(), index),
   });
   private readonly _slots = this._scroller.slots;
+  private readonly _bitmap = new BitmapSlotRenderer<SlideSlot, PptxTextRunInfo>({
+    slots: () => this._slots,
+    inFlight: () => this._scroller.inFlight,
+    epoch: () => this._renderEpoch,
+    destroyed: () => this._destroyed,
+    scale: () => this._scale,
+    width: () => this._slideWidthPx(),
+    dpr: () => this._dpr(),
+    slotIndex: (slot) => slot.renderedSlide,
+    token: (slot) => slot.renderGeneration,
+    nextToken: (slot) => ++slot.renderGeneration,
+    canRetry: (slot) => !(this._opts.enableMediaPlayback && slot.mediaInteractive),
+    wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) || this._findActive,
+    render: (slide, canvas, width, dpr, onTextRun) =>
+      renderPptxFocusedSlide(this._pres!, canvas, slide, 'worker', {
+        width, dpr, imageResources: this._opts.imageResources, onTextRun,
+      }),
+    commitBitmap: (_slide, _slot, dispatcher, generation, bitmap, width) => {
+      const size = { cssWidth: Math.round(width), cssHeight: Math.round(this._slideHeightPx()) };
+      return this._opts.enableMediaPlayback
+        ? dispatcher.commitBitmapTo2d(generation, bitmap, size)
+        : dispatcher.commitBitmap(generation, bitmap, size);
+    },
+    commitRuns: (slide, slot, runs, width, wantedRuns) => {
+      if (slot.textLayer) {
+        this._clearTextLayerPreview(slot.textLayer);
+        if (this._opts.enableTextSelection) {
+          buildPptxTextLayer(slot.textLayer, runs,
+            Math.round(width), Math.round(this._slideHeightPx()),
+            this._hyperlinkHandler(), slide);
+        }
+      }
+      if (wantedRuns) this._highlights.refreshRuns(slide, runs);
+      this._commitSlotComments(slide, slot);
+      this._highlights.redrawSlot(slide, slot);
+    },
+    reportError: (error) => this._reportRenderError(error),
+  });
   private readonly _selection = new SelectionContextController<PptxSelectionContext, PptxElementContext, PptxPresentation, SlideSlot>({
     wrapper: () => this._wrapper,
     scrollHost: () => this._scrollHost,
@@ -438,22 +477,6 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  reporting an error so a rejection that lands after teardown is swallowed
    *  rather than surfaced to a `onError` on a dead viewer. */
   private _destroyed = false;
-  /** Worker mode: slide indices whose bitmap render is currently dispatched to the
-   *  engine. Coalesces a scroll storm — we never dispatch a second render for a
-   *  slide whose first is still in flight — and lets us drop slides that scrolled
-   *  out of the window before dispatch (design §11 worker coalescing).
-   *
-   *  T4 ZOOM HAZARD (RESOLVED by the render epoch below): coalescing keys on slide
-   *  INDEX only, with no notion of the scale a dispatch was made at. Once
-   *  `setScale` can change the zoom mid-flight, an in-flight bitmap dispatched at
-   *  the OLD scale can still pass the on-resolution identity check if the SAME
-   *  slot object is re-mounted for slide `i` (the pool reuses slot objects, so
-   *  `_slots.get(i) === slot && slot.renderedSlide === i` can hold for an old
-   *  dispatch), and get painted at the WRONG resolution. We fix this with a render
-   *  epoch (`_renderEpoch`): each dispatch captures the epoch, and on resolution a
-   *  moved epoch ⇒ STALE (close + re-dispatch the live slot). See
-   *  `_renderSlotBitmap`. */
-  private readonly _slideInFlight = this._scroller.inFlight;
   /** Render generation, bumped on every effective `setScale` (and the resize
    *  re-fit in `_onResize`, which routes through `setScale`). Stamped into each async render
    *  dispatch; a resolution whose captured epoch ≠ this value is STALE — its
@@ -1429,192 +1452,14 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._errorRouter.report(err);
   }
 
-  /**
-   * Worker-mode slot render: dispatch `renderSlideToBitmap`, transfer the result
-   * via a per-slot `bitmaprenderer` context, and manage the ImageBitmap lifecycle.
-   *
-   * Coalescing / drop-stale (design §11):
-   *  - Skip if slide `i` is already in flight (a scroll storm won't double-dispatch).
-   *  - Skip if slide `i` already left the mounted window before dispatch.
-   *  - On resolution, if `slot` is no longer THIS slide's live slot (it recycled to
-   *    another slide, or slide `i` re-mounted onto a DIFFERENT slot while this render
-   *    was in flight), close the orphan bitmap and skip the paint. In that
-   *    re-mount case a live slot for `i` still awaits a render, so once we clear
-   *    the in-flight guard we re-dispatch it — a slide that recycled and re-mounted
-   *    mid-flight must never stay blank.
-   *  - RENDER EPOCH: the dispatch captures `this._renderEpoch`. `setScale` bumps
-   *    the epoch, so a resolution whose captured epoch ≠ the live epoch is STALE
-   *    even when the SAME slot object is still mounted for slide `i` (the pool
-   *    reuses slot objects, so the identity check alone can't catch a zoom that
-   *    happened mid-flight). A moved epoch ⇒ close the orphan + re-dispatch the
-   *    live slot at the new scale, never paint the old-scale bitmap.
-   *
-   * Do NOT pass `dim` or `skipMediaControls` to `renderSlideToBitmap`. The scroll
-   * viewer never dims slides (design §8.2 / Delta 6); passing neither means the
-   * static play-badge renders on media slides (matching `PptxViewer`'s
-   * non-media-playback path) — acceptable for v1.
-   */
-  private async _renderSlotBitmap(
-    i: number,
-    slot: SlideSlot,
-    widthPx: number,
-    dpr: number,
-    scale: number,
+  private _renderSlotBitmap(
+    i: number, slot: SlideSlot, widthPx: number, dpr: number, scale: number,
     renderGeneration = ++slot.renderGeneration,
-    dispatcher = slot.dispatcher,
-    generation = dispatcher.begin(),
-    reportErrors = true,
+    dispatcher = slot.dispatcher, generation = dispatcher.begin(), reportErrors = true,
   ): Promise<void> {
-    if (this._slideInFlight.has(i)) return; // coalesce: already dispatched
-    // Drop-stale before dispatch: if this slide already scrolled out of the
-    // mounted window, don't dispatch at all.
-    if (this._slots.get(i) !== slot) return;
-    const epoch = this._renderEpoch;
-    this._slideInFlight.add(i);
-    // Capture the actual canvas/context pair at dispatch. A media promotion swaps
-    // slot.canvas to a 2D canvas while this worker bitmap is in flight; reading
-    // the mutable slot fields after await would clear that new interactive canvas.
-    const canvas = slot.canvas;
-    // Whether this invocation actually painted its slot. When it did NOT (stale
-    // epoch or moved identity), the `finally` may need to re-dispatch a live slot.
-    let painted = false;
-    // IX6 — harvest the slide's run geometry alongside the bitmap so the
-    // worker-mode selection overlay is built from the SAME data main mode uses.
-    // The runs ride back beside the bitmap (one round-trip), collected only when
-    // an overlay is actually wanted.
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive;
-    const runs: PptxTextRunInfo[] = [];
-    try {
-      const bmp = await renderPptxFocusedSlide(this._pres!, canvas, i, 'worker', {
-        width: widthPx,
-        dpr,
-        imageResources: this._opts.imageResources,
-        onTextRun: wantRuns ? (r) => runs.push(r) : undefined,
-      });
-      // Stale if EITHER (a) the epoch moved (a setScale rescaled mid-flight, so
-      // this bitmap is at a superseded resolution — this catches the case where
-      // the SAME slot object is re-mounted for slide `i`, which the identity check
-      // below cannot), or (b) the slot recycled to a different slide / slide `i`
-      // re-mounted onto a DIFFERENT slot. Either way: close + skip the paint.
-      if (
-        renderGeneration !== slot.renderGeneration ||
-        !dispatcher.isCurrent(generation) ||
-        canvas !== slot.canvas ||
-        epoch !== this._renderEpoch ||
-        this._slots.get(i) !== slot ||
-        slot.renderedSlide !== i
-      ) {
-        bmp.close();
-        return;
-      }
-      const size = {
-        // The worker bitmap may be physically downscaled by the shared canvas
-        // area guard. Preserve the requested logical slide box instead of
-        // deriving CSS geometry from that reduced backing store.
-        cssWidth: Math.round(widthPx),
-        cssHeight: Math.round(this._slideHeightPx()),
-      };
-      // Interactive media later paints through `presentSlide()` on the same
-      // pooled canvas, so that canvas must remain a 2D canvas. A browser canvas
-      // cannot switch back from `bitmaprenderer` after the first acquisition.
-      const committed = this._opts.enableMediaPlayback
-        ? dispatcher.commitBitmapTo2d(generation, bmp, size)
-        : dispatcher.commitBitmap(generation, bmp, size);
-      if (!committed) return;
-      // This bitmap now defines the scale the on-screen canvas lives at, so a
-      // later zoom preview stretches from HERE (design §7 renderedScale).
-      slot.renderedScale = scale;
-      // IX6 — build the selection overlay from the runs the worker just shipped.
-      // Reached only past the staleness gate, so the geometry matches THIS paint.
-      // Clear any preview transform first (a settle lands at the current scale, so
-      // the `scale()` from `_previewSlot` is stale) — mirrors the main path. The
-      // overlay is sized to the slot's CSS box (Math.round of the uniform slide
-      // width/height at the current scale), NOT the dpr-scaled backing store.
-      if (slot.textLayer) {
-        this._clearTextLayerPreview(slot.textLayer);
-        if (wantOverlay) {
-          buildPptxTextLayer(
-            slot.textLayer,
-            runs,
-            Math.round(widthPx),
-            Math.round(this._slideHeightPx()),
-            this._hyperlinkHandler(),
-            i,
-          );
-        }
-      }
-      if (wantRuns) this._highlights.refreshRuns(i, runs);
-      this._commitSlotComments(i, slot);
-      this._highlights.redrawSlot(i, slot);
-      painted = true;
-    } catch (err) {
-      const isCurrent =
-        renderGeneration === slot.renderGeneration &&
-        dispatcher.isCurrent(generation) &&
-        canvas === slot.canvas &&
-        epoch === this._renderEpoch &&
-        this._slots.get(i) === slot &&
-        slot.renderedSlide === i;
-      if (isCurrent) {
-        if (reportErrors) this._reportRenderError(err);
-        else throw err;
-      }
-    } finally {
-      this._slideInFlight.delete(i);
-      // Re-dispatch ONLY when this invocation went stale — a LIVE slot for slide
-      // `i` still awaits a correct render and the reason we didn't paint was
-      // staleness, not a render failure. The two staleness cases:
-      //  - IDENTITY MOVED (`live !== slot`): slide `i` re-mounted onto a DIFFERENT
-      //    slot while we ran (the re-mount's own dispatch was coalesced away by
-      //    the in-flight guard), so the live slot has no render in flight.
-      //  - EPOCH MOVED (`epoch !== this._renderEpoch`): a `setScale` bumped the
-      //    epoch mid-flight, so this bitmap was at a superseded scale. The live
-      //    slot may be the SAME object reused from the pool, which the identity
-      //    test alone would miss — the epoch test catches the same-slot case.
-      // NO RETRY ON PLAIN REJECTION: when the slot is still live at the same epoch
-      // and we simply failed (`renderSlideToBitmap` rejected or the transfer threw),
-      // `!painted` holds but BOTH staleness tests are false, so we do NOT
-      // re-dispatch. Retrying a plain failure would loop unbounded (reject →
-      // re-dispatch → reject → …); the onError contract is that "a failed slide is
-      // left blank" (see PptxScrollViewerOptions.onError), so we leave it blank.
-      // Bounded epoch-then-reject: an epoch-moved re-dispatch captures the NEW
-      // epoch, so if that fresh render then rejects at the still-current epoch,
-      // both tests are false and it stops — no unbounded retry.
-      const live = this._slots.get(i);
-      if (
-        !painted &&
-        live &&
-        (
-          live !== slot ||
-          epoch !== this._renderEpoch ||
-          renderGeneration !== live.renderGeneration ||
-          !dispatcher.isCurrent(generation)
-        ) &&
-        !this._slideInFlight.has(i) &&
-        !this._destroyed &&
-        !(this._opts.enableMediaPlayback && live.mediaInteractive)
-      ) {
-        // live.renderedSlide === i already (set by _renderSlot on mount); the fresh
-        // dispatch runs at the CURRENT epoch/scale via _slideWidthPx(). Keep the
-        // replacement in this Promise chain so load() cannot resolve after a
-        // superseded opening render but before the bitmap that can actually
-        // commit. Fire-and-forget callers retain that behavior at their outer
-        // call site.
-        const nextDispatcher = live.dispatcher;
-        await this._renderSlotBitmap(
-          i,
-          live,
-          this._slideWidthPx(),
-          this._dpr(),
-          this._scale,
-          ++live.renderGeneration,
-          nextDispatcher,
-          nextDispatcher.begin(),
-          reportErrors,
-        );
-      }
-    }
+    return this._bitmap.render(
+      i, slot, widthPx, dpr, scale, renderGeneration, dispatcher, generation, reportErrors,
+    );
   }
 
   /** Keep the public zoom facade while core owns scale, fit and anchoring. */

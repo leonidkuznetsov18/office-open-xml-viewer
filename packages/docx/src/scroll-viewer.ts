@@ -18,6 +18,7 @@ import {
 import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/read-only-comment-contract';
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
+import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -360,6 +361,48 @@ export class DocxScrollViewer implements ZoomableViewer {
     onExistingSlot: (index, slot, reportErrors) => this._renderSlot(index, slot, reportErrors),
   });
   private readonly _slots = this._scroller.slots;
+  private readonly _bitmap = new BitmapSlotRenderer<PageSlot, DocxTextRunInfo>({
+    slots: () => this._slots,
+    inFlight: () => this._scroller.inFlight,
+    epoch: () => this._renderEpoch,
+    destroyed: () => this._destroyed,
+    scale: () => this._scale,
+    width: (page) => this._pageWidthPx(page),
+    dpr: () => this._dpr(),
+    slotIndex: (slot) => slot.renderedPage,
+    token: () => 0,
+    nextToken: () => 0,
+    canRetry: () => true,
+    wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) ||
+      this._findActive || !!slot.commentTintLayer,
+    render: (page, canvas, width, dpr, onTextRun) =>
+      renderDocxFocusedPage(this._doc!, canvas, page, 'worker', {
+        width, dpr,
+        imageResources: this._opts.imageResources,
+        defaultTextColor: this._opts.defaultTextColor,
+        currentDate: this._currentDate,
+        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
+        onTextRun,
+      }),
+    commitBitmap: (page, slot, dispatcher, generation, bitmap, width) =>
+      dispatcher.commitBitmap(generation, bitmap, {
+        cssWidth: width, cssHeight: this._pageHeightPx(page),
+      }),
+    commitRuns: (page, slot, runs, _width, wantedRuns) => {
+      if (slot.textLayer) {
+        this._clearTextLayerPreview(slot.textLayer);
+        if (this._opts.enableTextSelection) {
+          const { width, height } = this._canvasCssPx(slot.canvas);
+          buildDocxTextLayer(slot.textLayer, runs, width, height,
+            this._hyperlinkHandler(), (font) => this._highlights.measure(font), page);
+        }
+      }
+      if (wantedRuns) this._highlights.refreshRuns(page, runs);
+      this._commitCommentRuns(page, slot, runs);
+      this._highlights.redrawSlot(page, slot);
+    },
+    reportError: (error) => this._reportRenderError(error),
+  });
   private readonly _selection = new SelectionContextController<DocxSelectionContext, DocxElementContext, DocxDocument, PageSlot>({
     wrapper: () => this._wrapper,
     scrollHost: () => this._scrollHost,
@@ -469,22 +512,6 @@ export class DocxScrollViewer implements ZoomableViewer {
   /** Throwaway 2D context reused to measure text for the §17.3.2.10 縦中横 overlay
    *  clamp (#836). Lazily created; `null` when canvas metrics are unavailable
    *  (headless), in which case the overlay degrades to the un-clamped span. */
-  /** Worker mode: page indices whose bitmap render is currently dispatched to the
-   *  engine. Coalesces a scroll storm — we never dispatch a second render for a
-   *  page whose first is still in flight — and lets us drop pages that scrolled
-   *  out of the window before dispatch (design §11 worker coalescing).
-   *
-   *  T4 ZOOM HAZARD (RESOLVED by the render epoch below): coalescing keys on page
-   *  INDEX only, with no notion of the scale a dispatch was made at. Once
-   *  `setScale` can change the zoom mid-flight, an in-flight bitmap dispatched at
-   *  the OLD scale can still pass the on-resolution identity check if the SAME
-   *  slot object is re-mounted for page `i` (the pool reuses slot objects, so
-   *  `_slots.get(i) === slot && slot.renderedPage === i` can hold for an old
-   *  dispatch), and get painted at the WRONG resolution. We fix this with a render
-   *  epoch (`_renderEpoch`): each dispatch captures the epoch, and on resolution a
-   *  moved epoch ⇒ STALE (close + re-dispatch the live slot). See
-   *  `_renderSlotBitmap`. */
-  private readonly _bitmapInFlight = this._scroller.inFlight;
   /** Render generation, bumped on every effective `setScale` (and the resize
    *  re-fit in `_onResize`, which routes through `setScale`). Stamped into each async render
    *  dispatch; a resolution whose captured epoch ≠ this value is STALE — its
@@ -1424,172 +1451,11 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._errorRouter.report(err);
   }
 
-  /**
-   * Worker-mode slot render: dispatch `renderPageToBitmap`, transfer the result
-   * via a per-slot `bitmaprenderer` context, and manage the ImageBitmap lifecycle.
-   *
-   * Coalescing / drop-stale (design §11):
-   *  - Skip if page `i` is already in flight (a scroll storm won't double-dispatch).
-   *  - Skip if page `i` already left the mounted window before dispatch.
-   *  - On resolution, if `slot` is no longer THIS page's live slot (it recycled to
-   *    another page, or page `i` re-mounted onto a DIFFERENT slot while this render
-   *    was in flight), close the orphan bitmap and skip the paint. In that
-   *    re-mount case a live slot for `i` still awaits a render, so once we clear
-   *    the in-flight guard we re-dispatch it — a page that recycled and re-mounted
-   *    mid-flight must never stay blank.
-   *  - RENDER EPOCH: the dispatch captures `this._renderEpoch`. `setScale` bumps
-   *    the epoch, so a resolution whose captured epoch ≠ the live epoch is STALE
-   *    even when the SAME slot object is still mounted for page `i` (the pool
-   *    reuses slot objects, so the identity check alone can't catch a zoom that
-   *    happened mid-flight). A moved epoch ⇒ close the orphan + re-dispatch the
-   *    live slot at the new scale, never paint the old-scale bitmap.
-   */
-  private async _renderSlotBitmap(
-    i: number,
-    slot: PageSlot,
-    widthPx: number,
-    dpr: number,
-    scale: number,
-    dispatcher = slot.dispatcher,
-    generation = dispatcher.begin(),
-    reportErrors = true,
+  private _renderSlotBitmap(
+    i: number, slot: PageSlot, widthPx: number, dpr: number, scale: number,
+    dispatcher = slot.dispatcher, generation = dispatcher.begin(), reportErrors = true,
   ): Promise<void> {
-    if (this._bitmapInFlight.has(i)) return; // coalesce: already dispatched
-    // Drop-stale before dispatch: if this page already scrolled out of the
-    // mounted window, don't dispatch at all.
-    if (this._slots.get(i) !== slot) return;
-    const epoch = this._renderEpoch;
-    // Logical CSS geometry is independent from the worker bitmap's backing
-    // dimensions. The renderer may reduce the bitmap to stay inside the browser
-    // canvas area limit; the page must still occupy its requested layout box.
-    const heightPx = this._pageHeightPx(i);
-    this._bitmapInFlight.add(i);
-    // Whether this invocation actually painted its slot. When it did NOT (stale
-    // epoch or moved identity), the `finally` may need to re-dispatch a live slot.
-    let painted = false;
-    // IX6 — harvest the page's run geometry alongside the bitmap so the
-    // worker-mode selection overlay is built from the SAME data main mode uses.
-    // The runs ride back beside the bitmap (one round-trip), collected only when
-    // an overlay is actually wanted.
-    const wantOverlay = !!this._opts.enableTextSelection && !!slot.textLayer;
-    const wantRuns = wantOverlay || this._findActive || !!slot.commentTintLayer;
-    const runs: DocxTextRunInfo[] = [];
-    try {
-      const bmp = await renderDocxFocusedPage(this._doc!, slot.canvas, i, 'worker', {
-        width: widthPx,
-        dpr,
-        imageResources: this._opts.imageResources,
-        defaultTextColor: this._opts.defaultTextColor,
-        currentDate: this._currentDate,
-        ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
-        onTextRun: wantRuns ? (r) => runs.push(r) : undefined,
-      });
-      // Stale if EITHER (a) the epoch moved (a setScale rescaled mid-flight, so
-      // this bitmap is at a superseded resolution — this catches the case where
-      // the SAME slot object is re-mounted for page `i`, which the identity check
-      // below cannot), or (b) the slot recycled to a different page / page `i`
-      // re-mounted onto a DIFFERENT slot. Either way: close + skip the paint.
-      if (
-        !dispatcher.isCurrent(generation) ||
-        epoch !== this._renderEpoch ||
-        this._slots.get(i) !== slot ||
-        slot.renderedPage !== i
-      ) {
-        bmp.close();
-        return;
-      }
-      if (!dispatcher.commitBitmap(generation, bmp, {
-        cssWidth: widthPx,
-        cssHeight: heightPx,
-      })) return;
-      // This bitmap now defines the scale the on-screen canvas lives at, so a
-      // later zoom preview stretches from HERE (design §7 renderedScale).
-      slot.renderedScale = scale;
-      // IX6 — build the selection overlay from the runs the worker just shipped.
-      // Reached only past the staleness gate, so the geometry matches THIS paint
-      // (same epoch guard the main-mode path relies on for stale-scale safety).
-      // Clear any preview transform first: a settle re-render lands at the
-      // current scale, so the overlay's `scale()` from `_previewSlot` is stale
-      // and the rebuilt spans already sit at the crisp geometry (mirrors the
-      // main-mode `_refreshSlotAtomically` clear).
-      if (slot.textLayer) {
-        this._clearTextLayerPreview(slot.textLayer);
-        if (wantOverlay) {
-          const { width, height } = this._canvasCssPx(slot.canvas);
-          buildDocxTextLayer(
-            slot.textLayer,
-            runs,
-            width,
-            height,
-            this._hyperlinkHandler(),
-            (font) => this._highlights.measure(font),
-            i,
-          );
-        }
-      }
-      if (wantRuns) this._highlights.refreshRuns(i, runs);
-      this._commitCommentRuns(i, slot, runs);
-      this._highlights.redrawSlot(i, slot);
-      painted = true;
-    } catch (err) {
-      const isCurrent =
-        dispatcher.isCurrent(generation) &&
-        epoch === this._renderEpoch &&
-        this._slots.get(i) === slot &&
-        slot.renderedPage === i;
-      if (isCurrent) {
-        if (reportErrors) this._reportRenderError(err);
-        else throw err;
-      }
-    } finally {
-      this._bitmapInFlight.delete(i);
-      // Re-dispatch ONLY when this invocation went stale — a LIVE slot for page
-      // `i` still awaits a correct render and the reason we didn't paint was
-      // staleness, not a render failure. The two staleness cases:
-      //  - IDENTITY MOVED (`live !== slot`): page `i` re-mounted onto a DIFFERENT
-      //    slot while we ran (the re-mount's own dispatch was coalesced away by
-      //    the in-flight guard), so the live slot has no render in flight.
-      //  - EPOCH MOVED (`epoch !== this._renderEpoch`): a `setScale` bumped the
-      //    epoch mid-flight, so this bitmap was at a superseded scale. The live
-      //    slot may be the SAME object reused from the pool, which the identity
-      //    test alone would miss — the epoch test catches the same-slot case.
-      // NO RETRY ON PLAIN REJECTION: when the slot is still live at the same epoch
-      // and we simply failed (`renderPageToBitmap` rejected or the transfer threw),
-      // `!painted` holds but BOTH staleness tests are false, so we do NOT
-      // re-dispatch. Retrying a plain failure would loop unbounded (reject →
-      // re-dispatch → reject → …); the onError contract is that "a failed page is
-      // left blank" (see DocxScrollViewerOptions.onError), so we leave it blank.
-      // Bounded epoch-then-reject: an epoch-moved re-dispatch captures the NEW
-      // epoch, so if that fresh render then rejects at the still-current epoch,
-      // both tests are false and it stops — no unbounded retry.
-      const live = this._slots.get(i);
-      if (
-        !painted &&
-        live &&
-        (live !== slot || epoch !== this._renderEpoch || !dispatcher.isCurrent(generation)) &&
-        !this._bitmapInFlight.has(i) &&
-        !this._destroyed
-      ) {
-        // live.renderedPage === i already (set by _renderSlot on mount); the fresh
-        // dispatch runs at the CURRENT epoch/scale via _pageWidthPx(i). Keep the
-        // replacement in this Promise chain: load() awaits the render originally
-        // mounted for the opening window, and must therefore follow superseding
-        // epochs until the render that can actually commit has finished. Callers
-        // that intentionally fire-and-forget this method still do so at their
-        // outer call site.
-        const nextDispatcher = live.dispatcher;
-        await this._renderSlotBitmap(
-          i,
-          live,
-          this._pageWidthPx(i),
-          this._dpr(),
-          this._scale,
-          nextDispatcher,
-          nextDispatcher.begin(),
-          reportErrors,
-        );
-      }
-    }
+    return this._bitmap.render(i, slot, widthPx, dpr, scale, 0, dispatcher, generation, reportErrors);
   }
 
   /** Keep the public zoom facade while core owns scale, fit and anchoring. */
