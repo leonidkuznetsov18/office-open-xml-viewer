@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { FlowCapacityExceededError, layoutFlowBlocks } from './flow.js';
 import {
   assertAndDeepFreezeDocumentLayout,
@@ -29,6 +29,28 @@ const source = (index: number): SourceRef => ({
   story: 'body',
   storyInstance: 'body',
   path: [index],
+});
+
+describe('plain-data layout validation paths', () => {
+  it.each([
+    [{ pages: [{ content: [{ size: Number.NaN }] }], diagnostics: [] }, 'layout.pages[0].content[0].size is not finite'],
+    [{ pages: [{ content: [undefined] }], diagnostics: [] }, 'layout.pages[0].content[0] contains undefined'],
+    [{ pages: [], diagnostics: [], extra: new Date(0) }, 'layout.extra is not a plain record'],
+    [{ pages: [], diagnostics: [], extra: Object.assign([1], { note: 2 }) }, 'layout.extra.note is not an array index'],
+  ])('preserves the exact path and reason for a violation', (value, expected) => {
+    expect(() => layoutFingerprint(value as unknown as DocumentLayout))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', expected));
+  });
+
+  it('reports an accessor without invoking it', () => {
+    const getter = vi.fn(() => 1);
+    const value = { pages: [], diagnostics: [], extra: Object.defineProperty({}, 'value', {
+      enumerable: true, get: getter,
+    }) };
+    expect(() => layoutFingerprint(value as unknown as DocumentLayout))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.extra.value is not plain data'));
+    expect(getter).not.toHaveBeenCalled();
+  });
 });
 
 const rect = (xPt: number, yPt: number, widthPt: number, heightPt: number): LayoutRect => ({

@@ -63,66 +63,92 @@ const SOURCE_STORIES = new Set<SourceRef['story']>(
   Object.keys(SOURCE_STORY_MEMBERS) as SourceRef['story'][],
 );
 
-function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<object>(), deferPages = false): void {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is not finite`);
-    }
-    return;
-  }
-  if (typeof value !== 'object') {
-    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} contains ${typeof value}`);
-  }
-  if (ancestors.has(value)) {
-    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} contains a cycle`);
-  }
+function plainDataPath(root: string, parts: readonly (string | number)[]): string {
+  let path = root;
+  for (const part of parts) path += typeof part === 'number' ? `[${part}]` : `.${part}`;
+  return path;
+}
 
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) {
-      let indexCount = 0;
-      for (const key of Reflect.ownKeys(value)) {
-        if (key === 'length') continue;
-        if (typeof key !== 'string') {
-          throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} has a symbol key`);
-        }
-        const index = Number(key);
-        if (!Number.isInteger(index) || index < 0 || String(index) !== key || index >= value.length) {
-          throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}.${key} is not an array index`);
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (!descriptor?.enumerable || !('value' in descriptor)) {
-          throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}[${key}] is not plain data`);
-        }
-        if (!(deferPages && path === 'layout.pages')) {
-          assertPlainData(descriptor.value, `${path}[${key}]`, ancestors);
-        }
-        indexCount += 1;
-      }
-      if (indexCount !== value.length) {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is sparse`);
+function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<object>(), deferPages = false): void {
+  // Keep one mutable ancestry path for the walk. Rendering a string at each
+  // property used to allocate one full path per node on every finalization.
+  const parts: (string | number)[] = [];
+  const walk = (current: unknown, skipPageContents: boolean): void => {
+    if (current === null || typeof current === 'string' || typeof current === 'boolean') return;
+    if (typeof current === 'number') {
+      if (!Number.isFinite(current)) {
+        throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is not finite`);
       }
       return;
     }
+    if (typeof current !== 'object') {
+      throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} contains ${typeof current}`);
+    }
+    if (ancestors.has(current)) {
+      throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} contains a cycle`);
+    }
 
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is not a plain record`);
-    }
-    for (const key of Reflect.ownKeys(value)) {
-      if (typeof key !== 'string') {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} has a symbol key`);
+    ancestors.add(current);
+    try {
+      if (Array.isArray(current)) {
+        let indexCount = 0;
+        for (const key of Reflect.ownKeys(current)) {
+          if (key === 'length') continue;
+          if (typeof key !== 'string') {
+            throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} has a symbol key`);
+          }
+          const index = Number(key);
+          if (!Number.isInteger(index) || index < 0 || String(index) !== key || index >= current.length) {
+            throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)}.${key} is not an array index`);
+          }
+          // A descriptor is required here and for records below: reading the
+          // property would invoke an accessor, changing validation behavior.
+          const descriptor = Object.getOwnPropertyDescriptor(current, key);
+          if (!descriptor?.enumerable || !('value' in descriptor)) {
+            throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)}[${key}] is not plain data`);
+          }
+          if (!(skipPageContents && path === 'layout' && parts.length === 1 && parts[0] === 'pages')) {
+            const child = descriptor.value;
+            if (child !== null && typeof child !== 'string' && typeof child !== 'boolean'
+              && !(typeof child === 'number' && Number.isFinite(child))) {
+              parts.push(index);
+              walk(child, false);
+              parts.pop();
+            }
+          }
+          indexCount += 1;
+        }
+        if (indexCount !== current.length) {
+          throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is sparse`);
+        }
+        return;
       }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor?.enumerable || !('value' in descriptor)) {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}.${key} is not plain data`);
+
+      const prototype = Object.getPrototypeOf(current);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is not a plain record`);
       }
-      assertPlainData(descriptor.value, `${path}.${key}`, ancestors, deferPages);
+      for (const key of Reflect.ownKeys(current)) {
+        if (typeof key !== 'string') {
+          throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} has a symbol key`);
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!descriptor?.enumerable || !('value' in descriptor)) {
+          throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)}.${key} is not plain data`);
+        }
+        const child = descriptor.value;
+        if (child !== null && typeof child !== 'string' && typeof child !== 'boolean'
+          && !(typeof child === 'number' && Number.isFinite(child))) {
+          parts.push(key);
+          walk(child, skipPageContents);
+          parts.pop();
+        }
+      }
+    } finally {
+      ancestors.delete(current);
     }
-  } finally {
-    ancestors.delete(value);
-  }
+  };
+  walk(value, deferPages);
 }
 
 function requireFinite(value: number, path: string): void {
