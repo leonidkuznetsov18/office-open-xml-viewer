@@ -90,13 +90,29 @@ export function legacyBundleBoundary(): Plugin {
   return {
     name: 'legacy-bundle-boundary',
     generateBundle(_options, bundle) {
-      for (const [fileName, output] of Object.entries(bundle)) {
+      // Optional legacy-* entries are allowed to contain the reader. Follow
+      // only static imports from ordinary entries and workers, so a shared
+      // chunk cannot silently bring the reader into an OOXML load.
+      const entries = Object.values(bundle).filter((output) =>
+        output.type === 'chunk' && output.isEntry
+        && !output.fileName.startsWith('.types-work/')
+        && !/(?:^|[\\/])legacy-(?:doc|xls|ppt)\./.test(output.fileName));
+      const visited = new Set<string>();
+      const pending = [...entries];
+      while (pending.length > 0) {
+        const output = pending.pop()!;
         if (output.type !== 'chunk') continue;
+        if (visited.has(output.fileName)) continue;
+        visited.add(output.fileName);
         for (const moduleId of Object.keys(output.modules)) {
           if (/(?:^|[\\/])packages[\\/]legacy-converter(?:[\\/]|$)/.test(moduleId)
             || moduleId.includes('@silurus/ooxml-legacy-converter')) {
-            this.error(`${fileName} contains forbidden legacy module ${moduleId}`);
+            this.error(`${output.fileName} contains forbidden legacy module ${moduleId}`);
           }
+        }
+        for (const imported of output.imports) {
+          const child = bundle[imported];
+          if (child?.type === 'chunk') pending.push(child);
         }
       }
     },
