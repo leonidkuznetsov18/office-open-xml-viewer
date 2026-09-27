@@ -296,7 +296,7 @@ export class PptxPresentation {
   private _chartEx: ChartExRenderer | undefined;
   private _tiff: TiffRenderer | undefined;
 
-  private constructor(worker: Worker, mode: 'main' | 'worker', wasmUrlOverride?: string | URL) {
+  private constructor(worker: Worker, mode: 'main' | 'worker', wasmUrlOverride?: string | URL, initializeWasm = true) {
     this._worker = worker;
     this._mode = mode;
     this._bridge = new WorkerBridge<
@@ -321,8 +321,10 @@ export class PptxPresentation {
     // Default: the parser WASM emitted next to this bundle, resolved relative to
     // the document URL. `wasmUrl` overrides it (CDN / self-hosted copy); a
     // relative override is still resolved against `location.href`.
-    const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
-    this._bridge.post({ kind: 'init', wasmUrl } satisfies PptxWorkerRequest);
+    if (initializeWasm) {
+      const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
+      this._bridge.post({ kind: 'init', wasmUrl } satisfies PptxWorkerRequest);
+    }
   }
 
   private _assertResourceHealthy(): void {
@@ -394,7 +396,7 @@ export class PptxPresentation {
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     let pres: PptxPresentation | undefined;
     try {
-      pres = new PptxPresentation(worker, mode, opts.wasmUrl);
+      pres = new PptxPresentation(worker, mode, opts.wasmUrl, sourceLoad === undefined);
       pres._sourceLoad = sourceLoad;
       pres._metrics = metrics;
       if (opts.math && mode === 'worker' && !rendererDescriptors?.math) {
@@ -460,6 +462,7 @@ export class PptxPresentation {
         );
       }
       metrics.succeed({ slides: pres.slideCount });
+      sourceLoad?.release();
       return pres;
     } catch (error) {
       const rejectedPresentation = pres;
@@ -502,9 +505,9 @@ export class PptxPresentation {
     const response = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers, ...modelSourceFields(this._sourceLoad) } satisfies RenderWorkerRequest)
-          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback, ...modelSourceFields(this._sourceLoad) } satisfies PptxWorkerRequest),
-      [buffer, ...(this._sourceLoad?.transfer ?? [])],
+          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers, ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined) } satisfies RenderWorkerRequest)
+          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback, ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined) } satisfies PptxWorkerRequest),
+      this._sourceLoad ? [buffer, ...this._sourceLoad.transfer] : [buffer],
       { timeoutMs },
     );
     if (this._mode === 'worker') {
@@ -604,9 +607,9 @@ export class PptxPresentation {
       (id) => ({
         kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback,
         progressiveLayout: true,
-        ...modelSourceFields(this._sourceLoad),
+        ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined),
       }) satisfies PptxWorkerRequest,
-      [buffer, ...(this._sourceLoad?.transfer ?? [])],
+      this._sourceLoad ? [buffer, ...this._sourceLoad.transfer] : [buffer],
       { timeoutMs },
     );
     const bootstrap = normalizePresentationBootstrap(
@@ -689,10 +692,10 @@ export class PptxPresentation {
         return {
           kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers,
           progressiveLayout: true,
-          ...modelSourceFields(this._sourceLoad),
+          ...(this._sourceLoad ? modelSourceFields(this._sourceLoad) : undefined),
         } satisfies RenderWorkerRequest;
       },
-      [buffer, ...(this._sourceLoad?.transfer ?? [])],
+      this._sourceLoad ? [buffer, ...this._sourceLoad.transfer] : [buffer],
       // Healthy progressive work may exceed this interval while continuing to
       // publish slides. Measure silence between publications instead of using
       // an absolute deadline for the authoritative final response.
@@ -1538,9 +1541,8 @@ export class PptxPresentation {
 
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
-  load: AdmittedModelSourceLoad | undefined,
+  load: AdmittedModelSourceLoad,
 ): { source?: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[] } {
-  if (!load) return {};
   return load.transfer.length > 0
     ? { source: load.module, sourceTransfer: load.transfer }
     : { source: load.module };

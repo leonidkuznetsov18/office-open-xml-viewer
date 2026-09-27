@@ -52,6 +52,7 @@ export class SlidePullWorker {
     private readonly acceptSlide?: PptxSlideAcceptor,
     private readonly executeArchive: PptxSlideArchiveExecutor =
       (operation) => operation(this.requireArchive()),
+    private readonly copyPulledBytes: () => boolean = () => false,
   ) {}
 
   get coordinator(): PullSessionHostCoordinator {
@@ -117,7 +118,7 @@ export class SlidePullWorker {
               this.latchResourceFailure(error);
               throw error;
             }
-            const payload = exactTransferableArrayBuffer(bytes);
+            const payload = exactTransferableArrayBuffer(bytes, this.copyPulledBytes());
             if (this.acceptSlide) {
               preparedSlide = JSON.parse(new TextDecoder().decode(new Uint8Array(payload))) as Slide;
             }

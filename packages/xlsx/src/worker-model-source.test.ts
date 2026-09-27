@@ -8,7 +8,13 @@ const state = vi.hoisted(() => ({
   openSource: vi.fn(),
   ooxmlConstruct: vi.fn(),
   computeMdw: vi.fn(() => 9),
+  ownerImports: 0,
 }));
+
+vi.mock('./internal/worker-worksheet-source.js', async (load) => {
+  state.ownerImports += 1;
+  return load();
+});
 
 vi.mock('@silurus/ooxml-core', async (load) => {
   const actual = await load<typeof import('@silurus/ooxml-core')>();
@@ -32,7 +38,10 @@ class OoxmlArchive {
   free = vi.fn();
   assert_healthy() {}
   parse() { return new TextEncoder().encode(JSON.stringify(bootstrap)); }
-  resource_usage() { return new Uint8Array(48); }
+  resource_usage() { return new TextEncoder().encode(JSON.stringify({
+    archiveEntryCount: 0, declaredInflatedBytes: 0,
+    distinctInflatedBytes: 0, operationInflatedBytes: 0,
+  })); }
   open_sheet_cursor() {}
   pull_sheet_cursor() { return new Uint8Array(); }
   sheet_cursor_pull_finished() { return false; }
@@ -114,6 +123,40 @@ describe('XLSX workers with a model source', () => {
     vi.resetModules();
     vi.clearAllMocks();
     state.openSource.mockReset();
+    state.ownerImports = 0;
+  });
+
+  it('keeps the OOXML parse on the eager worker graph without loading the source owner', async () => {
+    const { scope, posted } = workerScope(7);
+    vi.stubGlobal('self', scope);
+    await import('./worker.js');
+    expect(state.ownerImports).toBe(0);
+    const dispatch = scope.onmessage!;
+    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/xlsx.wasm' } } as MessageEvent);
+    await dispatch({ data: { type: 'parse', id: 21, data: new ArrayBuffer(3), resourcePolicy } } as MessageEvent);
+    expect(posted).toEqual([expect.objectContaining({ type: 'parsed' })]);
+    expect(state.ownerImports).toBe(0);
+    expect(state.ensureReady).toHaveBeenCalledOnce();
+  });
+
+  it('transfers only the source parse and image subarray ranges', async () => {
+    const { scope, posted } = workerScope(7);
+    vi.stubGlobal('self', scope);
+    const archive = sourceArchive(undefined);
+    const json = new TextEncoder().encode(JSON.stringify(bootstrap));
+    const wrappedJson = new Uint8Array(json.length + 2);
+    wrappedJson.set(json, 1);
+    archive.parse.mockReturnValue(wrappedJson.subarray(1, -1));
+    archive.extract_image.mockReturnValue(new Uint8Array([91, 5, 92]).subarray(1, 2));
+    state.openSource.mockResolvedValue({ archive, viewDefaults: {}, close: vi.fn() });
+    await import('./worker.js');
+    const dispatch = scope.onmessage!;
+    await dispatch({ data: { type: 'parse', id: 30, data: new ArrayBuffer(3), resourcePolicy, source: descriptor } } as MessageEvent);
+    const parsed = ofType(posted, 'parsed')[0]!;
+    expect(new TextDecoder().decode(parsed.workbookJson as ArrayBuffer)).toBe(JSON.stringify(bootstrap));
+    await dispatch({ data: { type: 'extractImage', id: 31, path: 'image' } } as MessageEvent);
+    const image = ofType(posted, 'imageExtracted')[0]!;
+    expect(Array.from(new Uint8Array(image.bytes as ArrayBuffer))).toEqual([5]);
   });
 
   it('parse worker asks the page to measure, configures the reply and reports layoutMetrics', async () => {
@@ -129,7 +172,6 @@ describe('XLSX workers with a model source', () => {
     await import('./worker.js');
     const dispatch = scope.onmessage!;
 
-    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/xlsx.wasm' } } as MessageEvent);
     await dispatch({ data: { type: 'parse', id: 1, data: new ArrayBuffer(3), resourcePolicy, source: descriptor } } as MessageEvent);
     expect(state.ensureReady).not.toHaveBeenCalled();
     expect(state.setWasmInput).not.toHaveBeenCalled();
@@ -161,6 +203,7 @@ describe('XLSX workers with a model source', () => {
     expect(second.configure_host_layout).not.toHaveBeenCalled();
     expect(ofType(posted, 'parsed').at(-1)).not.toHaveProperty('layoutMetrics');
 
+    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/xlsx.wasm' } } as MessageEvent);
     await dispatch({ data: { type: 'parse', id: 6, data: new ArrayBuffer(3), resourcePolicy } } as MessageEvent);
     expect(secondClose).toHaveBeenCalledOnce();
     expect(state.ensureReady).toHaveBeenCalled();
@@ -181,7 +224,6 @@ describe('XLSX workers with a model source', () => {
     await import('./render-worker.js');
     const dispatch = scope.onmessage!;
 
-    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/xlsx.wasm' } } as MessageEvent);
     await dispatch({ data: {
       type: 'parse', id: 11, data: new ArrayBuffer(3), resourcePolicy, source: descriptor,
     } } as MessageEvent);
@@ -200,6 +242,7 @@ describe('XLSX workers with a model source', () => {
     expect(firstClose).toHaveBeenCalledOnce();
     expect(second.parse).toHaveBeenCalledOnce();
 
+    await dispatch({ data: { type: 'init', wasmUrl: 'https://example.test/xlsx.wasm' } } as MessageEvent);
     await dispatch({ data: { type: 'parse', id: 13, data: new ArrayBuffer(3), resourcePolicy } } as MessageEvent);
     expect(secondClose).toHaveBeenCalledOnce();
     expect(state.ensureReady).toHaveBeenCalled();

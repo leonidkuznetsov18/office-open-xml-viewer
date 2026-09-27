@@ -26,9 +26,18 @@
     import { regionMap } from '@ooxml-test-region-map-renderer';
     import { tiff } from '@ooxml-test-tiff-renderer';
 
-    // Text rasterization must not depend on how quickly Vite serves the
-    // fontsource CSS and weight-specific WOFF files. Regression baselines compare
-    // renderer output, so wait for the declared fixture fonts before painting.
+    // document.fonts.ready does not fetch fonts used only by Canvas. Force the
+    // declared Latin faces to load before any slide is painted, so the same
+    // renderer produces stable self-regression images across Vite servers.
+    const latin = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    await Promise.all([
+      '300 16px "Nunito Sans"',
+      '400 16px "Nunito Sans"',
+      'italic 400 16px "Nunito Sans"',
+      '600 16px "Nunito Sans"',
+      '700 16px "Nunito Sans"',
+      'italic 700 16px "Nunito Sans"',
+    ].map((font) => document.fonts.load(font, latin)));
     await document.fonts.ready;
 
     const params   = new URLSearchParams(location.search);

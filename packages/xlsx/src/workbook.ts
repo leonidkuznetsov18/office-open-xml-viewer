@@ -121,9 +121,8 @@ interface RetainedFontSet {
  *  deprecated `maxZipEntryBytes` alias, and `math`) with worker rendering. */
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
-  load: AdmittedModelSourceLoad | undefined,
+  load: AdmittedModelSourceLoad,
 ): { source?: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[] } {
-  if (!load) return {};
   return load.transfer.length > 0
     ? { source: load.module, sourceTransfer: load.transfer }
     : { source: load.module };
@@ -426,6 +425,7 @@ export class XlsxWorkbook {
       );
       metrics.checkpoint('workbook index ready');
       metrics.succeed({ sheets: wb.sheetCount });
+      sourceLoad?.release();
       return wb;
     } catch (error) {
       const rejectedWorkbook = wb;
@@ -515,16 +515,16 @@ export class XlsxWorkbook {
               useGoogleFonts: !!opts.useGoogleFonts,
               cjkFallback: this.cjkFallback,
               renderers: rendererDescriptors,
-              ...modelSourceFields(sourceLoad),
+              ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined),
             } satisfies RenderWorkerRequest)
           : ({
               type: 'parse',
               id,
               data: workerData,
               resourcePolicy,
-              ...modelSourceFields(sourceLoad),
+              ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined),
             } satisfies WorkerRequest),
-      [workerData, ...(sourceLoad?.transfer ?? [])],
+      sourceLoad ? [workerData, ...sourceLoad.transfer] : [workerData],
       { timeoutMs: opts.workerTimeoutMs },
     );
     // Both modes carry the light, workbook-level ParsedWorkbook back, so

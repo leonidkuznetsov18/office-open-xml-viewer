@@ -9,6 +9,7 @@
  */
 import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
+  copyModelSourceBytes,
   decodeDataUrl,
   preloadGoogleFonts,
   loadOfficeFontFallbacks,
@@ -34,7 +35,6 @@ import {
   WorkerSvgDecodeClient,
   type LoadedWorkerRenderers,
   type PullSessionResponse,
-  type WasmInitInput,
   type WorkerSvgDecodeResponse,
 } from '@silurus/ooxml-core/worker';
 import { prepareMathRuns, renderLayoutSourceToCanvas } from './renderer';
@@ -72,7 +72,8 @@ import {
   MaterializedDocumentCursorArchive,
 } from './document-pull-worker.js';
 import {
-  WorkerDocumentSourceOwner,
+  type WorkerDocumentSourceOwner,
+  type WorkerDocumentArchive,
   type DocxModelSourceViewDefaults,
 } from './internal/worker-document-source.js';
 
@@ -85,14 +86,23 @@ const host = new WasmParserHost<DocxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
-const sourceOwner = new WorkerDocumentSourceOwner(host);
+let sourceOwner: WorkerDocumentSourceOwner<DocxArchive> | undefined;
+function executeArchive<T>(operation: (archive: WorkerDocumentArchive) => T): T {
+  if (sourceOwner) return sourceOwner.execute(operation);
+  const archive = host.archive;
+  if (!archive) throw new Error('Document not loaded');
+  return host.run(() => operation(archive));
+}
+function sourceUsage(): Uint8Array | undefined {
+  return sourceOwner ? sourceOwner.resourceUsage() : host.run(() => host.archive?.resource_usage());
+}
 const documentPull = new DocumentPullWorker(
-  () => sourceOwner.cursor(),
-  (operation) => sourceOwner.execute(operation),
+  () => sourceOwner?.cursor() ?? host.archive,
+  (operation) => executeArchive(operation),
+  () => sourceOwner !== undefined,
 );
 let documentGeneration = 0;
 let parseGeneration = 0;
-let ooxmlWasmInput: WasmInitInput | undefined;
 let fallbackPull: DocumentPullWorker | null = null;
 let doc: RetainedRenderWorkerDocumentLayout | null = null;
 /** Compact model-derived inputs needed to re-project variant-specific review
@@ -143,7 +153,7 @@ const svgDecodeClient = new WorkerSvgDecodeClient(rawPost);
  *  Mime travels on the element, so the caller supplies it. */
 function getImage(path: string, mimeType: string): Promise<Blob> {
   return rawParts.get(path, mimeType, async () => {
-    const bytes = sourceOwner.execute((loaded) => loaded.extract_image(path));
+    const bytes = executeArchive((loaded) => loaded.extract_image(path));
     return new Blob([bytes as BlobPart], { type: mimeType });
   });
 }
@@ -172,14 +182,15 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
     return;
   }
   if (req.type === 'init') {
-    ooxmlWasmInput = decodeDataUrl(req.wasmUrl) ?? req.wasmUrl;
+    host.setWasmInput(decodeDataUrl(req.wasmUrl) ?? req.wasmUrl);
     return;
   }
   const id = req.id;
   let requestedGeneration: number | undefined;
   try {
-    if (req.type !== 'parse' && sourceOwner.cursor()) {
-      sourceOwner.execute((retained) => retained.assert_healthy());
+    if (req.type === 'parse' ? !req.source : !sourceOwner) await host.ensureReady();
+    if (req.type !== 'parse' && (sourceOwner?.cursor() ?? host.archive)) {
+      executeArchive((retained) => retained.assert_healthy());
     }
     if (req.type === 'parse') {
       requestedGeneration = ++parseGeneration;
@@ -191,7 +202,8 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       await previousFallback?.reset();
       if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
       if (fallbackPull === previousFallback) fallbackPull = null;
-      sourceOwner.closeModelSource();
+      sourceOwner?.closeModelSource();
+      sourceOwner = undefined;
       host.run(() => host.disposeArchive());
       doc = null;
       reviewIndexInput = null;
@@ -217,14 +229,13 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // boundary. Neither route creates a monolithic model JSON value.
       let viewDefaults: DocxModelSourceViewDefaults = {};
       if (req.source) {
+        const { WorkerDocumentSourceOwner } = await import('./internal/worker-document-source.js');
+        sourceOwner = new WorkerDocumentSourceOwner(host);
         viewDefaults = await sourceOwner.openModelSource(bytes, req.source, req.sourceTransfer);
         if (requestedGeneration !== parseGeneration) {
           throw new Error('render-worker parse was superseded');
         }
       } else {
-        if (ooxmlWasmInput === undefined) throw new Error('DOCX WASM input was not configured');
-        host.setWasmInput(ooxmlWasmInput);
-        await host.ensureReady();
         if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
         const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
         host.run(() => {
@@ -299,7 +310,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
           if (requestedGeneration !== parseGeneration) {
             throw new Error('render-worker parse was superseded');
           }
-          return sourceOwner.execute((loaded) => loaded.extract_image(p));
+          return executeArchive((loaded) => loaded.extract_image(p));
         });
         if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
       }
@@ -423,7 +434,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         endnotes: model.endnotes ?? [],
         ...projectRenderWorkerLayoutMeta(layout, source, reviewIndexInput),
       };
-      const usageBytes = sourceOwner.resourceUsage();
+      const usageBytes = sourceUsage();
       if (usageBytes) resourceUsage = decodeOoxmlResourceUsage(usageBytes);
       post({ type: 'parsedMeta', id, meta, usage: resourceUsage, showTrackedChanges });
       return;
@@ -493,19 +504,21 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // transfer).
       // wasm-bindgen returns an owned full-span Uint8Array; transfer its
       // standalone buffer directly, matching the parse worker contract.
-      const bytes = sourceOwner.execute((archive) => archive.extract_image(req.path).buffer as ArrayBuffer);
+      const bytes = executeArchive((archive) => sourceOwner
+        ? copyModelSourceBytes(archive.extract_image(req.path))
+        : archive.extract_image(req.path).buffer as ArrayBuffer);
       post({ type: 'imageExtracted', id, bytes }, [bytes]);
       return;
     }
     if (req.type === 'resourceUsage') {
-      const bytes = sourceOwner.resourceUsage();
+      const bytes = sourceUsage();
       post({ type: 'resourceUsage', id, usage: bytes ? decodeOoxmlResourceUsage(bytes) : undefined });
       return;
     }
     if (req.type === 'toMarkdown') {
       // Project the retained archive to markdown, straight from the handle the
       // worker already holds (same source as worker.ts's parse-mode arm).
-      const markdown = sourceOwner.toMarkdown();
+      const markdown = sourceOwner ? sourceOwner.toMarkdown() : executeArchive((archive) => (archive as DocxArchive).to_markdown());
       post({ type: 'markdownRendered', id, markdown });
       return;
     }
@@ -517,7 +530,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
     if (requestedGeneration !== undefined && requestedGeneration === parseGeneration) {
       // Cleanup must not replace the parse failure or suppress its terminal
       // response. A stale parse never touches the newer generation's owner.
-      try { sourceOwner.closeModelSource(); } catch {}
+      try { sourceOwner?.closeModelSource(); } catch {}
       releaseRetainedFonts();
       doc = null;
       reviewIndexInput = null;

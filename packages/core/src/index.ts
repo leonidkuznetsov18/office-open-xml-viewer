@@ -131,6 +131,7 @@ export { assertNotCfbContainer, resolveOoxmlContainer, toArrayBuffer } from './e
 export {
   MODEL_SOURCE_MODULE_PROTOCOL,
   beginModelSourceLoad,
+  copyModelSourceBytes,
   hasModelSourceCapability,
   openModelSourceModule,
   requireModelSourceArchiveMethods,

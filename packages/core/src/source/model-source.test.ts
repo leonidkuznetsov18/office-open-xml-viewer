@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   beginModelSourceLoad,
+  copyModelSourceBytes,
   MODEL_SOURCE_MODULE_PROTOCOL,
   openModelSourceModule,
   selectModelSource,
@@ -112,6 +113,29 @@ describe('beginModelSourceLoad', () => {
     expect(release).toHaveBeenCalledTimes(1);
     expect(admitted.transfer).toEqual([]);
   });
+
+  it('rejects unsupported, repeated and unbounded transfer lists and releases each failed admission', () => {
+    const buffer = new ArrayBuffer(1);
+    for (const transfer of [[{}], [buffer, buffer], Array.from({ length: 33 }, () => new ArrayBuffer(1))]) {
+      const release = vi.fn();
+      const selected: ModelSource = {
+        target: 'docx', claim: () => true,
+        beginLoad: () => ({ module: descriptor('https://example.test/m.mjs'), transfer: transfer as Transferable[], release }),
+      };
+      expect(() => beginModelSourceLoad(selected, 'docx')).toThrow();
+      expect(release).toHaveBeenCalledOnce();
+    }
+  });
+});
+
+it('copies exactly the bytes returned by a model source into a detachable buffer', () => {
+  const backing = new Uint8Array([99, 1, 2, 3, 88]);
+  const result = copyModelSourceBytes(backing.subarray(1, 4));
+  expect(new Uint8Array(result)).toEqual(new Uint8Array([1, 2, 3]));
+  expect(result).not.toBe(backing.buffer);
+  structuredClone(result, { transfer: [result] });
+  expect(result.byteLength).toBe(0);
+  expect(backing).toEqual(new Uint8Array([99, 1, 2, 3, 88]));
 });
 
 describe('openModelSourceModule', () => {

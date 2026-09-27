@@ -3,6 +3,7 @@ import {
   WorkerBridge,
   preloadGoogleFonts,
   registerEmbeddedFonts,
+  type ModelSource,
   type WorkerLike,
   type FontPreloadEntry,
 } from '@silurus/ooxml-core';
@@ -168,6 +169,33 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
     ).mockRejectedValueOnce(failure);
 
     await expect(PptxPresentation.load(new ArrayBuffer(0))).rejects.toBe(failure);
+    expect(SilentWorker.instances).toHaveLength(1);
+    expect(SilentWorker.instances[0].terminated).toBe(true);
+  });
+
+  it('terminates an opened model-source worker when release throws after parse', async () => {
+    G.Worker = SilentWorker;
+    G.location = { href: 'http://localhost/' };
+    const failure = new Error('release failed');
+    const release = vi.fn(() => { throw failure; });
+    const source: ModelSource<'pptx'> = {
+      target: 'pptx',
+      claim: () => true,
+      beginLoad: () => ({
+        module: {
+          protocol: 'ooxml-model-source-module/v1',
+          target: 'pptx', moduleUrl: 'https://example.test/source.mjs', config: {},
+        },
+        release,
+      }),
+    };
+    vi.spyOn(PptxPresentation.prototype as unknown as {
+      _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
+    }, '_parse').mockResolvedValueOnce(undefined);
+
+    await expect(PptxPresentation.load(new ArrayBuffer(0), { modelSources: [source] }))
+      .rejects.toBe(failure);
+    expect(release).toHaveBeenCalledOnce();
     expect(SilentWorker.instances).toHaveLength(1);
     expect(SilentWorker.instances[0].terminated).toBe(true);
   });

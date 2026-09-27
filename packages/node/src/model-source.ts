@@ -45,6 +45,12 @@ export async function resolveNodeSessionInput<TArchive>(
       options.signal,
       load.transfer,
     );
+    try {
+      load.release();
+    } catch (error) {
+      try { opened.close(); } catch {}
+      throw error;
+    }
     return { kind: 'model-source', opened, sourceByteLength: bytes.byteLength };
   } finally {
     load.release();

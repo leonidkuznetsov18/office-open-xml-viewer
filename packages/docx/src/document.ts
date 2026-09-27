@@ -296,9 +296,8 @@ function sameLayoutView(
 
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
-  load: AdmittedModelSourceLoad | undefined,
+  load: AdmittedModelSourceLoad,
 ): { source?: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[] } {
-  if (!load) return {};
   return load.transfer.length > 0
     ? { source: load.module, sourceTransfer: load.transfer }
     : { source: load.module };
@@ -418,6 +417,7 @@ export class DocxDocument {
     mode: 'main' | 'worker',
     defaultCurrentDateMs: number,
     wasmUrlOverride?: string | URL,
+    initializeWasm = true,
   ) {
     this._worker = worker;
     this._mode = mode;
@@ -455,8 +455,10 @@ export class DocxDocument {
     // Default: the parser WASM emitted next to this bundle, resolved relative to
     // the document URL. `wasmUrl` overrides it (CDN / self-hosted copy); a
     // relative override is still resolved against `location.href`.
-    const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
-    this._bridge.post({ type: 'init', wasmUrl } satisfies WorkerRequest);
+    if (initializeWasm) {
+      const wasmUrl = new URL(wasmUrlOverride ?? wasmAssetUrl, location.href).href;
+      this._bridge.post({ type: 'init', wasmUrl } satisfies WorkerRequest);
+    }
   }
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
@@ -509,7 +511,7 @@ export class DocxDocument {
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
     let doc: DocxDocument | undefined;
     try {
-      doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl);
+      doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl, sourceLoad === undefined);
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
       doc._callerShowTrackedChanges = opts.showTrackedChanges;
@@ -815,6 +817,7 @@ export class DocxDocument {
       );
       metrics.checkpoint('model and layout ready');
       metrics.succeed({ pages: doc.pageCount });
+      sourceLoad?.release();
       return doc;
     } catch (error) {
       const rejectedDocument = doc;
@@ -856,9 +859,9 @@ export class DocxDocument {
     const res = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, ...modelSourceFields(sourceLoad), useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
-          : ({ type: 'parse', id, data: buffer, resourcePolicy, ...modelSourceFields(sourceLoad) } satisfies WorkerRequest),
-      [buffer, ...(sourceLoad?.transfer ?? [])],
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined), useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          : ({ type: 'parse', id, data: buffer, resourcePolicy, ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined) } satisfies WorkerRequest),
+      sourceLoad ? [buffer, ...sourceLoad.transfer] : [buffer],
       { timeoutMs },
     );
     if ('protocol' in res) {
@@ -1195,7 +1198,7 @@ export class DocxDocument {
           id,
           data: buffer,
           resourcePolicy,
-          ...modelSourceFields(sourceLoad),
+          ...(sourceLoad ? modelSourceFields(sourceLoad) : undefined),
           useGoogleFonts,
           cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
@@ -1204,7 +1207,7 @@ export class DocxDocument {
           progressiveLayout: true,
         } satisfies RenderWorkerRequest;
       },
-      [buffer, ...(sourceLoad?.transfer ?? [])],
+      sourceLoad ? [buffer, ...sourceLoad.transfer] : [buffer],
       { timeoutMs: false },
     );
     // Retained rather than awaited: once a publication resolves load(), a later

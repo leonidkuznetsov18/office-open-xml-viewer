@@ -107,6 +107,13 @@ export async function openXlsxWorkbook(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenXlsxWorkbookOptions = {},
 ): Promise<XlsxWorkbookSession> {
+  if (options.modelSources === undefined) {
+    const acquired = await acquireXlsxNodeSession(toUint8(buffer), getXlsxWasmModule(), options);
+    return new XlsxWorkbookSessionImpl(
+      acquired.closeArchive, acquired.archive, acquired.workbookIndex,
+      acquired.metrics, acquired.usage, options.signal,
+    );
+  }
   const input = await resolveNodeSessionInput(
     buffer,
     'xlsx',
@@ -495,4 +502,8 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   const error = new Error('XLSX workbook session was aborted');
   error.name = 'AbortError';
   throw error;
+}
+
+function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
+  return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }

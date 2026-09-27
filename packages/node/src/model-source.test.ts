@@ -84,6 +84,19 @@ beforeAll(async () => {
 });
 
 describe('Node sessions with a model source', () => {
+  it.each(['docx', 'xlsx', 'pptx'] as const)('closes an opened %s archive when release throws', async (target) => {
+    const probe = fakeSource(target);
+    const failure = new Error('release failed');
+    probe.release.mockImplementation(() => { throw failure; });
+    const load = target === 'docx'
+      ? openDocxDocument(docxSample, { factory, modelSources: [probe.source] })
+      : target === 'xlsx'
+        ? openXlsxWorkbook(xlsxSample, { modelSources: [probe.source] })
+        : openPptxPresentation(pptxSample, { modelSources: [probe.source] });
+    await expect(load).rejects.toBe(failure);
+    expect(probe.closes()).toBe(1);
+    expect(probe.release).toHaveBeenCalledOnce();
+  });
   it('paginates the markup view when the DOCX source reports it as its view default', async () => {
     const ooxml = await openDocxDocument(trackedDocx, { factory, currentDate: 0 });
     const finalPages = ooxml.pageCount;

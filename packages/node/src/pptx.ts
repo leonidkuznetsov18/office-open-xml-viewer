@@ -91,6 +91,13 @@ async function openPptxPresentationImpl(
   options: OpenPptxPresentationOptions = {},
 ): Promise<PptxPresentationSessionImpl> {
   const cjkFallback = resolveCjkFallback(options.cjkFallback);
+  if (options.modelSources === undefined) {
+    const acquired = await acquirePptxNodeSession(toUint8(buffer), getPptxWasmModule(), options);
+    return new PptxPresentationSessionImpl(
+      acquired.closeArchive, acquired.archive, acquired.bootstrap,
+      acquired.metrics, options.signal, cjkFallback,
+    );
+  }
   const input = await resolveNodeSessionInput(
     buffer,
     'pptx',
@@ -379,4 +386,8 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   const error = new Error('PPTX presentation session was aborted');
   error.name = 'AbortError';
   throw error;
+}
+
+function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
+  return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }

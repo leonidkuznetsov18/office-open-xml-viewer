@@ -186,6 +186,17 @@ describe('DocxDocument.load with model sources', () => {
     document.destroy();
   });
 
+  it('terminates an opened worker when release throws after a successful parse', async () => {
+    install(renderWorkerScript(undefined));
+    const failure = new Error('release failed');
+    const { source, release } = fakeSource();
+    release.mockImplementation(() => { throw failure; });
+    await expect(DocxDocument.load(cfbBytes(), { mode: 'worker', modelSources: [source] }))
+      .rejects.toBe(failure);
+    expect(release).toHaveBeenCalledOnce();
+    expect(ProtocolWorker.instances[0]!.terminated).toBe(true);
+  });
+
   it('keeps unclaimed input on the OOXML path', async () => {
     install(renderWorkerScript(true));
     const { source, claim, beginLoad } = fakeSource({ claim: () => false });

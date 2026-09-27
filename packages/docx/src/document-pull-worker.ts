@@ -176,6 +176,7 @@ export class DocumentPullWorker {
     private readonly executeArchive: <T>(
       operation: (archive: DocxDocumentCursorArchive) => T,
     ) => T = (operation) => operation(this.requireArchive()),
+    private readonly copyPulledBytes: () => boolean = () => false,
   ) {}
 
   open(identity: PullSessionIdentity<number>): void {
@@ -208,7 +209,7 @@ export class DocumentPullWorker {
             if (insufficient) throw insufficient;
             throw error;
           }
-          const payload = exactTransferableArrayBuffer(bytes);
+          const payload = exactTransferableArrayBuffer(bytes, this.copyPulledBytes());
           return {
             payload,
             byteLength: payload.byteLength,
