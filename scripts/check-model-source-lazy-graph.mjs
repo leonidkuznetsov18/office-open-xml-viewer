@@ -215,18 +215,21 @@ const OOXML_BUNDLE_BASELINE = Object.freeze({
   // 2,501, offset by minification. The old implementations are absent and the
   // explicit state and named call boundaries remain. The allowance is unchanged.
   docx: { entry: 2_551_241, inline: 31_624, budget: 2_800 },
-  // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
-  // viewer state restoration. The optional model-source runtime stays lazy.
-  xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
+  // XLSX adds viewport preview eligibility and pull orchestration. The
+  // measured static entry at #1559 is 1,857,222 bytes (+13,040), and its
+  // ordinary inline pull worker is 40,879 decoded bytes (+977). The optional
+  // model-source runtime remains outside both eager graphs.
+  xlsx: { entry: 1_857_222, inline: 40_879, budget: 2_500 },
   // PPTX measures identically on aec306b6 and this merge. Re-pin the older
   // guard value to the measured graph without changing its allowance.
   pptx: { entry: 1_826_158, inline: 59_554, budget: 2_100 },
   node: { entry: 2_597_718, budget: 3_600 },
 });
-// The XLSX render worker adds 536 bytes for explicit worksheet eviction. The
-// DOCX worker includes PRs #1586 and #1590 plus the #1566 line-breaker split
-// (+19,183 bytes against aec306b6). Workers retain zero allowance.
-const OOXML_RENDER_WORKERS = [1_416_948, 1_458_524, 2_066_364];
+// The XLSX render worker measures 1,418,200 bytes (+1,252) after viewport
+// preview and pull orchestration. The DOCX worker includes PRs #1586 and #1590
+// plus the #1566 line-breaker split (+19,183 bytes against aec306b6). Workers
+// retain zero allowance.
+const OOXML_RENDER_WORKERS = [1_418_200, 1_458_524, 2_066_364];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {
