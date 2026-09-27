@@ -554,9 +554,10 @@ impl Properties {
                 // exactly like [1,0] in repeated direct-DOC exports of the
                 // same long document. Byte controls [0,0], [1,1], [2,'A'],
                 // [6,'A'], and [7,0] also printed unchanged there, but those
-                // runs are one character long. A separate Word-saved DOC with
-                // automatic hyphenation and multi-line CHPX runs confirmed
-                // [1,0] and [2,'X'] also print alike; that observation does
+                // runs are one character long. In controls with automatic
+                // hyphenation, multi-line CHPX runs, and forced soft hyphens,
+                // no tested operand combination changed print layout. The
+                // boundary sweep found no positive counterexample; it does
                 // not establish the other methods as inert in general. Admit
                 // only the observed undefined [0,1] alias and the normative
                 // default. Other methods need line-breaking model support.
