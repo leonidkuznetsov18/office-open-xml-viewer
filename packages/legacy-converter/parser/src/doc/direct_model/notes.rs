@@ -13,12 +13,12 @@
 //! The shared renderer numbers notes in first-reference order with the
 //! document-wide numbering format and start (ECMA-376 17.11.17/.18/.20), lays
 //! footnotes out at the page bottom and endnotes at
-//! the end of the document, and draws its fixed default separator (the DOCX
-//! parser likewise ignores separator notes). A document is accepted only when
+//! the end of the document, and draws the default or explicitly absent
+//! separator. A document is accepted only when
 //! Word's effective note properties produce that display: automatic marks,
 //! continuous numbering with one format and start per note kind (Arabic,
 //! Roman or letters), bottom-of-page footnotes,
-//! end-of-document endnotes and the standard separator stories. Everything
+//! end-of-document endnotes and standard or empty separator stories. Everything
 //! else stays rejected; custom marks additionally need renderer support for
 //! literal marks that do not consume a number.
 
@@ -124,7 +124,7 @@ pub(super) fn validate(
         footnote_numbering = footnote_values.unwrap_or((0, 1));
         endnote_numbering = endnote_values.unwrap_or((2, 1));
     }
-    let settings = NoteLayoutSettingsWire {
+    let mut settings = NoteLayoutSettingsWire {
         footnote_number_format: footnotes
             .then(|| number_format(footnote_numbering.0, footnote_message()))
             .transpose()?,
@@ -160,11 +160,23 @@ pub(super) fn validate(
         if !present {
             continue;
         }
-        if headers.separator_text(base) != "\u{3}\r\r"
+        let separator = headers.separator_text(base);
+        if !matches!(separator, "" | "\u{3}\r\r")
             || !matches!(headers.separator_text(base + 1), "\u{3}\r\r" | "\u{4}\r\r")
             || !matches!(headers.separator_text(base + 2), "" | "\r\r")
         {
             return Err(unsupported("custom Word note separators are not supported"));
+        }
+        // [MS-DOC] 2.3.3: the first separator slot is a separate story.
+        // Word's DOC→DOCX control preserves an empty slot as a bare paragraph,
+        // and its PDF has no separator rule. The shared note layout preserves
+        // the note gap while suppressing the rule for this explicit case.
+        if separator.is_empty() {
+            if base == 0 {
+                settings.footnote_separator = Some("none".to_string());
+            } else {
+                settings.endnote_separator = Some("none".to_string());
+            }
         }
     }
     Ok(Some(settings))
@@ -422,8 +434,8 @@ mod tests {
         missing.dop = None;
         assert!(reject(missing, "A\u{2}\r").contains("note properties"));
         for separators in [
-            ["", "\u{3}\r\r", "", "", "", ""],
             ["\u{3}\r\r\r", "\u{3}\r\r", "", "", "", ""],
+            ["", "", "", "", "", ""],
             ["\u{3}\r\r", "x\r\r", "", "", "", ""],
             ["\u{3}\r\r", "\u{3}\r\r", "x\r\r", "", "", ""],
         ] {
@@ -431,6 +443,24 @@ mod tests {
             properties.separators = separators;
             assert!(reject(properties, "A\u{2}\r").contains("separators"));
         }
+    }
+
+    #[test]
+    fn empty_separator_story_suppresses_only_the_note_rule() {
+        let notes = ["\u{2} one\r"];
+        let references = [(1, true)];
+        let mut properties = fixture(&notes, &references);
+        properties.separators[0] = "";
+        let document = document("A\u{2}\r", &properties).unwrap();
+        assert_eq!(document.footnotes.len(), 1);
+        assert_eq!(
+            document
+                .note_layout_settings
+                .unwrap()
+                .footnote_separator
+                .as_deref(),
+            Some("none")
+        );
     }
 
     #[test]

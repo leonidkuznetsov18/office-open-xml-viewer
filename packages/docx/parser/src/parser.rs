@@ -1711,7 +1711,7 @@ fn finish_document(
     let footnotes_path =
         find_internal_rel_target_by_types(&environment.rels_xml, FOOTNOTES_RELATIONSHIP_TYPES)
             .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
-    let footnotes = footnotes_path
+    let (footnotes, empty_footnote_separator) = footnotes_path
         .map(|path| {
             parse_notes(
                 zip,
@@ -1726,7 +1726,7 @@ fn finish_document(
     let endnotes_path =
         find_internal_rel_target_by_types(&environment.rels_xml, ENDNOTES_RELATIONSHIP_TYPES)
             .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
-    let endnotes = endnotes_path
+    let (endnotes, empty_endnote_separator) = endnotes_path
         .map(|path| {
             parse_notes(
                 zip,
@@ -1738,6 +1738,17 @@ fn finish_document(
             )
         })
         .unwrap_or_default();
+    if empty_footnote_separator || empty_endnote_separator {
+        let settings = environment
+            .note_layout_settings
+            .get_or_insert_with(Default::default);
+        if empty_footnote_separator {
+            settings.footnote_separator = Some("none".to_string());
+        }
+        if empty_endnote_separator {
+            settings.endnote_separator = Some("none".to_string());
+        }
+    }
 
     Ok(Document {
         section,
@@ -2044,9 +2055,9 @@ fn parse_notes(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
-) -> Vec<crate::types::DocxNote> {
+) -> (Vec<crate::types::DocxNote>, bool) {
     let Ok(xml) = read_zip_string(zip, path) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
 
     // Per-part rels for media (e.g. an image inside a footnote). The part lives
@@ -2059,9 +2070,10 @@ fn parse_notes(
     let local_chart_map = load_chart_map(zip, &local_relationships, path, theme);
 
     let Ok(doc) = parse_guarded(&xml) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let mut out = Vec::new();
+    let mut empty_separator = false;
     for n in doc
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == element_name)
@@ -2075,6 +2087,13 @@ fn parse_notes(
             note_type.as_deref(),
             Some("separator") | Some("continuationSeparator") | Some("continuationNotice")
         );
+        // ECMA-376 §17.11.1/.2: reserved note stories define the separator.
+        // Observed Word behavior: an explicitly empty story prints without the
+        // default rule; a missing reserved story still uses it. Limit the
+        // empty case to a single bare paragraph, as observed in Word controls.
+        if id == "-1" || note_type.as_deref() == Some("separator") {
+            empty_separator = is_empty_note_separator(n);
+        }
         if id.is_empty() || id == "-1" || id == "0" || is_special {
             continue;
         }
@@ -2093,7 +2112,79 @@ fn parse_notes(
         );
         out.push(crate::types::DocxNote { id, content });
     }
-    out
+    (out, empty_separator)
+}
+
+fn is_empty_note_separator(note: roxmltree::Node<'_, '_>) -> bool {
+    let mut content = note.children().filter(|child| child.is_element());
+    matches!(content.next(), Some(paragraph)
+        if paragraph.tag_name().name() == "p"
+            && !paragraph.children().any(|child| child.is_element()))
+        && content.next().is_none()
+}
+
+#[cfg(test)]
+mod note_separator_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn only_explicit_bare_paragraph_suppresses_default_separator() {
+        for (body, expected) in [
+            ("<w:p/>", true),
+            ("<w:p><w:r><w:separator/></w:r></w:p>", false),
+            ("<w:p><w:pPr/></w:p>", false),
+            ("<w:p/><w:p/>", false),
+        ] {
+            let xml = format!("<w:footnote xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{body}</w:footnote>");
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            assert_eq!(
+                is_empty_note_separator(doc.root_element()),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_projects_explicit_empty_separator_without_dropping_real_notes() {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            write_test_content_types(&mut writer);
+            for (path, xml) in [
+                (
+                    "word/document.xml",
+                    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#,
+                ),
+                (
+                    "word/_rels/document.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#,
+                ),
+                (
+                    "word/footnotes.xml",
+                    r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:type="separator" w:id="-1"><w:p/></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>note</w:t></w:r></w:p></w:footnote></w:footnotes>"#,
+                ),
+            ] {
+                writer
+                    .start_file(path, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(xml.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let document = parse_from_bytes(&bytes).expect("DOCX package parses");
+        assert_eq!(document.footnotes.len(), 1);
+        assert_eq!(
+            document
+                .note_layout_settings
+                .unwrap()
+                .footnote_separator
+                .as_deref(),
+            Some("none")
+        );
+    }
 }
 
 /// Resolve scheme color names (accent1..6, dk1, dk2, lt1, lt2, hlink, folHlink)
@@ -2433,6 +2524,8 @@ fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLa
         footnote_number_start: start("footnotePr"),
         endnote_number_format: value("endnotePr", "numFmt"),
         endnote_number_start: start("endnotePr"),
+        footnote_separator: None,
+        endnote_separator: None,
     };
     if result.footnote_position.is_none()
         && result.endnote_position.is_none()

@@ -263,6 +263,13 @@ pub struct NoteLayoutSettingsWire {
     /// §17.11.20 document-wide `w:endnotePr/w:numStart/@w:val`. Absent means 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endnote_number_start: Option<i64>,
+    /// ECMA-376 §17.11 reserved separator note. Word controls show that one
+    /// explicitly empty paragraph suppresses the rule while leaving note
+    /// placement unchanged. Absence retains the historical default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_separator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endnote_separator: Option<String>,
 }
 
 /// One embedded font-style slot from `word/fontTable.xml`. `style` is one of

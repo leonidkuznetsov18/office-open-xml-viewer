@@ -250,6 +250,8 @@ export interface InternalDocxDocumentModel extends DocxDocumentModel {
     footnoteNumberStart?: number;
     endnoteNumberFormat?: string;
     endnoteNumberStart?: number;
+    footnoteSeparator?: string;
+    endnoteSeparator?: string;
   }>;
   readonly __documentTypographySettings?: Readonly<{
     normalStyleFontSizePt?: number;
@@ -295,6 +297,8 @@ export interface DocumentNoteLayoutSettingsInput {
   readonly endnotePosition: string;
   readonly footnoteNumbering: Readonly<{ format: string; start: number }>;
   readonly endnoteNumbering: Readonly<{ format: string; start: number }>;
+  readonly footnoteSeparator: 'default' | 'none';
+  readonly endnoteSeparator: 'default' | 'none';
 }
 
 /** §17.11.17/.18 numFmt defaults to decimal and §17.11.20 numStart to 1 for
@@ -325,6 +329,8 @@ export function documentNoteLayoutSettingsInput(
       settings?.endnoteNumberFormat,
       settings?.endnoteNumberStart,
     ),
+    footnoteSeparator: settings?.footnoteSeparator === 'none' ? 'none' : 'default',
+    endnoteSeparator: settings?.endnoteSeparator === 'none' ? 'none' : 'default',
   }, 'DOCX note layout settings input');
 }
 

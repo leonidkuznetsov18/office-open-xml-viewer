@@ -99,6 +99,8 @@ export interface BodyLayoutInput {
     endnotePosition: string;
     footnoteNumbering?: NoteNumberingInput;
     endnoteNumbering?: NoteNumberingInput;
+    footnoteSeparator?: 'default' | 'none';
+    endnoteSeparator?: 'default' | 'none';
   }>;
 }
 
@@ -120,6 +122,8 @@ export interface BodyLayoutAcquisitionInput {
     endnotePosition: string;
     footnoteNumbering?: NoteNumberingInput;
     endnoteNumbering?: NoteNumberingInput;
+    footnoteSeparator?: 'default' | 'none';
+    endnoteSeparator?: 'default' | 'none';
   }>;
   readonly pageLayoutSettings: Readonly<{
     mirrorMargins: boolean;

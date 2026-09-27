@@ -102,6 +102,8 @@ describe('canonical body layout input', () => {
       // §17.11.17/.18/.20 defaults for both note kinds.
       footnoteNumbering: { format: 'decimal', start: 1 },
       endnoteNumbering: { format: 'decimal', start: 1 },
+      footnoteSeparator: 'default',
+      endnoteSeparator: 'default',
     });
   });
 
@@ -118,6 +120,7 @@ describe('canonical body layout input', () => {
         footnoteNumberFormat: 'upperLetter',
         footnoteNumberStart: 4,
         endnoteNumberFormat: 'lowerRoman',
+        footnoteSeparator: 'none',
       },
     } as unknown as DocxDocumentModel;
 
@@ -126,6 +129,8 @@ describe('canonical body layout input', () => {
       endnotePosition: 'sectEnd',
       footnoteNumbering: { format: 'upperLetter', start: 4 },
       endnoteNumbering: { format: 'lowerRoman', start: 1 },
+      footnoteSeparator: 'none',
+      endnoteSeparator: 'default',
     });
   });
 
