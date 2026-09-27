@@ -2291,6 +2291,8 @@ function resolveColumnWidths(
     owner: TableLayoutSource,
     ownerFormat = state.acquisitionInputs.tableFormatInput(owner),
   ): ((cell: DeepReadonly<DocTableCell>) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
+    const ownerLayout = ownerFormat.firstRowException?.layout === 'fixed'
+      || owner.layout === 'fixed' ? 'fixed' : 'autofit';
     const ownerMargins = new WeakMap<object, Readonly<{ left: number; right: number }>>();
     owner.rows.forEach((row, rowIndex) => row.cells.forEach((cell, cellIndex) => {
       const acquired = ownerFormat.rows[rowIndex]?.cells[cellIndex]?.marginsPt;
@@ -2331,7 +2333,7 @@ function resolveColumnWidths(
                   defaultTabPt: state.defaultTabPt,
                 }, state.layoutServices.text, false)
               : undefined);
-          return measureParagraphIntrinsicWidths(
+          const intrinsic = measureParagraphIntrinsicWidths(
             paragraph,
             context,
             contentWPt,
@@ -2340,6 +2342,20 @@ function resolveColumnWidths(
             numbering,
             { preserveWhitespaceOnlyContent: true },
           );
+          if (cell.noWrap !== true || cell.widthPt != null || ownerLayout === 'fixed'
+            || context.firstIndentPt <= 0 || numbering != null) return intrinsic;
+          // The nonbreaking text interval is independent of first-line
+          // positioning. Ordinary min/max still use the authored indent.
+          const unpositioned = measureParagraphIntrinsicWidths(
+            paragraph,
+            { ...context, firstIndentPt: 0 },
+            contentWPt,
+            { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
+            paragraphMeasurementEnvironment(state),
+            numbering,
+            { preserveWhitespaceOnlyContent: true },
+          );
+          return { ...intrinsic, noWrapWidthPt: unpositioned.maxWidthPt };
         },
         nestedTable: (nested) => measureTableIntrinsicWidths(
           state.acquisitionInputs.tableColumnLayoutInput(
@@ -2350,6 +2366,7 @@ function resolveColumnWidths(
           ),
         ),
       },
+      ownerLayout,
     );
   };
   return [...resolveTableColumnWidths(state.acquisitionInputs.tableColumnLayoutInput(

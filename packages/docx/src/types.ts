@@ -1595,6 +1595,9 @@ export interface DocTableCell {
   widthPt: number | null;
   /** `<w:tcW>` type="pct": 50ths of a percent of the final table width. */
   widthPct?: number;
+  /** ECMA-376 §17.4.29 `<w:noWrap>`: in AutoFit, auto/pct cell content
+   *  contributes its unbroken width as the minimum content constraint. */
+  noWrap?: boolean;
   /** Per-cell margins (pt) from `<w:tcPr><w:tcMar>` (ECMA-376 §17.4.42). Each
    *  edge overrides the table-level `cellMargin*` default when set; null/absent
    *  = inherit the table default. */

@@ -3373,6 +3373,11 @@ pub struct DocTableCell {
     /// table width). None unless the cell uses type="pct".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width_pct: Option<f64>,
+    /// ECMA-376 17.4.29 noWrap: AutoFit treats auto/pct cell content as one
+    /// unbroken string for its minimum-width constraint. Fixed cell widths
+    /// have a different preferred-width priority rule in the column solver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_wrap: Option<bool>,
     /// Per-cell margins from `<w:tcPr><w:tcMar>` (ECMA-376 §17.4.42), in pt.
     /// Each edge overrides the table-level `<w:tblCellMar>` default (§17.4.41)
     /// when present; None = inherit the table default. Used e.g. by résumé
