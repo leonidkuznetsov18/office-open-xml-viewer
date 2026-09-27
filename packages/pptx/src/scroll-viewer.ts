@@ -12,7 +12,7 @@ import {
   StaticCanvasRenderDispatcher,
   TerminalResourceOwner,
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
-import { eventTargetsDataAttributeWithin } from '@silurus/ooxml-core/internal/dom-interaction-boundary';
+import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { SlotScroller, clearTextLayerPreview, createSlotHost, createCommentSlotLayers, previewSlotHost, resetSlotHost } from '@silurus/ooxml-core/internal/slot-scroller';
 import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-margin-controller';
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
@@ -288,9 +288,10 @@ export class PptxScrollViewer implements ZoomableViewer {
   private readonly _opts: PptxScrollViewerOptions;
   private readonly _errorRouter: CanvasViewerErrorRouter;
   private readonly _container: HTMLElement;
-  private readonly _wrapper: HTMLDivElement;
-  private readonly _scrollHost: HTMLDivElement;
-  private readonly _spacer: HTMLDivElement;
+  private readonly _shell: ScrollViewerShell;
+  private get _wrapper(): HTMLDivElement { return this._shell.wrapper; }
+  private get _scrollHost(): HTMLDivElement { return this._shell.scrollHost; }
+  private get _spacer(): HTMLDivElement { return this._shell.spacer; }
   /** Resolved render mode. When an engine is borrowed the engine's own `mode`
    *  is authoritative (design §11 — no silent mis-pathing / no probing); an
    *  explicitly conflicting `opts.mode` is rejected at construction. When self-
@@ -394,8 +395,6 @@ export class PptxScrollViewer implements ZoomableViewer {
   private _lastReportedTotal = -1;
   private _lastReportedLayoutComplete: boolean | null = null;
   private _layoutUnsubscribe: (() => void) | null = null;
-  private _scrollListener: (() => void) | null = null;
-  private _commentOutsidePointerListener: ((event: PointerEvent) => void) | null = null;
   private _activeCommentId: string | null = null;
   private _activeCommentSlide: number | null = null;
   private _commentNavigationGeneration = 0;
@@ -531,24 +530,18 @@ export class PptxScrollViewer implements ZoomableViewer {
       this._mode = resolveCanvasViewerMode('PptxScrollViewer', opts.mode, undefined);
     }
 
-    // container → wrapper → scrollHost → spacer  (design §6)
-    this._wrapper = document.createElement('div');
-    this._wrapper.style.cssText = 'position:relative;width:100%;height:100%;overflow:hidden;';
-    this._scrollHost = document.createElement('div');
-    // Reserve the classic vertical scrollbar gutter before content overflows.
-    // Together with `_fitWidthPx` reading this scrollport's clientWidth, this
-    // prevents a vertical scrollbar from stealing width after the initial fit
-    // and creating a small, unintended horizontal overflow.
-    this._scrollHost.style.cssText = 'position:absolute;inset:0;overflow:auto;';
-    this._scrollHost.style.scrollbarGutter = 'stable';
-    // The "desk" behind/between slides. Undefined ⇒ transparent (container shows
-    // through); slides keep their own white canvas regardless.
-    if (opts.background) this._scrollHost.style.background = opts.background;
-    this._spacer = document.createElement('div');
-    this._spacer.style.cssText = 'position:absolute;top:0;left:0;width:1px;height:0;pointer-events:none;';
-    this._scrollHost.appendChild(this._spacer);
-    this._wrapper.appendChild(this._scrollHost);
-    this._container.appendChild(this._wrapper);
+    this._shell = new ScrollViewerShell(container, {
+      background: opts.background,
+      comments: !!opts.comments,
+      onScroll: () => this._onScroll(),
+      onOutsideComment: () => {
+        if (this._activeCommentId === null) return;
+        this._activeCommentId = null;
+        this._activeCommentSlide = null;
+        for (const [index, slot] of this._slots) this._redrawSlotComments(index, slot);
+        this._selection.emitChange();
+      },
+    });
 
     if (this._commentsEnabled()) {
       void loadPptxCommentUiRuntime().then((commentUi) => {
@@ -559,21 +552,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     }
 
     this._selection.bind(!!opts.onSelectionContextChange, !!opts.onContextMenu);
-
-    this._scrollListener = () => this._onScroll();
-    this._scrollHost.addEventListener('scroll', this._scrollListener);
-
-    if (opts.comments) {
-      this._commentOutsidePointerListener = (event) => {
-        if (eventTargetsDataAttributeWithin(event, this._wrapper, 'ooxmlCommentId')) return;
-        if (this._activeCommentId === null) return;
-        this._activeCommentId = null;
-        this._activeCommentSlide = null;
-        for (const [slide, slot] of this._slots) this._redrawSlotComments(slide, slot);
-        this._selection.emitChange();
-      };
-      this._wrapper.ownerDocument.addEventListener('pointerdown', this._commentOutsidePointerListener);
-    }
 
     this._zoom.bind(this._container, this._scrollHost, this._opts.enableZoom !== false);
 
@@ -2430,19 +2408,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._findActive = false;
     this._unbindLayoutPresentation();
     this._selection.destroy();
-    if (this._commentOutsidePointerListener) {
-      this._wrapper.ownerDocument.removeEventListener(
-        'pointerdown',
-        this._commentOutsidePointerListener,
-      );
-      this._commentOutsidePointerListener = null;
-    }
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
-    if (this._scrollListener) {
-      this._scrollHost.removeEventListener('scroll', this._scrollListener);
-      this._scrollListener = null;
-    }
     // Cancel a pending settle so no re-render is dispatched after teardown
     // (design §7 mechanism 2). `_destroyed` also guards `_settleRender`, but
     // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
@@ -2451,6 +2418,6 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._zoom.destroy();
     this._commentMargin.destroy();
     this._presentationOwner.close();
-    this._wrapper.remove();
+    this._shell.destroy();
   }
 }
