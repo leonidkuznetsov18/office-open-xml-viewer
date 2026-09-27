@@ -8,9 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::io::Cursor;
-#[cfg(test)]
-use std::io::Read;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::rc::Rc;
 
 use ooxml_common::bounded_xml::{
@@ -409,7 +407,6 @@ fn flush_streamed_rows(
     prev_row_idx: &mut u32,
     shared_strings: &[SharedString],
     theme_colors: &[String],
-    metadata_only: bool,
 ) -> Result<Vec<ProjectedWorksheetRow>, String> {
     if pending.is_empty() {
         return Ok(Vec::new());
@@ -442,36 +439,9 @@ fn flush_streamed_rows(
                     && is_x_ns(node.tag_name().namespace())
             })
             .ok_or_else(|| "streamed worksheet row lost its SpreadsheetML namespace".to_string())?;
-        let row = parse_row_node(
-            &row_node,
-            prev_row_idx,
-            shared_strings,
-            theme_colors,
-            metadata_only,
-        )?;
-        // CT_Cell@r is optional (§18.3.1.4). Resolve explicit and implicit
-        // columns exactly as parse_row_cells does, even in the metadata pass.
-        let max_col = if metadata_only {
-            let mut previous = 0;
-            let mut maximum = 0;
-            for cell in row_node.children().filter(|node| {
-                node.tag_name().name() == "c" && is_x_ns(node.tag_name().namespace())
-            }) {
-                let explicit = cell
-                    .attribute("r")
-                    .map(|reference| crate::parse_cell_ref_checked(reference).map(|(col, _)| col))
-                    .transpose()?;
-                let col =
-                    resolve_implicit_ordinal(explicit, &mut previous, SpreadsheetOrdinal::Column)?;
-                maximum = maximum.max(col);
-            }
-            maximum
-        } else {
-            row.cells.iter().map(|cell| cell.col).max().unwrap_or(0)
-        };
+        let row = parse_row_node(&row_node, prev_row_idx, shared_strings, theme_colors)?;
         rows.push(ProjectedWorksheetRow {
             row,
-            max_col,
             projected_bytes: source.projected_arena_bytes(),
         });
     }
@@ -487,7 +457,6 @@ fn parse_row_node(
     prev_row_idx: &mut u32,
     shared_strings: &[SharedString],
     theme_colors: &[String],
-    metadata_only: bool,
 ) -> Result<Row, String> {
     // ECMA-376 §18.3.1.73 makes `@r` optional; honor an explicit value when
     // present. When omitted, take the running previous row + 1 (implicit
@@ -520,11 +489,7 @@ fn parse_row_node(
         .min(7);
     let collapsed = attr_bool(node, "collapsed").unwrap_or(false);
     let row_ph = attr_bool(node, "ph").unwrap_or(false);
-    let cells = if metadata_only {
-        Vec::new()
-    } else {
-        parse_row_cells(node, row_idx, row_ph, shared_strings, theme_colors)?
-    };
+    let cells = parse_row_cells(node, row_idx, row_ph, shared_strings, theme_colors)?;
     Ok(Row {
         index: row_idx,
         height,
@@ -872,7 +837,6 @@ struct StreamedRowBatch {
 struct RowProjectionInputs<'a> {
     shared_strings: &'a [SharedString],
     theme_colors: &'a [String],
-    metadata_only: bool,
 }
 
 impl StreamedRowBatch {
@@ -907,7 +871,6 @@ impl StreamedRowBatch {
         &mut self,
         shared_strings: &[SharedString],
         theme_colors: &[String],
-        metadata_only: bool,
         ready_rows: &mut VecDeque<ProjectedWorksheetRow>,
     ) -> Result<(), WorksheetProjectorError> {
         for row in flush_streamed_rows(
@@ -915,7 +878,6 @@ impl StreamedRowBatch {
             &mut self.previous_index,
             shared_strings,
             theme_colors,
-            metadata_only,
         )? {
             if let Some(height) = row.row.height {
                 self.heights.insert(row.row.index, height);
@@ -951,7 +913,6 @@ impl StreamedRowBatch {
             self.dispatch(
                 inputs.shared_strings,
                 inputs.theme_colors,
-                inputs.metadata_only,
                 ready_rows,
             )?;
         }
@@ -960,7 +921,6 @@ impl StreamedRowBatch {
             self.dispatch(
                 inputs.shared_strings,
                 inputs.theme_colors,
-                inputs.metadata_only,
                 ready_rows,
             )?;
         }
@@ -987,7 +947,6 @@ pub(super) enum WorksheetProjectorItem {
 #[derive(Debug)]
 pub(super) struct ProjectedWorksheetRow {
     pub(super) row: Row,
-    pub(super) max_col: u32,
     /// Exact bytes retained for the row's standalone internal projection,
     /// including inherited namespace wrapper overhead.
     pub(super) projected_bytes: usize,
@@ -1022,7 +981,6 @@ where
     finished_tail: Option<StreamedWorksheetRows>,
     shared_strings: Option<S>,
     theme_colors: Option<T>,
-    metadata_only: bool,
     part: Option<String>,
     limit_reporter: Option<PackageLimitReporter>,
     row_projection_limit: usize,
@@ -1100,7 +1058,6 @@ where
             finished_tail: None,
             shared_strings: Some(shared_strings),
             theme_colors: Some(theme_colors),
-            metadata_only: false,
             part,
             limit_reporter,
             row_projection_limit,
@@ -1153,7 +1110,6 @@ where
                     .as_ref()
                     .expect("active projector owns theme colors")
                     .as_ref(),
-                metadata_only: self.metadata_only,
             },
             &mut self.ready_rows,
         )
@@ -1558,7 +1514,6 @@ where
                 .as_ref()
                 .expect("active projector owns theme colors")
                 .as_ref(),
-            self.metadata_only,
             &mut self.ready_rows,
         )?;
         self.reader.take();
@@ -1705,16 +1660,30 @@ where
         ))
     }
 
-    /// Scan the MCE-processed shell and row coordinates before the cursor's
-    /// bounded row pull. This pass does not decode cell values or retain rows.
-    pub(super) fn from_package_entry_metadata(
-        entry: PackageEntryStream,
+}
+
+impl<S, T> WorksheetRowProjector<BufReader<Box<dyn Read>>, S, T>
+where
+    S: AsRef<[SharedString]>,
+    T: AsRef<[String]>,
+{
+    pub(super) fn from_owned_reader(
+        source: Box<dyn Read>,
+        part: String,
+        reporter: PackageLimitReporter,
         shared_strings: S,
         theme_colors: T,
-    ) -> Result<Self, String> {
-        let mut projector = Self::from_package_entry(entry, shared_strings, theme_colors)?;
-        projector.metadata_only = true;
-        Ok(projector)
+    ) -> Self {
+        Self::with_limits_and_reporter(
+            BufReader::new(source),
+            shared_strings,
+            theme_colors,
+            STREAMED_XML_EVENT_BYTES,
+            STREAMED_ROW_PROJECTION_BYTES,
+            STREAMED_WORKSHEET_SHELL_BYTES,
+            Some(part),
+            Some(reporter),
+        )
     }
 }
 
@@ -1884,7 +1853,6 @@ mod worksheet_streaming_tests {
                     &mut previous_row,
                     shared_strings,
                     theme_colors,
-                    false,
                 )
                 .expect("reference worksheet row parses");
                 if let Some(height) = row.height {
@@ -2290,7 +2258,6 @@ mod worksheet_streaming_tests {
                 RowProjectionInputs {
                     shared_strings: &[],
                     theme_colors: &[],
-                    metadata_only: false,
                 },
                 &mut VecDeque::new(),
             )

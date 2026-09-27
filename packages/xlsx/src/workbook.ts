@@ -1093,8 +1093,11 @@ export class XlsxWorkbook {
     this.requireArchiveBridge();
     const queued = this.queuedImageLoads?.get(imagePath);
     if (queued) return queued;
-    const p = this.runArchiveOperation(() =>
-      this.getImageWithinArchiveOperation(imagePath, mimeType));
+    const provisional = [...(this.sheetPreviews?.values() ?? [])]
+      .some((preview) => preview.worksheet && !preview.complete);
+    const p = provisional
+      ? this.getImageWithinArchiveOperation(imagePath, mimeType)
+      : this.runArchiveOperation(() => this.getImageWithinArchiveOperation(imagePath, mimeType));
     this.queuedImageLoads ??= new Map();
     this.queuedImageLoads.set(imagePath, p);
     void p.finally(() => {

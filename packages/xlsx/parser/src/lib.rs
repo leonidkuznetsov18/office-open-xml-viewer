@@ -3537,29 +3537,12 @@ fn cursor_preview_blocker(
     has_row_outline: bool,
     ordered_rows: bool,
     worksheet: &Worksheet,
-    shell_xml: &str,
 ) -> Result<Option<&'static str>, String> {
     if !ordered_rows {
         return Ok(Some("unordered-rows"));
     }
     if has_row_outline || !worksheet.col_outline_levels.is_empty() {
         return Ok(Some("outline"));
-    }
-    if !worksheet.merge_cells.is_empty() {
-        return Ok(Some("merge"));
-    }
-    if !worksheet.conditional_formats.is_empty() {
-        return Ok(Some("conditional-format"));
-    }
-    let doc = parse_guarded(shell_xml).map_err(|error| error.to_string())?;
-    if doc.descendants().any(|node| {
-        node.is_element()
-            && matches!(
-                node.tag_name().name(),
-                "drawing" | "oleObjects" | "controls" | "tableParts" | "extLst"
-            )
-    }) {
-        return Ok(Some("ancillary-content"));
     }
     Ok(None)
 }
@@ -3571,7 +3554,7 @@ fn build_cursor_preview(
     name: &str,
     sheet_path: &str,
     part: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Rc<[u8]>), String> {
     let scanned = zip.scan_worksheet_preview(
         part,
         Rc::clone(&shared.shared_strings),
@@ -3579,14 +3562,19 @@ fn build_cursor_preview(
     )?;
     let max_row = scanned.max_row;
     let max_col = scanned.max_col;
+    let raw = scanned.raw;
     let has_row_outline = scanned.has_row_outline;
     let ordered_rows = scanned.ordered_rows;
-    let parsed = parse_projected_worksheet_tail(scanned.tail, shared.theme_colors.as_ref(), name)?;
     let reporter = zip.active_operation()?.limit_reporter()?;
-    if let Some(reason) =
-        cursor_preview_blocker(has_row_outline, ordered_rows, &parsed.0, &parsed.2)?
-    {
-        return serialize_cursor_preview(None, Some(reason), max_row, max_col, &reporter, part);
+    let Some(tail) = scanned.tail else {
+        return serialize_cursor_preview(
+            None, Some("metadata-unavailable"), 0, 0, &reporter, part,
+        ).map(|preview| (preview, raw));
+    };
+    let parsed = parse_projected_worksheet_tail(tail, shared.theme_colors.as_ref(), name)?;
+    if let Some(reason) = cursor_preview_blocker(has_row_outline, ordered_rows, &parsed.0)? {
+        return serialize_cursor_preview(None, Some(reason), max_row, max_col, &reporter, part)
+            .map(|preview| (preview, raw));
     }
     let worksheet = finalize_projected_sheet(
         zip,
@@ -3597,22 +3585,8 @@ fn build_cursor_preview(
         parsed,
         CurrentSheetLookup::Seed(None),
     )?;
-    if !worksheet.images.is_empty()
-        || !worksheet.charts.is_empty()
-        || !worksheet.shape_groups.is_empty()
-        || !worksheet.slicers.is_empty()
-        || !worksheet.sparkline_groups.is_empty()
-    {
-        return serialize_cursor_preview(
-            None,
-            Some("ancillary-content"),
-            max_row,
-            max_col,
-            &reporter,
-            part,
-        );
-    }
     serialize_cursor_preview(Some(&worksheet), None, max_row, max_col, &reporter, part)
+        .map(|preview| (preview, raw))
 }
 
 enum ActiveWorksheetSource {
@@ -3799,10 +3773,15 @@ impl XlsxArchive {
                     }
                 },
                 SheetPartKind::Worksheet => {
-                    let preview_result =
-                        build_cursor_preview(zip, shared, sheet_index, name, &sheet_path, &part);
+                    let preview_result = build_cursor_preview(
+                        zip, shared, sheet_index, name, &sheet_path, &part,
+                    );
+                    let mut buffered_xml = None;
                     match preview_result {
-                        Ok(bytes) => preview = Some(bytes),
+                        Ok((bytes, raw)) => {
+                            preview = Some(bytes);
+                            buffered_xml = Some(raw);
+                        }
                         Err(_) if zip.assert_healthy().is_ok() => {
                             let reporter = zip.active_operation()?.limit_reporter()?;
                             preview = Some(serialize_cursor_preview(
@@ -3819,11 +3798,18 @@ impl XlsxArchive {
                     if let Err(resource_error) = zip.assert_healthy() {
                         ActiveWorksheetSource::Poisoned(resource_error)
                     } else {
-                        match zip.open_worksheet_cursor(
-                            &part,
-                            Rc::clone(&shared.shared_strings),
-                            Rc::clone(&shared.theme_colors),
-                        ) {
+                        let cursor_result = if let Some(raw) = buffered_xml {
+                            zip.open_buffered_worksheet_cursor(
+                                &part, raw, Rc::clone(&shared.shared_strings),
+                                Rc::clone(&shared.theme_colors),
+                            )
+                        } else {
+                            zip.open_worksheet_cursor(
+                                &part, Rc::clone(&shared.shared_strings),
+                                Rc::clone(&shared.theme_colors),
+                            )
+                        };
+                        match cursor_result {
                             Ok(cursor) => ActiveWorksheetSource::Streaming(Box::new(cursor)),
                             Err(error) => {
                                 zip.assert_healthy()?;
@@ -4151,9 +4137,15 @@ impl XlsxArchive {
     /// "xl/media/image1.png") from the retained archive. Twin of the free
     /// `extract_image`, but reads through the already-open archive.
     pub fn extract_image(&mut self, path: &str) -> Result<Vec<u8>, JsValue> {
-        self.archive
-            .run_operation("extract-image", |zip| read_zip_bytes(zip, path))
-            .map_err(|error| JsValue::from_str(&error))
+        let result = if self.active_worksheet.is_some() {
+            // A provisional viewport may need a DrawingML blip while the
+            // worksheet cursor owns its operation. Charge it to that same
+            // operation, then let terminal ACK commit the combined usage.
+            read_zip_bytes(&mut self.archive, path)
+        } else {
+            self.archive.run_operation("extract-image", |zip| read_zip_bytes(zip, path))
+        };
+        result.map_err(|error| JsValue::from_str(&error))
     }
 
     /// GitHub-flavoured markdown projection of the retained archive. Mirrors the
@@ -7111,8 +7103,9 @@ mod rb7_partial_degradation_tests {
 
     #[test]
     fn cursor_preview_has_final_shell_and_implicit_scroll_bounds_before_rows() {
-        let mut archive =
-            XlsxArchive::new(build_implicit_ref_workbook(), None, None, None).unwrap();
+        let padding = "x".repeat(550_000);
+        let sheet = format!(r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{padding}</t></is></c></row><row r="2"><c r="C2" t="inlineStr"><is><t>{padding}</t></is></c></row></sheetData></worksheet>"#);
+        let mut archive = XlsxArchive::new(build_sheet_xml_workbook(&sheet), None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Sheet1").unwrap();
         let first: serde_json::Value =
             serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
@@ -7132,7 +7125,7 @@ mod rb7_partial_degradation_tests {
     }
 
     #[test]
-    fn cursor_preview_falls_back_for_whole_range_conditional_formatting() {
+    fn small_worksheet_emits_preview_before_rows() {
         let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1:A3"><cfRule type="top10" rank="1" priority="1"/></conditionalFormatting></worksheet>"#;
         let mut archive =
             XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
@@ -7140,8 +7133,8 @@ mod rb7_partial_degradation_tests {
         let first: serde_json::Value =
             serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
         assert_eq!(first["kind"], "preview");
-        assert_eq!(first["reason"], "conditional-format");
-        assert!(first["worksheet"].is_null());
+        assert!(first["reason"].is_null());
+        assert!(first["worksheet"].is_object());
         archive.cancel_sheet_cursor();
     }
 

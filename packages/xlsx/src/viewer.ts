@@ -32,6 +32,7 @@ import {
 import { findListValidationAt } from './data-validation.js';
 import { formatA1, parseA1 } from './a1.js';
 import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
+import { viewportPreviewBlocker, type ViewportPreviewBlocker } from './internal/worksheet-preview-eligibility.js';
 import { resolveXlsxInternalHyperlink } from './internal-hyperlink.js';
 import type {
   CellAddress,
@@ -734,6 +735,7 @@ class XlsxViewerEngine implements ZoomableViewer {
   private previewCompletion: Promise<Worksheet> | null = null;
   private firstPreviewRender = false;
   private previewPreparedViewport: { width: number; height: number; scale: number } | null = null;
+  private previewFallbackReason: ViewportPreviewBlocker | null = null;
   private releaseCurrentWorksheet: (() => void) | null = null;
   /** Authored comments for the selected sheet. Presentation filtering must not
    * erase the application-owned data and selection-context contracts. */
@@ -1347,6 +1349,7 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   private async showSheet(index: number): Promise<void> {
     const generation = ++this.sheetRequestGeneration;
+    this.previewFallbackReason = null;
     const workbook = this.workbook;
     let worksheet: Worksheet;
     let sourceWorksheet: Worksheet;
@@ -1367,7 +1370,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       sourceWorksheet = lease.worksheet;
       releaseNewWorksheet = lease.release;
       releaseFirstPaint = lease.releaseFirstPaint;
-      previewCompletion = lease.partial ? lease.completion : null;
+      let eligiblePreview = lease.partial;
       if (lease.partial) {
         previewPreparedViewport = {
           width: this.canvasArea.clientWidth,
@@ -1384,14 +1387,23 @@ class XlsxViewerEngine implements ZoomableViewer {
           headerHeight: HEADER_H,
           buffer: 2,
         });
-        await (lease.waitForRows?.(Math.max(
+        const coveringRow = Math.max(
           visible.range.row + visible.range.rows - 1,
           sourceWorksheet.freezeRows,
-        )) ?? Promise.resolve());
+        );
+        await (lease.waitForRows?.(coveringRow) ?? Promise.resolve());
+        this.previewFallbackReason = viewportPreviewBlocker(sourceWorksheet, visible.range, coveringRow);
+        if (this.previewFallbackReason) {
+          releaseFirstPaint?.();
+          sourceWorksheet = await lease.completion;
+          eligiblePreview = false;
+          previewPreparedViewport = null;
+        }
       }
+      previewCompletion = eligiblePreview ? lease.completion : null;
       const cachedView = this.sheetViews.get(index);
       worksheet = cachedView ?? this.createVisibleSheetView(sourceWorksheet);
-      if (lease.partial) worksheet.rows = sourceWorksheet.rows;
+      if (eligiblePreview) worksheet.rows = sourceWorksheet.rows;
       if (!cachedView) this.restoreSheetViewState(index, worksheet);
       const prepareRowHeights = workbook[prepareXlsxViewerRowHeights];
       if (typeof prepareRowHeights === 'function') {
@@ -1428,31 +1440,41 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.previewCompletion = null;
         this.firstPreviewRender = false;
         this.previewPreparedViewport = null;
+        // Chart and sparkline references can resolve more completely once all
+        // rows exist. Rebind the viewer to the committed model, preserving only
+        // viewer-owned size and outline edits made during the pull.
+        const finalized = this.createVisibleSheetView(completed);
+        this.restoreSheetViewState(index, finalized);
+        this.currentWorksheet = finalized;
+        this.sheetViews.set(index, finalized);
         if (completed.parseError) {
           // A later row may make the cursor produce the normal degraded-sheet
           // placeholder. Replace the provisional graph before the next frame.
-          const placeholder = this.createVisibleSheetView(completed);
-          this.currentWorksheet = placeholder;
-          this.sheetViews.set(index, placeholder);
           this.currentSourceComments = [];
           this.sourceCommentMap.clear();
           this.selectionController.reset();
           this.emitSelectionChange();
           this.updateSelectionOverlay();
-          this.buildCommentMap(placeholder);
-          this.buildHyperlinkMap(placeholder);
-          this.buildOutline(placeholder);
+          this.buildCommentMap(finalized);
+          this.buildHyperlinkMap(finalized);
+          this.buildOutline(finalized);
           this.layoutGutters();
-          this.updateSpacerSize(placeholder);
+          this.updateSpacerSize(finalized);
           this.scheduleRender();
           return;
         }
         invalidateSheetRenderCache(worksheet);
         invalidateAutoRowHeights(worksheet);
         const measureCtx = this.hostDocument.createElement('canvas').getContext('2d');
-        if (measureCtx) workbook[prepareXlsxViewerRowHeights](worksheet, measureCtx);
-        this.syncAutomaticRowOverrides(index, worksheet);
-        this.updateSpacerSize(worksheet);
+        if (measureCtx) workbook[prepareXlsxViewerRowHeights](finalized, measureCtx);
+        this.syncAutomaticRowOverrides(index, finalized);
+        this.currentSourceComments = completed.comments ?? [];
+        this.sourceCommentMap = this.createCommentMap(this.currentSourceComments);
+        this.buildCommentMap(finalized);
+        this.buildHyperlinkMap(finalized);
+        this.buildOutline(finalized);
+        this.layoutGutters();
+        this.updateSpacerSize(finalized);
         this.scheduleRender();
         this.scheduleSelectionContextNotification();
       }).catch((error: unknown) => {
