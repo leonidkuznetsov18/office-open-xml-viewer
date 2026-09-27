@@ -1,4 +1,6 @@
 import { resolveBorderConflict, type BorderCandidate } from '../cell-border-conflict.js';
+import { computeFrameBox } from '../frame-geometry.js';
+import { translateParagraphLayout } from './retained-geometry-translation.js';
 import { retainedBorderTreatment } from './border-treatment.js';
 import { paragraphGapPt } from './paragraph-spacing.js';
 import { snapshotPlainData } from './plain-data.js';
@@ -92,7 +94,10 @@ function resolveCellFlow(blocks: readonly TableCellBlockInput[]): CellFlowGeomet
         : beforePt;
       const advancePt = block.structuralTrailing ? 0 : paragraphBlockAdvance(layout);
       const offsetPt = cursorPt + (block.structuralTrailing ? 0 : gapPt);
-      placements.push({ layout, offsetPt, advancePt });
+      placements.push({
+        layout, offsetPt, advancePt,
+        ...(block.sourceBlockIndex !== undefined ? { sourceBlockIndex: block.sourceBlockIndex } : {}),
+      });
       if (!block.structuralTrailing) {
         cursorPt = offsetPt + advancePt;
         firstInkTopPt ??= offsetPt;
@@ -122,7 +127,10 @@ function resolveCellFlow(blocks: readonly TableCellBlockInput[]): CellFlowGeomet
 
     if (previousParagraph) cursorPt += previousAfterPt;
     const advancePt = layout.advancePt;
-    placements.push({ layout, offsetPt: cursorPt, advancePt });
+    placements.push({
+      layout, offsetPt: cursorPt, advancePt,
+      ...(block.sourceBlockIndex !== undefined ? { sourceBlockIndex: block.sourceBlockIndex } : {}),
+    });
     firstInkTopPt ??= cursorPt;
     cursorPt += advancePt;
     lastInkBottomPt = cursorPt;
@@ -1348,8 +1356,59 @@ export function layoutTable(
             ...block,
             offsetPt: inkOffsetPt + block.offsetPt,
           }));
+      const pageFrame = input.pageFrame ?? {
+        pageWidthPt: placement.availableBounds.widthPt,
+        pageHeightPt: placement.availableBounds.heightPt,
+        marginLeftPt: placement.availableBounds.xPt,
+        marginRightPt: 0,
+        marginTopPt: placement.availableBounds.yPt,
+        marginBottomPt: 0,
+      };
+      const frames = cell.verticalMerge === 'continue' ? [] : (cell.frames ?? []).map((frame) => {
+        // Resolve page/margin anchors only after this fragment's physical cell
+        // origin is known. Text anchors use the same owner cell's flow cursor;
+        // neighboring cells never enter this frame's exclusion domain.
+        const box = computeFrameBox(
+          frame.framePr,
+          {
+            contentX: contentBounds.xPt,
+            contentW: contentBounds.widthPt,
+            pageH: pageFrame.pageHeightPt,
+            pageWidth: pageFrame.pageWidthPt,
+            marginLeft: pageFrame.marginLeftPt,
+            marginRight: pageFrame.marginRightPt,
+            marginTop: pageFrame.marginTopPt,
+            marginBottom: pageFrame.marginBottomPt,
+          },
+          cellFlowBounds.yPt + inkOffsetPt + frame.anchorOffsetPt,
+          frame.acquiredBounds.widthPt,
+          frame.acquiredBounds.heightPt,
+          frame.framePr.lines > 0
+            ? frame.acquiredBounds.heightPt / frame.framePr.lines
+            : frame.acquiredBounds.heightPt,
+        );
+        const delta = {
+          xPt: box.x - frame.acquiredBounds.xPt,
+          yPt: box.y - frame.acquiredBounds.yPt,
+        };
+        return {
+          id: frame.id,
+          firstSourceBlockIndex: frame.firstSourceBlockIndex,
+          bounds: { xPt: box.x, yPt: box.y, widthPt: box.w, heightPt: box.h },
+          exclusionBounds: {
+            xPt: box.exLeft,
+            yPt: box.exTop,
+            widthPt: box.exRight - box.exLeft,
+            heightPt: box.exBottom - box.exTop,
+          },
+          members: frame.members.map((member) => translateParagraphLayout(member, delta)),
+          horizontalFollowsCell: frame.framePr.hAnchor === 'text',
+          verticalFollowsCell: frame.framePr.vAnchor === 'text',
+        };
+      });
       const childInk = blocks
         .map((block) => placedChildInkBounds(block, contentBounds.xPt, cellFlowBounds.yPt))
+        .concat(frames.map((frame) => frame.bounds))
         .map((bounds) => clipBounds ? intersectRects(bounds, clipBounds) : bounds)
         .filter((bounds): bounds is LayoutRect => bounds !== null);
       const cellInkBounds = unionLayoutRects([cellFlowBounds, ...childInk]) ?? cellFlowBounds;
@@ -1368,6 +1427,7 @@ export function layoutTable(
         vAlign: cell.vAlign,
         ...(cell.background ? { background: cell.background } : {}),
         blocks,
+        ...(frames.length ? { frames } : {}),
       };
     });
     const rowBounds = { xPt: rowOriginXPt, yPt: rowTopPt, widthPt, heightPt: rowHeightPt };

@@ -178,18 +178,42 @@ function paintTableContents(
       const paintBlocks = (
         blockContext: CanvasPaintContext,
         paintDirectNestedTableBorders = true,
+        rotated = false,
       ): void => {
-        for (const block of cell.blocks) {
+        const paintBlock = (block: typeof cell.blocks[number]): void => {
           paintPlacedChild(block.layout, {
             // Paragraphs are normalized to the cell content origin. A nested
-            // table's own flowBounds additionally retain jc/tblInd placement
-            // within that band, so translate its coordinate space by the outer
-            // content origin without erasing that local offset.
+            // table retains its own justification/indent within that band.
             xPt: cell.contentBounds.xPt
-              + (block.layout.kind === 'table' ? block.layout.flowBounds.xPt : 0),
-            yPt: cell.flowBounds.yPt + block.offsetPt
-              + (block.layout.kind === 'table' ? block.layout.flowBounds.yPt : 0),
+              + (!rotated && block.layout.kind === 'table' ? block.layout.flowBounds.xPt : 0),
+            yPt: (rotated ? 0 : cell.flowBounds.yPt) + block.offsetPt
+              + (!rotated && block.layout.kind === 'table' ? block.layout.flowBounds.yPt : 0),
           }, blockContext, block.layout.kind !== 'table' || paintDirectNestedTableBorders);
+        };
+        if (!cell.frames?.length) {
+          for (const block of cell.blocks) paintBlock(block);
+          return;
+        }
+        const ordered = [
+          ...cell.blocks.map((block) => ({
+            sourceBlockIndex: block.sourceBlockIndex ?? Number.POSITIVE_INFINITY,
+            block,
+            frame: undefined as undefined | NonNullable<typeof cell.frames>[number],
+          })),
+          ...cell.frames.map((frame) => ({
+            sourceBlockIndex: frame.firstSourceBlockIndex,
+            block: undefined as undefined | typeof cell.blocks[number],
+            frame,
+          })),
+        ].sort((a, b) => a.sourceBlockIndex - b.sourceBlockIndex);
+        for (const entry of ordered) {
+          if (entry.frame) {
+            for (const member of entry.frame.members) paintParagraphLayout(member, blockContext);
+            continue;
+          }
+          const block = entry.block;
+          if (!block) continue;
+          paintBlock(block);
         }
       };
       if (cell.verticalText) {
@@ -213,12 +237,7 @@ function paintTableContents(
           textBoxVerticalMode: verticalText.mode,
         };
         rotatedFrame(() => {
-          for (const block of cell.blocks) {
-            paintPlacedChild(block.layout, {
-              xPt: cell.contentBounds.xPt,
-              yPt: block.offsetPt,
-            }, rotatedContext, true);
-          }
+          paintBlocks(rotatedContext, true, true);
         })();
         continue;
       }

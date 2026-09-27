@@ -4560,6 +4560,9 @@ export interface RetainedFrameGroupOptions {
   /** Owning story of the grouped paragraphs; `sourceIndices` are paths in its
    * root block list. Defaults to the main body. */
   readonly story?: Readonly<{ story: SourceRef['story']; storyInstance: string }>;
+  /** Table-cell members keep their full row/cell/source path. Body and page
+   * stories use the group's root index when this callback is absent. */
+  readonly sourceForMember?: (memberIndex: number) => SourceRef;
   readonly place: (
     contentWidthPt: number,
     contentHeightPt: number,
@@ -4636,6 +4639,7 @@ export function acquireRetainedFrameGroup(
     frameFingerprintValue(options.borderExtentsPt),
     options.containerShading ?? null,
     frameFingerprintValue(options.anchorFrames),
+    options.sourceForMember ? group.sourceIndices.map((_, index) => options.sourceForMember!(index)) : null,
   ]);
   const cached = cache.get(cacheKey);
   if (cached) return cached;
@@ -4681,7 +4685,7 @@ export function acquireRetainedFrameGroup(
         suppressSpaceBefore: true,
       };
       const borderExtentPt = options.borderExtentsPt[memberIndex] ?? 0;
-      const source: SourceRef = {
+      const source: SourceRef = options.sourceForMember?.(memberIndex) ?? {
         story: owner.story,
         storyInstance: owner.storyInstance,
         path: [group.sourceIndices[memberIndex]!],

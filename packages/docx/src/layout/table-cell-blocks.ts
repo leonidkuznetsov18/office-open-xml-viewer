@@ -39,6 +39,8 @@ export interface TableCellBlockAcquisitionDependencies<State> {
     acquireNestedCellBlocks: AcquireNestedCellBlocks<State>,
   ): FlowFragment;
   advanceState(state: State, advancePt: number): void;
+  /** Positioned frame paragraphs are acquired but do not advance cell flow. */
+  advancesParagraph?(paragraph: ParagraphLayoutSource): boolean;
 }
 
 export interface AcquireTableCellBlocksInput<State> {
@@ -201,7 +203,9 @@ export function acquireTableCellBlocks<State>(
         ),
       );
       blocks.push(block);
-      dependencies.advanceState(cellState, block.advancePt);
+      if (dependencies.advancesParagraph?.(paragraph) !== false) {
+        dependencies.advanceState(cellState, block.advancePt);
+      }
       continue;
     }
 
