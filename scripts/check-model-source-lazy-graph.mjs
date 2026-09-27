@@ -199,18 +199,21 @@ function assertNoSourceRuntime(code, name) {
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  // Shared scroll collaborators add 11,866 bytes to the DOCX static graph:
-  // Vite factors a 31,779-byte controller chunk, while the entry shrinks by
-  // 16,921 bytes and a 2,992-byte boundary chunk is absorbed. File count stays
-  // at 36; the optional model-source runtime remains outside the graph.
-  docx: { entry: 2_537_512, inline: 31_624, budget: 2_800 },
+  // Against fed37873, the shared viewer moves 37,917 rendered module bytes
+  // into core, while the DOCX viewer/find modules shrink by 28,790 and the
+  // format layout/comment adapters add 6,317. Vite factors these into a
+  // shared 31,779-byte chunk in place of a 2,992-byte boundary chunk. The
+  // measured DOCX static graph grows 11,302 bytes (36 files); across DOCX and
+  // PPTX together, unique static bytes fall by 4,483. No optional source
+  // runtime or new worker code enters the graph.
+  docx: { entry: 2_536_948, inline: 31_624, budget: 2_800 },
   // XLSX entry +8,512 bytes versus 776237df: worksheet LRU/leases and
   // viewer state restoration. The optional model-source runtime stays lazy.
   xlsx: { entry: 1_844_182, inline: 39_902, budget: 2_500 },
-  // PPTX shares that controller chunk; its entry shrinks by 15,276 bytes and
-  // the same 2,992-byte boundary chunk is absorbed. Net growth is 13,511
-  // bytes with 38 files and no optional model-source runtime in the graph.
-  pptx: { entry: 1_837_773, inline: 59_554, budget: 2_100 },
+  // PPTX uses the same core chunk. Its viewer/find modules shrink by 30,988
+  // rendered bytes and format layout/media/comment adapters add 10,379;
+  // its measured static graph grows 13,002 bytes (38 files).
+  pptx: { entry: 1_837_264, inline: 59_554, budget: 2_100 },
   node: { entry: 2_575_997, budget: 3_600 },
 });
 // The XLSX render worker adds 536 bytes for explicit worksheet eviction;

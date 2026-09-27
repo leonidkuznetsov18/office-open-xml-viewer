@@ -16,7 +16,7 @@ import {
 import { READ_ONLY_COMMENT_MARGIN_WIDTH_PX } from '@silurus/ooxml-core/internal/read-only-comment-contract';
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
-import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
+import { BitmapSlotRenderer, type BitmapSlotHooks } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
@@ -174,20 +174,25 @@ export class DocxScrollViewer implements ZoomableViewer {
     refreshSlot: (page, slot) => this._refreshSlotAtomically(page, slot as PageSlot),
   });
 
-  private readonly _bitmap = new BitmapSlotRenderer<PageSlot, DocxTextRunInfo>({
+  private readonly _renderHooks = {
     slots: () => this._slots,
-    inFlight: () => this._scroller.inFlight,
     epoch: () => this._renderEpoch,
-    destroyed: () => this._destroyed,
     scale: () => this._scale,
-    width: (page) => this._pageWidthPx(page),
-    dpr: () => this._viewport.dpr(),
     slotIndex: (slot) => slot.renderedPage,
     token: () => 0,
     nextToken: () => 0,
-    canRetry: () => true,
     wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) ||
       this._findActive || !!slot.commentTintLayer,
+    reportError: (error) => this._reportRenderError(error),
+  } satisfies Pick<BitmapSlotHooks<PageSlot, DocxTextRunInfo>,
+    'slots' | 'epoch' | 'scale' | 'slotIndex' | 'token' | 'nextToken' | 'wantRuns' | 'reportError'>;
+  private readonly _bitmap = new BitmapSlotRenderer<PageSlot, DocxTextRunInfo>({
+    ...this._renderHooks,
+    inFlight: () => this._scroller.inFlight,
+    destroyed: () => this._destroyed,
+    width: (page) => this._pageWidthPx(page),
+    dpr: () => this._viewport.dpr(),
+    canRetry: () => true,
     render: (page, canvas, width, dpr, onTextRun) =>
       renderDocxFocusedPage(this._doc!, canvas, page, 'worker', {
         width, dpr,
@@ -201,30 +206,11 @@ export class DocxScrollViewer implements ZoomableViewer {
       dispatcher.commitBitmap(generation, bitmap, {
         cssWidth: width, cssHeight: this._pageHeightPx(page),
       }),
-    commitRuns: (page, slot, runs, _width, wantedRuns) => {
-      if (slot.textLayer) {
-        this._clearTextLayerPreview(slot.textLayer);
-        if (this._opts.enableTextSelection) {
-          const { width, height } = this._canvasCssPx(slot.canvas);
-          buildDocxTextLayer(slot.textLayer, runs, width, height,
-            this._hyperlinkHandler(), (font) => this._highlights.measure(font), page);
-        }
-      }
-      if (wantedRuns) this._highlights.refreshRuns(page, runs);
-      this._commitCommentRuns(page, slot, runs);
-      this._highlights.redrawSlot(page, slot);
-    },
-    reportError: (error) => this._reportRenderError(error),
+    commitRuns: (page, slot, runs, _width, wantedRuns) =>
+      this._commitRenderedRuns(page, slot, runs, slot.canvas, wantedRuns, true),
   });
   private readonly _main = new MainSlotRenderer<PageSlot, DocxTextRunInfo>({
-    slots: () => this._slots,
-    epoch: () => this._renderEpoch,
-    scale: () => this._scale,
-    token: () => 0,
-    nextToken: () => 0,
-    slotIndex: (slot) => slot.renderedPage,
-    wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) ||
-      this._findActive || !!slot.commentTintLayer,
+    ...this._renderHooks,
     render: (page, canvas, width, dpr, onTextRun) =>
       renderDocxFocusedPage(this._doc!, canvas, page, 'main', {
         width, dpr,
@@ -234,21 +220,9 @@ export class DocxScrollViewer implements ZoomableViewer {
         ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
         onTextRun,
       }),
-    commitRuns: (page, slot, runs, canvas, _width, wantedRuns, settled) => {
-      if (slot.textLayer) {
-        if (settled) this._clearTextLayerPreview(slot.textLayer);
-        if (this._opts.enableTextSelection) {
-          const { width, height } = this._canvasCssPx(canvas);
-          buildDocxTextLayer(slot.textLayer, runs, width, height,
-            this._hyperlinkHandler(), (font) => this._highlights.measure(font), page);
-        }
-      }
-      if (wantedRuns) this._highlights.refreshRuns(page, runs);
-      this._commitCommentRuns(page, slot, runs);
-      this._highlights.redrawSlot(page, slot);
-    },
+    commitRuns: (page, slot, runs, canvas, _width, wantedRuns, settled) =>
+      this._commitRenderedRuns(page, slot, runs, canvas, wantedRuns, settled),
     shadow: () => this._pageShadow,
-    reportError: (error) => this._reportRenderError(error),
   });
   private readonly _navigation = new ScrollNavigationController({
     host: () => this._scrollHost,
@@ -979,6 +953,23 @@ export class DocxScrollViewer implements ZoomableViewer {
     };
   }
 
+  private _commitRenderedRuns(
+    page: number, slot: PageSlot, runs: DocxTextRunInfo[], canvas: HTMLCanvasElement,
+    wantedRuns: boolean, clearPreview: boolean,
+  ): void {
+    if (slot.textLayer) {
+      if (clearPreview) this._clearTextLayerPreview(slot.textLayer);
+      if (this._opts.enableTextSelection) {
+        const { width, height } = this._canvasCssPx(canvas);
+        buildDocxTextLayer(slot.textLayer, runs, width, height,
+          this._hyperlinkHandler(), (font) => this._highlights.measure(font), page);
+      }
+    }
+    if (wantedRuns) this._highlights.refreshRuns(page, runs);
+    this._commitCommentRuns(page, slot, runs);
+    this._highlights.redrawSlot(page, slot);
+  }
+
   /** Route an async render failure to `onError`, or `console.error` when none is
    *  set (so failures are never fully silent), and never after teardown. */
   private _reportRenderError(err: unknown): void {
@@ -1013,8 +1004,6 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
   private _scheduleSettle(): void { this._scroller.scheduleSettle(DEFAULT_ZOOM_SETTLE_MS); }
-
-  private _settleRender(): void { this._scroller.settle(); }
 
   private _refreshSlotAtomically(i: number, slot: PageSlot): void {
     if (!this._doc) return;
@@ -1316,9 +1305,8 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
     // Cancel a pending settle so no re-render is dispatched after teardown
-    // (design §7 mechanism 2). `_destroyed` also guards `_settleRender`, but
-    // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
-    // deterministic.
+    // (design §7 mechanism 2). Clearing the timer avoids a wasted wake-up and
+    // keeps fake-timer tests deterministic.
     this._scroller.destroy();
     this._zoom.destroy();
     this._commentMargin.destroy();

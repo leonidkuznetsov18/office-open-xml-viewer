@@ -12,7 +12,7 @@ import {
 } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import { ScrollViewerShell } from '@silurus/ooxml-core/internal/scroll-viewer-shell';
 import { HighlightLayerController } from '@silurus/ooxml-core/internal/highlight-layer-controller';
-import { BitmapSlotRenderer } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
+import { BitmapSlotRenderer, type BitmapSlotHooks } from '@silurus/ooxml-core/internal/bitmap-slot-renderer';
 import { MainSlotRenderer } from '@silurus/ooxml-core/internal/main-slot-renderer';
 import { SlotLayerController } from '@silurus/ooxml-core/internal/slot-layer-controller';
 import { ScrollNavigationController } from '@silurus/ooxml-core/internal/scroll-navigation-controller';
@@ -173,19 +173,24 @@ export class PptxScrollViewer implements ZoomableViewer {
     },
   });
 
-  private readonly _bitmap = new BitmapSlotRenderer<SlideSlot, PptxTextRunInfo>({
+  private readonly _renderHooks = {
     slots: () => this._slots,
-    inFlight: () => this._scroller.inFlight,
     epoch: () => this._renderEpoch,
-    destroyed: () => this._destroyed,
     scale: () => this._scale,
-    width: () => this._slideWidthPx(),
-    dpr: () => this._viewport.dpr(),
     slotIndex: (slot) => slot.renderedSlide,
     token: (slot) => slot.renderGeneration,
     nextToken: (slot) => ++slot.renderGeneration,
-    canRetry: (slot) => !(this._opts.enableMediaPlayback && slot.mediaInteractive),
     wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) || this._findActive,
+    reportError: (error) => this._reportRenderError(error),
+  } satisfies Pick<BitmapSlotHooks<SlideSlot, PptxTextRunInfo>,
+    'slots' | 'epoch' | 'scale' | 'slotIndex' | 'token' | 'nextToken' | 'wantRuns' | 'reportError'>;
+  private readonly _bitmap = new BitmapSlotRenderer<SlideSlot, PptxTextRunInfo>({
+    ...this._renderHooks,
+    inFlight: () => this._scroller.inFlight,
+    destroyed: () => this._destroyed,
+    width: () => this._slideWidthPx(),
+    dpr: () => this._viewport.dpr(),
+    canRetry: (slot) => !(this._opts.enableMediaPlayback && slot.mediaInteractive),
     render: (slide, canvas, width, dpr, onTextRun) =>
       renderPptxFocusedSlide(this._pres!, canvas, slide, 'worker', {
         width, dpr, imageResources: this._opts.imageResources, onTextRun,
@@ -196,50 +201,20 @@ export class PptxScrollViewer implements ZoomableViewer {
         ? dispatcher.commitBitmapTo2d(generation, bitmap, size)
         : dispatcher.commitBitmap(generation, bitmap, size);
     },
-    commitRuns: (slide, slot, runs, width, wantedRuns) => {
-      if (slot.textLayer) {
-        this._clearTextLayerPreview(slot.textLayer);
-        if (this._opts.enableTextSelection) {
-          buildPptxTextLayer(slot.textLayer, runs,
-            Math.round(width), Math.round(this._slideHeightPx()),
-            this._hyperlinkHandler(), slide);
-        }
-      }
-      if (wantedRuns) this._highlights.refreshRuns(slide, runs);
-      this._commitSlotComments(slide, slot);
-      this._highlights.redrawSlot(slide, slot);
-    },
-    reportError: (error) => this._reportRenderError(error),
+    commitRuns: (slide, slot, runs, width, wantedRuns) =>
+      this._commitRenderedRuns(slide, slot, runs, width, wantedRuns, true),
   });
   private readonly _main = new MainSlotRenderer<SlideSlot, PptxTextRunInfo>({
-    slots: () => this._slots,
-    epoch: () => this._renderEpoch,
-    scale: () => this._scale,
-    token: (slot) => slot.renderGeneration,
-    nextToken: (slot) => ++slot.renderGeneration,
-    slotIndex: (slot) => slot.renderedSlide,
-    wantRuns: (slot) => !!(this._opts.enableTextSelection && slot.textLayer) || this._findActive,
+    ...this._renderHooks,
     render: (slide, canvas, width, dpr, onTextRun, settled) =>
       renderPptxFocusedSlide(this._pres!, canvas, slide, 'main', {
         width, dpr,
         ...(settled ? {} : { imageResources: this._opts.imageResources }),
         onTextRun,
       }),
-    commitRuns: (slide, slot, runs, _canvas, width, wantedRuns, settled) => {
-      if (slot.textLayer) {
-        if (settled) this._clearTextLayerPreview(slot.textLayer);
-        if (this._opts.enableTextSelection) {
-          buildPptxTextLayer(slot.textLayer, runs,
-            Math.round(width), Math.round(this._slideHeightPx()),
-            this._hyperlinkHandler(), slide);
-        }
-      }
-      if (wantedRuns) this._highlights.refreshRuns(slide, runs);
-      this._commitSlotComments(slide, slot);
-      this._highlights.redrawSlot(slide, slot);
-    },
+    commitRuns: (slide, slot, runs, _canvas, width, wantedRuns, settled) =>
+      this._commitRenderedRuns(slide, slot, runs, width, wantedRuns, settled),
     shadow: () => this._pageShadow,
-    reportError: (error) => this._reportRenderError(error),
   });
   private readonly _media = new PptxScrollMediaController<SlideSlot>({
     presentation: () => this._pres,
@@ -950,6 +925,23 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._errorRouter.report(err);
   }
 
+  private _commitRenderedRuns(
+    slide: number, slot: SlideSlot, runs: PptxTextRunInfo[], width: number,
+    wantedRuns: boolean, clearPreview: boolean,
+  ): void {
+    if (slot.textLayer) {
+      if (clearPreview) this._clearTextLayerPreview(slot.textLayer);
+      if (this._opts.enableTextSelection) {
+        buildPptxTextLayer(slot.textLayer, runs,
+          Math.round(width), Math.round(this._slideHeightPx()),
+          this._hyperlinkHandler(), slide);
+      }
+    }
+    if (wantedRuns) this._highlights.refreshRuns(slide, runs);
+    this._commitSlotComments(slide, slot);
+    this._highlights.redrawSlot(slide, slot);
+  }
+
   private _renderSlotBitmap(
     i: number, slot: SlideSlot, widthPx: number, dpr: number, scale: number,
     renderGeneration = ++slot.renderGeneration,
@@ -980,8 +972,6 @@ export class PptxScrollViewer implements ZoomableViewer {
   }
 
   private _scheduleSettle(): void { this._scroller.scheduleSettle(DEFAULT_ZOOM_SETTLE_MS); }
-
-  private _settleRender(): void { this._scroller.settle(); }
 
   private _settleSlot(i: number, slot: SlideSlot): void {
     if (!this._pres) return;
@@ -1315,9 +1305,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     this._commentOverlay.destroy();
     this._selection.clearElementContext();
     // Cancel a pending settle so no re-render is dispatched after teardown
-    // (design §7 mechanism 2). `_destroyed` also guards `_settleRender`, but
-    // clearing the timer avoids the wasted wake-up and keeps fake-timer tests
-    // deterministic.
+    // (design §7 mechanism 2). Clearing the timer avoids a wasted wake-up and
+    // keeps fake-timer tests deterministic.
     this._scroller.destroy();
     this._zoom.destroy();
     this._commentMargin.destroy();
