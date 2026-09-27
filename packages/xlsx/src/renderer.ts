@@ -2422,8 +2422,7 @@ function renderQuadrant(
     // ([Red] etc., §18.8.30) > table / PivotTable style colour > the cell's
     // own font colour (a cell's own colour beats the table's; see
     // tableStyleFontColor).
-    const tableFontColor = tableStyleFontColor(tableFontDxfFor(tableStyle, styles), xf)
-      ?? pivotFormat?.fontColor ?? null;
+    const tableFontColor = styleFontColor(tableFontDxfFor(tableStyle, styles), pivotFormat, xf);
     const textColor = hyperlinkUrl
       ? '#0563C1'
       : (cf.fontColor ?? formatted.color ?? tableFontColor ?? font.color);
@@ -2875,8 +2874,7 @@ function renderQuadrant(
       const hyperlinkUrl = rc.hyperlinkMap.get(key);
       // Table-style element dxfs can override font color (ECMA-376 §18.8.83),
       // following the same element hierarchy as the fill/bold above.
-      const tableFontColor = tableStyleFontColor(tableFontDxf, xf)
-        ?? pivotFormat?.fontColor ?? null;
+      const tableFontColor = styleFontColor(tableFontDxf, pivotFormat, xf);
       // Colour precedence: hyperlink > conditional-formatting font colour >
       // number-format section colour ([Red] etc., §18.8.30) > table-style dxf
       // colour > the cell's own font colour (a cell's own colour beats the
@@ -3482,6 +3480,20 @@ function tableFontDxfFor(tableStyle: TableCellStyle | undefined, styles: Styles)
  *  style): Excel draws that color over the table style's. */
 function tableStyleFontColor(tableFontDxf: Dxf | undefined, xf: CellXf): string | null {
   return xf.ownFontColor ? null : tableFontDxf?.font?.color ?? null;
+}
+
+/** The table or PivotTable style font color for a cell, or null when the
+ *  cell's font color is its own formatting. Measured in Excel for both: a
+ *  PivotTable cell given Automatic, RGB black or red keeps that color, while
+ *  one given the theme "Black, Text 1" (authored like Normal) shows the
+ *  PivotTable style's color. */
+function styleFontColor(
+  tableFontDxf: Dxf | undefined,
+  pivotFormat: PivotCellFormat | undefined,
+  xf: CellXf,
+): string | null {
+  if (xf.ownFontColor) return null;
+  return tableFontDxf?.font?.color ?? pivotFormat?.fontColor ?? null;
 }
 
 /** Rich-text runs as Excel draws them under a table style font color

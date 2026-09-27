@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { renderViewport, tableOverlayBorder, type TableCellStyle } from './renderer.js';
-import type { CellFont, Dxf, Styles, Worksheet } from './types.js';
+import type { CellFont, Dxf, PivotTableMetadata, Styles, Worksheet } from './types.js';
 
 /**
  * Regression tests for spurious table borders on *custom* `<tableStyle>`s
@@ -211,5 +211,73 @@ describe('rich-text runs under a custom table style font color', () => {
     expect(Object.fromEntries(['d1', 'd2', 'e1', 'e2', 'c1', 'g1', 'h1', 'k1'].map((t) => [t, hex(t)]))).toEqual({
       d1: blue, d2: blue, e1: black, e2: blue, c1: black, g1: black, h1: black, k1: red,
     });
+  });
+});
+
+/**
+ * PivotTable style font color vs the cell font, measured in Excel: a value
+ * cell given Automatic, RGB 0,0,0 or red keeps that color, while one given
+ * the theme "Black, Text 1" (authored like Normal) shows the PivotTable
+ * style's color. The parser's `ownFontColor` flag carries that distinction.
+ */
+describe('PivotTable style font color vs the cell font', () => {
+  const font = (color: string | null): CellFont => ({
+    bold: false, italic: false, underline: false, strike: false, size: 11, color, name: 'Arial',
+  });
+  const styles: Styles = {
+    fonts: [font('#000000'), font('#FF0000')],
+    fills: [],
+    borders: [],
+    cellXfs: [
+      { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false },
+      { fontId: 1, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false, ownFontColor: true },
+      { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false, ownFontColor: true },
+    ],
+    numFmts: [],
+    dxfs: [],
+  };
+  const green: Dxf = { font: font('#00B050'), fill: null, border: null, fontToggles: {} };
+  const pivot = {
+    name: 'P', cacheId: 1,
+    location: { top: 1, left: 1, bottom: 1, right: 3, firstHeaderRow: 1, firstDataRow: 1, firstDataCol: 1 },
+    rowFields: [0], columnFields: [], pageFields: [], dataFields: [],
+    status: { state: 'complete' },
+    rowItems: [{ kind: 'data', depth: 0 }], columnItems: [],
+    style: {
+      name: 'S', showRowHeaders: true, showColumnHeaders: true,
+      showRowStripes: false, showColumnStripes: false, showLastColumn: false,
+      elements: [{ kind: 'wholeTable', size: 1, dxf: green }],
+    },
+  } as unknown as PivotTableMetadata;
+  const text = (col: number, styleIndex: number, value: string) =>
+    ({ row: 1, col, styleIndex, value: { type: 'text' as const, text: value } });
+  const ws = {
+    name: 'P',
+    rows: [{ index: 1, height: null, cells: [text(1, 0, 'theme'), text(2, 1, 'red'), text(3, 2, 'auto')] }],
+    colWidths: {}, rowHeights: {}, defaultColWidth: 8.43, defaultRowHeight: 15,
+    mergeCells: [], freezeRows: 0, freezeCols: 0, conditionalFormats: [], images: [], charts: [],
+    pivotTables: [pivot],
+  } as unknown as Worksheet;
+
+  it('keeps a cell-owned color and applies the PivotTable color otherwise', () => {
+    let fillStyle = '';
+    const drawn = new Map<string, string>();
+    const noop = () => {};
+    const ctx = new Proxy({
+      canvas: { width: 400, height: 100 },
+      font: '11px Arial',
+      get fillStyle() { return fillStyle; },
+      set fillStyle(value: string) { fillStyle = value; },
+      measureText: (t: string) => ({ width: t.length * 7 }) as TextMetrics,
+      fillText: (t: string) => { drawn.set(t, fillStyle); },
+    } as Record<string | symbol, unknown>, {
+      get: (target, key) => (key in target ? target[key] : noop),
+      set: (target, key, value) => { target[key] = value; return true; },
+    }) as unknown as CanvasRenderingContext2D;
+    renderViewport(ctx, ws, styles, { row: 1, col: 1, rows: 1, cols: 3 });
+    const color = (t: string) => drawn.get(t)?.replace(/\s/g, '').toLowerCase();
+    expect(color('theme')).toMatch(/^(#00b050|rgba\(0,176,80,1\))$/);
+    expect(color('red')).toMatch(/^(#ff0000|rgba\(255,0,0,1\))$/);
+    expect(color('auto')).toMatch(/^(#000000|rgba\(0,0,0,1\))$/);
   });
 });
