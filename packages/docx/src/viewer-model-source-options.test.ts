@@ -54,11 +54,11 @@ describe.each([
     // What a model source's markup view default leaves on the loaded document.
     engine.layoutView = { showTrackedChanges: true, currentDate: 0 };
     const load = vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
-    const viewer = create({});
+    const viewer = create({ modelSources: [source] });
     await viewer.load(new ArrayBuffer(1));
     const options = load.mock.calls[0]![1]!;
     expect(options).not.toHaveProperty('showTrackedChanges');
-    expect(options).not.toHaveProperty('modelSources');
+    expect(options.modelSources).toEqual([source]);
     await vi.waitFor(() => expect(engine.renderCalls.length).toBeGreaterThan(0));
     expect(new Set(engine.renderCalls.map((call) => call.showTrackedChanges))).toEqual(new Set([renderedView]));
     viewer.destroy();

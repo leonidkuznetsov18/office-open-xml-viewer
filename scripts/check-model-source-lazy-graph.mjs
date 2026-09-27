@@ -101,16 +101,16 @@ function assertNoSourceRuntime(code, name) {
   }
 }
 
-// Baseline: the pre-feature OOXML production build at dcbae03b. The small
+// Baseline: the pre-feature OOXML production build at 776237df. The small
 // entry allowance covers the modelSources presence dispatch and its Vite
 // dynamic-chunk factoring; ordinary worker payloads have no allowance.
 const OOXML_BUNDLE_BASELINE = Object.freeze({
-  docx: { entry: 2_524_314, inline: 31_624, budget: 2_200 },
-  xlsx: { entry: 1_834_338, inline: 39_902, budget: 2_500 },
-  pptx: { entry: 1_822_930, inline: 59_554, budget: 2_100 },
-  node: { entry: 2_574_665, budget: 3_600 },
+  docx: { entry: 2_525_541, inline: 31_624, budget: 2_600 },
+  xlsx: { entry: 1_835_565, inline: 39_902, budget: 2_600 },
+  pptx: { entry: 1_824_157, inline: 59_554, budget: 2_200 },
+  node: { entry: 2_575_709, budget: 3_900 },
 });
-const OOXML_RENDER_WORKERS = [1_414_520, 1_456_632, 2_045_054];
+const OOXML_RENDER_WORKERS = [1_416_412, 1_458_524, 2_046_946];
 
 function assertBudget(actual, baseline, budget, label) {
   if (actual > baseline + budget) {

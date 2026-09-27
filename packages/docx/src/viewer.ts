@@ -308,10 +308,12 @@ export class DocxViewer implements ZoomableViewer {
         // paying for a second full pagination on the first render.
         // An explicit choice (including `false`) is forwarded; otherwise the
         // document's own view default applies.
-        ...(this._opts.showTrackedChanges === undefined
-          ? {}
-          : { showTrackedChanges: this._opts.showTrackedChanges }),
-        ...(this._opts.modelSources === undefined ? {} : { modelSources: this._opts.modelSources }),
+        ...(this._opts.modelSources === undefined
+          ? (this._opts.showTrackedChanges === true ? { showTrackedChanges: true } : {})
+          : (this._opts.showTrackedChanges === undefined
+            ? undefined
+            : { showTrackedChanges: this._opts.showTrackedChanges })),
+        ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
         ...(this._opts.currentDate === undefined
           ? {}
           : { currentDate: this._opts.currentDate }),
@@ -962,9 +964,11 @@ export class DocxViewer implements ZoomableViewer {
     const doc = this._doc;
     // Compare with the document's active view: it may come from the loaded
     // document's own view default rather than from this viewer's options.
-    const current = doc
-      ? activeDocxLayoutViewOf(doc).showTrackedChanges
-      : this._opts.showTrackedChanges === true;
+    const current = this._opts.modelSources === undefined
+      ? this._opts.showTrackedChanges === true
+      : doc
+        ? activeDocxLayoutViewOf(doc).showTrackedChanges
+        : this._opts.showTrackedChanges === true;
     if (current === value) {
       // Still forward the installed value: it cancels an older in-flight
       // worker switch that has not become this viewer's state yet.
