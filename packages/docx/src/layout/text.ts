@@ -670,12 +670,32 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     cache.set(key, value);
     if (cache.size > limit) cache.delete(cache.keys().next().value as string);
   };
+  // A route's identity is its (familyList, scope, fingerprint) triple. Spelling
+  // that triple into every measurement key made each retained key ~1.8 KB for
+  // a registered local face, so the measurement cache was dominated by copies
+  // of three distinct routes. Keys carry a service-scoped ordinal assigned
+  // one-to-one to the exact triple instead; the object map only skips
+  // re-deriving the ordinal for the shared resolver routes.
+  const routeOrdinals = new Map<string, number>();
+  const routeOrdinalByObject = new WeakMap<object, number>();
+  const routeOrdinal = (route: Readonly<CanvasFontRoute>): number => {
+    const known = routeOrdinalByObject.get(route);
+    if (known !== undefined) return known;
+    const identity = JSON.stringify([route.familyList, route.scope, route.fingerprint]);
+    let ordinal = routeOrdinals.get(identity);
+    if (ordinal === undefined) {
+      ordinal = routeOrdinals.size;
+      routeOrdinals.set(identity, ordinal);
+    }
+    // Only frozen routes are memoized by object: a mutable route could change
+    // its triple after the ordinal was recorded.
+    if (Object.isFrozen(route)) routeOrdinalByObject.set(route, ordinal);
+    return ordinal;
+  };
   const measureGlyph = (request: Readonly<GlyphMeasureRequest>): Readonly<GlyphMeasurement> => {
     const key = JSON.stringify([
       request.text,
-      request.fontRoute.familyList,
-      request.fontRoute.scope,
-      request.fontRoute.fingerprint,
+      routeOrdinal(request.fontRoute),
       request.fontSizePt,
       request.weight,
       request.style,

@@ -79,6 +79,50 @@ describe('font layout services', () => {
       .toMatchObject({ genericFamily: 'serif' });
   });
 
+  it('keys glyph measurements by the exact route triple', () => {
+    const measure = vi.fn((request: Readonly<GlyphMeasureRequest>): GlyphMeasurement => ({
+      advancePt: request.text.length, ascentPt: 7, descentPt: 2,
+    }));
+    const routeFor = (familyList: string, scope: 'native' | 'generic', fingerprint: string) =>
+      Object.freeze({ familyList, scope, fingerprint });
+    let route = routeFor('"Same", sans-serif', 'native', 'route-a');
+    const service = createTextLayoutService({
+      fonts: {
+        fingerprint: 'route-triple-v1',
+        resolve: () => Object.freeze({
+          requestedFamily: 'Same',
+          resolvedFamily: 'Same',
+          route,
+          source: 'native' as const,
+          weight: 400,
+          style: 'normal' as const,
+          diagnostics: [],
+          genericFamily: 'sans-serif' as const,
+        }),
+      },
+      measurer: { fingerprint: 'route-triple-measure-v1', measure },
+    });
+    // eastAsiaLanguage only selects a distinct shape entry here (Latin text),
+    // so each call reaches the glyph-measurement cache.
+    let variant = 0;
+    const measuredOne = () => {
+      service.shape({
+        text: 'one', fontSizePt: 10, fonts: { ascii: 'Same' },
+        clusterGeometry: false, eastAsiaLanguage: `x-${variant++}`,
+      });
+      return measure.mock.calls.filter(([request]) => request.text === 'one').length;
+    };
+    expect(measuredOne()).toBe(1);
+    route = routeFor('"Same", sans-serif', 'native', 'route-a');
+    expect(measuredOne()).toBe(1);
+    route = routeFor('"Same", sans-serif', 'generic', 'route-a');
+    expect(measuredOne()).toBe(2);
+    route = routeFor('"Same", sans-serif', 'native', 'route-b');
+    expect(measuredOne()).toBe(3);
+    route = routeFor('"Other", sans-serif', 'native', 'route-a');
+    expect(measuredOne()).toBe(4);
+  });
+
   it('records embedded, local, Google, substitute, and generic resolution', () => {
     const resolver = createFontResolver(faces);
 
@@ -431,48 +475,37 @@ describe('font layout services', () => {
   });
 
   it('does not retain contextual grapheme prefixes in the document measurement cache', () => {
+    const measured: string[] = [];
     const service = createTextLayoutService({
       fonts: createFontResolver(faces),
       measurer: {
         fingerprint: 'contextual-prefix-cache-scope-v1',
-        measure: (request) => ({
-          advancePt: request.text.length,
-          ascentPt: 1,
-          descentPt: 0,
-        }),
+        measure: (request) => {
+          measured.push(request.text);
+          return {
+            advancePt: request.text.length,
+            ascentPt: 1,
+            descentPt: 0,
+          };
+        },
       },
     });
     const text = 'a'.repeat(1_024);
-    const stringify = vi.spyOn(JSON, 'stringify');
-    let cachedMeasurementTexts: string[] = [];
-
-    try {
-      service.shape({
-        text,
-        fontSizePt: 10,
-        fonts: { ascii: 'Embedded Sans' },
-      });
-      // Measurement-cache keys have a font-route string in the second tuple
-      // position; shape-cache keys have the numeric font size there.
-      cachedMeasurementTexts = stringify.mock.calls
-        .map(([value]) => value)
-        .filter((value): value is unknown[] => (
-          Array.isArray(value)
-          && typeof value[0] === 'string'
-          && typeof value[1] === 'string'
-        ))
-        .map((value) => value[0] as string);
-    } finally {
-      stringify.mockRestore();
-    }
+    service.shape({ text, fontSizePt: 10, fonts: { ascii: 'Embedded Sans' } });
+    expect(measured).toContain(text.slice(0, 512));
 
     // A single script run may retain its complete request, but contextual
-    // prefixes are temporary facts owned by this shape call's prefixAdvances
-    // map.
-    expect(cachedMeasurementTexts).toHaveLength(1);
-    expect(cachedMeasurementTexts[0]).toBe(text);
-    expect(cachedMeasurementTexts.reduce((sum, value) => sum + value.length, 0))
-      .toBe(text.length);
+    // prefixes are temporary facts owned by that shape call's prefixAdvances
+    // map: a later whole-span measurement of an earlier prefix must miss the
+    // document measurement cache.
+    measured.length = 0;
+    service.shape({
+      text: text.slice(0, 512),
+      fontSizePt: 10,
+      fonts: { ascii: 'Embedded Sans' },
+      clusterGeometry: false,
+    });
+    expect(measured).toEqual([text.slice(0, 512)]);
   });
 
   it('reuses identical glyph measurements across convergence shape calls', () => {
