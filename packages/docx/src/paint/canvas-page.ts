@@ -225,8 +225,7 @@ function paintDrawingEntry(
   }
 }
 
-/** Paint a completed page into an already initialized point-space surface. */
-export function paintLayoutPageContent(
+function paintPageContents(
   page: LayoutPage,
   context: CanvasPaintContext,
 ): void {
@@ -288,6 +287,24 @@ export function paintLayoutPageContent(
   if (page.pageBorder?.zOrder !== 'back' && page.pageBorder) {
     paintPageBorderLayout(page.pageBorder, context);
   }
+}
+
+/** Paint a completed page into an already initialized point-space surface. */
+export function paintLayoutPageContent(
+  page: LayoutPage,
+  context: CanvasPaintContext,
+): void {
+  // Word's PDF export of header-anchored DrawingML watermarks (pct50 and
+  // dnDiag, unrotated, 315-degree rotated, and page-sized) uses the same
+  // 8-point tile on page axes, with phase at the page's top-left 8-point grid.
+  // Capture the page frame before region, anchor, or shape transforms. The
+  // DrawingML shape painter uses it to cancel only host-local transforms;
+  // chart and VML hosts retain their separate fill-coordinate policies.
+  const canvas = context.ctx as CanvasRenderingContext2D;
+  const pageToDevice = canvas.getTransform?.() ?? {
+    a: context.scale * context.dpr, d: context.scale * context.dpr,
+  };
+  paintPageContents(page, { ...context, patternPageToDevice: pageToDevice });
 }
 
 export async function paintLayoutPage(
