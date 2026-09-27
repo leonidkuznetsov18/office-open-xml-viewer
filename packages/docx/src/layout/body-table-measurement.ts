@@ -560,6 +560,7 @@ function measurePositionedTable(
     nestedAcquisitionRegistry,
     admissionBlockEndPt,
     freshAdmissionHeightPt,
+    ownPrescanOccurrenceId,
   });
   if (transaction.kind === 'fresh-flow-region') {
     return Object.freeze({
@@ -653,6 +654,7 @@ interface FloatingConvergenceFrame {
   readonly nestedAcquisitionRegistry: FloatRegistrySnapshotPt;
   readonly admissionBlockEndPt: number;
   readonly freshAdmissionHeightPt: number;
+  readonly ownPrescanOccurrenceId: string;
 }
 
 function convergeFloatingParentTransaction(
@@ -672,6 +674,7 @@ function convergeFloatingParentTransaction(
     nestedAcquisitionRegistry,
     admissionBlockEndPt,
     freshAdmissionHeightPt,
+    ownPrescanOccurrenceId,
   } = frame;
   let transaction: FloatingParentTransactionPass;
   try {
@@ -690,18 +693,18 @@ function convergeFloatingParentTransaction(
           yPt: raw.y,
         };
         const availableHeightPt = Math.max(0, admissionBlockEndPt - parentFrame.yPt);
-        const result = takeTableFragment(retained, cursor, {
-          availableHeightPt,
+        const fragmentRequest = (heightPt: number) => ({
+          availableHeightPt: heightPt,
           freshPageHeightPt: freshAdmissionHeightPt,
           placement: {
             container: {
               id: `${request.location.flowDomainId}:floating-table`,
-              kind: 'body',
+              kind: 'body' as const,
               bounds: {
                 xPt: 0,
                 yPt: 0,
                 widthPt: request.availableInlineExtentPt,
-                heightPt: availableHeightPt,
+                heightPt,
               },
             },
             cursor: { xPt: 0, yPt: 0 },
@@ -709,12 +712,12 @@ function convergeFloatingParentTransaction(
               xPt: 0,
               yPt: 0,
               widthPt: request.availableInlineExtentPt,
-              heightPt: availableHeightPt,
+              heightPt,
             },
           },
           services,
-          compatibility: 'word',
-          oversizedRowPolicy: 'atomic',
+          compatibility: 'word' as const,
+          oversizedRowPolicy: 'atomic' as const,
           page: {
             physicalPageIndex: request.location.pageIndex,
             displayPageNumber: state.displayPageNumber ?? request.location.pageIndex + 1,
@@ -727,15 +730,45 @@ function convergeFloatingParentTransaction(
           },
           floatingTableRegistry: nestedAcquisitionRegistry,
           finalPlacementTranslationPt: parentFrame,
-          reacquirePageDependentBlock: (request) =>
+          reacquirePageDependentBlock: (request: Parameters<BodyTableMeasurementOperations['reacquireBodyTableBlock']>[2]) =>
             operations.reacquireBodyTableBlock(state, dependencies.source, request),
         });
+        const fullResult = takeTableFragment(retained, cursor, fragmentRequest(availableHeightPt));
+        const ownPrescan = sessionState.floatRegistry.entries.find(
+          (entry) => entry.occurrenceId === ownPrescanOccurrenceId,
+        );
+        // Word print controls for a page-anchored table that continues on the
+        // next page keep its first row at the authored page coordinate even
+        // when its own exclusion places the preceding anchor paragraph below
+        // the table. Its other rows continue on following pages. Moving the
+        // anchor beyond the table or making the table inline removes this
+        // pattern. A table that fits this page remains whole: a separate
+        // page-anchored control with seven rows is the counterexample.
+        const anchorFollowsExclusion = ownPrescan !== undefined &&
+          request.cursor?.kind !== 'table' &&
+          request.location.cursorPt.yPt >=
+            ownPrescan.exclusionBounds.yPt + ownPrescan.exclusionBounds.heightPt;
+        const leadRowHeightPt = retained.layout.rows[cursor.rowIndex]?.advancePt;
+        const clippedResult = anchorFollowsExclusion && fullResult.nextCursor &&
+          fullResult.fragment &&
+          fullResult.fragment.rows.length > 1 && leadRowHeightPt !== undefined
+          ? takeTableFragment(retained, cursor, fragmentRequest(leadRowHeightPt))
+          : null;
+        const result = clippedResult?.fragment ? clippedResult : fullResult;
         if (!result.fragment || result.requiresFreshPage) {
           return Object.freeze({
             kind: 'fresh-flow-region' as const,
             result,
           });
         }
+        const fragment = clippedResult?.fragment && fullResult.fragment
+          ? Object.freeze({
+              ...result.fragment,
+              // Subsequent text still excludes the complete first-page table
+              // extent. The one-row painted fragment is not the wrap box.
+              pageAnchorPrescanHeightPt: fullResult.fragment.flowBounds.heightPt,
+            })
+          : result.fragment;
         const sourcePlacement: FloatingTablePlacementLayout = Object.freeze({
           kind: 'floating-table-placement',
           occurrenceId: bodyRootFloatingTablePlacementKey(
@@ -750,11 +783,11 @@ function convergeFloatingParentTransaction(
           hostCellId: request.location.flowDomainId,
           sourceBlockIndex: request.input.source.path[0]!,
           anchorBlockIndex: request.input.source.path[0]!,
-          tableId: result.fragment.id,
+          tableId: fragment.id,
           overlap: table.overlap === 'never' ? 'never' : 'overlap',
           positioning,
           anchorBounds: frames.text,
-          child: result.fragment,
+          child: fragment,
         });
         const nestedEntries = result.floatingTableRegistryDelta?.entries ?? [];
         const nestedNextParagraphId =
@@ -775,7 +808,7 @@ function convergeFloatingParentTransaction(
             xPt: resolved.placement.xPt,
             yPt: resolved.placement.yPt,
           },
-          fragment: result.fragment,
+          fragment,
           nestedEntries,
           resolvedBounds: resolved.placement.bounds,
         });
@@ -786,7 +819,7 @@ function convergeFloatingParentTransaction(
             yPt: parentFrame.yPt,
           }),
           result,
-          fragment: result.fragment,
+          fragment,
           resolved,
           nestedEntries,
           fingerprint,

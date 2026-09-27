@@ -595,6 +595,47 @@ describe('canonical producer with a real document model', () => {
     expect(placement).toMatchObject({ noteReference: { kind: 'footnote', id: '7' } });
   });
 
+  it('keeps the lead row at its page anchor when a wrapping table continues', () => {
+    const section = {
+      pageWidth: 200, pageHeight: 200,
+      marginTop: 10, marginRight: 10, marginBottom: 10, marginLeft: 10,
+      headerDistance: 5, footerDistance: 5, titlePage: false,
+      evenAndOddHeaders: false, sectionStart: 'nextPage', columns: null,
+    } as SectionProps;
+    const placed = floatingTable() as Extract<BodyElement, { type: 'table' }>;
+    placed.colWidths = [180];
+    placed.rows = Array.from({ length: 30 }, () => ({
+      ...placed.rows[0]!,
+      cells: [{ ...placed.rows[0]!.cells[0]!, widthPt: 180 }],
+    }));
+    placed.tblpPr = {
+      ...placed.tblpPr!, horzAnchor: 'margin', vertAnchor: 'page',
+      tblpX: 0, tblpY: 25,
+    };
+    const heading = ordinaryParagraph('before');
+    heading.spaceBefore = 20;
+    const model = {
+      section, body: [heading, placed],
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+      footnotes: [], endnotes: [], fontFamilyClasses: {},
+    } as unknown as DocxDocumentModel;
+    const layout = layoutDocument(model,
+      createLayoutServices(model, { measureContext: measureContext() }), { currentDateMs: 0 });
+    const rows = layout.pages.map((page) => page.layers.body
+      .filter((node) => node.kind === 'table' && node.source.path[0] === 1)
+      .reduce((sum, node) => sum + (node.kind === 'table' ? node.rows.length : 0), 0));
+    expect(rows).toEqual([1, 18, 11]);
+    const fittingModel = {
+      ...model, body: [heading, { ...placed, rows: placed.rows.slice(0, 7) }],
+    } as unknown as DocxDocumentModel;
+    const fitting = layoutDocument(fittingModel,
+      createLayoutServices(fittingModel, { measureContext: measureContext() }), { currentDateMs: 0 });
+    expect(fitting.pages.flatMap((page) => page.layers.body)
+      .filter((node) => node.kind === 'table' && node.source.path[0] === 1)
+      .map((node) => node.kind === 'table' ? node.rows.length : 0)).toEqual([7]);
+  });
+
   it('retains a frame paragraph as an out-of-flow placed occurrence', () => {
     const framed = paragraph();
     framed.framePr = {

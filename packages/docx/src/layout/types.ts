@@ -717,6 +717,9 @@ export interface TableRowLayout extends LayoutNodeBase {
 
 export interface TableLayout extends LayoutNodeBase {
   readonly kind: 'table';
+  /** First-page wrap extent when Word paints only the lead row of a page
+   * anchored table whose own exclusion moved its anchor below that table. */
+  readonly pageAnchorPrescanHeightPt?: number;
   readonly columnWidthsPt: readonly number[];
   readonly rows: readonly TableRowLayout[];
   readonly borders: readonly ResolvedBorderSegment[];

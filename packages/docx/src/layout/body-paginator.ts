@@ -2253,7 +2253,10 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
             kind: 'floating-table',
             occurrenceId,
             tableSource: node.source,
-            bounds: Object.freeze({ ...node.flowBounds }),
+            bounds: Object.freeze({
+              ...node.flowBounds,
+              heightPt: node.pageAnchorPrescanHeightPt ?? node.flowBounds.heightPt,
+            }),
             pageIndex: page.pageIndex,
             flowDomainId: node.flowDomainId,
           }));
