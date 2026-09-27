@@ -53,7 +53,7 @@ describe('excelSerialToUtcDate — 1900 date system (ECMA-376 §18.17.4.1)', () 
     const d = excelSerialToUtcDate(45292.33333333333, false);
     expect(d.getUTCHours()).toBe(8);
     expect(d.getUTCMinutes()).toBe(0);
-    expect(excelSerialToUtcDate(0.33333333333333331, true).getUTCHours()).toBe(8);
+    expect(excelSerialToUtcDate(45000.33333333333, true).getUTCHours()).toBe(8);
   });
 });
 

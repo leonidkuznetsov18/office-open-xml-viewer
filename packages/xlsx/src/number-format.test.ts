@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { formatCellValue } from './number-format.js';
+import { formatCellValue, formatCellValueWithColor } from './number-format.js';
 import type { Cell, Styles } from './types.js';
 
 const FMT_ID = 164; // first free custom id
@@ -226,6 +226,23 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
     expect(fmt(5, '0\\h')).toBe('5h');
     expect(fmt(5, '0_h')).toBe('5 ');
     expect(fmt(5, '0" hrs"')).toBe('5 hrs');
+    // An escaped or padded quote is not a string delimiter.
+    expect(fmt(5, '0\\""hours"\\"')).toBe('5"hours"');
+    expect(fmt(5, '0_""hours"')).toBe('5 hours');
+  });
+
+  it('decides number vs time from the section the value selects', () => {
+    expect(fmt(5, '0.00;h:mm')).toBe('5.00');
+    expect(fmt(-0.5, '0.00;h:mm')).toBe('12:00');
+    expect(fmt(100, '[>=1]0.00;h:mm')).toBe('100.00');
+    expect(fmt(0, 'h:mm;h:mm;"zero"')).toBe('zero');
+    expect(formatCellValueWithColor(numCell(0.5), styles('[Red]h:mm'))).toEqual({ text: '12:00', color: '#FF0000' });
+  });
+
+  it('carries elapsed-time totals from the same rounded duration', () => {
+    // 45292.33333333333 is a hair under 1 087 016 hours.
+    expect(fmt(45292.33333333333, '[h]:mm')).toBe('1087016:00');
+    expect(fmt(45292.33333333333, '[m]:ss')).toBe('65220960:00');
   });
 });
 

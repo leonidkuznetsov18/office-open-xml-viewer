@@ -230,7 +230,7 @@ function formatExcelDateCode(serial: number, fmtCode: string, date1904 = false):
   const sc = date.getUTCSeconds();
 
   // Take the first section (positive / no-sign section)
-  const section = fmtCode.split(';')[0];
+  const section = splitSections(fmtCode)[0];
   const hasAmPm = /am\/pm|a\/p/i.test(section);
   let era: ReturnType<typeof resolveJpEra> | null = null;
   const getEra = (): ReturnType<typeof resolveJpEra> => era ?? (era = resolveJpEra(date));
@@ -260,7 +260,9 @@ function formatExcelDateCode(serial: number, fmtCode: string, date1904 = false):
       if (elapsed) {
         const kind = elapsed[1].toLowerCase();
         const sign = serial < 0 ? '-' : '';
-        const absSec = Math.floor(Math.abs(serial) * 86400);
+        // Whole seconds of the millisecond-rounded duration, the same
+        // rounding the clock fields above get from excelSerialToUtcDate.
+        const absSec = Math.floor(Math.round(Math.abs(serial) * 86_400_000) / 1000);
         let v: number;
         if      (kind === 'h') v = Math.floor(absSec / 3600);
         else if (kind === 'm') v = Math.floor(absSec / 60);
@@ -391,22 +393,35 @@ function formatExcelDateCode(serial: number, fmtCode: string, date1904 = false):
   return result;
 }
 
-/** Returns true if a custom formatCode is a date/time format. */
-function isDateFormatCode(code: string): boolean {
-  // Elapsed-time brackets `[h]`, `[m]`, `[s]` (ECMA-376 §18.8.30) are themselves
-  // time formats, so detect those *before* stripping bracket content below.
-  if (/\[[hms]+\]/i.test(code)) return true;
-  // Drop everything that is literal or metadata: quoted strings, `\x`
-  // escapes, `_x` / `*x` padding and fill pairs, and bracket content.
-  const stripped = code
-    .replace(/"[^"]*"/g, '')
-    .replace(/\\.|_.|\*./g, '')
-    .replace(/\[[^\]]*\]/g, '');
-  // What remains is date/time only if it has a date or time specifier:
-  // y / m / d (year, month or minute, day), h / s (hour, second), AM/PM or
-  // A/P, and the Japanese-locale weekday code `aaa+`. A time-only code such
-  // as `h:mm;@` has no y or d but is still a time format.
-  return /[ymdhs]/i.test(stripped) || /a{3,}|am\/pm|a\/p/i.test(stripped);
+/** Whether one format section (§18.8.30) is a date/time format. The body is
+ *  scanned left to right so each token is read in context: `\x` escapes,
+ *  `_x` padding and `*x` fill pairs (whose operand may itself be `"`), quoted
+ *  literals and bracket content are skipped; what remains is date/time when
+ *  it holds y / m / d / h / s, AM/PM or A/P, the Japanese weekday code
+ *  `aaa+`, or an elapsed-time bracket `[h]` / `[mm]` / `[ss]`. */
+function isDateSection(body: string): boolean {
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === '\\' || ch === '_' || ch === '*') {
+      i += 2;
+    } else if (ch === '"') {
+      const end = body.indexOf('"', i + 1);
+      i = end < 0 ? body.length : end + 1;
+    } else if (ch === '[') {
+      const end = body.indexOf(']', i);
+      if (end < 0) return false;
+      if (/^([hms])\1*$/i.test(body.slice(i + 1, end))) return true;
+      i = end + 1;
+    } else if (/[ymdhs]/i.test(ch)) {
+      return true;
+    } else if (/^(am\/pm|a\/p|a{3,})/i.test(body.slice(i))) {
+      return true;
+    } else {
+      i++;
+    }
+  }
+  return false;
 }
 
 // Excel's General format does not round-trip the raw IEEE-754 double: the
@@ -508,10 +523,7 @@ function applyFormat(num: number, numFmtId: number, formatCode: string | null, d
   // formatCode="General"; tokenizing it as a literal pattern would render the
   // word "General" instead of the value (issue #358).
   if (formatCode && formatCode.trim().toLowerCase() === 'general') return { text: formatGeneralNumber(num) };
-  if (formatCode) {
-    if (isDateFormatCode(formatCode)) return { text: formatExcelDateCode(num, formatCode, date1904) };
-    return applyFormatCode(num, formatCode);
-  }
+  if (formatCode) return applyFormatCode(num, formatCode, date1904);
   switch (numFmtId) {
     // Built-in numeric numFmtIds without an explicit formatCode. Route the ones
     // that have a well-defined pattern (§18.8.30 p.1776 "All Languages" table)
@@ -1084,7 +1096,7 @@ function assembleFixed(lex: LexedSection, intText: string, fracText: string, exp
  * per-section colour, and the numeric grammar. Returns the display string and
  * any section colour.
  */
-function applyFormatCode(num: number, formatCode: string): FormattedCell {
+function applyFormatCode(num: number, formatCode: string, date1904 = false): FormattedCell {
   const rawSections = splitSections(formatCode);
   const parsed = rawSections.map(parseSection);
 
@@ -1134,6 +1146,10 @@ function applyFormatCode(num: number, formatCode: string): FormattedCell {
     }
   }
 
-  const text = renderNumericSection(num, chosen.body, useMagnitude);
+  // Date/time is a property of the selected section (§18.8.30): `0.00;h:mm`
+  // formats a positive value as a number and only a negative one as a time.
+  const text = isDateSection(chosen.body)
+    ? formatExcelDateCode(useMagnitude ? Math.abs(num) : num, chosen.body, date1904)
+    : renderNumericSection(num, chosen.body, useMagnitude);
   return chosen.color ? { text, color: chosen.color } : { text };
 }
