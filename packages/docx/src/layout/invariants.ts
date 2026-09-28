@@ -73,6 +73,17 @@ function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<o
   // Keep one mutable ancestry path for the walk. Rendering a string at each
   // property used to allocate one full path per node on every finalization.
   const parts: (string | number)[] = [];
+  // A page is a DAG, not a tree: paint operations, cluster ranges/offsets and
+  // layer roots alias the placements they describe, so a plain walk revisits
+  // each shared node several times (about 3.7 visits per unique object on a
+  // long document), allocating a key list and one descriptor per property on
+  // every visit. Validating a node is a pure function of its subgraph: the
+  // walk never mutates, a node is recorded only after its whole subgraph
+  // passed (so the first violation still throws at its first path), and a
+  // completed node can never be an ancestor. Skipping repeat visits is
+  // therefore exact. The set lives for one call (one page at finalization),
+  // so it never adds document-sized state at the retained-layout peak.
+  const completed = new Set<object>();
   const walk = (current: unknown, skipPageContents: boolean): void => {
     if (current === null || typeof current === 'string' || typeof current === 'boolean') return;
     if (typeof current === 'number') {
@@ -84,6 +95,7 @@ function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<o
     if (typeof current !== 'object') {
       throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} contains ${typeof current}`);
     }
+    if (completed.has(current)) return;
     if (ancestors.has(current)) {
       throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} contains a cycle`);
     }
@@ -121,6 +133,7 @@ function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<o
         if (indexCount !== current.length) {
           throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is sparse`);
         }
+        if (!skipPageContents) completed.add(current);
         return;
       }
 
@@ -144,6 +157,8 @@ function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<o
           parts.pop();
         }
       }
+      // A record walked with deferred page contents has not validated them.
+      if (!skipPageContents) completed.add(current);
     } finally {
       ancestors.delete(current);
     }

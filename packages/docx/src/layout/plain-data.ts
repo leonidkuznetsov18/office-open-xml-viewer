@@ -244,12 +244,21 @@ export function snapshotPlainData<T>(value: T, label: string, ownedProjectionOf?
     validatePlainData(value, label);
   }
   try {
-    // Projection owns every newly allocated node. With a verified frozen
-    // source root, its remaining aliases are immutable source facts and the
-    // new nodes can be frozen in place. This avoids copying the entire
-    // occurrence after translation/re-keying already made its distinct nodes.
-    // Unverified or mutable sources still take the deep-copy path.
-    const snapshot = ownedProjectionOf && processedPlainData.has(ownedProjectionOf)
+    // Projection owns every newly allocated node. With a deeply frozen source
+    // root, its remaining aliases are immutable source facts and the new
+    // nodes can be frozen in place. This avoids copying the entire occurrence
+    // after translation/re-keying already made its distinct nodes, so a
+    // paragraph acquisition and the pages that place it share one copy of
+    // its unchanged payload (glyph clusters, paint operations, typography).
+    // A deepFreezePlainData root qualifies as well as a processed one: the
+    // sharing needs immutability, which both brands prove for the whole
+    // graph. Plain-data validity of the shared payload is still enforced —
+    // by the development pre-pass above, and fatally by the unconditional
+    // assertDocumentLayout walk over every finished layout. Mutable sources
+    // still take the deep-copy path.
+    const snapshot = ownedProjectionOf && (
+      processedPlainData.has(ownedProjectionOf) || frozenPlainData.has(ownedProjectionOf)
+    )
       ? deepFreezePlainData(value)
       : cloneAndFreezePlainData(value, new Map<object, unknown>());
     if (typeof snapshot === 'object' && snapshot !== null) processedPlainData.add(snapshot);
