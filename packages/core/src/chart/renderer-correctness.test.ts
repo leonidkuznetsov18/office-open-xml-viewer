@@ -9059,25 +9059,6 @@ describe('CH3 — labels are locale-independent (§18.8.30)', () => {
     expect(connectors.every(segment => segment.lw === 0.75)).toBe(true);
   });
 
-  it('keeps semantic data-point fills when the ChartEx series shape has noFill', () => {
-    const rec = recordingCtx();
-    renderChart(rec.ctx, baseModel({
-      chartType: 'waterfall',
-      categories: ['Start', 'Drop', 'End'],
-      series: [series({
-        name: 'W',
-        values: [10, -2, 8],
-        chartexStyle: { fillHidden: true, lineColors: ['4472C4'] },
-      })],
-      subtotalIndices: [2],
-      chartexDataPointStyle: { fillColors: ['5B9BD5', 'ED7D31', 'A5A5A5'] },
-    }), RECT, 1);
-
-    expect(rec.rects.map(rect => rect.fs.toUpperCase())).toEqual([
-      '#5B9BD5', '#ED7D31', '#A5A5A5',
-    ]);
-  });
-
   it('suppresses waterfall connectors when CT_SeriesElementVisibilities says false', () => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, baseModel({
@@ -9883,6 +9864,9 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
   });
 
   it('keeps Waterfall point fill/outline formatting above series noFill and linked colors', () => {
+    // PowerPoint-observed: series `a:noFill` makes every point that lacks
+    // its own fill outline-only, even though the linked dataPoint entry
+    // (`fillRef idx=1`) carries no `allowNoFillOverride` modifier.
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'waterfall',
@@ -9893,8 +9877,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
       chartexDataPointStyle: {
         fillColors: ['E46970', '8977D7', 'A5A5A5'],
         fillPaintAuthored: true,
-        allowNoFillOverride: true,
-        allowNoLineOverride: true,
+        lineNoStyle: true,
       },
       series: [series({
         values: [245, 235, -52, -40, -108, 280],

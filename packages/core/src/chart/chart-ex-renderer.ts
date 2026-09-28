@@ -133,9 +133,8 @@ function waterfallPointPaint(
       chart, semanticIndex, 3, series.chartexStyle, series.color,
     );
   }
-  // CT_Series.spPr formats the series carrier. ChartEx semantic data points
-  // keep their dataPoint role when that carrier has noFill, while a positive
-  // series paint still wins; chartExDataPointPaint owns that distinction.
+  // Points without their own fill inherit the series `spPr` fill, including
+  // an authored `a:noFill`; chartExDataPointPaint owns that precedence.
   return chartExDataPointPaint(
     chart, semanticIndex, 3, series?.chartexStyle, series?.color,
   );
