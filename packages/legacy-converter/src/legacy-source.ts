@@ -79,7 +79,13 @@ export function createLegacySource<T extends ModelSourceTarget>(
     protocol: MODEL_SOURCE_MODULE_PROTOCOL,
     target,
     moduleUrl,
-    config: Object.freeze({ wasmUrl, maxInputBytes }),
+    // The DOC source requests generic offline Calibri and page-bottom footnote
+    // continuation. Both remain caller-overridable and leave OOXML defaults intact.
+    config: Object.freeze({ wasmUrl, maxInputBytes,
+      ...(family === 'doc'
+        ? { useBundledOfficeFonts: true, allowFootnoteContinuation: true }
+        : {}),
+    }),
   });
   return Object.freeze({
     target,

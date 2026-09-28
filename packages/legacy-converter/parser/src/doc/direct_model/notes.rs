@@ -151,9 +151,8 @@ pub(super) fn validate(
     // full-width continuation separator). A one-character binary control
     // changed only U+0003 to U+0004 in that slot: seven continued-note pages
     // gained a full-width line, while the other 280 pages were pixel-identical.
-    // The shared note layout draws a short line. Retain both admitted forms
-    // for now; the U+0004 form needs a generic continuation-line capability
-    // before its continued-note pages can be fidelity-complete.
+    // The shared note layout accepts the observed short/full continuation
+    // story distinction as a document fact, including the U+0004 control.
     let headers = headers
         .ok_or_else(|| unsupported("Word notes without separator stories are not supported"))?;
     for (present, base) in [(footnotes, 0), (endnotes, 3)] {
@@ -172,6 +171,16 @@ pub(super) fn validate(
             || !matches!(headers.separator_text(base + 2), "" | "\r\r")
         {
             return Err(unsupported("custom Word note separators are not supported"));
+        }
+        if base == 0 && !continuation.is_empty() {
+            settings.footnote_continuation_separator = Some(
+                if continuation == "\u{3}\r\r" {
+                    "short"
+                } else {
+                    "full"
+                }
+                .to_string(),
+            );
         }
         // [MS-DOC] 2.3.3: the first separator slot is a separate story.
         // Word's DOC→DOCX control preserves an empty slot as a bare paragraph,
@@ -487,6 +496,24 @@ mod tests {
                 .as_deref(),
             Some("none")
         );
+    }
+
+    #[test]
+    fn doc_reserved_continuation_story_preserves_short_and_full_rule() {
+        let notes = ["\u{2} one\r"];
+        let references = [(1, true)];
+        for (story, expected) in [("\u{3}\r\r", "short"), ("\u{4}\r\r", "full")] {
+            let mut properties = fixture(&notes, &references);
+            properties.separators[1] = story;
+            let settings = document("A\u{2}\r", &properties)
+                .unwrap()
+                .note_layout_settings
+                .unwrap();
+            assert_eq!(
+                settings.footnote_continuation_separator.as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

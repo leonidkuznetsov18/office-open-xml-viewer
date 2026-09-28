@@ -1524,18 +1524,18 @@ function buildConcreteBodyLayoutKernel(
                     0,
                     admissionBlockEndPt - parentFrame.yPt,
                   );
-                  const result = takeTableFragment(retained, cursor, {
-                    availableHeightPt,
+                  const fragmentRequest = (heightPt: number) => ({
+                    availableHeightPt: heightPt,
                     freshPageHeightPt: freshAdmissionHeightPt,
                     placement: {
                       container: {
                         id: `${request.location.flowDomainId}:floating-table`,
-                        kind: 'body',
+                        kind: 'body' as const,
                         bounds: {
                           xPt: 0,
                           yPt: 0,
                           widthPt: request.availableInlineExtentPt,
-                          heightPt: availableHeightPt,
+                          heightPt,
                         },
                       },
                       cursor: { xPt: 0, yPt: 0 },
@@ -1543,12 +1543,12 @@ function buildConcreteBodyLayoutKernel(
                         xPt: 0,
                         yPt: 0,
                         widthPt: request.availableInlineExtentPt,
-                        heightPt: availableHeightPt,
+                        heightPt,
                       },
                     },
                     services,
-                    compatibility: 'word',
-                    oversizedRowPolicy: 'atomic',
+                    compatibility: 'word' as const,
+                    oversizedRowPolicy: 'atomic' as const,
                     page: {
                       physicalPageIndex: request.location.pageIndex,
                       displayPageNumber: state.displayPageNumber
@@ -1564,12 +1564,32 @@ function buildConcreteBodyLayoutKernel(
                     finalPlacementTranslationPt: parentFrame,
                     reacquirePageDependentBlock: reacquireTableBlock,
                   });
+                  const fullResult = takeTableFragment(retained, cursor, fragmentRequest(availableHeightPt));
+                  const ownPrescan = floatRegistry.entries.find((entry) =>
+                    entry.occurrenceId === ownPrescanOccurrenceId);
+                  const anchorFollowsExclusion = ownPrescan !== undefined
+                    && request.cursor?.kind !== 'table'
+                    && request.location.cursorPt.yPt
+                      >= ownPrescan.exclusionBounds.yPt + ownPrescan.exclusionBounds.heightPt;
+                  const leadRowHeightPt = retained.layout.rows[cursor.rowIndex]?.advancePt;
+                  const clippedResult = anchorFollowsExclusion && fullResult.nextCursor
+                    && fullResult.fragment
+                    && fullResult.fragment.rows.length > 1 && leadRowHeightPt !== undefined
+                    ? takeTableFragment(retained, cursor, fragmentRequest(leadRowHeightPt))
+                    : null;
+                  const result = clippedResult?.fragment ? clippedResult : fullResult;
                   if (!result.fragment || result.requiresFreshPage) {
                     return Object.freeze({
                       kind: 'fresh-flow-region' as const,
                       result,
                     });
                   }
+                  const fragment = clippedResult?.fragment && fullResult.fragment
+                    ? Object.freeze({
+                        ...result.fragment,
+                        pageAnchorPrescanHeightPt: fullResult.fragment.flowBounds.heightPt,
+                      })
+                    : result.fragment;
                   const sourcePlacement: FloatingTablePlacementLayout = Object.freeze({
                     kind: 'floating-table-placement',
                     occurrenceId: bodyRootFloatingTablePlacementKey(
@@ -1585,11 +1605,11 @@ function buildConcreteBodyLayoutKernel(
                     hostCellId: request.location.flowDomainId,
                     sourceBlockIndex: request.input.source.path[0]!,
                     anchorBlockIndex: request.input.source.path[0]!,
-                    tableId: result.fragment.id,
+                    tableId: fragment.id,
                     overlap: table.overlap === 'never' ? 'never' : 'overlap',
                     positioning,
                     anchorBounds: frames.text,
-                    child: result.fragment,
+                    child: fragment,
                   });
                   const nestedEntries = result.floatingTableRegistryDelta?.entries ?? [];
                   const nestedNextParagraphId =
@@ -1610,7 +1630,7 @@ function buildConcreteBodyLayoutKernel(
                       xPt: resolved.placement.xPt,
                       yPt: resolved.placement.yPt,
                     },
-                    fragment: result.fragment,
+                    fragment,
                     nestedEntries,
                     resolvedBounds: resolved.placement.bounds,
                   });
@@ -1621,7 +1641,7 @@ function buildConcreteBodyLayoutKernel(
                       yPt: parentFrame.yPt,
                     }),
                     result,
-                    fragment: result.fragment,
+                    fragment,
                     resolved,
                     nestedEntries,
                     fingerprint,
@@ -1940,7 +1960,14 @@ function buildConcreteBodyLayoutKernel(
                 yPt: cursorYPt + separatorHeightPt / 2,
               }),
               to: Object.freeze({
-                xPt: request.container.bounds.xPt + request.container.bounds.widthPt / 3,
+              // ECMA-376 §17.11 reserved separator notes: the continuation
+              // story is distinct from the ordinary one. Word DOC controls
+              // with U+0003 in that slot draw a short rule; U+0004 draws a
+              // full-width rule. Absent DOCX metadata retains the full rule.
+              xPt: request.container.bounds.xPt + request.container.bounds.widthPt
+                * (request.continuing && (request.kind !== 'footnote'
+                  || noteSettings?.footnoteContinuationSeparator !== 'short')
+                  ? 1 : 1 / 3),
                 yPt: cursorYPt + separatorHeightPt / 2,
               }),
               color: '#000000',

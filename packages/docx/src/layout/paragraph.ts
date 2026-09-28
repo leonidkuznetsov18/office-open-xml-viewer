@@ -22,6 +22,7 @@ import type {
   DocGridCtx,
 } from '../line-layout.js';
 import {
+  charScaleFactor,
   effectiveCharacterSpacingPt,
   segLetterSpacingPx,
   widthBalanceSpaceAdjustmentForTextPt,
@@ -1364,7 +1365,7 @@ function textPlacement(
     direction: segment.rtl ? 'rtl' : 'ltr',
     ...(segment.verticalRun ? { writingMode: 'vertical-rl' as const } : {}),
     ...(segment.charSpacing !== undefined ? { characterSpacingPt: segment.charSpacing } : {}),
-    ...(segment.charScale !== undefined ? { characterScale: segment.charScale } : {}),
+    ...(charScaleFactor(segment) !== 1 ? { characterScale: charScaleFactor(segment) } : {}),
     ...(segment.fitTextRegionIndex !== undefined ? { fitText: {
       regionIndex: segment.fitTextRegionIndex,
       perGapPt: segment.fitTextPerGapPx ?? 0,
@@ -1442,7 +1443,7 @@ function textPlacement(
       range: { start: sourceOffset, end: sourceOffset + segment.text.length },
       offset: { xPt: 0, yPt: baselineOffsetPt },
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
-      scaleX: segment.charScale ?? 1,
+      scaleX: charScaleFactor(segment),
       direction: segment.rtl ? 'rtl' : 'ltr',
       kerning: segment.kerning === undefined
         ? 'none'
@@ -1807,7 +1808,7 @@ function textPlanSegment(
   const projected = textPlacement(segment, paragraph, sourceOffset, 0, 0, 0, 0);
   if (projected.kind !== 'text') throw new Error('Visible text segment projected as anchor host');
   const pitchPt = segLetterSpacingPx(segment, characterGrid, 1);
-  const scaleX = segment.charScale ?? 1;
+  const scaleX = charScaleFactor(segment);
   const baselineOffsetPt = retainedBaselineOffsetPt(segment);
   const retainedGeometry = retainedGeometryPlan(segment, sourceOffset, projected.color);
   const candidateClusters = segment.shapedClusters;

@@ -116,6 +116,8 @@ export type RenderWorkerRequest =
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
       useGoogleFonts?: boolean;
+      useBundledOfficeFonts?: boolean;
+      allowFootnoteContinuation?: boolean;
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;
       defaultCurrentDateMs: number;
       currentDateMs?: number;

@@ -252,6 +252,7 @@ export interface InternalDocxDocumentModel extends DocxDocumentModel {
     endnoteNumberFormat?: string;
     endnoteNumberStart?: number;
     footnoteSeparator?: string;
+    footnoteContinuationSeparator?: string;
     endnoteSeparator?: string;
   }>;
   readonly __documentTypographySettings?: Readonly<{
@@ -299,6 +300,7 @@ export interface DocumentNoteLayoutSettingsInput {
   readonly footnoteNumbering: Readonly<{ format: string; start: number }>;
   readonly endnoteNumbering: Readonly<{ format: string; start: number }>;
   readonly footnoteSeparator: 'default' | 'none';
+  readonly footnoteContinuationSeparator: 'short' | 'full';
   readonly endnoteSeparator: 'default' | 'none';
 }
 
@@ -331,6 +333,8 @@ export function documentNoteLayoutSettingsInput(
       settings?.endnoteNumberStart,
     ),
     footnoteSeparator: settings?.footnoteSeparator === 'none' ? 'none' : 'default',
+    footnoteContinuationSeparator: settings?.footnoteContinuationSeparator === 'short'
+      ? 'short' : 'full',
     endnoteSeparator: settings?.endnoteSeparator === 'none' ? 'none' : 'default',
   }, 'DOCX note layout settings input');
 }

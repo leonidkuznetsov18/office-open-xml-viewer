@@ -268,6 +268,11 @@ pub struct NoteLayoutSettingsWire {
     /// placement unchanged. Absence retains the historical default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub footnote_separator: Option<String>,
+    /// ECMA-376 §17.11.2 continuationSeparator reserved note. `short` and
+    /// `full` describe the observed rule width; absence uses the Word DOCX
+    /// default (`full`). This is separate from the first-page separator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_continuation_separator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endnote_separator: Option<String>,
 }

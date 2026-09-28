@@ -103,6 +103,7 @@ describe('canonical body layout input', () => {
       footnoteNumbering: { format: 'decimal', start: 1 },
       endnoteNumbering: { format: 'decimal', start: 1 },
       footnoteSeparator: 'default',
+      footnoteContinuationSeparator: 'full',
       endnoteSeparator: 'default',
     });
   });
@@ -121,6 +122,7 @@ describe('canonical body layout input', () => {
         footnoteNumberStart: 4,
         endnoteNumberFormat: 'lowerRoman',
         footnoteSeparator: 'none',
+        footnoteContinuationSeparator: 'short',
       },
     } as unknown as DocxDocumentModel;
 
@@ -130,6 +132,7 @@ describe('canonical body layout input', () => {
       footnoteNumbering: { format: 'upperLetter', start: 4 },
       endnoteNumbering: { format: 'lowerRoman', start: 1 },
       footnoteSeparator: 'none',
+      footnoteContinuationSeparator: 'short',
       endnoteSeparator: 'default',
     });
   });

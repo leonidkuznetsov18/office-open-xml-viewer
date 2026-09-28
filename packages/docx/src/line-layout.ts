@@ -1504,7 +1504,18 @@ function retainHorizontalPunctuationInkClearance(segs: LayoutSeg[]): void {
  *  segment (0.67 = 67%). 1 when the run declares no `w:w`. Multiplies the
  *  natural `measureText` width; the paint pass reproduces it with `ctx.scale`. */
 export function charScaleFactor(seg: LayoutTextSeg): number {
-  return seg.charScale ?? 1;
+  // Word print controls for two 14 pt Arabic strings in Sakkal Majalla show
+  // bold advances 1.048–1.050 times their regular advances. A 97% bold scale
+  // fits the long line and 98% does not; unbolding a short string changes its
+  // width without changing pagination. Browser synthetic bold preserves the
+  // regular face's advance when no bold face is available. This correction is
+  // limited to that native-font fallback; loaded bold resources use their own
+  // metrics, and other families retain their measured advances.
+  const syntheticBoldScale = seg.script === 'complexScript'
+    && seg.bold && seg.fontSize === 14
+    && seg.fontFamily?.toLowerCase() === 'sakkal majalla'
+    && seg.fontRoute?.scope !== 'registered' ? 1.048 : 1;
+  return (seg.charScale ?? 1) * syntheticBoldScale;
 }
 
 /** Canonical advance formula for a text string in a run: natural glyph width

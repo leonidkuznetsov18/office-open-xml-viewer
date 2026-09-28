@@ -100,6 +100,7 @@ export interface BodyLayoutInput {
     footnoteNumbering?: NoteNumberingInput;
     endnoteNumbering?: NoteNumberingInput;
     footnoteSeparator?: 'default' | 'none';
+    footnoteContinuationSeparator?: 'short' | 'full';
     endnoteSeparator?: 'default' | 'none';
   }>;
 }
@@ -123,6 +124,7 @@ export interface BodyLayoutAcquisitionInput {
     footnoteNumbering?: NoteNumberingInput;
     endnoteNumbering?: NoteNumberingInput;
     footnoteSeparator?: 'default' | 'none';
+    footnoteContinuationSeparator?: 'short' | 'full';
     endnoteSeparator?: 'default' | 'none';
   }>;
   readonly pageLayoutSettings: Readonly<{

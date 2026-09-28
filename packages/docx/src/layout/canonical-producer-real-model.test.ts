@@ -629,6 +629,41 @@ describe('canonical producer with a real document model', () => {
     expect(empty?.flowBounds).toEqual(standard?.flowBounds);
   });
 
+  it('uses the authored continuation rule width on a retained note fragment', () => {
+    const section = {
+      pageWidth: 200, pageHeight: 100,
+      marginTop: 10, marginRight: 10, marginBottom: 10, marginLeft: 10,
+      headerDistance: 5, footerDistance: 5, titlePage: false,
+      evenAndOddHeaders: false, sectionStart: 'nextPage', columns: null,
+    } as SectionProps;
+    const render = (style?: 'short' | 'full') => {
+      const model = {
+        section, body: [paragraph()],
+        headers: { default: null, first: null, even: null },
+        footers: { default: null, first: null, even: null },
+        footnotes: [{ id: '7', content: Array.from({ length: 8 }, () => ordinaryParagraph('note')) }],
+        endnotes: [], fontFamilyClasses: {},
+        __noteLayoutSettings: { footnoteContinuationSeparator: style },
+      } as unknown as DocxDocumentModel;
+      const services = createLayoutServices(model, {
+        measureContext: measureContext(), allowFootnoteContinuation: true,
+      });
+      return layoutDocument(model, services, { currentDateMs: 0 }).pages
+        .flatMap((page) => page.layers.notes)
+        .filter((note) => note.kind === 'note');
+    };
+    const short = render('short');
+    const full = render('full');
+    expect(short.length).toBeGreaterThan(1);
+    expect(full).toHaveLength(short.length);
+    const width = (note: (typeof short)[number]) => {
+      const edge = note.separator[0];
+      return edge ? edge.to.xPt - edge.from.xPt : 0;
+    };
+    expect(width(short[0]!)).toBeCloseTo(width(full[0]!), 5);
+    expect(width(full[1]!)).toBeGreaterThan(width(short[1]!) * 2.9);
+  });
+
   it('retains a frame paragraph as an out-of-flow placed occurrence', () => {
     const framed = paragraph();
     framed.framePr = {
