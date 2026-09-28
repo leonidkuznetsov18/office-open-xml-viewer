@@ -1094,10 +1094,16 @@ struct TableTextStyle {
     color: Option<String>,
     bold: Option<bool>,
     italic: Option<bool>,
+    /// Latin typeface from `tcTxStyle` (§20.1.4.2.10 fontRef → `+mj-lt` /
+    /// `+mn-lt`, or `<a:font><a:latin>`), unresolved; resolved per slide theme.
+    font: Option<String>,
 }
 
 impl TableTextStyle {
     fn overlay(&mut self, role: &Self) {
+        if role.font.is_some() {
+            self.font = role.font.clone();
+        }
         if role.color.is_some() {
             self.color = role.color.clone();
         }
@@ -1737,6 +1743,7 @@ fn parse_slide(
                         master_rels,
                         master_smartart_drawings,
                         theme,
+                        &lph.default_text,
                         zip,
                         &mut elements,
                     );
@@ -1761,7 +1768,12 @@ fn parse_slide(
             if let Ok(ldoc) = parse_preflighted_pptx_xml(lxml) {
                 let lroot = ldoc.root_element();
                 if let Some(lsp_tree) = child(lroot, "cSld").and_then(|n| child(n, "spTree")) {
-                    let empty_lph = LayoutPlaceholders::default();
+                    // Layout decorations are ordinary shapes: they take no
+                    // placeholder inheritance, only the defaultTextStyle levels.
+                    let empty_lph = LayoutPlaceholders {
+                        default_text: lph.default_text.clone(),
+                        ..LayoutPlaceholders::default()
+                    };
                     for node in lsp_tree.children().filter(|n| n.is_element()) {
                         let start = elements.len();
                         parse_sp_tree_node(
@@ -2479,6 +2491,9 @@ struct PresentationShared {
     modern_comment_authors: Option<HashMap<String, String>>,
     modern_comment_authors_path: Option<String>,
     pres_master_path: Option<String>,
+    /// The presentation `<p:defaultTextStyle>` as a standalone XML fragment
+    /// (see `default_text_style_fragment`); every master bundle reads it.
+    default_text_style: Option<String>,
     master_cache: HashMap<String, ParsedMaster>,
     no_master_bundle: Option<ParsedMaster>,
     layout_cache: HashMap<String, ParsedLayout>,
@@ -2505,6 +2520,39 @@ impl PresentationShared {
             fol_hlink_color,
         })
     }
+}
+
+/// Copy `<p:defaultTextStyle>` (ECMA-376 §19.2.1.8) out of presentation.xml as
+/// a standalone document so master bundles, which are built lazily after the
+/// presentation DOM is dropped, can read it with the list-style readers. The
+/// element's in-scope namespace declarations are re-declared on a wrapper.
+fn default_text_style_fragment(
+    pres_xml: &str,
+    pres_root: roxmltree::Node<'_, '_>,
+) -> Option<String> {
+    let node = child(pres_root, "defaultTextStyle")?;
+    let body = pres_xml.get(node.range())?;
+    let mut out = String::from("<wrapper");
+    for ns in node.namespaces() {
+        match ns.name() {
+            Some(prefix) => out.push_str(&format!(
+                " xmlns:{prefix}=\"{}\"",
+                escape_xml_attr(ns.uri())
+            )),
+            None => out.push_str(&format!(" xmlns=\"{}\"", escape_xml_attr(ns.uri()))),
+        }
+    }
+    out.push('>');
+    out.push_str(body);
+    out.push_str("</wrapper>");
+    Some(out)
+}
+
+fn escape_xml_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
 }
 
 fn bootstrap_presentation(
@@ -2577,6 +2625,7 @@ fn bootstrap_presentation(
     let modern_comment_authors_path =
         find_internal_rel_target_by_types(&pres_rels_xml, MODERN_COMMENT_AUTHOR_RELATIONSHIP_TYPES)
             .map(|target| resolve_path("ppt", &target));
+    let default_text_style = default_text_style_fragment(&pres_xml, pres_root);
 
     // This is a serialization-shaped projection of retained bootstrap state,
     // measured by a streaming writer without allocating a JSON buffer. It is a
@@ -2591,6 +2640,7 @@ fn bootstrap_presentation(
         &pres_master_path,
         &comment_authors_path,
         &modern_comment_authors_path,
+        &default_text_style,
     ))?
     .json_bytes;
     reporter.observe_hard_limit(
@@ -2635,6 +2685,7 @@ fn bootstrap_presentation(
         modern_comment_authors: None,
         modern_comment_authors_path,
         pres_master_path,
+        default_text_style,
         master_cache,
         no_master_bundle,
         layout_cache,
@@ -2730,6 +2781,7 @@ fn produce_slide_unit_with_journal<T>(
         modern_comment_authors,
         modern_comment_authors_path,
         pres_master_path,
+        default_text_style,
         master_cache,
         no_master_bundle,
         layout_cache,
@@ -2865,7 +2917,8 @@ fn produce_slide_unit_with_journal<T>(
         let bundle: &ParsedMaster = match resolved_master_path {
             Some(master_path) => {
                 if !master_cache.contains_key(master_path) {
-                    let candidate = build_master_bundle(master_path, theme, zip);
+                    let candidate =
+                        build_master_bundle(master_path, theme, default_text_style.as_deref(), zip);
                     zip.assert_healthy()?;
                     let reporter = zip.operation()?.limit_reporter()?;
                     observe_shared_cache_candidate(
@@ -2884,7 +2937,8 @@ fn produce_slide_unit_with_journal<T>(
             }
             None => {
                 if no_master_bundle.is_none() {
-                    let candidate = build_master_bundle("", theme, zip);
+                    let candidate =
+                        build_master_bundle("", theme, default_text_style.as_deref(), zip);
                     zip.assert_healthy()?;
                     let reporter = zip.operation()?.limit_reporter()?;
                     observe_shared_cache_candidate(
@@ -2977,11 +3031,18 @@ fn produce_slide_unit_with_journal<T>(
                 };
                 parse_background(c_sld, &theme, &mut resolve)
             });
+            let dts_doc = default_text_style
+                .as_deref()
+                .and_then(|xml| parse_preflighted_pptx_xml(xml).ok());
+            let dts = dts_doc.as_ref().and_then(|doc| {
+                doc.descendants()
+                    .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
+            });
             let master_color = master_root
-                .map(|root| parse_master_txstyle_color(root, &theme))
+                .map(|root| parse_master_txstyle_color(root, &theme, dts))
                 .unwrap_or_default();
             let master_level_colors = master_root
-                .map(|root| parse_master_level_colors(root, &theme))
+                .map(|root| parse_master_level_colors(root, &theme, dts))
                 .unwrap_or_default();
             let master_level_bullets = master_root
                 .map(|root| {
@@ -2990,6 +3051,7 @@ fn produce_slide_unit_with_journal<T>(
                         &theme,
                         &bundle.master_rels,
                         &bundle.master_dir,
+                        dts,
                         zip,
                     )
                 })
@@ -3026,8 +3088,8 @@ fn produce_slide_unit_with_journal<T>(
         let build_parsed_layout = |lx: &str, zip: &mut PptxZip| -> ParsedLayout {
             parse_layout(
                 lx,
-                &bundle.master_font_sizes,
-                &bundle.master_font_families,
+                &bundle.master_level_faces,
+                &bundle.default_text,
                 &bundle.master_level_font_sizes,
                 layout_master_colors,
                 &bundle.master_level_indents,
@@ -3076,7 +3138,7 @@ fn produce_slide_unit_with_journal<T>(
                 None // borrowed from the cache below
             }
             (_, Some(lx), _) => Some(build_parsed_layout(lx, zip)),
-            (_, None, _) => Some(ParsedLayout::default()),
+            (_, None, _) => Some(ParsedLayout::without_layout(&bundle.default_text)),
         };
         let parsed_layout: &ParsedLayout = match &fresh_layout {
             Some(pl) => pl,
@@ -4361,6 +4423,7 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
+            None,
             &mut zip,
         );
         match m.get("body").map(|b| b[0].resolve()) {
@@ -5174,18 +5237,12 @@ mod tests {
           <p:cSld><p:spTree/></p:cSld><p:txStyles><p:titleStyle><a:lvl1pPr><a:defRPr><a:latin typeface="+mj-lt"/></a:defRPr></a:lvl1pPr></p:titleStyle></p:txStyles>
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master_xml).unwrap();
-        let families = parse_master_font_families(master_doc.root_element(), &theme);
-        assert_eq!(
-            families.get("title").map(String::as_str),
-            Some("Arial Black")
-        );
-        assert_eq!(
-            families.get("ctrTitle").map(String::as_str),
-            Some("Arial Black")
-        );
+        let faces = parse_master_level_faces(master_doc.root_element(), &theme, None);
+        assert_eq!(faces["title"][0].as_deref(), Some("Arial Black"));
+        assert_eq!(faces["ctrTitle"][0].as_deref(), Some("Arial Black"));
 
         let placeholders = LayoutPlaceholders {
-            by_type_font_family: families,
+            by_type_level_faces: faces,
             ..LayoutPlaceholders::default()
         };
         let shape_xml = r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
@@ -5554,6 +5611,7 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
+            None,
             &mut zip,
         );
         // The listed-but-missing part must not produce a Blip anywhere. With only
@@ -5585,6 +5643,7 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
+            None,
             &mut zip_ok,
         );
         match m_ok.get("body").map(|b| b[0].resolve()) {
@@ -6030,7 +6089,7 @@ mod tests {
           </p:txStyles>
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master).unwrap();
-        let m = parse_master_level_font_sizes(master_doc.root_element());
+        let m = parse_master_level_font_sizes(master_doc.root_element(), None);
         let body = m.get("body").expect("body level sizes");
         assert_eq!(body[0], Some(28.0)); // lvl1 → level 0
         assert_eq!(body[1], Some(24.0)); // lvl2 → level 1
@@ -6070,6 +6129,7 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
+            None,
             &mut zip,
         );
         let body = m.get("body").expect("body bullets");
@@ -6136,7 +6196,7 @@ mod tests {
           </p:txStyles>
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master).unwrap();
-        let m = parse_master_level_indents(master_doc.root_element());
+        let m = parse_master_level_indents(master_doc.root_element(), None);
         let body = m.get("body").expect("body level indents");
         assert_eq!(body[0].mar_l, Some(1_000_000));
         assert_eq!(body[0].indent, Some(-500_000));
@@ -6200,7 +6260,7 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                None,
+                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
                 Default::default(), // inherited_level_indents
@@ -6285,7 +6345,7 @@ mod tests {
         let lph = parse_layout_placeholders(
             layout_doc.root_element(),
             &HashMap::new(),
-            &HashMap::new(),
+            &crate::master::DefaultTextLevels::default(),
             &HashMap::new(),
             &HashMap::new(),
             &master_indents,
@@ -6360,8 +6420,8 @@ mod tests {
             let mut zip = PptxZip::new(cursor).unwrap();
             parse_layout(
                 layout,
-                &m_f64,
-                &m_str,
+                &HashMap::new(),
+                &crate::master::DefaultTextLevels::default(),
                 &m_lfs,
                 &HashMap::new(),
                 &m_li,
@@ -6760,7 +6820,7 @@ mod tests {
           </p:bodyStyle></p:txStyles>
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master_xml).unwrap();
-        let master_colors = parse_master_level_colors(master_doc.root_element(), &theme);
+        let master_colors = parse_master_level_colors(master_doc.root_element(), &theme, None);
 
         let layout_xml = r#"<p:sldLayout
           xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -6779,7 +6839,7 @@ mod tests {
         let placeholders = parse_layout_placeholders(
             layout_doc.root_element(),
             &HashMap::new(),
-            &HashMap::new(),
+            &crate::master::DefaultTextLevels::default(),
             &HashMap::new(),
             &master_colors,
             &HashMap::new(),
@@ -6811,7 +6871,7 @@ mod tests {
             &HashMap::new(),
             "ppt/slides",
             None,
-            None,
+            Default::default(),
             [None; 9],
             inherited,
             Default::default(),
@@ -7240,7 +7300,7 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,                          // inherited_font_size
-                None,                          // inherited_font_family
+                Default::default(),            // inherited_level_faces
                 [None; 9],                     // inherited_level_font_sizes
                 std::array::from_fn(|_| None), // inherited_level_colors
                 Default::default(),            // inherited_level_indents
@@ -7325,7 +7385,7 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                None,
+                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
                 Default::default(),
@@ -7410,7 +7470,7 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                None,
+                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
                 Default::default(), // inherited_level_indents
@@ -7499,7 +7559,7 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                None,
+                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
                 Default::default(),
@@ -7576,7 +7636,7 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                None,
+                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
                 Default::default(),
@@ -7637,6 +7697,92 @@ mod tests {
 
     /// ECMA-376 §21.1.3.13 (`a:tblPr@rtl`): a right-to-left table sets `rtl=true`
     /// so the renderer can place column 0 at the right edge. Absent/false must be
+    /// Issue #1620: table-cell text takes the table style's tcTxStyle face
+    /// (built-in styles reference the theme minor font of the slide's master),
+    /// then the defaultTextStyle level; the cell's own formatting wins.
+    #[test]
+    fn table_cell_faces_follow_table_style_then_default_text_style() {
+        let parse = |tbl_xml: &str| -> TableElement {
+            let xml = format!(
+                r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{tbl_xml}</root>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let tbl = doc
+                .root_element()
+                .children()
+                .find(|n| n.is_element() && n.tag_name().name() == "tbl")
+                .unwrap();
+            let t = Transform {
+                x: 0,
+                y: 0,
+                cx: 100,
+                cy: 100,
+                rot: 0.0,
+                flip_h: false,
+                flip_v: false,
+            };
+            let theme = HashMap::from([("+mn-lt".to_owned(), "Candara".to_owned())]);
+            let mut faces: crate::text::LevelFaces = Default::default();
+            faces[0] = Some("Century Gothic".to_owned());
+            let dts = crate::master::DefaultTextLevels {
+                faces,
+                sizes: [None; 9],
+            };
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            parse_table(
+                tbl,
+                &t,
+                &theme,
+                &HashMap::new(),
+                "ppt/slides",
+                &dts,
+                &mut zip,
+            )
+            .unwrap()
+        };
+        let face = |table: &TableElement, row: usize| {
+            table.rows[row].cells[0]
+                .text_body
+                .as_ref()
+                .unwrap()
+                .paragraphs[0]
+                .def_font_family
+                .clone()
+        };
+        let rows = r#"<a:tblGrid><a:gridCol w="100"/></a:tblGrid>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>a</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:pPr><a:defRPr><a:latin typeface="Rockwell"/></a:defRPr></a:pPr><a:r><a:t>b</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
+        let styled = parse(&format!(
+            r#"<a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}</a:tableStyleId></a:tblPr>{rows}</a:tbl>"#
+        ));
+        assert_eq!(face(&styled, 0).as_deref(), Some("Candara"));
+        assert_eq!(face(&styled, 1).as_deref(), Some("Rockwell"));
+        let unstyled = parse(&format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#));
+        assert_eq!(face(&unstyled, 0).as_deref(), Some("Century Gothic"));
+    }
+
+    /// The presentation defaultTextStyle is copied out with the namespace
+    /// declarations in scope on presentation.xml.
+    #[test]
+    fn default_text_style_fragment_keeps_namespaces() {
+        let xml = r#"<x:presentation xmlns:x="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:d="http://schemas.openxmlformats.org/drawingml/2006/main"><x:defaultTextStyle><d:lvl1pPr><d:defRPr sz="2000"><d:latin typeface="Georgia"/></d:defRPr></d:lvl1pPr></x:defaultTextStyle></x:presentation>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let fragment = default_text_style_fragment(xml, doc.root_element()).unwrap();
+        let parsed = roxmltree::Document::parse(&fragment).unwrap();
+        let dts = parsed
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
+            .unwrap();
+        let levels = crate::master::parse_default_text_levels(Some(dts), &HashMap::new());
+        assert_eq!(levels.faces[0].as_deref(), Some("Georgia"));
+        assert_eq!(levels.sizes[0], Some(20.0));
+        let without = roxmltree::Document::parse(
+            r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>"#,
+        )
+        .unwrap();
+        assert!(default_text_style_fragment("", without.root_element()).is_none());
+    }
+
     /// omitted from the serialized JSON (TableElement.rtl is optional in TS).
     #[test]
     fn table_rtl_attribute_parses() {
@@ -7666,7 +7812,16 @@ mod tests {
             let bytes = empty_zip_bytes();
             let cursor = Cursor::new(bytes.clone());
             let mut zip = PptxZip::new(cursor).unwrap();
-            parse_table(tbl, &t, &theme, &rels, "ppt/slides", &mut zip).unwrap()
+            parse_table(
+                tbl,
+                &t,
+                &theme,
+                &rels,
+                "ppt/slides",
+                &crate::master::DefaultTextLevels::default(),
+                &mut zip,
+            )
+            .unwrap()
         }
 
         // rtl="1" → rtl=true, serialized.
@@ -10856,7 +11011,7 @@ mod tests {
             retained_ptr,
             "prepared bytes move; they are not cloned"
         );
-        const FIXED_SLIDE_3: &str = r#"{"index":2,"slideNumber":3,"partName":"ppt/slides/slide3.xml","background":null,"elements":[{"type":"shape","x":0,"y":0,"width":1000000,"height":1000000,"rotation":0.0,"flipH":false,"flipV":false,"geometry":"rect","fill":null,"stroke":null,"textBody":{"verticalAnchor":"t","paragraphs":[{"alignment":"l","marL":0,"marR":0,"indent":0,"spaceBefore":null,"spaceAfter":null,"spaceLine":null,"lvl":0,"bullet":{"type":"inherit"},"defFontSize":null,"defColor":null,"defBold":null,"defItalic":null,"defFontFamily":null,"tabStops":[],"eaLnBrk":true,"runs":[{"type":"text","text":"slide 3","bold":null,"italic":null,"underline":false,"strikethrough":false,"fontSize":null,"color":null,"fontFamily":null,"fieldType":null}]}],"defaultFontSize":null,"defaultBold":null,"defaultItalic":null,"lIns":91440,"rIns":91440,"tIns":45720,"bIns":45720,"wrap":"square","vert":"horz","autoFit":"none"},"defaultTextColor":null,"custGeom":null,"adj":null,"adj2":null,"adj3":null,"adj4":null,"adj5":null,"adj6":null,"adj7":null,"adj8":null,"shadow":null,"id":"2","name":"T"}],"elementSources":[{"origin":"slide"}]}"#;
+        const FIXED_SLIDE_3: &str = r#"{"index":2,"slideNumber":3,"partName":"ppt/slides/slide3.xml","background":null,"elements":[{"type":"shape","x":0,"y":0,"width":1000000,"height":1000000,"rotation":0.0,"flipH":false,"flipV":false,"geometry":"rect","fill":null,"stroke":null,"textBody":{"verticalAnchor":"t","paragraphs":[{"alignment":"l","marL":0,"marR":0,"indent":0,"spaceBefore":null,"spaceAfter":null,"spaceLine":null,"lvl":0,"bullet":{"type":"inherit"},"defFontSize":18.0,"defColor":null,"defBold":null,"defItalic":null,"defFontFamily":"Arial","tabStops":[],"eaLnBrk":true,"runs":[{"type":"text","text":"slide 3","bold":null,"italic":null,"underline":false,"strikethrough":false,"fontSize":null,"color":null,"fontFamily":null,"fieldType":null}]}],"defaultFontSize":18.0,"defaultBold":null,"defaultItalic":null,"lIns":91440,"rIns":91440,"tIns":45720,"bIns":45720,"wrap":"square","vert":"horz","autoFit":"none"},"defaultTextColor":null,"custGeom":null,"adj":null,"adj2":null,"adj3":null,"adj4":null,"adj5":null,"adj6":null,"adj7":null,"adj8":null,"shadow":null,"id":"2","name":"T"}],"elementSources":[{"origin":"slide"}]}"#;
         assert_eq!(bytes, FIXED_SLIDE_3.as_bytes());
         let legacy: serde_json::Value =
             serde_json::from_str(&parse_pptx_native(&legacy_data).unwrap()).unwrap();
@@ -10956,6 +11111,7 @@ mod tests {
             &shared.pres_master_path,
             &shared.comment_authors_path,
             &shared.modern_comment_authors_path,
+            &shared.default_text_style,
         ))
         .unwrap()
         .json_bytes;
