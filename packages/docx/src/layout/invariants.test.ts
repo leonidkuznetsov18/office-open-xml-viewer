@@ -42,6 +42,28 @@ describe('plain-data layout validation paths', () => {
       .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', expected));
   });
 
+  it('rejects a violation in a shared node through every path that reaches it', () => {
+    // A node reached twice is validated once; the violation must still be
+    // reported at the first path that reaches it, whichever parent that is.
+    const bad = { xPt: Number.NaN };
+    expect(() => layoutFingerprint({ pages: [{ a: bad, b: bad }], diagnostics: [] } as never))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.pages[0].a.xPt is not finite'));
+    expect(() => layoutFingerprint({ pages: [{ a: { ok: 1 }, b: [bad], c: bad }], diagnostics: [] } as never))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.pages[0].b[0].xPt is not finite'));
+    // A shared node that passed once is not a certificate for a different,
+    // invalid sibling reached through the same parent.
+    const good = { xPt: 1 };
+    expect(() => layoutFingerprint({
+      pages: [{ a: good, b: good, c: { inner: good, broken: undefined } }], diagnostics: [],
+    } as never)).toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.pages[0].c.broken contains undefined'));
+    // Aliasing is not a cycle; a genuine cycle through a shared node still is.
+    expect(() => layoutFingerprint({ pages: [{ a: good, b: good }], diagnostics: [] } as never)).not.toThrow();
+    const cyclic: Record<string, unknown> = { xPt: 1 };
+    cyclic.self = { back: cyclic };
+    expect(() => layoutFingerprint({ pages: [{ a: cyclic, b: cyclic }], diagnostics: [] } as never))
+      .toThrow(new LayoutInvariantError('INVALID_GEOMETRY', 'layout.pages[0].a.self.back contains a cycle'));
+  });
+
   it('reports an accessor without invoking it', () => {
     const getter = vi.fn(() => 1);
     const value = { pages: [], diagnostics: [], extra: Object.defineProperty({}, 'value', {
