@@ -1060,8 +1060,10 @@ function drawTextDecoLine(
 /**
  * Resolve a Run's font against a base Font. Per ECMA-376, a run's <rPr>
  * completely specifies bold/italic/underline/strike for that run, while
- * size/color/name fall back to the base when omitted. A run with no
- * <rPr> (run.font undefined) inherits the base entirely.
+ * size/name fall back to the base when omitted. A run with no <rPr>
+ * (run.font undefined) inherits the base entirely. An <rPr> without a
+ * <color> is automatic (black) rather than the cell's color: Excel draws
+ * such a run black even in a red cell.
  */
 function applyRunFont(base: CellFont, run: Run): CellFont {
   const rf = run.font;
@@ -1073,7 +1075,7 @@ function applyRunFont(base: CellFont, run: Run): CellFont {
     underlineStyle: rf.underlineStyle,
     strike: rf.strike,
     size: rf.size ?? base.size,
-    color: rf.color ?? base.color,
+    color: rf.color ?? null,
     name: rf.name ?? base.name,
     vertAlign: rf.vertAlign,
   };
@@ -2052,8 +2054,7 @@ function renderQuadrant(
     // ([Red] etc., §18.8.30) > table / PivotTable style colour > the cell's
     // own font colour (a cell's own colour beats the table's; see
     // tableStyleFontColor).
-    const tableFontColor = tableStyleFontColor(tableFontDxfFor(tableStyle, styles), xf)
-      ?? pivotFormat?.fontColor ?? null;
+    const tableFontColor = styleFontColor(tableFontDxfFor(tableStyle, styles), pivotFormat, xf);
     const textColor = hyperlinkUrl
       ? '#0563C1'
       : (cf.fontColor ?? formatted.color ?? tableFontColor ?? font.color);
@@ -2084,7 +2085,12 @@ function renderQuadrant(
     // Using the same code keeps the off-screen-anchor pre-pass and the
     // in-viewport-anchor path identical, so a merged cell renders the same
     // text whether or not its top-left anchor cell is scrolled out of view.
-    const runs = cell.value.type === 'text' ? cell.value.runs : undefined;
+    // Rich runs take the table style's font color by the measured run rule
+    // (richRunsWithTableColor); runs without <rPr> through the base font.
+    const tableRunColor = tableStyleFontColor(tableFontDxfFor(tableStyle, styles), xf);
+    const rawRuns = cell.value.type === 'text' ? cell.value.runs : undefined;
+    const runs = rawRuns && richRunsWithTableColor(rawRuns, tableRunColor);
+    const richBaseFont = tableRunColor != null ? { ...fontForDraw, color: tableRunColor } : fontForDraw;
     const hasRichText = runs && runs.length > 0;
 
     if (xf.wrapText && hasRichText) {
@@ -2093,7 +2099,7 @@ function renderQuadrant(
       // underline/strike, and bidi (previously this pre-pass drew only plain
       // per-segment fonts).
       drawWrappedRichText(
-        ctx, runs, fontForDraw,
+        ctx, runs, richBaseFont,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
         cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
@@ -2111,7 +2117,7 @@ function renderQuadrant(
       // off-screen-anchored merge renders identical per-run text (single line, or
       // multiple lines on a hard break) instead of joined base-font text.
       drawNonWrapRichText(
-        ctx, runs, fontForDraw,
+        ctx, runs, richBaseFont,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
         cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
@@ -2500,8 +2506,7 @@ function renderQuadrant(
       const hyperlinkUrl = rc.hyperlinkMap.get(key);
       // Table-style element dxfs can override font color (ECMA-376 §18.8.83),
       // following the same element hierarchy as the fill/bold above.
-      const tableFontColor = tableStyleFontColor(tableFontDxf, xf)
-        ?? pivotFormat?.fontColor ?? null;
+      const tableFontColor = styleFontColor(tableFontDxf, pivotFormat, xf);
       // Colour precedence: hyperlink > conditional-formatting font colour >
       // number-format section colour ([Red] etc., §18.8.30) > table-style dxf
       // colour > the cell's own font colour (a cell's own colour beats the
@@ -2770,15 +2775,18 @@ function renderQuadrant(
           cellBaseRtl(xf.readingOrder, text) ? 'rtl' : 'ltr';
       } catch { /* ignore */ }
 
-      // Rich text: draw each run with its own font. Only supported for the
-      // non-wrap path (wrap with mixed fonts is significantly more complex).
-      const runs = cell.value.type === 'text' ? cell.value.runs : undefined;
+      // Rich text: draw each run with its own font. Rich runs take the table
+      // style's font color by the measured run rule (richRunsWithTableColor).
+      const tableRunColor = tableStyleFontColor(tableFontDxf, xf);
+      const rawRuns = cell.value.type === 'text' ? cell.value.runs : undefined;
+      const runs = rawRuns && richRunsWithTableColor(rawRuns, tableRunColor);
+      const richBaseFont = tableRunColor != null ? { ...fontForDraw, color: tableRunColor } : fontForDraw;
       const hasRichText = runs && runs.length > 0;
 
       if (xf.wrapText && hasRichText) {
         // Rich text with wrapping — shared with the off-screen pre-pass.
         drawWrappedRichText(
-          ctx, runs, fontForDraw,
+          ctx, runs, richBaseFont,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
           cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
@@ -2798,7 +2806,7 @@ function renderQuadrant(
         // and a value with breaks as multiple lines, keeping this in-viewport
         // path and the off-screen-anchor pre-pass identical.
         drawNonWrapRichText(
-          ctx, runs, fontForDraw,
+          ctx, runs, richBaseFont,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
           cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
@@ -3112,6 +3120,34 @@ function tableFontDxfFor(tableStyle: TableCellStyle | undefined, styles: Styles)
  *  style): Excel draws that color over the table style's. */
 function tableStyleFontColor(tableFontDxf: Dxf | undefined, xf: CellXf): string | null {
   return xf.ownFontColor ? null : tableFontDxf?.font?.color ?? null;
+}
+
+/** The table or PivotTable style font color for a cell, or null when the
+ *  cell's font color is its own formatting. Measured in Excel for both: a
+ *  PivotTable cell given Automatic, RGB black or red keeps that color, while
+ *  one given the theme "Black, Text 1" (authored like Normal) shows the
+ *  PivotTable style's color. */
+function styleFontColor(
+  tableFontDxf: Dxf | undefined,
+  pivotFormat: PivotCellFormat | undefined,
+  xf: CellXf,
+): string | null {
+  if (xf.ownFontColor) return null;
+  return tableFontDxf?.font?.color ?? pivotFormat?.fontColor ?? null;
+}
+
+/** Rich-text runs as Excel draws them under a table style font color
+ *  (measured): a run whose <rPr> color is confirmed to be authored like the
+ *  Normal style's (`normalColor`) takes the table color; any other run with
+ *  <rPr> keeps its own color (automatic when it has none). Runs without <rPr>
+ *  take the base font, whose color the caller sets to the table color.
+ *  `tableColor` null (no table color, or the cell's font color is its own)
+ *  leaves the runs unchanged. */
+function richRunsWithTableColor(runs: Run[], tableColor: string | null): Run[] {
+  if (tableColor == null) return runs;
+  return runs.map((run) => (run.font?.normalColor
+    ? { ...run, font: { ...run.font, color: tableColor } }
+    : run));
 }
 
 /** The cell font with its bold/italic/underline/strike composed from every

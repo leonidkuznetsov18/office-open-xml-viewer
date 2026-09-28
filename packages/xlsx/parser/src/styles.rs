@@ -59,11 +59,13 @@ fn parse_default_font(doc: &roxmltree::Document) -> DefaultFont {
 pub(crate) struct ParsedStylesPart {
     pub(crate) styles: Styles,
     pub(crate) default_font: DefaultFont,
+    pub(crate) normal_font_color: Option<Option<String>>,
     pub(crate) chart_number_formats: crate::chart::ChartNumberFormatCache,
 }
 
 pub(crate) struct ParsedStyleProjection {
     pub(crate) default_font: DefaultFont,
+    pub(crate) normal_font_color: Option<Option<String>>,
     pub(crate) chart_number_formats: crate::chart::ChartNumberFormatCache,
 }
 
@@ -96,6 +98,7 @@ pub(crate) fn parse_styles(
             dxfs,
         },
         default_font,
+        normal_font_color: normal_font_color_key(&doc),
         chart_number_formats,
     })
 }
@@ -110,6 +113,7 @@ pub(crate) fn parse_style_projection(
     let doc = parse_guarded(&xml).map_err(|e| e.to_string())?;
     Ok(ParsedStyleProjection {
         default_font: parse_default_font(&doc),
+        normal_font_color: normal_font_color_key(&doc),
         chart_number_formats: crate::chart::ChartNumberFormatCache::from_document(&doc),
     })
 }
@@ -490,6 +494,75 @@ struct AuthoredColor {
     tint: Option<Typed<f64>>,
 }
 
+/// One `<color>` element as authored (see AuthoredColor).
+fn authored_color(color: &roxmltree::Node) -> AuthoredColor {
+    let rgb = color.attribute("rgb").map(|v| {
+        let v = v.trim().to_ascii_uppercase();
+        if v.len() == 6 {
+            format!("FF{v}")
+        } else {
+            v
+        }
+    });
+    AuthoredColor {
+        // xsd:boolean: 1/true and 0/false; omitted means false.
+        auto: match color.attribute("auto").map(str::trim) {
+            None | Some("0" | "false") => Typed::Value(false),
+            Some("1" | "true") => Typed::Value(true),
+            Some(other) => Typed::Invalid(other.to_string()),
+        },
+        rgb,
+        theme: typed(color.attribute("theme")),
+        indexed: typed(color.attribute("indexed")),
+        // A non-finite tint stays text so equality remains reflexive.
+        tint: match typed::<f64>(color.attribute("tint")) {
+            Some(Typed::Value(0.0)) => None,
+            Some(Typed::Value(t)) if !t.is_finite() => color
+                .attribute("tint")
+                .map(|v| Typed::Invalid(v.trim().to_string())),
+            other => other,
+        },
+    }
+}
+
+/// A canonical key for an authored `<color>`, equal exactly when two colors
+/// are the same authored value. Rich-text runs carry it so their color can be
+/// compared with the Normal style's once styles are known.
+pub(crate) fn authored_color_key(color: &roxmltree::Node) -> String {
+    format!("{:?}", authored_color(color))
+}
+
+/// The Normal cell style font's authored color key: the outer `None` when
+/// Normal cannot be resolved, the inner `None` for a font without `<color>`.
+pub(crate) fn normal_font_color_key(doc: &roxmltree::Document) -> Option<Option<String>> {
+    let normal_xf = normal_style_xf(doc)?;
+    let font_id = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "cellStyleXfs" && is_x_ns(n.tag_name().namespace()))?
+        .children()
+        .filter(|n| n.tag_name().name() == "xf")
+        .nth(normal_xf)?
+        .attribute("fontId")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0) as usize;
+    authored_font_colors(doc)
+        .get(font_id)
+        .map(|color| color.as_ref().map(|c| format!("{c:?}")))
+}
+
+/// `<cellStyle builtinId="0">`'s `xfId` (ECMA-376 §18.8.7): the Normal style.
+fn normal_style_xf(doc: &roxmltree::Document) -> Option<usize> {
+    doc.descendants()
+        .find(|n| {
+            n.tag_name().name() == "cellStyle"
+                && is_x_ns(n.tag_name().namespace())
+                && n.attribute("builtinId")
+                    .is_some_and(|v| v.trim().parse::<u32>() == Ok(0))
+        })
+        .and_then(|n| n.attribute("xfId"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
 /// Each `<font>`'s authored color; the inner `None` is a font without a
 /// `<color>` element.
 fn authored_font_colors(doc: &roxmltree::Document) -> Vec<Option<AuthoredColor>> {
@@ -503,34 +576,9 @@ fn authored_font_colors(doc: &roxmltree::Document) -> Vec<Option<AuthoredColor>>
         .children()
         .filter(|n| n.tag_name().name() == "font")
         .map(|font| {
-            let color = font.children().find(|c| c.tag_name().name() == "color")?;
-            let rgb = color.attribute("rgb").map(|v| {
-                let v = v.trim().to_ascii_uppercase();
-                if v.len() == 6 {
-                    format!("FF{v}")
-                } else {
-                    v
-                }
-            });
-            Some(AuthoredColor {
-                // xsd:boolean: 1/true and 0/false; omitted means false.
-                auto: match color.attribute("auto").map(str::trim) {
-                    None | Some("0" | "false") => Typed::Value(false),
-                    Some("1" | "true") => Typed::Value(true),
-                    Some(other) => Typed::Invalid(other.to_string()),
-                },
-                rgb,
-                theme: typed(color.attribute("theme")),
-                indexed: typed(color.attribute("indexed")),
-                // A non-finite tint stays text so equality remains reflexive.
-                tint: match typed::<f64>(color.attribute("tint")) {
-                    Some(Typed::Value(0.0)) => None,
-                    Some(Typed::Value(t)) if !t.is_finite() => color
-                        .attribute("tint")
-                        .map(|v| Typed::Invalid(v.trim().to_string())),
-                    other => other,
-                },
-            })
+            font.children()
+                .find(|c| c.tag_name().name() == "color")
+                .map(|color| authored_color(&color))
         })
         .collect()
 }
@@ -573,16 +621,7 @@ fn own_font_color_flags(doc: &roxmltree::Document) -> Vec<bool> {
             .unwrap_or_default()
     };
     let style_xfs = xfs_in("cellStyleXfs");
-    let normal_xf = doc
-        .descendants()
-        .find(|n| {
-            n.tag_name().name() == "cellStyle"
-                && is_x_ns(n.tag_name().namespace())
-                && n.attribute("builtinId")
-                    .is_some_and(|v| v.trim().parse::<u32>() == Ok(0))
-        })
-        .and_then(|n| n.attribute("xfId"))
-        .and_then(|v| v.trim().parse::<usize>().ok());
+    let normal_xf = normal_style_xf(doc);
     // Normal's authored color, then one "differs from Normal" answer per font
     // (None: the font index does not resolve), so each xf is a lookup.
     let Some(normal) = normal_xf
