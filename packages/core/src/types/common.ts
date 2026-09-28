@@ -512,8 +512,10 @@ export interface TextRunData {
 /** Run-level glyph outline. Width is in OOXML EMU (12700 EMU = 1 pt). */
 export interface TextOutline {
   width: number;
-  /** Hex without '#'. Absent = inherit from text fill colour. */
+  /** Legacy solid hex without '#'; absent with no `fill` inherits glyph paint. */
   color?: string;
+  /** Authored a:ln fill, including gradient or preset pattern. */
+  fill?: Fill;
 }
 
 export interface LineBreak {

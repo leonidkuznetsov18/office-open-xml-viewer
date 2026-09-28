@@ -2110,6 +2110,7 @@ interface TextBody__emitterCollision1 {
 export interface TextOutline {
     width: number;
     color?: string;
+    fill?: Fill;
 }
 export interface TextRect {
     x: number;

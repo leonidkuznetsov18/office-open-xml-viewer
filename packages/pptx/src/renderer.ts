@@ -3214,10 +3214,18 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
       (el.sp3d?.contourW ? el.sp3d.contourW * scale : 0) +
       (extrusion ? Math.hypot(extrusion.offsetX, extrusion.offsetY) / ctxDevScale : 0) +
       2;
+    const projectedTextHasPattern = el.textBody?.paragraphs.some(p =>
+      p.runs.some(run => run.type === 'text' && (
+        run.patternFill?.fillType === 'pattern' ||
+        run.outline?.fill?.fillType === 'pattern' ||
+        run.underlineFill?.fillType === 'pattern'
+      )),
+    ) ?? false;
     const paintProjectedElement = (
       target: CanvasRenderingContext2D,
       projectedElement: ShapeElement,
       padded: boolean,
+      preservePatternFrame = false,
     ): boolean =>
       projectScene3dPaint(
         target,
@@ -3233,13 +3241,13 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           renderShape(octx, projectedElement, scale, themeDefaultColor, slideNumber, rc, undefined);
         },
         padded
-          ? { bevels, extrusion: extrusion ?? undefined, edgePadCss }
-          : {},
+          ? { bevels, extrusion: extrusion ?? undefined, edgePadCss, preservePatternFrame }
+          : { preservePatternFrame },
       );
     const paintProjectedBody = (target: CanvasRenderingContext2D): boolean =>
       paintProjectedElement(target, localBodyEl, true);
     const paintProjectedText = (target: CanvasRenderingContext2D): boolean =>
-      !el.textBody || paintProjectedElement(target, localTextEl, false);
+      !el.textBody || paintProjectedElement(target, localTextEl, false, projectedTextHasPattern);
     const hasRasterEffects = Boolean(
       el.shadow || el.innerShadow || el.glow || el.softEdge || el.reflection,
     );
@@ -3292,7 +3300,10 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         ctx.restore();
         return;
       }
-    } else if (paintProjectedElement(ctx, localEl, true)) {
+    } else if (paintProjectedElement(
+      ctx, localEl, true,
+      projectedTextHasPattern && el.fill?.fillType !== 'pattern',
+    )) {
       ctx.restore();
       return;
     }
@@ -5170,6 +5181,9 @@ export function renderTextBody(
 
       if (segShadow) ctx.restore();
 
+      ctx.font = seg.font;
+      const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
+
       // Run-level text outline (rPr > a:ln). Strokes each glyph in addition
       // to the fill so the text reads as a thin lined character. ECMA-376
       // §20.1.2.2.24: `w` is EMU; convert to px via the same scale used for
@@ -5180,14 +5194,16 @@ export function renderTextBody(
       if (segOutline && segOutline.width > 0) {
         ctx.save();
         ctx.lineWidth = Math.max(0.5, emuToPx(segOutline.width, scale));
-        ctx.strokeStyle = segOutline.color ? `#${segOutline.color}` : glyphPaint;
+        ctx.strokeStyle = segOutline.fill
+          ? resolveFillCore(
+              segOutline.fill, ctx, penX, segBaseline - drawSizePx,
+              Math.max(1, segW), drawSizePx, 0, scale * PT_TO_EMU,
+            ) ?? 'rgba(0,0,0,0)'
+          : segOutline.color ? `#${segOutline.color}` : glyphPaint;
         ctx.lineJoin = 'round';
         drawRun(ctx, 'stroke');
         ctx.restore();
       }
-
-      ctx.font = seg.font;
-      const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
 
       if (onTextRun && seg.text) {
         onTextRun({
@@ -5409,6 +5425,8 @@ function buildExtrusion(
  * then fall back to painting directly.
  */
 interface Project3dOpts {
+  /** Text front faces retain the slide pattern frame before camera projection. */
+  preservePatternFrame?: boolean;
   /** Bevel lips to bake into the body before the warp (§20.1.5.12 bevelT/B). */
   bevels?: BevelInput[];
   /** Extrusion side-wall to bake in before the bevel (§20.1.5.12 extrusionH). */
@@ -5434,6 +5452,31 @@ interface Project3dOpts {
    * measures the true silhouette distance instead of the canvas edge.
    */
   edgePadCss?: number;
+}
+
+/** Map the source slide/device frame into a padded, shape-local effect raster.
+ * Bevels blit that raster; scene3d warps it through the camera after painting. */
+function patternFrameToLocalRaster(
+  tf: DOMMatrix,
+  devScale: number,
+  padDev: number,
+  x: number,
+  y: number,
+) {
+  const det = tf.a * tf.d - tf.b * tf.c;
+  if (Math.abs(det) <= 1e-12) return undefined;
+  const ia = tf.d / det;
+  const ib = -tf.b / det;
+  const ic = -tf.c / det;
+  const id = tf.a / det;
+  const ie = -(ia * tf.e + ic * tf.f);
+  const iff = -(ib * tf.e + id * tf.f);
+  return {
+    a: devScale * ia, b: devScale * ib,
+    c: devScale * ic, d: devScale * id,
+    e: padDev + devScale * (ie - x),
+    f: padDev + devScale * (iff - y),
+  };
 }
 
 function projectScene3dPaint(
@@ -5480,7 +5523,17 @@ function projectScene3dPaint(
   octx.save();
   octx.scale(devScale, devScale);
   octx.translate(padCss, padCss);
-  paintBody(octx, 0, 0, w, h);
+  // PowerPoint PDF rasterises projected pattern text as a front-face image
+  // before the camera warp. Its 8 pt tile stays in the slide frame: moving an
+  // otherwise identical dnDiag text shape by 4 pt changes the embedded image's
+  // colour phase, while camera rotation and extrusion retain that phase. Map
+  // the live slide root into this padded local raster before painting.
+  if (opts.preservePatternFrame) {
+    const sourceToAux = patternFrameToLocalRaster(tf, devScale, padDev, x, y);
+    withInheritedPatternScope(target, octx, () => paintBody(octx, 0, 0, w, h), undefined, sourceToAux);
+  } else {
+    paintBody(octx, 0, 0, w, h);
+  }
   octx.restore();
 
   // The body silhouette occupies the offscreen's inner box (device px):
@@ -5586,24 +5639,7 @@ function paintBeveledFlat(
   // The body is repainted in this shape-local device canvas, then blitted
   // through the shape CTM. Transfer the complete slide frame, including the
   // shape's rotation/flip, before resolving its pattern fill.
-  const signedDet = tf.a * tf.d - tf.b * tf.c;
-  const sourceToAux = Math.abs(signedDet) > 1e-12
-    ? (() => {
-        const invDet = 1 / signedDet;
-        const ia = tf.d * invDet;
-        const ib = -tf.b * invDet;
-        const ic = -tf.c * invDet;
-        const id = tf.a * invDet;
-        const ie = -(ia * tf.e + ic * tf.f);
-        const iff = -(ib * tf.e + id * tf.f);
-        return {
-          a: devScale * ia, b: devScale * ib,
-          c: devScale * ic, d: devScale * id,
-          e: padDev + devScale * (ie - x),
-          f: padDev + devScale * (iff - y),
-        };
-      })()
-    : undefined;
+  const sourceToAux = patternFrameToLocalRaster(tf, devScale, padDev, x, y);
   withInheritedPatternScope(target, octx, () => paintBody(octx, 0, 0, w, h), undefined, sourceToAux);
   octx.restore();
   // Restrict the bevel distance-transform to the body's inner box grown by the

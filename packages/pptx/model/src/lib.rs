@@ -1299,6 +1299,10 @@ pub struct TextOutline {
     /// Resolved hex colour (no `#`). None = inherit from text fill.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// Authored a:ln fill. Kept separately from `color` so gradient and
+    /// pattern strokes retain their complete DrawingML paint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

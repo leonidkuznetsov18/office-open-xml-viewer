@@ -4743,6 +4743,188 @@ mod tests {
     }
 
     #[test]
+    fn field_uses_the_run_formatting_cascade() {
+        // CT_TextField has the same rPr/t content as CT_RegularTextRun.
+        // A field's local rPr may be empty; paragraph defRPr and list-level
+        // defaults must give it the same paint and metrics as an adjacent run.
+        let xml = r#"<p xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <pPr lvl="1"><defRPr sz="3200" b="1"><pattFill prst="pct50">
+            <fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr>
+          </pattFill><latin typeface="Arial"/></defRPr></pPr>
+          <r><t>Run</t></r>
+          <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime"><rPr/><t>Field</t></fld>
+        </p>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected a run and a field");
+        };
+        assert_eq!(field.font_size, run.font_size);
+        assert_eq!(field.font_family, run.font_family);
+        assert_eq!(field.bold, run.bold);
+        assert!(
+            matches!(field.pattern_fill, Some(Fill::Pattern { ref preset, .. }) if preset == "pct50")
+        );
+
+        let list_xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <lstStyle><lvl1pPr><defRPr sz="3500" b="1"><pattFill prst="dnDiag">
+            <fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr>
+          </pattFill><latin typeface="Arial"/></defRPr></lvl1pPr></lstStyle>
+          <p><r><t>Run</t></r><fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime"><rPr/><t>Field</t></fld></p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(list_xml).unwrap();
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected a run and a field from the list-style paragraph");
+        };
+        assert_eq!(run.font_size, Some(35.0));
+        assert_eq!(field.font_size, run.font_size);
+        assert_eq!(field.font_family, run.font_family);
+        assert_eq!(field.bold, run.bold);
+        assert!(
+            matches!(&field.pattern_fill, Some(Fill::Pattern { preset, .. }) if preset == "dnDiag")
+        );
+        assert!(
+            matches!(&run.pattern_fill, Some(Fill::Pattern { preset, .. }) if preset == "dnDiag")
+        );
+
+        let solid_xml = r#"<p xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <pPr><defRPr sz="2800"><solidFill><srgbClr val="275B89"/></solidFill>
+          <latin typeface="Times New Roman"/></defRPr></pPr>
+          <r><t>Run</t></r><fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}"><t>Field</t></fld>
+        </p>"#;
+        let doc = roxmltree::Document::parse(solid_xml).unwrap();
+        let para = parse_paragraph(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected a run and a field");
+        };
+        assert_eq!(run.color.as_deref(), Some("275B89"));
+        assert_eq!(field.color, run.color);
+        assert_eq!(field.font_size, run.font_size);
+        assert_eq!(field.font_family, run.font_family);
+
+        let number_xml = r#"<p xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="slidenum"/>
+        </p>"#;
+        let doc = roxmltree::Document::parse(number_xml).unwrap();
+        let para = parse_paragraph(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        assert!(matches!(para.runs.as_slice(), [TextRun::Text(field)]
+            if field.field_type.as_deref() == Some("slidenum") && field.text.is_empty()));
+    }
+
+    #[test]
+    fn text_outline_keeps_its_own_pattern_or_gradient_fill() {
+        let theme = HashMap::new();
+        let rels = HashMap::new();
+        let pattern_xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr>
+          <solidFill><srgbClr val="101010"/></solidFill><ln w="50800"><pattFill prst="dnDiag">
+          <fgClr><srgbClr val="00A650"/></fgClr><bgClr><srgbClr val="FF8800"/></bgClr>
+          </pattFill></ln></rPr><t>O</t></r>"#;
+        let doc = roxmltree::Document::parse(pattern_xml).unwrap();
+        let run = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert_eq!(run.color.as_deref(), Some("101010"));
+        assert!(
+            matches!(run.outline.and_then(|o| o.fill), Some(Fill::Pattern { preset, fg, bg })
+            if preset == "dnDiag" && fg == "00A650" && bg == "FF8800")
+        );
+
+        let gradient_xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr>
+          <ln w="50800"><gradFill><gsLst><gs pos="0"><srgbClr val="00A650"/></gs>
+          <gs pos="100000"><srgbClr val="FF8800"/></gs></gsLst><lin ang="0"/></gradFill></ln>
+          </rPr><t>O</t></r>"#;
+        let doc = roxmltree::Document::parse(gradient_xml).unwrap();
+        let run = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(
+            matches!(run.outline.and_then(|o| o.fill), Some(Fill::Gradient { stops, .. }) if stops.len() == 2)
+        );
+    }
+
+    #[test]
+    fn hyperlink_without_run_fill_uses_theme_over_list_style_colour() {
+        let xml = r#"<root xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <defRPr><solidFill><srgbClr val="777777"/></solidFill></defRPr>
+          <r><rPr><hlinkClick r:id="rId1"/></rPr><t>Link</t></r>
+          <r><rPr><solidFill><srgbClr val="275B89"/></solidFill><hlinkClick r:id="rId1"/></rPr><t>Authored</t></r>
+        </root>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let root = doc.root_element();
+        let defaults = child(root, "defRPr");
+        let runs = children_vec(root, "r");
+        let rels = HashMap::from([("rId1".into(), "https://example.test/".into())]);
+        let inherited = parse_run(runs[0], defaults, &HashMap::new(), &rels).unwrap();
+        let authored = parse_run(runs[1], defaults, &HashMap::new(), &rels).unwrap();
+        assert!(inherited.hyperlink.is_some());
+        assert_eq!(inherited.color, None);
+        assert_eq!(authored.color.as_deref(), Some("275B89"));
+    }
+
+    #[test]
     fn test_parse_run_treats_uniform_gradient_text_fill_as_its_exact_color() {
         let uniform = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="353535"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>uniform</t></r>"#;
         let varying = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="FFFFFF"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>varying</t></r>"#;
