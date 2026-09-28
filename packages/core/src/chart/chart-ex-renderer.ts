@@ -613,9 +613,9 @@ function renderWaterfallChart(
         '#000000',
         { linkedNoStyleFallback: true },
       );
-      if (applyResolvedChartExLineStyle(
-        ctx, connectorLine, ptToPx, { x: px0, y: py0, w: pw, h: ph }, shapeRotationDeg,
-      )) {
+      // Connector strokes stay solid (no bounds): structured connector paint
+      // is not part of the paint-work budget, as on main.
+      if (applyResolvedChartExLineStyle(ctx, connectorLine, ptToPx)) {
         // A linked `seriesLine` NoStyle delegates to Waterfall's semantic
         // connector rather than suppressing it. Office vector output from
         // both an unstyled bridge and an explicitly styled bridge establishes
