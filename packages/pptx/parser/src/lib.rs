@@ -5040,7 +5040,7 @@ mod tests {
             );
             assert!(matches!(item.underline_fill, Some(Fill::Pattern { .. })));
             assert_eq!(item.highlight.as_deref(), Some("FFE800"));
-            assert_eq!(item.strikethrough, true);
+            assert!(item.strikethrough);
         }
         assert_eq!(run.character_attributes["lang"], "fr-FR");
         assert_eq!(run.caps.as_deref(), Some("none"));
