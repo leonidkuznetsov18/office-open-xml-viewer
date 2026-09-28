@@ -7048,10 +7048,12 @@ async function renderSlideLeased(
   const slideNumber = slide.slideNumber;
 
   // Resolve every picture and media poster concurrently, so the paint cost is
-  // max(decode) instead of sum; the paint below consumes them in z-order.
+  // max(decode) instead of sum; the paint below consumes them in z-order. Each
+  // preparation settles to a step (never rejects), so one that is abandoned
+  // after an earlier fatal failure cannot surface an unhandled rejection.
   const elementPreparations: Promise<PreparedPaint | null>[] = failed()
     ? []
-    : slide.elements.map((el) => {
+    : slide.elements.map((el): Promise<PreparedPaint | null> => {
       if (el.type === 'picture') {
         return preparePicture(
           el,
@@ -7077,7 +7079,9 @@ async function renderSlideLeased(
         );
       }
       return Promise.resolve(null);
-    });
+    }).map((preparation) => preparation.catch(
+      (error: unknown): PreparedPaint => ({ ...NO_PAINT, failure: { error } }),
+    ));
 
   const chartMarkerImages = new Map<string, CanvasImageSource | null>();
   // Picture bullets (`<a:buBlip>`, §21.1.2.4.2) and chart picture markers are
@@ -7422,10 +7426,21 @@ async function renderSlideLeased(
     }
   }
 
-  // Preparations never reject: every failure is carried by its step.
-  const elementSteps = await Promise.all(elementPreparations);
-  // A newer render of this canvas started while we awaited an image/equation —
-  // stop before clearing the canvas so we don't paint this (now stale) slide.
+  // Consume the preparations in paint order, as the former sequential paint
+  // awaited them. At the first fatal failure, stop: steps after it are
+  // abandoned (never awaited or painted), so a later hanging fetch cannot delay
+  // the rejection, and an earlier fatal failure always takes precedence.
+  const elementSteps: (PreparedPaint | null)[] = [];
+  if (!failed()) {
+    for (const preparation of elementPreparations) {
+      const step = await preparation;
+      // A newer render of this canvas started while we awaited an image —
+      // stop before clearing the canvas so we don't paint this stale slide.
+      if (superseded()) return canvas;
+      elementSteps.push(step);
+      if (step?.failure) break;
+    }
+  }
   if (superseded()) return canvas;
 
   // ---- Paint: synchronous from here on, so the whole slide is one task. ----

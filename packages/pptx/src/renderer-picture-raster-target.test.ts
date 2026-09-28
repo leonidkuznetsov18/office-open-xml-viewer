@@ -334,4 +334,48 @@ describe('PPTX slide paint atomicity', () => {
     await render;
     expect(events).toEqual(['clear', 'fillRect', 'drawImage', 'drawImage']);
   });
+
+  const picturesSlide = (...paths: string[]) => ({
+    index: 0,
+    slideNumber: 1,
+    background: null,
+    elements: paths.map((imagePath) => ({
+      type: 'picture',
+      x: 0,
+      y: 0,
+      width: 4_572_000,
+      height: 3_429_000,
+      rotation: 0,
+      flipH: false,
+      flipV: false,
+      imagePath,
+      mimeType: imagePath.endsWith('.tiff') ? 'image/tiff' : 'image/png',
+    })),
+  }) as Slide;
+  const renderPictures = (slide: Slide) => renderSlide(canvas(), slide, 9_144_000, 6_858_000, {
+    width: 960,
+    dpr: 1,
+    fetchImage: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+  });
+
+  it('rejects with a fatal decode error without waiting for later pictures', async () => {
+    const fatal = new TiffDecodeError('Unsupported TIFF compression');
+    coreMocks.decode.mockImplementation((path: string) => path.endsWith('a.tiff')
+      ? Promise.reject(fatal)
+      : new Promise(() => {}));
+
+    await expect(renderPictures(picturesSlide('ppt/media/a.tiff', 'ppt/media/b.png')))
+      .rejects.toBe(fatal);
+  });
+
+  it('reports the earliest fatal decode error in paint order', async () => {
+    const first = new TiffDecodeError('first picture');
+    const second = new TiffDecodeError('second picture');
+    coreMocks.decode.mockImplementation((path: string) => path.endsWith('a.tiff')
+      ? new Promise((_, reject) => setTimeout(() => reject(first), 10))
+      : Promise.reject(second));
+
+    await expect(renderPictures(picturesSlide('ppt/media/a.tiff', 'ppt/media/b.tiff')))
+      .rejects.toBe(first);
+  });
 });
