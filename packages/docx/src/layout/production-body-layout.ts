@@ -1157,7 +1157,10 @@ function layoutBodyNotes(
               yPt: cursorYPt + separatorHeightPt / 2,
             }),
             to: Object.freeze({
-              xPt: request.container.bounds.xPt + request.container.bounds.widthPt / 3,
+              // ECMA-376 §17.11.1: the continuation separator spans the
+              // main story's text extents; an ordinary separator is shorter.
+              xPt: request.container.bounds.xPt + request.container.bounds.widthPt
+                * (request.continuing ? 1 : 1 / 3),
               yPt: cursorYPt + separatorHeightPt / 2,
             }),
             color: '#000000',

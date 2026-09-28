@@ -1114,6 +1114,9 @@ export interface LayoutServices {
   readonly text: TextLayoutService;
   readonly images: ImageMetadataService;
   readonly math: MathMetadataService;
+  /** Opt-in page-bottom note continuation while authored separator and table
+   * note fragmentation support is incomplete. Immutable for this document. */
+  readonly allowFootnoteContinuation?: boolean;
   /** Geometry-affecting vertical glyph acquisition capability. Kept separate
    * from horizontal text shaping so each service fingerprint stays truthful. */
   readonly verticalGlyphFingerprint?: string;

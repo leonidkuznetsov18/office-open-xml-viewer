@@ -62,6 +62,7 @@ import {
   writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { selectParagraphFragment, type ParagraphFragmentCursor } from './paragraph-pagination.js';
+import { partitionFootnote, type FootnoteCursor } from './footnote-fragmentation.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import {
   endnoteIdsInRetainedSlice,
@@ -944,6 +945,7 @@ function* paginateBodyPassSteps(
     if (delta) session.commitFlowRegistryDelta(delta);
   };
   prescanPageAnchors(state, 0);
+  let placePendingFootnoteContinuations: () => void = () => {};
   const commitTransition = (
     transition: ReturnType<typeof applyAuthoredBreak>,
     nextEntryIndex: number,
@@ -971,6 +973,7 @@ function* paginateBodyPassSteps(
       const nextLocation = acquisitionLocation(state);
       session.resetPageAcquisition(nextLocation);
       if (!skipPageAnchorPrescan) prescanPageAnchors(state, nextEntryIndex);
+      placePendingFootnoteContinuations();
     } else {
       const nextLocation = acquisitionLocation(state);
       session.moveAcquisitionCursor(nextLocation);
@@ -985,6 +988,13 @@ function* paginateBodyPassSteps(
   const footnoteIdsByPage = new Map<number, Set<string>>();
   const footnoteReserveByPage = new Map<number, number>();
   const footnoteLayoutsByPage = new Map<number, NoteLayout[]>();
+  const pendingFootnoteContinuations = new Map<string, FootnoteCursor>();
+  type FootnoteAdmission = Readonly<{
+    ids: readonly string[];
+    layouts: readonly NoteLayout[];
+    reservePt: number;
+    continuations: readonly Readonly<{ id: string; cursor: FootnoteCursor }>[];
+  }>;
   // §17.18.77 observes committed references even when their measured reserve is zero;
   // footnoteReservePt remains only the page-local geometry charge.
   const hasFootnoteReferenceOnPage = (pageIndex: number): boolean => (
@@ -994,22 +1004,22 @@ function* paginateBodyPassSteps(
     candidate: ParagraphLayout | TableLayout,
     inlineExtentPt: number,
     retainedReferenceIds?: readonly string[],
-  ): Readonly<{
-    ids: readonly string[];
-    layouts: readonly NoteLayout[];
-    reservePt: number;
-  }> => footnoteAdmissionForIds(
+    availableReservePt?: number,
+  ): FootnoteAdmission => footnoteAdmissionForIds(
     retainedReferenceIds ?? footnoteIdsInRetainedSlice(candidate),
     inlineExtentPt,
+    // Word keeps the complete note with a reference in a body paragraph that
+    // continues on the next page (long-paragraph control: two references on
+    // opposite pages). A completed paragraph can leave its note behind as a
+    // page-bottom continuation (single-reference control).
+    candidate.kind === 'paragraph' && candidate.continuation?.continuesOnNext
+      ? undefined : availableReservePt,
   );
   const footnoteAdmissionForIds = (
     retainedReferenceIds: readonly string[],
     inlineExtentPt: number,
-  ): Readonly<{
-    ids: readonly string[];
-    layouts: readonly NoteLayout[];
-    reservePt: number;
-  }> => {
+    availableReservePt?: number,
+  ): FootnoteAdmission => {
     const retained = footnoteIdsByPage.get(state.flow.pageIndex) ?? new Set<string>();
     const ids = [...new Set(retainedReferenceIds)]
       .filter((id) => !retained.has(id));
@@ -1034,15 +1044,29 @@ function* paginateBodyPassSteps(
       },
       firstOnPage: retained.size === 0,
     });
+    const continuations: Array<Readonly<{ id: string; cursor: FootnoteCursor }>> = [];
+    const admittedLayouts = layouts.map((note, index) => {
+      if (services.allowFootnoteContinuation !== true
+        || availableReservePt === undefined || index !== layouts.length - 1) return note;
+      const precedingPt = layouts.slice(0, index).reduce((sum, preceding) => sum + preceding.advancePt, 0);
+      const partition = partitionFootnote(note, null, Math.max(0, availableReservePt - precedingPt));
+      if (partition?.nextCursor) {
+        continuations.push(Object.freeze({ id: note.source.storyInstance, cursor: partition.nextCursor }));
+        return partition.fragment;
+      }
+      return note;
+    });
     return Object.freeze({
       ids: Object.freeze(ids),
-      layouts,
-      reservePt: layouts.reduce((sum, note) => sum + note.advancePt, 0),
+      layouts: Object.freeze(admittedLayouts),
+      reservePt: admittedLayouts.reduce((sum, note) => sum + note.advancePt, 0),
+      continuations: Object.freeze(continuations),
     });
   };
   const commitFootnotes = (
     ids: readonly string[],
     layouts: readonly NoteLayout[],
+    continuations: FootnoteAdmission['continuations'] = [],
   ) => {
     let retained = footnoteIdsByPage.get(state.flow.pageIndex);
     if (!retained) {
@@ -1061,6 +1085,42 @@ function* paginateBodyPassSteps(
       state.flow.pageIndex,
       state.footnoteReservePt,
     );
+    continuations.forEach(({ id, cursor }) => pendingFootnoteContinuations.set(id, cursor));
+  };
+  placePendingFootnoteContinuations = () => {
+    if (pendingFootnoteContinuations.size === 0) return;
+    const pending = [...pendingFootnoteContinuations];
+    pendingFootnoteContinuations.clear();
+    const location = acquisitionLocation(state);
+    for (const [id, cursor] of pending) {
+      if (!session.layoutNotes) throw new Error('Footnote continuation requires note layout');
+      const [acquired] = session.layoutNotes({
+        kind: 'footnote',
+        referenceIds: Object.freeze([id]),
+        pageIndex: state.flow.pageIndex,
+        section: location.section,
+        container: {
+          id: `notes:page:${state.flow.pageIndex}`,
+          kind: 'footnote',
+          bounds: {
+            xPt: location.availableBounds.xPt,
+            yPt: 0,
+            widthPt: location.availableBounds.widthPt,
+            heightPt: location.section.geometry.pageHeight,
+          },
+        },
+        firstOnPage: !hasFootnoteReferenceOnPage(state.flow.pageIndex),
+        continuing: true,
+      });
+      if (!acquired) continue;
+      const capacityPt = Math.max(0, activeBlockEndPt(state)
+        - state.footnoteReservePt - state.flow.deepestColumnBlockPt);
+      const partition = partitionFootnote(acquired, cursor, capacityPt);
+      if (!partition) throw new NoteCapacityExceededError('footnote', state.flow.pageIndex, `notes:page:${state.flow.pageIndex}`);
+      commitFootnotes([id], [partition.fragment], partition.nextCursor
+        ? [Object.freeze({ id, cursor: partition.nextCursor })]
+        : []);
+    }
   };
   // §17.11.21 / §17.18.34 assign each note to the physical page that paints
   // its reference. Growing that page-wide band must not clip a deeper column
@@ -1490,6 +1550,11 @@ function* paginateBodyPassSteps(
           (fragment) => footnoteAdmission(
             fragment,
             location.availableBounds.widthPt,
+            undefined,
+            Math.max(0, Math.min(
+              location.availableBounds.heightPt - fragment.advancePt,
+              additionalFootnoteReserveCapacityPt(),
+            )),
           ).reservePt,
           acquired.uniformRubyAdvancePt,
           (reservePt) => !footnoteReserveInvadesCommittedPageContent(reservePt),
@@ -1516,13 +1581,18 @@ function* paginateBodyPassSteps(
         const notes = footnoteAdmission(
           selected.fragment,
           location.availableBounds.widthPt,
+          undefined,
+          Math.max(0, Math.min(
+            location.availableBounds.heightPt - selected.fragment.advancePt,
+            additionalFootnoteReserveCapacityPt(),
+          )),
         );
         assertFreshPageFootnoteAdmission(
           notes.reservePt,
           selected.fragment.advancePt + notes.reservePt,
           freshPageExtent(state),
         );
-        commitFootnotes(notes.ids, notes.layouts);
+        commitFootnotes(notes.ids, notes.layouts, notes.continuations);
         if (acquired.flowRegistryDelta) {
           const acceptedDelta = paragraphFlowRegistryDeltaForAcceptedFragment(
             acquired.flowRegistryDelta,
@@ -1766,6 +1836,12 @@ function* paginateBodyPassSteps(
       }
     }
     session.moveAcquisitionCursor(acquisitionLocation(state));
+  }
+  while (pendingFootnoteContinuations.size > 0) {
+    commitTransition(
+      advanceToPage(state.flow, state.flow.section, 'overflow'),
+      input.sequence.length,
+    );
   }
   const reservedPages = new Set([
     ...footnoteReserveByPage.keys(),
