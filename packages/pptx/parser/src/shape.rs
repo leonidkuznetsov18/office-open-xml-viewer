@@ -1174,6 +1174,19 @@ pub(crate) fn parse_shape(
     } else {
         std::array::from_fn(|_| None)
     };
+    let inherited_level_run_properties = if ph_node.is_some() {
+        let levels = lph.lookup_level_run_properties(&ph_type, ph_idx);
+        if style_node
+            .and_then(|style| child(style, "fontRef"))
+            .is_some()
+        {
+            levels.map(|props| props.without_fill())
+        } else {
+            levels
+        }
+    } else {
+        std::array::from_fn(|_| Default::default())
+    };
     let text_body = child(sp_node, "txBody").map(|n| {
         parse_text_body(
             n,
@@ -1184,6 +1197,7 @@ pub(crate) fn parse_shape(
             inherited_font_family,
             inherited_level_font_sizes,
             inherited_level_colors,
+            inherited_level_run_properties,
             inherited_level_indents,
             &inherited_level_bullets,
             inherited_bold,
@@ -2263,6 +2277,7 @@ pub(crate) fn parse_table_cell(
             None,
             [None; 9],
             std::array::from_fn(|_| None),
+            std::array::from_fn(|_| Default::default()),
             Default::default(), // inherited_level_indents
             &empty_level_bullets(),
             None,

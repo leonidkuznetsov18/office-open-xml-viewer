@@ -6,14 +6,37 @@
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
 use crate::fill::{parse_color_node, parse_fill, parse_reflection, parse_shadow};
-use crate::theme::{resolve_theme_typeface, PptxSchemeResolver};
+use crate::theme::resolve_theme_typeface;
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
 use ooxml_common::blip::mime_from_ext;
 use ooxml_common::math::parse_omath_nodes;
 use ooxml_common::text::{parse_lnspc, SpaceLine};
 use ooxml_common::units::text_point_to_pt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+type PropertyAttributes = BTreeMap<String, String>;
+
+#[derive(Clone, serde::Serialize)]
+struct InheritedRelationship {
+    target: String,
+    /// Set for master/layout levels. Slide-local targets retain the existing
+    /// slide-relative representation used by the viewer.
+    source_dir: Option<String>,
+}
+
+fn merge_attributes(higher: &PropertyAttributes, lower: &PropertyAttributes) -> PropertyAttributes {
+    let mut merged = lower.clone();
+    merged.extend(higher.clone());
+    merged
+}
+
+fn xml_attributes(node: roxmltree::Node<'_, '_>) -> PropertyAttributes {
+    node.attributes()
+        .filter(|a| !matches!(a.name(), "dirty" | "err"))
+        .map(|a| (a.name().to_owned(), a.value().to_owned()))
+        .collect()
+}
 
 /// One `CT_TextSpacing` choice from `<a:spcBef>` / `<a:spcAft>` (ECMA-376
 /// §21.1.2.2.9-.10): an absolute `<a:spcPts>` in hundredths of a point or a
@@ -497,26 +520,6 @@ pub(crate) fn text_property_color(
     }
 }
 
-fn text_property_pattern_fill(
-    properties: roxmltree::Node<'_, '_>,
-    theme: &HashMap<String, String>,
-) -> Option<Fill> {
-    let choice = text_property_fill(properties)?;
-    if choice.tag_name().name() != "pattFill" {
-        return None;
-    }
-    let pattern = ooxml_common::fill::parse_patt_fill(
-        choice,
-        &PptxSchemeResolver { theme },
-        ooxml_common::color::TintMode::PowerPointLinear,
-    );
-    Some(Fill::Pattern {
-        fg: pattern.fg,
-        bg: pattern.bg,
-        preset: pattern.preset,
-    })
-}
-
 fn underline_fill_choice<'a, 'input>(
     properties: roxmltree::Node<'a, 'input>,
 ) -> Option<roxmltree::Node<'a, 'input>> {
@@ -642,6 +645,426 @@ impl InheritedBodyPr {
     }
 }
 
+fn underline_line_choice<'a, 'input>(
+    properties: roxmltree::Node<'a, 'input>,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    properties
+        .children()
+        .find(|node| node.is_element() && matches!(node.tag_name().name(), "uLn" | "uLnTx"))
+}
+
+fn parse_text_line(
+    line: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> Option<TextOutline> {
+    if child(line, "noFill").is_some() {
+        return None;
+    }
+    let fill = parse_fill(line, theme);
+    Some(TextOutline {
+        width: attr_i64(&line, "w").unwrap_or(0),
+        color: match &fill {
+            Some(Fill::Solid { color }) => Some(color.clone()),
+            _ => None,
+        },
+        fill,
+    })
+}
+
+/// The authored part of CT_TextCharacterProperties. Each member retains its
+/// own presence bit so a partial pPr/defRPr overrides only that property of
+/// lstStyle, layout and master (§21.1.2.2.7, §21.1.2.4, §21.1.2.3.9).
+/// An explicit noFill is stored as Fill::None and never becomes "missing".
+#[derive(Clone, Default, serde::Serialize)]
+pub(crate) struct RunProperties {
+    /// Authored CT_TextCharacterProperties attributes, except dirty/err (the
+    /// schema marks these as editing diagnostics).  Keep the full set so
+    /// language, kerning, normalization and annotation state survive the same
+    /// cascade as visible paint even when this canvas has no consumer yet.
+    attributes: PropertyAttributes,
+    /// Direct child attributes, merged within a child after schema choice
+    /// groups have selected the nearest authored alternative.
+    child_attributes: BTreeMap<String, PropertyAttributes>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<String>,
+    underline_fill: Option<Option<Fill>>,
+    underline_line: Option<Option<TextOutline>>,
+    underline_line_follow_text: Option<bool>,
+    underline_line_fill_authored: bool,
+    strike: Option<String>,
+    caps: Option<String>,
+    letter_spacing: Option<f64>,
+    font_size: Option<f64>,
+    fill: Option<Fill>,
+    color: Option<String>,
+    fill_authored: bool,
+    font_family: Option<String>,
+    font_family_ea: Option<String>,
+    font_family_cs: Option<String>,
+    font_family_sym: Option<String>,
+    baseline: Option<i32>,
+    effects_authored: bool,
+    shadow: Option<Shadow>,
+    reflection: Option<Reflection>,
+    outline: Option<Option<TextOutline>>,
+    outline_fill_authored: bool,
+    highlight: Option<String>,
+    hyperlink_uses_text_fill: Option<bool>,
+    // Relationship IDs are local to their owning OPC part. Keep the target
+    // paired with the authored r:id as levels from master, layout and slide
+    // are merged (ECMA-376 Part 2, §9.3.3; §21.1.2.3.5).
+    hlink_click_target: Option<Option<InheritedRelationship>>,
+    hlink_mouse_over_target: Option<Option<InheritedRelationship>>,
+}
+pub(crate) type LevelRunProperties = [RunProperties; 9];
+
+impl RunProperties {
+    pub(crate) fn from_xml(node: roxmltree::Node<'_, '_>, theme: &HashMap<String, String>) -> Self {
+        let fill_choice = text_property_fill(node);
+        let underline_choice = underline_fill_choice(node);
+        let underline_line_choice = underline_line_choice(node);
+        let effects = child(node, "effectLst").or_else(|| child(node, "effectDag"));
+        let outline = child(node, "ln");
+        let mut child_attributes = BTreeMap::new();
+        for element in node.children().filter(|n| n.is_element()) {
+            child_attributes.insert(
+                element.tag_name().name().to_owned(),
+                xml_attributes(element),
+            );
+        }
+        Self {
+            attributes: xml_attributes(node),
+            child_attributes,
+            bold: attr(&node, "b").map(|v| v == "1" || v == "true"),
+            italic: attr(&node, "i").map(|v| v == "1" || v == "true"),
+            underline: attr(&node, "u"),
+            underline_fill: underline_choice.map(|n| {
+                if n.tag_name().name() == "uFill" {
+                    parse_fill(n, theme)
+                } else {
+                    None
+                }
+            }),
+            underline_line: underline_line_choice.map(|n| {
+                (n.tag_name().name() == "uLn")
+                    .then(|| parse_text_line(n, theme))
+                    .flatten()
+            }),
+            underline_line_follow_text: underline_line_choice
+                .map(|n| n.tag_name().name() == "uLnTx"),
+            underline_line_fill_authored: underline_line_choice
+                .is_some_and(|n| n.tag_name().name() == "uLn" && text_property_fill(n).is_some()),
+            strike: attr(&node, "strike"),
+            caps: attr(&node, "cap"),
+            letter_spacing: attr(&node, "spc").and_then(|v| text_point_to_pt(&v)),
+            font_size: attr_f64(&node, "sz").map(|v| v / 100.0),
+            fill: fill_choice.and_then(|_| parse_fill(node, theme)),
+            color: fill_choice.and_then(|_| text_property_color(node, theme)),
+            fill_authored: fill_choice.is_some(),
+            font_family: child(node, "latin")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            font_family_ea: child(node, "ea")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            font_family_cs: child(node, "cs")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            font_family_sym: child(node, "sym")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            baseline: attr(&node, "baseline").and_then(|v| v.parse().ok()),
+            effects_authored: effects.is_some(),
+            shadow: effects.and_then(|n| parse_shadow(n, theme)),
+            reflection: effects.and_then(parse_reflection),
+            outline: outline.map(|ln| {
+                if child(ln, "noFill").is_some() {
+                    return None;
+                }
+                let fill = parse_fill(ln, theme);
+                Some(TextOutline {
+                    width: attr_i64(&ln, "w").unwrap_or(0),
+                    color: match &fill {
+                        Some(Fill::Solid { color }) => Some(color.clone()),
+                        _ => None,
+                    },
+                    fill,
+                })
+            }),
+            outline_fill_authored: outline.is_some_and(|ln| text_property_fill(ln).is_some()),
+            highlight: child(node, "highlight").and_then(|n| parse_color_node(n, theme)),
+            hyperlink_uses_text_fill: child(node, "hlinkClick")
+                .and_then(|h| {
+                    h.descendants()
+                        .find(|n| n.is_element() && n.tag_name().name() == "hlinkClr")
+                })
+                .map(|n| n.attribute("val") == Some("tx")),
+            hlink_click_target: None,
+            hlink_mouse_over_target: None,
+        }
+    }
+
+    pub(crate) fn with_relationships(mut self, rels: &HashMap<String, String>) -> Self {
+        self.hlink_click_target = self
+            .child_attributes
+            .get("hlinkClick")
+            .and_then(|attrs| attrs.get("id"))
+            .map(|id| {
+                rels.get(id).map(|target| InheritedRelationship {
+                    target: target.clone(),
+                    source_dir: None,
+                })
+            });
+        self.hlink_mouse_over_target = self
+            .child_attributes
+            .get("hlinkMouseOver")
+            .and_then(|attrs| attrs.get("id"))
+            .map(|id| {
+                rels.get(id).map(|target| InheritedRelationship {
+                    target: target.clone(),
+                    source_dir: None,
+                })
+            });
+        self
+    }
+
+    /// Retain the relationship owner until after the attribute-wise cascade.
+    /// A nearer level may author @action without a new r:id, so resolving the
+    /// target here would miss a later hlinksldjump action.
+    pub(crate) fn with_part_targets(mut self, part_dir: &str) -> Self {
+        for link in [
+            &mut self.hlink_click_target,
+            &mut self.hlink_mouse_over_target,
+        ] {
+            if let Some(Some(relationship)) = link {
+                relationship.source_dir = Some(part_dir.to_owned());
+            }
+        }
+        self
+    }
+
+    /// `self` has higher priority. Every field, including explicit false/none,
+    /// is independently chosen; a present effect list is one OOXML choice.
+    pub(crate) fn over(&self, lower: &Self) -> Self {
+        macro_rules! pick {
+            ($field:ident) => {
+                self.$field.clone().or_else(|| lower.$field.clone())
+            };
+        }
+        Self {
+            attributes: merge_attributes(&self.attributes, &lower.attributes),
+            child_attributes: {
+                let mut merged = lower.child_attributes.clone();
+                // The schema groups are alternatives.  A nearer choice ends
+                // inheritance of the other choices, while attributes inside
+                // the same child remain independently inherited.
+                const FILL: &[&str] = &[
+                    "noFill",
+                    "solidFill",
+                    "gradFill",
+                    "blipFill",
+                    "pattFill",
+                    "grpFill",
+                ];
+                const EFFECT: &[&str] = &["effectLst", "effectDag"];
+                const ULINE: &[&str] = &["uLn", "uLnTx"];
+                const UFILL: &[&str] = &["uFill", "uFillTx"];
+                for (name, attrs) in &self.child_attributes {
+                    for group in [FILL, EFFECT, ULINE, UFILL] {
+                        if group.contains(&name.as_str()) {
+                            for other in group {
+                                if *other != name {
+                                    merged.remove(*other);
+                                }
+                            }
+                        }
+                    }
+                    let previous = merged.get(name).cloned().unwrap_or_default();
+                    merged.insert(name.clone(), merge_attributes(attrs, &previous));
+                }
+                merged
+            },
+            bold: pick!(bold),
+            italic: pick!(italic),
+            underline: pick!(underline),
+            underline_fill: pick!(underline_fill),
+            underline_line: match (&self.underline_line, &lower.underline_line) {
+                (Some(Some(higher)), Some(Some(lower_line)))
+                    if !self.underline_line_follow_text.unwrap_or(false) =>
+                {
+                    let fill = if self.underline_line_fill_authored {
+                        higher.fill.clone()
+                    } else {
+                        lower_line.fill.clone()
+                    };
+                    Some(Some(TextOutline {
+                        width: if self
+                            .child_attributes
+                            .get("uLn")
+                            .is_some_and(|a| a.contains_key("w"))
+                        {
+                            higher.width
+                        } else {
+                            lower_line.width
+                        },
+                        color: match &fill {
+                            Some(Fill::Solid { color }) => Some(color.clone()),
+                            _ => None,
+                        },
+                        fill,
+                    }))
+                }
+                (Some(value), _) => Some(value.clone()),
+                (None, _) => lower.underline_line.clone(),
+            },
+            underline_line_follow_text: pick!(underline_line_follow_text),
+            underline_line_fill_authored: self.underline_line_fill_authored
+                || lower.underline_line_fill_authored,
+            strike: pick!(strike),
+            caps: pick!(caps),
+            letter_spacing: pick!(letter_spacing),
+            font_size: pick!(font_size),
+            fill: if self.fill_authored {
+                self.fill.clone()
+            } else {
+                lower.fill.clone()
+            },
+            color: if self.fill_authored {
+                self.color.clone()
+            } else {
+                lower.color.clone()
+            },
+            fill_authored: self.fill_authored || lower.fill_authored,
+            font_family: pick!(font_family),
+            font_family_ea: pick!(font_family_ea),
+            font_family_cs: pick!(font_family_cs),
+            font_family_sym: pick!(font_family_sym),
+            baseline: pick!(baseline),
+            effects_authored: self.effects_authored || lower.effects_authored,
+            shadow: if self.effects_authored {
+                self.shadow.clone()
+            } else {
+                lower.shadow.clone()
+            },
+            reflection: if self.effects_authored {
+                self.reflection.clone()
+            } else {
+                lower.reflection.clone()
+            },
+            outline: match (&self.outline, &lower.outline) {
+                (Some(Some(higher)), Some(Some(lower_outline))) => {
+                    let fill = if self.outline_fill_authored {
+                        higher.fill.clone()
+                    } else {
+                        lower_outline.fill.clone()
+                    };
+                    Some(Some(TextOutline {
+                        width: if self
+                            .child_attributes
+                            .get("ln")
+                            .is_some_and(|a| a.contains_key("w"))
+                        {
+                            higher.width
+                        } else {
+                            lower_outline.width
+                        },
+                        color: match &fill {
+                            Some(Fill::Solid { color }) => Some(color.clone()),
+                            _ => None,
+                        },
+                        fill,
+                    }))
+                }
+                (Some(value), _) => Some(value.clone()),
+                (None, _) => lower.outline.clone(),
+            },
+            outline_fill_authored: self.outline_fill_authored || lower.outline_fill_authored,
+            highlight: pick!(highlight),
+            hyperlink_uses_text_fill: pick!(hyperlink_uses_text_fill),
+            hlink_click_target: pick!(hlink_click_target),
+            hlink_mouse_over_target: pick!(hlink_mouse_over_target),
+        }
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.attributes.is_empty()
+            && self.child_attributes.is_empty()
+            && self.bold.is_none()
+            && self.italic.is_none()
+            && self.underline.is_none()
+            && self.underline_fill.is_none()
+            && self.underline_line.is_none()
+            && self.strike.is_none()
+            && self.caps.is_none()
+            && self.letter_spacing.is_none()
+            && self.font_size.is_none()
+            && !self.fill_authored
+            && self.font_family.is_none()
+            && self.font_family_ea.is_none()
+            && self.font_family_cs.is_none()
+            && self.font_family_sym.is_none()
+            && self.baseline.is_none()
+            && !self.effects_authored
+            && self.outline.is_none()
+            && self.highlight.is_none()
+            && self.hyperlink_uses_text_fill.is_none()
+            && self.hlink_click_target.is_none()
+            && self.hlink_mouse_over_target.is_none()
+    }
+    pub(crate) fn without_fill(mut self) -> Self {
+        self.fill = None;
+        self.color = None;
+        self.fill_authored = false;
+        self
+    }
+}
+
+pub(crate) fn read_level_run_properties_with_rels(
+    list_style: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    rels: &HashMap<String, String>,
+) -> LevelRunProperties {
+    // CT_TextListStyle.defPPr supplies the run defaults for every level.  A
+    // level's defRPr overlays it one property at a time (§21.1.2.4).
+    let base = child(list_style, "defPPr")
+        .and_then(|p| child(p, "defRPr"))
+        .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
+        .unwrap_or_default();
+    std::array::from_fn(|level| {
+        child(list_style, &format!("lvl{}pPr", level + 1))
+            .and_then(|p| child(p, "defRPr"))
+            .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
+            .unwrap_or_default()
+            .over(&base)
+    })
+}
+#[cfg(test)]
+pub(crate) fn extract_level_run_properties(
+    tx_body: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> LevelRunProperties {
+    extract_level_run_properties_with_rels(tx_body, theme, &HashMap::new())
+}
+
+pub(crate) fn extract_level_run_properties_with_rels(
+    tx_body: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    rels: &HashMap<String, String>,
+) -> LevelRunProperties {
+    child(tx_body, "lstStyle")
+        .map(|n| read_level_run_properties_with_rels(n, theme, rels))
+        .unwrap_or_else(|| std::array::from_fn(|_| RunProperties::default()))
+}
+pub(crate) fn merge_level_run_properties(
+    higher: &LevelRunProperties,
+    lower: &LevelRunProperties,
+) -> LevelRunProperties {
+    std::array::from_fn(|i| higher[i].over(&lower[i]))
+}
+pub(crate) fn has_any_level_run_properties(levels: &LevelRunProperties) -> bool {
+    levels.iter().any(|p| !p.is_empty())
+}
+
 // Carries the resolved master/layout/placeholder inheritance context (theme,
 // rels, inherited font size, default alignment/spacing, level styles) that text
 // runs need; these are inheritance inputs, not an arbitrary parameter bag.
@@ -655,6 +1078,7 @@ pub(crate) fn parse_text_body(
     inherited_font_family: Option<String>,
     inherited_level_font_sizes: LevelFontSizes,
     inherited_level_colors: LevelColors,
+    inherited_level_run_properties: LevelRunProperties,
     inherited_level_indents: LevelIndents,
     inherited_level_bullets: &LevelBullets,
     inherited_bold: Option<bool>,
@@ -810,6 +1234,9 @@ pub(crate) fn parse_text_body(
     let effective_level_sizes = merge_level_sizes(&own_level_sizes, &inherited_level_font_sizes);
     let own_level_colors = extract_level_colors(tx_body, theme);
     let effective_level_colors = merge_level_colors(&own_level_colors, &inherited_level_colors);
+    let own_level_run_properties = extract_level_run_properties_with_rels(tx_body, theme, rels);
+    let effective_level_run_properties =
+        merge_level_run_properties(&own_level_run_properties, &inherited_level_run_properties);
     // Effective per-list-level indents: this shape's own lstStyle wins per
     // axis/level, else the layout/master inherited per-level indents. A paragraph
     // that omits marL/marR/indent picks them by `lvl` from this cascade before
@@ -884,6 +1311,7 @@ pub(crate) fn parse_text_body(
                 default_font_family.as_deref(),
                 default_reflection.as_ref(),
                 &effective_level_sizes,
+                &effective_level_run_properties,
                 &effective_level_indents,
                 &effective_level_bullets,
                 zip,
@@ -1044,6 +1472,7 @@ pub(crate) fn parse_paragraph(
     body_default_font_family: Option<&str>,
     body_default_reflection: Option<&Reflection>,
     level_font_sizes: &LevelFontSizes,
+    level_run_properties: &LevelRunProperties,
     level_indents: &LevelIndents,
     level_bullets: &LevelBullets,
     zip: &mut PptxZip,
@@ -1180,33 +1609,57 @@ pub(crate) fn parse_paragraph(
         .and_then(|n| attr_i64(&n, "defTabSz"))
         .filter(|&v| v > 0);
 
-    // Paragraph-level default run properties (pPr > defRPr)
-    let def_rpr = p_pr.and_then(|n| child(n, "defRPr"));
-    let def_font_size = def_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
-    let def_color = def_rpr.and_then(|n| text_property_color(n, theme));
-    let def_bold = def_rpr
-        .and_then(|n| attr(&n, "b"))
-        .map(|v| v == "1" || v == "true");
-    let def_italic = def_rpr
-        .and_then(|n| attr(&n, "i"))
-        .map(|v| v == "1" || v == "true");
-    let def_font_family = def_rpr
-        .and_then(|n| child(n, "latin"))
-        .and_then(|n| attr(&n, "typeface"))
-        .map(|tf| resolve_theme_typeface(&tf, theme))
+    // ECMA-376 §21.1.2.2.7 / §21.1.2.4: pPr/defRPr overlays the
+    // corresponding lstStyle level property by property. PowerPoint PDF
+    // confirms a paragraph with only b="1" still inherits that level's
+    // patterned fill for both a:r and a:fld.
+    let paragraph_props = p_pr
+        .and_then(|n| child(n, "defRPr"))
+        .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
+        .unwrap_or_default();
+    let mut defaults = paragraph_props.over(&level_run_properties[lvl.min(8) as usize]);
+    if !defaults.effects_authored && defaults.reflection.is_none() {
+        defaults.reflection = body_default_reflection.cloned();
+    }
+    let def_font_size = defaults.font_size;
+    let def_color = defaults.color.clone();
+    let def_bold = defaults.bold;
+    let def_italic = defaults.italic;
+    let def_font_family = defaults
+        .font_family
+        .clone()
         .or_else(|| body_default_font_family.map(str::to_owned));
 
     let mut runs = Vec::new();
     for node in p_node.children().filter(|n| n.is_element()) {
         match node.tag_name().name() {
             "r" => {
-                if let Some(run) =
-                    parse_run_with_reflection(node, def_rpr, body_default_reflection, theme, rels)
-                {
+                if let Some(run) = parse_run_with_defaults(node, &defaults, theme, rels) {
                     runs.push(TextRun::Text(run));
                 }
             }
-            "br" => runs.push(TextRun::Break),
+            "br" => {
+                let br_pr = child(node, "rPr");
+                let own = br_pr
+                    .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
+                    .unwrap_or_default();
+                let effective = own.over(&defaults);
+                runs.push(TextRun::Break {
+                    // Only a size/face/weight AUTHORED on the break adds a
+                    // line-metric segment.  A language-only rPr inherits the
+                    // paragraph's style for editing but must not inflate the
+                    // preceding line to the master default size (observed in
+                    // PowerPoint-exported Japanese and title controls).
+                    font_size: own.font_size,
+                    font_family: own.font_family,
+                    bold: own.bold,
+                    italic: own.italic,
+                    character_attributes: br_pr.map(|_| effective.attributes).unwrap_or_default(),
+                    character_child_attributes: br_pr
+                        .map(|_| effective.child_attributes)
+                        .unwrap_or_default(),
+                });
+            }
             // OMML equations (ECMA-376 §22.1). `def_font_size` here is the
             // paragraph's defRPr size (pre-level-fallback); the renderer applies
             // its own inheritance when this is None. PowerPoint stores inline
@@ -1215,67 +1668,16 @@ pub(crate) fn parse_paragraph(
             "oMath" | "oMathPara" | "AlternateContent" | "m" => {
                 push_math_runs(node, def_font_size, theme, &mut runs);
             }
-            // Field elements (e.g. slide number, date): parse like a run but tag the field type
+            // ECMA-376 §21.1.2.2.7: a:fld has the same rPr/t content as a:r.
+            // Resolve its formatting through the run cascade so defRPr and
+            // list-level defaults apply to every property, not only text fill.
             "fld" => {
-                let fld_type = attr(&node, "type").unwrap_or_default().to_string();
-                let text = child(node, "t")
-                    .and_then(|t| t.text())
-                    .unwrap_or("")
-                    .to_string();
-                let r_pr = child(node, "rPr");
-                let font_size = r_pr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
-                let color = r_pr.and_then(|n| text_property_color(n, theme));
-                let pattern_fill = r_pr.and_then(|n| text_property_pattern_fill(n, theme));
-                let bold = r_pr
-                    .and_then(|n| attr(&n, "b"))
-                    .map(|v| v == "1" || v == "true");
-                let italic = r_pr
-                    .and_then(|n| attr(&n, "i"))
-                    .map(|v| v == "1" || v == "true");
-                let font_family = r_pr
-                    .and_then(|n| child(n, "latin"))
-                    .and_then(|n| attr(&n, "typeface"))
-                    .map(|tf| resolve_theme_typeface(&tf, theme));
-                // §21.1.2.3.4 — a field's rPr can also carry a highlight; resolve
-                // it the same way as a normal run (CT_Color via the shared path).
-                let highlight = r_pr
-                    .and_then(|n| child(n, "highlight"))
-                    .and_then(|n| parse_color_node(n, theme));
-                runs.push(TextRun::Text(TextRunData {
-                    text,
-                    bold,
-                    italic,
-                    underline: false,
-                    underline_style: None,
-                    underline_color: None,
-                    underline_fill: None,
-                    strikethrough: false,
-                    strike_double: false,
-                    font_size,
-                    color,
-                    pattern_fill,
-                    font_family,
-                    font_family_ea: None,
-                    font_family_sym: None,
-                    baseline: None,
-                    caps: None,
-                    letter_spacing: None,
-                    field_type: if fld_type == "slidenum" {
-                        Some("slidenum".to_string())
-                    } else {
-                        None
-                    },
-                    hyperlink: None,
-                    hyperlink_uses_text_fill: false,
-                    hyperlink_action: None,
-                    shadow: None,
-                    reflection: match r_pr.and_then(|n| child(n, "effectLst")) {
-                        Some(effect_lst) => parse_reflection(effect_lst),
-                        None => body_default_reflection.cloned(),
-                    },
-                    outline: None,
-                    highlight,
-                }));
+                if let Some(mut run) = parse_run_with_defaults(node, &defaults, theme, rels) {
+                    if attr(&node, "type").as_deref() == Some("slidenum") {
+                        run.field_type = Some("slidenum".to_string());
+                    }
+                    runs.push(TextRun::Text(run));
+                }
             }
             _ => {}
         }
@@ -1284,20 +1686,32 @@ pub(crate) fn parse_paragraph(
     // For paragraphs with no visible text content, use endParaRPr sz to set line height.
     // This ensures empty spacer paragraphs have the correct height (e.g. between sections).
     let end_rpr = child(p_node, "endParaRPr");
-    let has_text = runs.iter().any(|r| matches!(r, TextRun::Text(_)));
-    let def_font_size = def_font_size
-        .or_else(|| {
-            if !has_text {
-                end_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0)
-            } else {
-                None
-            }
-        })
-        // Inherited per-list-level default size, indexed by this paragraph's
-        // level (ECMA-376 §21.1.2.4): a 2nd-level bullet uses lvl3pPr's smaller
-        // defRPr sz, not the level-1 size. The renderer applies `def_font_size`
-        // to runs that carry no explicit `sz`.
-        .or_else(|| level_font_sizes.get(lvl as usize).copied().flatten());
+    let end_run_properties = end_rpr.map(|node| {
+        Box::new(resolve_run_properties(
+            String::new(),
+            RunProperties::from_xml(node, theme).with_relationships(rels),
+            &defaults,
+        ))
+    });
+    let has_text = runs
+        .iter()
+        .any(|r| matches!(r, TextRun::Text(t) if !t.text.is_empty()));
+    // endParaRPr is the formatting of the insertion position after the last
+    // character (§21.1.2.2.2), not another default for existing runs.  For an
+    // empty paragraph that position is its only line, so its authored size
+    // wins over inherited defaults.  This also keeps empty spacer paragraphs
+    // at their Office height when a master supplies a different size.
+    let def_font_size = (if !has_text {
+        end_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0)
+    } else {
+        None
+    })
+    .or(def_font_size)
+    // Inherited per-list-level default size, indexed by this paragraph's
+    // level (ECMA-376 §21.1.2.4): a 2nd-level bullet uses lvl3pPr's smaller
+    // defRPr sz, not the level-1 size. The renderer applies `def_font_size`
+    // to runs that carry no explicit `sz`.
+    .or_else(|| level_font_sizes.get(lvl as usize).copied().flatten());
 
     Paragraph {
         alignment,
@@ -1321,6 +1735,7 @@ pub(crate) fn parse_paragraph(
         rtl,
         ea_ln_brk,
         runs,
+        end_run_properties,
     }
 }
 
@@ -1506,240 +1921,147 @@ pub(crate) fn parse_run(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
 ) -> Option<TextRunData> {
-    parse_run_with_reflection(r_node, def_rpr, None, theme, rels)
+    let defaults = def_rpr
+        .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
+        .unwrap_or_default();
+    parse_run_with_defaults(r_node, &defaults, theme, rels)
 }
 
-fn parse_run_with_reflection(
+fn parse_run_with_defaults(
     r_node: roxmltree::Node<'_, '_>,
-    def_rpr: Option<roxmltree::Node<'_, '_>>,
-    inherited_reflection: Option<&Reflection>,
+    defaults: &RunProperties,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
 ) -> Option<TextRunData> {
-    let t_node = child(r_node, "t")?;
-    let text = t_node.text().unwrap_or("").to_owned();
+    let t_node = child(r_node, "t");
+    if t_node.is_none() && r_node.tag_name().name() != "fld" {
+        return None;
+    }
+    // CT_TextField permits an absent a:t; a slide-number field still needs
+    // to reach the renderer so it can substitute the current slide number.
+    let text = t_node.and_then(|n| n.text()).unwrap_or("").to_owned();
     let r_pr = child(r_node, "rPr");
+    let authored = r_pr
+        .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
+        .unwrap_or_default();
+    Some(resolve_run_properties(text, authored, defaults))
+}
 
-    // Attribute with rPr → defRPr fallback; None means "not set" (inherit from body/layout defaults)
-    let bold = r_pr
-        .and_then(|n| attr(&n, "b"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "b")))
-        .map(|v| v == "1" || v == "true");
-    let italic = r_pr
-        .and_then(|n| attr(&n, "i"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "i")))
-        .map(|v| v == "1" || v == "true");
-    // ECMA-376 §21.1.2.3.9, ST_TextUnderlineType §20.1.10.82 — underline
-    // style enum: none/sng/dbl/heavy/dotted/
-    // dash/dashLong/dotDash/dotDotDash/wavy plus *Heavy variants. Carry the
-    // exact value through for the renderer to dispatch on; the bool stays
-    // true for any non-"none" value so existing code paths keep working.
-    let underline_attr = r_pr
-        .and_then(|n| attr(&n, "u"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "u")));
-    let underline = underline_attr
-        .as_deref()
-        .map(|v| v != "none")
-        .unwrap_or(false);
-    let underline_style = underline_attr.filter(|v| v != "none" && v != "sng");
+fn inherited_hyperlink_target(
+    relationship: &Option<Option<InheritedRelationship>>,
+    attributes: Option<&PropertyAttributes>,
+) -> Option<String> {
+    let rel = relationship.as_ref()?.as_ref()?;
+    if rel.target.is_empty() {
+        return None;
+    }
+    // An inherited @action can come from a different level than its r:id.
+    // Resolve a slide jump against the ID owner's OPC part only after the
+    // complete cascade. A relative external URI ending in `.xml` stays raw.
+    if attributes
+        .and_then(|a| a.get("action"))
+        .is_some_and(|action| action == "ppaction://hlinksldjump")
+        && rel.target.ends_with(".xml")
+        && !rel.target.contains("://")
+    {
+        if let Some(source_dir) = &rel.source_dir {
+            return Some(resolve_path(source_dir, &rel.target));
+        }
+    }
+    Some(rel.target.clone())
+}
 
-    // ECMA-376 §21.1.2.3.12–13: uFill is a complete EG_FillProperties choice;
-    // uFillTx follows the glyph paint. An explicit run-level uFillTx must also
-    // override an inherited defRPr uFill. PowerPoint PDF confirms patterned
-    // glyph/underline paint, a separately patterned underline, and solid uFill.
-    let underline_fill = r_pr
-        .and_then(underline_fill_choice)
-        .or_else(|| def_rpr.and_then(underline_fill_choice))
-        .filter(|node| node.tag_name().name() == "uFill")
-        .and_then(|node| parse_fill(node, theme));
+/// Resolve the same character-property chain for an a:r, a:fld, or the
+/// trailing endParaRPr insertion state.  The latter is stored separately and
+/// never painted over an existing run (§21.1.2.2.2).
+fn resolve_run_properties(
+    text: String,
+    authored: RunProperties,
+    defaults: &RunProperties,
+) -> TextRunData {
+    let props = authored.over(defaults);
+    let underline = props.underline.as_deref().is_some_and(|v| v != "none");
+    let underline_style = props
+        .underline
+        .clone()
+        .filter(|v| v != "none" && v != "sng");
+    let underline_fill = props.underline_fill.clone().flatten();
     let underline_color = match &underline_fill {
         Some(Fill::Solid { color }) => Some(color.clone()),
         _ => None,
     };
+    let strikethrough = matches!(props.strike.as_deref(), Some("sngStrike" | "dblStrike"));
+    let strike_double = props.strike.as_deref() == Some("dblStrike");
+    // An explicit cap="none" blocks an inherited all/small value.  The
+    // renderer treats "none" as a no-op while retaining its presence.
+    let caps = props.caps.clone();
+    let letter_spacing = props.letter_spacing.filter(|v| v.abs() > f64::EPSILON);
+    let pattern_fill = match &props.fill {
+        Some(fill @ Fill::Pattern { .. }) => Some(fill.clone()),
+        _ => None,
+    };
+    let no_fill = matches!(props.fill, Some(Fill::None));
+    let color = props.color.clone();
+    let font_family = props.font_family.clone();
+    let font_family_ea = props.font_family_ea.clone().filter(|v| !v.is_empty());
+    let font_family_cs = props.font_family_cs.clone().filter(|v| !v.is_empty());
+    let font_family_sym = props.font_family_sym.clone().filter(|v| !v.is_empty());
+    let baseline = props.baseline.filter(|v| *v != 0);
 
-    // strikethrough: "sngStrike" or "dblStrike" → true; double tracked separately
-    let strike_attr = r_pr
-        .and_then(|n| attr(&n, "strike"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "strike")));
-    let strikethrough = strike_attr
-        .as_deref()
-        .map(|v| v == "sngStrike" || v == "dblStrike")
-        .unwrap_or(false);
-    let strike_double = strike_attr.as_deref() == Some("dblStrike");
-
-    // ECMA-376 §21.1.2.3.9, ST_TextCapsType §20.1.10.64: "none" | "small" |
-    // "all". Treat
-    // "none" as not set (no transform) so the field stays absent in JSON.
-    let caps = r_pr
-        .and_then(|n| attr(&n, "cap"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "cap")))
-        .filter(|v| v == "small" || v == "all");
-
-    // ECMA-376 §21.1.2.3.9, ST_TextPoint §20.1.10.74: unitless `rPr@spc`
-    // values are hundredths of a point; ST_UniversalMeasure suffixes are also
-    // valid. Normalize both forms to points. Negative values tighten.
-    let letter_spacing = r_pr
-        .and_then(|n| attr(&n, "spc"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "spc")))
-        .and_then(|value| text_point_to_pt(&value))
-        .filter(|v| v.abs() > f64::EPSILON);
-
-    // sz in hundredths of a point
-    let font_size = r_pr
-        .and_then(|n| attr_f64(&n, "sz"))
-        .or_else(|| def_rpr.and_then(|n| attr_f64(&n, "sz")))
-        .map(|v| v / 100.0);
-
-    let color = r_pr
-        .and_then(|n| text_property_color(n, theme))
-        .or_else(|| def_rpr.and_then(|n| text_property_color(n, theme)));
-    // The first authored fill choice wins. A run-local solid/noFill must not
-    // inherit a patterned defRPr; text_property_fill enforces DrawingML order.
-    let pattern_fill = r_pr
-        .and_then(text_property_fill)
-        .or_else(|| def_rpr.and_then(text_property_fill))
-        .filter(|n| n.tag_name().name() == "pattFill")
-        .and_then(|n| text_property_pattern_fill(n.parent()?, theme));
-
-    let font_family = r_pr
-        .and_then(|n| child(n, "latin"))
-        .and_then(|n| attr(&n, "typeface"))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "latin"))
-                .and_then(|n| attr(&n, "typeface"))
-        })
-        .map(|tf| resolve_theme_typeface(&tf, theme));
-    // ECMA-376 §21.1.2.3.3 — <a:ea typeface="..."/> sets a separate font for
-    // East Asian glyphs (CJK). Defaults to the theme's +mn-ea slot when the
-    // run doesn't specify one explicitly.
-    let font_family_ea = r_pr
-        .and_then(|n| child(n, "ea"))
-        .and_then(|n| attr(&n, "typeface"))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "ea"))
-                .and_then(|n| attr(&n, "typeface"))
-        })
-        .map(|tf| resolve_theme_typeface(&tf, theme))
-        .filter(|tf| !tf.is_empty());
-
-    // ECMA-376 §21.1.2.3.10 — <a:sym typeface="..."/> sets the font used for
-    // symbol characters. PowerPoint stores those as PUA codepoints (U+F0xx).
-    let font_family_sym = r_pr
-        .and_then(|n| child(n, "sym"))
-        .and_then(|n| attr(&n, "typeface"))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "sym"))
-                .and_then(|n| attr(&n, "typeface"))
-        })
-        .map(|tf| resolve_theme_typeface(&tf, theme))
-        .filter(|tf| !tf.is_empty());
-
-    // baseline in thousandths of a point; 30000=superscript, -25000=subscript (OOXML typical)
-    let baseline = r_pr
-        .and_then(|n| attr(&n, "baseline"))
-        .and_then(|v| v.parse::<i32>().ok())
-        .filter(|&v| v != 0);
-
-    // a:hlinkClick — hyperlink. r:id refers to the slide rels (Target = URL or
-    // internal part name). Resolve immediately so the renderer doesn't need
-    // access to the rels table. ECMA-376 §21.1.2.3.5 (CT_Hyperlink): the
+    // a:hlinkClick — hyperlink. Its r:id was resolved against the owning
+    // master, layout, or slide part before character-property inheritance;
+    // the renderer therefore needs no rels table. ECMA-376 §21.1.2.3.5:
     // optional @action holds a "ppaction://..." verb (e.g. hlinksldjump) that
     // marks the link as an INTERNAL navigation; carry it through so the TS side
     // can distinguish a slide jump from an external URL. For a slide jump the
     // rel is TargetMode=Internal, so `hyperlink` is the internal slide part.
-    let hlink_click = r_pr.and_then(|n| child(n, "hlinkClick"));
-    let hyperlink = hlink_click
-        .and_then(|h| attr_r(&h, "id"))
-        .and_then(|rid| rels.get(&rid).cloned())
-        .filter(|s| !s.is_empty());
+    let hlink_click = props.child_attributes.get("hlinkClick");
+    let hyperlink = inherited_hyperlink_target(&props.hlink_click_target, hlink_click);
     let hyperlink_action = hlink_click
-        .and_then(|h| attr(&h, "action"))
+        .and_then(|h| h.get("action").cloned())
+        .filter(|s| !s.is_empty());
+    let hlink_mouse_over = props.child_attributes.get("hlinkMouseOver");
+    let hyperlink_mouse_over =
+        inherited_hyperlink_target(&props.hlink_mouse_over_target, hlink_mouse_over);
+    let hyperlink_mouse_over_action = hlink_mouse_over
+        .and_then(|h| h.get("action").cloned())
         .filter(|s| !s.is_empty());
     // Office's hyperlink-colour extension is written when an authored text
     // fill is reapplied after creating the link. Without hlinkClr="tx", the
-    // same pattFill XML is displayed in the hyperlink theme colour instead.
-    // Observed with PowerPoint-saved pattern text before/after reapplying the
-    // fill; the extension is intentionally scoped to run hyperlinks.
-    let hyperlink_uses_text_fill = hlink_click.is_some_and(|h| {
-        h.descendants().any(|n| {
-            n.is_element()
-                && n.tag_name().name() == "hlinkClr"
-                && n.tag_name().namespace()
-                    == Some("http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor")
-                && n.attribute("val") == Some("tx")
-        })
-    });
-
-    // ECMA-376 §20.1.8.45 — `<a:rPr><a:effectLst><a:outerShdw>` glyph drop
-    // shadow. Reuse the shape-level outerShdw reader so parse semantics
-    // stay identical (blurRad, dist, dir, color + alphaModFix).
-    let local_effects = r_pr.and_then(|n| child(n, "effectLst"));
-    let inherited_effects = def_rpr.and_then(|n| child(n, "effectLst"));
-    let shadow = match local_effects {
-        Some(el) => parse_shadow(el, theme),
-        None => inherited_effects.and_then(|el| parse_shadow(el, theme)),
-    };
-    let reflection = match local_effects {
-        Some(el) => parse_reflection(el),
-        None => inherited_effects
-            .and_then(parse_reflection)
-            .or_else(|| inherited_reflection.cloned()),
+    // hyperlink theme colour wins. The extension is scoped to run hyperlinks.
+    let hyperlink_uses_text_fill = props.hyperlink_uses_text_fill.unwrap_or(false);
+    // PowerPoint's hyperlink theme colour wins when the run has no authored
+    // fill of its own, even if a list-style defRPr supplies a solid colour.
+    // Preserve run-local solid colours, and hlinkClr="tx" explicitly asks to
+    // keep the inherited text paint. Observed with both list-style links and
+    // directly coloured links in PowerPoint PDF output.
+    let color = if hyperlink.is_some() && !hyperlink_uses_text_fill && !authored.fill_authored {
+        None
+    } else {
+        color
     };
 
-    // ECMA-376 §20.1.2.2.24 (CT_TextOutlineEffect) — `<a:rPr><a:ln w="..">`
-    // strokes each glyph outline. `<a:noFill>` inside the ln means "no
-    // visible outline" — skip in that case so the renderer doesn't draw a
-    // black box around every glyph. a:ln contains EG_LineFillProperties, so
-    // retain its full fill choice (solid, gradient or preset pattern).
-    let outline = r_pr
-        .and_then(|n| child(n, "ln"))
-        .filter(|ln| child(*ln, "noFill").is_none())
-        .map(|ln| {
-            let fill = parse_fill(ln, theme);
-            TextOutline {
-                width: attr_i64(&ln, "w").unwrap_or(0),
-                color: match &fill {
-                    Some(Fill::Solid { color }) => Some(color.clone()),
-                    _ => None,
-                },
-                fill,
-            }
-        });
-
-    // ECMA-376 §21.1.2.3.4 — `<a:rPr><a:highlight>` text highlight (marker).
-    // The element IS a CT_Color, so pass the <a:highlight> node straight to the
-    // shared colour resolver — the same one solidFill uses — which walks its
-    // srgbClr / schemeClr / sysClr / prstClr child and applies any tint / alpha
-    // transforms. schemeClr therefore resolves through the master clrMap +
-    // theme exactly like other run colours. Falls back to defRPr when the run
-    // itself doesn't set a highlight.
-    let highlight = r_pr
-        .and_then(|n| child(n, "highlight"))
-        .and_then(|n| parse_color_node(n, theme))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "highlight"))
-                .and_then(|n| parse_color_node(n, theme))
-        });
-
-    Some(TextRunData {
+    TextRunData {
         text,
-        bold,
-        italic,
+        bold: props.bold,
+        italic: props.italic,
         underline,
         underline_style,
         underline_color,
         underline_fill,
+        underline_line: props.underline_line.clone().flatten(),
+        underline_line_no_fill: props.underline_line.as_ref().is_some_and(Option::is_none)
+            && !props.underline_line_follow_text.unwrap_or(false),
         strikethrough,
         strike_double,
-        font_size,
+        font_size: props.font_size,
         color,
         pattern_fill,
+        glyph_fill: props.fill.clone(),
+        no_fill,
         font_family,
         font_family_ea,
+        font_family_cs,
         font_family_sym,
         baseline,
         caps,
@@ -1748,9 +2070,130 @@ fn parse_run_with_reflection(
         hyperlink,
         hyperlink_uses_text_fill,
         hyperlink_action,
-        shadow,
-        reflection,
-        outline,
-        highlight,
-    })
+        hyperlink_mouse_over,
+        hyperlink_mouse_over_action,
+        shadow: props.shadow,
+        reflection: props.reflection,
+        outline: props.outline.flatten(),
+        highlight: props.highlight,
+        character_attributes: props.attributes,
+        character_child_attributes: props.child_attributes,
+    }
+}
+
+#[cfg(test)]
+mod relationship_owner_tests {
+    use super::*;
+    use crate::master::parse_master_level_run_properties;
+
+    #[test]
+    fn inherited_hyperlinks_resolve_against_the_part_that_authored_the_id() {
+        // OPC relationship IDs have part-local scope.  All three parts use
+        // rId7, and an attribute-only child must not change its owner's ID.
+        let master = roxmltree::Document::parse(
+            r#"
+          <p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <p:txStyles><p:bodyStyle><a:lvl1pPr><a:defRPr>
+              <a:hlinkClick r:id="rId7" tooltip="master"/>
+              <a:hlinkMouseOver r:id="rId7"/>
+            </a:defRPr></a:lvl1pPr></p:bodyStyle></p:txStyles>
+          </p:sldMaster>"#,
+        )
+        .unwrap();
+        let layout = roxmltree::Document::parse(
+            r#"
+          <a:txBody xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <a:lstStyle><a:lvl1pPr><a:defRPr>
+              <a:hlinkClick r:id="rId7"/>
+              <a:hlinkMouseOver r:id="rId7"/>
+            </a:defRPr></a:lvl1pPr></a:lstStyle>
+          </a:txBody>"#,
+        )
+        .unwrap();
+        let master_rels = HashMap::from([("rId7".into(), "https://master.test/".into())]);
+        let layout_rels = HashMap::from([("rId7".into(), "https://layout.test/".into())]);
+        let slide_rels = HashMap::from([("rId7".into(), "https://slide.test/".into())]);
+        let theme = HashMap::new();
+        let master_levels = parse_master_level_run_properties(
+            master.root_element(),
+            &theme,
+            &master_rels,
+            "ppt/slideMasters",
+        );
+        let master_default = &master_levels["body"][0];
+        let layout_levels =
+            extract_level_run_properties_with_rels(layout.root_element(), &theme, &layout_rels);
+        let layout_default = layout_levels[0].over(master_default);
+
+        for (xml, defaults, click, hover) in [
+            ("<r><rPr/><t>master</t></r>", master_default,
+             "https://master.test/", "https://master.test/"),
+            ("<r><rPr><hlinkClick tooltip=\"near\"/></rPr><t>layout</t></r>", &layout_default,
+             "https://layout.test/", "https://layout.test/"),
+            ("<r><rPr><hlinkClick r:id=\"rId7\"/><hlinkMouseOver r:id=\"rId7\"/></rPr><t>slide</t></r>", &layout_default,
+             "https://slide.test/", "https://slide.test/"),
+        ] {
+            let xml = xml.replacen("<r>", "<r xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">", 1);
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let run = parse_run_with_defaults(doc.root_element(), defaults, &theme, &slide_rels).unwrap();
+            assert_eq!(run.hyperlink.as_deref(), Some(click));
+            assert_eq!(run.hyperlink_mouse_over.as_deref(), Some(hover));
+        }
+    }
+
+    #[test]
+    fn inherited_slide_jump_is_resolved_from_master_and_layout_directories() {
+        let doc = roxmltree::Document::parse(
+            r#"<rPr
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <hlinkClick r:id="rId7" action="ppaction://hlinksldjump"/>
+        </rPr>"#,
+        )
+        .unwrap();
+        let rels = HashMap::from([("rId7".into(), "../slides/slide3.xml".into())]);
+        for part_dir in ["ppt/slideMasters", "ppt/slideLayouts"] {
+            let props = RunProperties::from_xml(doc.root_element(), &HashMap::new())
+                .with_relationships(&rels)
+                .with_part_targets(part_dir);
+            assert_eq!(
+                inherited_hyperlink_target(
+                    &props.hlink_click_target,
+                    props.child_attributes.get("hlinkClick")
+                ),
+                Some("ppt/slides/slide3.xml".into())
+            );
+        }
+        let external = roxmltree::Document::parse(
+            r#"<rPr
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <hlinkClick r:id="rId7"/></rPr>"#,
+        )
+        .unwrap();
+        let props = RunProperties::from_xml(external.root_element(), &HashMap::new())
+            .with_relationships(&rels)
+            .with_part_targets("ppt/slideMasters");
+        assert_eq!(
+            inherited_hyperlink_target(
+                &props.hlink_click_target,
+                props.child_attributes.get("hlinkClick")
+            ),
+            Some("../slides/slide3.xml".into())
+        );
+        let nearer = roxmltree::Document::parse(
+            r#"<rPr><hlinkClick
+          action="ppaction://hlinksldjump"/></rPr>"#,
+        )
+        .unwrap();
+        let merged = RunProperties::from_xml(nearer.root_element(), &HashMap::new()).over(&props);
+        assert_eq!(
+            inherited_hyperlink_target(
+                &merged.hlink_click_target,
+                merged.child_attributes.get("hlinkClick")
+            ),
+            Some("ppt/slides/slide3.xml".into())
+        );
+    }
 }
