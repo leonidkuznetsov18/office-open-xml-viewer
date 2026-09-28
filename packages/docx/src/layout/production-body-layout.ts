@@ -1148,6 +1148,7 @@ function layoutBodyNotes(
       }
       throw error;
     }
+    const noteSettings = context.source.bodyLayoutInput.noteLayoutSettings;
     const separator = first
       ? Object.freeze([
           Object.freeze({
@@ -1157,10 +1158,12 @@ function layoutBodyNotes(
               yPt: cursorYPt + separatorHeightPt / 2,
             }),
             to: Object.freeze({
-              // ECMA-376 §17.11.1: the continuation separator spans the
-              // main story's text extents; an ordinary separator is shorter.
+              // ECMA-376 §17.11 reserved separator stories are separate.
+              // Word DOC controls draw U+0003 short and U+0004 full width.
               xPt: request.container.bounds.xPt + request.container.bounds.widthPt
-                * (request.continuing ? 1 : 1 / 3),
+                * (request.continuing && (request.kind !== 'footnote'
+                  || noteSettings?.footnoteContinuationSeparator !== 'short')
+                  ? 1 : 1 / 3),
               yPt: cursorYPt + separatorHeightPt / 2,
             }),
             color: '#000000',

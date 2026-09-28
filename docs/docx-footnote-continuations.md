@@ -3,7 +3,7 @@
 The DOCX layout engine can continue a footnote onto the next physical page when
 `allowFootnoteContinuation: true` is passed to `DocxDocument.load`. The default
 remains `false` while the renderer lacks row-aware splitting of footnote tables
-and support for authored continuation-separator stories. A caller should enable
+and general authored continuation-separator content. A caller should enable
 this option only for documents whose notes contain paragraphs and whose page
 geometry is stable across the affected page boundary.
 
@@ -11,9 +11,12 @@ ECMA-376 Part 1 §17.11.1 describes a footnote that continues onto the next
 page. §17.11.21 places notes at the page bottom. The continuation keeps the
 reference on its original body page, partitions the note at a complete line,
 and resumes the remaining lines in a new note band on the following physical
-page. The continuation page uses the full text width for its separator, as in
-Word's default continuation separator. An ordinary first-page separator uses
-one third of the text width.
+page. The continuation page uses the full text width for its separator by default.
+A projected reserved continuation story can instead request the short, one-third
+width rule. Word controls with the two reserved continuation characters show
+short and full-width rules on the same continued-note pages; all other pages
+are unchanged. General authored separator text remains unsupported. An ordinary
+first-page separator uses one third of the text width.
 
 The controls are Word-created documents and their PDFs. They establish that a
 note can continue even when its body reference remains on the prior page, and

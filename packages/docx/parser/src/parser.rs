@@ -2433,6 +2433,7 @@ fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLa
         footnote_number_start: start("footnotePr"),
         endnote_number_format: value("endnotePr", "numFmt"),
         endnote_number_start: start("endnotePr"),
+        footnote_continuation_separator: None,
     };
     if result.footnote_position.is_none()
         && result.endnote_position.is_none()

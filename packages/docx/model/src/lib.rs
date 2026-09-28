@@ -263,6 +263,10 @@ pub struct NoteLayoutSettingsWire {
     /// §17.11.20 document-wide `w:endnotePr/w:numStart/@w:val`. Absent means 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endnote_number_start: Option<i64>,
+    /// ECMA-376 §17.11 reserved continuation story. Absent uses the DOCX
+    /// default full-width rule; `short` preserves a short authored rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footnote_continuation_separator: Option<String>,
 }
 
 /// One embedded font-style slot from `word/fontTable.xml`. `style` is one of
