@@ -2110,6 +2110,7 @@ interface TextBody__emitterCollision1 {
 export interface TextOutline {
     width: number;
     color?: string;
+    fill?: Fill;
 }
 export interface TextRect {
     x: number;
@@ -2121,16 +2122,19 @@ export type TextRun = TextRunData | LineBreak | EquationRun;
 export type TextRunCallback = (run: PptxTextRunInfo) => void;
 export interface TextRunData {
     type: 'text';
+    hyperlinkUsesTextFill?: boolean;
     text: string;
     bold: boolean | null;
     italic: boolean | null;
     underline: boolean;
     underlineStyle?: string;
     underlineColor?: string;
+    underlineFill?: Fill;
     strikethrough: boolean;
     strikeDouble?: boolean;
     fontSize: number | null;
     color: string | null;
+    patternFill?: PatternFill;
     fontFamily: string | null;
     fontFamilyEa?: string;
     fontFamilySym?: string;

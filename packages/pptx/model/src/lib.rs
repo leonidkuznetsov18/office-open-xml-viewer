@@ -1199,11 +1199,15 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.9 (`rPr@u`); ST_TextUnderlineType §20.1.10.82.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underline_style: Option<String>,
-    /// Underline-specific colour from rPr > uFill > solidFill. None means the
-    /// underline follows the text colour (uFillTx behaviour, the default).
+    /// Solid underline colour from rPr > uFill > solidFill. None also covers
+    /// patterned uFill and uFillTx, which follows the glyph paint.
     /// ECMA-376 §21.1.2.3.12 (CT_TextUnderlineFillGroupWrapper).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underline_color: Option<String>,
+    /// Explicit rPr > uFill paint. uFillTx and absence follow the glyph fill.
+    /// ECMA-376 §21.1.2.3.12–13 (EG_TextUnderlineFill).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline_fill: Option<Fill>,
     /// true when strike == "sngStrike" or "dblStrike"
     pub strikethrough: bool,
     /// true only when strike == "dblStrike" (renderer draws two parallel lines)
@@ -1211,6 +1215,11 @@ pub struct TextRunData {
     pub strike_double: bool,
     pub font_size: Option<f64>,
     pub color: Option<String>,
+    /// ECMA-376 §21.1.2.3.9 CT_TextCharacterProperties permits a DrawingML
+    /// fill choice. Preserve a patterned glyph fill separately from the solid
+    /// colour used for decorations and fallback text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_fill: Option<Fill>,
     pub font_family: Option<String>,
     /// East Asian font family from rPr > ea (resolved through the theme).
     /// Renderer uses this for CJK runs. None = inherit from latin font.
@@ -1243,6 +1252,10 @@ pub struct TextRunData {
     /// None for runs without a:hlinkClick. ECMA-376 §21.1.2.3.5 (CT_Hyperlink).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// Office hlinkClr="tx" extension on hlinkClick: retain the authored text
+    /// fill after applying a hyperlink. Without it PowerPoint uses link colour.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hyperlink_uses_text_fill: bool,
     /// Raw `<a:hlinkClick @action>` string (e.g. "ppaction://hlinksldjump")
     /// when present. Its presence marks the link as an INTERNAL PowerPoint
     /// action (slide jump / first / last / ...) rather than an external URL;
@@ -1286,6 +1299,10 @@ pub struct TextOutline {
     /// Resolved hex colour (no `#`). None = inherit from text fill.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// Authored a:ln fill. Kept separately from `color` so gradient and
+    /// pattern strokes retain their complete DrawingML paint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

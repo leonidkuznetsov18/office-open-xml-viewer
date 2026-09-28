@@ -392,6 +392,8 @@ export interface EquationRun {
 
 export interface TextRunData {
   type: 'text';
+  /** PowerPoint hlinkClr="tx" extension: hyperlink keeps the authored text fill. */
+  hyperlinkUsesTextFill?: boolean;
   text: string;
   /** null = not set, inherit from paragraph/body defaults */
   bold: boolean | null;
@@ -409,10 +411,12 @@ export interface TextRunData {
    */
   underlineStyle?: string;
   /**
-   * Underline-only colour from rPr > uFill (ECMA-376 §21.1.2.3.12). Absent
-   * means the underline follows the text colour (uFillTx default).
+   * Solid underline colour from rPr > uFill (ECMA-376 §21.1.2.3.12).
+   * Absent also covers patterned uFill and uFillTx, which follows glyph paint.
    */
   underlineColor?: string;
+  /** Explicit DrawingML rPr > uFill paint; uFillTx follows the glyph fill. */
+  underlineFill?: Fill;
   /** True when rPr strike is sngStrike or dblStrike. */
   strikethrough: boolean;
   /**
@@ -424,6 +428,8 @@ export interface TextRunData {
   /** Font size in points */
   fontSize: number | null;
   color: string | null;
+  /** Patterned glyph fill from DrawingML rPr/defRPr (ECMA-376 §21.1.2.3.9). */
+  patternFill?: PatternFill;
   fontFamily: string | null;
   /**
    * East Asian font family from rPr > a:ea (ECMA-376 §21.1.2.3.3),
@@ -506,8 +512,10 @@ export interface TextRunData {
 /** Run-level glyph outline. Width is in OOXML EMU (12700 EMU = 1 pt). */
 export interface TextOutline {
   width: number;
-  /** Hex without '#'. Absent = inherit from text fill colour. */
+  /** Legacy solid hex without '#'; absent with no `fill` inherits glyph paint. */
   color?: string;
+  /** Authored a:ln fill, including gradient or preset pattern. */
+  fill?: Fill;
 }
 
 export interface LineBreak {
