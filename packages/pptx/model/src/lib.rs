@@ -1252,6 +1252,10 @@ pub struct TextRunData {
     /// None for runs without a:hlinkClick. ECMA-376 §21.1.2.3.5 (CT_Hyperlink).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// Office hlinkClr="tx" extension on hlinkClick: retain the authored text
+    /// fill after applying a hyperlink. Without it PowerPoint uses link colour.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hyperlink_uses_text_fill: bool,
     /// Raw `<a:hlinkClick @action>` string (e.g. "ppaction://hlinksldjump")
     /// when present. Its presence marks the link as an INTERNAL PowerPoint
     /// action (slide jump / first / last / ...) rather than an external URL;

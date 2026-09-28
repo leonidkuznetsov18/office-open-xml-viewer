@@ -575,8 +575,8 @@ const hexToRgba = hexToRgbaCore;
  * shadow is set on the context so the box itself isn't shadowed. `width` is the
  * glyph advance computed by the caller (it differs between the normal and
  * tab-stop paths only by the justification stretch added to it). The vertical
- * band comes from the shared `highlightBox` helper. `glyphColor` restores
- * `ctx.fillStyle` so the subsequent fillText draws in the run colour.
+ * band comes from the shared `highlightBox` helper. Restore the resolved glyph
+ * paint, which may be a CanvasPattern, before the subsequent fillText.
  */
 export function paintHighlight(
   ctx: CanvasRenderingContext2D,
@@ -585,12 +585,12 @@ export function paintHighlight(
   width: number,
   fontPx: number,
   highlight: string,
-  glyphColor: string,
+  glyphPaint: string | CanvasGradient | CanvasPattern,
 ): void {
   const { top, height } = highlightBox(baseline, fontPx);
   ctx.fillStyle = highlight;
   ctx.fillRect(x, top, width, height);
-  ctx.fillStyle = glyphColor;
+  ctx.fillStyle = glyphPaint;
 }
 
 /** Simple fill resolver that returns a CSS color string.
@@ -774,6 +774,23 @@ type LayoutSegment = {
     descent: number;
   };
 };
+
+type TextPaint = string | CanvasGradient | CanvasPattern;
+
+/** Resolve a run once per destination canvas. Effects and decorations consume
+ * this same paint; a reflection's auxiliary canvas resolves the same source
+ * again inside its inherited slide coordinate scope. */
+function resolveSegmentTextPaint(
+  ctx: CanvasRenderingContext2D,
+  seg: LayoutSegment,
+  x: number,
+  baseline: number,
+  scale: number,
+): TextPaint {
+  return seg.patternFill
+    ? resolveFillCore(seg.patternFill, ctx, x, baseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
+    : seg.color;
+}
 
 interface LayoutLine {
   segments: LayoutSegment[];
@@ -1473,7 +1490,9 @@ export function layoutParagraph(
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
     const baseStyle: LayoutSegment = {
       text: '', font: baseFont, sizePx, drawSizePx, color,
-      patternFill: run.patternFill,
+      // PowerPoint's default hyperlink theme colour masks pattFill. Reapplying
+      // the text fill writes hlinkClr="tx" and restores the authored pattern.
+      patternFill: run.hyperlink && !run.hyperlinkUsesTextFill ? undefined : run.patternFill,
       underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
@@ -2139,7 +2158,8 @@ function drawWarpedGlyphStrips(
   bandFrac: number,
   boxX: number,
   boxY: number,
-  color: string,
+  paint: TextPaint,
+  resolveAuxPaint?: (target: CanvasRenderingContext2D) => TextPaint,
 ): void {
   if (chW <= 0) return;
   // Ink extremes about the baseline (css px), from real metrics — this is where
@@ -2219,7 +2239,7 @@ function drawWarpedGlyphStrips(
   // Paint the whole strip stack onto `target` in `fillStyle`. The transform
   // chain per strip is the single-affine per-glyph draw anchored at the STRIP
   // centre so vScale/shear/angle track this slice's u.
-  const paintStrips = (target: CanvasRenderingContext2D, fillStyle: string): void => {
+  const paintStrips = (target: CanvasRenderingContext2D, fillStyle: TextPaint): void => {
     target.fillStyle = fillStyle;
     for (let i = 0; i <= last; i++) {
       const { s0, s1, g } = strips[i];
@@ -2248,10 +2268,10 @@ function drawWarpedGlyphStrips(
   // to the pre-#879 path — the overwhelmingly common WordArt case, zero
   // allocation. Otherwise the 1-device-px overlap band would double-compose and
   // darken, so route through the layer below.
-  const fillAlpha = rgbaAlpha(color);
+  const fillAlpha = typeof paint === 'string' ? rgbaAlpha(paint) : 1;
   const destAlpha = typeof ctx.globalAlpha === 'number' ? ctx.globalAlpha : 1;
-  if (fillAlpha >= 1 && destAlpha >= 1) {
-    paintStrips(ctx, color);
+  if (typeof paint === 'string' && fillAlpha >= 1 && destAlpha >= 1) {
+    paintStrips(ctx, paint);
     return;
   }
   if (fillAlpha <= 0 || destAlpha <= 0) return; // fully transparent — nothing to draw
@@ -2265,7 +2285,7 @@ function drawWarpedGlyphStrips(
   // mock ctx), which is never pixel-verified anyway.
   const base = typeof ctx.getTransform === 'function' ? ctx.getTransform() : null;
   if (!base) {
-    paintStrips(ctx, color);
+    paintStrips(ctx, paint);
     return;
   }
 
@@ -2311,7 +2331,7 @@ function drawWarpedGlyphStrips(
   const aux = createAuxCanvas(layerW, layerH);
   const auxCtx = aux ? (aux.getContext('2d') as CanvasRenderingContext2D | null) : null;
   if (!aux || !auxCtx) {
-    paintStrips(ctx, color);
+    paintStrips(ctx, paint);
     return;
   }
   // The layer's own transform is the live transform translated by −origin (a
@@ -2322,7 +2342,22 @@ function drawWarpedGlyphStrips(
   auxCtx.textAlign = 'left';
   auxCtx.textBaseline = 'alphabetic';
   auxCtx.setTransform(base.a, base.b, base.c, base.d, base.e - originX, base.f - originY);
-  paintStrips(auxCtx, opaqueRgba(color));
+  if (typeof paint === 'string') {
+    paintStrips(auxCtx, opaqueRgba(paint));
+  } else {
+    // A patterned warp can have translucent cells. Build the overlapping strip
+    // stack as one opaque glyph mask, then colour that mask once on the slide
+    // grid. This avoids double-compositing where adjacent strip clips overlap.
+    paintStrips(auxCtx, '#fff');
+    auxCtx.save();
+    auxCtx.setTransform(1, 0, 0, 1, 0, 0);
+    auxCtx.globalCompositeOperation = 'source-in';
+    withInheritedPatternScope(ctx, auxCtx, () => {
+      auxCtx.fillStyle = resolveAuxPaint?.(auxCtx) ?? paint;
+      auxCtx.fillRect(0, 0, layerW, layerH);
+    }, { x: originX, y: originY });
+    auxCtx.restore();
+  }
 
   // Composite the opaque layer once at the effective alpha, at identity so the
   // (already device-oriented) layer blits 1:1. save/restore preserves the live
@@ -2656,7 +2691,8 @@ function renderWarpedText(
         continue;
       }
       ctx.font = seg.font;
-      ctx.fillStyle = seg.color;
+      const glyphPaint = resolveSegmentTextPaint(ctx, seg, boxX, boxY, scale);
+      ctx.fillStyle = glyphPaint;
       const ls = seg.letterSpacingPx ?? 0;
       const chars = [...seg.text];
       for (const ch of chars) {
@@ -2691,7 +2727,10 @@ function renderWarpedText(
             bandFrac,
             boxX,
             boxY,
-            seg.color,
+            glyphPaint,
+            seg.patternFill
+              ? target => resolveSegmentTextPaint(target, seg, boxX, boxY, scale)
+              : undefined,
           );
           penW += chW;
           continue;
@@ -4039,6 +4078,7 @@ export function renderTextBody(
     bulletLabel: string;  // text to render as bullet ('' = none)
     bulletFont: string;
     bulletColor: string;
+    bulletFollowsText: boolean;
     bulletX: number;      // canvas X for bullet
     // Picture bullet (`<a:buBlip>`, §21.1.2.4.2): the resolved image + its
     // authored height in px (scaled by buSzPct); painting preserves the source
@@ -4141,6 +4181,7 @@ export function renderTextBody(
     let bulletLabel  = '';
     let bulletFont   = buildFont(false, false, bulletBaseSizePx, 'sans-serif', rc);
     let bulletColor  = bulletInheritedColor;
+    let bulletFollowsText = false;
     // Picture bullet (`<a:buBlip>`, §21.1.2.4.2). Resolved to its image + drawn
     // size below; stays null for char/number/none bullets.
     let bulletImage: { imagePath: string; mimeType: string; sizePx: number } | null = null;
@@ -4172,6 +4213,7 @@ export function renderTextBody(
       bulletFont  = buildFont(false, false, bSizePx, convertedFamily, rc, bulletLabel,
         hasNamedFontFamily(b.fontFamily));
       bulletColor = b.color ? hexToRgba(b.color) : bulletInheritedColor;
+      bulletFollowsText = !b.color;
     } else if (bullet.type === 'autoNum') {
       const b = bullet;
       const bSizePx = b.sizePts != null
@@ -4193,6 +4235,7 @@ export function renderTextBody(
       // is absent does the marker fall back to the buClrTx default
       // (§21.1.2.4.5 — the inherited first-run colour).
       bulletColor = bullet.color ? hexToRgba(bullet.color) : bulletInheritedColor;
+      bulletFollowsText = !bullet.color;
     } else if (bullet.type === 'blip') {
       // ECMA-376 §21.1.2.4.2 picture bullet. Its height follows the text's em
       // box, scaled by `<a:buSzPct>`, while paint preserves the source aspect
@@ -4424,7 +4467,7 @@ export function renderTextBody(
         line, linePx, lineHeight, baselineLineHeight, topGapPx: topGap,
         textXOffset,
         bulletLabel: isFirst ? bulletLabel : '',
-        bulletFont, bulletColor, bulletX,
+        bulletFont, bulletColor, bulletFollowsText, bulletX,
         bulletImage: entryBulletImage,
         textX, textMaxW,
         alignment: para.alignment,
@@ -4591,7 +4634,7 @@ export function renderTextBody(
   let entriesInCol = 0;
 
   for (const entry of allLines) {
-    const { line, linePx, lineHeight, topGapPx, textXOffset, bulletLabel, bulletFont, bulletColor, bulletImage, alignment, isLastLine, useResolvedFontMetrics, metricAscent } = entry;
+    const { line, linePx, lineHeight, topGapPx, textXOffset, bulletLabel, bulletFont, bulletColor, bulletFollowsText, bulletImage, alignment, isLastLine, useResolvedFontMetrics, metricAscent } = entry;
     // Balanced column advance: when the current column has reached its share
     // of paragraphs, jump to the next one. PowerPoint never breaks a single
     // line across columns and never spills past the last column — anything
@@ -4758,7 +4801,14 @@ export function renderTextBody(
     // Draw bullet.
     if (bulletLabel) {
       ctx.font = bulletFont;
-      ctx.fillStyle = bulletColor;
+      // §21.1.2.4.5 buClrTx follows the first run's patterned fill in the
+      // PowerPoint control. Keep the existing solid-colour inheritance path
+      // for runs without pattFill; their bullet colour can come from a level
+      // style rather than that first run. An explicit buClr stays solid.
+      const firstTextSegment = line.segments.find(seg => !seg.isTab && !seg.math && !!seg.text);
+      ctx.fillStyle = bulletFollowsText && firstTextSegment?.patternFill
+        ? resolveSegmentTextPaint(ctx, firstTextSegment, bulletX, baseline, scale)
+        : bulletColor;
       if (paraNeedsBidi && baseRtl) {
         const prevDir = ctx.direction;
         ctx.direction = 'rtl';
@@ -4903,13 +4953,12 @@ export function renderTextBody(
         continue;
       }
       ctx.font = seg.font;
-      ctx.fillStyle = seg.patternFill
-        ? resolveFillCore(seg.patternFill, ctx, penX, baseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
-        : seg.color;
       const drawSizePx = seg.drawSizePx ?? seg.sizePx;
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
       const segBaseline = baseline + baselineShift;
+      const glyphPaint = resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
+      ctx.fillStyle = glyphPaint;
       const ls = seg.letterSpacingPx ?? 0;
 
       // Run-level text highlight (rPr > a:highlight, ECMA-376 §21.1.2.3.4).
@@ -4919,7 +4968,7 @@ export function renderTextBody(
         const hlW = measureTextAdvance(ctx, seg.text, ls)
           + internalStretch
           + jext;
-        paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, seg.color);
+        paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, glyphPaint);
       }
 
       const segShadow = seg.shadow;
@@ -5089,9 +5138,7 @@ export function renderTextBody(
             ctx,
             (target) => {
               target.font = seg.font;
-              target.fillStyle = seg.patternFill
-                ? resolveFillCore(seg.patternFill, target, penX, segBaseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
-                : seg.color;
+              target.fillStyle = resolveSegmentTextPaint(target, seg, penX, segBaseline, scale);
               drawRun(target, 'fill');
             },
             bbox,
@@ -5102,9 +5149,7 @@ export function renderTextBody(
             deviceH,
           );
           ctx.font = seg.font;
-          ctx.fillStyle = seg.patternFill
-            ? resolveFillCore(seg.patternFill, ctx, penX, segBaseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
-            : seg.color;
+          ctx.fillStyle = glyphPaint;
         }
       }
 
@@ -5135,7 +5180,7 @@ export function renderTextBody(
       if (segOutline && segOutline.width > 0) {
         ctx.save();
         ctx.lineWidth = Math.max(0.5, emuToPx(segOutline.width, scale));
-        ctx.strokeStyle = segOutline.color ? `#${segOutline.color}` : seg.color;
+        ctx.strokeStyle = segOutline.color ? `#${segOutline.color}` : glyphPaint;
         ctx.lineJoin = 'round';
         drawRun(ctx, 'stroke');
         ctx.restore();
@@ -5172,13 +5217,13 @@ export function renderTextBody(
               seg.underlineFill, ctx, penX, segBaseline, segW + jext, drawSizePx * 0.05,
               0, scale * PT_TO_EMU,
             ) ?? 'rgba(0,0,0,0)'
-          : seg.underlineColor ?? ctx.fillStyle;
+          : seg.underlineColor ?? glyphPaint;
         drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx, underlinePaint, seg.underlineStyle, rc.dpr);
       }
 
       if (seg.strikethrough) {
         const lineW = Math.max(1, drawSizePx * 0.05);
-        ctx.strokeStyle = seg.color;
+        ctx.strokeStyle = glyphPaint;
         ctx.lineWidth = lineW;
         ctx.setLineDash([]);
         // Crispness nudge (see crispOffset): the strike is a horizontal stroke;

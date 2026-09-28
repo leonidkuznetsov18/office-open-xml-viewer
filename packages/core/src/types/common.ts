@@ -392,6 +392,8 @@ export interface EquationRun {
 
 export interface TextRunData {
   type: 'text';
+  /** PowerPoint hlinkClr="tx" extension: hyperlink keeps the authored text fill. */
+  hyperlinkUsesTextFill?: boolean;
   text: string;
   /** null = not set, inherit from paragraph/body defaults */
   bold: boolean | null;

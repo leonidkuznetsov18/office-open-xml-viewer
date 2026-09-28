@@ -492,6 +492,7 @@ fn default_run() -> TextRunData {
         letter_spacing: None,
         field_type: None,
         hyperlink: None,
+        hyperlink_uses_text_fill: false,
         hyperlink_action: None,
         shadow: None,
         reflection: None,

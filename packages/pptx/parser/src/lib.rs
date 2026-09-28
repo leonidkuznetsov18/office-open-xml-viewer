@@ -4544,6 +4544,21 @@ mod tests {
         let parsed = parse_run(r_node, None, &theme, &rels).expect("run should parse");
         assert_eq!(parsed.hyperlink.as_deref(), Some("https://example.com/"));
         assert!(parsed.hyperlink_action.is_none());
+        assert!(!parsed.hyperlink_uses_text_fill);
+    }
+
+    /// PowerPoint's hlinkClr="tx" extension is written after a text pattern
+    /// is reapplied to a linked run. It preserves the run fill; its absence
+    /// leaves the hyperlink theme colour in effect despite pattFill in rPr.
+    #[test]
+    fn test_parse_run_hyperlink_text_fill_extension() {
+        let xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:ah="http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor"><rPr><pattFill prst="pct50"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill><hlinkClick r:id="rId7"><extLst><ext uri="{A12FA001-AC4F-418D-AE19-62706E023703}"><ah:hlinkClr val="tx"/></ext></extLst></hlinkClick></rPr><t>Linked pattern</t></r>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut rels = HashMap::new();
+        rels.insert("rId7".to_owned(), "https://example.com/".to_owned());
+        let parsed = parse_run(doc.root_element(), None, &HashMap::new(), &rels).unwrap();
+        assert!(parsed.pattern_fill.is_some());
+        assert!(parsed.hyperlink_uses_text_fill);
     }
 
     /// A run without hlinkClick should have hyperlink = None.

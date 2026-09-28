@@ -2121,6 +2121,7 @@ export type TextRun = TextRunData | LineBreak | EquationRun;
 export type TextRunCallback = (run: PptxTextRunInfo) => void;
 export interface TextRunData {
     type: 'text';
+    hyperlinkUsesTextFill?: boolean;
     text: string;
     bold: boolean | null;
     italic: boolean | null;

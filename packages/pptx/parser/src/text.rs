@@ -1208,6 +1208,7 @@ pub(crate) fn parse_paragraph(
                         None
                     },
                     hyperlink: None,
+                    hyperlink_uses_text_fill: false,
                     hyperlink_action: None,
                     shadow: None,
                     reflection: match r_pr.and_then(|n| child(n, "effectLst")) {
@@ -1599,6 +1600,20 @@ fn parse_run_with_reflection(
     let hyperlink_action = hlink_click
         .and_then(|h| attr(&h, "action"))
         .filter(|s| !s.is_empty());
+    // Office's hyperlink-colour extension is written when an authored text
+    // fill is reapplied after creating the link. Without hlinkClr="tx", the
+    // same pattFill XML is displayed in the hyperlink theme colour instead.
+    // Observed with PowerPoint-saved pattern text before/after reapplying the
+    // fill; the extension is intentionally scoped to run hyperlinks.
+    let hyperlink_uses_text_fill = hlink_click.is_some_and(|h| {
+        h.descendants().any(|n| {
+            n.is_element()
+                && n.tag_name().name() == "hlinkClr"
+                && n.tag_name().namespace()
+                    == Some("http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor")
+                && n.attribute("val") == Some("tx")
+        })
+    });
 
     // ECMA-376 §20.1.8.45 — `<a:rPr><a:effectLst><a:outerShdw>` glyph drop
     // shadow. Reuse the shape-level outerShdw reader so parse semantics
@@ -1665,6 +1680,7 @@ fn parse_run_with_reflection(
         letter_spacing,
         field_type: None,
         hyperlink,
+        hyperlink_uses_text_fill,
         hyperlink_action,
         shadow,
         reflection,
