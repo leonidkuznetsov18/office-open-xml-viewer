@@ -1122,18 +1122,8 @@ pub(crate) fn parse_paragraph(
         .and_then(|n| attr_i64(&n, "defTabSz"))
         .filter(|&v| v > 0);
 
-    // ECMA-376 §21.1.2.4: a paragraph without its own defRPr inherits the
-    // matching level's default run properties from this text body's lstStyle.
-    // Apply the same default to a:r and a:fld. PowerPoint's PDF confirms both
-    // hosts with a patterned lvl1pPr/defRPr, alongside paragraph defRPr.
-    let level_name = format!("lvl{}pPr", lvl.min(8) + 1);
-    let def_rpr = p_pr.and_then(|n| child(n, "defRPr")).or_else(|| {
-        p_node
-            .parent()
-            .and_then(|body| child(body, "lstStyle"))
-            .and_then(|style| child(style, &level_name))
-            .and_then(|level| child(level, "defRPr"))
-    });
+    // Paragraph-level default run properties (pPr > defRPr)
+    let def_rpr = p_pr.and_then(|n| child(n, "defRPr"));
     let def_font_size = def_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
     let def_color = def_rpr.and_then(|n| text_property_color(n, theme));
     let def_bold = def_rpr
@@ -1167,18 +1157,67 @@ pub(crate) fn parse_paragraph(
             "oMath" | "oMathPara" | "AlternateContent" | "m" => {
                 push_math_runs(node, def_font_size, theme, &mut runs);
             }
-            // ECMA-376 §21.1.2.2.7: a:fld has the same rPr/t content as a:r.
-            // Resolve its formatting through the run cascade so defRPr and
-            // list-level defaults apply to every property, not only text fill.
+            // Field elements (e.g. slide number, date): parse like a run but tag the field type
             "fld" => {
-                if let Some(mut run) =
-                    parse_run_with_reflection(node, def_rpr, body_default_reflection, theme, rels)
-                {
-                    if attr(&node, "type").as_deref() == Some("slidenum") {
-                        run.field_type = Some("slidenum".to_string());
-                    }
-                    runs.push(TextRun::Text(run));
-                }
+                let fld_type = attr(&node, "type").unwrap_or_default().to_string();
+                let text = child(node, "t")
+                    .and_then(|t| t.text())
+                    .unwrap_or("")
+                    .to_string();
+                let r_pr = child(node, "rPr");
+                let font_size = r_pr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
+                let color = r_pr.and_then(|n| text_property_color(n, theme));
+                let pattern_fill = r_pr.and_then(|n| text_property_pattern_fill(n, theme));
+                let bold = r_pr
+                    .and_then(|n| attr(&n, "b"))
+                    .map(|v| v == "1" || v == "true");
+                let italic = r_pr
+                    .and_then(|n| attr(&n, "i"))
+                    .map(|v| v == "1" || v == "true");
+                let font_family = r_pr
+                    .and_then(|n| child(n, "latin"))
+                    .and_then(|n| attr(&n, "typeface"))
+                    .map(|tf| resolve_theme_typeface(&tf, theme));
+                // §21.1.2.3.4 — a field's rPr can also carry a highlight; resolve
+                // it the same way as a normal run (CT_Color via the shared path).
+                let highlight = r_pr
+                    .and_then(|n| child(n, "highlight"))
+                    .and_then(|n| parse_color_node(n, theme));
+                runs.push(TextRun::Text(TextRunData {
+                    text,
+                    bold,
+                    italic,
+                    underline: false,
+                    underline_style: None,
+                    underline_color: None,
+                    underline_fill: None,
+                    strikethrough: false,
+                    strike_double: false,
+                    font_size,
+                    color,
+                    pattern_fill,
+                    font_family,
+                    font_family_ea: None,
+                    font_family_sym: None,
+                    baseline: None,
+                    caps: None,
+                    letter_spacing: None,
+                    field_type: if fld_type == "slidenum" {
+                        Some("slidenum".to_string())
+                    } else {
+                        None
+                    },
+                    hyperlink: None,
+                    hyperlink_uses_text_fill: false,
+                    hyperlink_action: None,
+                    shadow: None,
+                    reflection: match r_pr.and_then(|n| child(n, "effectLst")) {
+                        Some(effect_lst) => parse_reflection(effect_lst),
+                        None => body_default_reflection.cloned(),
+                    },
+                    outline: None,
+                    highlight,
+                }));
             }
             _ => {}
         }
@@ -1419,13 +1458,8 @@ fn parse_run_with_reflection(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
 ) -> Option<TextRunData> {
-    let t_node = child(r_node, "t");
-    if t_node.is_none() && r_node.tag_name().name() != "fld" {
-        return None;
-    }
-    // CT_TextField permits an absent a:t; a slide-number field still needs
-    // to reach the renderer so it can substitute the current slide number.
-    let text = t_node.and_then(|n| n.text()).unwrap_or("").to_owned();
+    let t_node = child(r_node, "t")?;
+    let text = t_node.text().unwrap_or("").to_owned();
     let r_pr = child(r_node, "rPr");
 
     // Attribute with rPr → defRPr fallback; None means "not set" (inherit from body/layout defaults)
@@ -1580,19 +1614,6 @@ fn parse_run_with_reflection(
                 && n.attribute("val") == Some("tx")
         })
     });
-    // PowerPoint's hyperlink theme colour wins when the run has no authored
-    // fill of its own, even if a list-style defRPr supplies a solid colour.
-    // Preserve run-local solid colours, and hlinkClr="tx" explicitly asks to
-    // keep the inherited text paint. Observed with both list-style links and
-    // directly coloured links in PowerPoint PDF output.
-    let color = if hyperlink.is_some()
-        && !hyperlink_uses_text_fill
-        && r_pr.and_then(text_property_fill).is_none()
-    {
-        None
-    } else {
-        color
-    };
 
     // ECMA-376 §20.1.8.45 — `<a:rPr><a:effectLst><a:outerShdw>` glyph drop
     // shadow. Reuse the shape-level outerShdw reader so parse semantics
@@ -1613,8 +1634,8 @@ fn parse_run_with_reflection(
     // ECMA-376 §20.1.2.2.24 (CT_TextOutlineEffect) — `<a:rPr><a:ln w="..">`
     // strokes each glyph outline. `<a:noFill>` inside the ln means "no
     // visible outline" — skip in that case so the renderer doesn't draw a
-    // black box around every glyph. a:ln contains EG_LineFillProperties, so retain
-    // its full fill choice (solid, gradient or preset pattern) for stroke paint.
+    // black box around every glyph. a:ln contains EG_LineFillProperties, so
+    // retain its full fill choice (solid, gradient or preset pattern).
     let outline = r_pr
         .and_then(|n| child(n, "ln"))
         .filter(|ln| child(*ln, "noFill").is_none())

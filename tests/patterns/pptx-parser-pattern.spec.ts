@@ -24,7 +24,7 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => { await server?.close(); });
 
-test('parsed field, patterned outline, and projected text retain their paints in both render modes', async ({ page }) => {
+test('field-local pattern, patterned outline, and projected text retain their paints in both render modes', async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto(url);
   await expect(page.locator('body')).toHaveAttribute('data-ready', 'true');
@@ -77,7 +77,7 @@ test('parsed field, patterned outline, and projected text retain their paints in
         projected: count(projected), projectedPhase: projectedPhase(projected),
         fieldTop: count(field, [50, 50, 620, 210]),
         fieldBottom: count(field, [50, 240, 620, 450]),
-        listField: count(field, [50, 470, 620, 670]),
+        fieldLower: count(field, [50, 470, 620, 670]),
       });
     }
     return out;
@@ -87,8 +87,8 @@ test('parsed field, patterned outline, and projected text retain their paints in
     expect(row.fieldTop.cyan, row.mode).toBeGreaterThan(20);
     expect(row.fieldBottom.red, row.mode).toBeGreaterThan(20);
     expect(row.fieldBottom.cyan, row.mode).toBeGreaterThan(20);
-    expect(row.listField.red, row.mode).toBeGreaterThan(20);
-    expect(row.listField.cyan, row.mode).toBeGreaterThan(20);
+    expect(row.fieldLower.red, row.mode).toBeGreaterThan(20);
+    expect(row.fieldLower.cyan, row.mode).toBeGreaterThan(20);
     expect(row.outline.green, row.mode).toBeGreaterThan(20);
     expect(row.outline.orange, row.mode).toBeGreaterThan(20);
     expect(row.projected.red, row.mode).toBeGreaterThan(20);

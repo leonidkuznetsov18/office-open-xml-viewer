@@ -4,12 +4,10 @@ A='http://schemas.openxmlformats.org/drawingml/2006/main';P='http://schemas.open
 pat='<a:pattFill prst="pct50"><a:fgClr><a:srgbClr val="D21D54"/></a:fgClr><a:bgClr><a:srgbClr val="12CED4"/></a:bgClr></a:pattFill>'
 outline='<a:pattFill prst="dnDiag"><a:fgClr><a:srgbClr val="00A650"/></a:fgClr><a:bgClr><a:srgbClr val="FF8800"/></a:bgClr></a:pattFill>'
 def shape(i,x,y,w,h,text,para='',run='',field=False,scene='',list_style=''):
- t=f'<a:fld id="{{0FBB9679-570D-4509-9600-E07789CF24BB}}" type="datetime"><a:rPr/>' if field else f'<a:r><a:rPr sz="4800" b="1">{run}<a:latin typeface="Arial"/></a:rPr>'
+ t=f'<a:fld id="{{0FBB9679-570D-4509-9600-E07789CF24BB}}" type="datetime"><a:rPr sz="4800" b="1">{run}<a:latin typeface="Arial"/></a:rPr>' if field else f'<a:r><a:rPr sz="4800" b="1">{run}<a:latin typeface="Arial"/></a:rPr>'
  return f'''<p:sp><p:nvSpPr><p:cNvPr id="{i}" name="Control {i}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/>{scene}</p:spPr><p:txBody><a:bodyPr wrap="none" lIns="0" rIns="0" tIns="0" bIns="0"/><a:lstStyle>{list_style}</a:lstStyle><a:p>{para}{t}<a:t>{text}</a:t>{'</a:fld>' if field else '</a:r>'}</a:p></p:txBody></p:sp>'''
 def slide(shapes):return f'<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{shapes}</p:spTree></p:cSld></p:sld>'
-fieldp=f'<a:pPr><a:defRPr sz="4800" b="1">{pat}<a:latin typeface="Arial"/></a:defRPr></a:pPr>'
-listp=f'<a:lvl1pPr><a:defRPr sz="4800" b="1">{pat.replace("pct50","dnDiag")}<a:latin typeface="Arial"/></a:defRPr></a:lvl1pPr>'
-s1=slide(shape(2,600000,500000,5000000,1300000,'MMMMMMMM',fieldp,field=True)+shape(3,600000,2500000,5000000,1300000,'MMMMMMMM','',pat)+shape(4,600000,4500000,5000000,1300000,'MMMMMMMM',field=True,list_style=listp))
+s1=slide(shape(2,600000,500000,5000000,1300000,'MMMMMMMM','',pat,field=True)+shape(3,600000,2500000,5000000,1300000,'MMMMMMMM','',pat)+shape(4,600000,4500000,5000000,1300000,'MMMMMMMM','',pat.replace('pct50','dnDiag'),field=True))
 s2=slide(shape(2,600000,500000,8000000,1600000,'OUTLINE TEXT','',f'<a:ln w="50800">{outline}</a:ln><a:solidFill><a:srgbClr val="101010"/></a:solidFill>'))
 sc='<a:scene3d><a:camera prst="perspectiveRelaxed"><a:rot lat="1800000" lon="1800000" rev="0"/></a:camera><a:lightRig rig="threePt" dir="t"/></a:scene3d><a:sp3d extrusionH="457200" prstMaterial="plastic"/>'
 pat3=pat.replace('pct50','dnDiag')
