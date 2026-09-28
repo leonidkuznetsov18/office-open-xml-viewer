@@ -144,10 +144,17 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
         None if provenance_code_page_range1 is None
         else bool(provenance_code_page_range1 & 0x001E0000)
     )
+    # Excel's DrawingML shape-text line box follows the OS/2 usWin extent
+    # (issue #1604 controls: Yu Gothic, whose hhea and usWin boxes differ).
+    # Null means the face has no OS/2 table.
+    profile["win"] = (
+        None if os2 is None
+        else [integer(os2, "usWinAscent"), integer(os2, "usWinDescent")]
+    )
     # Keep provenance identifiers stable when a source fact stops shipping in
     # the runtime profile. The identity still covers that raw OS/2 value.
     identity_profile = {
-        **{key: value for key, value in profile.items() if key != "farEastCodePage"},
+        **{key: value for key, value in profile.items() if key not in {"farEastCodePage", "win"}},
         "os2": None if os2 is None else {
             "codePageRange1": provenance_code_page_range1,
         },

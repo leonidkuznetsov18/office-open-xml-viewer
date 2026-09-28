@@ -13,6 +13,9 @@ export interface ReferenceFontMetricProfile {
   /** Signed OS/2 xAvgCharWidth design units, when declared. */
   readonly xAvgCharWidth?: number | null;
   readonly hhea: readonly [ascender: number, descender: number, lineGap: number];
+  /** OS/2 [usWinAscent, usWinDescent] design units. Null means the face has no
+   * OS/2 table; undefined means this source did not record the field. */
+  readonly win?: readonly [ascent: number, descent: number] | null;
   /** Derived OS/2 code-page class. Null means this source did not provide the
    * code-page field needed to classify Word's auto-line allocation. */
   readonly farEastCodePage: boolean | null;
@@ -27,6 +30,7 @@ export interface FindReferenceFontMetricsOptions {
 function freezeProfile(profile: ReferenceFontMetricProfile): ReferenceFontMetricProfile {
   Object.freeze(profile.aliases);
   Object.freeze(profile.hhea);
+  if (profile.win) Object.freeze(profile.win);
   return Object.freeze(profile);
 }
 

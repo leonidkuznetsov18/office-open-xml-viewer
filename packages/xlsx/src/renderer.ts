@@ -1,7 +1,7 @@
 import type { CjkLang } from '@silurus/ooxml-core';
 import {
   breakDrawingMlText, drawingMlTextRect, drawingMlLineHeight,
-  drawingMlBlockTop, drawingMlLineX, paintDrawingMlLine,
+  drawingMlSpacedLineBox, drawingMlParagraphSpacing, drawingMlBlockTop, drawingMlLineX, paintDrawingMlLine,
   wrapSpreadsheetCellParagraph, layoutSpreadsheetCellRichLines,
   type SpreadsheetCellRichSeg, type SpreadsheetCellRichLine,
   type DrawingMlInputRun,
@@ -27,7 +27,7 @@ import { chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, 
 import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
-import { officeRequestKey, shapeOfficeNaturalLineRatio, shapeOfficeRouteKey, singleNaturalShapeRun } from './shape-office-line.js';
+import { officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios, type ShapeRunLineRatios } from './shape-office-line.js';
 import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
 import { formatCellValueWithColor } from './number-format.js';
 import { type CfContext, type CfResult, compileCf, evaluateCf } from './conditional-format.js';
@@ -4761,28 +4761,24 @@ export function drawShapeText(
   const innerH = rect.height;
   if (innerW <= 0 || innerH <= 0) return;
 
-  // Controlled Excel PDF shapes with one run, omitted <a:lnSpc>, and 12/25pt
-  // Meiryo UI/Arial top/centre/bottom anchors use the same OS/2+hhea natural
-  // line allocation observed in Word. Admit only a loaded exact local tuple
-  // with unambiguous reference geometry; a name alone cannot identify bytes.
-  const naturalRun = singleNaturalShapeRun(txt);
-  const naturalRoute = naturalRun
-    ? officeRoutesByContext.get(ctx)?.[shapeOfficeRouteKey(naturalRun)] : undefined;
-  const naturalRatio = naturalRun
-    ? shapeOfficeNaturalLineRatio(naturalRun, naturalRoute) : undefined;
-  let useNaturalRoute = false;
-  if (naturalRun && naturalRoute && naturalRatio !== undefined) {
-    const paragraph = txt.paragraphs[0];
-    const fontPx = (naturalRun.size > 0 ? naturalRun.size : DEFAULT_FONT_SIZE) * PT_TO_PX * cs;
-    const aliasFont = `${naturalRun.italic ? 'italic ' : ''}${naturalRun.bold ? 'bold ' : ''}${fontPx}px "${naturalRoute.family}"`;
-    const available = innerW - ((paragraph.marL ?? 0) + (paragraph.marR ?? 0)
-      + Math.max(0, paragraph.indent ?? 0)) / EMU_PER_PX * cs;
-    const previousFont = ctx.font;
-    ctx.font = aliasFont;
-    const width = ctx.measureText(naturalRun.text).width;
-    ctx.font = previousFont;
-    useNaturalRoute = txt.wrap === 'none' || width <= available;
+  // Excel's natural line box follows each run's font metrics (see
+  // excelDrawingMlLineRatios): Arial 1.150 em, Calibri 1.221 em, Meiryo
+  // 1.95 em, and so on, instead of a flat 1.2 em. A name alone cannot identify
+  // the selected bytes or their geometry. Use the metric box only when every
+  // text run's exact local face has loaded with unambiguous reference metrics.
+  // Otherwise the whole body keeps the ordinary 1.2 em Canvas line box, so one
+  // body never mixes two line-box models.
+  const runLineRatios = new Map<object, ShapeRunLineRatios>();
+  let metricBody = !txt.paragraphs.some((p) => p.runs.some((run) => run.type === 'math'));
+  const routes = officeRoutesByContext.get(ctx);
+  for (const paragraph of txt.paragraphs) for (const run of paragraph.runs) {
+    if (!metricBody) break;
+    if (run.type !== 'text') continue;
+    const ratios = run.fontFace ? shapeRunLineRatios(run, routes?.[shapeOfficeRouteKey(run)]) : undefined;
+    if (!ratios) metricBody = false;
+    else runLineRatios.set(run, ratios);
   }
+  if (!txt.paragraphs.some((p) => p.runs.some((run) => run.type === 'text'))) metricBody = false;
 
   // A laid-out segment: measured text or a rasterized equation. `w` is the
   // advance width (px); math also carries baseline-relative ascent/descent.
@@ -4794,20 +4790,22 @@ export function drawShapeText(
   // margin, plus the first-line indent on a paragraph's first line). `availW` = the
   // width of the alignment region for this line (paraW, minus the first-line
   // indent on the first line). ECMA-376 §21.1.2.2.7 (marL/marR/indent).
-  type Line = { segs: Seg[]; align: string; height: number; ascent: number; hasMath: boolean; leftInset: number; availW: number };
+  // `height`/`ascent` are the spaced line box. `gapBefore` is the paragraph
+  // spacing (spcAft of the previous paragraph plus spcBef of this one) that
+  // precedes a paragraph's first line.
+  type Line = {
+    segs: Seg[]; align: string; height: number; ascent: number; hasMath: boolean;
+    leftInset: number; availW: number; gapBefore: number;
+  };
 
   // Font string + px size for a text run (math runs have no run-level font).
   const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>): { font: string; px: number } => {
     const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
     const px = size * PT_TO_PX * cs;
-    const family = run === naturalRun && useNaturalRoute && naturalRoute
-      ? `"${naturalRoute.family}", ${fontStackFor(run.fontFace, cjkFallback, run.text,
-          undefined, googleSubstitutesByContext.get(ctx) === true,
-          undefined, contextRegularAlias(ctx, run.fontFace))}`
-      : fontStackFor(run.fontFace, cjkFallback, run.text,
-          officeRoute(ctx, run.fontFace, run.bold, run.italic),
-          googleSubstitutesByContext.get(ctx) === true,
-          undefined, contextRegularAlias(ctx, run.fontFace));
+    const family = fontStackFor(run.fontFace, cjkFallback, run.text,
+      officeRoute(ctx, run.fontFace, run.bold, run.italic),
+      googleSubstitutesByContext.get(ctx) === true,
+      undefined, contextRegularAlias(ctx, run.fontFace));
     return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
   };
 
@@ -4829,6 +4827,9 @@ export function drawShapeText(
   // Wrap each paragraph into lines (segments preserve run order).
   const wrap = txt.wrap !== 'none';
   const lines: Line[] = [];
+  // Natural (unspaced) height of each line, indexed like `lines`.
+  const naturalHeights: number[] = [];
+  let previousParagraph: { spaceAfter: import('./types.js').ShapeParagraph['spaceAfter']; lastNaturalHeight: number } | undefined;
   // The shared DrawingML break phase owns every soft opportunity. Excel keeps
   // the resource resolver, equation raster, line-box policy, and paint here.
   for (const p of txt.paragraphs) {
@@ -4849,6 +4850,8 @@ export function drawShapeText(
       display?: boolean;
       /** Authored face of a text run, for an empty line's fallback ascent. */
       face?: string;
+      /** Excel's natural line box of a text run, when the body uses it. */
+      ratios?: ShapeRunLineRatios;
     };
     const input: DrawingMlInputRun<ShapeStyle>[] = [];
     let lastTextPt = 0;
@@ -4870,7 +4873,8 @@ export function drawShapeText(
       lastTextPt = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
       const { font, px } = textFont(run);
       input.push({ type: 'text', text: run.text,
-        style: { kind: 'text', font, color: run.color ?? '#000000', pxSize: px, face: run.fontFace } });
+        style: { kind: 'text', font, color: run.color ?? '#000000', pxSize: px, face: run.fontFace,
+          ratios: metricBody ? runLineRatios.get(run) : undefined } });
     }
     const broken = breakDrawingMlText(input, {
       maxWidth: wrap ? paraW : Infinity,
@@ -4919,6 +4923,12 @@ export function drawShapeText(
     const emptyLineBox = (): { height: number; ascent: number } => {
       const pxSize = fallback?.pxSize ?? DEFAULT_FONT_SIZE * PT_TO_PX * cs;
       const face = fallback?.face;
+      if (fallback?.ratios) {
+        return {
+          height: pxSize * (fallback.ratios.ascentRatio + fallback.ratios.descentRatio),
+          ascent: pxSize * fallback.ratios.ascentRatio,
+        };
+      }
       return {
         height: pxSize * 1.2,
         ascent: measuredAscent(`${pxSize}px ${fontStackFor(face, undefined, '',
@@ -4926,14 +4936,23 @@ export function drawShapeText(
           undefined, contextRegularAlias(ctx, face))}`, pxSize),
       };
     };
+    const reduction = txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0;
     const lineHeightOf = (natural: number): number => drawingMlLineHeight(
-      natural, p.spaceLine, PT_TO_PX * cs,
-      txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0,
+      natural, p.spaceLine, PT_TO_PX * cs, reduction,
     );
+    // A metric line box keeps its natural ascent/descent split, which
+    // a:lnSpc then re-divides (drawingMlSpacedLineBox).
+    const metricLine = (ascent: number, descent: number): { height: number; ascent: number } => {
+      const box = drawingMlSpacedLineBox({ ascent, descent }, p.spaceLine, PT_TO_PX * cs, reduction);
+      return { height: box.ascent + box.descent, ascent: box.ascent };
+    };
+    const firstLineIndex = lines.length;
     for (const [index, brokenLine] of broken.entries()) {
       const segs: Seg[] = [];
       let naturalHeight = 0;
       let ascent = 0;
+      let metricAscent = 0;
+      let metricDescent = 0;
       let hasMath = false;
       let displayMath = false;
       for (const part of brokenLine.segments) {
@@ -4959,12 +4978,17 @@ export function drawShapeText(
           color: style.color, w: part.width });
         naturalHeight = Math.max(naturalHeight, style.pxSize * 1.2);
         ascent = Math.max(ascent, measuredAscent(style.font, style.pxSize));
+        if (style.ratios) {
+          metricAscent = Math.max(metricAscent, style.pxSize * style.ratios.ascentRatio);
+          metricDescent = Math.max(metricDescent, style.pxSize * style.ratios.descentRatio);
+        }
         noteText(style);
       }
       if (displayMath && blankBeforeDisplay[displayIndex++]) {
         const blank = emptyLineBox();
         lines.push({ segs: [], align, height: lineHeightOf(blank.height), ascent: blank.ascent,
-          hasMath: false, leftInset: marLpx, availW: paraW });
+          hasMath: false, leftInset: marLpx, availW: paraW, gapBefore: 0 });
+        naturalHeights.push(blank.height);
       }
       // Runs that paint nothing (trimmed or wrapped spaces) still size their line.
       for (const idx of brokenLine.hiddenRuns ?? []) {
@@ -4972,10 +4996,28 @@ export function drawShapeText(
         if (item.type !== 'text') continue;
         naturalHeight = Math.max(naturalHeight, item.style.pxSize * 1.2);
         ascent = Math.max(ascent, measuredAscent(item.style.font, item.style.pxSize));
+        if (item.style.ratios) {
+          metricAscent = Math.max(metricAscent, item.style.pxSize * item.style.ratios.ascentRatio);
+          metricDescent = Math.max(metricDescent, item.style.pxSize * item.style.ratios.descentRatio);
+        }
         noteText(item.style);
       }
-      if (naturalHeight === 0) ({ height: naturalHeight, ascent } = emptyLineBox());
-      const height = lineHeightOf(naturalHeight);
+      let height: number;
+      if (metricBody) {
+        // Office shares one baseline across the runs of a line and unions their
+        // ascents and descents (#1604 controls: Arial+Meiryo, Arial+MS Gothic,
+        // 11+40 pt runs in one line).
+        if (metricAscent + metricDescent === 0) {
+          const blank = emptyLineBox();
+          metricAscent = blank.ascent;
+          metricDescent = blank.height - blank.ascent;
+        }
+        naturalHeight = metricAscent + metricDescent;
+        ({ height, ascent } = metricLine(metricAscent, metricDescent));
+      } else {
+        if (naturalHeight === 0) ({ height: naturalHeight, ascent } = emptyLineBox());
+        height = lineHeightOf(naturalHeight);
+      }
       // Classify this line by its own equation: an inline equation on a
       // paragraph's first line keeps the first-line indent even when a later
       // equation in the paragraph is display math.
@@ -4984,17 +5026,43 @@ export function drawShapeText(
         segs, align, height, ascent, hasMath,
         leftInset: isDisplayMath ? marLpx : marLpx + (index === 0 ? firstLineIndent : 0),
         availW: isDisplayMath ? paraW : paraW - (index === 0 ? firstLineIndent : 0),
+        gapBefore: 0,
       });
+      naturalHeights.push(naturalHeight);
+    }
+    // §21.1.2.2.10 spcBef / §21.1.2.2.9 spcAft. Excel adds the previous
+    // paragraph's spcAft and this paragraph's spcBef (#1604: 12 + 18 pt gave
+    // 30 pt), and ignores spcBef on the body's first paragraph. A percentage
+    // refers to the natural single-line height of the adjacent line.
+    if (lines.length > firstLineIndex) {
+      if (previousParagraph && firstLineIndex > 0) {
+        lines[firstLineIndex].gapBefore = drawingMlParagraphSpacing(
+          previousParagraph.spaceAfter, previousParagraph.lastNaturalHeight, PT_TO_PX * cs,
+        ) + drawingMlParagraphSpacing(p.spaceBefore, naturalHeights[firstLineIndex], PT_TO_PX * cs);
+      }
+      previousParagraph = { spaceAfter: p.spaceAfter, lastNaturalHeight: naturalHeights[lines.length - 1] };
     }
   }
 
-  if (useNaturalRoute && naturalRun && naturalRatio !== undefined && lines.length === 1) {
-    const px = (naturalRun.size > 0 ? naturalRun.size : DEFAULT_FONT_SIZE) * PT_TO_PX * cs;
-    lines[0].height = px * naturalRatio;
-  }
+  // Canvas px size of a CSS font string built by textFont.
+  const fontPx = (font: string): number => Number(/(\d+(?:\.\d+)?)px/u.exec(font)?.[1] ?? 0);
+  // Offset from a 'middle' paint position to that run's alphabetic baseline.
+  const middleToAlphabetic = (seg: { font: string; text: string }): number => {
+    const prevFont = ctx.font;
+    const prevBaseline = ctx.textBaseline;
+    ctx.font = seg.font;
+    ctx.textBaseline = 'alphabetic';
+    const alphabetic = ctx.measureText(seg.text).actualBoundingBoxAscent;
+    ctx.textBaseline = 'middle';
+    const middle = ctx.measureText(seg.text).actualBoundingBoxAscent;
+    ctx.font = prevFont;
+    ctx.textBaseline = prevBaseline;
+    const offset = alphabetic - middle;
+    return Number.isFinite(offset) ? offset : 0;
+  };
 
   // Total text block height
-  const blockH = lines.reduce((s, l) => s + l.height, 0);
+  const blockH = lines.reduce((s, l) => s + l.gapBefore + l.height, 0);
 
   // Vertical anchor — ECMA-376 §20.1.7.2 <a:bodyPr anchor>.
   // For 'ctr' we intentionally skip Math.max(0,...) so the block stays
@@ -5003,6 +5071,7 @@ export function drawShapeText(
 
   let lineTop = y0;
   for (const line of lines) {
+    lineTop += line.gapBefore;
     const totalW = line.segs.reduce((s, seg) => s + seg.w, 0);
     // Per-line region: the left edge is padLeft + the paragraph's left inset
     // (marL, plus first-line indent on the first line), and alignment happens
@@ -5044,15 +5113,37 @@ export function drawShapeText(
           ctx.drawImage(img, penX, baseline - seg.ascent, seg.w, seg.ascent + seg.descent);
         }
       });
-    } else {
-      ctx.textBaseline = 'middle';
-      const drawY = lineTop + line.height / 2;
-      paintDrawingMlLine(paintSegments, x, drawY, (part, penX) => {
+    } else if (metricBody) {
+      // Excel's metric line box: one alphabetic baseline at the line ascent.
+      ctx.textBaseline = 'alphabetic';
+      const baseline = lineTop + line.ascent;
+      paintDrawingMlLine(paintSegments, x, baseline, (part, penX) => {
         const seg = part.style;
         if (seg.kind === 'text') {
           ctx.font = seg.font;
           ctx.fillStyle = seg.color;
-          ctx.fillText(seg.text, penX, drawY);
+          ctx.fillText(seg.text, penX, baseline);
+        }
+      });
+    } else {
+      // Ordinary 1.2 em line box, centred on the line's largest run. Office
+      // puts every run of a line on one baseline (#1604 mixed-run controls),
+      // so runs in another font or size share that run's alphabetic baseline
+      // instead of each being centred on its own em box.
+      const drawY = lineTop + line.height / 2;
+      const textSegs = line.segs.filter((seg): seg is Extract<Seg, { kind: 'text' }> => seg.kind === 'text');
+      const lead = textSegs.reduce<Extract<Seg, { kind: 'text' }> | undefined>((best, seg) => (
+        !best || fontPx(seg.font) > fontPx(best.font) ? seg : best), undefined);
+      const shared = lead && textSegs.some((seg) => seg.font !== lead.font)
+        ? drawY + middleToAlphabetic(lead) : undefined;
+      ctx.textBaseline = shared === undefined ? 'middle' : 'alphabetic';
+      const y = shared ?? drawY;
+      paintDrawingMlLine(paintSegments, x, y, (part, penX) => {
+        const seg = part.style;
+        if (seg.kind === 'text') {
+          ctx.font = seg.font;
+          ctx.fillStyle = seg.color;
+          ctx.fillText(seg.text, penX, y);
         }
       });
     }

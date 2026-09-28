@@ -1,24 +1,36 @@
 import { findReferenceFontMetrics } from '@silurus/ooxml-core';
-import { officeOpenTypeAutoLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
+import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 import type { OfficeFontFallbackRequest, OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import type { ShapeText, ShapeTextRun } from './types.js';
 
 type TextRun = Extract<ShapeTextRun, { type: 'text' }>;
 
-/** Excel evidence covers one natural DrawingML line with omitted <a:lnSpc>.
- * A body that can wrap is admitted only after the renderer measures one line. */
-export function singleNaturalShapeRun(text: ShapeText): TextRun | undefined {
-  if ((text.autoFit && text.autoFit !== 'none') || text.paragraphs.length !== 1) return undefined;
-  const paragraph = text.paragraphs[0];
-  if (paragraph.spaceLine != null || paragraph.runs.length !== 1) return undefined;
-  const run = paragraph.runs[0];
-  if (run.type !== 'text' || !run.text || run.text.includes('\n') || !run.fontFace?.trim()) return undefined;
-  // The existing shape paint path selects a:latin. A distinct East Asian or
-  // complex-script face would require script-run routing before its metrics
-  // could own the complete line box.
-  if (run.fontFaceEa && run.fontFaceEa.toLocaleLowerCase('en-US') !== run.fontFace.toLocaleLowerCase('en-US')) return undefined;
-  if (run.fontFaceCs && run.fontFaceCs.toLocaleLowerCase('en-US') !== run.fontFace.toLocaleLowerCase('en-US')) return undefined;
-  return run;
+/** Excel's natural line box of one shape-text run, as em ratios. */
+export interface ShapeRunLineRatios {
+  ascentRatio: number;
+  descentRatio: number;
+}
+
+/** The single face that owns a run's line box, or undefined when the run
+ * names no face or routes East Asian / complex-script text to another face.
+ * The shape paint path selects a:latin; a distinct a:ea or a:cs face would
+ * need script-run routing before its metrics could own the line. */
+function soleFace(run: TextRun): string | undefined {
+  const face = run.fontFace?.trim();
+  if (!face) return undefined;
+  const same = (other: string | undefined) => !other?.trim()
+    || other.trim().toLocaleLowerCase('en-US') === face.toLocaleLowerCase('en-US');
+  return same(run.fontFaceEa) && same(run.fontFaceCs) ? face : undefined;
+}
+
+/** Text runs of a shape body whose face could own Excel's line box. These are
+ * the tuples the workbook preflights as exact local faces. */
+export function shapeLineFontRuns(text: ShapeText): TextRun[] {
+  const runs: TextRun[] = [];
+  for (const paragraph of text.paragraphs) for (const run of paragraph.runs) {
+    if (run.type === 'text' && soleFace(run)) runs.push(run);
+  }
+  return runs;
 }
 
 /** One key rule for workbook, worker, and synchronous shape paint. */
@@ -35,35 +47,42 @@ export function shapeOfficeRouteKey(run: TextRun): string {
 }
 
 /**
- * The static catalog is reference geometry, not proof of bytes behind local().
- * Admit it only after an exact style has loaded and every known profile for
- * that authored tuple agrees on the Office projection. Unknown OS/2 class or
- * conflicting Office/macOS versions leave the ordinary Canvas line height.
+ * Excel's natural line box for one run (see `excelDrawingMlLineRatios`).
+ *
+ * The static catalog is reference geometry, not proof of the bytes behind
+ * local(). Admit it only after the exact style has loaded, and only when every
+ * known profile for that authored tuple agrees on the projection. An unknown
+ * OS/2 class, missing usWin metrics or conflicting Office/macOS versions
+ * (e.g. Times New Roman's hhea lineGap 0 vs 87) return undefined, and the
+ * caller keeps the ordinary Canvas line box.
  */
-export function shapeOfficeNaturalLineRatio(
+export function shapeRunLineRatios(
   run: TextRun,
   route: OfficeFontFallbackRoute | undefined,
-): number | undefined {
-  if (!route || route.source !== 'local' || route.metric.synthesized
+): ShapeRunLineRatios | undefined {
+  const family = soleFace(run);
+  if (!family || !route || route.source !== 'local' || route.metric.synthesized
     || !route.resourceIdentity.startsWith('office-local:')) return undefined;
-  const family = run.fontFace!.trim();
   if (route.requestedFamily.toLocaleLowerCase('en-US') !== family.toLocaleLowerCase('en-US')
     || route.weight !== (run.bold ? 700 : 400)
     || route.style !== (run.italic ? 'italic' : 'normal')) return undefined;
   const profiles = findReferenceFontMetrics(family, { weight: route.weight, style: route.style });
   if (profiles.length === 0) return undefined;
-  let ratio: number | undefined;
+  let ratios: ShapeRunLineRatios | undefined;
   for (const profile of profiles) {
-    if (profile.farEastCodePage == null) return undefined;
-    const projected = officeOpenTypeAutoLineRatios({
+    if (profile.farEastCodePage == null || !profile.win) return undefined;
+    const projected = excelDrawingMlLineRatios({
       unitsPerEm: profile.unitsPerEm,
+      winAscent: profile.win[0],
+      winDescent: profile.win[1],
       hheaAscent: profile.hhea[0],
       hheaDescent: profile.hhea[1],
       hheaLineGap: profile.hhea[2],
       farEastCodePage: profile.farEastCodePage,
-    })?.lineHeightRatio;
-    if (projected == null || (ratio !== undefined && projected !== ratio)) return undefined;
-    ratio = projected;
+    });
+    if (!projected || (ratios && (projected.ascentRatio !== ratios.ascentRatio
+      || projected.descentRatio !== ratios.descentRatio))) return undefined;
+    ratios = projected;
   }
-  return ratio;
+  return ratios;
 }
