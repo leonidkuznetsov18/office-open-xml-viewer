@@ -6114,7 +6114,6 @@ mod tests {
                 None,
                 None,
                 None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -6730,7 +6729,6 @@ mod tests {
             None,
             None,
             None,
-            ShapeKind::Sp,
             &mut zip,
         );
         assert_eq!(body.paragraphs[0].def_color.as_deref(), Some("505050"));
@@ -7161,7 +7159,6 @@ mod tests {
                 None, // inherited_space_before
                 None, // inherited_space_after
                 None, // inherited_line_spacing
-                ShapeKind::Sp,
                 &mut zip,
             )
         };
@@ -7248,7 +7245,6 @@ mod tests {
                 None,
                 None,
                 None,
-                ShapeKind::Sp,
                 &mut zip,
             )
         };
@@ -7335,7 +7331,6 @@ mod tests {
                 None,
                 None,
                 None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -7426,7 +7421,6 @@ mod tests {
                 None,
                 None,
                 None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -7505,7 +7499,6 @@ mod tests {
                 inherited,
                 inherited,
                 None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)

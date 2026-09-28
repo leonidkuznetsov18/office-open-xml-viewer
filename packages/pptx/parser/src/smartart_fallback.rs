@@ -44,7 +44,7 @@
 //! `packages/pptx/src/smartart-fallback-contrast.ts`.
 
 use crate::parse_preflighted_pptx_xml;
-use crate::text::{empty_level_bullets, parse_text_body, ShapeKind};
+use crate::text::{empty_level_bullets, parse_text_body};
 use crate::types::*;
 use crate::{attr, child, read_zip_str, resolve_path, PptxZip};
 use std::collections::HashMap;
@@ -324,7 +324,6 @@ fn append_point_paragraphs(
         None,
         None,
         None,
-        ShapeKind::Sp,
         zip,
     );
     if default_font_size.is_none() {

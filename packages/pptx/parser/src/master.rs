@@ -2313,7 +2313,7 @@ pub(crate) fn parse_layout(
 #[derive(serde::Serialize)]
 pub(crate) struct ParsedMaster {
     /// The master's effective theme palette, with the master's `<p:clrMap>`
-    /// pre-baked (logical names → slot hex). Includes font/line/objectDefault
+    /// pre-baked (logical names → slot hex). Includes font/line
     /// keys exactly as `parse_theme_colors` produced them.
     pub(crate) theme: PptxTheme,
     pub(crate) master_xml: Option<String>,

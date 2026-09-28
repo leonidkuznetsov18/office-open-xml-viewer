@@ -425,24 +425,6 @@ pub(crate) fn merge_level_bullets(primary: &LevelBullets, fallback: &LevelBullet
 //  Text body parsing
 // ===========================
 
-/// Which `<a:objectDefaults>` slot to consult when the shape's own bodyPr
-/// leaves an attribute unset. `Tx` ⇔ "text box" (slide-level
-/// `<p:cNvSpPr txBox="1"/>`), which inherits from `<a:txDef>`. `Sp` ⇔
-/// "regular shape with text" — a placeholder or preset-geometry shape carrying
-/// a `<p:txBody>` — which inherits from `<a:spDef>`. `TableCell` is DrawingML
-/// table content rather than a shape and therefore uses CT_TextBodyProperties'
-/// own defaults instead of theme objectDefaults. Falling back to txDef for
-/// non-text-boxes is wrong because
-/// txDef commonly carries `<a:spAutoFit/>` (PowerPoint's default for
-/// freshly-inserted text boxes); applying that to e.g. a placeholder body
-/// makes the whole paragraph spill horizontally instead of wrapping.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShapeKind {
-    Tx,
-    Sp,
-    TableCell,
-}
-
 /// Return the text-property fill choice only when it appears in the
 /// `CT_TextCharacterProperties` sequence position defined by ECMA-376
 /// §21.1.2.3.9 / dml-main.xsd. The fill choice precedes effects, highlight,
@@ -542,70 +524,51 @@ pub(crate) fn parse_text_body(
     inherited_space_before: Option<ParagraphSpacing>,
     inherited_space_after: Option<ParagraphSpacing>,
     inherited_line_spacing: Option<f64>,
-    shape_kind: ShapeKind,
     zip: &mut PptxZip,
 ) -> TextBody {
     let body_pr = child(tx_body, "bodyPr");
-    // ECMA-376 §20.1.6.7 objectDefaults. The theme-level `<a:txDef>` (and
-    // `<a:spDef>` as a secondary fallback) provides defaults for every
-    // bodyPr attribute the slide-level shape leaves unset. Without this
-    // fallback chain, sample-2's "20代" (txDef carries `<a:spAutoFit/>`)
-    // and similar templates would silently use the spec's literal defaults
-    // instead of what the theme author intended.
-    // Shape-kind-aware lookup: text boxes consult txDef, regular shapes spDef.
-    // Cross-fall is intentionally NOT done — see ShapeKind doc.
-    let def_prefix = match shape_kind {
-        ShapeKind::Tx => Some("+txDef"),
-        ShapeKind::Sp => Some("+spDef"),
-        ShapeKind::TableCell => None,
-    };
-    let theme_default_str = |key: &str| -> Option<String> {
-        def_prefix.and_then(|prefix| theme.get(&format!("{prefix}-bodyPr-{key}")).cloned())
-    };
-    let theme_default_i64 =
-        |key: &str| -> Option<i64> { theme_default_str(key).and_then(|v| v.parse::<i64>().ok()) };
-    let theme_default_u32 =
-        |key: &str| -> Option<u32> { theme_default_str(key).and_then(|v| v.parse::<u32>().ok()) };
-    let theme_auto_fit = || -> Option<String> {
-        def_prefix.and_then(|prefix| theme.get(&format!("{prefix}-autoFit")).cloned())
-    };
+    // Theme `<a:objectDefaults>` (ECMA-376 §20.1.6.7: spDef / lnDef / txDef)
+    // are deliberately NOT a fallback here. They are the templates PowerPoint
+    // uses for objects newly inserted in its UI; an existing shape that omits
+    // a bodyPr attribute resolves it from its placeholder cascade and then the
+    // CT_TextBodyProperties schema default. Observed with PowerPoint for Mac
+    // PDF export (issue #1618): identical shape XML rendered under a theme
+    // whose txDef/spDef set large insets, anchor ctr/b, wrap none, vert270,
+    // numCol 2, spcFirstLastPara 1, spAutoFit / normAutofit fontScale 50 %,
+    // lstStyle size/colour/face/alignment, spPr fill+line and style refs (and
+    // lnDef line + style) matched a control theme with an empty
+    // objectDefaults on every case — text boxes (txBox="1"), autoshapes with
+    // and without p:style, body placeholders whose layout/master bodyPr omit
+    // the attributes, connectors and line shapes. Explicit attributes on the
+    // same shapes (fontScale, spcFirstLastPara) did take effect, so the
+    // properties were observable. Evidence boundary: an explicit spAutoFit is
+    // not re-run on export either, so a txDef spAutoFit could not change the
+    // PDF; it is excluded for consistency with every observable property.
 
     // Shared `<a:bodyPr>` grammar (anchor / wrap / vert / insets / autofit) via
-    // ooxml_common::text::parse_body_pr. pptx's inheritance + theme
-    // objectDefaults resolution is pre-baked into the defaults: each field is
-    // `inherited?.or(theme objectDefault)?.or(spec default)`, and parse_body_pr
-    // then applies the shape's own bodyPr attribute over it — so the effective
-    // precedence (shape attr → inherited → theme → spec) is unchanged. When the
-    // shape has no `<a:bodyPr>` at all, the resolved defaults ARE the result.
+    // ooxml_common::text::parse_body_pr. pptx's placeholder inheritance is
+    // pre-baked into the defaults: each field is `inherited?.or(spec default)`,
+    // and parse_body_pr then applies the shape's own bodyPr attribute over it,
+    // giving the precedence shape attr → inherited → spec. When the shape has
+    // no `<a:bodyPr>` at all, the resolved defaults ARE the result.
     //
     // Insets: OOXML defaults lIns=rIns=91440, tIns=bIns=45720 (the shared
     // ooxml_common::text::DEFAULT_INS_* constants, via BodyPrDefaults::spec()).
-    // Autofit child (spAutoFit / normAutofit): when absent, defer to theme txDef
-    // (auto_fit default below); a normAutofit also captures PowerPoint's stored
+    // Autofit child (spAutoFit / normAutofit): when absent, the inherited
+    // value or the schema default (none) applies; a normAutofit also captures
+    // PowerPoint's stored
     // fontScale / lnSpcReduction (ECMA-376 §21.1.2.1.3, 62500 → 0.625).
     let spec = ooxml_common::text::BodyPrDefaults::spec();
     let inherited_text_insets = inherited_text_insets.unwrap_or([None; 4]);
     let body_pr_defaults = ooxml_common::text::BodyPrDefaults {
-        anchor: inherited_anchor
-            .or_else(|| theme_default_str("anchor"))
-            .unwrap_or(spec.anchor),
-        wrap: theme_default_str("wrap").unwrap_or(spec.wrap),
-        vert: theme_default_str("vert").unwrap_or(spec.vert),
-        l_ins: inherited_text_insets[0]
-            .or_else(|| theme_default_i64("lIns"))
-            .unwrap_or(spec.l_ins),
-        t_ins: inherited_text_insets[1]
-            .or_else(|| theme_default_i64("tIns"))
-            .unwrap_or(spec.t_ins),
-        r_ins: inherited_text_insets[2]
-            .or_else(|| theme_default_i64("rIns"))
-            .unwrap_or(spec.r_ins),
-        b_ins: inherited_text_insets[3]
-            .or_else(|| theme_default_i64("bIns"))
-            .unwrap_or(spec.b_ins),
-        auto_fit: inherited_auto_fit
-            .or_else(theme_auto_fit)
-            .unwrap_or(spec.auto_fit),
+        anchor: inherited_anchor.unwrap_or(spec.anchor),
+        wrap: spec.wrap,
+        vert: spec.vert,
+        l_ins: inherited_text_insets[0].unwrap_or(spec.l_ins),
+        t_ins: inherited_text_insets[1].unwrap_or(spec.t_ins),
+        r_ins: inherited_text_insets[2].unwrap_or(spec.r_ins),
+        b_ins: inherited_text_insets[3].unwrap_or(spec.b_ins),
+        auto_fit: inherited_auto_fit.unwrap_or(spec.auto_fit),
     };
     let body = match body_pr {
         Some(n) => ooxml_common::text::parse_body_pr(n, &body_pr_defaults),
@@ -635,31 +598,24 @@ pub(crate) fn parse_text_body(
     let ln_spc_reduction = body.ln_spc_reduction;
     // ECMA-376 §20.1.10.34: numCol on <a:bodyPr> tells the renderer to
     // distribute paragraphs across N columns within the shape. Default 1.
-    // spcCol is the inter-column gutter in EMU (default 0). Both fall back
-    // through theme objectDefaults.
+    // spcCol is the inter-column gutter in EMU (default 0).
     let num_col = body_pr
         .and_then(|n| attr(&n, "numCol"))
         .and_then(|v| v.parse::<u32>().ok())
-        .or_else(|| theme_default_u32("numCol"))
         .filter(|&n| n >= 1)
         .unwrap_or(1);
-    let spc_col = body_pr
-        .and_then(|n| attr_i64(&n, "spcCol"))
-        .or_else(|| theme_default_i64("spcCol"))
-        .unwrap_or(0);
+    let spc_col = body_pr.and_then(|n| attr_i64(&n, "spcCol")).unwrap_or(0);
     // ECMA-376 §21.1.2.1.1: rtlCol on <a:bodyPr> lays out the text body's
     // columns right-to-left. xsd:boolean, so accept "1"/"true". Shape
-    // attribute → theme objectDefaults → spec default (false).
+    // attribute → spec default (false).
     let rtl_col = body_pr
         .and_then(|n| attr(&n, "rtlCol"))
-        .or_else(|| theme_default_str("rtlCol"))
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
-    // ECMA-376 §21.1.2.1.1 spcFirstLastPara: shape attribute → theme
-    // objectDefaults → spec default (false, edge spacing suppressed).
+    // ECMA-376 §21.1.2.1.1 spcFirstLastPara: shape attribute → spec default
+    // (false, edge spacing suppressed).
     let spc_first_last_para = body_pr
         .and_then(|n| attr(&n, "spcFirstLastPara"))
-        .or_else(|| theme_default_str("spcFirstLastPara"))
         .is_some_and(|v| v == "1" || v == "true");
 
     // ECMA-376 §20.1.9.19 — `<a:bodyPr><a:prstTxWarp prst="…">` selects a WordArt

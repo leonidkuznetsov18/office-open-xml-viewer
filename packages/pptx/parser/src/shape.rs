@@ -13,7 +13,7 @@ use crate::fill::{
 };
 use crate::master::{InheritedShapeGeometry, LayoutPlaceholders};
 use crate::text::{
-    empty_level_bullets, parse_text_body, LevelBullets, LevelFontSizes, LevelIndents, ShapeKind,
+    empty_level_bullets, parse_text_body, LevelBullets, LevelFontSizes, LevelIndents,
 };
 use crate::theme::{PptxRawSchemeResolver, PptxSchemeResolver, PptxThemeSource};
 use crate::types::*;
@@ -1159,19 +1159,6 @@ pub(crate) fn parse_shape(
         Default::default()
     };
 
-    // ECMA-376 §19.3.1.13 / §20.1.4.2: a slide-level `<p:cNvSpPr txBox="1"/>`
-    // marks the shape as a true text box, which means the theme's
-    // `<a:txDef>` (rather than `<a:spDef>`) provides the fallback bodyPr.
-    let is_text_box = child(sp_node, "nvSpPr")
-        .and_then(|n| child(n, "cNvSpPr"))
-        .and_then(|n| attr(&n, "txBox"))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let shape_kind = if is_text_box {
-        ShapeKind::Tx
-    } else {
-        ShapeKind::Sp
-    };
     // Per-level bullets a paragraph inherits when it declares no explicit one
     // (ECMA-376 §19.7.10): the layout/master placeholder cascade for this slot.
     let inherited_level_bullets: LevelBullets = if ph_node.is_some() {
@@ -1212,7 +1199,6 @@ pub(crate) fn parse_shape(
             inherited_space_before,
             inherited_space_after,
             inherited_line_spacing,
-            shape_kind,
             zip,
         )
     });
@@ -2290,7 +2276,6 @@ pub(crate) fn parse_table_cell(
             None, // inherited_space_before
             None, // inherited_space_after
             None, // inherited_line_spacing
-            ShapeKind::TableCell,
             zip,
         );
         // Table-cell text direction is authored on tcPr rather than txBody's
@@ -3702,30 +3687,102 @@ mod style_ref_tests {
         );
     }
 
+    /// Issue #1618: theme objectDefaults are templates for newly inserted
+    /// objects only. PowerPoint renders existing text boxes, autoshapes (with
+    /// or without their own p:style) and table cells that omit bodyPr
+    /// attributes with the schema defaults, whatever txDef/spDef say.
     #[test]
-    fn table_cell_does_not_inherit_shape_object_default_insets() {
-        let doc = roxmltree::Document::parse(
+    fn theme_object_defaults_do_not_reach_existing_text_bodies() {
+        let theme = PptxTheme::from_xml(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="t">
+              <a:themeElements/>
+              <a:objectDefaults>
+                <a:spDef><a:spPr/><a:bodyPr wrap="none" vert="vert270" anchor="b" lIns="1371600"
+                  tIns="1143000" rIns="685800" bIns="533400" numCol="2" rtlCol="1" spcFirstLastPara="1">
+                  <a:normAutofit fontScale="50000"/></a:bodyPr><a:lstStyle/></a:spDef>
+                <a:txDef><a:spPr/><a:bodyPr wrap="none" anchor="ctr" lIns="914400" tIns="0"
+                  rIns="457200" bIns="381000" numCol="2" spcFirstLastPara="1"><a:spAutoFit/></a:bodyPr>
+                  <a:lstStyle/></a:txDef>
+              </a:objectDefaults>
+            </a:theme>"#,
+        );
+        let body = |c_nv_sp_pr: &str, style: &str| {
+            format!(
+                r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                         xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <p:nvSpPr><p:cNvPr id="2" name="s"/>{c_nv_sp_pr}<p:nvPr/></p:nvSpPr>
+                  <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>
+                    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>{style}
+                  <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Hg</a:t></a:r></a:p></p:txBody>
+                </p:sp>"#
+            )
+        };
+        let style = r#"<p:style><a:lnRef idx="1"><a:srgbClr val="000000"/></a:lnRef>
+            <a:fillRef idx="1"><a:srgbClr val="000000"/></a:fillRef>
+            <a:effectRef idx="0"><a:srgbClr val="000000"/></a:effectRef>
+            <a:fontRef idx="minor"><a:srgbClr val="000000"/></a:fontRef></p:style>"#;
+        for xml in [
+            body(r#"<p:cNvSpPr txBox="1"/>"#, ""),
+            body("<p:cNvSpPr/>", ""),
+            body("<p:cNvSpPr/>", style),
+        ] {
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut zip = empty_zip();
+            let mut out = Vec::new();
+            parse_sp_tree_node(
+                doc.root_element(),
+                &LayoutPlaceholders::default(),
+                "ppt/slides",
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut zip,
+                &theme,
+                &mut out,
+                false,
+                None,
+                DepthGuard::root(),
+            );
+            let Some(SlideElement::Shape(shape)) = out.pop() else {
+                panic!("expected a shape")
+            };
+            let tb = shape.text_body.expect("text body");
+            assert_eq!(
+                (tb.l_ins, tb.t_ins, tb.r_ins, tb.b_ins),
+                (91_440, 45_720, 91_440, 45_720),
+                "{xml}"
+            );
+            assert_eq!(
+                (
+                    tb.vertical_anchor.as_str(),
+                    tb.wrap.as_str(),
+                    tb.vert.as_str()
+                ),
+                ("t", "square", "horz")
+            );
+            assert_eq!((tb.auto_fit.as_str(), tb.font_scale), ("none", None));
+            assert_eq!(
+                (tb.num_col, tb.rtl_col, tb.spc_first_last_para),
+                (1, false, false)
+            );
+        }
+
+        let cell = roxmltree::Document::parse(
             r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
               <a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Cell</a:t></a:r></a:p></a:txBody>
               <a:tcPr/>
             </a:tc>"#,
         )
         .unwrap();
-        let theme = HashMap::from([
-            ("+spDef-bodyPr-tIns".to_owned(), "146304".to_owned()),
-            ("+spDef-bodyPr-bIns".to_owned(), "146304".to_owned()),
-        ]);
         let mut zip = empty_zip();
         let cell = parse_table_cell(
-            doc.root_element(),
+            cell.root_element(),
             &theme,
             &HashMap::new(),
             "ppt/slides",
             &mut zip,
         );
-        let body = cell.text_body.expect("table cell text body");
-
-        assert_eq!((body.t_ins, body.b_ins), (45_720, 45_720));
+        let tb = cell.text_body.expect("table cell text body");
+        assert_eq!((tb.t_ins, tb.b_ins), (45_720, 45_720));
     }
 
     #[test]
