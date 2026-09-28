@@ -823,8 +823,11 @@ function renderFunnelChart(
         );
         target.fillRect(bx, by, barW, barH);
       }
+      // A zero-width ordinal slot keeps main's solid stroke: resolving a
+      // structured paint there would be work the paint budget skips.
       if (applyResolvedChartExLineStyle(
-        target, outline, ptToPx, { x: bx, y: by, w: barW, h: barH }, shapeRotationDeg,
+        target, outline, ptToPx,
+        barW > 0 ? { x: bx, y: by, w: barW, h: barH } : undefined, shapeRotationDeg,
       )) {
         target.strokeRect(bx, by, barW, barH);
       }
