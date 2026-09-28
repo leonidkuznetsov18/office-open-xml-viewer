@@ -367,8 +367,8 @@ export function resolveChartExPointFill(
 /** Resolve a ChartEx outline through ordered Chart Style role chains.
  * `paintRoles` are tried in order after the direct carrier until one supplies
  * line paint; `geometryRoles` supply `w`, dash, cap and join atoms the direct
- * `a:ln` omits, in order. A semantic-fallback result (no paint anywhere) keeps
- * only direct geometry so family fallback rules keep their own width. */
+ * `a:ln` omits (see the geometry-role selection below). A semantic-fallback
+ * result takes role geometry only from its paint roles. */
 export function resolveChartExLineChain(
   chart: ChartModel,
   carrier: Partial<ChartExSeriesStyleCarrier> | null | undefined,
@@ -455,8 +455,10 @@ export function resolveChartExPointLine(
   // Paint and geometry are separate atoms: a point `a:ln` that authors only
   // geometry keeps the series outline paint (the same per-atom inheritance the
   // controls show for fill versus line).
-  const pointPaintAuthored = point?.lineColor != null || point?.lineHidden != null
-    || pointStyle?.linePaintAuthored === true || pointStyle?.lineHidden != null
+  // The parser records `lineHidden: false` for any authored `a:ln`, so only an
+  // explicit no-line or actual paint atoms mean the point authors paint.
+  const pointPaintAuthored = point?.lineColor != null || point?.lineHidden === true
+    || pointStyle?.linePaintAuthored === true || pointStyle?.lineHidden === true
     || pointStyle?.linePaints?.some(paint => paint != null) === true
     || pointStyle?.lineColors?.some(color => color != null) === true;
   const paintSource = pointPaintAuthored
@@ -493,9 +495,23 @@ export function applyResolvedChartExLineStyle(
   ctx: CanvasRenderingContext2D,
   line: ResolvedChartExLineStyle,
   ptToPx: number,
+  bounds?: ChartRect,
+  shapeRotationDeg = 0,
 ): boolean {
   if (!line.visible) return false;
-  ctx.strokeStyle = line.color.startsWith('#') ? line.color : `#${line.color}`;
+  // Structured (gradient/pattern) outline paint resolves against the stroked
+  // shape's bounds; a paint Canvas cannot express leaves the outline unpainted
+  // rather than reviving the solid fallback. Callers without bounds keep the
+  // resolved solid colour.
+  if (line.paint && line.paint.fillType !== 'solid' && bounds) {
+    const stroke = resolveFill(
+      line.paint, ctx, bounds.x, bounds.y, bounds.w, bounds.h, shapeRotationDeg,
+    );
+    if (!stroke) return false;
+    ctx.strokeStyle = stroke;
+  } else {
+    ctx.strokeStyle = line.color.startsWith('#') ? line.color : `#${line.color}`;
+  }
   // An authored outline without `w` is 0.75 pt. A family's semantic fallback
   // outline (e.g. the treemap tile separator standing in for Office's tile
   // gap) keeps its one-device-pixel rule.
@@ -570,7 +586,12 @@ export function chartExLegendSeries(
     color: fillColor.replace(/^#/, ''),
     lineHidden: !inheritPlotOutline || !line.visible,
     lineColor: inheritPlotOutline && line.visible ? line.color.replace(/^#/, '') : null,
-    lineWidthEmu: inheritPlotOutline ? line.widthEmu : null,
+    // A visible authored outline without `w` is 0.75 pt on the body; give
+    // the legend key the same default rather than the legend's 1 px rule.
+    lineWidthEmu: inheritPlotOutline
+      ? line.widthEmu ?? (line.visible && !line.semanticFallback
+        ? CHARTEX_DEFAULT_LINE_WIDTH_EMU : null)
+      : null,
     chartexStyle: {
       linePaints: inheritPlotOutline && line.paint !== undefined ? [line.paint] : null,
       linePaintAuthored: inheritPlotOutline && line.paint !== undefined ? true : null,

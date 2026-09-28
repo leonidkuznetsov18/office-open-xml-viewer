@@ -1375,6 +1375,8 @@ export function renderBarChart(
               chart, s, pointOverride, pointStyleIndex, barSeries.length, color,
             ),
             ptToPx,
+            { x: px0, y: py0, w: pw, h: ph },
+            shapeRotationDeg,
           );
         }
         const hasPointLine = pointOverride?.lineHidden != null
@@ -2075,6 +2077,7 @@ export function renderBarChart(
             );
             if (!applyResolvedChartExLineStyle(
               target, { ...paretoLine, semanticFallback: false }, ptToPx,
+              { x: px0, y: py0, w: pw, h: ph }, shapeRotationDeg,
             )) return;
             strokeOverlayRuns(target);
             return;

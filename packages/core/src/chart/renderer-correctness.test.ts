@@ -10043,12 +10043,57 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
       series: [series({
         values: [2, 1],
         chartexStyle: { linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true },
-        dataPointOverrides: [{ idx: 1, chartexStyle: { lineWidthEmu: 28575 } }],
+        // As parsed: an authored point `a:ln` records lineHidden false.
+        dataPointOverrides: [{ idx: 1, lineHidden: false, chartexStyle: { lineWidthEmu: 28575, lineHidden: false } }],
       })],
     }), RECT, 1);
 
     const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
     expect(red.map(rect => rect.lw)).toEqual([0.75, 2.25]);
+  });
+
+  it('paints a gradient ChartEx column outline', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A', 'B'],
+      showLegend: true,
+      legendPos: 'r',
+      chartexDataPointStyle: unmodifiedLinkedDataPoint,
+      series: [series({
+        values: [2, 1],
+        chartexStyle: {
+          linePaints: [{
+            fillType: 'gradient', angle: 0, gradType: 'linear',
+            stops: [{ position: 0, color: 'FF0000' }, { position: 1, color: '0000FF' }],
+          }],
+          linePaintAuthored: true,
+        },
+      })],
+    }), RECT, 1);
+
+    // Both bars stroke with a Canvas gradient built from the outline paint.
+    expect(rec.gradients.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('gives a ChartEx legend key without an authored outline width the 0.75pt default', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'funnel',
+      categories: ['A', 'B'],
+      catAxisHidden: true,
+      showLegend: true,
+      legendPos: 'r',
+      chartexDataPointStyle: unmodifiedLinkedDataPoint,
+      series: [series({
+        values: [2, 1],
+        chartexStyle: { linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true },
+      })],
+    }), RECT, 1);
+
+    const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    expect(red.length).toBeGreaterThan(2);
+    expect(red.every(rect => rect.lw === 0.75)).toBe(true);
   });
 
   it('draws the Waterfall legend key outline with the body role geometry', () => {

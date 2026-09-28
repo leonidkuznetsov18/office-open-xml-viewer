@@ -585,7 +585,9 @@ function renderWaterfallChart(
             target, paint, { x: bx, y: yTop, w: barW, h: bh }, fallback,
             ptToPx, shapeRotationDeg,
           );
-          if (applyResolvedChartExLineStyle(target, outline, ptToPx)) {
+          if (applyResolvedChartExLineStyle(
+            target, outline, ptToPx, { x: bx, y: yTop, w: barW, h: bh }, shapeRotationDeg,
+          )) {
             target.strokeRect(bx, yTop, barW, bh);
           }
         },
@@ -611,7 +613,9 @@ function renderWaterfallChart(
         '#000000',
         { linkedNoStyleFallback: true },
       );
-      if (applyResolvedChartExLineStyle(ctx, connectorLine, ptToPx)) {
+      if (applyResolvedChartExLineStyle(
+        ctx, connectorLine, ptToPx, { x: px0, y: py0, w: pw, h: ph }, shapeRotationDeg,
+      )) {
         // A linked `seriesLine` NoStyle delegates to Waterfall's semantic
         // connector rather than suppressing it. Office vector output from
         // both an unstyled bridge and an explicitly styled bridge establishes
@@ -819,7 +823,9 @@ function renderFunnelChart(
         );
         target.fillRect(bx, by, barW, barH);
       }
-      if (applyResolvedChartExLineStyle(target, outline, ptToPx)) {
+      if (applyResolvedChartExLineStyle(
+        target, outline, ptToPx, { x: bx, y: by, w: barW, h: barH }, shapeRotationDeg,
+      )) {
         target.strokeRect(bx, by, barW, barH);
       }
     };
@@ -1520,6 +1526,8 @@ function renderBoxWhiskerChart(
               { linkedNoStyleFallback: true },
             ),
             ptToPx,
+            { x: bx, y: boxTop, w: boxW, h: boxH },
+            shapeRotationDeg,
           )) {
             const edgeWidth = target.lineWidth;
             target.strokeRect(
@@ -1827,7 +1835,9 @@ function renderSunburstChart(
             target, nodePaint, nodeBounds, branchColor(node.branchIndex),
             ptToPx, shapeRotationDeg,
           );
-          if (applyResolvedChartExLineStyle(target, nodeOutline, ptToPx)) target.stroke();
+          if (applyResolvedChartExLineStyle(
+            target, nodeOutline, ptToPx, nodeBounds, shapeRotationDeg,
+          )) target.stroke();
         },
         node.branchIndex,
       );
@@ -2215,6 +2225,8 @@ function renderTreemapChart(
             { linkedNoStyleFallback: true },
           ),
           ptToPx,
+          tile,
+          shapeRotationDeg,
         );
         if (hasAuthoredOutline) {
           // ChartEx outlines are centered on the tile boundary. An inset
