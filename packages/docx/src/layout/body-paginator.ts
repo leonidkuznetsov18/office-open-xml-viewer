@@ -1032,18 +1032,6 @@ function* paginateBodyPassSteps(
   };
   const deferralContext: AnchorLineDeferralContext = Object.freeze({
     reads: serializedAnchorInputs,
-    plannedPrescan: (pageIndex: number, flowDomainId: string) => (anchorDestinations === null
-      ? null
-      : serializeAnchorInput(Object.freeze({
-          kind: 'prescan',
-          pageIndex,
-          flowDomainId,
-          anchors: plannedPageStartAnchors(anchorDestinations, pageIndex, flowDomainId),
-        }), pageStartAnchorsIdentity)),
-    tableFloor: (key: string) => minimumTablePageBySource?.get(key),
-    appliedDeferrals: (pageIndex: number): ReadonlySet<string> => (
-      pageIndex === deferralPage ? appliedDeferralKeys : new Set<string>()
-    ),
   });
   /** Whether a proven anchor-line deferral (see anchor-line-deferral.ts)
    * sends the line anchoring `keys` past the current physical page. */
@@ -2533,10 +2521,10 @@ function pageStartAnchorsIdentity(anchors: PageStartAnchors): string {
  *   reached before the bound but placed at or after it could still move, and
  *   its next floor could then act at r, so it lowers the bound to r.
  * - An applied anchor-line deferral at page r ends r above the anchor line;
- *   the bound stops at r. A carried proof for page p is verified against the
- *   reads before and at p's registration, which agree by induction, and
- *   against carry values for the proving pass's later reads on p, which the
- *   next carry may change; a proof with such reads lowers the bound to p.
+ *   the bound stops at r. A carried proof for page p is verified only against
+ *   this pass's own reads up to its anchor line on p, which agree in the next
+ *   pass by induction; a new proof for the same anchor and page needs a
+ *   disagreeing prescan of p.
  *
  * By induction every later pass, including the converged one, reproduces
  * pages below the returned bound exactly. The bound never exceeds the live
@@ -2551,13 +2539,9 @@ function anchorStablePageLimit(
   events: readonly PageAnchorInputEvent[],
   appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
   snapshot: BodyPaginationPassResult,
-  deferrals: AnchorLineDeferrals | null = null,
 ): Readonly<{ limit: number; prescanDisagreementPage: number }> {
   const observed = pageAnchorDestinationPlan(snapshot.layout);
   let limit = livePageIndex(snapshot);
-  for (const proof of deferrals?.values() ?? []) {
-    if (proof.inPage.length > 0) limit = Math.min(limit, proof.pageIndex);
-  }
   // A disagreeing prescan on a closed page stays disagreeing for the rest of
   // this pass, so its page also caps every later snapshot of the pass.
   let prescanDisagreementPage = Number.POSITIVE_INFINITY;
@@ -2762,14 +2746,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
   // whose passes form a different chain.
   const anchorPassObserver = (
     appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
-    deferrals: AnchorLineDeferrals | null,
   ): BodyPaginationPassObserver | undefined => {
     if (!publisher || seedPlan) return undefined;
     const events: PageAnchorInputEvent[] = [];
     // A prescan disagreement on a closed page is permanent for this pass.
     let ceiling = Number.POSITIVE_INFINITY;
     return passPublicationObserver(publisher, (pass) => {
-      const stable = anchorStablePageLimit(events, appliedPlan, pass, deferrals);
+      const stable = anchorStablePageLimit(events, appliedPlan, pass);
       ceiling = Math.min(ceiling, stable.prescanDisagreementPage);
       return stable.limit;
     }, {
@@ -2799,7 +2782,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
           appliedPlan,
           previous?.minimumTablePageBySource ?? null,
           balancePlan,
-          anchorPassObserver(appliedPlan, appliedDeferrals.size > 0 ? appliedDeferrals : null),
+          anchorPassObserver(appliedPlan),
           appliedDeferrals.size > 0 ? appliedDeferrals : null,
         );
         const observed = pageAnchorDestinationPlan(pass.layout);

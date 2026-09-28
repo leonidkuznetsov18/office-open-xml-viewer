@@ -44,20 +44,6 @@ export type PageAnchorInputEvent = Readonly<{
   keys: readonly string[];
 }>;
 
-/** A carry read of the proving pass on page N after A's registration. */
-type InPageRead = Readonly<{
-  kind: 'prescan';
-  flowDomainId: string;
-  serialized: string;
-}> | Readonly<{
-  kind: 'page-owned-table';
-  key: string;
-  floor: number | undefined;
-}> | Readonly<{
-  kind: 'anchor-line-deferral';
-  keysId: string;
-}>;
-
 export type AnchorLineDeferralProof = Readonly<{
   /** Occurrence keys of the page-owned drawings anchored on line L. */
   keys: readonly string[];
@@ -69,8 +55,8 @@ export type AnchorLineDeferralProof = Readonly<{
   registrationIndex: number;
   /** That prescan without `keys`: what a deferring pass reads there. */
   expectedRegistration: string;
-  /** Later carry reads of the proving pass on page N. */
-  inPage: readonly InPageRead[];
+  /** Serialized later carry reads of the proving pass on page N, in order. */
+  inPage: readonly string[];
   identity: string;
 }>;
 
@@ -117,20 +103,11 @@ export function createAnchorLineDeferralProof(
     ...registration,
     anchors: Object.freeze(registration.anchors.filter((anchor) => !keySet.has(anchor.occurrenceId))),
   }), anchorsIdentity);
-  const inPage: InPageRead[] = [];
+  const inPage: string[] = [];
   for (let index = registrationIndex + 1; index < events.length; index += 1) {
     const event = events[index]!;
     if (event.pageIndex > pageIndex) break;
-    if (event.pageIndex < pageIndex) continue;
-    if (event.kind === 'prescan') {
-      inPage.push(Object.freeze({
-        kind: 'prescan', flowDomainId: event.flowDomainId, serialized: serialized[index]!,
-      }));
-    } else if (event.kind === 'page-owned-table') {
-      inPage.push(Object.freeze({ kind: 'page-owned-table', key: event.key, floor: event.floor }));
-    } else {
-      inPage.push(Object.freeze({ kind: 'anchor-line-deferral', keysId: anchorKeysId(event.keys) }));
-    }
+    if (event.pageIndex === pageIndex) inPage.push(serialized[index]!);
   }
   const sortedKeys = Object.freeze([...keys].sort());
   return Object.freeze({
@@ -144,7 +121,7 @@ export function createAnchorLineDeferralProof(
     // page, so it enters as a digest; application still compares it exactly.
     identity: `${sortedKeys.join(',')}@${pageIndex}:${registrationIndex}:${
       digest(serialized, registrationIndex)}\u0002${expectedRegistration}\u0002${
-      inPage.map((read) => JSON.stringify(read)).join('\u0001')}`,
+      inPage.join('\u0001')}`,
   });
 }
 
@@ -167,19 +144,17 @@ function digest(values: readonly string[], length: number): string {
 
 /** What a deferring pass knows about its own reads when it reaches line L. */
 export interface AnchorLineDeferralContext {
-  /** Serialized reads of this pass so far. */
+  /** Serialized reads of this pass so far, in order. */
   readonly reads: readonly string[];
-  /** The serialized prescan this pass's plan performs for a flow domain. */
-  plannedPrescan(pageIndex: number, flowDomainId: string): string | null;
-  tableFloor(key: string): number | undefined;
-  /** Deferrals this pass already applied on `pageIndex`. */
-  appliedDeferrals(pageIndex: number): ReadonlySet<string>;
 }
 
-/** Whether the proof's counterfactual is this pass's own page-N context plus
- * the deferred anchors: identical reads before N's registration, the same
- * registration without them, and the same carry values for every later read
- * the proving pass made on page N. */
+/** Whether the proof's counterfactual is exactly this pass's page-N context
+ * plus the deferred anchors: identical reads before N's registration, the
+ * same registration without them, and after it exactly the proving pass's
+ * later reads on page N — none missing, none extra. A different read (for
+ * example a page-owned table or section region reached on N only because the
+ * anchors are absent) means the proof does not describe this page, so the
+ * line is laid out normally and the next pass retests it. */
 export function anchorLineDeferralApplies(
   proof: AnchorLineDeferralProof,
   keys: readonly string[],
@@ -188,20 +163,13 @@ export function anchorLineDeferralApplies(
 ): boolean {
   if (proof.pageIndex !== pageIndex || anchorKeysId(proof.keys) !== anchorKeysId(keys)) return false;
   const { reads } = context;
-  if (reads.length <= proof.registrationIndex) return false;
+  if (reads.length !== proof.registrationIndex + 1 + proof.inPage.length) return false;
   for (let index = 0; index < proof.registrationIndex; index += 1) {
     if (reads[index] !== proof.prefix[index]) return false;
   }
   if (reads[proof.registrationIndex] !== proof.expectedRegistration) return false;
-  const applied = context.appliedDeferrals(pageIndex);
-  for (const read of proof.inPage) {
-    if (read.kind === 'prescan') {
-      if (context.plannedPrescan(pageIndex, read.flowDomainId) !== read.serialized) return false;
-    } else if (read.kind === 'page-owned-table') {
-      if (context.tableFloor(read.key) !== read.floor) return false;
-    } else if (!applied.has(read.keysId)) {
-      return false;
-    }
+  for (let index = 0; index < proof.inPage.length; index += 1) {
+    if (reads[proof.registrationIndex + 1 + index] !== proof.inPage[index]) return false;
   }
   return true;
 }
@@ -226,4 +194,3 @@ export function pageOwnedAnchorKeysByLine(layout: ParagraphLayout): readonly (re
     return [anchor.acquisitionOccurrenceId ?? anchor.occurrenceId];
   }));
 }
-

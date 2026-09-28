@@ -11,6 +11,12 @@ import type { DocxDocumentModel } from '../types.js';
 import { layoutFingerprint } from './invariants.js';
 import { normalizeLayoutOptions } from './options.js';
 import { layoutDocumentProgressively, type ProgressiveLayoutPreview } from './progressive.js';
+import {
+  anchorLineDeferralApplies,
+  createAnchorLineDeferralProof,
+  serializeAnchorInput,
+  type PageAnchorInputEvent,
+} from './anchor-line-deferral.js';
 import type { DocumentLayout, LayoutPage } from './types.js';
 
 // Word's resolution of a page-owned anchor whose own exclusion pushes its
@@ -318,4 +324,54 @@ describe('page-owned anchor whose own exclusion pushes its anchor line off the p
       });
     }
   }, 300_000);
+});
+
+describe('anchor-line deferral proof', () => {
+  // A proof is the proving pass's exact page context: a pass may apply it
+  // only when its reads up to the anchor line are that context without the
+  // deferred anchors, with no read missing and none added.
+  const source = { story: 'body', storyInstance: 'body', path: [5] } as const;
+  const identity = (anchors: readonly { occurrenceId: string }[]) => (
+    anchors.map((anchor) => anchor.occurrenceId).join(',')
+  );
+  const prescan = (pageIndex: number, keys: readonly string[]): PageAnchorInputEvent => ({
+    kind: 'prescan',
+    pageIndex,
+    flowDomainId: `page:${pageIndex}`,
+    anchors: keys.map((occurrenceId) => ({ kind: 'drawing', occurrenceId, paragraphSource: source })),
+  });
+  const table = (pageIndex: number): PageAnchorInputEvent => ({
+    kind: 'page-owned-table', pageIndex, key: 'table:body:3', floor: undefined,
+  });
+  const reads = (events: readonly PageAnchorInputEvent[]) => events.map(
+    (event) => serializeAnchorInput(event, identity),
+  );
+  const prove = (events: readonly PageAnchorInputEvent[]) => createAnchorLineDeferralProof(
+    ['a'], 1, events, reads(events), 1, identity,
+  );
+
+  it('applies to the same page context without the deferred anchor', () => {
+    const proof = prove([prescan(0, []), prescan(1, ['a']), prescan(2, ['a'])]);
+    expect(anchorLineDeferralApplies(proof, ['a'], 1, {
+      reads: reads([prescan(0, []), prescan(1, [])]),
+    })).toBe(true);
+  });
+
+  it('rejects a context with an additional read before the anchor line', () => {
+    // Without the anchor, a page-owned table is reached on the page first.
+    const proof = prove([prescan(0, []), prescan(1, ['a']), prescan(2, ['a'])]);
+    expect(anchorLineDeferralApplies(proof, ['a'], 1, {
+      reads: reads([prescan(0, []), prescan(1, []), table(1)]),
+    })).toBe(false);
+  });
+
+  it('rejects a context missing a read of the proving page', () => {
+    const proof = prove([prescan(0, []), prescan(1, ['a']), table(1), prescan(2, ['a'])]);
+    expect(anchorLineDeferralApplies(proof, ['a'], 1, {
+      reads: reads([prescan(0, []), prescan(1, [])]),
+    })).toBe(false);
+    expect(anchorLineDeferralApplies(proof, ['a'], 1, {
+      reads: reads([prescan(0, []), prescan(1, []), table(1)]),
+    })).toBe(true);
+  });
 });
