@@ -3044,6 +3044,17 @@ fn produce_slide_unit_with_journal<T>(
             let master_level_colors = master_root
                 .map(|root| parse_master_level_colors(root, &theme, dts))
                 .unwrap_or_default();
+            let master_level_run_properties = master_root
+                .map(|root| {
+                    parse_master_level_run_properties(
+                        root,
+                        &theme,
+                        &bundle.master_rels,
+                        &bundle.master_dir,
+                        dts,
+                    )
+                })
+                .unwrap_or_default();
             let master_level_bullets = master_root
                 .map(|root| {
                     parse_master_level_bullets(
@@ -3061,6 +3072,7 @@ fn produce_slide_unit_with_journal<T>(
                 master_bg,
                 master_color,
                 master_level_colors,
+                master_level_run_properties,
                 master_level_bullets,
             }
         });
@@ -3083,6 +3095,10 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_level_bullets,
             ),
         };
+        let layout_master_run_properties = effective_master
+            .as_ref()
+            .map(|e| &e.master_level_run_properties)
+            .unwrap_or(&bundle.master_level_run_properties);
         // Build a `ParsedLayout` from a layout XML string with the resolved
         // theme/bullets and this bundle's remaining (theme-independent) maps.
         let build_parsed_layout = |lx: &str, zip: &mut PptxZip| -> ParsedLayout {
@@ -3092,6 +3108,7 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.default_text,
                 &bundle.master_level_font_sizes,
                 layout_master_colors,
+                layout_master_run_properties,
                 &bundle.master_level_indents,
                 layout_master_bullets,
                 &bundle.master_anchors,
@@ -3907,9 +3924,20 @@ mod tests {
     const DEFAULT_TXSTYLES: &str = r#"<p:txStyles><p:titleStyle><a:lvl1pPr algn="ctr"><a:defRPr sz="4400"/></a:lvl1pPr></p:titleStyle><p:bodyStyle><a:lvl1pPr algn="l"><a:defRPr sz="2800"/></a:lvl1pPr></p:bodyStyle><p:otherStyle><a:lvl1pPr algn="r"><a:defRPr sz="1800"/></a:lvl1pPr></p:otherStyle></p:txStyles>"#;
 
     fn build_align_pptx(slide_sp: &str, layout_extra_sp: &str, master_txstyles: &str) -> Vec<u8> {
+        build_align_pptx_with_rels(slide_sp, layout_extra_sp, master_txstyles, "", "", "")
+    }
+
+    fn build_align_pptx_with_rels(
+        slide_sp: &str,
+        layout_extra_sp: &str,
+        master_txstyles: &str,
+        slide_extra_rels: &str,
+        layout_extra_rels: &str,
+        master_extra_rels: &str,
+    ) -> Vec<u8> {
         use std::io::{Cursor, Write};
         let layout = format!(
-            r#"<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            r#"<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
               <p:cSld><p:spTree>
                 <p:sp><p:nvSpPr><p:cNvPr id="2" name="Body 1"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
                   <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
@@ -3918,17 +3946,17 @@ mod tests {
             </p:sldLayout>"#
         );
         let master = format!(
-            r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp></p:spTree></p:cSld>{master_txstyles}</p:sldMaster>"#
+            r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp></p:spTree></p:cSld>{master_txstyles}</p:sldMaster>"#
         );
         let entries: &[(&str, String)] = &[
             ("ppt/presentation.xml", r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#.to_owned()),
             ("ppt/_rels/presentation.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/></Relationships>"#.to_owned()),
-            ("ppt/slides/slide1.xml", format!(r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{slide_sp}</p:spTree></p:cSld></p:sld>"#)),
-            ("ppt/slides/_rels/slide1.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#.to_owned()),
+            ("ppt/slides/slide1.xml", format!(r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree>{slide_sp}</p:spTree></p:cSld></p:sld>"#)),
+            ("ppt/slides/_rels/slide1.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>{slide_extra_rels}</Relationships>"#)),
             ("ppt/slideLayouts/slideLayout1.xml", layout),
-            ("ppt/slideLayouts/_rels/slideLayout1.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>"#.to_owned()),
+            ("ppt/slideLayouts/_rels/slideLayout1.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>{layout_extra_rels}</Relationships>"#)),
             ("ppt/slideMasters/slideMaster1.xml", master),
-            ("ppt/slideMasters/_rels/slideMaster1.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/></Relationships>"#.to_owned()),
+            ("ppt/slideMasters/_rels/slideMaster1.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>{master_extra_rels}</Relationships>"#)),
             ("ppt/theme/theme1.xml", r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="t"><a:themeElements><a:clrScheme name="c"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="000000"/></a:dk2><a:lt2><a:srgbClr val="FFFFFF"/></a:lt2><a:accent1><a:srgbClr val="000000"/></a:accent1><a:accent2><a:srgbClr val="000000"/></a:accent2><a:accent3><a:srgbClr val="000000"/></a:accent3><a:accent4><a:srgbClr val="000000"/></a:accent4><a:accent5><a:srgbClr val="000000"/></a:accent5><a:accent6><a:srgbClr val="000000"/></a:accent6><a:hlink><a:srgbClr val="000000"/></a:hlink><a:folHlink><a:srgbClr val="000000"/></a:folHlink></a:clrScheme><a:fontScheme name="f"><a:majorFont><a:latin typeface="Arial"/></a:majorFont><a:minorFont><a:latin typeface="Arial"/></a:minorFont></a:fontScheme><a:fmtScheme name="s"><a:fillStyleLst/><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme></a:themeElements></a:theme>"#.to_owned()),
         ];
         let mut buf = Vec::new();
@@ -3975,6 +4003,106 @@ mod tests {
             first_para_alignment(&build_align_pptx(BODY_SP, "", DEFAULT_TXSTYLES)),
             "l"
         );
+    }
+
+    #[test]
+    fn run_attributes_flow_through_master_layout_placeholder_shape_paragraph_and_run() {
+        let master = r#"<p:txStyles><p:bodyStyle><a:defPPr><a:defRPr
+          lang="en-US" altLang="ja-JP" kern="1200" spc="80" cap="all">
+          <a:cs typeface="Amiri"/></a:defRPr></a:defPPr></p:bodyStyle></p:txStyles>"#;
+        let layout = r#"<p:sp><p:nvSpPr><p:cNvPr id="7" name="Body 2"/>
+          <p:cNvSpPr/><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+          <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:defPPr>
+          <a:defRPr lang="fr-FR" i="1"/></a:defPPr></a:lstStyle><a:p/></p:txBody></p:sp>"#;
+        let slide = r#"<p:sp><p:nvSpPr><p:cNvPr id="8" name="Body 2"/>
+          <p:cNvSpPr/><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+          <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:defPPr>
+          <a:defRPr kern="1800"/></a:defPPr></a:lstStyle>
+          <a:p><a:pPr><a:defRPr b="1"/></a:pPr>
+            <a:r><a:rPr cap="none"/><a:t>Run</a:t></a:r>
+            <a:fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+              <a:rPr/><a:t>Field</a:t></a:fld>
+          </a:p></p:txBody></p:sp>"#;
+        let json = parse_pptx_native(&build_align_pptx(slide, layout, master)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let runs = &v["slides"][0]["elements"][0]["textBody"]["paragraphs"][0]["runs"];
+        for run in runs.as_array().unwrap() {
+            let attrs = &run["characterAttributes"];
+            assert_eq!(attrs["lang"], "fr-FR");
+            assert_eq!(attrs["altLang"], "ja-JP");
+            assert_eq!(attrs["kern"], "1800");
+            assert_eq!(attrs["spc"], "80");
+            assert_eq!(attrs["i"], "1");
+            assert_eq!(attrs["b"], "1");
+            assert_eq!(run["fontFamilyCs"], "Amiri");
+        }
+        assert_eq!(runs[0]["caps"], "none");
+        assert_eq!(runs[1]["caps"], "all");
+    }
+
+    #[test]
+    fn inherited_hyperlink_ids_use_master_layout_and_slide_relationships_in_full_parse() {
+        // ECMA-376 Part 2 §9.3.3: rId7 is local to each source part. All
+        // three text runs use the same ID but must reach different targets.
+        let make_shape = |id: u8, name: &str, idx: u8, run_properties: &str| {
+            format!(
+                r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="{name}"/><p:cNvSpPr/>
+              <p:nvPr><p:ph type="body" idx="{idx}"/></p:nvPr></p:nvSpPr><p:spPr/>
+              <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr>{run_properties}</a:rPr>
+              <a:t>{name}</a:t></a:r></a:p></p:txBody></p:sp>"#
+            )
+        };
+        let slide = format!(
+            "{}{}{}",
+            make_shape(5, "Master link", 1, ""),
+            make_shape(6, "Layout link", 2, ""),
+            make_shape(
+                7,
+                "Slide link",
+                3,
+                r#"<a:hlinkClick r:id="rId7"/><a:hlinkMouseOver r:id="rId7"/>"#
+            )
+        );
+        let layout = r#"<p:sp><p:nvSpPr><p:cNvPr id="8" name="Layout link"/>
+          <p:cNvSpPr/><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+          <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr><a:defRPr>
+          <a:hlinkClick r:id="rId7"/><a:hlinkMouseOver r:id="rId7"/>
+          </a:defRPr></a:lvl1pPr></a:lstStyle><a:p/></p:txBody></p:sp>"#;
+        let master = r#"<p:txStyles><p:bodyStyle><a:lvl1pPr><a:defRPr>
+          <a:hlinkClick r:id="rId7"/><a:hlinkMouseOver r:id="rId7"/>
+          </a:defRPr></a:lvl1pPr></p:bodyStyle></p:txStyles>"#;
+        let rel = |url: &str| {
+            format!(
+                r#"<Relationship Id="rId7"
+          Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+          Target="{url}" TargetMode="External"/>"#
+            )
+        };
+        let data = build_align_pptx_with_rels(
+            &slide,
+            layout,
+            master,
+            &rel("https://slide.test/"),
+            &rel("https://layout.test/"),
+            &rel("https://master.test/"),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&parse_pptx_native(&data).unwrap()).unwrap();
+        for (name, expected) in [
+            ("Master link", "https://master.test/"),
+            ("Layout link", "https://layout.test/"),
+            ("Slide link", "https://slide.test/"),
+        ] {
+            let shape = parsed["slides"][0]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|shape| shape["name"] == name)
+                .unwrap();
+            let run = &shape["textBody"]["paragraphs"][0]["runs"][0];
+            assert_eq!(run["hyperlink"], expected, "{name} click");
+            assert_eq!(run["hyperlinkMouseOver"], expected, "{name} hover");
+        }
     }
 
     #[test]
@@ -4832,6 +4960,323 @@ mod tests {
     }
 
     #[test]
+    fn partial_paragraph_defaults_merge_every_run_property_for_runs_and_fields() {
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <lstStyle><lvl1pPr><defRPr b="0" i="1" sz="3500" u="dbl"
+              strike="dblStrike" cap="all" spc="200" baseline="30000">
+            <ln w="12700"><solidFill><srgbClr val="123456"/></solidFill></ln>
+            <solidFill><srgbClr val="D21D54"/></solidFill>
+            <effectLst><reflection blurRad="12700" stA="48000" endA="300"
+                endPos="55000" dir="5400000" sy="-90000" algn="bl" rotWithShape="0"/></effectLst>
+            <highlight><srgbClr val="F5DD22"/></highlight>
+            <uFill><solidFill><srgbClr val="234567"/></solidFill></uFill>
+            <latin typeface="Arial"/><ea typeface="Yu Gothic"/><sym typeface="Symbol"/>
+          </defRPr></lvl1pPr></lstStyle>
+          <p><pPr><defRPr b="1"/></pPr>
+            <r><rPr i="0"/><t>Run</t></r>
+            <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime"><rPr/><t>Field</t></fld>
+          </p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let levels = extract_level_run_properties(doc.root_element(), &HashMap::new());
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &levels,
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected regular run and field");
+        };
+        for parsed in [run, field] {
+            assert_eq!(parsed.bold, Some(true));
+            assert_eq!(parsed.font_size, Some(35.0));
+            assert!(parsed.underline && parsed.strikethrough && parsed.strike_double);
+            assert_eq!(parsed.underline_style.as_deref(), Some("dbl"));
+            assert_eq!(parsed.underline_color.as_deref(), Some("234567"));
+            assert_eq!(parsed.caps.as_deref(), Some("all"));
+            assert_eq!(parsed.letter_spacing, Some(2.0));
+            assert_eq!(parsed.baseline, Some(30000));
+            assert_eq!(parsed.font_family.as_deref(), Some("Arial"));
+            assert_eq!(parsed.font_family_ea.as_deref(), Some("Yu Gothic"));
+            assert_eq!(parsed.font_family_sym.as_deref(), Some("Symbol"));
+            assert_eq!(parsed.highlight.as_deref(), Some("F5DD22"));
+            assert!(parsed.outline.is_some());
+            assert!(parsed.reflection.is_some());
+            assert_eq!(parsed.color.as_deref(), Some("D21D54"));
+        }
+        assert_eq!(run.italic, Some(false));
+        assert_eq!(field.italic, Some(true));
+    }
+
+    #[test]
+    fn explicit_text_no_fill_stops_inherited_paint_for_run_and_field() {
+        let xml = r#"<p xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <pPr><defRPr><solidFill><srgbClr val="D21D54"/></solidFill></defRPr></pPr>
+          <r><rPr u="sng"><noFill/><highlight><srgbClr val="F5DD22"/></highlight>
+            <uFillTx/></rPr><t>Run</t></r>
+          <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+            <rPr><noFill/></rPr><t>Field</t></fld>
+        </p>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &std::array::from_fn(|_| Default::default()),
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected run and field");
+        };
+        for text in [run, field] {
+            assert!(text.no_fill);
+            assert!(text.color.is_none());
+        }
+        assert!(run.underline);
+        assert_eq!(run.highlight.as_deref(), Some("F5DD22"));
+    }
+
+    #[test]
+    fn character_property_cascade_covers_attributes_children_break_and_insertion_state() {
+        // ECMA-376 §21.1.2.3.9, §21.1.2.2.2, §21.1.2.4: each authored
+        // attribute overrides only itself.  CT_TextListStyle.defPPr is the
+        // common base of all levels; a:br has its own rPr; endParaRPr is an
+        // insertion state and cannot recolour either existing run.
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <lstStyle><defPPr><defRPr kumimoji="1" lang="ja-JP" kern="1200"
+            normalizeH="1" noProof="1" smtClean="0" smtId="17" bmk="mark"
+            dirty="1" err="1" spc="80" baseline="12000" u="sng" strike="sngStrike">
+            <ln w="12700"><solidFill><srgbClr val="00AA00"/></solidFill></ln>
+            <uLn w="6350"><solidFill><srgbClr val="112233"/></solidFill></uLn>
+            <latin typeface="Arial" panose="020B0604020202020204" pitchFamily="34" charset="1"/>
+            <ea typeface="Yu Gothic"/><cs typeface="Noto Naskh Arabic"/>
+            <sym typeface="Symbol"/>
+            <hlinkClick r:id="rId9" tooltip="default" history="0"/>
+            <hlinkMouseOver r:id="rId10" tooltip="hover"/>
+          </defRPr></defPPr>
+          <lvl1pPr><defRPr altLang="en-US" sz="3200" i="1" cap="all">
+            <solidFill><srgbClr val="D21D54"/></solidFill>
+            <highlight><srgbClr val="FFE800"/></highlight>
+            <uFill><pattFill prst="pct50"><fgClr><srgbClr val="0022EE"/></fgClr>
+              <bgClr><srgbClr val="FFDD00"/></bgClr></pattFill></uFill>
+            <latin typeface="Aptos"/>
+          </defRPr></lvl1pPr></lstStyle>
+          <p><pPr><defRPr b="1" cap="small">
+            <ln w="25400"/><uLn w="12700"/>
+            <latin charset="177"/><hlinkClick tooltip="near"/>
+          </defRPr></pPr>
+            <r><rPr cap="none" lang="fr-FR"/><t>Run</t></r>
+            <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+              <rPr/><t>Field</t></fld>
+            <br><rPr sz="4800"/></br>
+            <endParaRPr sz="6000"><solidFill><srgbClr val="123456"/></solidFill></endParaRPr>
+          </p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let rels = HashMap::from([
+            ("rId9".to_owned(), "https://example.test/click".to_owned()),
+            ("rId10".to_owned(), "https://example.test/hover".to_owned()),
+        ]);
+        let levels =
+            extract_level_run_properties_with_rels(doc.root_element(), &HashMap::new(), &rels);
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &rels,
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &levels,
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field), TextRun::Break { font_size, .. }] =
+            para.runs.as_slice()
+        else {
+            panic!("run, field, formatted break expected")
+        };
+        for item in [run, field] {
+            let a = &item.character_attributes;
+            for (key, value) in [
+                ("kumimoji", "1"),
+                ("altLang", "en-US"),
+                ("kern", "1200"),
+                ("normalizeH", "1"),
+                ("noProof", "1"),
+                ("smtClean", "0"),
+                ("smtId", "17"),
+                ("bmk", "mark"),
+                ("spc", "80"),
+                ("baseline", "12000"),
+                ("u", "sng"),
+                ("strike", "sngStrike"),
+                ("sz", "3200"),
+                ("b", "1"),
+                ("i", "1"),
+            ] {
+                assert_eq!(a.get(key).map(String::as_str), Some(value), "{key}");
+            }
+            assert!(!a.contains_key("dirty") && !a.contains_key("err"));
+            assert_eq!(item.font_family.as_deref(), Some("Aptos"));
+            assert_eq!(item.font_family_cs.as_deref(), Some("Noto Naskh Arabic"));
+            assert_eq!(
+                item.hyperlink.as_deref(),
+                Some("https://example.test/click")
+            );
+            assert_eq!(
+                item.hyperlink_mouse_over.as_deref(),
+                Some("https://example.test/hover")
+            );
+            assert_eq!(
+                item.character_child_attributes["latin"]["panose"],
+                "020B0604020202020204"
+            );
+            assert_eq!(item.character_child_attributes["latin"]["charset"], "177");
+            assert_eq!(
+                item.character_child_attributes["hlinkClick"]["tooltip"],
+                "near"
+            );
+            assert_eq!(item.character_child_attributes["hlinkClick"]["id"], "rId9");
+            assert_eq!(
+                item.character_child_attributes["hlinkMouseOver"]["tooltip"],
+                "hover"
+            );
+            assert_eq!(item.outline.as_ref().unwrap().width, 25400);
+            assert_eq!(
+                item.outline.as_ref().unwrap().color.as_deref(),
+                Some("00AA00")
+            );
+            assert_eq!(item.underline_line.as_ref().unwrap().width, 12700);
+            assert_eq!(
+                item.underline_line.as_ref().unwrap().color.as_deref(),
+                Some("112233")
+            );
+            assert!(matches!(item.underline_fill, Some(Fill::Pattern { .. })));
+            assert_eq!(item.highlight.as_deref(), Some("FFE800"));
+            assert!(item.strikethrough);
+        }
+        assert_eq!(run.character_attributes["lang"], "fr-FR");
+        assert_eq!(run.caps.as_deref(), Some("none"));
+        assert_eq!(field.character_attributes["lang"], "ja-JP");
+        assert_eq!(field.caps.as_deref(), Some("small"));
+        assert_eq!(*font_size, Some(48.0));
+        assert_eq!(run.font_size, Some(32.0));
+        assert_eq!(
+            para.end_run_properties.as_ref().unwrap().font_size,
+            Some(60.0)
+        );
+        assert_eq!(
+            para.end_run_properties.as_ref().unwrap().color.as_deref(),
+            Some("123456")
+        );
+    }
+
+    #[test]
+    fn table_cell_text_uses_the_same_defppr_and_paragraph_character_cascade() {
+        let xml = r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:txBody><a:bodyPr/><a:lstStyle>
+            <a:defPPr><a:defRPr lang="ja-JP" sz="2200"><a:solidFill>
+              <a:srgbClr val="AA2200"/></a:solidFill><a:cs typeface="Amiri"/></a:defRPr></a:defPPr>
+            <a:lvl1pPr><a:defRPr i="1"/></a:lvl1pPr>
+          </a:lstStyle><a:p><a:pPr><a:defRPr b="1"/></a:pPr>
+            <a:r><a:rPr/><a:t>Cell</a:t></a:r>
+            <a:fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+              <a:rPr/><a:t>Field</a:t></a:fld>
+          </a:p></a:txBody><a:tcPr/>
+        </a:tc>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let cell = parse_table_cell(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            &mut zip,
+        );
+        let runs = &cell.text_body.unwrap().paragraphs[0].runs;
+        for item in runs {
+            let TextRun::Text(run) = item else {
+                panic!("text run expected")
+            };
+            assert_eq!(run.bold, Some(true));
+            assert_eq!(run.italic, Some(true));
+            assert_eq!(run.font_size, Some(22.0));
+            assert_eq!(run.color.as_deref(), Some("AA2200"));
+            assert_eq!(run.font_family_cs.as_deref(), Some("Amiri"));
+            assert_eq!(run.character_attributes["lang"], "ja-JP");
+        }
+    }
+
+    #[test]
+    fn empty_run_does_not_override_the_end_paragraph_insertion_size() {
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <lstStyle><lvl1pPr><defRPr sz="3200"/></lvl1pPr></lstStyle>
+          <p><r><rPr/><t></t></r><endParaRPr sz="6000"/></p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let levels = extract_level_run_properties(doc.root_element(), &HashMap::new());
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &levels,
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        assert_eq!(para.def_font_size, Some(60.0));
+        let TextRun::Text(run) = &para.runs[0] else {
+            panic!("empty run")
+        };
+        assert_eq!(run.font_size, Some(32.0));
+        assert_eq!(
+            para.end_run_properties.as_ref().unwrap().font_size,
+            Some(60.0)
+        );
+    }
+
+    #[test]
     fn test_parse_run_treats_uniform_gradient_text_fill_as_its_exact_color() {
         let uniform = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="353535"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>uniform</t></r>"#;
         let varying = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="FFFFFF"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>varying</t></r>"#;
@@ -4846,6 +5291,10 @@ mod tests {
         let varying_doc = roxmltree::Document::parse(varying).unwrap();
         let varying_run = parse_run(varying_doc.root_element(), None, &theme, &rels).unwrap();
         assert_eq!(varying_run.color, None);
+        assert!(matches!(
+            varying_run.glyph_fill,
+            Some(Fill::Gradient { .. })
+        ));
 
         let unresolved_doc = roxmltree::Document::parse(partly_unresolved).unwrap();
         let unresolved_run = parse_run(unresolved_doc.root_element(), None, &theme, &rels).unwrap();
@@ -4853,8 +5302,8 @@ mod tests {
     }
 
     /// ECMA-376 §21.1.2.3.9; ST_TextCapsType §20.1.10.64 — cap="all" /
-    /// "small" are passed through;
-    /// cap="none" or omitted yields None so the field stays absent in JSON.
+    /// "small" and explicit "none" are passed through.  The latter blocks
+    /// a cap inherited from an earlier level of the style cascade.
     #[test]
     fn test_parse_run_caps_attribute() {
         let theme = HashMap::new();
@@ -4862,7 +5311,7 @@ mod tests {
         let cases = [
             ("all", Some("all")),
             ("small", Some("small")),
-            ("none", None),
+            ("none", Some("none")),
         ];
         for (val, expected) in cases {
             let xml = format!(
@@ -5707,6 +6156,22 @@ mod tests {
         let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
         assert!(r.underline_color.is_none());
 
+        let inherited_line = r#"<defRPr xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><uLn w="12700"><solidFill><srgbClr val="112233"/></solidFill></uLn></defRPr>"#;
+        let text_line = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><uLnTx/></rPr><t>x</t></r>"#;
+        let default_doc = roxmltree::Document::parse(inherited_line).unwrap();
+        let doc = roxmltree::Document::parse(text_line).unwrap();
+        let r = parse_run(
+            doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(r.underline_line.is_none(), "uLnTx replaces inherited uLn");
+        assert!(!r.underline_line_no_fill);
+        assert!(r.character_child_attributes.contains_key("uLnTx"));
+        assert!(!r.character_child_attributes.contains_key("uLn"));
+
         let with_pattern = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><pattFill prst="pct50"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill><uFill><pattFill prst="dnDiag"><fgClr><srgbClr val="00A650"/></fgClr><bgClr><srgbClr val="F5A623"/></bgClr></pattFill></uFill></rPr><t>x</t></r>"#;
         let doc = roxmltree::Document::parse(with_pattern).unwrap();
         let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
@@ -6260,9 +6725,9 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(), // inherited_level_indents
                 &empty_level_bullets(),
                 None,
@@ -6348,6 +6813,7 @@ mod tests {
             &crate::master::DefaultTextLevels::default(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &master_indents,
             &HashMap::new(),
             &HashMap::new(),
@@ -6423,6 +6889,7 @@ mod tests {
                 &HashMap::new(),
                 &crate::master::DefaultTextLevels::default(),
                 &m_lfs,
+                &HashMap::new(),
                 &HashMap::new(),
                 &m_li,
                 &m_lb,
@@ -6852,6 +7319,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -6871,9 +7339,9 @@ mod tests {
             &HashMap::new(),
             "ppt/slides",
             None,
-            Default::default(),
             [None; 9],
             inherited,
+            std::array::from_fn(|_| Default::default()),
             Default::default(),
             &empty_level_bullets(),
             None,
@@ -7299,11 +7767,11 @@ mod tests {
                 &theme,
                 &rels,
                 "ppt/slides",
-                None,                          // inherited_font_size
-                Default::default(),            // inherited_level_faces
-                [None; 9],                     // inherited_level_font_sizes
-                std::array::from_fn(|_| None), // inherited_level_colors
-                Default::default(),            // inherited_level_indents
+                None,
+                [None; 9], // inherited_level_font_sizes
+                std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()), // inherited_level_colors
+                Default::default(),                          // inherited_level_indents
                 &empty_level_bullets(),
                 None, // inherited_bold
                 None, // inherited_italic
@@ -7385,9 +7853,9 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(),
                 &empty_level_bullets(),
                 None,
@@ -7470,9 +7938,9 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(), // inherited_level_indents
                 &empty_level_bullets(),
                 None,
@@ -7559,9 +8027,9 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(),
                 &empty_level_bullets(),
                 None,
@@ -7636,9 +8104,9 @@ mod tests {
                 &rels,
                 "ppt/slides",
                 None,
-                Default::default(),
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(),
                 &empty_level_bullets(),
                 None,
@@ -11011,7 +11479,7 @@ mod tests {
             retained_ptr,
             "prepared bytes move; they are not cloned"
         );
-        const FIXED_SLIDE_3: &str = r#"{"index":2,"slideNumber":3,"partName":"ppt/slides/slide3.xml","background":null,"elements":[{"type":"shape","x":0,"y":0,"width":1000000,"height":1000000,"rotation":0.0,"flipH":false,"flipV":false,"geometry":"rect","fill":null,"stroke":null,"textBody":{"verticalAnchor":"t","paragraphs":[{"alignment":"l","marL":0,"marR":0,"indent":0,"spaceBefore":null,"spaceAfter":null,"spaceLine":null,"lvl":0,"bullet":{"type":"inherit"},"defFontSize":18.0,"defColor":null,"defBold":null,"defItalic":null,"defFontFamily":"Arial","tabStops":[],"eaLnBrk":true,"runs":[{"type":"text","text":"slide 3","bold":null,"italic":null,"underline":false,"strikethrough":false,"fontSize":null,"color":null,"fontFamily":null,"fieldType":null}]}],"defaultFontSize":18.0,"defaultBold":null,"defaultItalic":null,"lIns":91440,"rIns":91440,"tIns":45720,"bIns":45720,"wrap":"square","vert":"horz","autoFit":"none"},"defaultTextColor":null,"custGeom":null,"adj":null,"adj2":null,"adj3":null,"adj4":null,"adj5":null,"adj6":null,"adj7":null,"adj8":null,"shadow":null,"id":"2","name":"T"}],"elementSources":[{"origin":"slide"}]}"#;
+        const FIXED_SLIDE_3: &str = r#"{"index":2,"slideNumber":3,"partName":"ppt/slides/slide3.xml","background":null,"elements":[{"type":"shape","x":0,"y":0,"width":1000000,"height":1000000,"rotation":0.0,"flipH":false,"flipV":false,"geometry":"rect","fill":null,"stroke":null,"textBody":{"verticalAnchor":"t","paragraphs":[{"alignment":"l","marL":0,"marR":0,"indent":0,"spaceBefore":null,"spaceAfter":null,"spaceLine":null,"lvl":0,"bullet":{"type":"inherit"},"defFontSize":18.0,"defColor":null,"defBold":null,"defItalic":null,"defFontFamily":"Arial","tabStops":[],"eaLnBrk":true,"runs":[{"type":"text","text":"slide 3","bold":null,"italic":null,"underline":false,"strikethrough":false,"fontSize":18.0,"color":null,"fontFamily":"Arial","fieldType":null}]}],"defaultFontSize":18.0,"defaultBold":null,"defaultItalic":null,"lIns":91440,"rIns":91440,"tIns":45720,"bIns":45720,"wrap":"square","vert":"horz","autoFit":"none"},"defaultTextColor":null,"custGeom":null,"adj":null,"adj2":null,"adj3":null,"adj4":null,"adj5":null,"adj6":null,"adj7":null,"adj8":null,"shadow":null,"id":"2","name":"T"}],"elementSources":[{"origin":"slide"}]}"#;
         assert_eq!(bytes, FIXED_SLIDE_3.as_bytes());
         let legacy: serde_json::Value =
             serde_json::from_str(&parse_pptx_native(&legacy_data).unwrap()).unwrap();

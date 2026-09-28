@@ -15,7 +15,7 @@ use crate::master::{DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholder
 use crate::text::{
     complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
     resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes, LevelIndents,
-    HARD_DEFAULT_LATIN_FACE,
+    LevelRunProperties, HARD_DEFAULT_LATIN_FACE,
 };
 use crate::theme::{PptxRawSchemeResolver, PptxSchemeResolver, PptxThemeSource};
 use crate::types::*;
@@ -1215,6 +1215,32 @@ pub(crate) fn parse_shape(
     } else {
         std::array::from_fn(|_| None)
     };
+    let chain_run_properties: LevelRunProperties = if placeholder_inherits {
+        let levels = lph.lookup_level_run_properties(&ph_type, ph_idx);
+        if style_node
+            .and_then(|style| child(style, "fontRef"))
+            .is_some()
+        {
+            levels.map(|props| props.without_fill())
+        } else {
+            levels
+        }
+    } else {
+        std::array::from_fn(|_| Default::default())
+    };
+    // The resolved chain is authoritative for the Latin face and size of every
+    // level; the other character properties keep their own cascade.
+    let inherited_level_run_properties: LevelRunProperties = {
+        let mut level = 0;
+        chain_run_properties.map(|props| {
+            let resolved = props.with_chain_face_and_size(
+                inherited_level_faces[level].clone(),
+                inherited_level_font_sizes[level],
+            );
+            level += 1;
+            resolved
+        })
+    };
     let text_body = child(sp_node, "txBody").map(|n| {
         parse_text_body(
             n,
@@ -1222,9 +1248,9 @@ pub(crate) fn parse_shape(
             rels,
             source_dir,
             inherited_font_size,
-            inherited_level_faces,
             inherited_level_font_sizes,
             inherited_level_colors,
+            inherited_level_run_properties,
             inherited_level_indents,
             &inherited_level_bullets,
             inherited_bold,
@@ -2352,9 +2378,9 @@ pub(crate) fn parse_table_cell(
             // Faces are completed after the table style is resolved
             // (`complete_table_cell_faces`): the style tier sits between the
             // cell's own formatting and defaultTextStyle.
-            LevelFaces::default(),
             [None; 9],
             std::array::from_fn(|_| None),
+            std::array::from_fn(|_| Default::default()),
             Default::default(), // inherited_level_indents
             &empty_level_bullets(),
             None,

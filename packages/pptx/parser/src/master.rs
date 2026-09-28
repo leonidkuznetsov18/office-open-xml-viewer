@@ -14,13 +14,15 @@ use crate::shape::{
 };
 use crate::text::{
     empty_level_bullets, extract_level_bullets, extract_level_colors, extract_level_faces,
-    extract_level_font_sizes, extract_level_indents, has_any_level_bullet, has_any_level_color,
-    has_any_level_face, has_any_level_indent, has_any_level_size, merge_level_bullets,
-    merge_level_colors, merge_level_faces, merge_level_indents, merge_level_sizes,
+    extract_level_font_sizes, extract_level_indents, extract_level_run_properties_with_rels,
+    has_any_level_bullet, has_any_level_color, has_any_level_face, has_any_level_indent,
+    has_any_level_run_properties, has_any_level_size, merge_level_bullets, merge_level_colors,
+    merge_level_faces, merge_level_indents, merge_level_run_properties, merge_level_sizes,
     paragraph_spacing, read_level_bullets, read_level_colors, read_level_faces,
-    read_level_font_sizes, read_level_indents, resolve_latin_face, text_property_color, BuFont,
-    BuMarker, InheritedBodyPr, LevelBullets, LevelColors, LevelFaces, LevelFontSizes, LevelIndents,
-    ParagraphSpacing, HARD_DEFAULT_FONT_SIZE, HARD_DEFAULT_LATIN_FACE,
+    read_level_font_sizes, read_level_indents, read_level_run_properties_with_rels,
+    resolve_latin_face, text_property_color, BuFont, BuMarker, InheritedBodyPr, LevelBullets,
+    LevelColors, LevelFaces, LevelFontSizes, LevelIndents, LevelRunProperties, ParagraphSpacing,
+    HARD_DEFAULT_FONT_SIZE, HARD_DEFAULT_LATIN_FACE,
 };
 use crate::theme::{
     bake_clr_map, parse_theme_part, PptxSchemeResolver, PptxTheme, PptxThemeSource,
@@ -83,6 +85,9 @@ pub(crate) struct LayoutPlaceholders {
     pub(crate) by_idx_level_colors: HashMap<u32, LevelColors>,
     pub(crate) by_type_level_colors: HashMap<String, LevelColors>,
     pub(crate) by_type_master_level_colors: HashMap<String, LevelColors>,
+    pub(crate) by_idx_level_run_properties: HashMap<u32, LevelRunProperties>,
+    pub(crate) by_type_level_run_properties: HashMap<String, LevelRunProperties>,
+    pub(crate) by_type_master_level_run_properties: HashMap<String, LevelRunProperties>,
     /// Per-list-level paragraph indents (`marL`/`marR`/`indent`, EMU) per
     /// placeholder idx — what a paragraph with no own `marL`/`marR`/`indent`
     /// inherits from the authored list-style cascade (ECMA-376 §21.1.2.4.13),
@@ -417,6 +422,40 @@ impl LayoutPlaceholders {
                 }
             })
             .unwrap_or_else(|| std::array::from_fn(|_| None))
+    }
+
+    pub(crate) fn lookup_level_run_properties(
+        &self,
+        ph_type: &str,
+        ph_idx: Option<u32>,
+    ) -> LevelRunProperties {
+        let empty = || std::array::from_fn(|_| Default::default());
+        if let Some(i) = ph_idx {
+            return self
+                .by_idx_level_run_properties
+                .get(&i)
+                .cloned()
+                .or_else(|| {
+                    self.by_type_master_level_run_properties
+                        .get(ph_type)
+                        .cloned()
+                })
+                .or_else(|| {
+                    (ph_type == "obj")
+                        .then(|| self.by_type_master_level_run_properties.get("").cloned())
+                        .flatten()
+                })
+                .unwrap_or_else(empty);
+        }
+        self.by_type_level_run_properties
+            .get(ph_type)
+            .cloned()
+            .or_else(|| {
+                (ph_type == "body")
+                    .then(|| self.by_type_level_run_properties.get("").cloned())
+                    .flatten()
+            })
+            .unwrap_or_else(empty)
     }
 
     /// Per-list-level inherited paragraph indents (lvl1..lvl9). Same idx-strict
@@ -1243,6 +1282,47 @@ pub(crate) fn parse_master_level_colors(
     specific
 }
 
+/// Per-level CT_TextCharacterProperties from the master placeholder lstStyle
+/// and the class list styles (see `TITLE_CLASS` / `BODY_CLASS` /
+/// `OTHER_CLASS`). Merge each property so a partial master placeholder defRPr
+/// still receives the omitted fields from its class style (§21.1.2.4). The
+/// Latin face and size of these levels are replaced by the resolved chain in
+/// shape.rs.
+pub(crate) fn parse_master_level_run_properties(
+    root: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    master_rels: &HashMap<String, String>,
+    master_dir: &str,
+    default_text_style: Option<roxmltree::Node<'_, '_>>,
+) -> HashMap<String, LevelRunProperties> {
+    let mut specific = HashMap::new();
+    for (ph_type, sp) in master_placeholder_shapes(root) {
+        if let Some(body) = child(sp, "txBody") {
+            let props = extract_level_run_properties_with_rels(body, theme, master_rels)
+                .map(|p| p.with_part_targets(master_dir));
+            if has_any_level_run_properties(&props) {
+                specific.entry(ph_type).or_insert(props);
+            }
+        }
+    }
+    inherit_master_placeholder_classes(&mut specific);
+    // defaultTextStyle lives in presentation.xml, which has no relationships
+    // of its own that a character property could reference.
+    for (style, ph_types) in class_style_nodes(root, default_text_style) {
+        let props = read_level_run_properties_with_rels(style, theme, master_rels)
+            .map(|p| p.with_part_targets(master_dir));
+        if has_any_level_run_properties(&props) {
+            for ph_type in ph_types {
+                specific
+                    .entry((*ph_type).to_owned())
+                    .and_modify(|own| *own = merge_level_run_properties(own, &props))
+                    .or_insert_with(|| props.clone());
+            }
+        }
+    }
+    specific
+}
+
 /// Per-list-level paragraph indents (`marL`/`marR`/`indent`, EMU) from the
 /// master, keyed by ph_type: master placeholder lstStyle, then the class list
 /// style (ECMA-376 §21.1.2.4.13).
@@ -1541,6 +1621,7 @@ pub(crate) fn parse_layout_placeholders(
     default_text: &DefaultTextLevels,
     master_level_font_sizes: &HashMap<String, LevelFontSizes>,
     master_level_colors: &HashMap<String, LevelColors>,
+    master_level_run_properties: &HashMap<String, LevelRunProperties>,
     master_level_indents: &HashMap<String, LevelIndents>,
     master_level_bullets: &HashMap<String, LevelBullets>,
     master_anchors: &HashMap<String, String>,
@@ -1563,6 +1644,7 @@ pub(crate) fn parse_layout_placeholders(
         default_text: default_text.clone(),
         by_type_master_level_sizes: master_level_font_sizes.clone(),
         by_type_master_level_colors: master_level_colors.clone(),
+        by_type_master_level_run_properties: master_level_run_properties.clone(),
         by_type_master_level_indents: master_level_indents.clone(),
         by_type_master_level_bullets: master_level_bullets.clone(),
         by_type_master_anchor: master_anchors.clone(),
@@ -1619,6 +1701,12 @@ pub(crate) fn parse_layout_placeholders(
         let layout_level_colors: LevelColors = child(sp, "txBody")
             .map(|tx_body| extract_level_colors(tx_body, theme))
             .unwrap_or_else(|| std::array::from_fn(|_| None));
+        let layout_level_run_properties = child(sp, "txBody")
+            .map(|tx_body| {
+                extract_level_run_properties_with_rels(tx_body, theme, layout_rels)
+                    .map(|p| p.with_part_targets(layout_dir))
+            })
+            .unwrap_or_else(|| std::array::from_fn(|_| Default::default()));
         // Per-level indents (marL/marR/indent) from the layout placeholder's own
         // lstStyle, the inherited list-indent cascade (ECMA-376 §21.1.2.4.13).
         let layout_level_indents: LevelIndents = child(sp, "txBody")
@@ -1785,6 +1873,18 @@ pub(crate) fn parse_layout_placeholders(
                 if has_any_level_color(&level_colors) {
                     lph.by_idx_level_colors.entry(idx).or_insert(level_colors);
                 }
+                let empty_run = std::array::from_fn(|_| Default::default());
+                let level_run = merge_level_run_properties(
+                    &layout_level_run_properties,
+                    master_level_run_properties
+                        .get(&ph_type)
+                        .unwrap_or(&empty_run),
+                );
+                if has_any_level_run_properties(&level_run) {
+                    lph.by_idx_level_run_properties
+                        .entry(idx)
+                        .or_insert(level_run);
+                }
                 // Per-level indents: layout lstStyle wins per axis/level, else master.
                 let level_indents = merge_level_indents(
                     &layout_level_indents,
@@ -1887,6 +1987,18 @@ pub(crate) fn parse_layout_placeholders(
                 lph.by_type_level_colors
                     .entry(ph_type.clone())
                     .or_insert(type_level_colors);
+            }
+            let empty_run = std::array::from_fn(|_| Default::default());
+            let type_level_run = merge_level_run_properties(
+                &layout_level_run_properties,
+                master_level_run_properties
+                    .get(&ph_type)
+                    .unwrap_or(&empty_run),
+            );
+            if has_any_level_run_properties(&type_level_run) {
+                lph.by_type_level_run_properties
+                    .entry(ph_type.clone())
+                    .or_insert(type_level_run);
             }
             let type_level_indents = merge_level_indents(
                 &layout_level_indents,
@@ -2004,6 +2116,11 @@ pub(crate) fn parse_layout_placeholders(
             .entry(ph_type.clone())
             .or_insert_with(|| value.clone());
     }
+    for (ph_type, value) in master_level_run_properties {
+        lph.by_type_level_run_properties
+            .entry(ph_type.clone())
+            .or_insert_with(|| value.clone());
+    }
     for (ph_type, value) in master_level_indents {
         lph.by_type_level_indents
             .entry(ph_type.clone())
@@ -2098,6 +2215,7 @@ pub(crate) fn parse_layout(
     default_text: &DefaultTextLevels,
     master_level_font_sizes: &HashMap<String, LevelFontSizes>,
     master_level_colors: &HashMap<String, LevelColors>,
+    master_level_run_properties: &HashMap<String, LevelRunProperties>,
     master_level_indents: &HashMap<String, LevelIndents>,
     master_level_bullets: &HashMap<String, LevelBullets>,
     master_anchors: &HashMap<String, String>,
@@ -2128,6 +2246,7 @@ pub(crate) fn parse_layout(
         default_text,
         master_level_font_sizes,
         master_level_colors,
+        master_level_run_properties,
         master_level_indents,
         master_level_bullets,
         master_anchors,
@@ -2197,6 +2316,7 @@ pub(crate) struct ParsedMaster {
     pub(crate) default_text: DefaultTextLevels,
     pub(crate) master_level_font_sizes: HashMap<String, LevelFontSizes>,
     pub(crate) master_level_colors: HashMap<String, LevelColors>,
+    pub(crate) master_level_run_properties: HashMap<String, LevelRunProperties>,
     pub(crate) master_level_indents: HashMap<String, LevelIndents>,
     pub(crate) master_level_bullets: HashMap<String, LevelBullets>,
     pub(crate) master_anchors: HashMap<String, String>,
@@ -2231,6 +2351,7 @@ pub(crate) struct EffectiveMaster {
     pub(crate) master_color: HashMap<String, String>,
     /// Master list-level colours re-resolved against `theme`.
     pub(crate) master_level_colors: HashMap<String, LevelColors>,
+    pub(crate) master_level_run_properties: HashMap<String, LevelRunProperties>,
     /// Master per-level bullet colors re-resolved against `theme`.
     pub(crate) master_level_bullets: HashMap<String, LevelBullets>,
 }
@@ -2334,6 +2455,9 @@ pub(crate) fn build_master_bundle(
     let master_level_colors = master_root
         .map(|root| parse_master_level_colors(root, &theme, dts))
         .unwrap_or_default();
+    let master_level_run_properties = master_root
+        .map(|root| parse_master_level_run_properties(root, &theme, &master_rels, &master_dir, dts))
+        .unwrap_or_default();
     let master_level_indents = master_root
         .map(|root| parse_master_level_indents(root, dts))
         .unwrap_or_default();
@@ -2390,6 +2514,7 @@ pub(crate) fn build_master_bundle(
         default_text,
         master_level_font_sizes,
         master_level_colors,
+        master_level_run_properties,
         master_level_indents,
         master_level_bullets,
         master_anchors,
@@ -2421,6 +2546,70 @@ mod placeholder_geometry_tests {
         PptxZip::new(cursor).unwrap()
     }
 
+    #[test]
+    fn layout_partial_run_defaults_keep_master_pattern_and_other_fields() {
+        let master = r#"<p:sldMaster
+          xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:cSld><p:spTree/></p:cSld><p:txStyles>
+            <p:bodyStyle><a:lvl1pPr><a:defRPr b="0" i="1" sz="3400">
+              <a:pattFill prst="dnDiag"><a:fgClr><a:srgbClr val="D21D54"/></a:fgClr>
+                <a:bgClr><a:srgbClr val="12CED4"/></a:bgClr></a:pattFill>
+            </a:defRPr></a:lvl1pPr></p:bodyStyle>
+          </p:txStyles>
+        </p:sldMaster>"#;
+        let layout = r#"<p:sldLayout
+          xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:cSld><p:spTree><p:sp>
+            <p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/>
+              <p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+            <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle>
+              <a:lvl1pPr><a:defRPr b="1"/></a:lvl1pPr>
+            </a:lstStyle><a:p/></p:txBody>
+          </p:sp></p:spTree></p:cSld>
+        </p:sldLayout>"#;
+        let master_doc = roxmltree::Document::parse(master).unwrap();
+        let layout_doc = roxmltree::Document::parse(layout).unwrap();
+        let theme = HashMap::new();
+        let master_runs = parse_master_level_run_properties(
+            master_doc.root_element(),
+            &theme,
+            &HashMap::new(),
+            "ppt/slideMasters",
+            None,
+        );
+        let mut zip = empty_zip();
+        let placeholders = parse_layout_placeholders(
+            layout_doc.root_element(),
+            &HashMap::new(),
+            &crate::master::DefaultTextLevels::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &master_runs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &theme,
+            "ppt/slideLayouts",
+            &HashMap::new(),
+            &mut zip,
+        );
+        let level = placeholders.lookup_level_run_properties("body", Some(1));
+        let value = serde_json::to_value(&level[0]).unwrap();
+        assert_eq!(value["bold"], true);
+        assert_eq!(value["italic"], true);
+        assert_eq!(value["font_size"], 34.0);
+        assert!(value["fill"].to_string().contains("dnDiag"));
+    }
+
     fn parse_layout_with_master(
         layout_shape: &str,
         master_level_sizes: &HashMap<String, LevelFontSizes>,
@@ -2440,6 +2629,7 @@ mod placeholder_geometry_tests {
             &DefaultTextLevels::default(),
             master_level_sizes,
             &HashMap::<String, LevelColors>::new(),
+            &HashMap::new(),
             &HashMap::<String, LevelIndents>::new(),
             &HashMap::<String, LevelBullets>::new(),
             &HashMap::<String, String>::new(),
@@ -2603,6 +2793,7 @@ mod placeholder_geometry_tests {
             &parse_master_level_faces(root, &theme, None),
             &DefaultTextLevels::default(),
             &parse_master_level_font_sizes(root, None),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &parse_master_level_bullets(
@@ -2791,7 +2982,10 @@ mod placeholder_geometry_tests {
             .collect();
         // "" is Arial; `+mn-lt` naming an empty slot is unspecified and falls
         // to the paragraph's defaultTextStyle face.
-        assert_eq!(run_faces, vec![Some("Arial".to_owned()), None]);
+        assert_eq!(
+            run_faces,
+            vec![Some("Arial".to_owned()), Some("Century Gothic".to_owned())]
+        );
         assert_eq!(paragraph.def_font_family.as_deref(), Some("Century Gothic"));
     }
 
@@ -3059,6 +3253,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &master_bullets,
             &HashMap::new(),
             &HashMap::new(),
@@ -3227,6 +3422,7 @@ mod placeholder_geometry_tests {
             layout_doc.root_element(),
             &HashMap::new(),
             &crate::master::DefaultTextLevels::default(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
