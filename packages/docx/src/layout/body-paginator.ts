@@ -62,6 +62,7 @@ import {
   writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { selectParagraphFragment, type ParagraphFragmentCursor } from './paragraph-pagination.js';
+import { sliceParagraphLayout } from './paragraph.js';
 import { partitionFootnote, type FootnoteCursor } from './footnote-fragmentation.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import {
@@ -1134,6 +1135,41 @@ function* paginateBodyPassSteps(
   const footnoteReserveInvadesCommittedPageContent = (reservePt: number): boolean => (
     reservePt > additionalFootnoteReserveCapacityPt()
   );
+  const noteContinuationEligibilityByEntry = new Map<number, boolean>();
+  const noteContinuationBeforeHardBreak = (entryIndex: number): boolean => {
+    const cached = noteContinuationEligibilityByEntry.get(entryIndex);
+    if (cached !== undefined) return cached;
+    // Word print controls: a pending hard page/section break with no
+    // intervening note allows the preceding completed paragraph's long note
+    // to continue; the intervening-note counterexample keeps it whole.
+    // Cache every traversed entry so the lookahead is linear over the story.
+    const visited = [entryIndex];
+    const finish = (eligible: boolean): boolean => {
+      visited.forEach((index) => noteContinuationEligibilityByEntry.set(index, eligible));
+      return eligible;
+    };
+    for (let index = entryIndex + 1; index < input.sequence.length; index += 1) {
+      const prior = noteContinuationEligibilityByEntry.get(index);
+      if (prior !== undefined) return finish(prior);
+      const next = input.sequence[index]!;
+      if (next.kind === 'authored-break' && next.break !== 'column') return finish(true);
+      if (next.kind === 'begin-section' && next.section.startType !== 'continuous') return finish(true);
+      const block = next.kind === 'body-block' ? next.block
+        : next.kind === 'adjacent-table-group' ? next : null;
+      if (block?.kind === 'paragraph' && block.pageBreakBefore) return finish(true);
+      if (block) {
+        const location = acquisitionLocation(state);
+        const measurement = session.measureFollowingBlock({
+          input: block,
+          location,
+          availableInlineExtentPt: location.availableBounds.widthPt,
+        });
+        if ((measurement.fullFootnoteReferenceIds?.length ?? 0) > 0) return finish(false);
+      }
+      visited.push(index);
+    }
+    return finish(false);
+  };
   let previousParagraph: BodyParagraphSourceInput | null = null;
   const activeColumnBreakIndexes = wordActiveColumnBreakIndexes(input.sequence);
   let terminalDiagnostic: LayoutDiagnostic | null = null;
@@ -1534,6 +1570,43 @@ function* paginateBodyPassSteps(
             markBelowBaselinePt: acquired.markBelowBaselinePt ?? 0,
             markOnLineGrid: acquired.markOnLineGrid === true,
           });
+        const firstNoteLine = acquired.layout.lines.findIndex((line) => line.placements
+          .some((placement) => placement.kind === 'text'
+            && placement.noteReference?.kind === 'footnote'));
+        let textAfterReference = false;
+        let passedReference = false;
+        for (const line of acquired.layout.lines) {
+          for (const placement of line.placements) {
+            if (placement.kind !== 'text') continue;
+            if (placement.noteReference?.kind === 'footnote') passedReference = true;
+            else if (passedReference && placement.text.trim().length > 0) textAfterReference = true;
+          }
+        }
+        const firstNoteFragment = firstNoteLine < 0 || acquired.fragmentation.kind === 'indivisible'
+          ? acquired.layout
+          : sliceParagraphLayout(acquired.layout, {
+              lineStart: 0,
+              lineEnd: firstNoteLine + 1,
+              continuesFromPrevious: cursor.boundary !== null,
+              continuesOnNext: firstNoteLine + 1 < acquired.layout.lines.length,
+            });
+        const fullNoteReservePt = firstNoteLine < 0 ? 0
+          : footnoteAdmission(firstNoteFragment, location.availableBounds.widthPt).reservePt;
+        const wholeNoteFitsWithReference = firstNoteLine >= 0
+          && firstNoteFragment.advancePt + fullNoteReservePt <= location.availableBounds.heightPt
+          && !footnoteReserveInvadesCommittedPageContent(fullNoteReservePt);
+        // Word controls: a full note that fits with its first retained reference
+        // line stays intact; a longer note with following text can continue.
+        // At a nearby hard break Word also continues a completed paragraph's
+        // long note instead of creating a mostly empty intermediate page.
+        // If even a fresh page cannot carry the first reference line with the
+        // complete note, continuation is required to retain all note text.
+        const wholeNoteFitsFreshPage = firstNoteFragment.advancePt + fullNoteReservePt
+          <= freshPageExtent(state);
+        const allowNoteContinuation = services.allowFootnoteContinuation === true
+          && firstNoteLine >= 0 && !wholeNoteFitsWithReference
+          && (!wholeNoteFitsFreshPage || textAfterReference
+            || noteContinuationBeforeHardBreak(entryIndex));
         const selected = selectParagraphFragment(
           acquired.layout,
           cursor,
@@ -1551,10 +1624,10 @@ function* paginateBodyPassSteps(
             fragment,
             location.availableBounds.widthPt,
             undefined,
-            Math.max(0, Math.min(
+            allowNoteContinuation ? Math.max(0, Math.min(
               location.availableBounds.heightPt - fragment.advancePt,
               additionalFootnoteReserveCapacityPt(),
-            )),
+            )) : undefined,
           ).reservePt,
           acquired.uniformRubyAdvancePt,
           (reservePt) => !footnoteReserveInvadesCommittedPageContent(reservePt),
@@ -1582,10 +1655,10 @@ function* paginateBodyPassSteps(
           selected.fragment,
           location.availableBounds.widthPt,
           undefined,
-          Math.max(0, Math.min(
+          allowNoteContinuation ? Math.max(0, Math.min(
             location.availableBounds.heightPt - selected.fragment.advancePt,
             additionalFootnoteReserveCapacityPt(),
-          )),
+          )) : undefined,
         );
         assertFreshPageFootnoteAdmission(
           notes.reservePt,
