@@ -3033,8 +3033,7 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_level_indents,
                 layout_master_bullets,
                 &bundle.master_anchors,
-                &bundle.master_text_insets,
-                &bundle.master_auto_fit,
+                &bundle.master_body_pr,
                 &bundle.master_transforms,
                 &bundle.master_alignments,
                 &bundle.master_ea_ln_brk,
@@ -6217,8 +6216,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -6302,7 +6299,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             "",
             &HashMap::new(),
             &mut zip,
@@ -6372,7 +6368,6 @@ mod tests {
                 &m_lb,
                 &m_str,
                 &HashMap::new(),
-                &m_str,
                 &m_tf,
                 &m_str,
                 &m_bool,
@@ -6797,7 +6792,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -6833,8 +6827,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            ShapeKind::Sp,
             &mut zip,
         );
         assert_eq!(body.paragraphs[0].def_color.as_deref(), Some("505050"));
@@ -7258,14 +7250,12 @@ mod tests {
                 None, // inherited_caps
                 None, // inherited_reflection
                 None, // inherited_anchor
-                None, // inherited_text_insets
-                None, // inherited_auto_fit
+                None, // inherited_body_pr
                 None, // inherited_alignment
                 None, // inherited_ea_ln_brk
                 None, // inherited_space_before
                 None, // inherited_space_after
                 None, // inherited_line_spacing
-                ShapeKind::Sp,
                 &mut zip,
             )
         };
@@ -7351,8 +7341,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                ShapeKind::Sp,
                 &mut zip,
             )
         };
@@ -7438,8 +7426,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -7529,8 +7515,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -7605,11 +7589,9 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 inherited,
                 inherited,
                 None,
-                ShapeKind::Sp,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
