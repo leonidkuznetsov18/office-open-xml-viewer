@@ -9,20 +9,27 @@ const SCHEMA_VERSION = 1;
 // Bootstrap-only exception for running the current VRT harness against an old
 // renderer commit that predates the harness. No renderer/parser source is
 // allowed in this set. Future baselines should be clean and need no exception.
+// The package Vite configs are listed only because they hold the
+// `@ooxml-test-*` aliases through which the fixtures load optional renderers
+// (for example ChartEx). A bootstrap diff there must be limited to those
+// aliases.
 const VRT_HARNESS_PATHS = new Set([
   'package.json',
   'packages/docx/package.json',
   'packages/docx/playwright.config.ts',
   'packages/docx/tests/visual/fixture.html',
+  'packages/docx/vite.config.ts',
   'packages/docx/tests/visual/stable-canvas-render.mjs',
   'packages/docx/tests/visual/visual.spec.ts',
   'packages/xlsx/package.json',
   'packages/xlsx/playwright.config.ts',
   'packages/xlsx/tests/visual/fixture.html',
+  'packages/xlsx/vite.config.ts',
   'packages/xlsx/tests/visual/visual.spec.ts',
   'packages/pptx/package.json',
   'packages/pptx/playwright.config.ts',
   'packages/pptx/tests/visual/fixture.html',
+  'packages/pptx/vite.config.ts',
   'packages/pptx/tests/visual/visual.spec.ts',
   'tests/visual/private-corpus.mjs',
 ]);
