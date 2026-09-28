@@ -158,12 +158,21 @@ fn project_table(
     // -500/0/+500 twips move the physical left edge by the *negative* of the
     // preference; the zero control equals the unmodified table. The DOCX
     // table model's tblInd applies that same leading-edge rule for bidiVisual.
-    // For LTR native tables, separately controlled TDxaLeft/GapHalf remains
-    // the physical placement source (see PreferredIndent).
+    // For LTR native tables, TDxaLeft/GapHalf remains the physical placement
+    // source for nonnegative preferences (see PreferredIndent). With a
+    // negative dxa preferred indent, Word's DOC-to-DOCX save preserves the
+    // signed preference and places the table into the leading margin; controls
+    // at -10/-5/0 twips distinguish this from the positive grid origin.
     let table_indent = if first_bidi {
         match first_preferred_indent {
             Some(PreferredIndent::Dxa(value)) => i32::from(value),
             _ => plan.origin,
+        }
+    } else if let Some(PreferredIndent::Dxa(value)) = first_preferred_indent {
+        if value < 0 {
+            i32::from(value)
+        } else {
+            plan.origin
         }
     } else {
         plan.origin
