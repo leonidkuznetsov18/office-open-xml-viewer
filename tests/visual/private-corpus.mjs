@@ -91,6 +91,13 @@ function baselineRevision(snapshot = false) {
         );
       }
       for (const path of changed.filter((changedPath) => changedPath.endsWith('vite.config.ts'))) {
+        // An untracked config has no HEAD version to diff against, so its
+        // whole content would escape the alias-only bound.
+        if (untracked.includes(path)) {
+          throw new Error(
+            `private self-VRT harness bootstrap cannot add an untracked ${path}`,
+          );
+        }
         const violations = harnessBootstrapDiffViolations(execFileSync(
           'git', ['diff', '-U0', 'HEAD', '--', path], { cwd: root, encoding: 'utf8' },
         ));
