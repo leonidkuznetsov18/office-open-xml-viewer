@@ -5,8 +5,8 @@
 //! `children_vec`, `attr`, `attr_r`, `attr_i64`, `attr_f64`, `resolve_path`)
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
-use crate::fill::{parse_color_node, parse_reflection, parse_shadow};
-use crate::theme::resolve_theme_typeface;
+use crate::fill::{parse_color_node, parse_fill, parse_reflection, parse_shadow};
+use crate::theme::{resolve_theme_typeface, PptxSchemeResolver};
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
 use ooxml_common::blip::mime_from_ext;
@@ -513,6 +513,34 @@ pub(crate) fn text_property_color(
         }
         _ => None,
     }
+}
+
+fn text_property_pattern_fill(
+    properties: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> Option<Fill> {
+    let choice = text_property_fill(properties)?;
+    if choice.tag_name().name() != "pattFill" {
+        return None;
+    }
+    let pattern = ooxml_common::fill::parse_patt_fill(
+        choice,
+        &PptxSchemeResolver { theme },
+        ooxml_common::color::TintMode::PowerPointLinear,
+    );
+    Some(Fill::Pattern {
+        fg: pattern.fg,
+        bg: pattern.bg,
+        preset: pattern.preset,
+    })
+}
+
+fn underline_fill_choice<'a, 'input>(
+    properties: roxmltree::Node<'a, 'input>,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    properties
+        .children()
+        .find(|node| node.is_element() && matches!(node.tag_name().name(), "uFill" | "uFillTx"))
 }
 
 // Carries the resolved master/layout/placeholder inheritance context (theme,
@@ -1139,6 +1167,7 @@ pub(crate) fn parse_paragraph(
                 let r_pr = child(node, "rPr");
                 let font_size = r_pr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
                 let color = r_pr.and_then(|n| text_property_color(n, theme));
+                let pattern_fill = r_pr.and_then(|n| text_property_pattern_fill(n, theme));
                 let bold = r_pr
                     .and_then(|n| attr(&n, "b"))
                     .map(|v| v == "1" || v == "true");
@@ -1161,10 +1190,12 @@ pub(crate) fn parse_paragraph(
                     underline: false,
                     underline_style: None,
                     underline_color: None,
+                    underline_fill: None,
                     strikethrough: false,
                     strike_double: false,
                     font_size,
                     color,
+                    pattern_fill,
                     font_family,
                     font_family_ea: None,
                     font_family_sym: None,
@@ -1177,6 +1208,7 @@ pub(crate) fn parse_paragraph(
                         None
                     },
                     hyperlink: None,
+                    hyperlink_uses_text_fill: false,
                     hyperlink_action: None,
                     shadow: None,
                     reflection: match r_pr.and_then(|n| child(n, "effectLst")) {
@@ -1453,13 +1485,19 @@ fn parse_run_with_reflection(
         .unwrap_or(false);
     let underline_style = underline_attr.filter(|v| v != "none" && v != "sng");
 
-    // ECMA-376 §21.1.2.3.12 — uFill specifies a per-underline colour that
-    // overrides the text colour. uFillTx (or absence) means "follow text".
-    let underline_color = r_pr
-        .and_then(|n| child(n, "uFill"))
-        .or_else(|| def_rpr.and_then(|n| child(n, "uFill")))
-        .and_then(|n| child(n, "solidFill"))
-        .and_then(|n| parse_color_node(n, theme));
+    // ECMA-376 §21.1.2.3.12–13: uFill is a complete EG_FillProperties choice;
+    // uFillTx follows the glyph paint. An explicit run-level uFillTx must also
+    // override an inherited defRPr uFill. PowerPoint PDF confirms patterned
+    // glyph/underline paint, a separately patterned underline, and solid uFill.
+    let underline_fill = r_pr
+        .and_then(underline_fill_choice)
+        .or_else(|| def_rpr.and_then(underline_fill_choice))
+        .filter(|node| node.tag_name().name() == "uFill")
+        .and_then(|node| parse_fill(node, theme));
+    let underline_color = match &underline_fill {
+        Some(Fill::Solid { color }) => Some(color.clone()),
+        _ => None,
+    };
 
     // strikethrough: "sngStrike" or "dblStrike" → true; double tracked separately
     let strike_attr = r_pr
@@ -1497,6 +1535,13 @@ fn parse_run_with_reflection(
     let color = r_pr
         .and_then(|n| text_property_color(n, theme))
         .or_else(|| def_rpr.and_then(|n| text_property_color(n, theme)));
+    // The first authored fill choice wins. A run-local solid/noFill must not
+    // inherit a patterned defRPr; text_property_fill enforces DrawingML order.
+    let pattern_fill = r_pr
+        .and_then(text_property_fill)
+        .or_else(|| def_rpr.and_then(text_property_fill))
+        .filter(|n| n.tag_name().name() == "pattFill")
+        .and_then(|n| text_property_pattern_fill(n.parent()?, theme));
 
     let font_family = r_pr
         .and_then(|n| child(n, "latin"))
@@ -1555,6 +1600,20 @@ fn parse_run_with_reflection(
     let hyperlink_action = hlink_click
         .and_then(|h| attr(&h, "action"))
         .filter(|s| !s.is_empty());
+    // Office's hyperlink-colour extension is written when an authored text
+    // fill is reapplied after creating the link. Without hlinkClr="tx", the
+    // same pattFill XML is displayed in the hyperlink theme colour instead.
+    // Observed with PowerPoint-saved pattern text before/after reapplying the
+    // fill; the extension is intentionally scoped to run hyperlinks.
+    let hyperlink_uses_text_fill = hlink_click.is_some_and(|h| {
+        h.descendants().any(|n| {
+            n.is_element()
+                && n.tag_name().name() == "hlinkClr"
+                && n.tag_name().namespace()
+                    == Some("http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor")
+                && n.attribute("val") == Some("tx")
+        })
+    });
 
     // ECMA-376 §20.1.8.45 — `<a:rPr><a:effectLst><a:outerShdw>` glyph drop
     // shadow. Reuse the shape-level outerShdw reader so parse semantics
@@ -1575,13 +1634,21 @@ fn parse_run_with_reflection(
     // ECMA-376 §20.1.2.2.24 (CT_TextOutlineEffect) — `<a:rPr><a:ln w="..">`
     // strokes each glyph outline. `<a:noFill>` inside the ln means "no
     // visible outline" — skip in that case so the renderer doesn't draw a
-    // black box around every glyph. Pull color from solidFill if present.
+    // black box around every glyph. a:ln contains EG_LineFillProperties, so
+    // retain its full fill choice (solid, gradient or preset pattern).
     let outline = r_pr
         .and_then(|n| child(n, "ln"))
         .filter(|ln| child(*ln, "noFill").is_none())
-        .map(|ln| TextOutline {
-            width: attr_i64(&ln, "w").unwrap_or(0),
-            color: child(ln, "solidFill").and_then(|n| parse_color_node(n, theme)),
+        .map(|ln| {
+            let fill = parse_fill(ln, theme);
+            TextOutline {
+                width: attr_i64(&ln, "w").unwrap_or(0),
+                color: match &fill {
+                    Some(Fill::Solid { color }) => Some(color.clone()),
+                    _ => None,
+                },
+                fill,
+            }
         });
 
     // ECMA-376 §21.1.2.3.4 — `<a:rPr><a:highlight>` text highlight (marker).
@@ -1607,10 +1674,12 @@ fn parse_run_with_reflection(
         underline,
         underline_style,
         underline_color,
+        underline_fill,
         strikethrough,
         strike_double,
         font_size,
         color,
+        pattern_fill,
         font_family,
         font_family_ea,
         font_family_sym,
@@ -1619,6 +1688,7 @@ fn parse_run_with_reflection(
         letter_spacing,
         field_type: None,
         hyperlink,
+        hyperlink_uses_text_fill,
         hyperlink_action,
         shadow,
         reflection,

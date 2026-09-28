@@ -4587,14 +4587,14 @@ function drawShape(
       // stroke flag. `fill="none"` leaves the path unfilled and `stroke="0"`
       // unstroked. The lighten/darken modes shade the fill by the amounts
       // measured from PowerPoint's output (shared with the preset engine).
-      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh)) {
+      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh, cs)) {
         const overlay = pathFillModeOverlay(path.fill);
         if (overlay) {
           ctx.fillStyle = overlay;
           ctx.fill();
         }
       }
-      if (path.stroke !== false) strokeShapePath(ctx, shape, sw, sh);
+      if (path.stroke !== false) strokeShapePath(ctx, shape, sw, sh, cs);
     }
   } else if (shape.geom.type === 'preset') {
     // Drive the shape off the ECMA-376 §20.1.9 spec-driven preset engine
@@ -4613,9 +4613,11 @@ function drawShape(
       sw,
       sh,
       shape.rot,
+      PT_TO_PX * cs,
+      axisAlignedPatternTransform(shape, sw, sh),
     );
     const applyAndStroke = shape.strokeColor && shape.strokeWidth > 0
-      ? () => strokeShapePath(ctx, shape, sw, sh)
+      ? () => strokeShapePath(ctx, shape, sw, sh, cs)
       : null;
     const drawn = renderPresetShape(
       ctx,
@@ -4634,7 +4636,7 @@ function drawShape(
     if (!drawn) {
       ctx.beginPath();
       ctx.rect(0, 0, sw, sh);
-      fillAndStroke(ctx, shape, sw, sh);
+      fillAndStroke(ctx, shape, sw, sh, cs);
     }
   } else if (shape.geom.type === 'image') {
     // Image leaf inside a group (e.g. a sun-emoji clip-art nested in the
@@ -5204,9 +5206,37 @@ function fillAndStroke(
   shape: ShapeInfo,
   width: number,
   height: number,
+  cs: number,
 ): void {
-  fillShape(ctx, shape, width, height);
-  strokeShapePath(ctx, shape, width, height);
+  fillShape(ctx, shape, width, height, cs);
+  strokeShapePath(ctx, shape, width, height, cs);
+}
+
+/** Excel's printed DrawingML pattern stays on the page axes through shape
+ * rotation, reflection and a rotated group. The fill itself is phased from
+ * the unrotated shape anchor. Counter-transform only the pattern coordinates;
+ * the shape geometry continues to follow the authored transform. The six
+ * baseline/rotation/flip/group controls all exported an axis-aligned 8 pt PDF
+ * tile, including the rotated and reflected cases. */
+function axisAlignedPatternTransform(
+  shape: ShapeInfo,
+  width: number,
+  height: number,
+): DOMMatrix2DInit | undefined {
+  if (shape.rot === 0 && !shape.flipH && !shape.flipV) return undefined;
+  const angle = shape.rot * Math.PI / 180;
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  const fx = shape.flipH ? -1 : 1;
+  const fy = shape.flipV ? -1 : 1;
+  // Inverse of the local centre rotation/reflection used by drawShape.
+  const a = fx * cosine;
+  const b = -fy * sine;
+  const c = fx * sine;
+  const d = fy * cosine;
+  const cx = width / 2;
+  const cy = height / 2;
+  return { a, b, c, d, e: cx - a * cx - c * cy, f: cy - b * cx - d * cy };
 }
 
 /** Fill the current path with the shape fill; returns whether it painted. */
@@ -5215,11 +5245,21 @@ function fillShape(
   shape: ShapeInfo,
   width: number,
   height: number,
+  cs: number,
 ): boolean {
   const fill = shape.fill ?? (shape.fillColor
     ? { fillType: 'solid' as const, color: shape.fillColor }
     : null);
-  const paint = resolveFill(fill, ctx, 0, 0, width, height, shape.rot);
+  // Excel's direct PDF export uses the same 8 pt tile artwork and cell size
+  // as PowerPoint, but its print pattern matrix starts at each shape's X and
+  // an 8 pt grid measured from the PDF page bottom. The sheet viewer has no
+  // print-page origin, so its phase is anchored to this local shape frame.
+  // One point is 4/3 CSS pixels at native zoom; cellScale changes the sheet
+  // coordinate system without an additional canvas scale for shape painting.
+  const paint = resolveFill(
+    fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
+    axisAlignedPatternTransform(shape, width, height),
+  );
   if (!paint) return false;
   ctx.fillStyle = paint;
   ctx.fill();
@@ -5249,12 +5289,16 @@ function strokeShapePath(
   shape: ShapeInfo,
   width: number,
   height: number,
+  cs: number,
 ): void {
   const stroke = shapeStroke(shape);
   if (!stroke) return;
   applyStroke(ctx, stroke, 1 / EMU_PER_PX);
   if (stroke.fill) {
-    const paint = resolveFill(stroke.fill, ctx, 0, 0, width, height, shape.rot);
+    const paint = resolveFill(
+      stroke.fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
+      axisAlignedPatternTransform(shape, width, height),
+    );
     if (paint) ctx.strokeStyle = paint;
   }
   ctx.stroke();
@@ -5619,6 +5663,11 @@ function renderCharts(
       regionMap,
       fill => loadedImages?.get(chartImageFillKey(fill)),
       chartEx,
+      // Excel PDF controls at 75/100/200% view zoom and two scroll positions
+      // retain the same page-grid tile matrix. Moving the chart 5 pt moves its
+      // fill rectangle but leaves that matrix fixed. Keep the chart pattern on
+      // the viewport grid (the existing main policy), while the CTM above
+      // scales each cell with worksheet zoom on screen.
     );
     ctx.restore();
     ctx.restore();

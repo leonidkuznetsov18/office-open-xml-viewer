@@ -28,7 +28,7 @@ export function drawUnderline(
   baseline: number,
   width: number,
   sizePx: number,
-  color: string,
+  color: string | CanvasGradient | CanvasPattern,
   style: string | undefined,
   dpr = 1,
 ): void {

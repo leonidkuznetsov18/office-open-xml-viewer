@@ -4544,6 +4544,21 @@ mod tests {
         let parsed = parse_run(r_node, None, &theme, &rels).expect("run should parse");
         assert_eq!(parsed.hyperlink.as_deref(), Some("https://example.com/"));
         assert!(parsed.hyperlink_action.is_none());
+        assert!(!parsed.hyperlink_uses_text_fill);
+    }
+
+    /// PowerPoint's hlinkClr="tx" extension is written after a text pattern
+    /// is reapplied to a linked run. It preserves the run fill; its absence
+    /// leaves the hyperlink theme colour in effect despite pattFill in rPr.
+    #[test]
+    fn test_parse_run_hyperlink_text_fill_extension() {
+        let xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:ah="http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor"><rPr><pattFill prst="pct50"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill><hlinkClick r:id="rId7"><extLst><ext uri="{A12FA001-AC4F-418D-AE19-62706E023703}"><ah:hlinkClr val="tx"/></ext></extLst></hlinkClick></rPr><t>Linked pattern</t></r>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut rels = HashMap::new();
+        rels.insert("rId7".to_owned(), "https://example.com/".to_owned());
+        let parsed = parse_run(doc.root_element(), None, &HashMap::new(), &rels).unwrap();
+        assert!(parsed.pattern_fill.is_some());
+        assert!(parsed.hyperlink_uses_text_fill);
     }
 
     /// A run without hlinkClick should have hyperlink = None.
@@ -4686,6 +4701,72 @@ mod tests {
         let invalid_doc = roxmltree::Document::parse(invalid).unwrap();
         let invalid_run = parse_run(invalid_doc.root_element(), None, &theme, &rels).unwrap();
         assert_eq!(invalid_run.color, None);
+    }
+
+    /// ECMA-376 §21.1.2.3.9 permits a:patFill in the text run fill choice.
+    /// A direct solid choice suppresses an inherited patterned defRPr.
+    #[test]
+    fn test_parse_run_preserves_patterned_glyph_fill_and_precedence() {
+        let xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><pattFill prst="horz"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill></rPr><t>text</t></r>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let theme = HashMap::new();
+        let rels = HashMap::new();
+        let run = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(
+            matches!(run.pattern_fill, Some(Fill::Pattern { ref preset, ref fg, ref bg })
+            if preset == "horz" && fg == "D21D54" && bg == "12CED4")
+        );
+
+        let default_xml = r#"<defRPr xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><pattFill prst="dnDiag"/></defRPr>"#;
+        let default_doc = roxmltree::Document::parse(default_xml).unwrap();
+        let inherited = parse_run(
+            doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(
+            matches!(inherited.pattern_fill, Some(Fill::Pattern { ref preset, .. }) if preset == "horz")
+        );
+
+        let solid_xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><solidFill><srgbClr val="000000"/></solidFill></rPr><t>text</t></r>"#;
+        let solid_doc = roxmltree::Document::parse(solid_xml).unwrap();
+        let override_run = parse_run(
+            solid_doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(override_run.pattern_fill.is_none());
+    }
+
+    #[test]
+    fn text_outline_keeps_its_own_pattern_or_gradient_fill() {
+        let theme = HashMap::new();
+        let rels = HashMap::new();
+        let pattern_xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr>
+          <solidFill><srgbClr val="101010"/></solidFill><ln w="50800"><pattFill prst="dnDiag">
+          <fgClr><srgbClr val="00A650"/></fgClr><bgClr><srgbClr val="FF8800"/></bgClr>
+          </pattFill></ln></rPr><t>O</t></r>"#;
+        let doc = roxmltree::Document::parse(pattern_xml).unwrap();
+        let run = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert_eq!(run.color.as_deref(), Some("101010"));
+        assert!(
+            matches!(run.outline.and_then(|o| o.fill), Some(Fill::Pattern { preset, fg, bg })
+            if preset == "dnDiag" && fg == "00A650" && bg == "FF8800")
+        );
+
+        let gradient_xml = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr>
+          <ln w="50800"><gradFill><gsLst><gs pos="0"><srgbClr val="00A650"/></gs>
+          <gs pos="100000"><srgbClr val="FF8800"/></gs></gsLst><lin ang="0"/></gradFill></ln>
+          </rPr><t>O</t></r>"#;
+        let doc = roxmltree::Document::parse(gradient_xml).unwrap();
+        let run = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(
+            matches!(run.outline.and_then(|o| o.fill), Some(Fill::Gradient { stops, .. }) if stops.len() == 2)
+        );
     }
 
     #[test]
@@ -5566,6 +5647,29 @@ mod tests {
         let with_ufilltx = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><uFillTx/></rPr><t>x</t></r>"#;
         let doc = roxmltree::Document::parse(with_ufilltx).unwrap();
         let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(r.underline_color.is_none());
+
+        let with_pattern = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><pattFill prst="pct50"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill><uFill><pattFill prst="dnDiag"><fgClr><srgbClr val="00A650"/></fgClr><bgClr><srgbClr val="F5A623"/></bgClr></pattFill></uFill></rPr><t>x</t></r>"#;
+        let doc = roxmltree::Document::parse(with_pattern).unwrap();
+        let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(
+            matches!(r.underline_fill, Some(Fill::Pattern { preset, .. }) if preset == "dnDiag")
+        );
+
+        let inherited = r#"<defRPr xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><uFill><solidFill><srgbClr val="FF0000"/></solidFill></uFill></defRPr>"#;
+        let default_doc = roxmltree::Document::parse(inherited).unwrap();
+        let doc = roxmltree::Document::parse(with_ufilltx).unwrap();
+        let r = parse_run(
+            doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(
+            r.underline_fill.is_none(),
+            "explicit uFillTx overrides inherited uFill"
+        );
         assert!(r.underline_color.is_none());
     }
 
