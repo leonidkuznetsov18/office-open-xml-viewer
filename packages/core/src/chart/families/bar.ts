@@ -2076,8 +2076,9 @@ export function renderBarChart(
               { linkedNoStyleFallback: true },
             );
             if (!applyResolvedChartExLineStyle(
+              // No bounds: structured Pareto line paint stays solid, as on
+              // main, because the paint-work budget does not count it.
               target, { ...paretoLine, semanticFallback: false }, ptToPx,
-              { x: px0, y: py0, w: pw, h: ph }, shapeRotationDeg,
             )) return;
             strokeOverlayRuns(target);
             return;
