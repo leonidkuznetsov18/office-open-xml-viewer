@@ -369,6 +369,8 @@ export interface Paragraph {
    */
   rtl?: boolean;
   runs: TextRun[];
+  /** Effective endParaRPr insertion formatting; never paints over existing runs. */
+  endRunProperties?: TextRunData;
 }
 
 export type TextRun = TextRunData | LineBreak | EquationRun;
@@ -417,6 +419,10 @@ export interface TextRunData {
   underlineColor?: string;
   /** Explicit DrawingML rPr > uFill paint; uFillTx follows the glyph fill. */
   underlineFill?: Fill;
+  /** Explicit a:uLn line width/paint, independent of the glyph fill. */
+  underlineLine?: TextOutline;
+  /** Explicit a:uLn/a:noFill suppresses the underline stroke. */
+  underlineLineNoFill?: boolean;
   /** True when rPr strike is sngStrike or dblStrike. */
   strikethrough: boolean;
   /**
@@ -430,6 +436,8 @@ export interface TextRunData {
   color: string | null;
   /** Patterned glyph fill from DrawingML rPr/defRPr (ECMA-376 §21.1.2.3.9). */
   patternFill?: PatternFill;
+  /** Complete resolved DrawingML glyph-fill choice; patternFill remains the canvas adapter. */
+  glyphFill?: Fill;
   /** Explicit DrawingML text noFill hides glyphs but preserves advance. */
   noFill?: boolean;
   fontFamily: string | null;
@@ -439,6 +447,8 @@ export interface TextRunData {
    * present; absent means CJK falls back to fontFamily.
    */
   fontFamilyEa?: string;
+  /** Complex-script font from rPr > cs, after the DrawingML style cascade. */
+  fontFamilyCs?: string;
   /**
    * Symbol font family from rPr > a:sym (ECMA-376 §21.1.2.3.10), resolved
    * through the theme. PowerPoint stores symbol-font glyphs as Private-Use
@@ -479,6 +489,10 @@ export interface TextRunData {
    * when the hlinkClick has no @action. ECMA-376 §21.1.2.3.5. (IX1)
    */
   hyperlinkAction?: string;
+  /** Resolved inherited a:hlinkMouseOver target, if present. */
+  hyperlinkMouseOver?: string;
+  /** a:hlinkMouseOver action, independently inherited from click navigation. */
+  hyperlinkMouseOverAction?: string;
   /**
    * Run-level drop shadow on glyphs (`<a:rPr><a:effectLst><a:outerShdw>`),
    * ECMA-376 §20.1.8.45. Independent of the shape-level shadow on `spPr`.
@@ -509,6 +523,10 @@ export interface TextRunData {
    * Absent means no highlight.
    */
   highlight?: string;
+  /** Effective CT_TextCharacterProperties attributes, including inherited ones. */
+  characterAttributes?: Record<string, string>;
+  /** Effective direct child attributes after schema-choice and per-attribute merge. */
+  characterChildAttributes?: Record<string, Record<string, string>>;
 }
 
 /** Run-level glyph outline. Width is in OOXML EMU (12700 EMU = 1 pt). */
@@ -522,6 +540,14 @@ export interface TextOutline {
 
 export interface LineBreak {
   type: 'break';
+  /** Effective a:br/rPr size in points for the break's line box. */
+  fontSize?: number;
+  fontFamily?: string;
+  bold?: boolean;
+  italic?: boolean;
+  /** Effective character metadata carried by an authored a:br/rPr. */
+  characterAttributes?: Record<string, string>;
+  characterChildAttributes?: Record<string, Record<string, string>>;
 }
 
 export interface RenderOptions {

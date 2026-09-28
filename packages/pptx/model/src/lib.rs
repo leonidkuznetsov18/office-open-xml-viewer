@@ -8,6 +8,7 @@ use ooxml_common::drawing::{DrawingGroupSpec, DrawingGroupTransform, DrawingRect
 use ooxml_common::math::MathNode;
 use ooxml_common::text::SpaceLine;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // Chart data-model structs now live in `ooxml_common::chart` (the Rust mirror
 // of core's TS `ChartModel`). The parser builds a `ChartModel` and emits it as
@@ -1156,6 +1157,10 @@ pub struct Paragraph {
     /// `alignment`, so the renderer receives the effective value.
     pub ea_ln_brk: bool,
     pub runs: Vec<TextRun>,
+    /// Formatting at the insertion point after the last character.  It is
+    /// never merged into existing a:r/a:fld runs (ECMA-376 §21.1.2.2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_run_properties: Option<Box<TextRunData>>,
 }
 
 // serde-facing parser output enum; same rationale as SlideElement — the Text
@@ -1166,7 +1171,23 @@ pub struct Paragraph {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TextRun {
     Text(TextRunData),
-    Break,
+    /// CT_TextLineBreak.rPr formats the break's line box.  It is separate from
+    /// endParaRPr, which describes the trailing insertion point.
+    #[serde(rename_all = "camelCase")]
+    Break {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        font_size: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        font_family: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bold: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        italic: Option<bool>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        character_attributes: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        character_child_attributes: BTreeMap<String, BTreeMap<String, String>>,
+    },
     /// An OMML equation embedded in the paragraph (ECMA-376 §22.1). PowerPoint
     /// stores these as `a14:m` inside `mc:AlternateContent`. `display` is true
     /// for `m:oMathPara` (block) math, false for inline `m:oMath`.
@@ -1208,6 +1229,11 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.12–13 (EG_TextUnderlineFill).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underline_fill: Option<Fill>,
+    /// a:uLn line style, separately inherited from a:uFill and glyph fill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline_line: Option<TextOutline>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline_line_no_fill: bool,
     /// true when strike == "sngStrike" or "dblStrike"
     pub strikethrough: bool,
     /// true only when strike == "dblStrike" (renderer draws two parallel lines)
@@ -1218,6 +1244,11 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.9 permits a DrawingML fill choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern_fill: Option<Fill>,
+    /// Complete inherited DrawingML glyph fill choice.  The canvas currently
+    /// paints solid/pattern/noFill; retaining the authored gradient/blip/group
+    /// choice prevents the parser from silently losing the style cascade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glyph_fill: Option<Fill>,
     /// Explicit noFill suppresses glyphs while retaining advance.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_fill: bool,
@@ -1227,6 +1258,9 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.3 (CT_TextFont, ea variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family_ea: Option<String>,
+    /// Complex-script face from a:cs, after the run-property cascade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family_cs: Option<String>,
     /// Symbol font family from rPr > sym (resolved through the theme).
     /// Renderer uses this for symbol-range PUA glyphs (U+F0xx).
     /// ECMA-376 §21.1.2.3.10 (CT_TextFont, sym variant).
@@ -1264,6 +1298,11 @@ pub struct TextRunData {
     /// None when the hlinkClick has no @action. ECMA-376 §21.1.2.3.5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hyperlink_action: Option<String>,
+    /// Mouse-over hyperlink target from the inherited hlinkMouseOver child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyperlink_mouse_over: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hyperlink_mouse_over_action: Option<String>,
     /// ECMA-376 §20.1.8.45 (CT_OuterShadowEffect) — drop shadow on this run's
     /// glyphs from `<a:rPr><a:effectLst><a:outerShdw>`. Distinct from the
     /// shape-level shadow on `spPr`. None = no shadow on the run.
@@ -1288,6 +1327,15 @@ pub struct TextRunData {
     /// highlight; renderer draws no background box.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight: Option<String>,
+    /// Resolved CT_TextCharacterProperties attributes (editing diagnostics
+    /// dirty/err excluded).  The parser retains attributes not yet consumed by
+    /// canvas so every run and field has the same effective inheritance state.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub character_attributes: BTreeMap<String, String>,
+    /// Direct CT_TextCharacterProperties child attributes, with the nearest
+    /// schema choice selected and same-child attributes merged individually.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub character_child_attributes: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Run-level text outline (`<a:rPr><a:ln>`). The width is the OOXML EMU

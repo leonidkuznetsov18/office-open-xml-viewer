@@ -466,6 +466,7 @@ fn default_paragraph() -> Paragraph {
         rtl: false,
         ea_ln_brk: true,
         runs: Vec::new(),
+        end_run_properties: None,
     }
 }
 
@@ -478,14 +479,18 @@ fn default_run() -> TextRunData {
         underline_style: None,
         underline_color: None,
         underline_fill: None,
+        underline_line: None,
+        underline_line_no_fill: false,
         strikethrough: false,
         strike_double: false,
         font_size: None,
         color: None,
         pattern_fill: None,
+        glyph_fill: None,
         no_fill: false,
         font_family: None,
         font_family_ea: None,
+        font_family_cs: None,
         font_family_sym: None,
         baseline: None,
         caps: None,
@@ -494,10 +499,14 @@ fn default_run() -> TextRunData {
         hyperlink: None,
         hyperlink_uses_text_fill: false,
         hyperlink_action: None,
+        hyperlink_mouse_over: None,
+        hyperlink_mouse_over_action: None,
         shadow: None,
         reflection: None,
         outline: None,
         highlight: None,
+        character_attributes: Default::default(),
+        character_child_attributes: Default::default(),
     }
 }
 

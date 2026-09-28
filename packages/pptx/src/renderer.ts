@@ -80,6 +80,7 @@ import {
   NON_CJK_SERIF_FALLBACKS,
   DEFAULT_KINSOKU_RULES,
   isCjkBreakChar,
+  isComplexScriptCodePoint,
   isUax14NoBreakPair,
   lineBreakClass,
   containsSeaScript,
@@ -736,6 +737,8 @@ type LayoutSegment = {
   underlineColor?: string;
   /** Explicit rPr > uFill; otherwise the underline follows the glyph paint. */
   underlineFill?: Fill;
+  underlineLine?: import('@silurus/ooxml-core').TextOutline;
+  underlineLineNoFill?: boolean;
   strikethrough: boolean;
   /** Two parallel strike lines (rPr strike="dblStrike"). */
   strikeDouble?: boolean;
@@ -1222,6 +1225,9 @@ function firstLineIndentPxFor(hasBullet: boolean, indentPx: number): number {
  * hyphen; it does not erase a break opportunity supplied by an authored hyphen.
  */
 const LATIN_SCALAR_RE = /^\p{Script_Extensions=Latin}$/u;
+// The core predicate covers the RTL cs axis. DrawingML also routes Indic and
+// Southeast Asian shaping scripts through a:cs when that font slot is present.
+const INDIC_CS_GLYPH_RE = /[\p{Script=Devanagari}\p{Script=Thai}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Malayalam}\p{Script=Gujarati}\p{Script=Gurmukhi}\p{Script=Oriya}\p{Script=Sinhala}\p{Script=Khmer}\p{Script=Lao}\p{Script=Myanmar}\p{Script=Tibetan}]/u;
 const LETTER_SCALAR_RE = /^\p{L}$/u;
 const ASCII_SCALARS_RE = /^[\u0000-\u007f]*$/u;
 
@@ -1449,7 +1455,21 @@ export function layoutParagraph(
   const input: DrawingMlInputRun<LayoutSegment>[] = [];
   for (const [sourceRunId, run] of para.runs.entries()) {
     if (run.type === 'break') {
-      input.push({ type: 'break' });
+      const sizePx = run.fontSize != null
+        ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
+      const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
+      const bold = run.bold ?? para.defBold ?? defaultBold;
+      const italic = run.italic ?? para.defItalic ?? defaultItalic;
+      const style: LayoutSegment | undefined = run.fontSize != null || run.fontFamily != null
+        || run.bold != null || run.italic != null
+        ? {
+            text: '', sizePx, color: defaultColor,
+            font: buildFont(bold, italic, sizePx, family, rc, ''),
+            underline: false, strikethrough: false,
+            lineMetricShare: lineMetricShareFor(family, bold, italic, rc),
+          }
+        : undefined;
+      input.push({ type: 'break', style });
       continue;
     }
     if (run.type === 'math') {
@@ -1476,6 +1496,7 @@ export function layoutParagraph(
     const drawSizePx = baselineDrawSizePx(sizePx, run.baseline ?? undefined);
     const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
     const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : null;
+    const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
     const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
     const bold = run.bold ?? para.defBold ?? defaultBold;
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
@@ -1486,6 +1507,8 @@ export function layoutParagraph(
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
     const eaFont = familyEa
       ? buildFont(bold, italic, drawSizePx, familyEa, rc, rawText) : baseFont;
+    const csFont = familyCs
+      ? buildFont(bold, italic, drawSizePx, familyCs, rc, rawText) : baseFont;
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
     const color = run.color ? hexToRgba(run.color)
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
@@ -1499,6 +1522,8 @@ export function layoutParagraph(
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
       underlineFill: run.underlineFill,
+      underlineLine: run.underlineLine,
+      underlineLineNoFill: run.underlineLineNoFill,
       strikethrough: run.strikethrough,
       strikeDouble: run.strikeDouble === true,
       letterSpacingPx: letterSpacingPx || undefined,
@@ -1527,8 +1552,10 @@ export function layoutParagraph(
     for (const ch of rawText) {
       let glyph = ch;
       const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
-      let font = eaGlyph ? eaFont : baseFont;
-      let share = lineMetricShareFor(eaGlyph ? familyEa : family, bold, italic, rc);
+      const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
+        || INDIC_CS_GLYPH_RE.test(ch));
+      let font = eaGlyph ? eaFont : csGlyph ? csFont : baseFont;
+      let share = lineMetricShareFor(eaGlyph ? familyEa : csGlyph ? familyCs : family, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         glyph = symbolFontToUnicode(ch, symbolFamily);
@@ -1551,6 +1578,8 @@ export function layoutParagraph(
     && a.underlineStyle === b.underlineStyle
     && a.underlineColor === b.underlineColor
     && a.underlineFill === b.underlineFill
+    && a.underlineLine === b.underlineLine
+    && a.underlineLineNoFill === b.underlineLineNoFill
     && a.strikethrough === b.strikethrough && a.strikeDouble === b.strikeDouble
     && a.letterSpacingPx === b.letterSpacingPx && a.baseline === b.baseline
     && a.shadow === b.shadow && a.reflection === b.reflection
@@ -1583,10 +1612,31 @@ export function layoutParagraph(
     nonMonotoneMeasure: input.some((item) => item.type === 'text' && (item.style.letterSpacingPx ?? 0) < 0),
     eastAsianLineBreak: para.eaLnBrk !== false,
   });
-  return broken.map((line) => ({
+  const end = para.endRunProperties;
+  const endSizePx = end?.fontSize != null
+    ? end.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
+  const endFamily = normalizeFontFamily(end?.fontFamily ?? para.defFontFamily ?? null, rc);
+  const endBold = end?.bold ?? para.defBold ?? defaultBold;
+  const endItalic = end?.italic ?? para.defItalic ?? defaultItalic;
+  const endStyle: LayoutSegment | undefined = end && (
+    end.fontSize != null || end.fontFamily != null || end.bold != null || end.italic != null)
+    ? {
+        text: '', sizePx: endSizePx, color: defaultColor,
+        font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
+        underline: false, strikethrough: false,
+        lineMetricShare: lineMetricShareFor(endFamily, endBold, endItalic, rc),
+      }
+    : undefined;
+  return broken.map((line, lineIndex) => ({
     // Office L07/L08: an empty line opened by a line feed inside a run keeps
     // that run's size; a zero-width segment carries it to the line metrics.
-    segments: line.segments.length === 0 && line.lineFeedRun !== undefined
+    segments: [
+      // endParaRPr formats only the empty insertion line after the final
+      // character/break (§21.1.2.2.2); it never replaces existing run paint.
+      ...(lineIndex === broken.length - 1 && line.segments.length === 0 && endStyle
+        ? [endStyle] : []),
+      ...(line.segments.length === 0 && line.lineFeedRun !== undefined
+      && !(lineIndex === broken.length - 1 && endStyle)
       && input[line.lineFeedRun]?.type === 'text'
       ? [{ ...(input[line.lineFeedRun] as { style: LayoutSegment }).style, text: '' }]
       : line.segments.map((part, index): LayoutSegment => {
@@ -1599,7 +1649,12 @@ export function layoutParagraph(
       }
       if (part.type === 'tab') return { ...part.style, text: '', isTab: true, tabWidthPx: part.width };
       return { ...part.style, text: '' };
-    }),
+    })),
+      ...(line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
+        && (input[line.endBreakRun] as { style?: LayoutSegment }).style
+        ? [{ ...(input[line.endBreakRun] as { style: LayoutSegment }).style, text: '' }]
+        : []),
+    ],
     ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
   }));
 }
@@ -2162,6 +2217,7 @@ function drawWarpedGlyphStrips(
   boxY: number,
   paint: TextPaint,
   resolveAuxPaint?: (target: CanvasRenderingContext2D) => TextPaint,
+  strokeWidth = 0,
 ): void {
   if (chW <= 0) return;
   // Ink extremes about the baseline (css px), from real metrics — this is where
@@ -2242,7 +2298,13 @@ function drawWarpedGlyphStrips(
   // chain per strip is the single-affine per-glyph draw anchored at the STRIP
   // centre so vScale/shear/angle track this slice's u.
   const paintStrips = (target: CanvasRenderingContext2D, fillStyle: TextPaint): void => {
-    target.fillStyle = fillStyle;
+    if (strokeWidth > 0) {
+      target.strokeStyle = fillStyle;
+      target.lineWidth = strokeWidth;
+      target.lineJoin = 'round';
+    } else {
+      target.fillStyle = fillStyle;
+    }
     for (let i = 0; i <= last; i++) {
       const { s0, s1, g } = strips[i];
       const centre = (s0 + s1) / 2;
@@ -2258,7 +2320,8 @@ function drawWarpedGlyphStrips(
       target.clip();
       // Pen origin sits at local −centre; the ls/2 shift centres the ink inside
       // its letter-spaced advance, matching the flat draw's origin convention.
-      target.fillText(ch, -centre + ls / 2, 0);
+      if (strokeWidth > 0) target.strokeText(ch, -centre + ls / 2, 0);
+      else target.fillText(ch, -centre + ls / 2, 0);
       target.restore();
     }
   };
@@ -2325,7 +2388,7 @@ function drawWarpedGlyphStrips(
   }
   if (!(maxX > minX && maxY > minY)) return; // no ink mapped — nothing to composite
 
-  const pad = 2; // device px, for AA/rounding slack around the ink AABB
+  const pad = 2 + strokeWidth * devScale; // AA and outline around the ink AABB
   const originX = Math.floor(minX - pad);
   const originY = Math.floor(minY - pad);
   const layerW = Math.ceil(maxX + pad) - originX;
@@ -2687,6 +2750,8 @@ function renderWarpedText(
     // CENTRE maps to its u fraction; the glyph is drawn at a per-glyph transform.
     let penW = 0;
     for (const seg of line.segments) {
+      const segmentStartW = penW;
+      const segmentBandFrac = env.singleEdge ? baselineFrac : v0 + baselineFrac * (v1 - v0);
       if (seg.math) {
         // Equations inside WordArt are exotic; advance without warping them.
         penW += seg.math.width;
@@ -2695,11 +2760,19 @@ function renderWarpedText(
       ctx.font = seg.font;
       const glyphPaint = resolveSegmentTextPaint(ctx, seg, boxX, boxY, scale);
       ctx.fillStyle = glyphPaint;
+      const outline = seg.outline && seg.outline.width > 0 ? seg.outline : undefined;
+      const outlineFill = outline?.fill;
+      const outlinePaint = outline
+        ? outlineFill
+          ? resolveFillCore(outlineFill, ctx, boxX, boxY, boxW, boxH, 0, scale * PT_TO_EMU)
+          : outline.color ? `#${outline.color}` : seg.noFill ? undefined : glyphPaint
+        : undefined;
+      const outlineWidth = outline ? Math.max(0.5, emuToPx(outline.width, scale)) : 0;
       const ls = seg.letterSpacingPx ?? 0;
       const chars = [...seg.text];
       for (const ch of chars) {
         const chW = ctx.measureText(ch).width + ls;
-        if (seg.noFill) { penW += chW; continue; }
+        if (seg.noFill && !outlinePaint) { penW += chW; continue; }
         // Blend the per-line vertical band into the baseline fraction so line 2
         // sits below line 1 within the envelope.
         const bandFrac = env.singleEdge ? baselineFrac : v0 + baselineFrac * (v1 - v0);
@@ -2715,26 +2788,26 @@ function renderWarpedText(
         // single-edge (Follow Path) branch below keeps rigid per-glyph rotation;
         // its separate placement rules preserve natural size and alignment.
         if (!env.singleEdge && chW > 0) {
-          drawWarpedGlyphStrips(
-            ctx,
-            ch,
-            ls,
-            chW,
-            getDevScale(),
-            env,
-            penW,
-            totalW,
-            followScale,
-            hScale,
-            warpBoxH,
-            bandFrac,
-            boxX,
-            boxY,
-            glyphPaint,
-            seg.patternFill
-              ? target => resolveSegmentTextPaint(target, seg, boxX, boxY, scale)
-              : undefined,
-          );
+          if (!seg.noFill) {
+            drawWarpedGlyphStrips(
+              ctx, ch, ls, chW, getDevScale(), env, penW, totalW, followScale,
+              hScale, warpBoxH, bandFrac, boxX, boxY, glyphPaint,
+              seg.patternFill
+                ? target => resolveSegmentTextPaint(target, seg, boxX, boxY, scale)
+                : undefined,
+            );
+          }
+          if (outlinePaint && outline) {
+            drawWarpedGlyphStrips(
+              ctx, ch, ls, chW, getDevScale(), env, penW, totalW, followScale,
+              hScale, warpBoxH, bandFrac, boxX, boxY, outlinePaint,
+              outlineFill
+                ? target => resolveFillCore(outlineFill, target, boxX, boxY, boxW, boxH,
+                  0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
+                : undefined,
+              outlineWidth,
+            );
+          }
           penW += chW;
           continue;
         }
@@ -2760,9 +2833,49 @@ function renderWarpedText(
         if (hScale !== 1 || g.vScale !== 1) ctx.scale(hScale, g.vScale);
         // Draw the glyph centred on the mapped point: shift left by half its
         // advance so its own centre lands on `u`.
-        ctx.fillText(ch, -chW / 2 + ls / 2, 0);
+        if (!seg.noFill) ctx.fillText(ch, -chW / 2 + ls / 2, 0);
+        if (outlinePaint) {
+          ctx.strokeStyle = outlinePaint;
+          ctx.lineWidth = outlineWidth;
+          ctx.lineJoin = 'round';
+          ctx.strokeText(ch, -chW / 2 + ls / 2, 0);
+        }
         ctx.restore();
         penW += chW;
+      }
+      // A separately authored underline remains visible for noFill WordArt.
+      // Trace it on the same warped baseline as the glyphs; uFill and uLn are
+      // independent CT_TextCharacterProperties children (§21.1.2.3.9).
+      if (seg.underline && !seg.underlineLineNoFill && penW > segmentStartW
+        && (!seg.noFill || seg.underlineFill || seg.underlineColor || seg.underlineLine?.fill)) {
+        const underlinePaint = seg.underlineFill
+          ? resolveFillCore(seg.underlineFill, ctx, boxX, boxY, boxW, boxH,
+              0, scale * PT_TO_EMU)
+          : seg.underlineLine?.fill
+            ? resolveFillCore(seg.underlineLine.fill, ctx, boxX, boxY, boxW, boxH,
+                0, scale * PT_TO_EMU)
+            : seg.underlineColor ?? glyphPaint;
+        if (underlinePaint) {
+          ctx.save();
+          ctx.strokeStyle = underlinePaint;
+          ctx.lineWidth = seg.underlineLine?.width
+            ? emuToPx(seg.underlineLine.width, scale)
+            : Math.max(1, seg.sizePx * 0.05);
+          ctx.beginPath();
+          const samples = Math.max(2, Math.ceil((penW - segmentStartW) / 8));
+          for (let sample = 0; sample <= samples; sample++) {
+            const flat = segmentStartW + (penW - segmentStartW) * sample / samples;
+            const u = followOffset + flat / totalW * followScale;
+            const g = warpGlyphTransform(lineEnv, u, warpBoxH, segmentBandFrac);
+            const offset = Math.max(2, ctx.lineWidth) * g.vScale;
+            const x = boxX + g.x - outset - Math.sin(g.angle) * offset;
+            const y = boxY + g.y + Math.cos(g.angle) * offset;
+            if (sample === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          ctx.restore();
+        }
       }
     }
   }
@@ -4985,18 +5098,9 @@ export function renderTextBody(
         paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, glyphPaint);
       }
 
-      // CT_TextCharacterProperties noFill is an explicit fill choice. It
-      // preserves layout advance and highlight; only an explicitly coloured
-      // underline paints when the text itself has no fill.
-      if (seg.noFill) {
-        const advance = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
-        if (seg.underline && seg.underlineColor) {
-          drawUnderline(ctx, penX, segBaseline, advance + jext, drawSizePx,
-            seg.underlineColor, seg.underlineStyle, rc.dpr);
-        }
-        penX += advance + jext;
-        continue;
-      }
+      // noFill is the GLYPH fill choice (§21.1.2.3.9).  It does not erase an
+      // independently authored a:ln outline, uFill underline, highlight, or
+      // the text-selection geometry.  Keep those consumers in the common path.
 
       const segShadow = seg.shadow;
 
@@ -5128,7 +5232,7 @@ export function renderTextBody(
       // vertical glyph orientation, and outlines without rasterizing the whole
       // text body as one effect image.
       const segReflection = seg.reflection;
-      if (segReflection && seg.text) {
+      if (segReflection && seg.text && !seg.noFill) {
         const deviceW = (ctx.canvas as { width: number }).width || 0;
         const deviceH = (ctx.canvas as { height: number }).height || 0;
         if (deviceW > 0 && deviceH > 0) {
@@ -5183,7 +5287,7 @@ export function renderTextBody(
       // Run-level text shadow (rPr > effectLst > outerShdw). Apply it only to
       // the primary glyph paint; the reflection above must not cast a second
       // shadow of its already-mirrored pixels.
-      if (segShadow) {
+      if (segShadow && !seg.noFill) {
         const dirRad = (segShadow.dir * Math.PI) / 180;
         const dist = emuToPx(segShadow.dist, scale);
         ctx.save();
@@ -5193,9 +5297,9 @@ export function renderTextBody(
         ctx.shadowOffsetY = Math.sin(dirRad) * dist;
       }
 
-      drawRun(ctx, 'fill');
+      if (!seg.noFill) drawRun(ctx, 'fill');
 
-      if (segShadow) ctx.restore();
+      if (segShadow && !seg.noFill) ctx.restore();
 
       ctx.font = seg.font;
       const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
@@ -5215,9 +5319,11 @@ export function renderTextBody(
               segOutline.fill, ctx, penX, segBaseline - drawSizePx,
               Math.max(1, segW), drawSizePx, 0, scale * PT_TO_EMU,
             ) ?? 'rgba(0,0,0,0)'
-          : segOutline.color ? `#${segOutline.color}` : glyphPaint;
-        ctx.lineJoin = 'round';
-        drawRun(ctx, 'stroke');
+          : segOutline.color ? `#${segOutline.color}` : seg.noFill ? 'rgba(0,0,0,0)' : glyphPaint;
+        if (!seg.noFill || segOutline.fill || segOutline.color) {
+          ctx.lineJoin = 'round';
+          drawRun(ctx, 'stroke');
+        }
         ctx.restore();
       }
 
@@ -5239,7 +5345,8 @@ export function renderTextBody(
         });
       }
 
-      if (seg.underline) {
+      if (seg.underline && !seg.underlineLineNoFill
+        && (!seg.noFill || seg.underlineFill || seg.underlineColor || seg.underlineLine?.fill)) {
         // §21.1.2.3.13 uFillTx follows the actual glyph fill (including
         // pattFill), while §21.1.2.3.12 uFill supplies its own fill choice.
         // Office PDF shows a separately chosen underline pattern on the
@@ -5249,11 +5356,16 @@ export function renderTextBody(
               seg.underlineFill, ctx, penX, segBaseline, segW + jext, drawSizePx * 0.05,
               0, scale * PT_TO_EMU,
             ) ?? 'rgba(0,0,0,0)'
-          : seg.underlineColor ?? glyphPaint;
-        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx, underlinePaint, seg.underlineStyle, rc.dpr);
+          : seg.underlineLine?.fill
+            ? resolveFillCore(seg.underlineLine.fill, ctx, penX, segBaseline,
+                segW + jext, drawSizePx * 0.05, 0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
+            : seg.underlineColor ?? glyphPaint;
+        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx,
+          underlinePaint, seg.underlineStyle, rc.dpr,
+          seg.underlineLine?.width ? emuToPx(seg.underlineLine.width, scale) : undefined);
       }
 
-      if (seg.strikethrough) {
+      if (seg.strikethrough && !seg.noFill) {
         const lineW = Math.max(1, drawSizePx * 0.05);
         ctx.strokeStyle = glyphPaint;
         ctx.lineWidth = lineW;

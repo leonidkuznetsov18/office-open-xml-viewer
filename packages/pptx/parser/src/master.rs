@@ -2651,7 +2651,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -3156,6 +3155,7 @@ mod placeholder_geometry_tests {
         let mut zip = empty_zip();
         let placeholders = parse_layout_placeholders(
             layout_doc.root_element(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),

@@ -3925,6 +3925,41 @@ mod tests {
     }
 
     #[test]
+    fn run_attributes_flow_through_master_layout_placeholder_shape_paragraph_and_run() {
+        let master = r#"<p:txStyles><p:bodyStyle><a:defPPr><a:defRPr
+          lang="en-US" altLang="ja-JP" kern="1200" spc="80" cap="all">
+          <a:cs typeface="Amiri"/></a:defRPr></a:defPPr></p:bodyStyle></p:txStyles>"#;
+        let layout = r#"<p:sp><p:nvSpPr><p:cNvPr id="7" name="Body 2"/>
+          <p:cNvSpPr/><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+          <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:defPPr>
+          <a:defRPr lang="fr-FR" i="1"/></a:defPPr></a:lstStyle><a:p/></p:txBody></p:sp>"#;
+        let slide = r#"<p:sp><p:nvSpPr><p:cNvPr id="8" name="Body 2"/>
+          <p:cNvSpPr/><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+          <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:defPPr>
+          <a:defRPr kern="1800"/></a:defPPr></a:lstStyle>
+          <a:p><a:pPr><a:defRPr b="1"/></a:pPr>
+            <a:r><a:rPr cap="none"/><a:t>Run</a:t></a:r>
+            <a:fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+              <a:rPr/><a:t>Field</a:t></a:fld>
+          </a:p></p:txBody></p:sp>"#;
+        let json = parse_pptx_native(&build_align_pptx(slide, layout, master)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let runs = &v["slides"][0]["elements"][0]["textBody"]["paragraphs"][0]["runs"];
+        for run in runs.as_array().unwrap() {
+            let attrs = &run["characterAttributes"];
+            assert_eq!(attrs["lang"], "fr-FR");
+            assert_eq!(attrs["altLang"], "ja-JP");
+            assert_eq!(attrs["kern"], "1800");
+            assert_eq!(attrs["spc"], "80");
+            assert_eq!(attrs["i"], "1");
+            assert_eq!(attrs["b"], "1");
+            assert_eq!(run["fontFamilyCs"], "Amiri");
+        }
+        assert_eq!(runs[0]["caps"], "none");
+        assert_eq!(runs[1]["caps"], "all");
+    }
+
+    #[test]
     fn align_inherit_body_ignores_unrelated_typeless_center() {
         // Layout has an unrelated centred typeless placeholder (idx=10). The body
         // placeholder (idx=1) must NOT borrow it; resolves to master bodyStyle "l".
@@ -4881,6 +4916,223 @@ mod tests {
     }
 
     #[test]
+    fn character_property_cascade_covers_attributes_children_break_and_insertion_state() {
+        // ECMA-376 §21.1.2.3.9, §21.1.2.2.2, §21.1.2.4: each authored
+        // attribute overrides only itself.  CT_TextListStyle.defPPr is the
+        // common base of all levels; a:br has its own rPr; endParaRPr is an
+        // insertion state and cannot recolour either existing run.
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <lstStyle><defPPr><defRPr kumimoji="1" lang="ja-JP" kern="1200"
+            normalizeH="1" noProof="1" smtClean="0" smtId="17" bmk="mark"
+            dirty="1" err="1" spc="80" baseline="12000" u="sng" strike="sngStrike">
+            <ln w="12700"><solidFill><srgbClr val="00AA00"/></solidFill></ln>
+            <uLn w="6350"><solidFill><srgbClr val="112233"/></solidFill></uLn>
+            <latin typeface="Arial" panose="020B0604020202020204" pitchFamily="34" charset="1"/>
+            <ea typeface="Yu Gothic"/><cs typeface="Noto Naskh Arabic"/>
+            <sym typeface="Symbol"/>
+            <hlinkClick r:id="rId9" tooltip="default" history="0"/>
+            <hlinkMouseOver r:id="rId10" tooltip="hover"/>
+          </defRPr></defPPr>
+          <lvl1pPr><defRPr altLang="en-US" sz="3200" i="1" cap="all">
+            <solidFill><srgbClr val="D21D54"/></solidFill>
+            <highlight><srgbClr val="FFE800"/></highlight>
+            <uFill><pattFill prst="pct50"><fgClr><srgbClr val="0022EE"/></fgClr>
+              <bgClr><srgbClr val="FFDD00"/></bgClr></pattFill></uFill>
+            <latin typeface="Aptos"/>
+          </defRPr></lvl1pPr></lstStyle>
+          <p><pPr><defRPr b="1" cap="small">
+            <ln w="25400"/><uLn w="12700"/>
+            <latin charset="177"/><hlinkClick tooltip="near"/>
+          </defRPr></pPr>
+            <r><rPr cap="none" lang="fr-FR"/><t>Run</t></r>
+            <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+              <rPr/><t>Field</t></fld>
+            <br><rPr sz="4800"/></br>
+            <endParaRPr sz="6000"><solidFill><srgbClr val="123456"/></solidFill></endParaRPr>
+          </p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let levels = extract_level_run_properties(doc.root_element(), &HashMap::new());
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let rels = HashMap::from([
+            ("rId9".to_owned(), "https://example.test/click".to_owned()),
+            ("rId10".to_owned(), "https://example.test/hover".to_owned()),
+        ]);
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &rels,
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &levels,
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field), TextRun::Break { font_size, .. }] =
+            para.runs.as_slice()
+        else {
+            panic!("run, field, formatted break expected")
+        };
+        for item in [run, field] {
+            let a = &item.character_attributes;
+            for (key, value) in [
+                ("kumimoji", "1"),
+                ("altLang", "en-US"),
+                ("kern", "1200"),
+                ("normalizeH", "1"),
+                ("noProof", "1"),
+                ("smtClean", "0"),
+                ("smtId", "17"),
+                ("bmk", "mark"),
+                ("spc", "80"),
+                ("baseline", "12000"),
+                ("u", "sng"),
+                ("strike", "sngStrike"),
+                ("sz", "3200"),
+                ("b", "1"),
+                ("i", "1"),
+            ] {
+                assert_eq!(a.get(key).map(String::as_str), Some(value), "{key}");
+            }
+            assert!(!a.contains_key("dirty") && !a.contains_key("err"));
+            assert_eq!(item.font_family.as_deref(), Some("Aptos"));
+            assert_eq!(item.font_family_cs.as_deref(), Some("Noto Naskh Arabic"));
+            assert_eq!(
+                item.hyperlink.as_deref(),
+                Some("https://example.test/click")
+            );
+            assert_eq!(
+                item.hyperlink_mouse_over.as_deref(),
+                Some("https://example.test/hover")
+            );
+            assert_eq!(
+                item.character_child_attributes["latin"]["panose"],
+                "020B0604020202020204"
+            );
+            assert_eq!(item.character_child_attributes["latin"]["charset"], "177");
+            assert_eq!(
+                item.character_child_attributes["hlinkClick"]["tooltip"],
+                "near"
+            );
+            assert_eq!(item.character_child_attributes["hlinkClick"]["id"], "rId9");
+            assert_eq!(
+                item.character_child_attributes["hlinkMouseOver"]["tooltip"],
+                "hover"
+            );
+            assert_eq!(item.outline.as_ref().unwrap().width, 25400);
+            assert_eq!(
+                item.outline.as_ref().unwrap().color.as_deref(),
+                Some("00AA00")
+            );
+            assert_eq!(item.underline_line.as_ref().unwrap().width, 12700);
+            assert_eq!(
+                item.underline_line.as_ref().unwrap().color.as_deref(),
+                Some("112233")
+            );
+            assert!(matches!(item.underline_fill, Some(Fill::Pattern { .. })));
+            assert_eq!(item.highlight.as_deref(), Some("FFE800"));
+            assert_eq!(item.strikethrough, true);
+        }
+        assert_eq!(run.character_attributes["lang"], "fr-FR");
+        assert_eq!(run.caps.as_deref(), Some("none"));
+        assert_eq!(field.character_attributes["lang"], "ja-JP");
+        assert_eq!(field.caps.as_deref(), Some("small"));
+        assert_eq!(*font_size, Some(48.0));
+        assert_eq!(run.font_size, Some(32.0));
+        assert_eq!(
+            para.end_run_properties.as_ref().unwrap().font_size,
+            Some(60.0)
+        );
+        assert_eq!(
+            para.end_run_properties.as_ref().unwrap().color.as_deref(),
+            Some("123456")
+        );
+    }
+
+    #[test]
+    fn table_cell_text_uses_the_same_defppr_and_paragraph_character_cascade() {
+        let xml = r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:txBody><a:bodyPr/><a:lstStyle>
+            <a:defPPr><a:defRPr lang="ja-JP" sz="2200"><a:solidFill>
+              <a:srgbClr val="AA2200"/></a:solidFill><a:cs typeface="Amiri"/></a:defRPr></a:defPPr>
+            <a:lvl1pPr><a:defRPr i="1"/></a:lvl1pPr>
+          </a:lstStyle><a:p><a:pPr><a:defRPr b="1"/></a:pPr>
+            <a:r><a:rPr/><a:t>Cell</a:t></a:r>
+            <a:fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+              <a:rPr/><a:t>Field</a:t></a:fld>
+          </a:p></a:txBody><a:tcPr/>
+        </a:tc>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let cell = parse_table_cell(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            &mut zip,
+        );
+        let runs = &cell.text_body.unwrap().paragraphs[0].runs;
+        for item in runs {
+            let TextRun::Text(run) = item else {
+                panic!("text run expected")
+            };
+            assert_eq!(run.bold, Some(true));
+            assert_eq!(run.italic, Some(true));
+            assert_eq!(run.font_size, Some(22.0));
+            assert_eq!(run.color.as_deref(), Some("AA2200"));
+            assert_eq!(run.font_family_cs.as_deref(), Some("Amiri"));
+            assert_eq!(run.character_attributes["lang"], "ja-JP");
+        }
+    }
+
+    #[test]
+    fn empty_run_does_not_override_the_end_paragraph_insertion_size() {
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <lstStyle><lvl1pPr><defRPr sz="3200"/></lvl1pPr></lstStyle>
+          <p><r><rPr/><t></t></r><endParaRPr sz="6000"/></p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let levels = extract_level_run_properties(doc.root_element(), &HashMap::new());
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &levels,
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        assert_eq!(para.def_font_size, Some(60.0));
+        let TextRun::Text(run) = &para.runs[0] else {
+            panic!("empty run")
+        };
+        assert_eq!(run.font_size, Some(32.0));
+        assert_eq!(
+            para.end_run_properties.as_ref().unwrap().font_size,
+            Some(60.0)
+        );
+    }
+
+    #[test]
     fn test_parse_run_treats_uniform_gradient_text_fill_as_its_exact_color() {
         let uniform = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="353535"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>uniform</t></r>"#;
         let varying = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="FFFFFF"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>varying</t></r>"#;
@@ -4895,6 +5147,10 @@ mod tests {
         let varying_doc = roxmltree::Document::parse(varying).unwrap();
         let varying_run = parse_run(varying_doc.root_element(), None, &theme, &rels).unwrap();
         assert_eq!(varying_run.color, None);
+        assert!(matches!(
+            varying_run.glyph_fill,
+            Some(Fill::Gradient { .. })
+        ));
 
         let unresolved_doc = roxmltree::Document::parse(partly_unresolved).unwrap();
         let unresolved_run = parse_run(unresolved_doc.root_element(), None, &theme, &rels).unwrap();
@@ -4902,8 +5158,8 @@ mod tests {
     }
 
     /// ECMA-376 §21.1.2.3.9; ST_TextCapsType §20.1.10.64 — cap="all" /
-    /// "small" are passed through;
-    /// cap="none" or omitted yields None so the field stays absent in JSON.
+    /// "small" and explicit "none" are passed through.  The latter blocks
+    /// a cap inherited from an earlier level of the style cascade.
     #[test]
     fn test_parse_run_caps_attribute() {
         let theme = HashMap::new();
@@ -4911,7 +5167,7 @@ mod tests {
         let cases = [
             ("all", Some("all")),
             ("small", Some("small")),
-            ("none", None),
+            ("none", Some("none")),
         ];
         for (val, expected) in cases {
             let xml = format!(
@@ -5759,6 +6015,22 @@ mod tests {
         let doc = roxmltree::Document::parse(with_ufilltx).unwrap();
         let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
         assert!(r.underline_color.is_none());
+
+        let inherited_line = r#"<defRPr xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><uLn w="12700"><solidFill><srgbClr val="112233"/></solidFill></uLn></defRPr>"#;
+        let text_line = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><uLnTx/></rPr><t>x</t></r>"#;
+        let default_doc = roxmltree::Document::parse(inherited_line).unwrap();
+        let doc = roxmltree::Document::parse(text_line).unwrap();
+        let r = parse_run(
+            doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(r.underline_line.is_none(), "uLnTx replaces inherited uLn");
+        assert!(!r.underline_line_no_fill);
+        assert!(r.character_child_attributes.contains_key("uLnTx"));
+        assert!(!r.character_child_attributes.contains_key("uLn"));
 
         let with_pattern = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><pattFill prst="pct50"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill><uFill><pattFill prst="dnDiag"><fgClr><srgbClr val="00A650"/></fgClr><bgClr><srgbClr val="F5A623"/></bgClr></pattFill></uFill></rPr><t>x</t></r>"#;
         let doc = roxmltree::Document::parse(with_pattern).unwrap();
@@ -6897,7 +7169,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &master_colors,
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),

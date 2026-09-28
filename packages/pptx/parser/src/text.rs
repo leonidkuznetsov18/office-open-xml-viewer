@@ -13,7 +13,22 @@ use ooxml_common::blip::mime_from_ext;
 use ooxml_common::math::parse_omath_nodes;
 use ooxml_common::text::{parse_lnspc, SpaceLine};
 use ooxml_common::units::text_point_to_pt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+type PropertyAttributes = BTreeMap<String, String>;
+
+fn merge_attributes(higher: &PropertyAttributes, lower: &PropertyAttributes) -> PropertyAttributes {
+    let mut merged = lower.clone();
+    merged.extend(higher.clone());
+    merged
+}
+
+fn xml_attributes(node: roxmltree::Node<'_, '_>) -> PropertyAttributes {
+    node.attributes()
+        .filter(|a| !matches!(a.name(), "dirty" | "err"))
+        .map(|a| (a.name().to_owned(), a.value().to_owned()))
+        .collect()
+}
 
 /// One `CT_TextSpacing` choice from `<a:spcBef>` / `<a:spcAft>` (ECMA-376
 /// §21.1.2.2.9-.10): an absolute `<a:spcPts>` in hundredths of a point or a
@@ -622,16 +637,53 @@ impl InheritedBodyPr {
     }
 }
 
+fn underline_line_choice<'a, 'input>(
+    properties: roxmltree::Node<'a, 'input>,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    properties
+        .children()
+        .find(|node| node.is_element() && matches!(node.tag_name().name(), "uLn" | "uLnTx"))
+}
+
+fn parse_text_line(
+    line: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> Option<TextOutline> {
+    if child(line, "noFill").is_some() {
+        return None;
+    }
+    let fill = parse_fill(line, theme);
+    Some(TextOutline {
+        width: attr_i64(&line, "w").unwrap_or(0),
+        color: match &fill {
+            Some(Fill::Solid { color }) => Some(color.clone()),
+            _ => None,
+        },
+        fill,
+    })
+}
+
 /// The authored part of CT_TextCharacterProperties. Each member retains its
 /// own presence bit so a partial pPr/defRPr overrides only that property of
 /// lstStyle, layout and master (§21.1.2.2.7, §21.1.2.4, §21.1.2.3.9).
 /// An explicit noFill is stored as Fill::None and never becomes "missing".
 #[derive(Clone, Default, serde::Serialize)]
 pub(crate) struct RunProperties {
+    /// Authored CT_TextCharacterProperties attributes, except dirty/err (the
+    /// schema marks these as editing diagnostics).  Keep the full set so
+    /// language, kerning, normalization and annotation state survive the same
+    /// cascade as visible paint even when this canvas has no consumer yet.
+    attributes: PropertyAttributes,
+    /// Direct child attributes, merged within a child after schema choice
+    /// groups have selected the nearest authored alternative.
+    child_attributes: BTreeMap<String, PropertyAttributes>,
     bold: Option<bool>,
     italic: Option<bool>,
     underline: Option<String>,
     underline_fill: Option<Option<Fill>>,
+    underline_line: Option<Option<TextOutline>>,
+    underline_line_follow_text: Option<bool>,
+    underline_line_fill_authored: bool,
     strike: Option<String>,
     caps: Option<String>,
     letter_spacing: Option<f64>,
@@ -641,13 +693,16 @@ pub(crate) struct RunProperties {
     fill_authored: bool,
     font_family: Option<String>,
     font_family_ea: Option<String>,
+    font_family_cs: Option<String>,
     font_family_sym: Option<String>,
     baseline: Option<i32>,
     effects_authored: bool,
     shadow: Option<Shadow>,
     reflection: Option<Reflection>,
     outline: Option<Option<TextOutline>>,
+    outline_fill_authored: bool,
     highlight: Option<String>,
+    hyperlink_uses_text_fill: Option<bool>,
 }
 pub(crate) type LevelRunProperties = [RunProperties; 9];
 
@@ -655,9 +710,19 @@ impl RunProperties {
     pub(crate) fn from_xml(node: roxmltree::Node<'_, '_>, theme: &HashMap<String, String>) -> Self {
         let fill_choice = text_property_fill(node);
         let underline_choice = underline_fill_choice(node);
-        let effects = child(node, "effectLst");
+        let underline_line_choice = underline_line_choice(node);
+        let effects = child(node, "effectLst").or_else(|| child(node, "effectDag"));
         let outline = child(node, "ln");
+        let mut child_attributes = BTreeMap::new();
+        for element in node.children().filter(|n| n.is_element()) {
+            child_attributes.insert(
+                element.tag_name().name().to_owned(),
+                xml_attributes(element),
+            );
+        }
         Self {
+            attributes: xml_attributes(node),
+            child_attributes,
             bold: attr(&node, "b").map(|v| v == "1" || v == "true"),
             italic: attr(&node, "i").map(|v| v == "1" || v == "true"),
             underline: attr(&node, "u"),
@@ -668,6 +733,15 @@ impl RunProperties {
                     None
                 }
             }),
+            underline_line: underline_line_choice.map(|n| {
+                (n.tag_name().name() == "uLn")
+                    .then(|| parse_text_line(n, theme))
+                    .flatten()
+            }),
+            underline_line_follow_text: underline_line_choice
+                .map(|n| n.tag_name().name() == "uLnTx"),
+            underline_line_fill_authored: underline_line_choice
+                .is_some_and(|n| n.tag_name().name() == "uLn" && text_property_fill(n).is_some()),
             strike: attr(&node, "strike"),
             caps: attr(&node, "cap"),
             letter_spacing: attr(&node, "spc").and_then(|v| text_point_to_pt(&v)),
@@ -679,6 +753,9 @@ impl RunProperties {
                 .and_then(|n| attr(&n, "typeface"))
                 .map(|v| resolve_theme_typeface(&v, theme)),
             font_family_ea: child(node, "ea")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            font_family_cs: child(node, "cs")
                 .and_then(|n| attr(&n, "typeface"))
                 .map(|v| resolve_theme_typeface(&v, theme)),
             font_family_sym: child(node, "sym")
@@ -702,7 +779,14 @@ impl RunProperties {
                     fill,
                 })
             }),
+            outline_fill_authored: outline.is_some_and(|ln| text_property_fill(ln).is_some()),
             highlight: child(node, "highlight").and_then(|n| parse_color_node(n, theme)),
+            hyperlink_uses_text_fill: child(node, "hlinkClick")
+                .and_then(|h| {
+                    h.descendants()
+                        .find(|n| n.is_element() && n.tag_name().name() == "hlinkClr")
+                })
+                .map(|n| n.attribute("val") == Some("tx")),
         }
     }
 
@@ -715,10 +799,74 @@ impl RunProperties {
             };
         }
         Self {
+            attributes: merge_attributes(&self.attributes, &lower.attributes),
+            child_attributes: {
+                let mut merged = lower.child_attributes.clone();
+                // The schema groups are alternatives.  A nearer choice ends
+                // inheritance of the other choices, while attributes inside
+                // the same child remain independently inherited.
+                const FILL: &[&str] = &[
+                    "noFill",
+                    "solidFill",
+                    "gradFill",
+                    "blipFill",
+                    "pattFill",
+                    "grpFill",
+                ];
+                const EFFECT: &[&str] = &["effectLst", "effectDag"];
+                const ULINE: &[&str] = &["uLn", "uLnTx"];
+                const UFILL: &[&str] = &["uFill", "uFillTx"];
+                for (name, attrs) in &self.child_attributes {
+                    for group in [FILL, EFFECT, ULINE, UFILL] {
+                        if group.contains(&name.as_str()) {
+                            for other in group {
+                                if *other != name {
+                                    merged.remove(*other);
+                                }
+                            }
+                        }
+                    }
+                    let previous = merged.get(name).cloned().unwrap_or_default();
+                    merged.insert(name.clone(), merge_attributes(attrs, &previous));
+                }
+                merged
+            },
             bold: pick!(bold),
             italic: pick!(italic),
             underline: pick!(underline),
             underline_fill: pick!(underline_fill),
+            underline_line: match (&self.underline_line, &lower.underline_line) {
+                (Some(Some(higher)), Some(Some(lower_line)))
+                    if !self.underline_line_follow_text.unwrap_or(false) =>
+                {
+                    let fill = if self.underline_line_fill_authored {
+                        higher.fill.clone()
+                    } else {
+                        lower_line.fill.clone()
+                    };
+                    Some(Some(TextOutline {
+                        width: if self
+                            .child_attributes
+                            .get("uLn")
+                            .is_some_and(|a| a.contains_key("w"))
+                        {
+                            higher.width
+                        } else {
+                            lower_line.width
+                        },
+                        color: match &fill {
+                            Some(Fill::Solid { color }) => Some(color.clone()),
+                            _ => None,
+                        },
+                        fill,
+                    }))
+                }
+                (Some(value), _) => Some(value.clone()),
+                (None, _) => lower.underline_line.clone(),
+            },
+            underline_line_follow_text: pick!(underline_line_follow_text),
+            underline_line_fill_authored: self.underline_line_fill_authored
+                || lower.underline_line_fill_authored,
             strike: pick!(strike),
             caps: pick!(caps),
             letter_spacing: pick!(letter_spacing),
@@ -736,6 +884,7 @@ impl RunProperties {
             fill_authored: self.fill_authored || lower.fill_authored,
             font_family: pick!(font_family),
             font_family_ea: pick!(font_family_ea),
+            font_family_cs: pick!(font_family_cs),
             font_family_sym: pick!(font_family_sym),
             baseline: pick!(baseline),
             effects_authored: self.effects_authored || lower.effects_authored,
@@ -749,15 +898,46 @@ impl RunProperties {
             } else {
                 lower.reflection.clone()
             },
-            outline: pick!(outline),
+            outline: match (&self.outline, &lower.outline) {
+                (Some(Some(higher)), Some(Some(lower_outline))) => {
+                    let fill = if self.outline_fill_authored {
+                        higher.fill.clone()
+                    } else {
+                        lower_outline.fill.clone()
+                    };
+                    Some(Some(TextOutline {
+                        width: if self
+                            .child_attributes
+                            .get("ln")
+                            .is_some_and(|a| a.contains_key("w"))
+                        {
+                            higher.width
+                        } else {
+                            lower_outline.width
+                        },
+                        color: match &fill {
+                            Some(Fill::Solid { color }) => Some(color.clone()),
+                            _ => None,
+                        },
+                        fill,
+                    }))
+                }
+                (Some(value), _) => Some(value.clone()),
+                (None, _) => lower.outline.clone(),
+            },
+            outline_fill_authored: self.outline_fill_authored || lower.outline_fill_authored,
             highlight: pick!(highlight),
+            hyperlink_uses_text_fill: pick!(hyperlink_uses_text_fill),
         }
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.bold.is_none()
+        self.attributes.is_empty()
+            && self.child_attributes.is_empty()
+            && self.bold.is_none()
             && self.italic.is_none()
             && self.underline.is_none()
             && self.underline_fill.is_none()
+            && self.underline_line.is_none()
             && self.strike.is_none()
             && self.caps.is_none()
             && self.letter_spacing.is_none()
@@ -765,11 +945,13 @@ impl RunProperties {
             && !self.fill_authored
             && self.font_family.is_none()
             && self.font_family_ea.is_none()
+            && self.font_family_cs.is_none()
             && self.font_family_sym.is_none()
             && self.baseline.is_none()
             && !self.effects_authored
             && self.outline.is_none()
             && self.highlight.is_none()
+            && self.hyperlink_uses_text_fill.is_none()
     }
     pub(crate) fn without_fill(mut self) -> Self {
         self.fill = None;
@@ -783,11 +965,18 @@ pub(crate) fn read_level_run_properties(
     list_style: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
 ) -> LevelRunProperties {
+    // CT_TextListStyle.defPPr supplies the run defaults for every level.  A
+    // level's defRPr overlays it one property at a time (§21.1.2.4).
+    let base = child(list_style, "defPPr")
+        .and_then(|p| child(p, "defRPr"))
+        .map(|r| RunProperties::from_xml(r, theme))
+        .unwrap_or_default();
     std::array::from_fn(|level| {
         child(list_style, &format!("lvl{}pPr", level + 1))
             .and_then(|p| child(p, "defRPr"))
             .map(|r| RunProperties::from_xml(r, theme))
             .unwrap_or_default()
+            .over(&base)
     })
 }
 pub(crate) fn extract_level_run_properties(
@@ -1381,7 +1570,28 @@ pub(crate) fn parse_paragraph(
                     runs.push(TextRun::Text(run));
                 }
             }
-            "br" => runs.push(TextRun::Break),
+            "br" => {
+                let br_pr = child(node, "rPr");
+                let own = br_pr
+                    .map(|r| RunProperties::from_xml(r, theme))
+                    .unwrap_or_default();
+                let effective = own.over(&defaults);
+                runs.push(TextRun::Break {
+                    // Only a size/face/weight AUTHORED on the break adds a
+                    // line-metric segment.  A language-only rPr inherits the
+                    // paragraph's style for editing but must not inflate the
+                    // preceding line to the master default size (observed in
+                    // PowerPoint-exported Japanese and title controls).
+                    font_size: own.font_size,
+                    font_family: own.font_family,
+                    bold: own.bold,
+                    italic: own.italic,
+                    character_attributes: br_pr.map(|_| effective.attributes).unwrap_or_default(),
+                    character_child_attributes: br_pr
+                        .map(|_| effective.child_attributes)
+                        .unwrap_or_default(),
+                });
+            }
             // OMML equations (ECMA-376 §22.1). `def_font_size` here is the
             // paragraph's defRPr size (pre-level-fallback); the renderer applies
             // its own inheritance when this is None. PowerPoint stores inline
@@ -1408,20 +1618,33 @@ pub(crate) fn parse_paragraph(
     // For paragraphs with no visible text content, use endParaRPr sz to set line height.
     // This ensures empty spacer paragraphs have the correct height (e.g. between sections).
     let end_rpr = child(p_node, "endParaRPr");
-    let has_text = runs.iter().any(|r| matches!(r, TextRun::Text(_)));
-    let def_font_size = def_font_size
-        .or_else(|| {
-            if !has_text {
-                end_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0)
-            } else {
-                None
-            }
-        })
-        // Inherited per-list-level default size, indexed by this paragraph's
-        // level (ECMA-376 §21.1.2.4): a 2nd-level bullet uses lvl3pPr's smaller
-        // defRPr sz, not the level-1 size. The renderer applies `def_font_size`
-        // to runs that carry no explicit `sz`.
-        .or_else(|| level_font_sizes.get(lvl as usize).copied().flatten());
+    let end_run_properties = end_rpr.map(|node| {
+        Box::new(resolve_run_properties(
+            String::new(),
+            RunProperties::from_xml(node, theme),
+            &defaults,
+            rels,
+        ))
+    });
+    let has_text = runs
+        .iter()
+        .any(|r| matches!(r, TextRun::Text(t) if !t.text.is_empty()));
+    // endParaRPr is the formatting of the insertion position after the last
+    // character (§21.1.2.2.2), not another default for existing runs.  For an
+    // empty paragraph that position is its only line, so its authored size
+    // wins over inherited defaults.  This also keeps empty spacer paragraphs
+    // at their Office height when a master supplies a different size.
+    let def_font_size = (if !has_text {
+        end_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0)
+    } else {
+        None
+    })
+    .or(def_font_size)
+    // Inherited per-list-level default size, indexed by this paragraph's
+    // level (ECMA-376 §21.1.2.4): a 2nd-level bullet uses lvl3pPr's smaller
+    // defRPr sz, not the level-1 size. The renderer applies `def_font_size`
+    // to runs that carry no explicit `sz`.
+    .or_else(|| level_font_sizes.get(lvl as usize).copied().flatten());
 
     Paragraph {
         alignment,
@@ -1445,6 +1668,7 @@ pub(crate) fn parse_paragraph(
         rtl,
         ea_ln_brk,
         runs,
+        end_run_properties,
     }
 }
 
@@ -1653,6 +1877,18 @@ fn parse_run_with_defaults(
     let authored = r_pr
         .map(|n| RunProperties::from_xml(n, theme))
         .unwrap_or_default();
+    Some(resolve_run_properties(text, authored, defaults, rels))
+}
+
+/// Resolve the same character-property chain for an a:r, a:fld, or the
+/// trailing endParaRPr insertion state.  The latter is stored separately and
+/// never painted over an existing run (§21.1.2.2.2).
+fn resolve_run_properties(
+    text: String,
+    authored: RunProperties,
+    defaults: &RunProperties,
+    rels: &HashMap<String, String>,
+) -> TextRunData {
     let props = authored.over(defaults);
     let underline = props.underline.as_deref().is_some_and(|v| v != "none");
     let underline_style = props
@@ -1666,7 +1902,9 @@ fn parse_run_with_defaults(
     };
     let strikethrough = matches!(props.strike.as_deref(), Some("sngStrike" | "dblStrike"));
     let strike_double = props.strike.as_deref() == Some("dblStrike");
-    let caps = props.caps.clone().filter(|v| v == "small" || v == "all");
+    // An explicit cap="none" blocks an inherited all/small value.  The
+    // renderer treats "none" as a no-op while retaining its presence.
+    let caps = props.caps.clone();
     let letter_spacing = props.letter_spacing.filter(|v| v.abs() > f64::EPSILON);
     let pattern_fill = match &props.fill {
         Some(fill @ Fill::Pattern { .. }) => Some(fill.clone()),
@@ -1676,6 +1914,7 @@ fn parse_run_with_defaults(
     let color = props.color.clone();
     let font_family = props.font_family.clone();
     let font_family_ea = props.font_family_ea.clone().filter(|v| !v.is_empty());
+    let font_family_cs = props.font_family_cs.clone().filter(|v| !v.is_empty());
     let font_family_sym = props.font_family_sym.clone().filter(|v| !v.is_empty());
     let baseline = props.baseline.filter(|v| *v != 0);
 
@@ -1686,26 +1925,26 @@ fn parse_run_with_defaults(
     // marks the link as an INTERNAL navigation; carry it through so the TS side
     // can distinguish a slide jump from an external URL. For a slide jump the
     // rel is TargetMode=Internal, so `hyperlink` is the internal slide part.
-    let hlink_click = r_pr.and_then(|n| child(n, "hlinkClick"));
+    let hlink_click = props.child_attributes.get("hlinkClick");
     let hyperlink = hlink_click
-        .and_then(|h| attr_r(&h, "id"))
-        .and_then(|rid| rels.get(&rid).cloned())
+        .and_then(|h| h.get("id"))
+        .and_then(|rid| rels.get(rid).cloned())
         .filter(|s| !s.is_empty());
     let hyperlink_action = hlink_click
-        .and_then(|h| attr(&h, "action"))
+        .and_then(|h| h.get("action").cloned())
+        .filter(|s| !s.is_empty());
+    let hlink_mouse_over = props.child_attributes.get("hlinkMouseOver");
+    let hyperlink_mouse_over = hlink_mouse_over
+        .and_then(|h| h.get("id"))
+        .and_then(|rid| rels.get(rid).cloned())
+        .filter(|s| !s.is_empty());
+    let hyperlink_mouse_over_action = hlink_mouse_over
+        .and_then(|h| h.get("action").cloned())
         .filter(|s| !s.is_empty());
     // Office's hyperlink-colour extension is written when an authored text
     // fill is reapplied after creating the link. Without hlinkClr="tx", the
     // hyperlink theme colour wins. The extension is scoped to run hyperlinks.
-    let hyperlink_uses_text_fill = hlink_click.is_some_and(|h| {
-        h.descendants().any(|n| {
-            n.is_element()
-                && n.tag_name().name() == "hlinkClr"
-                && n.tag_name().namespace()
-                    == Some("http://schemas.microsoft.com/office/drawing/2018/hyperlinkcolor")
-                && n.attribute("val") == Some("tx")
-        })
-    });
+    let hyperlink_uses_text_fill = props.hyperlink_uses_text_fill.unwrap_or(false);
     // PowerPoint's hyperlink theme colour wins when the run has no authored
     // fill of its own, even if a list-style defRPr supplies a solid colour.
     // Preserve run-local solid colours, and hlinkClr="tx" explicitly asks to
@@ -1717,7 +1956,7 @@ fn parse_run_with_defaults(
         color
     };
 
-    Some(TextRunData {
+    TextRunData {
         text,
         bold: props.bold,
         italic: props.italic,
@@ -1725,14 +1964,19 @@ fn parse_run_with_defaults(
         underline_style,
         underline_color,
         underline_fill,
+        underline_line: props.underline_line.clone().flatten(),
+        underline_line_no_fill: props.underline_line.as_ref().is_some_and(Option::is_none)
+            && !props.underline_line_follow_text.unwrap_or(false),
         strikethrough,
         strike_double,
         font_size: props.font_size,
         color,
         pattern_fill,
+        glyph_fill: props.fill.clone(),
         no_fill,
         font_family,
         font_family_ea,
+        font_family_cs,
         font_family_sym,
         baseline,
         caps,
@@ -1741,9 +1985,13 @@ fn parse_run_with_defaults(
         hyperlink,
         hyperlink_uses_text_fill,
         hyperlink_action,
+        hyperlink_mouse_over,
+        hyperlink_mouse_over_action,
         shadow: props.shadow,
         reflection: props.reflection,
         outline: props.outline.flatten(),
         highlight: props.highlight,
-    })
+        character_attributes: props.attributes,
+        character_child_attributes: props.child_attributes,
+    }
 }
