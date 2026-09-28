@@ -1069,9 +1069,11 @@ function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
   for (let index = start; index < end; index += 1) {
     const line = input.lines[index];
     if (!line) continue;
-    if (index === 0 && !continuation?.continuesFromPrevious) {
-      advancePt += Math.max(0,
-        line.bounds.yPt - (input.flowBounds.yPt + input.spacing.beforePt));
+    if (index === 0) {
+      // A remeasured body continuation starts at lineStart 0 without space
+      // before; wrap may still place its first line below the flow cursor.
+      advancePt += Math.max(0, line.bounds.yPt - (input.flowBounds.yPt
+        + (continuation?.continuesFromPrevious ? 0 : input.spacing.beforePt)));
     } else if (index > start) {
       const previous = input.lines[index - 1];
       advancePt += Math.max(0,
@@ -3158,16 +3160,14 @@ function acquireAnchorOccurrence(
     throw new Error('resolved anchor frame must retain overlap and cell behavior');
   }
   const effectiveWrapBounds = effectiveResult.geometry.wrapBounds;
-  const normativeCollision = !behavior.allowOverlap;
-  const compatibilityCollision = behavior.allowOverlap
-    && options.ordinaryFlow
-    && effectiveWrapBounds !== null;
-  if (normativeCollision || compatibilityCollision) {
-    // §20.4.2.3 object collision is independent of text wrapping. The
-    // allowOverlap=true compatibility path deliberately retains the old
-    // wrap-exclusion policy only for ordinary-flow anchors.
-    // ECMA-376 §20.4.2.3 otherwise requires displacement for every existing
-    // object whose allowOverlap behavior makes it a collision participant.
+  // §20.4.2.3: allowOverlap=true lets this object overlap other floating
+  // objects, so only allowOverlap=false re-seats it. The issue #1615 controls
+  // agree for pictures anchored in different paragraphs (square and
+  // topAndBottom wrap; page-, margin- and paragraph-relative; identical and
+  // partial overlap). Collision is independent of text wrapping.
+  if (!behavior.allowOverlap) {
+    // ECMA-376 §20.4.2.3 requires displacement for every existing object
+    // whose allowOverlap behavior makes it a collision participant.
     // Word has one narrower composition exception: a source-later page-owned
     // member below the already-authored layers in this SAME anchor paragraph
     // retains its authored position. Cross-paragraph entries remain blockers.
@@ -3182,36 +3182,21 @@ function acquireAnchorOccurrence(
         behavior.relativeHeight,
         entry.relativeHeight,
       ));
-    const blockerBounds = normativeCollision
-      ? [...externalCollisions, ...sameParagraphBlockers]
-          .filter((entry) => entry.occurrenceId !== occurrenceId)
-          .map((entry) => ({
-            occurrenceId: entry.occurrenceId,
-            bounds: entry.bounds,
-          }))
-      : externalExclusions
-          // Page-owned prescan registers this paragraph's own anchors on the
-          // page before the paragraph lays out. They are same-paragraph
-          // siblings, not different-paragraph blockers, so the compatibility
-          // policy leaves them to overlap as allowOverlap=true permits.
-          .filter((exclusion) => exclusion.anchorOccurrenceId === undefined
-            || !paragraphOccurrenceIds.has(exclusion.anchorOccurrenceId))
-          .map((exclusion) => ({
-            occurrenceId: exclusion.anchorOccurrenceId ?? exclusion.id,
-            bounds: exclusion.bounds,
-          }));
+    const blockerBounds = [...externalCollisions, ...sameParagraphBlockers]
+      .filter((entry) => entry.occurrenceId !== occurrenceId)
+      .map((entry) => ({
+        occurrenceId: entry.occurrenceId,
+        bounds: entry.bounds,
+      }));
     const blockers: FloatPlacementParticipant[] = blockerBounds.map((entry) => ({
       occurrenceId: entry.occurrenceId,
       kind: 'drawingml',
-      // `externalExclusions` is the already-established other-paragraph
-      // registry; the current paragraph uses a distinct compatibility id.
       paragraphId: 0,
       bounds: entry.bounds,
       exclusionBounds: entry.bounds,
     }));
     const page = options.anchorFrames?.page;
-    const rightBoundary = normativeCollision
-      && behavior.layoutInCell
+    const rightBoundary = behavior.layoutInCell
       && options.anchorCellBounds
       ? options.anchorCellBounds.xPt + options.anchorCellBounds.widthPt
       : page
@@ -3226,9 +3211,7 @@ function acquireAnchorOccurrence(
         exclusionBounds: effectiveWrapBounds ?? rect,
       },
       blockers,
-      avoidance: normativeCollision
-        ? { kind: 'drawingml-normative' }
-        : { kind: 'word-different-paragraph', paragraphId: 1 },
+      avoidance: { kind: 'drawingml-normative' },
       rightBoundaryPt: rightBoundary,
     });
     const delta = displaced.displacement;
@@ -5227,11 +5210,16 @@ export function sliceParagraphLayout(
   const selected = acquired.lines.slice(continuation.lineStart, continuation.lineEnd);
   const first = selected[0];
   const last = selected.at(-1);
-  // A continuation is placed in a new flow slice. Preserve the acquired x/range
-  // geometry, but make its first retained line own the same local y origin as
-  // the original paragraph so placement translates one coherent coordinate
-  // space instead of carrying the preceding page's consumed line offset.
-  const deltaYPt = continuation.continuesFromPrevious && first
+  // A continuation cut from lines measured earlier in the same flow (a table
+  // cell slice starting at lineStart > 0) is placed in a new flow slice.
+  // Preserve the acquired x/range geometry, but make its first retained line
+  // own the same local y origin as the original paragraph so placement
+  // translates one coherent coordinate space instead of carrying the
+  // preceding page's consumed line offset. A body continuation is remeasured
+  // at its new location (lineStart 0); its first line already sits where that
+  // location's wrap places it (§20.4.2.20 topAndBottom skips the band), and
+  // rebasing it would paint it inside a page-owned float's exclusion.
+  const deltaYPt = continuation.continuesFromPrevious && continuation.lineStart > 0 && first
     ? acquired.flowBounds.yPt - first.bounds.yPt
     : 0;
   const rebasedSelected = deltaYPt === 0

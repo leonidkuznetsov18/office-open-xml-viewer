@@ -54,13 +54,20 @@ export function floatingTableAvoidance(
     : Object.freeze({ kind: 'none' });
 }
 
-export function drawingMLAvoidance(
-  allowOverlap: boolean,
-  paragraphId: number,
-): FloatAvoidance {
+/** ECMA-376 §20.4.2.3: an overlap-permitted DrawingML object keeps its
+ * position; the issue #1615 controls show no different-paragraph displacement
+ * for pictures with square or topAndBottom wrap, page-, margin- or
+ * paragraph-relative, identical or partially overlapping. */
+export function drawingMLAvoidance(allowOverlap: boolean): FloatAvoidance {
   return allowOverlap
-    ? Object.freeze({ kind: 'word-different-paragraph', paragraphId })
+    ? Object.freeze({ kind: 'none' })
     : Object.freeze({ kind: 'drawingml-normative' });
+}
+
+/** §17.3.1.11 frames carry no allowOverlap; they keep the established
+ * different-paragraph displacement policy. */
+export function frameAvoidance(paragraphId: number): FloatAvoidance {
+  return Object.freeze({ kind: 'word-different-paragraph', paragraphId });
 }
 
 export function floatRegistryParticipant(
