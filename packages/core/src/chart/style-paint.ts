@@ -98,6 +98,15 @@ export function chartStyleLineDecision(
   return style.linePaintAuthored === true ? null : undefined;
 }
 
+/** Whether a direct ChartEx waterfall series/point `spPr` removes the body
+ * fill. PowerPoint honors that `a:noFill` without the linked dataPoint
+ * entry's `allowNoFillOverride`; see chartExWaterfallDataPointPaint. */
+export function chartStyleWaterfallDirectNoFill(
+  direct: ChartExElementStyle | null | undefined,
+): boolean {
+  return direct?.fillHidden === true && direct.fillNoStyle !== true;
+}
+
 /** Resolve direct shape paint over a linked CT_StyleEntry. An omitted fill or
  * line in a present `spPr` still inherits: MS-ODRAWXML's `allowNo*Override`
  * permits an authored `noFill`/no-line choice to replace the style; it does

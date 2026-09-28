@@ -40,6 +40,7 @@ import {
   chartStockBarFillDecision,
   chartStyleFillDecision,
   chartThreeDSurfacePaint,
+  chartStyleWaterfallDirectNoFill,
 } from './style-paint.js';
 import {
   chartDataPointStyleRole,
@@ -523,32 +524,21 @@ function collectChartMarkerImageFillResult(
       || point?.chartexStyle?.fillHidden != null
       || point?.chartexStyle?.fillColors?.some(color => color != null) === true
       || point?.chartexStyle?.fillPaints?.some(paint => paint != null) === true;
-    if (pointAuthors) {
-      const pointStyle = point?.fillHidden === true
+    const local = pointAuthors
+      ? point?.fillHidden === true
         ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
-        : point?.chartexStyle;
-      return dataPointImageDecision(
-        pointStyle,
-        point?.color,
-        chart.chartexDataPointStyle,
-        rawLinkedChartStyleRole(chart, 'dataPoint')
-          ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
-        semanticIndex,
-      );
-    }
-    if (series?.chartexStyle?.fillPaintAuthored === true) {
-      return dataPointImageDecision(
-        series.chartexStyle,
-        series.color,
-        chart.chartexDataPointStyle,
-        rawLinkedChartStyleRole(chart, 'dataPoint')
-          ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
-        semanticIndex,
-      );
-    }
+        : point?.chartexStyle
+      : series?.chartexStyle;
+    // Mirror chartExWaterfallDataPointPaint: direct waterfall no-fill removes
+    // the body, so a linked picture fill must not be fetched for it.
+    if (chartStyleWaterfallDirectNoFill(local)) return null;
     return dataPointImageDecision(
-      series?.chartexStyle, series?.color, chart.chartexDataPointStyle,
-      rawLinkedChartStyleRole(chart, 'dataPoint'), semanticIndex,
+      local,
+      pointAuthors ? point?.color : series?.color,
+      chart.chartexDataPointStyle,
+      rawLinkedChartStyleRole(chart, 'dataPoint')
+        ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
+      semanticIndex,
     );
   };
   const frameImageDecision = (

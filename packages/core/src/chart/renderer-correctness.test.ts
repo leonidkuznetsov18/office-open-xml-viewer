@@ -9902,6 +9902,26 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(rec.strokeRects.filter(rect => rect.ss === '#E46970')).toHaveLength(3);
   });
 
+  it('does not preflight a linked Waterfall picture fill removed by series noFill', () => {
+    const picture = {
+      fillType: 'image' as const,
+      imagePath: 'ppt/media/linked-point.png',
+      mimeType: 'image/png',
+      stretch: true,
+    };
+    const model = (seriesStyle: ChartSeries['chartexStyle']) => baseModel({
+      chartType: 'waterfall',
+      categories: ['Start', 'Drop', 'End'],
+      subtotalIndices: [2],
+      chartexDataPointStyle: { fillPaints: [picture], fillPaintAuthored: true },
+      series: [series({ values: [10, -2, 8], chartexStyle: seriesStyle })],
+    });
+
+    expect(collectChartImageFillUsages(model(null))).toHaveLength(1);
+    expect(collectChartImageFillUsages(model({ fillHidden: true, fillPaintAuthored: true })))
+      .toHaveLength(0);
+  });
+
   const chartExLegendModel = (
     chartType: string,
     localStyle: ChartSeries['chartexStyle'],

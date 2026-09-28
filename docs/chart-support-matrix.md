@@ -107,10 +107,10 @@ boundary precedes that paint cascade: `<c:ser>` / `<c:dPt>`
 `spPr/a:ln/a:noFill` removes the series connector or point outline itself, so
 an unmodified linked `dataPointLine` / `dataPoint` role cannot recreate it.
 The modifier rule still applies when no-line is contributed by a style layer
-rather than by that classic mark-visibility property. ChartEx data-point fill
+rather than by that classic mark-visibility property. ChartEx waterfall fill
 is a second boundary: a direct `<cx:series>` / `<cx:dataPt>` `spPr/a:noFill`
-removes the point fill without `allowNoFillOverride`, as observed in
-PowerPoint waterfall rendering.
+removes the waterfall point fill without `allowNoFillOverride`, as observed
+in PowerPoint. Other ChartEx families keep the modifier gate.
 Numeric style definitions, source-layer composition, and Canvas role adapters
 are separate implementation layers. Numeric style semantics are always on:
 `c:style` is document content, not an optional enhancement. Resource ceilings

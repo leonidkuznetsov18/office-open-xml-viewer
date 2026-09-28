@@ -58,6 +58,7 @@ import {
   chartStyleLineDecision,
 } from './style-paint.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
+import { chartExWaterfallDataPointPaint } from './shared/chartex-style.js';
 import { paintPlotAreaFrame } from './plot-area-frame.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
 import {
@@ -124,19 +125,14 @@ function waterfallPointPaint(
     const pointStyle = point?.fillHidden === true
       ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
       : point?.chartexStyle;
-    return chartExDataPointPaint(
-      chart, semanticIndex, 3, pointStyle, point?.color,
-    );
-  }
-  if (series?.chartexStyle?.fillPaintAuthored === true) {
-    return chartExDataPointPaint(
-      chart, semanticIndex, 3, series.chartexStyle, series.color,
+    return chartExWaterfallDataPointPaint(
+      chart, semanticIndex, pointStyle, point?.color,
     );
   }
   // Points without their own fill inherit the series `spPr` fill, including
-  // an authored `a:noFill`; chartExDataPointPaint owns that precedence.
-  return chartExDataPointPaint(
-    chart, semanticIndex, 3, series?.chartexStyle, series?.color,
+  // an authored `a:noFill`; chartExWaterfallDataPointPaint owns that rule.
+  return chartExWaterfallDataPointPaint(
+    chart, semanticIndex, series?.chartexStyle, series?.color,
   );
 }
 
@@ -447,9 +443,9 @@ function renderWaterfallChart(
   const colorPos = `#${series?.color ?? chartExDataPointFill(chart, 0, 3, localStyle)}`;
   const colorNeg = `#${chartExDataPointFill(chart, 1, 3, localStyle)}`;
   const colorSub = `#${chartExDataPointFill(chart, 2, 3, localStyle)}`;
-  const legendPaintPos = chartExDataPointPaint(chart, 0, 3, localStyle, series?.color);
-  const legendPaintNeg = chartExDataPointPaint(chart, 1, 3, localStyle);
-  const legendPaintSub = chartExDataPointPaint(chart, 2, 3, localStyle);
+  const legendPaintPos = chartExWaterfallDataPointPaint(chart, 0, localStyle, series?.color);
+  const legendPaintNeg = chartExWaterfallDataPointPaint(chart, 1, localStyle);
+  const legendPaintSub = chartExWaterfallDataPointPaint(chart, 2, localStyle);
   const legendChart: ChartModel = {
     ...chart,
     chartType: 'clusteredBar',

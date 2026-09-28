@@ -1,6 +1,6 @@
 // Classic chart chartex style helpers.
 import type { ChartModel, ChartRect, ChartSeries, ChartStyleRole } from '../../types/chart';
-import { chartStyleColor, chartStyleDirectFillDecision, chartStyleDirectLineDecision, chartStyleDirectNoLineDecision, chartStyleFillDecision, chartStyleLineDecision } from '../style-paint.js';
+import { chartStyleColor, chartStyleDirectFillDecision, chartStyleDirectLineDecision, chartStyleDirectNoFillDecision, chartStyleDirectNoLineDecision, chartStyleFillDecision, chartStyleLineDecision, chartStyleWaterfallDirectNoFill } from '../style-paint.js';
 import type { Fill } from '../../types/common';
 import { rawLinkedChartStyleRole } from '../effective-style.js';
 import { resolveFill } from '../../shape/paint.js';
@@ -142,24 +142,18 @@ export function chartExDataPointPaint(
   legacyColor?: string | null,
   linkedStyle: ChartExStyle | null | undefined = chart.chartexDataPointStyle,
 ): Fill | null {
-  // Direct CT_Series (MS-ODRAWXML §2.24.3.77) / CT_DataPoint `spPr` owns
-  // the ChartEx data-point fill; the linked dataPoint Chart
-  // Style supplies paint only where that direct fill is omitted.
-  //
-  // PowerPoint-observed: a waterfall whose series `spPr` authors `a:noFill`
-  // (with an outline) and whose linked dataPoint entry is `fillRef idx=1`
-  // with no `mods` paints every point lacking its own fill outline-only;
-  // points with a direct solid fill keep it. So a direct ChartEx `a:noFill`
-  // is not gated by `allowNoFillOverride` here, unlike the classic chart-space
-  // frame rule measured separately. That boundary is the observed waterfall
-  // series/point cascade; the other ChartEx families share this resolver
-  // and the same spPr precedence without a contrary observation.
+  // CT_Series.spPr formats the series shape; ChartEx semantic data points
+  // (box bodies, hierarchy nodes, funnel bars) still obtain their own paint
+  // from the dataPoint Chart Style. A direct `<a:noFill>` replaces that role
+  // only through its `allowNoFillOverride` modifier. Waterfall points are the
+  // observed exception; see chartExWaterfallDataPointPaint. Positive local
+  // series fills remain direct formatting and do override the linked recipe.
   const rawLinkedStyle = linkedStyle === chart.chartexDataPointStyle
     ? rawLinkedChartStyleRole(chart, 'dataPoint')
       ?? (chart.classicChartStyleRoles == null ? linkedStyle : undefined)
     : linkedStyle;
   const local = localStyle?.fillHidden
-    ? null
+    ? chartStyleDirectNoFillDecision(rawLinkedStyle)
     : chartStyleDirectFillDecision(localStyle, rawLinkedStyle, index);
   if (local !== undefined) return local;
   if (localStyle && legacyColor) return { fillType: 'solid', color: legacyColor };
@@ -167,6 +161,26 @@ export function chartExDataPointPaint(
   const linked = chartStyleFillDecision(linkedStyle, index);
   if (linked !== undefined) return linked;
   return { fillType: 'solid', color: chartExSemanticFill(chart, index, count) };
+}
+
+
+/** Waterfall counterpart of chartExDataPointPaint.
+ *
+ * PowerPoint-observed: a waterfall whose series `spPr` authors `a:noFill`
+ * (with an outline), under a linked dataPoint entry `fillRef idx=1` with no
+ * `mods`, paints every point lacking its own fill outline-only, while points
+ * with a direct solid fill keep it. A direct waterfall series/point no-fill
+ * therefore owns the body fill without `allowNoFillOverride`. The observation
+ * covers the waterfall series cascade only; other ChartEx families keep the
+ * modifier-gated rule until Office evidence covers them. */
+export function chartExWaterfallDataPointPaint(
+  chart: ChartModel,
+  index: number,
+  localStyle?: ChartExStyle | null,
+  legacyColor?: string | null,
+): Fill | null {
+  if (chartStyleWaterfallDirectNoFill(localStyle)) return null;
+  return chartExDataPointPaint(chart, index, 3, localStyle, legacyColor);
 }
 
 
