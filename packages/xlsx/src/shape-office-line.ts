@@ -50,11 +50,14 @@ export function shapeOfficeRouteKey(run: TextRun): string {
  * Excel's natural line box for one run (see `excelDrawingMlLineRatios`).
  *
  * The static catalog is reference geometry, not proof of the bytes behind
- * local(). Admit it only after the exact style has loaded, and only when every
- * known profile for that authored tuple agrees on the projection. An unknown
- * OS/2 class, missing usWin metrics or conflicting Office/macOS versions
- * (e.g. Times New Roman's hhea lineGap 0 vs 87) return undefined, and the
- * caller keeps the ordinary Canvas line box.
+ * local(). Admit it only after the exact style has loaded. Excel for Mac
+ * prefers a macOS system copy of a family over the copy bundled in Office
+ * (#1604: its Times New Roman had the system hhea lineGap 87), so macOS
+ * profiles win when present, and Office profiles are used otherwise. Every
+ * profile in the chosen source must agree. Anything else returns undefined
+ * and the caller keeps the ordinary Canvas line box: another source such as
+ * a published open font, missing OS/2 data, disagreeing profiles, or a macOS
+ * Far East face (not measured).
  */
 export function shapeRunLineRatios(
   run: TextRun,
@@ -67,17 +70,18 @@ export function shapeRunLineRatios(
     || route.weight !== (run.bold ? 700 : 400)
     || route.style !== (run.italic ? 'italic' : 'normal')) return undefined;
   const profiles = findReferenceFontMetrics(family, { weight: route.weight, style: route.style });
-  if (profiles.length === 0) return undefined;
+  const system = profiles.filter((p) => p.source === 'macos-system' || p.source === 'macos-supplemental');
+  const chosen = system.length > 0 ? system : profiles.filter((p) => p.source === 'office-mac');
+  if (chosen.length === 0) return undefined;
   let ratios: ShapeRunLineRatios | undefined;
-  for (const profile of profiles) {
+  for (const profile of chosen) {
     if (profile.farEastCodePage == null || !profile.win) return undefined;
     const projected = excelDrawingMlLineRatios({
+      faceSource: system.length > 0 ? 'system' : 'office-bundle',
       unitsPerEm: profile.unitsPerEm,
-      winAscent: profile.win[0],
-      winDescent: profile.win[1],
-      hheaAscent: profile.hhea[0],
-      hheaDescent: profile.hhea[1],
-      hheaLineGap: profile.hhea[2],
+      hhea: profile.hhea,
+      win: profile.win,
+      typoMetrics: profile.typoMetrics,
       farEastCodePage: profile.farEastCodePage,
     });
     if (!projected || (ratios && (projected.ascentRatio !== ratios.ascentRatio

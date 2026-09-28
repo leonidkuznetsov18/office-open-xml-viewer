@@ -50,7 +50,7 @@ function route(family: string, weight: 400 | 700 = 400): OfficeFontFallbackRoute
   };
 }
 
-const ROUTES = {
+const ROUTES: Record<string, OfficeFontFallbackRoute> = {
   arial: route('Arial'),
   meiryo: route('Meiryo'),
   'ms gothic': route('MS Gothic'),
@@ -80,8 +80,16 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
     expect(sum(shapeRunLineRatios(run('日g', 'Yu Gothic', 24), ROUTES['yu gothic']))).toBeCloseTo(1.6732, 3);
     // Earlier single-line controls: Meiryo UI Bold measured 1.646–1.649 em.
     expect(sum(shapeRunLineRatios(run('予算', 'Meiryo UI', 25, true), route('Meiryo UI', 700)))).toBeCloseTo(1.651, 3);
-    // Office and macOS ship Times New Roman with different hhea lineGap: ambiguous.
-    expect(shapeRunLineRatios(run('Hg', 'Times New Roman', 24), ROUTES['times new roman'])).toBeUndefined();
+    // Excel used the macOS system Times New Roman (hhea lineGap 87): 1.150 em,
+    // not the Office copy's 1.107 em.
+    expect(sum(shapeRunLineRatios(run('Hg', 'Times New Roman', 24), ROUTES['times new roman']))).toBeCloseTo(1.1499, 4);
+    // Supplement L-*: bundled Baskerville Old Face follows usWin (1.141 em),
+    // bundled Gabriola its USE_TYPO_METRICS typo box (1.700 em), and the macOS
+    // system Palatino and Helvetica their hhea box (1.100 and 1.000 em).
+    expect(sum(shapeRunLineRatios(run('Hg', 'Baskerville Old Face', 24), route('Baskerville Old Face')))).toBeCloseTo(1.1406, 4);
+    expect(sum(shapeRunLineRatios(run('Hg', 'Gabriola', 24), route('Gabriola')))).toBeCloseTo(1.7, 3);
+    expect(sum(shapeRunLineRatios(run('Hg', 'Palatino', 24), route('Palatino')))).toBeCloseTo(1.1001, 4);
+    expect(sum(shapeRunLineRatios(run('Hg', 'Helvetica', 24), route('Helvetica')))).toBeCloseTo(1.0, 4);
     // Unverified resources and distinct East Asian faces stay undefined.
     expect(shapeRunLineRatios(run('Hg', 'Arial', 24), { ...ROUTES.arial, resourceIdentity: 'injected:x' })).toBeUndefined();
     expect(shapeRunLineRatios({ ...run('Hg', 'Arial', 24), fontFaceEa: 'Meiryo' }, ROUTES.arial)).toBeUndefined();
@@ -134,6 +142,28 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
     expect(baselinesPt(three('Meiryo', 24, { type: 'pts', val: 18 }))[0]).toBeCloseTo(12.84, 1);
   });
 
+  it('keeps the natural descent under spcPts until a quarter of the line exceeds it', () => {
+    const three = (size: number, pts: number) =>
+      body([1, 2, 3].map((n) => para([run(`M${n}`, 'Meiryo', size)], { spaceLine: { type: 'pts', val: pts } })));
+    // Excel T-mei-mix-30 / E-mei-14-30: 14 pt Meiryo at 30 pt keeps its 9.31 pt
+    // descent (first baseline 24.26–24.52 pt); at 40 pt the descent grows to
+    // 0.25·H + k (first baseline 31.6 pt).
+    expectOffice(baselinesPt(three(14, 30))[0], 24.3);
+    expect(Math.abs(baselinesPt(three(14, 40))[0] - 31.6)).toBeLessThanOrEqual(0.6);
+    // Supplement E-mei-24-56: first baseline 43.48 pt (0.24 pt export grid).
+    expect(Math.abs(baselinesPt(three(24, 56))[0] - 43.48)).toBeLessThanOrEqual(0.3);
+  });
+
+  it('takes spcPct from the natural line even when lnSpc is not 100 %', () => {
+    // Supplement Q-Arial-l150-bef50: lnSpc 150 % and spcBef 50 % → 55.2 pt
+    // (41.4 + 13.8 of the 27.6 pt natural line), not 41.4 + 20.7.
+    const lines = baselinesPt(body([1, 2].map((n) => para([run(`Q${n}`, 'Arial', 24)], {
+      spaceLine: { type: 'pct', val: 150000 },
+      ...(n === 2 ? { spaceBefore: { type: 'pct', val: 50000 } } : {}),
+    }))));
+    expect(Math.abs(lines[1] - lines[0] - 55.2)).toBeLessThanOrEqual(0.3);
+  });
+
   it('adds spcAft and spcBef between paragraphs but not before the first', () => {
     const lines = (p1: Partial<ShapeParagraph>, p2: Partial<ShapeParagraph>) => baselinesPt(body([
       para([run('P1', 'Arial', 24)], p1), para([run('P2', 'Arial', 24)], p2),
@@ -164,7 +194,7 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
   it('keeps the ordinary 1.2 em box when any run lacks a verified face', () => {
     const plain = baselinesPt(body([para([run('A1', 'Arial', 20)]), para([run('A2', 'Arial', 20)])]), null);
     expect(plain[1] - plain[0]).toBeCloseTo(24, 5);
-    const mixed = baselinesPt(body([para([run('A1', 'Arial', 20)]), para([run('T2', 'Times New Roman', 20)])]));
+    const mixed = baselinesPt(body([para([run('A1', 'Arial', 20)]), para([run('G2', 'Gabriola', 20)])]));
     expect(mixed[1] - mixed[0]).toBeCloseTo(24, 5);
     // Paragraph spacing still applies to the ordinary box.
     const spaced = baselinesPt(body([

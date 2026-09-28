@@ -65,24 +65,24 @@ export interface DrawingMlLineBox {
 /**
  * Where `a:lnSpc` (§21.1.2.2.5) puts the baseline inside the spaced line.
  * ECMA-376 gives the spaced height (see {@link drawingMlLineHeight}) but not
- * the baseline position. This is observed Excel behaviour (issue #1604 PDF
- * controls: six fonts, spcPct 80/150 % at 11 and 40 pt, spcPts 18/36/30 pt,
- * and mixed sizes). It matched every line within 0.16 pt except the one
- * boundary noted below.
+ * the baseline position. This is observed Excel behaviour (#1604 PDF
+ * controls). They covered twelve faces, spcPct 80/150 %, and spcPts from
+ * 15 pt to 56 pt on both sides of each natural height, including mixed sizes.
+ * The rule fits every line of the controls to the export's rounding.
  *
- * With the natural box `a`/`d` (L = a + d) and the spaced height H:
- * - Excel keeps a 3:1 split of the spaced line, lowered by
- *   k = max(0, 0.75·L − a) for faces whose natural ascent is below 75 %
- *   (Meiryo, Yu Gothic). A taller line gets `0.75·H − k` above the baseline.
- * - A shorter line keeps at least its natural descent: `max(H − d, 0.75·H − k)`.
- * - H = L therefore reproduces the natural box.
+ * Natural box: `a`/`d`, L = a + d. Spaced height: H.
+ * Let k = max(0, d − 0.25·L); faces with a deep natural descent (Meiryo,
+ * Yu Gothic) have k > 0.
+ * - H < L: the descent becomes min(d, 0.25·H + k).
+ * - H > L: while 0.25·H ≤ d, the natural descent is kept and all the extra
+ *   space goes above. Past that point the descent becomes 0.25·H + k.
+ *   Examples: Meiryo 14 pt (d 9.31 pt) keeps d up to spcPts 36 and gets
+ *   12.5 pt at 40; Arial always gets 0.25·H.
+ * - H = L: the natural box is kept.
  *
- * The descent is the rest of H, so each baseline pitch is the previous
+ * The ascent is the rest of H. Each baseline pitch is therefore the previous
  * line's descent plus the next line's ascent, and a run of same-size lines
  * steps by exactly H.
- *
- * Known residual: a 14 pt Meiryo line at spcPts 30 (just above its 27.3 pt
- * natural height) sat 0.65 pt lower in Excel than this rule predicts.
  */
 export function drawingMlSpacedLineBox(
   natural: DrawingMlLineBox,
@@ -93,21 +93,20 @@ export function drawingMlSpacedLineBox(
   const L = natural.ascent + natural.descent;
   const H = drawingMlLineHeight(L, spacing, pxPerPt, reduction);
   if (H === L) return { ascent: natural.ascent, descent: natural.descent };
-  const k = Math.max(0, 0.75 * L - natural.ascent);
-  const ascent = H < L
-    ? Math.max(H - natural.descent, 0.75 * H - k)
-    : 0.75 * H - k;
-  return { ascent, descent: H - ascent };
+  const k = Math.max(0, natural.descent - 0.25 * L);
+  const descent = H < L
+    ? Math.min(natural.descent, 0.25 * H + k)
+    : 0.25 * H <= natural.descent ? natural.descent : 0.25 * H + k;
+  return { ascent: H - descent, descent };
 }
 
 /**
  * `a:spcBef` (§21.1.2.2.10) / `a:spcAft` (§21.1.2.2.9) in px. spcPts is
  * absolute. For spcPct, Excel's base is the natural single-line height of
  * the adjacent line: the paragraph's first line for spcBef, its last line
- * for spcAft (issue #1604 controls: 50 % and 100 % at 24 pt, and 14/40 pt
- * mixes where the base followed the owning paragraph's 40 pt line). The
- * controls held lnSpc at 100 % whenever spcPct was used, so a percentage of
- * a spaced line is outside the measured scope.
+ * for spcAft (issue #1604 controls: 50 % and 100 % at 24 pt, 14/40 pt mixes
+ * where the base followed the owning paragraph's 40 pt line). The base stays
+ * the natural line when the paragraph's lnSpc is 80 %, 150 % or 36 pt.
  */
 export function drawingMlParagraphSpacing(
   spacing: DrawingMlLineSpacing,
