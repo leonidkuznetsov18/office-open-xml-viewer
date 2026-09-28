@@ -320,12 +320,26 @@ export function withInheritedPatternScope<T>(
   target: CanvasRenderingContext2D,
   paint: () => T,
   deviceOffset?: { x: number; y: number },
+  sourceDeviceToTargetDevice?: PatternMatrix,
 ): T {
   const scale = activePatternPointScale.get(source);
   const root = activePatternCoordinateRoot.get(source);
-  const inherited = root && deviceOffset
-    ? { ...root, e: root.e - deviceOffset.x, f: root.f - deviceOffset.y }
-    : root;
+  // An effect canvas may crop the source, while a bevel canvas additionally
+  // changes its axes to the shape's local frame. Transfer the complete affine
+  // slide frame in that case; a translation alone would rotate the tile with
+  // the bevel when the shape has an authored transform.
+  const inherited = root && sourceDeviceToTargetDevice
+    ? {
+        a: sourceDeviceToTargetDevice.a * root.a + sourceDeviceToTargetDevice.c * root.b,
+        b: sourceDeviceToTargetDevice.b * root.a + sourceDeviceToTargetDevice.d * root.b,
+        c: sourceDeviceToTargetDevice.a * root.c + sourceDeviceToTargetDevice.c * root.d,
+        d: sourceDeviceToTargetDevice.b * root.c + sourceDeviceToTargetDevice.d * root.d,
+        e: sourceDeviceToTargetDevice.a * root.e + sourceDeviceToTargetDevice.c * root.f + sourceDeviceToTargetDevice.e,
+        f: sourceDeviceToTargetDevice.b * root.e + sourceDeviceToTargetDevice.d * root.f + sourceDeviceToTargetDevice.f,
+      }
+    : root && deviceOffset
+      ? { ...root, e: root.e - deviceOffset.x, f: root.f - deviceOffset.y }
+      : root;
   const run = () => inherited
     ? withPatternCoordinateSpace(target, inherited, paint)
     : paint();

@@ -5606,6 +5606,29 @@ mod tests {
         let doc = roxmltree::Document::parse(with_ufilltx).unwrap();
         let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
         assert!(r.underline_color.is_none());
+
+        let with_pattern = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr u="sng"><pattFill prst="pct50"><fgClr><srgbClr val="D21D54"/></fgClr><bgClr><srgbClr val="12CED4"/></bgClr></pattFill><uFill><pattFill prst="dnDiag"><fgClr><srgbClr val="00A650"/></fgClr><bgClr><srgbClr val="F5A623"/></bgClr></pattFill></uFill></rPr><t>x</t></r>"#;
+        let doc = roxmltree::Document::parse(with_pattern).unwrap();
+        let r = parse_run(doc.root_element(), None, &theme, &rels).unwrap();
+        assert!(
+            matches!(r.underline_fill, Some(Fill::Pattern { preset, .. }) if preset == "dnDiag")
+        );
+
+        let inherited = r#"<defRPr xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><uFill><solidFill><srgbClr val="FF0000"/></solidFill></uFill></defRPr>"#;
+        let default_doc = roxmltree::Document::parse(inherited).unwrap();
+        let doc = roxmltree::Document::parse(with_ufilltx).unwrap();
+        let r = parse_run(
+            doc.root_element(),
+            Some(default_doc.root_element()),
+            &theme,
+            &rels,
+        )
+        .unwrap();
+        assert!(
+            r.underline_fill.is_none(),
+            "explicit uFillTx overrides inherited uFill"
+        );
+        assert!(r.underline_color.is_none());
     }
 
     /// ECMA-376 §21.1.2.3.4 — rPr > highlight is a CT_Color (the marker /

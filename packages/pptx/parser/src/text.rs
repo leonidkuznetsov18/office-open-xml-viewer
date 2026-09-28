@@ -5,7 +5,7 @@
 //! `children_vec`, `attr`, `attr_r`, `attr_i64`, `attr_f64`, `resolve_path`)
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
-use crate::fill::{parse_color_node, parse_reflection, parse_shadow};
+use crate::fill::{parse_color_node, parse_fill, parse_reflection, parse_shadow};
 use crate::theme::{resolve_theme_typeface, PptxSchemeResolver};
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
@@ -533,6 +533,14 @@ fn text_property_pattern_fill(
         bg: pattern.bg,
         preset: pattern.preset,
     })
+}
+
+fn underline_fill_choice<'a, 'input>(
+    properties: roxmltree::Node<'a, 'input>,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    properties
+        .children()
+        .find(|node| node.is_element() && matches!(node.tag_name().name(), "uFill" | "uFillTx"))
 }
 
 // Carries the resolved master/layout/placeholder inheritance context (theme,
@@ -1182,6 +1190,7 @@ pub(crate) fn parse_paragraph(
                     underline: false,
                     underline_style: None,
                     underline_color: None,
+                    underline_fill: None,
                     strikethrough: false,
                     strike_double: false,
                     font_size,
@@ -1475,13 +1484,19 @@ fn parse_run_with_reflection(
         .unwrap_or(false);
     let underline_style = underline_attr.filter(|v| v != "none" && v != "sng");
 
-    // ECMA-376 §21.1.2.3.12 — uFill specifies a per-underline colour that
-    // overrides the text colour. uFillTx (or absence) means "follow text".
-    let underline_color = r_pr
-        .and_then(|n| child(n, "uFill"))
-        .or_else(|| def_rpr.and_then(|n| child(n, "uFill")))
-        .and_then(|n| child(n, "solidFill"))
-        .and_then(|n| parse_color_node(n, theme));
+    // ECMA-376 §21.1.2.3.12–13: uFill is a complete EG_FillProperties choice;
+    // uFillTx follows the glyph paint. An explicit run-level uFillTx must also
+    // override an inherited defRPr uFill. PowerPoint PDF confirms patterned
+    // glyph/underline paint, a separately patterned underline, and solid uFill.
+    let underline_fill = r_pr
+        .and_then(underline_fill_choice)
+        .or_else(|| def_rpr.and_then(underline_fill_choice))
+        .filter(|node| node.tag_name().name() == "uFill")
+        .and_then(|node| parse_fill(node, theme));
+    let underline_color = match &underline_fill {
+        Some(Fill::Solid { color }) => Some(color.clone()),
+        _ => None,
+    };
 
     // strikethrough: "sngStrike" or "dblStrike" → true; double tracked separately
     let strike_attr = r_pr
@@ -1636,6 +1651,7 @@ fn parse_run_with_reflection(
         underline,
         underline_style,
         underline_color,
+        underline_fill,
         strikethrough,
         strike_double,
         font_size,

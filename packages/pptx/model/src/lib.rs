@@ -1199,11 +1199,15 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.9 (`rPr@u`); ST_TextUnderlineType §20.1.10.82.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underline_style: Option<String>,
-    /// Underline-specific colour from rPr > uFill > solidFill. None means the
-    /// underline follows the text colour (uFillTx behaviour, the default).
+    /// Solid underline colour from rPr > uFill > solidFill. None also covers
+    /// patterned uFill and uFillTx, which follows the glyph paint.
     /// ECMA-376 §21.1.2.3.12 (CT_TextUnderlineFillGroupWrapper).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub underline_color: Option<String>,
+    /// Explicit rPr > uFill paint. uFillTx and absence follow the glyph fill.
+    /// ECMA-376 §21.1.2.3.12–13 (EG_TextUnderlineFill).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline_fill: Option<Fill>,
     /// true when strike == "sngStrike" or "dblStrike"
     pub strikethrough: bool,
     /// true only when strike == "dblStrike" (renderer draws two parallel lines)

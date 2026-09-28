@@ -733,6 +733,8 @@ type LayoutSegment = {
   underlineStyle?: string;
   /** rgba() colour for the underline when uFill overrides the text colour. */
   underlineColor?: string;
+  /** Explicit rPr > uFill; otherwise the underline follows the glyph paint. */
+  underlineFill?: Fill;
   strikethrough: boolean;
   /** Two parallel strike lines (rPr strike="dblStrike"). */
   strikeDouble?: boolean;
@@ -1475,6 +1477,7 @@ export function layoutParagraph(
       underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
+      underlineFill: run.underlineFill,
       strikethrough: run.strikethrough,
       strikeDouble: run.strikeDouble === true,
       letterSpacingPx: letterSpacingPx || undefined,
@@ -1526,6 +1529,7 @@ export function layoutParagraph(
     && a.drawSizePx === b.drawSizePx && a.underline === b.underline
     && a.underlineStyle === b.underlineStyle
     && a.underlineColor === b.underlineColor
+    && a.underlineFill === b.underlineFill
     && a.strikethrough === b.strikethrough && a.strikeDouble === b.strikeDouble
     && a.letterSpacingPx === b.letterSpacingPx && a.baseline === b.baseline
     && a.shadow === b.shadow && a.reflection === b.reflection
@@ -5159,7 +5163,17 @@ export function renderTextBody(
       }
 
       if (seg.underline) {
-        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx, seg.underlineColor ?? seg.color, seg.underlineStyle, rc.dpr);
+        // §21.1.2.3.13 uFillTx follows the actual glyph fill (including
+        // pattFill), while §21.1.2.3.12 uFill supplies its own fill choice.
+        // Office PDF shows a separately chosen underline pattern on the
+        // same slide-aligned grid.
+        const underlinePaint = seg.underlineFill
+          ? resolveFillCore(
+              seg.underlineFill, ctx, penX, segBaseline, segW + jext, drawSizePx * 0.05,
+              0, scale * PT_TO_EMU,
+            ) ?? 'rgba(0,0,0,0)'
+          : seg.underlineColor ?? ctx.fillStyle;
+        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx, underlinePaint, seg.underlineStyle, rc.dpr);
       }
 
       if (seg.strikethrough) {
@@ -5523,7 +5537,29 @@ function paintBeveledFlat(
   octx.save();
   octx.scale(devScale, devScale);
   octx.translate(padCss, padCss);
-  paintBody(octx, 0, 0, w, h);
+  // PowerPoint keeps the pattern's slide axes inside an orthographic bevel.
+  // The body is repainted in this shape-local device canvas, then blitted
+  // through the shape CTM. Transfer the complete slide frame, including the
+  // shape's rotation/flip, before resolving its pattern fill.
+  const signedDet = tf.a * tf.d - tf.b * tf.c;
+  const sourceToAux = Math.abs(signedDet) > 1e-12
+    ? (() => {
+        const invDet = 1 / signedDet;
+        const ia = tf.d * invDet;
+        const ib = -tf.b * invDet;
+        const ic = -tf.c * invDet;
+        const id = tf.a * invDet;
+        const ie = -(ia * tf.e + ic * tf.f);
+        const iff = -(ib * tf.e + id * tf.f);
+        return {
+          a: devScale * ia, b: devScale * ib,
+          c: devScale * ic, d: devScale * id,
+          e: padDev + devScale * (ie - x),
+          f: padDev + devScale * (iff - y),
+        };
+      })()
+    : undefined;
+  withInheritedPatternScope(target, octx, () => paintBody(octx, 0, 0, w, h), undefined, sourceToAux);
   octx.restore();
   // Restrict the bevel distance-transform to the body's inner box grown by the
   // band width (perf: A3 — skips the transparent pad border). Equivalent because

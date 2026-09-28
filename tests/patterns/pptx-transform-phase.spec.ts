@@ -4,6 +4,51 @@ import { fileURLToPath } from 'node:url';
 
 const entry = fileURLToPath(new URL('../../packages/pptx/src/renderer.ts', import.meta.url));
 
+test('PowerPoint bevel body keeps the slide pattern phase in its interior', async ({ page }) => {
+  const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
+  await page.addScriptTag({ content: bundle.output[0].code });
+  const agreements = await page.evaluate(async () => {
+    const renderer = (globalThis as typeof globalThis & {
+      pptxRenderer: typeof import('../../packages/pptx/src/renderer.js');
+    }).pptxRenderer;
+    const render = async (bevel: boolean, rotation: number, flipH: boolean) => {
+      const canvas = document.createElement('canvas');
+      const shape = {
+        type: 'shape', x: 83 * 12700, y: 73 * 12700,
+        width: 180 * 12700, height: 100 * 12700,
+        geometry: 'rect', rotation, flipH, flipV: false,
+        fill: { fillType: 'pattern', preset: 'horz', fg: 'D21D54', bg: '12CED4' },
+        stroke: null,
+        ...(bevel ? {
+          scene3d: { camera: { prst: 'orthographicFront' }, lightRig: { rig: 'threePt', dir: 't' } },
+          sp3d: { bevelT: { w: 127000, h: 76200, prst: 'circle' } },
+        } : {}),
+      };
+      await renderer.renderSlide(canvas, { index: 0, slideNumber: 1, background: null, elements: [shape] } as never,
+        960 * 12700, 540 * 12700, { width: 960, dpr: 1 });
+      return canvas.getContext('2d')!.getImageData(145, 105, 60, 40).data;
+    };
+    const results = [];
+    for (const { rotation, flipH } of [
+      { rotation: 0, flipH: false },
+      { rotation: 45, flipH: false },
+      { rotation: 45, flipH: true },
+    ]) {
+      const flat = await render(false, rotation, flipH);
+      const beveled = await render(true, rotation, flipH);
+      let same = 0;
+      for (let i = 0; i < flat.length; i += 4) {
+        if ((flat[i] > flat[i + 2]) === (beveled[i] > beveled[i + 2])) same++;
+      }
+      results.push(same / (flat.length / 4));
+    }
+    return results;
+  });
+  // Rotated bevels resample the auxiliary raster once more than flat shapes.
+  // Their cell classes still agree across the central region despite edge aliasing.
+  for (const agreement of agreements) expect(agreement).toBeGreaterThan(0.95);
+});
+
 test('PowerPoint pattern cells keep slide phase through rotation and reflection', async ({ page }) => {
   const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
   await page.addScriptTag({ content: bundle.output[0].code });

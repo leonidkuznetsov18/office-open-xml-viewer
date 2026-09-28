@@ -478,6 +478,7 @@ fn default_run() -> TextRunData {
         underline: false,
         underline_style: None,
         underline_color: None,
+        underline_fill: None,
         strikethrough: false,
         strike_double: false,
         font_size: None,

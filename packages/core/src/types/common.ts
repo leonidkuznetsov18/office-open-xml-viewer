@@ -409,10 +409,12 @@ export interface TextRunData {
    */
   underlineStyle?: string;
   /**
-   * Underline-only colour from rPr > uFill (ECMA-376 §21.1.2.3.12). Absent
-   * means the underline follows the text colour (uFillTx default).
+   * Solid underline colour from rPr > uFill (ECMA-376 §21.1.2.3.12).
+   * Absent also covers patterned uFill and uFillTx, which follows glyph paint.
    */
   underlineColor?: string;
+  /** Explicit DrawingML rPr > uFill paint; uFillTx follows the glyph fill. */
+  underlineFill?: Fill;
   /** True when rPr strike is sngStrike or dblStrike. */
   strikethrough: boolean;
   /**

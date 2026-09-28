@@ -2127,6 +2127,7 @@ export interface TextRunData {
     underline: boolean;
     underlineStyle?: string;
     underlineColor?: string;
+    underlineFill?: Fill;
     strikethrough: boolean;
     strikeDouble?: boolean;
     fontSize: number | null;
