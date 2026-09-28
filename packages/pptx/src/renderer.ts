@@ -155,11 +155,15 @@ import { justifiedPiecePositions } from '@silurus/ooxml-core';
 import { resolveTableBorderConflict } from './table-border-conflict.js';
 import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-fallback-contrast';
 import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
+import {
+  powerPointAscentShare, powerPointExactLinePoints, powerPointNaturalLine,
+} from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
 import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
   drawingMlLineHeight,
+  drawingMlSpacedLineBox,
   drawingMlLineX,
   drawingMlLineShouldJustify,
   drawingMlBlockTop,
@@ -703,6 +707,13 @@ type LayoutSegment = {
   font: string;
   /** Inline DrawingML TAB, classified UAX#9 S during visual ordering (#916). */
   isTab?: true;
+  /** PowerPoint's ascent share for this segment's face (see
+   * powerPointAscentShare); undefined when the face is not resolvable. */
+  lineMetricShare?: number;
+  /** Share of the run's latin face. PowerPoint sizes a line by the run's
+   * latin face even when an East Asian segment draws none of its glyphs
+   * (#1610 powerpoint-line-supplement-3); null when unresolved. */
+  lineMetricLatinShare?: number | null;
   /** Reading-frame gap resolved against a:tabLst immediately before paint. */
   tabWidthPx?: number;
   sizePx: number;
@@ -1100,6 +1111,23 @@ export function buildFont(
 }
 
 /**
+ * The PowerPoint line-metric share of a resolved family (see
+ * powerPointAscentShare). A document-embedded face has its own bytes, which
+ * the reference catalog does not describe, so it has no share, and neither
+ * does a CSS generic family.
+ */
+function lineMetricShareFor(
+  family: string,
+  bold: boolean,
+  italic: boolean,
+  rc: RenderContext,
+): number | undefined {
+  if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
+  if (rc.embeddedFontAuthoredFamilies?.has(family)) return undefined;
+  return powerPointAscentShare(family, bold, italic);
+}
+
+/**
  * Lay out a paragraph into display lines.
  * Handles:
  *  - Explicit line breaks (TextRun type='break')
@@ -1455,22 +1483,32 @@ export function layoutParagraph(
     // the selected font changes, leaving run seams and break policy to core.
     let group = '';
     let groupFont = '';
+    let groupShare: number | undefined;
+    const latinShare = lineMetricShareFor(family, bold, italic, rc) ?? null;
     const emitGroup = () => {
-      if (group) input.push({ type: 'text', text: group, style: { ...baseStyle, font: groupFont } });
+      if (group) {
+        input.push({ type: 'text', text: group,
+          style: { ...baseStyle, font: groupFont, lineMetricShare: groupShare,
+            lineMetricLatinShare: latinShare } });
+      }
       group = '';
     };
     for (const ch of rawText) {
       let glyph = ch;
-      let font = familyEa && isCjkBreakChar(ch.codePointAt(0) ?? 0) ? eaFont : baseFont;
-      if (/[-]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
+      const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
+      let font = eaGlyph ? eaFont : baseFont;
+      let share = lineMetricShareFor(eaGlyph ? familyEa : family, bold, italic, rc);
+      if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         glyph = symbolFontToUnicode(ch, symbolFamily);
         font = buildFont(bold, italic, drawSizePx,
           glyph === ch ? symbolFamily : 'sans-serif', rc, glyph);
+        share = undefined;
       }
-      if (group && font !== groupFont) emitGroup();
+      if (group && (font !== groupFont || share !== groupShare)) emitGroup();
       group += glyph;
       groupFont = font;
+      groupShare = share;
     }
     emitGroup();
   }
@@ -3992,13 +4030,19 @@ export function renderTextBody(
     /** This spAutoFit line replaces an authored-font design floor with metrics
      * from the font Canvas actually resolved. */
     useResolvedFontMetrics: boolean;
+    /** PowerPoint's metric ascent of the spaced line (px), when every run of
+     * the body has a known face; undefined for the ordinary 0.8 × line model. */
+    metricAscent?: number;
+    /** The line's natural (unspaced) descent in the metric model. */
+    metricNaturalDescent?: number;
   }
 
   // buildLayout runs Pass 1 at a given font scale (1.0 = normal; <1 = normAutoFit shrink)
-  const buildLayout = (fontScale: number): {
+  const buildLayout = (fontScale: number, metric: boolean): {
     allLines: LineEntry[];
     totalHeight: number;
     requiredHeight: number;
+    metricOk: boolean;
   } => {
   const bodyDefaultFontSizePx = (body.defaultFontSize ?? 18) * PT_TO_EMU * scale * fontScale;
   const allLines: LineEntry[] = [];
@@ -4008,6 +4052,10 @@ export function renderTextBody(
   // enough to contain the last line, but must not silently become the pitch of
   // every preceding line when a:lnSpc is omitted (#1473).
   let requiredHeight = 0;
+  // Every line must resolve PowerPoint's metric split (see
+  // powerpoint-line-metrics.ts) for the body to use it; one body never mixes
+  // the two line models.
+  let metricOk = metric;
 
   // AutoNum counters per list level
   const autoNumCounters = new Map<number, number>();
@@ -4178,6 +4226,7 @@ export function renderTextBody(
       // defaults like `defRPr sz="30000"` (300pt prompt-text marker) would
       // inflate lineHeight and push real 24pt runs far below the anchor.
       let maxSizePx = 0;
+      const metricRuns: { sizePx: number; share: number }[] = [];
       // Measure the fonts Canvas actually resolved (including browser
       // substitutions). A tall live font box is retained for containment under
       // spAutoFit, but PowerPoint does not repeat that box as the implicit
@@ -4193,6 +4242,19 @@ export function renderTextBody(
           ? Math.max(seg.sizePx, (seg.math.ascent + seg.math.descent) / 1.2)
           : seg.sizePx;
         if (effSize > maxSizePx) maxSizePx = effSize;
+        if (seg.math) metricOk = false;
+        else if (!seg.isTab) {
+          if (seg.lineMetricShare === undefined) metricOk = false;
+          else metricRuns.push({ sizePx: seg.sizePx, share: seg.lineMetricShare });
+          // A run's latin face sizes its line even where an East Asian or
+          // symbol segment draws no latin glyph; an unused ea or cs face does
+          // not (#1610 supplements 2 and 3).
+          if (seg.lineMetricLatinShare === null) metricOk = false;
+          else if (seg.lineMetricLatinShare !== undefined
+            && seg.lineMetricLatinShare !== seg.lineMetricShare) {
+            metricRuns.push({ sizePx: seg.sizePx, share: seg.lineMetricLatinShare });
+          }
+        }
         if (!seg.math) {
           if (isSpAutoFit) {
             ctx.font = seg.font;
@@ -4205,6 +4267,7 @@ export function renderTextBody(
         }
       }
       if (maxSizePx === 0) maxSizePx = paraDefaultFontSizePx;
+      const textMaxSizePx = maxSizePx;
       // Bullet font size also counts
       if (isFirst && bulletLabel) {
         ctx.font = bulletFont;
@@ -4217,6 +4280,8 @@ export function renderTextBody(
       if (isFirst && bulletImage && bulletImage.sizePx > maxSizePx) {
         maxSizePx = bulletImage.sizePx;
       }
+      // A marker taller than the text is outside the #1610 controls.
+      if (maxSizePx > textMaxSizePx) metricOk = false;
 
       // PowerPoint's natural single-line pitch is 120% of the authored text size.
       // An Office-produced boundary deck confirms that this is independent of
@@ -4268,6 +4333,27 @@ export function renderTextBody(
       // spcPts height does not.
       if (body.autoFit === 'norm' && body.lnSpcReduction != null && para.spaceLine?.type !== 'pts') {
         lineHeight *= 1 - body.lnSpcReduction;
+      }
+      // PowerPoint's metric line (#1610, powerpoint-line-metrics.ts): the
+      // same 1.2 × size box, split at the baseline by the runs' faces and
+      // re-divided for lnSpc by the shared DrawingML rule. An empty line (no
+      // glyphs) takes a 0.8 split; its split moves no visible glyph and the
+      // next line's top depends only on the line height. spcPts is rounded to
+      // whole points first.
+      let metricAscent: number | undefined;
+      let metricNaturalDescent: number | undefined;
+      if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
+        const natural = metricRuns.length > 0
+          ? powerPointNaturalLine(metricRuns)
+          : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 };
+        const spacing = para.spaceLine?.type === 'pts'
+          ? { type: 'pts' as const, val: powerPointExactLinePoints(para.spaceLine.val) }
+          : para.spaceLine;
+        const box = drawingMlSpacedLineBox(natural, spacing, PT_TO_EMU * scale,
+          body.autoFit === 'norm' && body.lnSpcReduction != null ? body.lnSpcReduction : 0);
+        lineHeight = box.ascent + box.descent;
+        metricAscent = box.ascent;
+        metricNaturalDescent = natural.descent;
       }
       // ECMA-376 §21.1.2.2.9-.10 with §21.1.2.3.11: a percentage spcBef /
       // spcAft is a fraction of the text size, 100000 being one line. It is
@@ -4321,11 +4407,13 @@ export function renderTextBody(
         alignment: para.alignment,
         isLastLine: isLast,
         para,
-        useResolvedFontMetrics,
+        useResolvedFontMetrics: metricAscent === undefined && useResolvedFontMetrics,
+        metricAscent,
+        metricNaturalDescent,
       });
       const lineTop = totalHeight + topGap;
       totalHeight += linePx + topGap;
-      const requiredLineHeight = useResolvedFontMetrics
+      const requiredLineHeight = useResolvedFontMetrics && metricAscent === undefined
         ? Math.max(lineHeight, resolvedFontLine)
         : lineHeight;
       requiredHeight = Math.max(
@@ -4338,10 +4426,21 @@ export function renderTextBody(
     }
   }
 
-  return { allLines, totalHeight, requiredHeight };
+  return { allLines, totalHeight, requiredHeight, metricOk };
   }; // end buildLayout
 
-  let { allLines, totalHeight, requiredHeight } = buildLayout(1.0);
+  // Try PowerPoint's metric line model first; a body with any face outside
+  // it is laid out again with the ordinary model.
+  let useMetricLines = true;
+  const layoutAt = (fontScale: number) => {
+    let layout = buildLayout(fontScale, useMetricLines);
+    if (useMetricLines && !layout.metricOk) {
+      useMetricLines = false;
+      layout = buildLayout(fontScale, false);
+    }
+    return layout;
+  };
+  let { allLines, totalHeight, requiredHeight } = layoutAt(1.0);
 
   // ── normAutoFit ──────────────────────────────────────────────────────────
   // ECMA-376 §21.1.2.1.3 gives an omitted fontScale the value 100% and an
@@ -4355,7 +4454,7 @@ export function renderTextBody(
   // Therefore our own text metrics must not manufacture a new scale here.
   if (body.autoFit === 'norm') {
     if (body.fontScale != null && body.fontScale > 0) {
-      if (body.fontScale < 1.0) ({ allLines, totalHeight, requiredHeight } = buildLayout(body.fontScale));
+      if (body.fontScale < 1.0) ({ allLines, totalHeight, requiredHeight } = layoutAt(body.fontScale));
     }
   }
 
@@ -4375,22 +4474,36 @@ export function renderTextBody(
     effectiveBh = tPad + requiredHeight + bPad;
     effectiveBy = by - effectiveBh;
   } else {
-    // ── Effective height (spAutoFit: shape expands to fit text) ─────────────
-    const isSpAutoFit = body.autoFit === 'sp';
-    effectiveBh = isSpAutoFit
-      ? Math.max(bh, tPad + requiredHeight + bPad)
+    // spAutoFit (§21.1.2.1.4) asks the editor to resize the shape to its text,
+    // and PowerPoint writes the resized extents when it saves. Rendering and
+    // PDF export keep the authored extents (#1610 controls: 60 pt and 300 pt
+    // boxes holding 100 pt text, anchor t and ctr, are laid out exactly as
+    // with noAutofit; a centred block overflows both edges). Only a zero
+    // height, which has no box to anchor in, still takes the content height.
+    effectiveBh = body.autoFit === 'sp' && bh === 0
+      ? tPad + requiredHeight + bPad
       : bh;
   }
 
   // ── Vertical anchor ─────────────────────────────────────────────────────
+  // PowerPoint anchors the metric block by its last line's natural descent,
+  // not by the spaced one: an lnSpc/spcPts change below the last baseline
+  // does not move a bottom-anchored block (#1610 controls: two 100 pt lines
+  // at 80/90/150 % and 100/140 pt, ctr and b, Arial and Meiryo; normAutofit
+  // lnSpcReduction likewise).
+  const lastMetric = allLines[allLines.length - 1];
+  const anchorHeight = lastMetric?.metricAscent !== undefined
+    && lastMetric.metricNaturalDescent !== undefined
+    ? requiredHeight - (lastMetric.lineHeight - lastMetric.metricAscent) + lastMetric.metricNaturalDescent
+    : requiredHeight;
   let cursorY: number;
   const contentH = Math.max(0, effectiveBh - tPad - bPad);
   if (anchor === 'ctr') {
     cursorY = effectiveBy + drawingMlBlockTop('ctr', {
       left: lPad, top: tPad, width: bw - lPad - rPad, height: contentH,
-    }, requiredHeight);
+    }, anchorHeight);
   } else if (anchor === 'b') {
-    cursorY = effectiveBy + effectiveBh - bPad - requiredHeight;
+    cursorY = effectiveBy + effectiveBh - bPad - anchorHeight;
   } else {
     cursorY = effectiveBy + tPad;
   }
@@ -4455,7 +4568,7 @@ export function renderTextBody(
   let entriesInCol = 0;
 
   for (const entry of allLines) {
-    const { line, linePx, lineHeight, topGapPx, textXOffset, bulletLabel, bulletFont, bulletColor, bulletImage, alignment, isLastLine, useResolvedFontMetrics } = entry;
+    const { line, linePx, lineHeight, topGapPx, textXOffset, bulletLabel, bulletFont, bulletColor, bulletImage, alignment, isLastLine, useResolvedFontMetrics, metricAscent } = entry;
     // Balanced column advance: when the current column has reached its share
     // of paragraphs, jump to the next one. PowerPoint never breaks a single
     // line across columns and never spills past the last column — anything
@@ -4580,7 +4693,9 @@ export function renderTextBody(
             resolvedFontAscent + Math.max(0, lineHeight - resolvedFontHeight) / 2,
           )
       : Math.max(lineHeight * 0.8, maxAscent);
-    const baseline = cursorY + baselineOffset;
+    const baseline = metricAscent !== undefined
+      ? cursorY + metricAscent
+      : cursorY + baselineOffset;
 
     // Reading-frame marker placement under an RTL base (issue #930, same class as
     // the docx #830 / pptx #913 leading-edge mirroring). PowerPoint seats a list
