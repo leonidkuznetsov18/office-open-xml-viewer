@@ -2984,7 +2984,14 @@ fn produce_slide_unit_with_journal<T>(
                 .map(|root| parse_master_level_colors(root, &theme))
                 .unwrap_or_default();
             let master_level_run_properties = master_root
-                .map(|root| parse_master_level_run_properties(root, &theme))
+                .map(|root| {
+                    parse_master_level_run_properties(
+                        root,
+                        &theme,
+                        &bundle.master_rels,
+                        &bundle.master_dir,
+                    )
+                })
                 .unwrap_or_default();
             let master_level_bullets = master_root
                 .map(|root| {
@@ -3854,9 +3861,20 @@ mod tests {
     const DEFAULT_TXSTYLES: &str = r#"<p:txStyles><p:titleStyle><a:lvl1pPr algn="ctr"><a:defRPr sz="4400"/></a:lvl1pPr></p:titleStyle><p:bodyStyle><a:lvl1pPr algn="l"><a:defRPr sz="2800"/></a:lvl1pPr></p:bodyStyle><p:otherStyle><a:lvl1pPr algn="r"><a:defRPr sz="1800"/></a:lvl1pPr></p:otherStyle></p:txStyles>"#;
 
     fn build_align_pptx(slide_sp: &str, layout_extra_sp: &str, master_txstyles: &str) -> Vec<u8> {
+        build_align_pptx_with_rels(slide_sp, layout_extra_sp, master_txstyles, "", "", "")
+    }
+
+    fn build_align_pptx_with_rels(
+        slide_sp: &str,
+        layout_extra_sp: &str,
+        master_txstyles: &str,
+        slide_extra_rels: &str,
+        layout_extra_rels: &str,
+        master_extra_rels: &str,
+    ) -> Vec<u8> {
         use std::io::{Cursor, Write};
         let layout = format!(
-            r#"<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            r#"<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
               <p:cSld><p:spTree>
                 <p:sp><p:nvSpPr><p:cNvPr id="2" name="Body 1"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
                   <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
@@ -3865,17 +3883,17 @@ mod tests {
             </p:sldLayout>"#
         );
         let master = format!(
-            r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp></p:spTree></p:cSld>{master_txstyles}</p:sldMaster>"#
+            r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp></p:spTree></p:cSld>{master_txstyles}</p:sldMaster>"#
         );
         let entries: &[(&str, String)] = &[
             ("ppt/presentation.xml", r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#.to_owned()),
             ("ppt/_rels/presentation.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/></Relationships>"#.to_owned()),
-            ("ppt/slides/slide1.xml", format!(r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>{slide_sp}</p:spTree></p:cSld></p:sld>"#)),
-            ("ppt/slides/_rels/slide1.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#.to_owned()),
+            ("ppt/slides/slide1.xml", format!(r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree>{slide_sp}</p:spTree></p:cSld></p:sld>"#)),
+            ("ppt/slides/_rels/slide1.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>{slide_extra_rels}</Relationships>"#)),
             ("ppt/slideLayouts/slideLayout1.xml", layout),
-            ("ppt/slideLayouts/_rels/slideLayout1.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>"#.to_owned()),
+            ("ppt/slideLayouts/_rels/slideLayout1.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>{layout_extra_rels}</Relationships>"#)),
             ("ppt/slideMasters/slideMaster1.xml", master),
-            ("ppt/slideMasters/_rels/slideMaster1.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/></Relationships>"#.to_owned()),
+            ("ppt/slideMasters/_rels/slideMaster1.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>{master_extra_rels}</Relationships>"#)),
             ("ppt/theme/theme1.xml", r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="t"><a:themeElements><a:clrScheme name="c"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="000000"/></a:dk2><a:lt2><a:srgbClr val="FFFFFF"/></a:lt2><a:accent1><a:srgbClr val="000000"/></a:accent1><a:accent2><a:srgbClr val="000000"/></a:accent2><a:accent3><a:srgbClr val="000000"/></a:accent3><a:accent4><a:srgbClr val="000000"/></a:accent4><a:accent5><a:srgbClr val="000000"/></a:accent5><a:accent6><a:srgbClr val="000000"/></a:accent6><a:hlink><a:srgbClr val="000000"/></a:hlink><a:folHlink><a:srgbClr val="000000"/></a:folHlink></a:clrScheme><a:fontScheme name="f"><a:majorFont><a:latin typeface="Arial"/></a:majorFont><a:minorFont><a:latin typeface="Arial"/></a:minorFont></a:fontScheme><a:fmtScheme name="s"><a:fillStyleLst/><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme></a:themeElements></a:theme>"#.to_owned()),
         ];
         let mut buf = Vec::new();
@@ -3957,6 +3975,71 @@ mod tests {
         }
         assert_eq!(runs[0]["caps"], "none");
         assert_eq!(runs[1]["caps"], "all");
+    }
+
+    #[test]
+    fn inherited_hyperlink_ids_use_master_layout_and_slide_relationships_in_full_parse() {
+        // ECMA-376 Part 2 §9.3.3: rId7 is local to each source part. All
+        // three text runs use the same ID but must reach different targets.
+        let make_shape = |id: u8, name: &str, idx: u8, run_properties: &str| {
+            format!(
+                r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="{name}"/><p:cNvSpPr/>
+              <p:nvPr><p:ph type="body" idx="{idx}"/></p:nvPr></p:nvSpPr><p:spPr/>
+              <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr>{run_properties}</a:rPr>
+              <a:t>{name}</a:t></a:r></a:p></p:txBody></p:sp>"#
+            )
+        };
+        let slide = format!(
+            "{}{}{}",
+            make_shape(5, "Master link", 1, ""),
+            make_shape(6, "Layout link", 2, ""),
+            make_shape(
+                7,
+                "Slide link",
+                3,
+                r#"<a:hlinkClick r:id="rId7"/><a:hlinkMouseOver r:id="rId7"/>"#
+            )
+        );
+        let layout = r#"<p:sp><p:nvSpPr><p:cNvPr id="8" name="Layout link"/>
+          <p:cNvSpPr/><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+          <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr><a:defRPr>
+          <a:hlinkClick r:id="rId7"/><a:hlinkMouseOver r:id="rId7"/>
+          </a:defRPr></a:lvl1pPr></a:lstStyle><a:p/></p:txBody></p:sp>"#;
+        let master = r#"<p:txStyles><p:bodyStyle><a:lvl1pPr><a:defRPr>
+          <a:hlinkClick r:id="rId7"/><a:hlinkMouseOver r:id="rId7"/>
+          </a:defRPr></a:lvl1pPr></p:bodyStyle></p:txStyles>"#;
+        let rel = |url: &str| {
+            format!(
+                r#"<Relationship Id="rId7"
+          Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+          Target="{url}" TargetMode="External"/>"#
+            )
+        };
+        let data = build_align_pptx_with_rels(
+            &slide,
+            layout,
+            master,
+            &rel("https://slide.test/"),
+            &rel("https://layout.test/"),
+            &rel("https://master.test/"),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&parse_pptx_native(&data).unwrap()).unwrap();
+        for (name, expected) in [
+            ("Master link", "https://master.test/"),
+            ("Layout link", "https://layout.test/"),
+            ("Slide link", "https://slide.test/"),
+        ] {
+            let shape = parsed["slides"][0]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|shape| shape["name"] == name)
+                .unwrap();
+            let run = &shape["textBody"]["paragraphs"][0]["runs"][0];
+            assert_eq!(run["hyperlink"], expected, "{name} click");
+            assert_eq!(run["hyperlinkMouseOver"], expected, "{name} hover");
+        }
     }
 
     #[test]
@@ -4953,12 +5036,13 @@ mod tests {
           </p>
         </txBody>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
-        let levels = extract_level_run_properties(doc.root_element(), &HashMap::new());
-        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
         let rels = HashMap::from([
             ("rId9".to_owned(), "https://example.test/click".to_owned()),
             ("rId10".to_owned(), "https://example.test/hover".to_owned()),
         ]);
+        let levels =
+            extract_level_run_properties_with_rels(doc.root_element(), &HashMap::new(), &rels);
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
         let para = parse_paragraph(
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),

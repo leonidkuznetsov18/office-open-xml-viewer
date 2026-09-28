@@ -17,6 +17,14 @@ use std::collections::{BTreeMap, HashMap};
 
 type PropertyAttributes = BTreeMap<String, String>;
 
+#[derive(Clone, serde::Serialize)]
+struct InheritedRelationship {
+    target: String,
+    /// Set for master/layout levels. Slide-local targets retain the existing
+    /// slide-relative representation used by the viewer.
+    source_dir: Option<String>,
+}
+
 fn merge_attributes(higher: &PropertyAttributes, lower: &PropertyAttributes) -> PropertyAttributes {
     let mut merged = lower.clone();
     merged.extend(higher.clone());
@@ -703,6 +711,11 @@ pub(crate) struct RunProperties {
     outline_fill_authored: bool,
     highlight: Option<String>,
     hyperlink_uses_text_fill: Option<bool>,
+    // Relationship IDs are local to their owning OPC part. Keep the target
+    // paired with the authored r:id as levels from master, layout and slide
+    // are merged (ECMA-376 Part 2, §9.3.3; §21.1.2.3.5).
+    hlink_click_target: Option<Option<InheritedRelationship>>,
+    hlink_mouse_over_target: Option<Option<InheritedRelationship>>,
 }
 pub(crate) type LevelRunProperties = [RunProperties; 9];
 
@@ -787,7 +800,48 @@ impl RunProperties {
                         .find(|n| n.is_element() && n.tag_name().name() == "hlinkClr")
                 })
                 .map(|n| n.attribute("val") == Some("tx")),
+            hlink_click_target: None,
+            hlink_mouse_over_target: None,
         }
+    }
+
+    pub(crate) fn with_relationships(mut self, rels: &HashMap<String, String>) -> Self {
+        self.hlink_click_target = self
+            .child_attributes
+            .get("hlinkClick")
+            .and_then(|attrs| attrs.get("id"))
+            .map(|id| {
+                rels.get(id).map(|target| InheritedRelationship {
+                    target: target.clone(),
+                    source_dir: None,
+                })
+            });
+        self.hlink_mouse_over_target = self
+            .child_attributes
+            .get("hlinkMouseOver")
+            .and_then(|attrs| attrs.get("id"))
+            .map(|id| {
+                rels.get(id).map(|target| InheritedRelationship {
+                    target: target.clone(),
+                    source_dir: None,
+                })
+            });
+        self
+    }
+
+    /// Retain the relationship owner until after the attribute-wise cascade.
+    /// A nearer level may author @action without a new r:id, so resolving the
+    /// target here would miss a later hlinksldjump action.
+    pub(crate) fn with_part_targets(mut self, part_dir: &str) -> Self {
+        for link in [
+            &mut self.hlink_click_target,
+            &mut self.hlink_mouse_over_target,
+        ] {
+            if let Some(Some(relationship)) = link {
+                relationship.source_dir = Some(part_dir.to_owned());
+            }
+        }
+        self
     }
 
     /// `self` has higher priority. Every field, including explicit false/none,
@@ -928,6 +982,8 @@ impl RunProperties {
             outline_fill_authored: self.outline_fill_authored || lower.outline_fill_authored,
             highlight: pick!(highlight),
             hyperlink_uses_text_fill: pick!(hyperlink_uses_text_fill),
+            hlink_click_target: pick!(hlink_click_target),
+            hlink_mouse_over_target: pick!(hlink_mouse_over_target),
         }
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -952,6 +1008,8 @@ impl RunProperties {
             && self.outline.is_none()
             && self.highlight.is_none()
             && self.hyperlink_uses_text_fill.is_none()
+            && self.hlink_click_target.is_none()
+            && self.hlink_mouse_over_target.is_none()
     }
     pub(crate) fn without_fill(mut self) -> Self {
         self.fill = None;
@@ -961,30 +1019,40 @@ impl RunProperties {
     }
 }
 
-pub(crate) fn read_level_run_properties(
+pub(crate) fn read_level_run_properties_with_rels(
     list_style: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
+    rels: &HashMap<String, String>,
 ) -> LevelRunProperties {
     // CT_TextListStyle.defPPr supplies the run defaults for every level.  A
     // level's defRPr overlays it one property at a time (§21.1.2.4).
     let base = child(list_style, "defPPr")
         .and_then(|p| child(p, "defRPr"))
-        .map(|r| RunProperties::from_xml(r, theme))
+        .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
         .unwrap_or_default();
     std::array::from_fn(|level| {
         child(list_style, &format!("lvl{}pPr", level + 1))
             .and_then(|p| child(p, "defRPr"))
-            .map(|r| RunProperties::from_xml(r, theme))
+            .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
             .unwrap_or_default()
             .over(&base)
     })
 }
+#[cfg(test)]
 pub(crate) fn extract_level_run_properties(
     tx_body: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
 ) -> LevelRunProperties {
+    extract_level_run_properties_with_rels(tx_body, theme, &HashMap::new())
+}
+
+pub(crate) fn extract_level_run_properties_with_rels(
+    tx_body: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    rels: &HashMap<String, String>,
+) -> LevelRunProperties {
     child(tx_body, "lstStyle")
-        .map(|n| read_level_run_properties(n, theme))
+        .map(|n| read_level_run_properties_with_rels(n, theme, rels))
         .unwrap_or_else(|| std::array::from_fn(|_| RunProperties::default()))
 }
 pub(crate) fn merge_level_run_properties(
@@ -1166,7 +1234,7 @@ pub(crate) fn parse_text_body(
     let effective_level_sizes = merge_level_sizes(&own_level_sizes, &inherited_level_font_sizes);
     let own_level_colors = extract_level_colors(tx_body, theme);
     let effective_level_colors = merge_level_colors(&own_level_colors, &inherited_level_colors);
-    let own_level_run_properties = extract_level_run_properties(tx_body, theme);
+    let own_level_run_properties = extract_level_run_properties_with_rels(tx_body, theme, rels);
     let effective_level_run_properties =
         merge_level_run_properties(&own_level_run_properties, &inherited_level_run_properties);
     // Effective per-list-level indents: this shape's own lstStyle wins per
@@ -1547,7 +1615,7 @@ pub(crate) fn parse_paragraph(
     // patterned fill for both a:r and a:fld.
     let paragraph_props = p_pr
         .and_then(|n| child(n, "defRPr"))
-        .map(|n| RunProperties::from_xml(n, theme))
+        .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
         .unwrap_or_default();
     let mut defaults = paragraph_props.over(&level_run_properties[lvl.min(8) as usize]);
     if !defaults.effects_authored && defaults.reflection.is_none() {
@@ -1573,7 +1641,7 @@ pub(crate) fn parse_paragraph(
             "br" => {
                 let br_pr = child(node, "rPr");
                 let own = br_pr
-                    .map(|r| RunProperties::from_xml(r, theme))
+                    .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
                     .unwrap_or_default();
                 let effective = own.over(&defaults);
                 runs.push(TextRun::Break {
@@ -1621,9 +1689,8 @@ pub(crate) fn parse_paragraph(
     let end_run_properties = end_rpr.map(|node| {
         Box::new(resolve_run_properties(
             String::new(),
-            RunProperties::from_xml(node, theme),
+            RunProperties::from_xml(node, theme).with_relationships(rels),
             &defaults,
-            rels,
         ))
     });
     let has_text = runs
@@ -1855,7 +1922,7 @@ pub(crate) fn parse_run(
     rels: &HashMap<String, String>,
 ) -> Option<TextRunData> {
     let defaults = def_rpr
-        .map(|n| RunProperties::from_xml(n, theme))
+        .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
         .unwrap_or_default();
     parse_run_with_defaults(r_node, &defaults, theme, rels)
 }
@@ -1875,9 +1942,33 @@ fn parse_run_with_defaults(
     let text = t_node.and_then(|n| n.text()).unwrap_or("").to_owned();
     let r_pr = child(r_node, "rPr");
     let authored = r_pr
-        .map(|n| RunProperties::from_xml(n, theme))
+        .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
         .unwrap_or_default();
-    Some(resolve_run_properties(text, authored, defaults, rels))
+    Some(resolve_run_properties(text, authored, defaults))
+}
+
+fn inherited_hyperlink_target(
+    relationship: &Option<Option<InheritedRelationship>>,
+    attributes: Option<&PropertyAttributes>,
+) -> Option<String> {
+    let rel = relationship.as_ref()?.as_ref()?;
+    if rel.target.is_empty() {
+        return None;
+    }
+    // An inherited @action can come from a different level than its r:id.
+    // Resolve a slide jump against the ID owner's OPC part only after the
+    // complete cascade. A relative external URI ending in `.xml` stays raw.
+    if attributes
+        .and_then(|a| a.get("action"))
+        .is_some_and(|action| action == "ppaction://hlinksldjump")
+        && rel.target.ends_with(".xml")
+        && !rel.target.contains("://")
+    {
+        if let Some(source_dir) = &rel.source_dir {
+            return Some(resolve_path(source_dir, &rel.target));
+        }
+    }
+    Some(rel.target.clone())
 }
 
 /// Resolve the same character-property chain for an a:r, a:fld, or the
@@ -1887,7 +1978,6 @@ fn resolve_run_properties(
     text: String,
     authored: RunProperties,
     defaults: &RunProperties,
-    rels: &HashMap<String, String>,
 ) -> TextRunData {
     let props = authored.over(defaults);
     let underline = props.underline.as_deref().is_some_and(|v| v != "none");
@@ -1918,26 +2008,21 @@ fn resolve_run_properties(
     let font_family_sym = props.font_family_sym.clone().filter(|v| !v.is_empty());
     let baseline = props.baseline.filter(|v| *v != 0);
 
-    // a:hlinkClick — hyperlink. r:id refers to the slide rels (Target = URL or
-    // internal part name). Resolve immediately so the renderer doesn't need
-    // access to the rels table. ECMA-376 §21.1.2.3.5 (CT_Hyperlink): the
+    // a:hlinkClick — hyperlink. Its r:id was resolved against the owning
+    // master, layout, or slide part before character-property inheritance;
+    // the renderer therefore needs no rels table. ECMA-376 §21.1.2.3.5:
     // optional @action holds a "ppaction://..." verb (e.g. hlinksldjump) that
     // marks the link as an INTERNAL navigation; carry it through so the TS side
     // can distinguish a slide jump from an external URL. For a slide jump the
     // rel is TargetMode=Internal, so `hyperlink` is the internal slide part.
     let hlink_click = props.child_attributes.get("hlinkClick");
-    let hyperlink = hlink_click
-        .and_then(|h| h.get("id"))
-        .and_then(|rid| rels.get(rid).cloned())
-        .filter(|s| !s.is_empty());
+    let hyperlink = inherited_hyperlink_target(&props.hlink_click_target, hlink_click);
     let hyperlink_action = hlink_click
         .and_then(|h| h.get("action").cloned())
         .filter(|s| !s.is_empty());
     let hlink_mouse_over = props.child_attributes.get("hlinkMouseOver");
-    let hyperlink_mouse_over = hlink_mouse_over
-        .and_then(|h| h.get("id"))
-        .and_then(|rid| rels.get(rid).cloned())
-        .filter(|s| !s.is_empty());
+    let hyperlink_mouse_over =
+        inherited_hyperlink_target(&props.hlink_mouse_over_target, hlink_mouse_over);
     let hyperlink_mouse_over_action = hlink_mouse_over
         .and_then(|h| h.get("action").cloned())
         .filter(|s| !s.is_empty());
@@ -1993,5 +2078,122 @@ fn resolve_run_properties(
         highlight: props.highlight,
         character_attributes: props.attributes,
         character_child_attributes: props.child_attributes,
+    }
+}
+
+#[cfg(test)]
+mod relationship_owner_tests {
+    use super::*;
+    use crate::master::parse_master_level_run_properties;
+
+    #[test]
+    fn inherited_hyperlinks_resolve_against_the_part_that_authored_the_id() {
+        // OPC relationship IDs have part-local scope.  All three parts use
+        // rId7, and an attribute-only child must not change its owner's ID.
+        let master = roxmltree::Document::parse(
+            r#"
+          <p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <p:txStyles><p:bodyStyle><a:lvl1pPr><a:defRPr>
+              <a:hlinkClick r:id="rId7" tooltip="master"/>
+              <a:hlinkMouseOver r:id="rId7"/>
+            </a:defRPr></a:lvl1pPr></p:bodyStyle></p:txStyles>
+          </p:sldMaster>"#,
+        )
+        .unwrap();
+        let layout = roxmltree::Document::parse(
+            r#"
+          <a:txBody xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <a:lstStyle><a:lvl1pPr><a:defRPr>
+              <a:hlinkClick r:id="rId7"/>
+              <a:hlinkMouseOver r:id="rId7"/>
+            </a:defRPr></a:lvl1pPr></a:lstStyle>
+          </a:txBody>"#,
+        )
+        .unwrap();
+        let master_rels = HashMap::from([("rId7".into(), "https://master.test/".into())]);
+        let layout_rels = HashMap::from([("rId7".into(), "https://layout.test/".into())]);
+        let slide_rels = HashMap::from([("rId7".into(), "https://slide.test/".into())]);
+        let theme = HashMap::new();
+        let master_levels = parse_master_level_run_properties(
+            master.root_element(),
+            &theme,
+            &master_rels,
+            "ppt/slideMasters",
+        );
+        let master_default = &master_levels["body"][0];
+        let layout_levels =
+            extract_level_run_properties_with_rels(layout.root_element(), &theme, &layout_rels);
+        let layout_default = layout_levels[0].over(master_default);
+
+        for (xml, defaults, click, hover) in [
+            ("<r><rPr/><t>master</t></r>", master_default,
+             "https://master.test/", "https://master.test/"),
+            ("<r><rPr><hlinkClick tooltip=\"near\"/></rPr><t>layout</t></r>", &layout_default,
+             "https://layout.test/", "https://layout.test/"),
+            ("<r><rPr><hlinkClick r:id=\"rId7\"/><hlinkMouseOver r:id=\"rId7\"/></rPr><t>slide</t></r>", &layout_default,
+             "https://slide.test/", "https://slide.test/"),
+        ] {
+            let xml = xml.replacen("<r>", "<r xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">", 1);
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let run = parse_run_with_defaults(doc.root_element(), defaults, &theme, &slide_rels).unwrap();
+            assert_eq!(run.hyperlink.as_deref(), Some(click));
+            assert_eq!(run.hyperlink_mouse_over.as_deref(), Some(hover));
+        }
+    }
+
+    #[test]
+    fn inherited_slide_jump_is_resolved_from_master_and_layout_directories() {
+        let doc = roxmltree::Document::parse(
+            r#"<rPr
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <hlinkClick r:id="rId7" action="ppaction://hlinksldjump"/>
+        </rPr>"#,
+        )
+        .unwrap();
+        let rels = HashMap::from([("rId7".into(), "../slides/slide3.xml".into())]);
+        for part_dir in ["ppt/slideMasters", "ppt/slideLayouts"] {
+            let props = RunProperties::from_xml(doc.root_element(), &HashMap::new())
+                .with_relationships(&rels)
+                .with_part_targets(part_dir);
+            assert_eq!(
+                inherited_hyperlink_target(
+                    &props.hlink_click_target,
+                    props.child_attributes.get("hlinkClick")
+                ),
+                Some("ppt/slides/slide3.xml".into())
+            );
+        }
+        let external = roxmltree::Document::parse(
+            r#"<rPr
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <hlinkClick r:id="rId7"/></rPr>"#,
+        )
+        .unwrap();
+        let props = RunProperties::from_xml(external.root_element(), &HashMap::new())
+            .with_relationships(&rels)
+            .with_part_targets("ppt/slideMasters");
+        assert_eq!(
+            inherited_hyperlink_target(
+                &props.hlink_click_target,
+                props.child_attributes.get("hlinkClick")
+            ),
+            Some("../slides/slide3.xml".into())
+        );
+        let nearer = roxmltree::Document::parse(
+            r#"<rPr><hlinkClick
+          action="ppaction://hlinksldjump"/></rPr>"#,
+        )
+        .unwrap();
+        let merged = RunProperties::from_xml(nearer.root_element(), &HashMap::new()).over(&props);
+        assert_eq!(
+            inherited_hyperlink_target(
+                &merged.hlink_click_target,
+                merged.child_attributes.get("hlinkClick")
+            ),
+            Some("ppt/slides/slide3.xml".into())
+        );
     }
 }

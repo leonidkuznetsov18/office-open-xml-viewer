@@ -14,13 +14,13 @@ use crate::shape::{
 };
 use crate::text::{
     empty_level_bullets, extract_level_bullets, extract_level_colors, extract_level_font_sizes,
-    extract_level_indents, extract_level_run_properties, extract_lvl1_font_size,
+    extract_level_indents, extract_level_run_properties_with_rels, extract_lvl1_font_size,
     has_any_level_bullet, has_any_level_color, has_any_level_indent, has_any_level_run_properties,
     has_any_level_size, merge_level_bullets, merge_level_colors, merge_level_indents,
     merge_level_run_properties, merge_level_sizes, paragraph_spacing, read_level_bullets,
-    read_level_colors, read_level_font_sizes, read_level_indents, read_level_run_properties,
-    text_property_color, BuMarker, InheritedBodyPr, LevelBullets, LevelColors, LevelFontSizes,
-    LevelIndents, LevelRunProperties, ParagraphSpacing,
+    read_level_colors, read_level_font_sizes, read_level_indents,
+    read_level_run_properties_with_rels, text_property_color, BuMarker, InheritedBodyPr,
+    LevelBullets, LevelColors, LevelFontSizes, LevelIndents, LevelRunProperties, ParagraphSpacing,
 };
 use crate::theme::{
     bake_clr_map, parse_theme_part, resolve_theme_typeface, PptxSchemeResolver, PptxTheme,
@@ -1318,6 +1318,8 @@ pub(crate) fn parse_master_level_colors(
 pub(crate) fn parse_master_level_run_properties(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
+    master_rels: &HashMap<String, String>,
+    master_dir: &str,
 ) -> HashMap<String, LevelRunProperties> {
     let mut specific = HashMap::new();
     if let Some(sp_tree) = child(root, "cSld").and_then(|n| child(n, "spTree")) {
@@ -1330,7 +1332,8 @@ pub(crate) fn parse_master_level_run_properties(
                 .find(|n| n.is_element() && n.tag_name().name() == "ph")
             {
                 if let Some(body) = child(sp, "txBody") {
-                    let props = extract_level_run_properties(body, theme);
+                    let props = extract_level_run_properties_with_rels(body, theme, master_rels)
+                        .map(|p| p.with_part_targets(master_dir));
                     if has_any_level_run_properties(&props) {
                         specific
                             .entry(attr(&ph, "type").unwrap_or_default())
@@ -1343,7 +1346,8 @@ pub(crate) fn parse_master_level_run_properties(
     if let Some(tx_styles) = child(root, "txStyles") {
         for (style_name, ph_types) in MASTER_TXSTYLE_PH_TYPES {
             if let Some(style) = child(tx_styles, style_name) {
-                let props = read_level_run_properties(style, theme);
+                let props = read_level_run_properties_with_rels(style, theme, master_rels)
+                    .map(|p| p.with_part_targets(master_dir));
                 if has_any_level_run_properties(&props) {
                     for ph_type in *ph_types {
                         specific
@@ -1791,7 +1795,10 @@ pub(crate) fn parse_layout_placeholders(
             .map(|tx_body| extract_level_colors(tx_body, theme))
             .unwrap_or_else(|| std::array::from_fn(|_| None));
         let layout_level_run_properties = child(sp, "txBody")
-            .map(|tx_body| extract_level_run_properties(tx_body, theme))
+            .map(|tx_body| {
+                extract_level_run_properties_with_rels(tx_body, theme, layout_rels)
+                    .map(|p| p.with_part_targets(layout_dir))
+            })
             .unwrap_or_else(|| std::array::from_fn(|_| Default::default()));
         // Per-level indents (marL/marR/indent) from the layout placeholder's own
         // lstStyle, the inherited list-indent cascade (ECMA-376 §21.1.2.4.13).
@@ -2519,7 +2526,7 @@ pub(crate) fn build_master_bundle(
         .map(|root| parse_master_level_colors(root, &theme))
         .unwrap_or_default();
     let master_level_run_properties = master_root
-        .map(|root| parse_master_level_run_properties(root, &theme))
+        .map(|root| parse_master_level_run_properties(root, &theme, &master_rels, &master_dir))
         .unwrap_or_default();
     let master_level_indents = master_root
         .map(parse_master_level_indents)
@@ -2632,7 +2639,12 @@ mod placeholder_geometry_tests {
         let master_doc = roxmltree::Document::parse(master).unwrap();
         let layout_doc = roxmltree::Document::parse(layout).unwrap();
         let theme = HashMap::new();
-        let master_runs = parse_master_level_run_properties(master_doc.root_element(), &theme);
+        let master_runs = parse_master_level_run_properties(
+            master_doc.root_element(),
+            &theme,
+            &HashMap::new(),
+            "ppt/slideMasters",
+        );
         let mut zip = empty_zip();
         let placeholders = parse_layout_placeholders(
             layout_doc.root_element(),
