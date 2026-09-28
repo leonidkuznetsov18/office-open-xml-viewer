@@ -9597,6 +9597,47 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(texts).toEqual(expect.arrayContaining(['Twenty', 'Ten', 'Five', '0%', '100%']));
   });
 
+  // PowerPoint-observed Pareto line chain: direct `a:ln`, then the dataPoint
+  // role line, then dataPointLine (paint and geometry), else the dataPoint
+  // fill colour at 0.75pt.
+  it.each([
+    {
+      name: 'direct paint with dataPointLine geometry',
+      line: { linePaints: [{ fillType: 'solid' as const, color: 'FF0000' }], linePaintAuthored: true },
+      expected: { strokeStyle: '#FF0000', lineWidth: 2.25, cap: 'round' },
+    },
+    {
+      name: 'dataPoint fill colour without any line role',
+      line: null,
+      dataPointLine: { lineHidden: true, lineNoStyle: true },
+      expected: { strokeStyle: '#8977D7', lineWidth: 0.75, cap: 'butt' },
+    },
+  ])('paints the owner-backed Pareto line from $name', ({ line, dataPointLine, expected }) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'pareto',
+      categories: ['A', 'B', 'C'],
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      chartexDataPointLineStyle: dataPointLine ?? {
+        lineColors: ['000000'], linePaintAuthored: true, lineWidthEmu: 28575, lineCap: 'rnd',
+      },
+      series: [
+        series({ name: 'Frequency', values: [30, 20, 10], chartexFormatIdx: 0 }),
+        series({
+          name: 'Cumulative %', values: [], seriesType: 'line', chartexFormatIdx: 1,
+          chartexStyle: line,
+        }),
+      ],
+    }), RECT, 1);
+
+    expect(rec.strokeDetails).toContainEqual(expect.objectContaining({
+      strokeStyle: expected.strokeStyle, lineWidth: expected.lineWidth, cap: expected.cap,
+    }));
+  });
+
   it.each(['pareto', 'paretoLine'])('%s rejects oversized input before sorting or paint', chartType => {
     const rec = recordingCtx();
     const values = Array.from({ length: 10_001 }, (_, index) => index);
@@ -9947,6 +9988,49 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
       expect(rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#0000FF')).toHaveLength(0);
     },
   );
+
+  it.each([
+    // R01: dataPoint has no line, so dataPointLine supplies bar geometry; the
+    // empty seriesLine role lets connectors use dataPointLine as well.
+    { name: 'dataPointLine', dataPoint: {}, bar: [2.25, 'round'], connector: [2.25, 'round'] },
+    // R05: a dataPoint lnRef theme line beats dataPointLine for bars only.
+    { name: 'dataPoint lnRef', dataPoint: { lineHidden: false, lineNoStyle: false, lineWidthEmu: 6350, lineCap: 'flat' }, bar: [0.5, 'butt'], connector: [2.25, 'round'] },
+    // Excel: the first role with a line supplies geometry as a unit, so a
+    // dataPoint `w` without `cap` does not borrow dataPointLine's round cap.
+    { name: 'dataPoint spPr without cap', dataPoint: { lineHidden: false, lineNoStyle: false, lineWidthEmu: 19050 }, bar: [1.5, 'butt'], connector: [2.25, 'round'] },
+    // R03: a dataPoint spPr line never reaches the connectors.
+    { name: 'dataPoint spPr', dataPoint: { lineHidden: false, lineNoStyle: false, lineWidthEmu: 38100, lineCap: 'rnd' }, bar: [3, 'round'], connector: [2.25, 'round'] },
+  ] as const)('resolves ChartEx outline geometry from the $name role', ({ dataPoint, bar, connector }) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true, ...dataPoint,
+      },
+      chartexDataPointLineStyle: {
+        lineColors: ['000000'], linePaintAuthored: true, lineWidthEmu: 28575, lineCap: 'rnd',
+      },
+      chartexSeriesLineStyle: { lineHidden: true, lineNoStyle: true },
+      series: [series({
+        values: [10, 5, 15],
+        chartexStyle: { linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true },
+      })],
+    }), RECT, 1);
+
+    const bars = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    expect(bars).toHaveLength(3);
+    expect(bars.every(rect => rect.lw === bar[0] && rect.cap === bar[1])).toBe(true);
+    const connectors = rec.strokeDetails.filter(detail =>
+      detail.strokeStyle.toUpperCase() === '#FF0000');
+    expect(connectors.length).toBeGreaterThan(0);
+    expect(connectors.every(detail =>
+      detail.lineWidth === connector[0] && detail.cap === connector[1])).toBe(true);
+  });
 
   it('takes an omitted ChartEx outline width from the linked lnRef theme line', () => {
     const rec = recordingCtx();

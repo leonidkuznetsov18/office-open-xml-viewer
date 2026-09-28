@@ -370,10 +370,71 @@ export function resolveChartExPointFill(
 }
 
 
+/** Resolve a ChartEx outline through ordered Chart Style role chains.
+ * `paintRoles` are tried in order after the direct carrier until one supplies
+ * line paint; `geometryRoles` supply `w`, dash, cap and join atoms the direct
+ * `a:ln` omits, in order. A semantic-fallback result (no paint anywhere) keeps
+ * only direct geometry so family fallback rules keep their own width. */
+export function resolveChartExLineChain(
+  chart: ChartModel,
+  carrier: Partial<ChartExSeriesStyleCarrier> | null | undefined,
+  paintRoles: ReadonlyArray<ChartExStyle | null | undefined>,
+  geometryRoles: ReadonlyArray<ChartExStyle | null | undefined>,
+  index: number,
+  count: number,
+  fallbackColor: string,
+  options: { linkedNoStyleFallback?: boolean } = {},
+): ResolvedChartExLineStyle {
+  let line = resolveChartExSeriesLineStyle(
+    chart, paintRoles[0], carrier, index, count, fallbackColor, options,
+  );
+  for (const role of paintRoles.slice(1)) {
+    if (!line.semanticFallback) break;
+    const next = resolveChartExSeriesLineStyle(
+      chart, role, null, index, count, fallbackColor, options,
+    );
+    if (!next.semanticFallback) line = next;
+  }
+  const direct = carrier?.chartexStyle;
+  const directDash = direct?.lineDash != null || direct?.lineCustomDash != null;
+  // The first role that carries a line supplies every omitted geometry atom
+  // as a unit; atoms are not merged across roles. Excel output shows a
+  // dataPoint `a:ln w` without `cap` keeping a flat cap even when the
+  // dataPointLine role authors `cap="rnd"`.
+  const geometryRole = line.semanticFallback
+    ? undefined
+    : geometryRoles.find(role => role != null && role.lineNoStyle !== true && (
+      role.lineWidthEmu != null || role.lineCap != null || role.lineJoin != null
+      || role.lineDash != null || role.lineCustomDash != null
+      || role.linePaintAuthored === true));
+  const fromRoles = <T>(pick: (role: ChartExStyle) => T | null | undefined): T | null =>
+    geometryRole ? pick(geometryRole) ?? null : null;
+  const roleDash = geometryRole;
+  return {
+    ...line,
+    widthEmu: direct?.lineWidthEmu ?? carrier?.lineWidthEmu
+      ?? fromRoles(role => role.lineWidthEmu),
+    dash: directDash
+      ? direct?.lineCustomDash != null ? null : direct?.lineDash ?? null
+      : roleDash?.lineCustomDash != null ? null : roleDash?.lineDash ?? null,
+    customDash: directDash
+      ? direct?.lineCustomDash ?? null
+      : roleDash?.lineCustomDash ?? null,
+    cap: direct?.lineCap ?? fromRoles(role => role.lineCap),
+    join: direct?.lineJoin ?? fromRoles(role => role.lineJoin),
+  };
+}
+
+
 /** Resolve one ChartEx data point's outline with the same point → series →
  * linked role precedence as resolveChartExPointFill. Paint belongs to the
- * layer that authors `a:ln`. Geometry atoms (`w`, dash, cap, join) omitted by
- * a point's `a:ln` fall back to the series outline, then to the linked role. */
+ * layer that authors `a:ln`, else the linked dataPoint role. Geometry atoms a
+ * point's `a:ln` omits fall back to the series outline, then the dataPoint
+ * role (its `spPr` line or `lnRef` theme line), then the dataPointLine role's
+ * geometry. PowerPoint-observed in every ChartEx family: dataPointLine never
+ * paints a data-point outline, but supplies `w`/cap to a direct one whose
+ * dataPoint role has no line (for example 2.25 pt round from the waterfall
+ * default style); a dataPoint `lnRef idx` >= 1 or `spPr` line wins over it. */
 export function resolveChartExPointLine(
   chart: ChartModel,
   series: Partial<ChartExSeriesStyleCarrier> | null | undefined,
@@ -384,24 +445,35 @@ export function resolveChartExPointLine(
   linkedStyle: ChartExStyle | null | undefined = chart.chartexDataPointStyle,
   options: { linkedNoStyleFallback?: boolean } = {},
 ): ResolvedChartExLineStyle {
-  const seriesLine = resolveChartExSeriesLineStyle(
-    chart, linkedStyle, series, index, count, fallbackColor, options,
-  );
-  if (!chartExPointAuthorsLine(point)) return seriesLine;
-  const pointLine = resolveChartExSeriesLineStyle(
-    chart, linkedStyle, point, index, count, fallbackColor, options,
-  );
+  const geometryRoles = linkedStyle === chart.chartexDataPointStyle
+    ? [linkedStyle, chart.chartexDataPointLineStyle]
+    : [linkedStyle];
+  if (!chartExPointAuthorsLine(point)) {
+    return resolveChartExLineChain(
+      chart, series, [linkedStyle], geometryRoles, index, count, fallbackColor, options,
+    );
+  }
   const pointStyle = point?.chartexStyle;
-  const pointDashAuthored = pointStyle?.lineDash != null
-    || pointStyle?.lineCustomDash != null || point?.lineDash != null;
-  return {
-    ...pointLine,
-    widthEmu: pointStyle?.lineWidthEmu ?? point?.lineWidthEmu ?? seriesLine.widthEmu,
-    dash: pointDashAuthored ? pointLine.dash : seriesLine.dash,
-    customDash: pointDashAuthored ? pointLine.customDash : seriesLine.customDash,
-    cap: pointStyle?.lineCap ?? seriesLine.cap,
-    join: pointStyle?.lineJoin ?? seriesLine.join,
+  const seriesStyle = series?.chartexStyle;
+  const pointDashAuthored = pointStyle?.lineDash != null || pointStyle?.lineCustomDash != null;
+  const carrier: Partial<ChartExSeriesStyleCarrier> = {
+    lineColor: point?.lineColor,
+    lineHidden: point?.lineHidden,
+    lineWidthEmu: point?.lineWidthEmu ?? series?.lineWidthEmu,
+    chartexStyle: {
+      ...pointStyle,
+      lineWidthEmu: pointStyle?.lineWidthEmu ?? point?.lineWidthEmu
+        ?? seriesStyle?.lineWidthEmu ?? series?.lineWidthEmu,
+      lineDash: pointDashAuthored ? pointStyle?.lineDash : seriesStyle?.lineDash,
+      lineCustomDash: pointDashAuthored
+        ? pointStyle?.lineCustomDash : seriesStyle?.lineCustomDash,
+      lineCap: pointStyle?.lineCap ?? seriesStyle?.lineCap,
+      lineJoin: pointStyle?.lineJoin ?? seriesStyle?.lineJoin,
+    },
   };
+  return resolveChartExLineChain(
+    chart, carrier, [linkedStyle], geometryRoles, index, count, fallbackColor, options,
+  );
 }
 
 

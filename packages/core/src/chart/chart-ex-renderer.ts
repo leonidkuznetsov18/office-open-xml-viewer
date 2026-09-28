@@ -59,6 +59,7 @@ import {
 } from './style-paint.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
 import {
+  resolveChartExLineChain,
   resolveChartExPointFill,
   resolveChartExPointLine,
 } from './shared/chartex-style.js';
@@ -68,7 +69,6 @@ import {
   applyChartExSeriesLineStyle,
   applyResolvedChartExLineStyle,
   axisLabelPx,
-  chartColor,
   chartExDataPointFill,
   chartExDataPointPaint,
   chartExFillStyle,
@@ -596,10 +596,15 @@ function renderWaterfallChart(
       const nextBx = px0 + gapW * (i + 1) + (gapW - barW) / 2;
       const connY = bar.isPos ? yTop : yBot;
       ctx.save();
-      const connectorLine = resolveChartExSeriesLineStyle(
+      // PowerPoint-observed connector chain: direct series `a:ln`, then the
+      // seriesLine role, then dataPointLine (paint and geometry), else the
+      // black 0.75 pt semantic rule. The dataPoint role does not apply.
+      const connectorRoles = [chart.chartexSeriesLineStyle, chart.chartexDataPointLineStyle];
+      const connectorLine = resolveChartExLineChain(
         chart,
-        chart.chartexSeriesLineStyle,
         series,
+        connectorRoles,
+        connectorRoles,
         accentIndex,
         3,
         '#000000',
@@ -900,13 +905,16 @@ function renderParetoLineChart(
   const layout = planParetoLayout(source, chart.categories, { sortDescending: false });
   if (layout.points.length === 0) return;
   const styleIndex = chartExSeriesFormatIndex(source, 0);
-  const paretoLine = resolveChartExSeriesLineStyle(
+  // Same role chain as the owner-backed Pareto line (see bar.ts).
+  const paretoRoles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
+  const paretoLine = resolveChartExLineChain(
     chart,
-    chart.chartexDataPointLineStyle,
     source,
+    paretoRoles,
+    paretoRoles,
     styleIndex,
     1,
-    chartColor(0, source),
+    `#${chartExDataPointFill(chart, styleIndex, 1, source.chartexStyle)}`,
     { linkedNoStyleFallback: true },
   );
   renderLineChart(ctx, {
@@ -1448,11 +1456,6 @@ function renderBoxWhiskerChart(
       const styleIndex = boxStyleIndices[si];
       const styleLine = chartExStyleColor(chart, pointStyle, 'line', styleIndex, nSer);
       const edge = s.lineColor ? `#${s.lineColor}` : styleLine ? `#${styleLine}` : fill;
-      const edgeWidth = s.lineWidthEmu
-        ? axisLineWidthPx(s.lineWidthEmu, ptToPx)
-        : pointStyle?.lineWidthEmu != null
-          ? axisLineWidthPx(pointStyle.lineWidthEmu, ptToPx)
-          : 1;
       const lineEdge = chartExStyleColor(chart, lineStyle, 'line', styleIndex, nSer);
       const markerFill = chartExStyleColor(chart, markerStyle, 'fill', styleIndex, nSer);
       const markerFillPaint = chartExMarkerPaint(
@@ -1507,15 +1510,22 @@ function renderBoxWhiskerChart(
             target, fillPaint, { x: bx, y: boxTop, w: boxW, h: boxH }, fill,
             ptToPx, shapeRotationDeg,
           );
-          if (applyChartExSeriesLineStyle(
-            target, chart, pointStyle, s, styleIndex, nSer, edge, ptToPx,
-            { linkedNoStyleFallback: true },
-          )) target.strokeRect(
-            bx + edgeWidth / 2,
-            boxTop + edgeWidth / 2,
-            boxW - edgeWidth,
-            boxH - edgeWidth,
-          );
+          if (applyResolvedChartExLineStyle(
+            target,
+            resolveChartExPointLine(
+              chart, s, undefined, styleIndex, nSer, edge, pointStyle,
+              { linkedNoStyleFallback: true },
+            ),
+            ptToPx,
+          )) {
+            const edgeWidth = target.lineWidth;
+            target.strokeRect(
+              bx + edgeWidth / 2,
+              boxTop + edgeWidth / 2,
+              boxW - edgeWidth,
+              boxH - edgeWidth,
+            );
+          }
         },
       );
 
