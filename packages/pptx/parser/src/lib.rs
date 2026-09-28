@@ -2983,6 +2983,9 @@ fn produce_slide_unit_with_journal<T>(
             let master_level_colors = master_root
                 .map(|root| parse_master_level_colors(root, &theme))
                 .unwrap_or_default();
+            let master_level_run_properties = master_root
+                .map(|root| parse_master_level_run_properties(root, &theme))
+                .unwrap_or_default();
             let master_level_bullets = master_root
                 .map(|root| {
                     parse_master_level_bullets(
@@ -2999,6 +3002,7 @@ fn produce_slide_unit_with_journal<T>(
                 master_bg,
                 master_color,
                 master_level_colors,
+                master_level_run_properties,
                 master_level_bullets,
             }
         });
@@ -3021,6 +3025,10 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_level_bullets,
             ),
         };
+        let layout_master_run_properties = effective_master
+            .as_ref()
+            .map(|e| &e.master_level_run_properties)
+            .unwrap_or(&bundle.master_level_run_properties);
         // Build a `ParsedLayout` from a layout XML string with the resolved
         // theme/bullets and this bundle's remaining (theme-independent) maps.
         let build_parsed_layout = |lx: &str, zip: &mut PptxZip| -> ParsedLayout {
@@ -3030,6 +3038,7 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_font_families,
                 &bundle.master_level_font_sizes,
                 layout_master_colors,
+                layout_master_run_properties,
                 &bundle.master_level_indents,
                 layout_master_bullets,
                 &bundle.master_anchors,
@@ -4769,6 +4778,109 @@ mod tests {
     }
 
     #[test]
+    fn partial_paragraph_defaults_merge_every_run_property_for_runs_and_fields() {
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <lstStyle><lvl1pPr><defRPr b="0" i="1" sz="3500" u="dbl"
+              strike="dblStrike" cap="all" spc="200" baseline="30000">
+            <ln w="12700"><solidFill><srgbClr val="123456"/></solidFill></ln>
+            <solidFill><srgbClr val="D21D54"/></solidFill>
+            <effectLst><reflection blurRad="12700" stA="48000" endA="300"
+                endPos="55000" dir="5400000" sy="-90000" algn="bl" rotWithShape="0"/></effectLst>
+            <highlight><srgbClr val="F5DD22"/></highlight>
+            <uFill><solidFill><srgbClr val="234567"/></solidFill></uFill>
+            <latin typeface="Arial"/><ea typeface="Yu Gothic"/><sym typeface="Symbol"/>
+          </defRPr></lvl1pPr></lstStyle>
+          <p><pPr><defRPr b="1"/></pPr>
+            <r><rPr i="0"/><t>Run</t></r>
+            <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime"><rPr/><t>Field</t></fld>
+          </p>
+        </txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let levels = extract_level_run_properties(doc.root_element(), &HashMap::new());
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            child(doc.root_element(), "p").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &levels,
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected regular run and field");
+        };
+        for parsed in [run, field] {
+            assert_eq!(parsed.bold, Some(true));
+            assert_eq!(parsed.font_size, Some(35.0));
+            assert!(parsed.underline && parsed.strikethrough && parsed.strike_double);
+            assert_eq!(parsed.underline_style.as_deref(), Some("dbl"));
+            assert_eq!(parsed.underline_color.as_deref(), Some("234567"));
+            assert_eq!(parsed.caps.as_deref(), Some("all"));
+            assert_eq!(parsed.letter_spacing, Some(2.0));
+            assert_eq!(parsed.baseline, Some(30000));
+            assert_eq!(parsed.font_family.as_deref(), Some("Arial"));
+            assert_eq!(parsed.font_family_ea.as_deref(), Some("Yu Gothic"));
+            assert_eq!(parsed.font_family_sym.as_deref(), Some("Symbol"));
+            assert_eq!(parsed.highlight.as_deref(), Some("F5DD22"));
+            assert!(parsed.outline.is_some());
+            assert!(parsed.reflection.is_some());
+            assert_eq!(parsed.color.as_deref(), Some("D21D54"));
+        }
+        assert_eq!(run.italic, Some(false));
+        assert_eq!(field.italic, Some(true));
+    }
+
+    #[test]
+    fn explicit_text_no_fill_stops_inherited_paint_for_run_and_field() {
+        let xml = r#"<p xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <pPr><defRPr><solidFill><srgbClr val="D21D54"/></solidFill></defRPr></pPr>
+          <r><rPr u="sng"><noFill/><highlight><srgbClr val="F5DD22"/></highlight>
+            <uFillTx/></rPr><t>Run</t></r>
+          <fld id="{0FBB9679-570D-4509-9600-E07789CF24BB}" type="datetime">
+            <rPr><noFill/></rPr><t>Field</t></fld>
+        </p>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let para = parse_paragraph(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[None; 9],
+            &std::array::from_fn(|_| Default::default()),
+            &Default::default(),
+            &empty_level_bullets(),
+            &mut zip,
+        );
+        let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
+            panic!("expected run and field");
+        };
+        for text in [run, field] {
+            assert!(text.no_fill);
+            assert!(text.color.is_none());
+        }
+        assert!(run.underline);
+        assert_eq!(run.highlight.as_deref(), Some("F5DD22"));
+    }
+
+    #[test]
     fn test_parse_run_treats_uniform_gradient_text_fill_as_its_exact_color() {
         let uniform = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="353535"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>uniform</t></r>"#;
         let varying = r#"<r xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><rPr><gradFill><gsLst><gs pos="0"><srgbClr val="353535"/></gs><gs pos="100000"><srgbClr val="FFFFFF"/></gs></gsLst><lin ang="5400000"/></gradFill></rPr><t>varying</t></r>"#;
@@ -6203,6 +6315,7 @@ mod tests {
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(), // inherited_level_indents
                 &empty_level_bullets(),
                 None,
@@ -6288,6 +6401,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &master_indents,
             &HashMap::new(),
             &HashMap::new(),
@@ -6363,6 +6477,7 @@ mod tests {
                 &m_f64,
                 &m_str,
                 &m_lfs,
+                &HashMap::new(),
                 &HashMap::new(),
                 &m_li,
                 &m_lb,
@@ -6792,6 +6907,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -6814,6 +6931,7 @@ mod tests {
             None,
             [None; 9],
             inherited,
+            std::array::from_fn(|_| Default::default()),
             Default::default(),
             &empty_level_bullets(),
             None,
@@ -7239,11 +7357,12 @@ mod tests {
                 &theme,
                 &rels,
                 "ppt/slides",
-                None,                          // inherited_font_size
-                None,                          // inherited_font_family
-                [None; 9],                     // inherited_level_font_sizes
-                std::array::from_fn(|_| None), // inherited_level_colors
-                Default::default(),            // inherited_level_indents
+                None,      // inherited_font_size
+                None,      // inherited_font_family
+                [None; 9], // inherited_level_font_sizes
+                std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()), // inherited_level_colors
+                Default::default(),                          // inherited_level_indents
                 &empty_level_bullets(),
                 None, // inherited_bold
                 None, // inherited_italic
@@ -7328,6 +7447,7 @@ mod tests {
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(),
                 &empty_level_bullets(),
                 None,
@@ -7413,6 +7533,7 @@ mod tests {
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(), // inherited_level_indents
                 &empty_level_bullets(),
                 None,
@@ -7502,6 +7623,7 @@ mod tests {
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(),
                 &empty_level_bullets(),
                 None,
@@ -7579,6 +7701,7 @@ mod tests {
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
                 Default::default(),
                 &empty_level_bullets(),
                 None,

@@ -430,6 +430,8 @@ export interface TextRunData {
   color: string | null;
   /** Patterned glyph fill from DrawingML rPr/defRPr (ECMA-376 §21.1.2.3.9). */
   patternFill?: PatternFill;
+  /** Explicit DrawingML text noFill hides glyphs but preserves advance. */
+  noFill?: boolean;
   fontFamily: string | null;
   /**
    * East Asian font family from rPr > a:ea (ECMA-376 §21.1.2.3.3),

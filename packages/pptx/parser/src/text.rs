@@ -6,7 +6,7 @@
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
 use crate::fill::{parse_color_node, parse_fill, parse_reflection, parse_shadow};
-use crate::theme::{resolve_theme_typeface, PptxSchemeResolver};
+use crate::theme::resolve_theme_typeface;
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
 use ooxml_common::blip::mime_from_ext;
@@ -497,26 +497,6 @@ pub(crate) fn text_property_color(
     }
 }
 
-fn text_property_pattern_fill(
-    properties: roxmltree::Node<'_, '_>,
-    theme: &HashMap<String, String>,
-) -> Option<Fill> {
-    let choice = text_property_fill(properties)?;
-    if choice.tag_name().name() != "pattFill" {
-        return None;
-    }
-    let pattern = ooxml_common::fill::parse_patt_fill(
-        choice,
-        &PptxSchemeResolver { theme },
-        ooxml_common::color::TintMode::PowerPointLinear,
-    );
-    Some(Fill::Pattern {
-        fg: pattern.fg,
-        bg: pattern.bg,
-        preset: pattern.preset,
-    })
-}
-
 fn underline_fill_choice<'a, 'input>(
     properties: roxmltree::Node<'a, 'input>,
 ) -> Option<roxmltree::Node<'a, 'input>> {
@@ -642,6 +622,192 @@ impl InheritedBodyPr {
     }
 }
 
+/// The authored part of CT_TextCharacterProperties. Each member retains its
+/// own presence bit so a partial pPr/defRPr overrides only that property of
+/// lstStyle, layout and master (§21.1.2.2.7, §21.1.2.4, §21.1.2.3.9).
+/// An explicit noFill is stored as Fill::None and never becomes "missing".
+#[derive(Clone, Default, serde::Serialize)]
+pub(crate) struct RunProperties {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<String>,
+    underline_fill: Option<Option<Fill>>,
+    strike: Option<String>,
+    caps: Option<String>,
+    letter_spacing: Option<f64>,
+    font_size: Option<f64>,
+    fill: Option<Fill>,
+    color: Option<String>,
+    fill_authored: bool,
+    font_family: Option<String>,
+    font_family_ea: Option<String>,
+    font_family_sym: Option<String>,
+    baseline: Option<i32>,
+    effects_authored: bool,
+    shadow: Option<Shadow>,
+    reflection: Option<Reflection>,
+    outline: Option<Option<TextOutline>>,
+    highlight: Option<String>,
+}
+pub(crate) type LevelRunProperties = [RunProperties; 9];
+
+impl RunProperties {
+    pub(crate) fn from_xml(node: roxmltree::Node<'_, '_>, theme: &HashMap<String, String>) -> Self {
+        let fill_choice = text_property_fill(node);
+        let underline_choice = underline_fill_choice(node);
+        let effects = child(node, "effectLst");
+        let outline = child(node, "ln");
+        Self {
+            bold: attr(&node, "b").map(|v| v == "1" || v == "true"),
+            italic: attr(&node, "i").map(|v| v == "1" || v == "true"),
+            underline: attr(&node, "u"),
+            underline_fill: underline_choice.map(|n| {
+                if n.tag_name().name() == "uFill" {
+                    parse_fill(n, theme)
+                } else {
+                    None
+                }
+            }),
+            strike: attr(&node, "strike"),
+            caps: attr(&node, "cap"),
+            letter_spacing: attr(&node, "spc").and_then(|v| text_point_to_pt(&v)),
+            font_size: attr_f64(&node, "sz").map(|v| v / 100.0),
+            fill: fill_choice.and_then(|_| parse_fill(node, theme)),
+            color: fill_choice.and_then(|_| text_property_color(node, theme)),
+            fill_authored: fill_choice.is_some(),
+            font_family: child(node, "latin")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            font_family_ea: child(node, "ea")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            font_family_sym: child(node, "sym")
+                .and_then(|n| attr(&n, "typeface"))
+                .map(|v| resolve_theme_typeface(&v, theme)),
+            baseline: attr(&node, "baseline").and_then(|v| v.parse().ok()),
+            effects_authored: effects.is_some(),
+            shadow: effects.and_then(|n| parse_shadow(n, theme)),
+            reflection: effects.and_then(parse_reflection),
+            outline: outline.map(|ln| {
+                if child(ln, "noFill").is_some() {
+                    return None;
+                }
+                let fill = parse_fill(ln, theme);
+                Some(TextOutline {
+                    width: attr_i64(&ln, "w").unwrap_or(0),
+                    color: match &fill {
+                        Some(Fill::Solid { color }) => Some(color.clone()),
+                        _ => None,
+                    },
+                    fill,
+                })
+            }),
+            highlight: child(node, "highlight").and_then(|n| parse_color_node(n, theme)),
+        }
+    }
+
+    /// `self` has higher priority. Every field, including explicit false/none,
+    /// is independently chosen; a present effect list is one OOXML choice.
+    pub(crate) fn over(&self, lower: &Self) -> Self {
+        macro_rules! pick {
+            ($field:ident) => {
+                self.$field.clone().or_else(|| lower.$field.clone())
+            };
+        }
+        Self {
+            bold: pick!(bold),
+            italic: pick!(italic),
+            underline: pick!(underline),
+            underline_fill: pick!(underline_fill),
+            strike: pick!(strike),
+            caps: pick!(caps),
+            letter_spacing: pick!(letter_spacing),
+            font_size: pick!(font_size),
+            fill: if self.fill_authored {
+                self.fill.clone()
+            } else {
+                lower.fill.clone()
+            },
+            color: if self.fill_authored {
+                self.color.clone()
+            } else {
+                lower.color.clone()
+            },
+            fill_authored: self.fill_authored || lower.fill_authored,
+            font_family: pick!(font_family),
+            font_family_ea: pick!(font_family_ea),
+            font_family_sym: pick!(font_family_sym),
+            baseline: pick!(baseline),
+            effects_authored: self.effects_authored || lower.effects_authored,
+            shadow: if self.effects_authored {
+                self.shadow.clone()
+            } else {
+                lower.shadow.clone()
+            },
+            reflection: if self.effects_authored {
+                self.reflection.clone()
+            } else {
+                lower.reflection.clone()
+            },
+            outline: pick!(outline),
+            highlight: pick!(highlight),
+        }
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bold.is_none()
+            && self.italic.is_none()
+            && self.underline.is_none()
+            && self.underline_fill.is_none()
+            && self.strike.is_none()
+            && self.caps.is_none()
+            && self.letter_spacing.is_none()
+            && self.font_size.is_none()
+            && !self.fill_authored
+            && self.font_family.is_none()
+            && self.font_family_ea.is_none()
+            && self.font_family_sym.is_none()
+            && self.baseline.is_none()
+            && !self.effects_authored
+            && self.outline.is_none()
+            && self.highlight.is_none()
+    }
+    pub(crate) fn without_fill(mut self) -> Self {
+        self.fill = None;
+        self.color = None;
+        self.fill_authored = false;
+        self
+    }
+}
+
+pub(crate) fn read_level_run_properties(
+    list_style: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> LevelRunProperties {
+    std::array::from_fn(|level| {
+        child(list_style, &format!("lvl{}pPr", level + 1))
+            .and_then(|p| child(p, "defRPr"))
+            .map(|r| RunProperties::from_xml(r, theme))
+            .unwrap_or_default()
+    })
+}
+pub(crate) fn extract_level_run_properties(
+    tx_body: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> LevelRunProperties {
+    child(tx_body, "lstStyle")
+        .map(|n| read_level_run_properties(n, theme))
+        .unwrap_or_else(|| std::array::from_fn(|_| RunProperties::default()))
+}
+pub(crate) fn merge_level_run_properties(
+    higher: &LevelRunProperties,
+    lower: &LevelRunProperties,
+) -> LevelRunProperties {
+    std::array::from_fn(|i| higher[i].over(&lower[i]))
+}
+pub(crate) fn has_any_level_run_properties(levels: &LevelRunProperties) -> bool {
+    levels.iter().any(|p| !p.is_empty())
+}
+
 // Carries the resolved master/layout/placeholder inheritance context (theme,
 // rels, inherited font size, default alignment/spacing, level styles) that text
 // runs need; these are inheritance inputs, not an arbitrary parameter bag.
@@ -655,6 +821,7 @@ pub(crate) fn parse_text_body(
     inherited_font_family: Option<String>,
     inherited_level_font_sizes: LevelFontSizes,
     inherited_level_colors: LevelColors,
+    inherited_level_run_properties: LevelRunProperties,
     inherited_level_indents: LevelIndents,
     inherited_level_bullets: &LevelBullets,
     inherited_bold: Option<bool>,
@@ -810,6 +977,9 @@ pub(crate) fn parse_text_body(
     let effective_level_sizes = merge_level_sizes(&own_level_sizes, &inherited_level_font_sizes);
     let own_level_colors = extract_level_colors(tx_body, theme);
     let effective_level_colors = merge_level_colors(&own_level_colors, &inherited_level_colors);
+    let own_level_run_properties = extract_level_run_properties(tx_body, theme);
+    let effective_level_run_properties =
+        merge_level_run_properties(&own_level_run_properties, &inherited_level_run_properties);
     // Effective per-list-level indents: this shape's own lstStyle wins per
     // axis/level, else the layout/master inherited per-level indents. A paragraph
     // that omits marL/marR/indent picks them by `lvl` from this cascade before
@@ -884,6 +1054,7 @@ pub(crate) fn parse_text_body(
                 default_font_family.as_deref(),
                 default_reflection.as_ref(),
                 &effective_level_sizes,
+                &effective_level_run_properties,
                 &effective_level_indents,
                 &effective_level_bullets,
                 zip,
@@ -1044,6 +1215,7 @@ pub(crate) fn parse_paragraph(
     body_default_font_family: Option<&str>,
     body_default_reflection: Option<&Reflection>,
     level_font_sizes: &LevelFontSizes,
+    level_run_properties: &LevelRunProperties,
     level_indents: &LevelIndents,
     level_bullets: &LevelBullets,
     zip: &mut PptxZip,
@@ -1180,29 +1352,32 @@ pub(crate) fn parse_paragraph(
         .and_then(|n| attr_i64(&n, "defTabSz"))
         .filter(|&v| v > 0);
 
-    // Paragraph-level default run properties (pPr > defRPr)
-    let def_rpr = p_pr.and_then(|n| child(n, "defRPr"));
-    let def_font_size = def_rpr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
-    let def_color = def_rpr.and_then(|n| text_property_color(n, theme));
-    let def_bold = def_rpr
-        .and_then(|n| attr(&n, "b"))
-        .map(|v| v == "1" || v == "true");
-    let def_italic = def_rpr
-        .and_then(|n| attr(&n, "i"))
-        .map(|v| v == "1" || v == "true");
-    let def_font_family = def_rpr
-        .and_then(|n| child(n, "latin"))
-        .and_then(|n| attr(&n, "typeface"))
-        .map(|tf| resolve_theme_typeface(&tf, theme))
+    // ECMA-376 §21.1.2.2.7 / §21.1.2.4: pPr/defRPr overlays the
+    // corresponding lstStyle level property by property. PowerPoint PDF
+    // confirms a paragraph with only b="1" still inherits that level's
+    // patterned fill for both a:r and a:fld.
+    let paragraph_props = p_pr
+        .and_then(|n| child(n, "defRPr"))
+        .map(|n| RunProperties::from_xml(n, theme))
+        .unwrap_or_default();
+    let mut defaults = paragraph_props.over(&level_run_properties[lvl.min(8) as usize]);
+    if !defaults.effects_authored && defaults.reflection.is_none() {
+        defaults.reflection = body_default_reflection.cloned();
+    }
+    let def_font_size = defaults.font_size;
+    let def_color = defaults.color.clone();
+    let def_bold = defaults.bold;
+    let def_italic = defaults.italic;
+    let def_font_family = defaults
+        .font_family
+        .clone()
         .or_else(|| body_default_font_family.map(str::to_owned));
 
     let mut runs = Vec::new();
     for node in p_node.children().filter(|n| n.is_element()) {
         match node.tag_name().name() {
             "r" => {
-                if let Some(run) =
-                    parse_run_with_reflection(node, def_rpr, body_default_reflection, theme, rels)
-                {
+                if let Some(run) = parse_run_with_defaults(node, &defaults, theme, rels) {
                     runs.push(TextRun::Text(run));
                 }
             }
@@ -1215,67 +1390,16 @@ pub(crate) fn parse_paragraph(
             "oMath" | "oMathPara" | "AlternateContent" | "m" => {
                 push_math_runs(node, def_font_size, theme, &mut runs);
             }
-            // Field elements (e.g. slide number, date): parse like a run but tag the field type
+            // ECMA-376 §21.1.2.2.7: a:fld has the same rPr/t content as a:r.
+            // Resolve its formatting through the run cascade so defRPr and
+            // list-level defaults apply to every property, not only text fill.
             "fld" => {
-                let fld_type = attr(&node, "type").unwrap_or_default().to_string();
-                let text = child(node, "t")
-                    .and_then(|t| t.text())
-                    .unwrap_or("")
-                    .to_string();
-                let r_pr = child(node, "rPr");
-                let font_size = r_pr.and_then(|n| attr_f64(&n, "sz")).map(|v| v / 100.0);
-                let color = r_pr.and_then(|n| text_property_color(n, theme));
-                let pattern_fill = r_pr.and_then(|n| text_property_pattern_fill(n, theme));
-                let bold = r_pr
-                    .and_then(|n| attr(&n, "b"))
-                    .map(|v| v == "1" || v == "true");
-                let italic = r_pr
-                    .and_then(|n| attr(&n, "i"))
-                    .map(|v| v == "1" || v == "true");
-                let font_family = r_pr
-                    .and_then(|n| child(n, "latin"))
-                    .and_then(|n| attr(&n, "typeface"))
-                    .map(|tf| resolve_theme_typeface(&tf, theme));
-                // §21.1.2.3.4 — a field's rPr can also carry a highlight; resolve
-                // it the same way as a normal run (CT_Color via the shared path).
-                let highlight = r_pr
-                    .and_then(|n| child(n, "highlight"))
-                    .and_then(|n| parse_color_node(n, theme));
-                runs.push(TextRun::Text(TextRunData {
-                    text,
-                    bold,
-                    italic,
-                    underline: false,
-                    underline_style: None,
-                    underline_color: None,
-                    underline_fill: None,
-                    strikethrough: false,
-                    strike_double: false,
-                    font_size,
-                    color,
-                    pattern_fill,
-                    font_family,
-                    font_family_ea: None,
-                    font_family_sym: None,
-                    baseline: None,
-                    caps: None,
-                    letter_spacing: None,
-                    field_type: if fld_type == "slidenum" {
-                        Some("slidenum".to_string())
-                    } else {
-                        None
-                    },
-                    hyperlink: None,
-                    hyperlink_uses_text_fill: false,
-                    hyperlink_action: None,
-                    shadow: None,
-                    reflection: match r_pr.and_then(|n| child(n, "effectLst")) {
-                        Some(effect_lst) => parse_reflection(effect_lst),
-                        None => body_default_reflection.cloned(),
-                    },
-                    outline: None,
-                    highlight,
-                }));
+                if let Some(mut run) = parse_run_with_defaults(node, &defaults, theme, rels) {
+                    if attr(&node, "type").as_deref() == Some("slidenum") {
+                        run.field_type = Some("slidenum".to_string());
+                    }
+                    runs.push(TextRun::Text(run));
+                }
             }
             _ => {}
         }
@@ -1506,142 +1630,54 @@ pub(crate) fn parse_run(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
 ) -> Option<TextRunData> {
-    parse_run_with_reflection(r_node, def_rpr, None, theme, rels)
+    let defaults = def_rpr
+        .map(|n| RunProperties::from_xml(n, theme))
+        .unwrap_or_default();
+    parse_run_with_defaults(r_node, &defaults, theme, rels)
 }
 
-fn parse_run_with_reflection(
+fn parse_run_with_defaults(
     r_node: roxmltree::Node<'_, '_>,
-    def_rpr: Option<roxmltree::Node<'_, '_>>,
-    inherited_reflection: Option<&Reflection>,
+    defaults: &RunProperties,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
 ) -> Option<TextRunData> {
-    let t_node = child(r_node, "t")?;
-    let text = t_node.text().unwrap_or("").to_owned();
+    let t_node = child(r_node, "t");
+    if t_node.is_none() && r_node.tag_name().name() != "fld" {
+        return None;
+    }
+    // CT_TextField permits an absent a:t; a slide-number field still needs
+    // to reach the renderer so it can substitute the current slide number.
+    let text = t_node.and_then(|n| n.text()).unwrap_or("").to_owned();
     let r_pr = child(r_node, "rPr");
-
-    // Attribute with rPr → defRPr fallback; None means "not set" (inherit from body/layout defaults)
-    let bold = r_pr
-        .and_then(|n| attr(&n, "b"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "b")))
-        .map(|v| v == "1" || v == "true");
-    let italic = r_pr
-        .and_then(|n| attr(&n, "i"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "i")))
-        .map(|v| v == "1" || v == "true");
-    // ECMA-376 §21.1.2.3.9, ST_TextUnderlineType §20.1.10.82 — underline
-    // style enum: none/sng/dbl/heavy/dotted/
-    // dash/dashLong/dotDash/dotDotDash/wavy plus *Heavy variants. Carry the
-    // exact value through for the renderer to dispatch on; the bool stays
-    // true for any non-"none" value so existing code paths keep working.
-    let underline_attr = r_pr
-        .and_then(|n| attr(&n, "u"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "u")));
-    let underline = underline_attr
-        .as_deref()
-        .map(|v| v != "none")
-        .unwrap_or(false);
-    let underline_style = underline_attr.filter(|v| v != "none" && v != "sng");
-
-    // ECMA-376 §21.1.2.3.12–13: uFill is a complete EG_FillProperties choice;
-    // uFillTx follows the glyph paint. An explicit run-level uFillTx must also
-    // override an inherited defRPr uFill. PowerPoint PDF confirms patterned
-    // glyph/underline paint, a separately patterned underline, and solid uFill.
-    let underline_fill = r_pr
-        .and_then(underline_fill_choice)
-        .or_else(|| def_rpr.and_then(underline_fill_choice))
-        .filter(|node| node.tag_name().name() == "uFill")
-        .and_then(|node| parse_fill(node, theme));
+    let authored = r_pr
+        .map(|n| RunProperties::from_xml(n, theme))
+        .unwrap_or_default();
+    let props = authored.over(defaults);
+    let underline = props.underline.as_deref().is_some_and(|v| v != "none");
+    let underline_style = props
+        .underline
+        .clone()
+        .filter(|v| v != "none" && v != "sng");
+    let underline_fill = props.underline_fill.clone().flatten();
     let underline_color = match &underline_fill {
         Some(Fill::Solid { color }) => Some(color.clone()),
         _ => None,
     };
-
-    // strikethrough: "sngStrike" or "dblStrike" → true; double tracked separately
-    let strike_attr = r_pr
-        .and_then(|n| attr(&n, "strike"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "strike")));
-    let strikethrough = strike_attr
-        .as_deref()
-        .map(|v| v == "sngStrike" || v == "dblStrike")
-        .unwrap_or(false);
-    let strike_double = strike_attr.as_deref() == Some("dblStrike");
-
-    // ECMA-376 §21.1.2.3.9, ST_TextCapsType §20.1.10.64: "none" | "small" |
-    // "all". Treat
-    // "none" as not set (no transform) so the field stays absent in JSON.
-    let caps = r_pr
-        .and_then(|n| attr(&n, "cap"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "cap")))
-        .filter(|v| v == "small" || v == "all");
-
-    // ECMA-376 §21.1.2.3.9, ST_TextPoint §20.1.10.74: unitless `rPr@spc`
-    // values are hundredths of a point; ST_UniversalMeasure suffixes are also
-    // valid. Normalize both forms to points. Negative values tighten.
-    let letter_spacing = r_pr
-        .and_then(|n| attr(&n, "spc"))
-        .or_else(|| def_rpr.and_then(|n| attr(&n, "spc")))
-        .and_then(|value| text_point_to_pt(&value))
-        .filter(|v| v.abs() > f64::EPSILON);
-
-    // sz in hundredths of a point
-    let font_size = r_pr
-        .and_then(|n| attr_f64(&n, "sz"))
-        .or_else(|| def_rpr.and_then(|n| attr_f64(&n, "sz")))
-        .map(|v| v / 100.0);
-
-    let color = r_pr
-        .and_then(|n| text_property_color(n, theme))
-        .or_else(|| def_rpr.and_then(|n| text_property_color(n, theme)));
-    // The first authored fill choice wins. A run-local solid/noFill must not
-    // inherit a patterned defRPr; text_property_fill enforces DrawingML order.
-    let pattern_fill = r_pr
-        .and_then(text_property_fill)
-        .or_else(|| def_rpr.and_then(text_property_fill))
-        .filter(|n| n.tag_name().name() == "pattFill")
-        .and_then(|n| text_property_pattern_fill(n.parent()?, theme));
-
-    let font_family = r_pr
-        .and_then(|n| child(n, "latin"))
-        .and_then(|n| attr(&n, "typeface"))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "latin"))
-                .and_then(|n| attr(&n, "typeface"))
-        })
-        .map(|tf| resolve_theme_typeface(&tf, theme));
-    // ECMA-376 §21.1.2.3.3 — <a:ea typeface="..."/> sets a separate font for
-    // East Asian glyphs (CJK). Defaults to the theme's +mn-ea slot when the
-    // run doesn't specify one explicitly.
-    let font_family_ea = r_pr
-        .and_then(|n| child(n, "ea"))
-        .and_then(|n| attr(&n, "typeface"))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "ea"))
-                .and_then(|n| attr(&n, "typeface"))
-        })
-        .map(|tf| resolve_theme_typeface(&tf, theme))
-        .filter(|tf| !tf.is_empty());
-
-    // ECMA-376 §21.1.2.3.10 — <a:sym typeface="..."/> sets the font used for
-    // symbol characters. PowerPoint stores those as PUA codepoints (U+F0xx).
-    let font_family_sym = r_pr
-        .and_then(|n| child(n, "sym"))
-        .and_then(|n| attr(&n, "typeface"))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "sym"))
-                .and_then(|n| attr(&n, "typeface"))
-        })
-        .map(|tf| resolve_theme_typeface(&tf, theme))
-        .filter(|tf| !tf.is_empty());
-
-    // baseline in thousandths of a point; 30000=superscript, -25000=subscript (OOXML typical)
-    let baseline = r_pr
-        .and_then(|n| attr(&n, "baseline"))
-        .and_then(|v| v.parse::<i32>().ok())
-        .filter(|&v| v != 0);
+    let strikethrough = matches!(props.strike.as_deref(), Some("sngStrike" | "dblStrike"));
+    let strike_double = props.strike.as_deref() == Some("dblStrike");
+    let caps = props.caps.clone().filter(|v| v == "small" || v == "all");
+    let letter_spacing = props.letter_spacing.filter(|v| v.abs() > f64::EPSILON);
+    let pattern_fill = match &props.fill {
+        Some(fill @ Fill::Pattern { .. }) => Some(fill.clone()),
+        _ => None,
+    };
+    let no_fill = matches!(props.fill, Some(Fill::None));
+    let color = props.color.clone();
+    let font_family = props.font_family.clone();
+    let font_family_ea = props.font_family_ea.clone().filter(|v| !v.is_empty());
+    let font_family_sym = props.font_family_sym.clone().filter(|v| !v.is_empty());
+    let baseline = props.baseline.filter(|v| *v != 0);
 
     // a:hlinkClick — hyperlink. r:id refers to the slide rels (Target = URL or
     // internal part name). Resolve immediately so the renderer doesn't need
@@ -1660,9 +1696,7 @@ fn parse_run_with_reflection(
         .filter(|s| !s.is_empty());
     // Office's hyperlink-colour extension is written when an authored text
     // fill is reapplied after creating the link. Without hlinkClr="tx", the
-    // same pattFill XML is displayed in the hyperlink theme colour instead.
-    // Observed with PowerPoint-saved pattern text before/after reapplying the
-    // fill; the extension is intentionally scoped to run hyperlinks.
+    // hyperlink theme colour wins. The extension is scoped to run hyperlinks.
     let hyperlink_uses_text_fill = hlink_click.is_some_and(|h| {
         h.descendants().any(|n| {
             n.is_element()
@@ -1672,72 +1706,31 @@ fn parse_run_with_reflection(
                 && n.attribute("val") == Some("tx")
         })
     });
-
-    // ECMA-376 §20.1.8.45 — `<a:rPr><a:effectLst><a:outerShdw>` glyph drop
-    // shadow. Reuse the shape-level outerShdw reader so parse semantics
-    // stay identical (blurRad, dist, dir, color + alphaModFix).
-    let local_effects = r_pr.and_then(|n| child(n, "effectLst"));
-    let inherited_effects = def_rpr.and_then(|n| child(n, "effectLst"));
-    let shadow = match local_effects {
-        Some(el) => parse_shadow(el, theme),
-        None => inherited_effects.and_then(|el| parse_shadow(el, theme)),
+    // PowerPoint's hyperlink theme colour wins when the run has no authored
+    // fill of its own, even if a list-style defRPr supplies a solid colour.
+    // Preserve run-local solid colours, and hlinkClr="tx" explicitly asks to
+    // keep the inherited text paint. Observed with both list-style links and
+    // directly coloured links in PowerPoint PDF output.
+    let color = if hyperlink.is_some() && !hyperlink_uses_text_fill && !authored.fill_authored {
+        None
+    } else {
+        color
     };
-    let reflection = match local_effects {
-        Some(el) => parse_reflection(el),
-        None => inherited_effects
-            .and_then(parse_reflection)
-            .or_else(|| inherited_reflection.cloned()),
-    };
-
-    // ECMA-376 §20.1.2.2.24 (CT_TextOutlineEffect) — `<a:rPr><a:ln w="..">`
-    // strokes each glyph outline. `<a:noFill>` inside the ln means "no
-    // visible outline" — skip in that case so the renderer doesn't draw a
-    // black box around every glyph. a:ln contains EG_LineFillProperties, so
-    // retain its full fill choice (solid, gradient or preset pattern).
-    let outline = r_pr
-        .and_then(|n| child(n, "ln"))
-        .filter(|ln| child(*ln, "noFill").is_none())
-        .map(|ln| {
-            let fill = parse_fill(ln, theme);
-            TextOutline {
-                width: attr_i64(&ln, "w").unwrap_or(0),
-                color: match &fill {
-                    Some(Fill::Solid { color }) => Some(color.clone()),
-                    _ => None,
-                },
-                fill,
-            }
-        });
-
-    // ECMA-376 §21.1.2.3.4 — `<a:rPr><a:highlight>` text highlight (marker).
-    // The element IS a CT_Color, so pass the <a:highlight> node straight to the
-    // shared colour resolver — the same one solidFill uses — which walks its
-    // srgbClr / schemeClr / sysClr / prstClr child and applies any tint / alpha
-    // transforms. schemeClr therefore resolves through the master clrMap +
-    // theme exactly like other run colours. Falls back to defRPr when the run
-    // itself doesn't set a highlight.
-    let highlight = r_pr
-        .and_then(|n| child(n, "highlight"))
-        .and_then(|n| parse_color_node(n, theme))
-        .or_else(|| {
-            def_rpr
-                .and_then(|n| child(n, "highlight"))
-                .and_then(|n| parse_color_node(n, theme))
-        });
 
     Some(TextRunData {
         text,
-        bold,
-        italic,
+        bold: props.bold,
+        italic: props.italic,
         underline,
         underline_style,
         underline_color,
         underline_fill,
         strikethrough,
         strike_double,
-        font_size,
+        font_size: props.font_size,
         color,
         pattern_fill,
+        no_fill,
         font_family,
         font_family_ea,
         font_family_sym,
@@ -1748,9 +1741,9 @@ fn parse_run_with_reflection(
         hyperlink,
         hyperlink_uses_text_fill,
         hyperlink_action,
-        shadow,
-        reflection,
-        outline,
-        highlight,
+        shadow: props.shadow,
+        reflection: props.reflection,
+        outline: props.outline.flatten(),
+        highlight: props.highlight,
     })
 }

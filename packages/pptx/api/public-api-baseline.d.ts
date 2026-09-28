@@ -2135,6 +2135,7 @@ export interface TextRunData {
     fontSize: number | null;
     color: string | null;
     patternFill?: PatternFill;
+    noFill?: boolean;
     fontFamily: string | null;
     fontFamilyEa?: string;
     fontFamilySym?: string;

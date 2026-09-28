@@ -728,6 +728,7 @@ type LayoutSegment = {
   drawSizePx?: number;
   color: string;
   patternFill?: Extract<Fill, { fillType: 'pattern' }>;
+  noFill?: boolean;
   underline: boolean;
   /** OOXML rPr @u value when not the default "sng": "dbl"/"dotted"/"wavy"/etc. */
   underlineStyle?: string;
@@ -1493,6 +1494,7 @@ export function layoutParagraph(
       // PowerPoint's default hyperlink theme colour masks pattFill. Reapplying
       // the text fill writes hlinkClr="tx" and restores the authored pattern.
       patternFill: run.hyperlink && !run.hyperlinkUsesTextFill ? undefined : run.patternFill,
+      noFill: run.noFill,
       underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
@@ -1544,7 +1546,7 @@ export function layoutParagraph(
 
   const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
     a.font === b.font && a.color === b.color && a.patternFill === b.patternFill
-    && a.sizePx === b.sizePx
+    && a.noFill === b.noFill && a.sizePx === b.sizePx
     && a.drawSizePx === b.drawSizePx && a.underline === b.underline
     && a.underlineStyle === b.underlineStyle
     && a.underlineColor === b.underlineColor
@@ -2697,6 +2699,7 @@ function renderWarpedText(
       const chars = [...seg.text];
       for (const ch of chars) {
         const chW = ctx.measureText(ch).width + ls;
+        if (seg.noFill) { penW += chW; continue; }
         // Blend the per-line vertical band into the baseline fraction so line 2
         // sits below line 1 within the envelope.
         const bandFrac = env.singleEdge ? baselineFrac : v0 + baselineFrac * (v1 - v0);
@@ -4980,6 +4983,19 @@ export function renderTextBody(
           + internalStretch
           + jext;
         paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, glyphPaint);
+      }
+
+      // CT_TextCharacterProperties noFill is an explicit fill choice. It
+      // preserves layout advance and highlight; only an explicitly coloured
+      // underline paints when the text itself has no fill.
+      if (seg.noFill) {
+        const advance = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
+        if (seg.underline && seg.underlineColor) {
+          drawUnderline(ctx, penX, segBaseline, advance + jext, drawSizePx,
+            seg.underlineColor, seg.underlineStyle, rc.dpr);
+        }
+        penX += advance + jext;
+        continue;
       }
 
       const segShadow = seg.shadow;

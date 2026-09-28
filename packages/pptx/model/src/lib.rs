@@ -1215,11 +1215,12 @@ pub struct TextRunData {
     pub strike_double: bool,
     pub font_size: Option<f64>,
     pub color: Option<String>,
-    /// ECMA-376 §21.1.2.3.9 CT_TextCharacterProperties permits a DrawingML
-    /// fill choice. Preserve a patterned glyph fill separately from the solid
-    /// colour used for decorations and fallback text.
+    /// ECMA-376 §21.1.2.3.9 permits a DrawingML fill choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern_fill: Option<Fill>,
+    /// Explicit noFill suppresses glyphs while retaining advance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_fill: bool,
     pub font_family: Option<String>,
     /// East Asian font family from rPr > ea (resolved through the theme).
     /// Renderer uses this for CJK runs. None = inherit from latin font.
