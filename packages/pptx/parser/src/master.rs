@@ -965,7 +965,13 @@ pub(crate) fn parse_master_text_body_properties(
             };
             let value = InheritedBodyPr::from_body_pr(body_pr);
             if !value.is_empty() {
-                map.entry(ph_type).or_insert(value);
+                // Same-type master placeholders merge field by field: the
+                // first placeholder in document order that sets a field wins.
+                let merged = match map.remove(&ph_type) {
+                    Some(first) => InheritedBodyPr::or(first, &value),
+                    None => value,
+                };
+                map.insert(ph_type, merged);
             }
         }
     }
@@ -2014,9 +2020,12 @@ pub(crate) fn parse_layout_placeholders(
                     .or_insert(ls);
             }
             if !effective_body_pr.is_empty() {
-                lph.by_type_body_pr
-                    .entry(ph_type.clone())
-                    .or_insert(effective_body_pr);
+                // Per field, the first same-type layout placeholder that sets it.
+                let merged = match lph.by_type_body_pr.remove(&ph_type) {
+                    Some(first) => first.or(&effective_body_pr),
+                    None => effective_body_pr,
+                };
+                lph.by_type_body_pr.insert(ph_type.clone(), merged);
             }
             // Anchor: layout bodyPr > fall back to master anchor map
             let effective_anchor = layout_anchor
@@ -3059,6 +3068,48 @@ mod placeholder_geometry_tests {
                 None
             )
         );
+    }
+
+    /// Several same-type master placeholders: each bodyPr field comes from the
+    /// first placeholder in document order that sets it, so an inset on one
+    /// and an autofit child on another both survive.
+    #[test]
+    fn master_body_properties_merge_same_type_placeholders_per_field() {
+        let xml = r#"
+          <p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <p:cSld><p:spTree>
+              <p:sp><p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>
+                <p:txBody><a:bodyPr lIns="0"/></p:txBody></p:sp>
+              <p:sp><p:nvSpPr><p:nvPr><p:ph type="body" idx="2"/></p:nvPr></p:nvSpPr>
+                <p:txBody><a:bodyPr lIns="12700"><a:normAutofit fontScale="50000"/></a:bodyPr></p:txBody></p:sp>
+            </p:spTree></p:cSld>
+          </p:sldMaster>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let master_body_pr = parse_master_text_body_properties(doc.root_element());
+        let body = master_body_pr.get("body").expect("master body bodyPr");
+        assert_eq!(body.insets, [Some(0), None, None, None]);
+        let fit = body
+            .auto_fit
+            .as_ref()
+            .expect("autofit from the second placeholder");
+        assert_eq!((fit.mode.as_str(), fit.font_scale), ("norm", Some(0.5)));
+
+        let placeholders = LayoutPlaceholders {
+            by_type_master_body_pr: master_body_pr,
+            ..LayoutPlaceholders::default()
+        };
+        let slide = r#"
+          <p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/>
+            <p:nvPr><p:ph type="body" idx="10"/></p:nvPr>
+          </p:nvSpPr>
+          <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm></p:spPr>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Body</a:t></a:r></a:p></p:txBody>"#;
+        let tb = parse_slide_shape(slide, &placeholders)
+            .text_body
+            .expect("placeholder text body");
+        assert_eq!(tb.l_ins, 0);
+        assert_eq!((tb.auto_fit.as_str(), tb.font_scale), ("norm", Some(0.5)));
     }
 
     #[test]
