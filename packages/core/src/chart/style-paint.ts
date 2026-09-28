@@ -1,5 +1,5 @@
 import type {
-  ChartExElementStyle, ChartModel, ChartStockBarPaint,
+  ChartDataPointOverride, ChartExElementStyle, ChartModel, ChartStockBarPaint,
 } from '../types/chart.js';
 import type { Fill } from '../types/common.js';
 import { chartStyleDashChoice, rawLinkedChartStyleRole } from './effective-style.js';
@@ -98,14 +98,43 @@ export function chartStyleLineDecision(
   return style.linePaintAuthored === true ? null : undefined;
 }
 
-/** Whether a direct ChartEx waterfall series/point `spPr` removes the body
- * fill. PowerPoint honors that `a:noFill` without the linked dataPoint
- * entry's `allowNoFillOverride`; see chartExWaterfallDataPointPaint. */
-export function chartStyleWaterfallDirectNoFill(
-  direct: ChartExElementStyle | null | undefined,
-): boolean {
-  return direct?.fillHidden === true && direct.fillNoStyle !== true;
+export type ChartExPointCarrier = Pick<
+  ChartDataPointOverride,
+  'color' | 'fillHidden' | 'chartexStyle' | 'lineColor' | 'lineWidthEmu' | 'lineDash' | 'lineHidden'
+>;
+
+
+/** Whether a CT_DataPoint `spPr` authors its own fill atom. */
+export function chartExPointAuthorsFill(point: ChartExPointCarrier | null | undefined): boolean {
+  const style = point?.chartexStyle;
+  return point?.fillHidden === true
+    || point?.color != null
+    || (style != null && style.fillNoStyle !== true && (
+      style.fillPaintAuthored === true
+      || style.fillHidden === true
+      || style.fillColors?.some(color => color != null) === true
+      || style.fillPaints?.some(paint => paint != null) === true));
 }
+
+
+/** Whether a CT_DataPoint `spPr` authors its own outline (`a:ln`). */
+export function chartExPointAuthorsLine(point: ChartExPointCarrier | null | undefined): boolean {
+  const style = point?.chartexStyle;
+  return point?.lineHidden != null
+    || point?.lineColor != null
+    || point?.lineWidthEmu != null
+    || point?.lineDash != null
+    || style?.linePaintAuthored === true
+    || style?.lineHidden != null
+    || style?.lineColors?.some(color => color != null) === true
+    || style?.linePaints?.some(paint => paint != null) === true
+    || style?.lineWidthEmu != null
+    || style?.lineDash != null
+    || style?.lineCustomDash != null
+    || style?.lineCap != null
+    || style?.lineJoin != null;
+}
+
 
 /** Resolve direct shape paint over a linked CT_StyleEntry. An omitted fill or
  * line in a present `spPr` still inherits: MS-ODRAWXML's `allowNo*Override`

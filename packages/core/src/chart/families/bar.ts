@@ -78,7 +78,7 @@ import { drawScatterSeriesLayer } from '../shared/scatter-paint.js';
 import { drawChartMarker, seriesHasResolvedMarkerDetail } from '../shared/markers.js';
 import { clamp, appendCurve, dashPatternForPreset } from '../shared/geometry.js';
 
-import { chartExDataPointFill, chartExDataPointPaint, paintClassicDataPointPath, paintClassicDataPointRect, applyChartExSeriesLineStyle, chartExLegendSeries } from '../shared/chartex-style.js';
+import { chartExDataPointFill, chartExDataPointPaint, paintClassicDataPointPath, paintClassicDataPointRect, applyChartExSeriesLineStyle, applyResolvedChartExLineStyle, chartExLegendSeries, resolveChartExPointFill, resolveChartExPointLine } from '../shared/chartex-style.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Bar chart — vertical columns + horizontal bars, clustered + stacked +
@@ -1352,12 +1352,31 @@ export function renderBarChart(
       const pointOwnsFill = pointStructuredFill !== undefined
         || pointNoFill !== undefined
         || pointOverride?.color != null;
-      const pointPaint = pointOwnsFill
-        ? styleFill
-        : invertedPaint !== undefined
-          ? invertedPaint
-          : styleFill;
+      // ChartEx columns (histogram/pareto) use the ChartEx direct-format
+      // cascade, in which a direct point or series no-fill/no-line owns its
+      // atom without the classic allowNo*Override gate.
+      const chartExPointFill = isChartExColumn
+        ? resolveChartExPointFill(
+          chart, s, pointOverride, pointStyleIndex, barSeries.length,
+        )
+        : undefined;
+      const pointPaint = chartExPointFill !== undefined
+        ? chartExPointFill
+        : pointOwnsFill
+          ? styleFill
+          : invertedPaint !== undefined
+            ? invertedPaint
+            : styleFill;
       const applyPointOutline = (target: CanvasRenderingContext2D): boolean => {
+        if (isChartExColumn) {
+          return applyResolvedChartExLineStyle(
+            target,
+            resolveChartExPointLine(
+              chart, s, pointOverride, pointStyleIndex, barSeries.length, color,
+            ),
+            ptToPx,
+          );
+        }
         const hasPointLine = pointOverride?.lineHidden != null
           || pointOverride?.lineColor != null
           || pointOverride?.lineWidthEmu != null

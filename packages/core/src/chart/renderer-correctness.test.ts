@@ -9902,6 +9902,101 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(rec.strokeRects.filter(rect => rect.ss === '#E46970')).toHaveLength(3);
   });
 
+  // PowerPoint-observed ChartEx direct formatting (all families): the linked
+  // dataPoint entry carries fill and line paint but no allowNo*Override, yet a
+  // direct series/point noFill or no-line still wins, point paint wins over the
+  // series, and an outline without `w` is 0.75pt.
+  const unmodifiedLinkedDataPoint = {
+    fillColors: ['E46970', '8977D7', 'A5A5A5'],
+    fillPaintAuthored: true,
+    lineColors: ['0000FF'],
+    linePaintAuthored: true,
+  };
+
+  it.each(['funnel', 'clusteredBar'] as const)(
+    'lets %s point and series noFill/line beat an unmodified linked role',
+    chartType => {
+      const rec = recordingCtx();
+      renderChart(rec.ctx, baseModel({
+        chartType,
+        categories: ['A', 'B', 'C'],
+        catAxisHidden: true,
+        valAxisHidden: true,
+        chartexDataPointStyle: unmodifiedLinkedDataPoint,
+        series: [series({
+          values: [30, 20, 10],
+          chartexStyle: {
+            fillHidden: true,
+            fillPaintAuthored: true,
+            linePaints: [{ fillType: 'solid', color: 'FF0000' }],
+            linePaintAuthored: true,
+          },
+          dataPointOverrides: [
+            { idx: 1, chartexStyle: { fillPaints: [{ fillType: 'solid', color: '7030A0' }], fillPaintAuthored: true } },
+            { idx: 2, chartexStyle: { lineHidden: true, linePaintAuthored: true } },
+          ],
+        })],
+      }), RECT, 1);
+
+      expect(rec.rects.filter(rect => ['#E46970', '#8977D7', '#A5A5A5'].includes(rect.fs)))
+        .toHaveLength(0);
+      expect(rec.rects.filter(rect => rect.fs.toUpperCase() === '#7030A0')).toHaveLength(1);
+      const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+      expect(red).toHaveLength(2);
+      expect(red.every(rect => rect.lw === 0.75)).toBe(true);
+      expect(rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#0000FF')).toHaveLength(0);
+    },
+  );
+
+  it('takes an omitted ChartEx outline width from the linked lnRef theme line', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'funnel',
+      categories: ['A', 'B'],
+      catAxisHidden: true,
+      chartexDataPointStyle: {
+        ...unmodifiedLinkedDataPoint, lineWidthEmu: 6350, lineCap: 'flat',
+      },
+      series: [series({
+        values: [2, 1],
+        chartexStyle: { linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true },
+      })],
+    }), RECT, 1);
+
+    const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    expect(red.map(rect => rect.lw)).toEqual([0.5, 0.5]);
+  });
+
+  it('addresses hierarchy dataPt by pre-order node index', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'treemap',
+      chartexDataPointStyle: unmodifiedLinkedDataPoint,
+      chartexTreemap: {
+        parentLabelLayout: 'none',
+        rows: [
+          { path: ['North', 'A'], size: 48 },
+          { path: ['North', 'B'], size: 35 },
+          { path: ['South', 'C'], size: 25 },
+        ],
+      },
+      series: [series({
+        values: [],
+        dataPointOverrides: [{
+          idx: 1,
+          chartexStyle: { fillPaints: [{ fillType: 'solid', color: '7030A0' }], fillPaintAuthored: true },
+        }],
+      })],
+    }), RECT, 1);
+
+    const purple = rec.rects.filter(rect => rect.fs.toUpperCase() === '#7030A0');
+    const north = rec.rects.filter(rect => rect.fs.toUpperCase() === '#E46970');
+    expect(purple).toHaveLength(1);
+    expect(north).toHaveLength(1);
+    // Pre-order index 1 is North/A, the larger North leaf; data row 1 (B) is not.
+    expect(purple[0]!.w * purple[0]!.h).toBeGreaterThan(north[0]!.w * north[0]!.h);
+  });
+
   it('does not preflight a linked Waterfall picture fill removed by series noFill', () => {
     const picture = {
       fillType: 'image' as const,
