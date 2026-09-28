@@ -59,6 +59,7 @@ import {
 } from './style-paint.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
 import {
+  CHARTEX_DEFAULT_LINE_WIDTH_EMU,
   resolveChartExLineChain,
   resolveChartExPointFill,
   resolveChartExPointLine,
@@ -926,7 +927,9 @@ function renderParetoLineChart(
       showMarker: false,
       lineHidden: !paretoLine.visible,
       lineColor: paretoLine.color.replace(/^#/, ''),
-      lineWidthEmu: paretoLine.widthEmu,
+      // Excel draws a standalone paretoLine without any line width at the
+      // ChartEx 0.75 pt default, not the classic line family's 2.25 pt.
+      lineWidthEmu: paretoLine.widthEmu ?? CHARTEX_DEFAULT_LINE_WIDTH_EMU,
       chartexStyle: {
         lineDash: paretoLine.dash,
         lineCap: paretoLine.cap,
@@ -2089,8 +2092,8 @@ function renderTreemapChart(
     (chart.series[0]?.dataLabelOverrides ?? []).map(override => [override.idx, override]),
   );
   // With no direct or linked line recipe, use a one-CSS-pixel separator derived
-  // from the chart background. `applyChartExSeriesLineStyle` still resolves
-  // direct series formatting and the linked data-point role before this fallback.
+  // from the chart background. `resolveChartExPointLine` still resolves direct
+  // point/series formatting and the linked data-point role before this fallback.
   const automaticSeparator = chart.chartBg
     ? (chart.chartBg.startsWith('#') ? chart.chartBg : `#${chart.chartBg}`)
     : '#ffffff';

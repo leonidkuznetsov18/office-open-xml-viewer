@@ -136,6 +136,61 @@ export function chartExPointAuthorsLine(point: ChartExPointCarrier | null | unde
 }
 
 
+/** A ChartEx model: no classic numeric role table, but a ChartEx dataPoint
+ * role or colour palette. Classic models that merely expose effective roles
+ * through the historical `chartex*Style` aliases are excluded. */
+export function chartModelIsChartEx(chart: ChartModel): boolean {
+  return chart.classicChartStyleRoles == null
+    && (chart.chartexDataPointStyle != null || chart.chartexColorPalette != null);
+}
+
+/** Pure ChartEx data-point fill decision shared by paint, picture preflight
+ * and paint-work accounting: the point `spPr` fill if it authors one, else
+ * the series `spPr` fill, else the linked dataPoint role. Direct `noFill` is
+ * not modifier-gated. `undefined` delegates to the family's semantic palette. */
+export function chartExPointFillDecision(
+  chart: ChartModel,
+  series: { chartexStyle?: ChartExElementStyle | null; color?: string | null } | null | undefined,
+  point: ChartExPointCarrier | null | undefined,
+  index: number,
+  linkedStyle: ChartExElementStyle | null | undefined = chart.chartexDataPointStyle,
+): Fill | null | undefined {
+  const pointOwns = chartExPointAuthorsFill(point);
+  const local = pointOwns
+    ? point?.fillHidden === true
+      ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
+      : point?.chartexStyle
+    : series?.chartexStyle;
+  const legacyColor = pointOwns ? point?.color : series?.color;
+  const direct = chartStyleFillDecision(local, index);
+  if (direct !== undefined) return direct;
+  if (legacyColor) return { fillType: 'solid', color: legacyColor };
+  return chartStyleFillDecision(linkedStyle, index);
+}
+
+/** Line-paint counterpart of chartExPointFillDecision (paint only; geometry
+ * is resolved by the renderer's role chain). */
+export function chartExPointLinePaintDecision(
+  chart: ChartModel,
+  series: {
+    chartexStyle?: ChartExElementStyle | null;
+    lineColor?: string | null;
+    lineHidden?: boolean | null;
+  } | null | undefined,
+  point: ChartExPointCarrier | null | undefined,
+  index: number,
+  linkedStyle: ChartExElementStyle | null | undefined = chart.chartexDataPointStyle,
+): ChartModel['plotAreaLineFill'] | null | undefined {
+  for (const layer of [point, series]) {
+    if (!layer) continue;
+    if (layer.lineHidden === true) return null;
+    const decision = chartStyleLineDecision(layer.chartexStyle, index);
+    if (decision !== undefined) return decision;
+    if (layer.lineColor) return { fillType: 'solid', color: layer.lineColor };
+  }
+  return chartStyleLineDecision(linkedStyle, index);
+}
+
 /** Resolve direct shape paint over a linked CT_StyleEntry. An omitted fill or
  * line in a present `spPr` still inherits: MS-ODRAWXML's `allowNo*Override`
  * permits an authored `noFill`/no-line choice to replace the style; it does

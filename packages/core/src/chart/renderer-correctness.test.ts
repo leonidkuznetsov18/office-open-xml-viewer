@@ -9998,9 +9998,10 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     // Excel: the first role with a line supplies geometry as a unit, so a
     // dataPoint `w` without `cap` does not borrow dataPointLine's round cap.
     { name: 'dataPoint spPr without cap', dataPoint: { lineHidden: false, lineNoStyle: false, lineWidthEmu: 19050 }, bar: [1.5, 'butt'], connector: [2.25, 'round'] },
-    // R03: a dataPoint spPr line never reaches the connectors.
-    { name: 'dataPoint spPr', dataPoint: { lineHidden: false, lineNoStyle: false, lineWidthEmu: 38100, lineCap: 'rnd' }, bar: [3, 'round'], connector: [2.25, 'round'] },
-  ] as const)('resolves ChartEx outline geometry from the $name role', ({ dataPoint, bar, connector }) => {
+    // R03: a dataPoint spPr line never reaches the connectors, which keep the
+    // 0.75 pt default when no seriesLine/dataPointLine role carries a line.
+    { name: 'dataPoint spPr', dataPoint: { lineHidden: false, lineNoStyle: false, lineWidthEmu: 38100, lineCap: 'rnd' }, dataPointLine: null, bar: [3, 'round'], connector: [0.75, 'butt'] },
+  ] as const)('resolves ChartEx outline geometry from the $name role', ({ dataPoint, bar, connector, ...rest }) => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'waterfall',
@@ -10012,7 +10013,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
         fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
         lineHidden: true, lineNoStyle: true, ...dataPoint,
       },
-      chartexDataPointLineStyle: {
+      chartexDataPointLineStyle: 'dataPointLine' in rest ? { lineHidden: true, lineNoStyle: true } : {
         lineColors: ['000000'], linePaintAuthored: true, lineWidthEmu: 28575, lineCap: 'rnd',
       },
       chartexSeriesLineStyle: { lineHidden: true, lineNoStyle: true },
@@ -10030,6 +10031,53 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(connectors.length).toBeGreaterThan(0);
     expect(connectors.every(detail =>
       detail.lineWidth === connector[0] && detail.cap === connector[1])).toBe(true);
+  });
+
+  it('keeps series outline paint when a point line authors only geometry', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'funnel',
+      categories: ['A', 'B'],
+      catAxisHidden: true,
+      chartexDataPointStyle: unmodifiedLinkedDataPoint,
+      series: [series({
+        values: [2, 1],
+        chartexStyle: { linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true },
+        dataPointOverrides: [{ idx: 1, chartexStyle: { lineWidthEmu: 28575 } }],
+      })],
+    }), RECT, 1);
+
+    const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    expect(red.map(rect => rect.lw)).toEqual([0.75, 2.25]);
+  });
+
+  it('draws the Waterfall legend key outline with the body role geometry', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      showLegend: true,
+      legendPos: 'r',
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      chartexDataPointLineStyle: {
+        lineColors: ['000000'], linePaintAuthored: true, lineWidthEmu: 28575, lineCap: 'rnd',
+      },
+      series: [series({
+        values: [10, 5, 15],
+        chartexStyle: { linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true },
+      })],
+    }), RECT, 1);
+
+    const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    // Three bodies plus the Increase/Decrease/Total legend keys.
+    expect(red.length).toBeGreaterThan(3);
+    expect(red.every(rect => rect.lw === 2.25)).toBe(true);
   });
 
   it('takes an omitted ChartEx outline width from the linked lnRef theme line', () => {
@@ -10079,6 +10127,43 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(north).toHaveLength(1);
     // Pre-order index 1 is North/A, the larger North leaf; data row 1 (B) is not.
     expect(purple[0]!.w * purple[0]!.h).toBeGreaterThan(north[0]!.w * north[0]!.h);
+  });
+
+  it('does not preflight a linked ChartEx column picture fill removed by series noFill', () => {
+    const picture = {
+      fillType: 'image' as const,
+      imagePath: 'ppt/media/linked-column.png',
+      mimeType: 'image/png',
+      stretch: true,
+    };
+    // The linked dataPoint role is present (as parsed from a Chart Style
+    // part) and carries no allowNoFillOverride modifier.
+    const linked = { fillPaints: [picture], fillPaintAuthored: true };
+    const model = (seriesStyle: ChartSeries['chartexStyle']) => baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A', 'B'],
+      chartexDataPointStyle: linked,
+      chartStyleRoles: { dataPoint: linked },
+      series: [series({ values: [2, 1], chartexStyle: seriesStyle })],
+    });
+
+    expect(collectChartImageFillUsages(model(null))).toHaveLength(1);
+    expect(collectChartImageFillUsages(model({ fillHidden: true, fillPaintAuthored: true })))
+      .toHaveLength(0);
+  });
+
+  it('draws a standalone ChartEx Pareto line without a width at 0.75pt', () => {
+    const rec = strokedPolylineCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'paretoLine',
+      categories: ['A', 'B', 'C'],
+      chartexDataPointStyle: { fillColors: ['156082'], fillPaintAuthored: true, lineHidden: true, lineNoStyle: true },
+      chartexDataPointLineStyle: { lineHidden: true, lineNoStyle: true },
+      series: [series({ values: [3, 2, 1] })],
+    }), RECT, 1);
+
+    const cumulative = rec.strokes.find(stroke => stroke.points.length > 2);
+    expect(cumulative).toMatchObject({ ss: '#156082', lw: 0.75 });
   });
 
   it('does not preflight a linked Waterfall picture fill removed by series noFill', () => {

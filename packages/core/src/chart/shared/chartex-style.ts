@@ -1,8 +1,8 @@
 // Classic chart chartex style helpers.
 import type { ChartModel, ChartRect, ChartSeries, ChartStyleRole } from '../../types/chart';
 import {
-  chartExPointAuthorsFill,
   chartExPointAuthorsLine,
+  chartExPointFillDecision,
   chartStyleColor,
   chartStyleDirectFillDecision,
   chartStyleFillDecision,
@@ -358,15 +358,9 @@ export function resolveChartExPointFill(
   count: number,
   linkedStyle: ChartExStyle | null | undefined = chart.chartexDataPointStyle,
 ): Fill | null {
-  if (chartExPointAuthorsFill(point)) {
-    const pointStyle = point?.fillHidden === true
-      ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
-      : point?.chartexStyle;
-    return chartExDataPointPaint(chart, index, count, pointStyle, point?.color, linkedStyle);
-  }
-  return chartExDataPointPaint(
-    chart, index, count, series?.chartexStyle, series?.color, linkedStyle,
-  );
+  const decision = chartExPointFillDecision(chart, series, point, index, linkedStyle);
+  if (decision !== undefined) return decision;
+  return { fillType: 'solid', color: chartExSemanticFill(chart, index, count) };
 }
 
 
@@ -400,13 +394,15 @@ export function resolveChartExLineChain(
   // The first role that carries a line supplies every omitted geometry atom
   // as a unit; atoms are not merged across roles. Excel output shows a
   // dataPoint `a:ln w` without `cap` keeping a flat cap even when the
-  // dataPointLine role authors `cap="rnd"`.
-  const geometryRole = line.semanticFallback
-    ? undefined
-    : geometryRoles.find(role => role != null && role.lineNoStyle !== true && (
-      role.lineWidthEmu != null || role.lineCap != null || role.lineJoin != null
-      || role.lineDash != null || role.lineCustomDash != null
-      || role.linePaintAuthored === true));
+  // dataPointLine role authors `cap="rnd"`. NoStyle (`lnRef idx=0`) affects
+  // paint only, so geometry authored beside it still counts. A semantic
+  // fallback outline takes geometry only from its paint roles: PowerPoint
+  // draws no data-point outline from dataPointLine alone (round 2 R02).
+  const geometryCandidates = line.semanticFallback ? paintRoles : geometryRoles;
+  const geometryRole = geometryCandidates.find(role => role != null && (
+    role.lineWidthEmu != null || role.lineCap != null || role.lineJoin != null
+    || role.lineDash != null || role.lineCustomDash != null
+    || (role.linePaintAuthored === true && role.lineNoStyle !== true)));
   const fromRoles = <T>(pick: (role: ChartExStyle) => T | null | undefined): T | null =>
     geometryRole ? pick(geometryRole) ?? null : null;
   const roleDash = geometryRole;
@@ -456,12 +452,28 @@ export function resolveChartExPointLine(
   const pointStyle = point?.chartexStyle;
   const seriesStyle = series?.chartexStyle;
   const pointDashAuthored = pointStyle?.lineDash != null || pointStyle?.lineCustomDash != null;
+  // Paint and geometry are separate atoms: a point `a:ln` that authors only
+  // geometry keeps the series outline paint (the same per-atom inheritance the
+  // controls show for fill versus line).
+  const pointPaintAuthored = point?.lineColor != null || point?.lineHidden != null
+    || pointStyle?.linePaintAuthored === true || pointStyle?.lineHidden != null
+    || pointStyle?.linePaints?.some(paint => paint != null) === true
+    || pointStyle?.lineColors?.some(color => color != null) === true;
+  const paintSource = pointPaintAuthored
+    ? { lineColor: point?.lineColor, lineHidden: point?.lineHidden, style: pointStyle }
+    : { lineColor: series?.lineColor, lineHidden: series?.lineHidden, style: seriesStyle };
   const carrier: Partial<ChartExSeriesStyleCarrier> = {
-    lineColor: point?.lineColor,
-    lineHidden: point?.lineHidden,
+    lineColor: paintSource.lineColor,
+    lineHidden: paintSource.lineHidden,
     lineWidthEmu: point?.lineWidthEmu ?? series?.lineWidthEmu,
     chartexStyle: {
       ...pointStyle,
+      linePaints: paintSource.style?.linePaints,
+      lineColors: paintSource.style?.lineColors,
+      lineColorIndex: paintSource.style?.lineColorIndex,
+      linePaintAuthored: paintSource.style?.linePaintAuthored,
+      lineHidden: paintSource.style?.lineHidden,
+      lineNoStyle: paintSource.style?.lineNoStyle,
       lineWidthEmu: pointStyle?.lineWidthEmu ?? point?.lineWidthEmu
         ?? seriesStyle?.lineWidthEmu ?? series?.lineWidthEmu,
       lineDash: pointDashAuthored ? pointStyle?.lineDash : seriesStyle?.lineDash,
@@ -538,10 +550,15 @@ export function chartExLegendSeries(
   semanticNoStyleFallback = false,
   inheritPlotOutline = true,
 ): ChartSeries {
-  const line = resolveChartExSeriesLineStyle(
+  // Legend keys follow the same role chain as the plotted body so their
+  // outline geometry (e.g. a dataPointLine 2.25 pt round rule) matches.
+  const line = resolveChartExLineChain(
     chart,
-    linkedStyle,
     series,
+    [linkedStyle],
+    linkedStyle === chart.chartexDataPointStyle
+      ? [linkedStyle, chart.chartexDataPointLineStyle]
+      : [linkedStyle],
     index,
     count,
     fillColor,
