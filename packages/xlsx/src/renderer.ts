@@ -3332,8 +3332,10 @@ export function applyAutoRowHeights(
 
   const geometry = getGridGeometryForWorksheet(worksheet);
   const defaultHeightPx = rowHeightToPx(worksheet.defaultRowHeight);
+  // Row auto-fit compares against the Normal style's font; column MDW uses
+  // the default font (`<fonts>[0]`), which may differ.
   const defaultFontLineHeightPx = vMetricPx(
-    worksheet.defaultFontSize ?? DEFAULT_FONT_SIZE,
+    worksheet.normalFontSize ?? worksheet.defaultFontSize ?? DEFAULT_FONT_SIZE,
     1,
     1.2,
   );
