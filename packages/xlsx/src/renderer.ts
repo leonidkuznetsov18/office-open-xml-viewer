@@ -27,7 +27,9 @@ import { chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, 
 import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
-import { officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios, type ShapeRunLineRatios } from './shape-office-line.js';
+import {
+  canvasShapeFontBoxProbe, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios, type ShapeRunLineRatios,
+} from './shape-office-line.js';
 import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
 import { formatCellValueWithColor } from './number-format.js';
 import { type CfContext, type CfResult, compileCf, evaluateCf } from './conditional-format.js';
@@ -4771,10 +4773,13 @@ export function drawShapeText(
   const runLineRatios = new Map<object, ShapeRunLineRatios>();
   let metricBody = !txt.paragraphs.some((p) => p.runs.some((run) => run.type === 'math'));
   const routes = officeRoutesByContext.get(ctx);
+  const fontBoxProbe = canvasShapeFontBoxProbe(ctx);
   for (const paragraph of txt.paragraphs) for (const run of paragraph.runs) {
     if (!metricBody) break;
     if (run.type !== 'text') continue;
-    const ratios = run.fontFace ? shapeRunLineRatios(run, routes?.[shapeOfficeRouteKey(run)]) : undefined;
+    const ratios = run.fontFace
+      ? shapeRunLineRatios(run, routes?.[shapeOfficeRouteKey(run)], fontBoxProbe)
+      : undefined;
     if (!ratios) metricBody = false;
     else runLineRatios.set(run, ratios);
   }

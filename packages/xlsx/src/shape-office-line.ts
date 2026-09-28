@@ -46,22 +46,126 @@ export function shapeOfficeRouteKey(run: TextRun): string {
     style: run.italic ? 'italic' : 'normal' });
 }
 
+/** A loaded face's browser-observable font box, as em ratios. */
+export interface ShapeFontBox {
+  ascent: number;
+  descent: number;
+}
+
+/** Reads the font box of a route's loaded face. Returns undefined when the
+ * engine does not expose it. */
+export type ShapeFontBoxProbe = (route: OfficeFontFallbackRoute) => ShapeFontBox | undefined;
+
+// Probe size and tolerance for matching a loaded face to a catalog profile.
+// Blink rounds a face's ascent and descent to whole pixels on most platforms,
+// so at 1000 px the observation carries at most 0.0005 em of rounding. Two
+// pixels (0.002 em, about 4 design units at 2048 upm) covers that with margin
+// and stays well below the smallest gap between disagreeing catalog profiles
+// whose boxes differ at all (Helvetica Neue Bold, 0.014 em). Copies whose boxes
+// are identical, such as Times New Roman's, match together and are declined.
+// A wider tolerance can only make more profiles match, and a match with
+// disagreeing profiles is declined, so it never admits a wrong profile.
+const PROBE_PX = 1000;
+const PROBE_TOLERANCE_EM = 2 / PROBE_PX;
+
+const probedBoxes = new WeakMap<OfficeFontFallbackRoute, ShapeFontBox | null>();
+
+/** A probe that measures the route's face on `ctx`, once per route object.
+ * TextMetrics.fontBoundingBoxAscent/Descent report the face's own ascent and
+ * descent (hhea on CoreText, usWin or typo on other rasterizers), not the
+ * requested family's name, so they identify which copy local() loaded. */
+export function canvasShapeFontBoxProbe(
+  ctx: Pick<CanvasRenderingContext2D, 'font' | 'measureText'>,
+): ShapeFontBoxProbe {
+  return (route) => {
+    const cached = probedBoxes.get(route);
+    if (cached !== undefined) return cached ?? undefined;
+    const saved = ctx.font;
+    let box: ShapeFontBox | null = null;
+    try {
+      ctx.font = `${route.style} ${route.weight} ${PROBE_PX}px "${route.family}"`;
+      const measured = ctx.measureText('H');
+      const ascent = measured.fontBoundingBoxAscent;
+      const descent = measured.fontBoundingBoxDescent;
+      if (Number.isFinite(ascent) && Number.isFinite(descent) && ascent + descent > 0) {
+        box = { ascent: ascent / PROBE_PX, descent: descent / PROBE_PX };
+      }
+    } finally {
+      ctx.font = saved;
+    }
+    probedBoxes.set(route, box);
+    return box ?? undefined;
+  };
+}
+
+type Profile = ReturnType<typeof findReferenceFontMetrics>[number];
+
+const isSystemProfile = (profile: Profile) =>
+  profile.source === 'macos-system' || profile.source === 'macos-supplemental';
+
+function projectProfile(profile: Profile): ShapeRunLineRatios | undefined {
+  if (profile.source === 'published-open-font') return undefined;
+  if (profile.farEastCodePage == null || !profile.win) return undefined;
+  return excelDrawingMlLineRatios({
+    faceSource: isSystemProfile(profile) ? 'system' : 'office-bundle',
+    unitsPerEm: profile.unitsPerEm,
+    hhea: profile.hhea,
+    win: profile.win,
+    typoMetrics: profile.typoMetrics,
+    farEastCodePage: profile.farEastCodePage,
+  }) ?? undefined;
+}
+
+/** One ratio pair when every profile projects to it, else undefined. */
+function agreed(profiles: readonly Profile[]): ShapeRunLineRatios | undefined {
+  let ratios: ShapeRunLineRatios | undefined;
+  for (const profile of profiles) {
+    const projected = projectProfile(profile);
+    if (!projected || (ratios && (projected.ascentRatio !== ratios.ascentRatio
+      || projected.descentRatio !== ratios.descentRatio))) return undefined;
+    ratios = projected;
+  }
+  return ratios;
+}
+
+/** Does the observed font box equal one of the boxes a rasterizer can report
+ * for this profile (hhea, usWin, or typo when USE_TYPO_METRICS is set)? */
+function matchesProfile(box: ShapeFontBox, profile: Profile): boolean {
+  const upm = profile.unitsPerEm;
+  const pairs: Array<readonly [number, number]> = [[profile.hhea[0], -profile.hhea[1]]];
+  if (profile.win) pairs.push(profile.win);
+  if (profile.typoMetrics) pairs.push([profile.typoMetrics[0], -profile.typoMetrics[1]]);
+  return pairs.some(([ascent, descent]) =>
+    Math.abs(box.ascent - ascent / upm) <= PROBE_TOLERANCE_EM
+    && Math.abs(box.descent - descent / upm) <= PROBE_TOLERANCE_EM);
+}
+
 /**
  * Excel's natural line box for one run (see `excelDrawingMlLineRatios`).
  *
  * The static catalog is reference geometry, not proof of the bytes behind
- * local(). Admit it only after the exact style has loaded. Excel for Mac
- * prefers a macOS system copy of a family over the copy bundled in Office
- * (#1604: its Times New Roman had the system hhea lineGap 87), so macOS
- * profiles win when present, and Office profiles are used otherwise. Every
- * profile in the chosen source must agree. Anything else returns undefined
- * and the caller keeps the ordinary Canvas line box: another source such as
- * a published open font, missing OS/2 data, disagreeing profiles, or a macOS
- * Far East face (not measured).
+ * local(). Admit it only after the exact style has loaded. When every catalog
+ * profile of the tuple projects to the same box, that box is used.
+ *
+ * Otherwise the loaded copy's provenance decides, and it must be proven. Excel
+ * for Mac uses a macOS system copy of a family over the copy bundled in Office
+ * (#1604: its Times New Roman had the system hhea lineGap 87, 1.150 em, where
+ * the Office copy gives 1.107 em). A local() route does not say which copy it
+ * loaded, so `probe` compares the loaded face's font box with each profile.
+ * The run resolves only when the matching profiles all project to one box,
+ * and, if the family has a system profile, only when they are all system
+ * profiles: an Office copy on the viewer's machine does not prove the system
+ * copy that Excel would prefer is absent. Times New Roman's two copies share
+ * their ascent and descent (they differ only in lineGap, which Canvas does not
+ * expose), so it stays unresolved. Anything unresolved returns undefined and
+ * the caller keeps the ordinary Canvas line box: no probe, no match, an
+ * ambiguous match, a published open font, missing OS/2 data, or a macOS Far
+ * East face (not measured).
  */
 export function shapeRunLineRatios(
   run: TextRun,
   route: OfficeFontFallbackRoute | undefined,
+  probe?: ShapeFontBoxProbe,
 ): ShapeRunLineRatios | undefined {
   const family = soleFace(run);
   if (!family || !route || route.source !== 'local' || route.metric.synthesized
@@ -70,23 +174,13 @@ export function shapeRunLineRatios(
     || route.weight !== (run.bold ? 700 : 400)
     || route.style !== (run.italic ? 'italic' : 'normal')) return undefined;
   const profiles = findReferenceFontMetrics(family, { weight: route.weight, style: route.style });
-  const system = profiles.filter((p) => p.source === 'macos-system' || p.source === 'macos-supplemental');
-  const chosen = system.length > 0 ? system : profiles.filter((p) => p.source === 'office-mac');
-  if (chosen.length === 0) return undefined;
-  let ratios: ShapeRunLineRatios | undefined;
-  for (const profile of chosen) {
-    if (profile.farEastCodePage == null || !profile.win) return undefined;
-    const projected = excelDrawingMlLineRatios({
-      faceSource: system.length > 0 ? 'system' : 'office-bundle',
-      unitsPerEm: profile.unitsPerEm,
-      hhea: profile.hhea,
-      win: profile.win,
-      typoMetrics: profile.typoMetrics,
-      farEastCodePage: profile.farEastCodePage,
-    });
-    if (!projected || (ratios && (projected.ascentRatio !== ratios.ascentRatio
-      || projected.descentRatio !== ratios.descentRatio))) return undefined;
-    ratios = projected;
-  }
-  return ratios;
+  if (profiles.length === 0) return undefined;
+  const unanimous = agreed(profiles);
+  if (unanimous || profiles.length === 1) return unanimous;
+  const box = probe?.(route);
+  if (!box) return undefined;
+  const matching = profiles.filter((profile) => matchesProfile(box, profile));
+  if (matching.length === 0) return undefined;
+  if (profiles.some(isSystemProfile) && !matching.every(isSystemProfile)) return undefined;
+  return agreed(matching);
 }

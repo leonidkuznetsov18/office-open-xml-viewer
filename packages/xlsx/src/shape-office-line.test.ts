@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PT_TO_PX, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { bindXlsxOfficeFontRoutes, drawShapeText } from './renderer.js';
 import { xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
-import { shapeRunLineRatios } from './shape-office-line.js';
+import { canvasShapeFontBoxProbe, shapeRunLineRatios, type ShapeFontBoxProbe } from './shape-office-line.js';
 import type { ShapeParagraph, ShapeText, ShapeTextRun, Worksheet } from './types.js';
 
 // Expectations below come from Excel for Mac 16.113.2 PDF exports of the
@@ -80,9 +80,6 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
     expect(sum(shapeRunLineRatios(run('日g', 'Yu Gothic', 24), ROUTES['yu gothic']))).toBeCloseTo(1.6732, 3);
     // Earlier single-line controls: Meiryo UI Bold measured 1.646–1.649 em.
     expect(sum(shapeRunLineRatios(run('予算', 'Meiryo UI', 25, true), route('Meiryo UI', 700)))).toBeCloseTo(1.651, 3);
-    // Excel used the macOS system Times New Roman (hhea lineGap 87): 1.150 em,
-    // not the Office copy's 1.107 em.
-    expect(sum(shapeRunLineRatios(run('Hg', 'Times New Roman', 24), ROUTES['times new roman']))).toBeCloseTo(1.1499, 4);
     // Supplement L-*: bundled Baskerville Old Face follows usWin (1.141 em),
     // bundled Gabriola its USE_TYPO_METRICS typo box (1.700 em), and the macOS
     // system Palatino and Helvetica their hhea box (1.100 and 1.000 em).
@@ -93,6 +90,48 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
     // Unverified resources and distinct East Asian faces stay undefined.
     expect(shapeRunLineRatios(run('Hg', 'Arial', 24), { ...ROUTES.arial, resourceIdentity: 'injected:x' })).toBeUndefined();
     expect(shapeRunLineRatios({ ...run('Hg', 'Arial', 24), fontFaceEa: 'Meiryo' }, ROUTES.arial)).toBeUndefined();
+  });
+
+  it('resolves disagreeing catalog profiles only from the loaded copy\'s font box', () => {
+    const sum = (r: ReturnType<typeof shapeRunLineRatios>) => (r ? r.ascentRatio + r.descentRatio : NaN);
+    const box = (ascent: number, descent: number, upm = 2048): ShapeFontBoxProbe =>
+      () => ({ ascent: ascent / upm, descent: descent / upm });
+    const rockwell = run('Hg', 'Rockwell', 24);
+    // Rockwell: macOS copy hhea 1391/-657/410 (system rule 1.200 em), Office
+    // copy 1937/-468 (usWin rule 1.174 em). A name-only route proves neither.
+    expect(shapeRunLineRatios(rockwell, route('Rockwell'))).toBeUndefined();
+    // Unambiguous match: the loaded box is the macOS copy's hhea box, within
+    // the 0.002 em probe tolerance, so Excel's system-copy rule applies.
+    expect(sum(shapeRunLineRatios(rockwell, route('Rockwell'), box(1391 + 3, 657 - 3)))).toBeCloseTo(2458 / 2048, 4);
+    // Beyond the tolerance, nothing matches.
+    expect(shapeRunLineRatios(rockwell, route('Rockwell'), box(1391 + 6, 657))).toBeUndefined();
+    // The Office copy is loaded, but Excel prefers a system copy the viewer may
+    // also have, so the Office box is not proof: declined.
+    expect(shapeRunLineRatios(rockwell, route('Rockwell'), box(1937, 468))).toBeUndefined();
+    // Ambiguous: both Times New Roman copies report 1825/443 (they differ only
+    // in hhea lineGap, 87 vs 0, which Canvas does not expose): declined.
+    expect(shapeRunLineRatios(run('Hg', 'Times New Roman', 24), ROUTES['times new roman'], box(1825, 443)))
+      .toBeUndefined();
+    // Two macOS Helvetica Neue Bold faces disagree; the probe picks one.
+    expect(sum(shapeRunLineRatios(run('Hg', 'Helvetica Neue', 24, true), route('Helvetica Neue', 700),
+      box(961, 221, 1000)))).toBeCloseTo((961 + 28 + 221) / 1000, 4);
+    // A single-profile family needs no probe, and a probe does not override it.
+    const probe = vi.fn(box(0, 0));
+    expect(sum(shapeRunLineRatios(run('Hg', 'Baskerville Old Face', 24), route('Baskerville Old Face'), probe)))
+      .toBeCloseTo(1.1406, 4);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('probes the route face once and restores the context font', () => {
+    let font = '10px serif';
+    const measureText = vi.fn(() => ({ fontBoundingBoxAscent: 600, fontBoundingBoxDescent: 400 }));
+    const ctx = { get font() { return font; }, set font(value: string) { font = value; }, measureText };
+    const probe = canvasShapeFontBoxProbe(ctx as unknown as CanvasRenderingContext2D);
+    const target = route('Rockwell');
+    expect(probe(target)).toEqual({ ascent: 0.6, descent: 0.4 });
+    expect(probe(target)).toEqual({ ascent: 0.6, descent: 0.4 });
+    expect(measureText).toHaveBeenCalledTimes(1);
+    expect(font).toBe('10px serif');
   });
 
   it('steps same-size lines by the font line box and places the first baseline at the ascent', () => {
