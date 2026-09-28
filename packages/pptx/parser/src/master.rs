@@ -1023,9 +1023,10 @@ pub(crate) fn parse_master_text_body_properties(
     map
 }
 
-/// Placeholder classes and the list style each one inherits after the layout
-/// and master placeholders (ECMA-376 §19.3.1.52 txStyles, §19.2.1.8
-/// defaultTextStyle).
+/// Placeholder classes and the list style whose Latin FACE and SIZE each one
+/// inherits after the layout and master placeholders (ECMA-376 §19.3.1.52
+/// txStyles, §19.2.1.8 defaultTextStyle). Every other list-style property
+/// keeps the txStyles mapping of `tx_style_nodes`.
 ///
 /// * title / ctrTitle → master `titleStyle` (§19.3.1.49);
 /// * body / subTitle / obj / typeless → master `bodyStyle` (§19.3.1.5);
@@ -1038,14 +1039,16 @@ pub(crate) fn parse_master_text_body_properties(
 /// level (Century Gothic 20 pt; lvl2, which named no face, in Arial 20 pt),
 /// on masters with and without txStyles (issue #1620). Non-placeholder text
 /// on the slide, layout and master used `defaultTextStyle` as well, so no
-/// observed text reads `otherStyle` and this parser does not consult it.
+/// observed face or size came from `otherStyle`. Only face and size were
+/// observable in those controls, so the switch is limited to them.
 pub(crate) const TITLE_CLASS: &[&str] = &["title", "ctrTitle"];
 pub(crate) const BODY_CLASS: &[&str] = &["body", "subTitle", "obj", ""];
 pub(crate) const OTHER_CLASS: &[&str] = &["dt", "ftr", "sldNum"];
 
-/// The authored class list styles of a master: `titleStyle` / `bodyStyle`
-/// from its txStyles and the presentation `defaultTextStyle` for the other
-/// class. A missing element yields no entry; see the synthesized defaults.
+/// The class list styles that supply the Latin face and size: `titleStyle` /
+/// `bodyStyle` from the master txStyles and the presentation
+/// `defaultTextStyle` for the other class. A missing element yields no entry;
+/// see the synthesized defaults.
 pub(crate) fn class_style_nodes<'a, 'i>(
     root: roxmltree::Node<'a, 'i>,
     default_text_style: Option<roxmltree::Node<'a, 'i>>,
@@ -1063,6 +1066,27 @@ pub(crate) fn class_style_nodes<'a, 'i>(
         out.push((n, OTHER_CLASS));
     }
     out
+}
+
+/// The master txStyles class mapping for every list-style property other than
+/// the Latin face and size: title/ctrTitle → titleStyle, body/subTitle/obj →
+/// bodyStyle, dt/ftr/sldNum → otherStyle (ECMA-376 §19.3.1.52). The #1620
+/// controls only evidence the face and size of the other class (which follow
+/// `class_style_nodes`), so the other properties keep this mapping.
+pub(crate) fn tx_style_nodes<'a, 'i>(
+    root: roxmltree::Node<'a, 'i>,
+) -> Vec<(roxmltree::Node<'a, 'i>, &'static [&'static str])> {
+    let Some(tx_styles) = child(root, "txStyles") else {
+        return Vec::new();
+    };
+    [
+        ("titleStyle", TITLE_CLASS),
+        ("bodyStyle", BODY_CLASS),
+        ("otherStyle", OTHER_CLASS),
+    ]
+    .into_iter()
+    .filter_map(|(name, types)| child(tx_styles, name).map(|n| (n, types)))
+    .collect()
 }
 
 /// CT_SlideMaster makes txStyles optional. For a master without it PowerPoint
@@ -1118,10 +1142,7 @@ fn inherit_master_placeholder_classes<T: Clone>(map: &mut HashMap<String, T>) {
 
 /// Parse paragraph alignment from master placeholder shapes' lstStyle > lvl1pPr algn,
 /// then the class list styles.
-pub(crate) fn parse_master_alignments(
-    root: roxmltree::Node<'_, '_>,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
-) -> HashMap<String, String> {
+pub(crate) fn parse_master_alignments(root: roxmltree::Node<'_, '_>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (ph_type, sp) in master_placeholder_shapes(root) {
         if let Some(algn) = child(sp, "txBody")
@@ -1132,8 +1153,7 @@ pub(crate) fn parse_master_alignments(
             map.entry(ph_type).or_insert(algn);
         }
     }
-    inherit_master_placeholder_classes(&mut map);
-    for (style, types) in class_style_nodes(root, default_text_style) {
+    for (style, types) in tx_style_nodes(root) {
         if let Some(algn) = child(style, "lvl1pPr").and_then(|lp| attr(&lp, "algn")) {
             for t in types {
                 map.entry((*t).to_string()).or_insert_with(|| algn.clone());
@@ -1157,7 +1177,6 @@ pub(crate) fn parse_master_ea_ln_brk(root: roxmltree::Node<'_, '_>) -> HashMap<S
             map.entry(ph_type).or_insert(v == "1" || v == "true");
         }
     }
-    inherit_master_placeholder_classes(&mut map);
     map
 }
 
@@ -1250,7 +1269,6 @@ pub(crate) fn parse_master_level_font_sizes(
 pub(crate) fn parse_master_level_colors(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> HashMap<String, LevelColors> {
     let mut specific: HashMap<String, LevelColors> = HashMap::new();
     for (ph_type, sp) in master_placeholder_shapes(root) {
@@ -1261,10 +1279,9 @@ pub(crate) fn parse_master_level_colors(
             }
         }
     }
-    inherit_master_placeholder_classes(&mut specific);
 
     let mut generic: HashMap<String, LevelColors> = HashMap::new();
-    for (style_node, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style_node, ph_types) in tx_style_nodes(root) {
         let colors = read_level_colors(style_node, theme);
         if has_any_level_color(&colors) {
             for ph_type in ph_types {
@@ -1283,17 +1300,15 @@ pub(crate) fn parse_master_level_colors(
 }
 
 /// Per-level CT_TextCharacterProperties from the master placeholder lstStyle
-/// and the class list styles (see `TITLE_CLASS` / `BODY_CLASS` /
-/// `OTHER_CLASS`). Merge each property so a partial master placeholder defRPr
-/// still receives the omitted fields from its class style (§21.1.2.4). The
-/// Latin face and size of these levels are replaced by the resolved chain in
-/// shape.rs.
+/// and txStyles (`tx_style_nodes`). Merge each property so a partial master
+/// placeholder defRPr still receives the omitted fields from its matching
+/// txStyle (§21.1.2.4). The Latin face and size of these levels are replaced
+/// by the resolved chain in shape.rs.
 pub(crate) fn parse_master_level_run_properties(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     master_rels: &HashMap<String, String>,
     master_dir: &str,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> HashMap<String, LevelRunProperties> {
     let mut specific = HashMap::new();
     for (ph_type, sp) in master_placeholder_shapes(root) {
@@ -1305,10 +1320,9 @@ pub(crate) fn parse_master_level_run_properties(
             }
         }
     }
-    inherit_master_placeholder_classes(&mut specific);
     // defaultTextStyle lives in presentation.xml, which has no relationships
     // of its own that a character property could reference.
-    for (style, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style, ph_types) in tx_style_nodes(root) {
         let props = read_level_run_properties_with_rels(style, theme, master_rels)
             .map(|p| p.with_part_targets(master_dir));
         if has_any_level_run_properties(&props) {
@@ -1328,7 +1342,6 @@ pub(crate) fn parse_master_level_run_properties(
 /// style (ECMA-376 §21.1.2.4.13).
 pub(crate) fn parse_master_level_indents(
     root: roxmltree::Node<'_, '_>,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> HashMap<String, LevelIndents> {
     let mut map: HashMap<String, LevelIndents> = HashMap::new();
     for (ph_type, sp) in master_placeholder_shapes(root) {
@@ -1339,8 +1352,7 @@ pub(crate) fn parse_master_level_indents(
             }
         }
     }
-    inherit_master_placeholder_classes(&mut map);
-    for (style_node, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style_node, ph_types) in tx_style_nodes(root) {
         let indents = read_level_indents(style_node);
         if has_any_level_indent(&indents) {
             for ph_type in ph_types {
@@ -1368,7 +1380,6 @@ pub(crate) fn parse_master_level_bullets(
     theme: &HashMap<String, String>,
     master_rels: &HashMap<String, String>,
     master_dir: &str,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
     zip: &mut PptxZip,
 ) -> HashMap<String, LevelBullets> {
     let mut map: HashMap<String, LevelBullets> = HashMap::new();
@@ -1392,14 +1403,13 @@ pub(crate) fn parse_master_level_bullets(
             }
         }
     }
-    inherit_master_placeholder_classes(&mut map);
 
     // Class-style fallback, resolved per bullet group: a per-shape entry that
     // declares only a marker inherits its colour/size/font from the matching
     // class style level (ECMA-376 §21.1.2.4, the four groups are independent).
     // The defaultTextStyle is a CT_TextListStyle, so the dt/ftr/sldNum class
     // reads its bullets exactly like the master styles.
-    for (style_node, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style_node, ph_types) in tx_style_nodes(root) {
         let bullets = read_level_bullets(style_node, theme, &mut resolve_blip);
         if has_any_level_bullet(&bullets) {
             for ph_type in ph_types {
@@ -1435,7 +1445,6 @@ type MasterTxStyleRunProperties = (
 
 pub(crate) fn parse_master_txstyle_run_properties(
     root: roxmltree::Node<'_, '_>,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> MasterTxStyleRunProperties {
     let mut bold_map: HashMap<String, bool> = HashMap::new();
     let mut italic_map: HashMap<String, bool> = HashMap::new();
@@ -1444,7 +1453,7 @@ pub(crate) fn parse_master_txstyle_run_properties(
     // upper-cases every title.
     let mut caps_map: HashMap<String, String> = HashMap::new();
     let mut reflection_map: HashMap<String, Reflection> = HashMap::new();
-    for (style_node, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style_node, ph_types) in tx_style_nodes(root) {
         let def_rpr = child(style_node, "lvl1pPr").and_then(|lp| child(lp, "defRPr"));
         let b = def_rpr
             .and_then(|rp| attr(&rp, "b"))
@@ -1489,7 +1498,6 @@ pub(crate) fn parse_master_txstyle_run_properties(
 pub(crate) fn parse_master_txstyle_color(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     for (ph_type, sp) in master_placeholder_shapes(root) {
@@ -1502,8 +1510,7 @@ pub(crate) fn parse_master_txstyle_color(
             map.entry(ph_type).or_insert(color);
         }
     }
-    inherit_master_placeholder_classes(&mut map);
-    for (style_node, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style_node, ph_types) in tx_style_nodes(root) {
         if let Some(color) = child(style_node, "lvl1pPr")
             .and_then(|lp| child(lp, "defRPr"))
             .and_then(|rp| text_property_color(rp, theme))
@@ -1522,7 +1529,6 @@ pub(crate) fn parse_master_txstyle_color(
 /// line_spacing values are the level-1 `lnSpc/spcPct` val (e.g. 90000 = 90%).
 pub(crate) fn parse_master_txstyle_spacing(
     root: roxmltree::Node<'_, '_>,
-    default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> (
     HashMap<String, ParagraphSpacing>,
     HashMap<String, ParagraphSpacing>,
@@ -1531,7 +1537,7 @@ pub(crate) fn parse_master_txstyle_spacing(
     let mut before_map: HashMap<String, ParagraphSpacing> = HashMap::new();
     let mut after_map: HashMap<String, ParagraphSpacing> = HashMap::new();
     let mut line_map: HashMap<String, f64> = HashMap::new();
-    for (style_node, ph_types) in class_style_nodes(root, default_text_style) {
+    for (style_node, ph_types) in tx_style_nodes(root) {
         let lvl1 = child(style_node, "lvl1pPr");
         let spc_before = lvl1.and_then(|lp| paragraph_spacing(lp, "spcBef"));
         let spc_after = lvl1.and_then(|lp| paragraph_spacing(lp, "spcAft"));
@@ -2453,16 +2459,16 @@ pub(crate) fn build_master_bundle(
         .map(|root| parse_master_level_font_sizes(root, dts))
         .unwrap_or_default();
     let master_level_colors = master_root
-        .map(|root| parse_master_level_colors(root, &theme, dts))
+        .map(|root| parse_master_level_colors(root, &theme))
         .unwrap_or_default();
     let master_level_run_properties = master_root
-        .map(|root| parse_master_level_run_properties(root, &theme, &master_rels, &master_dir, dts))
+        .map(|root| parse_master_level_run_properties(root, &theme, &master_rels, &master_dir))
         .unwrap_or_default();
     let master_level_indents = master_root
-        .map(|root| parse_master_level_indents(root, dts))
+        .map(|root| parse_master_level_indents(root))
         .unwrap_or_default();
     let master_level_bullets = master_root
-        .map(|root| parse_master_level_bullets(root, &theme, &master_rels, &master_dir, dts, zip))
+        .map(|root| parse_master_level_bullets(root, &theme, &master_rels, &master_dir, zip))
         .unwrap_or_default();
     let master_anchors = master_root.map(parse_master_anchors).unwrap_or_default();
     let master_body_pr = master_root
@@ -2470,17 +2476,17 @@ pub(crate) fn build_master_bundle(
         .unwrap_or_default();
     let master_transforms = master_root.map(parse_master_transforms).unwrap_or_default();
     let master_alignments = master_root
-        .map(|root| parse_master_alignments(root, dts))
+        .map(|root| parse_master_alignments(root))
         .unwrap_or_default();
     let master_ea_ln_brk = master_root.map(parse_master_ea_ln_brk).unwrap_or_default();
     let (master_space_before, master_space_after, master_line_spacing) = master_root
-        .map(|root| parse_master_txstyle_spacing(root, dts))
+        .map(|root| parse_master_txstyle_spacing(root))
         .unwrap_or_default();
     let (master_bold, master_italic, master_caps, master_reflection) = master_root
-        .map(|root| parse_master_txstyle_run_properties(root, dts))
+        .map(|root| parse_master_txstyle_run_properties(root))
         .unwrap_or_default();
     let master_color = master_root
-        .map(|root| parse_master_txstyle_color(root, &theme, dts))
+        .map(|root| parse_master_txstyle_color(root, &theme))
         .unwrap_or_default();
 
     // Pre-extract the master's decorative (non-placeholder) spTree shapes ONCE,
@@ -2577,7 +2583,6 @@ mod placeholder_geometry_tests {
             &theme,
             &HashMap::new(),
             "ppt/slideMasters",
-            None,
         );
         let mut zip = empty_zip();
         let placeholders = parse_layout_placeholders(
@@ -2693,7 +2698,7 @@ mod placeholder_geometry_tests {
           </p:txStyles>
         </p:sldMaster>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
-        let (_, _, lines) = parse_master_txstyle_spacing(doc.root_element(), None);
+        let (_, _, lines) = parse_master_txstyle_spacing(doc.root_element());
         assert_eq!(lines.get("title"), Some(&85000.0));
         assert_eq!(lines.get("body"), Some(&90000.0));
         assert_eq!(lines.get("obj"), Some(&90000.0));
@@ -2801,7 +2806,6 @@ mod placeholder_geometry_tests {
                 &theme,
                 &HashMap::new(),
                 "ppt/slideMasters",
-                None,
                 &mut zip,
             ),
             &HashMap::new(),
@@ -3004,14 +3008,13 @@ mod placeholder_geometry_tests {
 
         let sizes = parse_master_level_font_sizes(doc.root_element(), None);
         let faces = parse_master_level_faces(doc.root_element(), &theme, None);
-        let indents = parse_master_level_indents(doc.root_element(), None);
+        let indents = parse_master_level_indents(doc.root_element());
         let mut zip = empty_zip();
         let bullets = parse_master_level_bullets(
             doc.root_element(),
             &theme,
             &HashMap::new(),
             "ppt/slideMasters",
-            None,
             &mut zip,
         );
 
@@ -3039,6 +3042,70 @@ mod placeholder_geometry_tests {
         assert_eq!(sizes["body"][1], None);
         assert_eq!(faces["body"][1], None);
         assert!(!sizes.contains_key("dt"));
+    }
+
+    /// Review regression (#1620 x #1625): only the Latin face and size of
+    /// dt/ftr/sldNum switch to defaultTextStyle. Every other character
+    /// property of a footer still inherits master otherStyle.
+    #[test]
+    fn footer_keeps_other_style_character_properties() {
+        let master = format!(
+            r#"<p:sldMaster {PML_A}><p:cSld><p:spTree/></p:cSld><p:txStyles>
+              <p:otherStyle><a:lvl1pPr><a:defRPr sz="1600" b="1"><a:solidFill><a:srgbClr val="C00000"/></a:solidFill>
+                <a:latin typeface="Trebuchet MS"/></a:defRPr></a:lvl1pPr></p:otherStyle></p:txStyles></p:sldMaster>"#
+        );
+        let dts = format!(
+            r#"<p:defaultTextStyle {PML_A}><a:lvl1pPr><a:defRPr sz="2000"><a:latin typeface="Century Gothic"/></a:defRPr></a:lvl1pPr></p:defaultTextStyle>"#
+        );
+        let master_doc = roxmltree::Document::parse(&master).unwrap();
+        let dts_doc = roxmltree::Document::parse(&dts).unwrap();
+        let root = master_doc.root_element();
+        let dts = Some(dts_doc.root_element());
+        let theme = HashMap::new();
+        let layout = format!(
+            r#"<p:sldLayout {PML_A}><p:cSld><p:spTree>
+              <p:sp><p:nvSpPr><p:cNvPr id="2" name="F"/><p:cNvSpPr/><p:nvPr><p:ph type="ftr" idx="11"/></p:nvPr></p:nvSpPr><p:spPr/>
+                <p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sldLayout>"#
+        );
+        let layout_doc = roxmltree::Document::parse(&layout).unwrap();
+        let mut zip = empty_zip();
+        let placeholders = parse_layout_placeholders(
+            layout_doc.root_element(),
+            &parse_master_level_faces(root, &theme, dts),
+            &DefaultTextLevels::default(),
+            &parse_master_level_font_sizes(root, dts),
+            &HashMap::new(),
+            &parse_master_level_run_properties(root, &theme, &HashMap::new(), "ppt/slideMasters"),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &theme,
+            "ppt/slideLayouts",
+            &HashMap::new(),
+            &mut zip,
+        );
+        let footer = parse_shape_with_theme(
+            r#"<p:nvSpPr><p:cNvPr id="9" name="x"/><p:cNvSpPr/><p:nvPr><p:ph type="ftr" idx="11"/></p:nvPr></p:nvSpPr><p:spPr/>
+              <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>f</a:t></a:r></a:p></p:txBody>"#,
+            &placeholders,
+            &theme,
+        );
+        let paragraph = &footer.text_body.unwrap().paragraphs[0];
+        let TextRun::Text(run) = &paragraph.runs[0] else {
+            panic!("expected a text run");
+        };
+        assert_eq!(run.bold, Some(true));
+        assert_eq!(run.color.as_deref(), Some("C00000"));
+        assert_eq!(run.font_family.as_deref(), Some("Century Gothic"));
+        assert_eq!(run.font_size, Some(20.0));
     }
 
     #[test]
@@ -3296,8 +3363,7 @@ mod placeholder_geometry_tests {
             </p:txStyles>
           </p:sldMaster>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
-        let (_, _, caps, reflections) =
-            parse_master_txstyle_run_properties(doc.root_element(), None);
+        let (_, _, caps, reflections) = parse_master_txstyle_run_properties(doc.root_element());
 
         assert_eq!(caps.get("title").map(String::as_str), Some("all"));
         assert_eq!(caps.get("ctrTitle").map(String::as_str), Some("all"));

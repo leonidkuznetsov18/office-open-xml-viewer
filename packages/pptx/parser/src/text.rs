@@ -2221,7 +2221,6 @@ mod relationship_owner_tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
-            None,
         );
         let master_default = &master_levels["body"][0];
         let layout_levels =

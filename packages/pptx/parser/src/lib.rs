@@ -3031,18 +3031,11 @@ fn produce_slide_unit_with_journal<T>(
                 };
                 parse_background(c_sld, &theme, &mut resolve)
             });
-            let dts_doc = default_text_style
-                .as_deref()
-                .and_then(|xml| parse_preflighted_pptx_xml(xml).ok());
-            let dts = dts_doc.as_ref().and_then(|doc| {
-                doc.descendants()
-                    .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
-            });
             let master_color = master_root
-                .map(|root| parse_master_txstyle_color(root, &theme, dts))
+                .map(|root| parse_master_txstyle_color(root, &theme))
                 .unwrap_or_default();
             let master_level_colors = master_root
-                .map(|root| parse_master_level_colors(root, &theme, dts))
+                .map(|root| parse_master_level_colors(root, &theme))
                 .unwrap_or_default();
             let master_level_run_properties = master_root
                 .map(|root| {
@@ -3051,7 +3044,6 @@ fn produce_slide_unit_with_journal<T>(
                         &theme,
                         &bundle.master_rels,
                         &bundle.master_dir,
-                        dts,
                     )
                 })
                 .unwrap_or_default();
@@ -3062,7 +3054,6 @@ fn produce_slide_unit_with_journal<T>(
                         &theme,
                         &bundle.master_rels,
                         &bundle.master_dir,
-                        dts,
                         zip,
                     )
                 })
@@ -4551,7 +4542,6 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
-            None,
             &mut zip,
         );
         match m.get("body").map(|b| b[0].resolve()) {
@@ -6060,7 +6050,6 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
-            None,
             &mut zip,
         );
         // The listed-but-missing part must not produce a Blip anywhere. With only
@@ -6092,7 +6081,6 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
-            None,
             &mut zip_ok,
         );
         match m_ok.get("body").map(|b| b[0].resolve()) {
@@ -6594,7 +6582,6 @@ mod tests {
             &theme,
             &master_rels,
             "ppt/slideMasters",
-            None,
             &mut zip,
         );
         let body = m.get("body").expect("body bullets");
@@ -6661,7 +6648,7 @@ mod tests {
           </p:txStyles>
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master).unwrap();
-        let m = parse_master_level_indents(master_doc.root_element(), None);
+        let m = parse_master_level_indents(master_doc.root_element());
         let body = m.get("body").expect("body level indents");
         assert_eq!(body[0].mar_l, Some(1_000_000));
         assert_eq!(body[0].indent, Some(-500_000));
@@ -7287,7 +7274,7 @@ mod tests {
           </p:bodyStyle></p:txStyles>
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master_xml).unwrap();
-        let master_colors = parse_master_level_colors(master_doc.root_element(), &theme, None);
+        let master_colors = parse_master_level_colors(master_doc.root_element(), &theme);
 
         let layout_xml = r#"<p:sldLayout
           xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
