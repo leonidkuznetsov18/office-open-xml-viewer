@@ -353,6 +353,9 @@ struct WorkbookShared {
     /// workbook styles stay owned by the full-parse path instead of being
     /// retained and deeply cloned here.
     default_font: DefaultFont,
+    /// The Normal cell style font's authored color key (see
+    /// `styles::normal_font_color_key`); marks rich-text runs' own colors.
+    normal_font_color: Option<Option<String>>,
     chart_number_formats: ChartNumberFormatCache,
     shared_strings: Rc<[SharedString]>,
     /// #773: a part-tagged degradation error set when `xl/sharedStrings.xml` was
@@ -472,31 +475,43 @@ impl WorkbookShared {
         let theme_fonts = theme.fonts;
         let theme_japanese_fonts = theme.japanese_fonts;
         let theme_chart_images = Rc::new(theme.chart_images);
-        let (default_font, chart_number_formats, styles) = if include_full_styles {
+        let (default_font, normal_font_color, chart_number_formats, styles) = if include_full_styles
+        {
             match parse_styles(archive, theme_colors.as_ref()) {
                 Ok(parsed) => (
                     parsed.default_font,
+                    parsed.normal_font_color,
                     parsed.chart_number_formats,
                     Some(Ok(parsed.styles)),
                 ),
                 Err(error) => (
                     (None, None, false, false),
+                    None,
                     ChartNumberFormatCache::default(),
                     Some(Err(error)),
                 ),
             }
         } else {
             match styles::parse_style_projection(archive) {
-                Ok(parsed) => (parsed.default_font, parsed.chart_number_formats, None),
+                Ok(parsed) => (
+                    parsed.default_font,
+                    parsed.normal_font_color,
+                    parsed.chart_number_formats,
+                    None,
+                ),
                 Err(_) => (
                     (None, None, false, false),
+                    None,
                     ChartNumberFormatCache::default(),
                     None,
                 ),
             }
         };
-        let (shared_strings, shared_strings_error) =
+        let (mut shared_strings, shared_strings_error) =
             read_shared_strings(archive, theme_colors.as_ref());
+        for string in &mut shared_strings {
+            mark_run_colors(string.runs.as_deref_mut(), normal_font_color.as_ref());
+        }
         Ok((
             WorkbookShared {
                 workbook_xml,
@@ -509,6 +524,7 @@ impl WorkbookShared {
                 theme_fonts,
                 theme_japanese_fonts,
                 default_font,
+                normal_font_color,
                 chart_number_formats,
                 shared_strings: shared_strings.into(),
                 shared_strings_error,
@@ -759,6 +775,7 @@ fn finalize_projected_sheet(
         &mut reference_session,
     );
     ws.sparkline_groups = sparkline_groups;
+    mark_rows_run_colors(&mut ws.rows, shared.normal_font_color.as_ref());
     ws.default_font_family = shared.default_font.0.clone();
     ws.default_font_size = shared.default_font.1;
     ws.default_font_bold = shared.default_font.2.then_some(true);
@@ -1302,6 +1319,7 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
                                     }
                                     "color" => {
                                         f.color = parse_color(&rp, theme_colors);
+                                        f.authored_color = Some(styles::authored_color_key(&rp));
                                     }
                                     "rFont" | "name" => {
                                         f.name = rp.attribute("val").map(|s| s.to_string());
@@ -1330,6 +1348,37 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
         phonetic_pr,
     }
 }
+/// Mark each rich-text run whose `<rPr>` color is confirmed to be authored
+/// exactly like the Normal style font's color (`RunFont::normal_color`).
+/// Measured in Excel: such a run takes a table style's font color, while a
+/// run with any other authored color, or none (automatic), keeps it. Only a
+/// confirmed match is marked: when the Normal style cannot be resolved
+/// (`normal` is `None`) nothing is, so runs keep their own colors. Runs
+/// without `<rPr>` are the cell's font and follow the cell's classification.
+fn mark_run_colors(runs: Option<&mut [Run]>, normal: Option<&Option<String>>) {
+    let (Some(runs), Some(normal)) = (runs, normal) else {
+        return;
+    };
+    for font in runs.iter_mut().filter_map(|run| run.font.as_mut()) {
+        // Only an authored `<color>` can confirm the match: a run without one
+        // is automatic, measured against a `theme="1"` Normal; the boundary
+        // where Normal also lacks `<color>` is not measured and keeps the
+        // run's own (automatic) color.
+        font.normal_color = font.authored_color.is_some() && &font.authored_color == normal;
+    }
+}
+
+/// `mark_run_colors` for the inline rich text of worksheet rows, applied on
+/// every path that hands rows to a renderer (materialized sheets and cursor
+/// row batches). Shared-string runs are marked once when the table is read.
+fn mark_rows_run_colors(rows: &mut [Row], normal: Option<&Option<String>>) {
+    for cell in rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+        if let CellValue::Text { runs, .. } = &mut cell.value {
+            mark_run_colors(runs.as_deref_mut(), normal);
+        }
+    }
+}
+
 /// Pending cell-hyperlink descriptors, awaiting rels resolution of the external
 /// `r:id`. Each entry is `(col, row, rid, location, display)`:
 /// - `rid`: the external relationship id (§18.3.1.47 `r:id`), if present.
@@ -3946,6 +3995,12 @@ impl XlsxArchive {
                 .ok_or_else(|| "worksheet cursor shared state is missing".to_string())?
                 .shared_strings,
         );
+        let normal_font_color = self
+            .shared
+            .as_ref()
+            .ok_or_else(|| "worksheet cursor shared state is missing".to_string())?
+            .normal_font_color
+            .clone();
         let source = &mut self
             .active_worksheet
             .as_mut()
@@ -3958,7 +4013,8 @@ impl XlsxArchive {
             _ => unreachable!("source checked above"),
         };
         match pull {
-            Ok(WorksheetCursorPull::Rows { rows, .. }) => {
+            Ok(WorksheetCursorPull::Rows { mut rows, .. }) => {
+                mark_rows_run_colors(&mut rows, normal_font_color.as_ref());
                 extend_lookup_transactionally(
                     &mut self
                         .active_worksheet
@@ -6115,6 +6171,54 @@ mod phonetic_tests {
 
     const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 
+    /// Rich-text runs are marked `normal_color` exactly when their `<rPr>`
+    /// carries a `<color>` authored like the Normal style font's (typed
+    /// comparison). Runs without `<rPr>`, without `<color>` (even when Normal
+    /// has none), or with another color, and every run when Normal cannot be
+    /// resolved, stay unmarked and keep their own color.
+    #[test]
+    fn rich_runs_mark_only_colors_authored_like_normal() {
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><color theme="1"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let normal = styles::normal_font_color_key(&roxmltree::Document::parse(styles).unwrap());
+        let xml = format!(
+            r#"<si xmlns="{ns}"><r><t>a</t></r><r><rPr><color theme="1"/></rPr><t>b</t></r><r><rPr><color theme="01"/></rPr><t>c</t></r><r><rPr><sz val="11"/></rPr><t>d</t></r><r><rPr><color rgb="FF000000"/></rPr><t>e</t></r></si>"#,
+            ns = NS,
+        );
+        let doc = roxmltree::Document::parse(&xml).expect("parse");
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), normal.as_ref());
+        let marked: Vec<Option<bool>> = ss
+            .runs
+            .unwrap()
+            .iter()
+            .map(|run| run.font.as_ref().map(|font| font.normal_color))
+            .collect();
+        assert_eq!(
+            marked,
+            [None, Some(true), Some(true), Some(false), Some(false)]
+        );
+
+        // Without a resolvable Normal style no run is marked.
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), None);
+        assert!(ss
+            .runs
+            .unwrap()
+            .iter()
+            .all(|run| run.font.as_ref().is_none_or(|f| !f.normal_color)));
+
+        // Normal without <color>: a run without <color> is not confirmed.
+        let bare = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><sz val="11"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let bare_normal = styles::normal_font_color_key(&roxmltree::Document::parse(bare).unwrap());
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), bare_normal.as_ref());
+        assert!(ss
+            .runs
+            .unwrap()
+            .iter()
+            .all(|run| run.font.as_ref().is_none_or(|f| !f.normal_color)));
+    }
+
     /// ECMA-376 §18.4.6 / §18.4.3: a `<si>` with `<rPh>` runs and a
     /// `<phoneticPr>` must parse the furigana runs (sb/eb + hint text) and the
     /// display properties, while `text` stays the base string only.
@@ -7085,6 +7189,41 @@ mod rb7_partial_degradation_tests {
         let streamed = drain_cursor_model(data);
         assert_eq!(streamed, legacy);
         streamed
+    }
+
+    /// Inline rich text reaches the viewer through cursor row batches, so its
+    /// runs must be marked there too, exactly as a full parse marks them.
+    #[test]
+    fn cursor_rows_mark_inline_rich_run_colors_like_a_full_parse() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let sheet = format!(
+            r#"<worksheet xmlns="{ns}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><r><rPr><color theme="1"/></rPr><t>n</t></r><r><rPr><color rgb="FFFF0000"/></rPr><t>r</t></r></is></c></row></sheetData></worksheet>"#
+        );
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let styles = format!(
+            r#"<styleSheet xmlns="{ns}"><fonts count="1"><font><sz val="11"/><color theme="1"/><name val="Calibri"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let mut data = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut data));
+            let o = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("xl/workbook.xml", workbook.to_string()),
+                ("xl/_rels/workbook.xml.rels", wb_rels.to_string()),
+                ("xl/worksheets/sheet1.xml", sheet),
+                ("xl/styles.xml", styles),
+            ] {
+                w.start_file(name, o).unwrap();
+                w.write_all(body.as_bytes()).unwrap();
+            }
+            crate::write_test_content_types(&mut w);
+            w.finish().unwrap();
+        }
+        let streamed = assert_cursor_parity(data);
+        let runs = &streamed["rows"][0]["cells"][0]["value"]["runs"];
+        assert_eq!(runs[0]["font"]["normalColor"], serde_json::json!(true));
+        assert!(runs[1]["font"].get("normalColor").is_none());
     }
 
     #[test]
