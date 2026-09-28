@@ -13,7 +13,8 @@ use crate::fill::{
 };
 use crate::master::{InheritedShapeGeometry, LayoutPlaceholders};
 use crate::text::{
-    empty_level_bullets, parse_text_body, LevelBullets, LevelFontSizes, LevelIndents,
+    empty_level_bullets, parse_text_body, InheritedBodyPr, LevelBullets, LevelFontSizes,
+    LevelIndents,
 };
 use crate::theme::{PptxRawSchemeResolver, PptxSchemeResolver, PptxThemeSource};
 use crate::types::*;
@@ -1117,8 +1118,7 @@ pub(crate) fn parse_shape(
         inherited_caps,
         inherited_reflection,
         inherited_anchor,
-        inherited_text_insets,
-        inherited_auto_fit,
+        inherited_body_pr,
         inherited_alignment,
         inherited_ea_ln_brk,
         inherited_space_before,
@@ -1133,8 +1133,7 @@ pub(crate) fn parse_shape(
             lph.lookup_caps(&ph_type),
             lph.lookup_reflection(&ph_type),
             lph.lookup_anchor(&ph_type, ph_idx),
-            lph.lookup_text_insets(&ph_type, ph_idx),
-            lph.lookup_auto_fit(&ph_type, ph_idx),
+            lph.lookup_body_pr(&ph_type, ph_idx),
             lph.lookup_alignment(&ph_type, ph_idx),
             lph.lookup_ea_ln_brk(&ph_type),
             lph.lookup_space_before(&ph_type, ph_idx),
@@ -1143,7 +1142,7 @@ pub(crate) fn parse_shape(
         )
     } else {
         (
-            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
     };
     let inherited_level_font_sizes: LevelFontSizes = if ph_node.is_some() {
@@ -1192,8 +1191,7 @@ pub(crate) fn parse_shape(
             inherited_caps.clone(),
             inherited_reflection.clone(),
             inherited_anchor,
-            inherited_text_insets,
-            inherited_auto_fit,
+            inherited_body_pr,
             inherited_alignment,
             inherited_ea_ln_brk,
             inherited_space_before,
@@ -2244,13 +2242,16 @@ pub(crate) fn parse_table_cell(
         .and_then(|n| attr(&n, "anchor"))
         .map(|a| a.to_string());
     let text_direction = tc_pr.and_then(|n| attr(&n, "vert"));
-    let text_insets = tc_pr.map(|n| {
-        [
+    // Table-cell margins (tcPr marL/marT/marR/marB) play the role of the
+    // inherited insets for the cell's text body.
+    let text_insets = tc_pr.map(|n| InheritedBodyPr {
+        insets: [
             attr_i64(&n, "marL"),
             attr_i64(&n, "marT"),
             attr_i64(&n, "marR"),
             attr_i64(&n, "marB"),
-        ]
+        ],
+        ..InheritedBodyPr::default()
     });
     let text_body = child(tc, "txBody").map(|n| {
         let mut body = parse_text_body(
@@ -2270,7 +2271,6 @@ pub(crate) fn parse_table_cell(
             None, // inherited_reflection
             anchor,
             text_insets,
-            None, // inherited_auto_fit
             None, // inherited_alignment
             None, // inherited_ea_ln_brk
             None, // inherited_space_before

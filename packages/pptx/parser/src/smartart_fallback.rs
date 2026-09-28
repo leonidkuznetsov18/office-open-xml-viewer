@@ -323,7 +323,6 @@ fn append_point_paragraphs(
         None,
         None,
         None,
-        None,
         zip,
     );
     if default_font_size.is_none() {
