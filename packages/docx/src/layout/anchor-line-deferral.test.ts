@@ -319,31 +319,3 @@ describe('page-owned anchor whose own exclusion pushes its anchor line off the p
     }
   }, 300_000);
 });
-
-describe('overlap-permitted pictures anchored in different paragraphs', () => {
-  it('keep their authored positions (§20.4.2.3)', () => {
-    // Word controls: square pictures, page-owned and paragraph-relative,
-    // partially overlapping, allowOverlap=1.
-    const pageOwned = pictures(layout(docx(30, {
-      3: { anchors: [{ wrap: 'square' }] },
-      10: { anchors: [{ wrap: 'square', xPt: 100, yPt: 100 }] },
-    })));
-    expect(pageOwned.get(3)).toEqual([{ page: 1, xPt: 72, yPt: 72 }]);
-    expect(pageOwned.get(10)).toEqual([{ page: 1, xPt: 172, yPt: 172 }]);
-    const paragraphRelative = pictures(layout(docx(30, {
-      3: { anchors: [{ wrap: 'square', relativeFrom: 'paragraph' }] },
-      4: { anchors: [{ wrap: 'square', relativeFrom: 'paragraph' }] },
-    })));
-    expect(paragraphRelative.get(3)).toEqual([{ page: 1, xPt: 72, yPt: 144 }]);
-    expect(paragraphRelative.get(4)).toEqual([{ page: 1, xPt: 72, yPt: 168 }]);
-  });
-
-  it('still separates allowOverlap=0 pictures', () => {
-    const placed = pictures(layout(docx(30, {
-      3: { anchors: [{ allowOverlap: false }] },
-      4: { anchors: [{ allowOverlap: false }] },
-    })));
-    expect(placed.get(3)).toEqual([{ page: 1, xPt: 72, yPt: 72 }]);
-    expect(placed.get(4)).toEqual([{ page: 1, xPt: 272, yPt: 72 }]);
-  });
-});

@@ -562,11 +562,7 @@ describe('table-cell parser-owned anchor reflow', () => {
     expect(secondExclusion!.bounds.yPt).toBe(second!.flowBounds.yPt);
   });
 
-  // §20.4.2.3: allowOverlap=true permits overlap, so an anchor from a later
-  // paragraph keeps its authored position. Word controls (issue #1615) show
-  // this for body pictures from different paragraphs; the cell uses the same
-  // retained collision path.
-  it('keeps a later paragraph anchor at its authored position when allowOverlap permits overlap', () => {
+  it('preserves prior-paragraph collision avoidance when allowOverlap permits overlap', () => {
     const [first, second] = cellParagraphs(model([
       paragraph([
         ...anchoredImageRuns({
@@ -597,7 +593,9 @@ describe('table-cell parser-owned anchor reflow', () => {
 
     expect(firstExclusion).toBeDefined();
     expect(secondExclusion).toBeDefined();
-    expect(secondExclusion!.bounds.xPt).toBe(firstExclusion!.bounds.xPt);
+    expect(secondExclusion!.bounds.xPt).toBe(
+      firstExclusion!.bounds.xPt + firstExclusion!.bounds.widthPt,
+    );
   });
 
   it('applies allowOverlap=false between anchors hosted by the same paragraph', () => {

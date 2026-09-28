@@ -3160,14 +3160,16 @@ function acquireAnchorOccurrence(
     throw new Error('resolved anchor frame must retain overlap and cell behavior');
   }
   const effectiveWrapBounds = effectiveResult.geometry.wrapBounds;
-  // §20.4.2.3: allowOverlap=true lets this object overlap other floating
-  // objects, so only allowOverlap=false re-seats it. The issue #1615 controls
-  // agree for pictures anchored in different paragraphs (square and
-  // topAndBottom wrap; page-, margin- and paragraph-relative; identical and
-  // partial overlap). Collision is independent of text wrapping.
-  if (!behavior.allowOverlap) {
-    // ECMA-376 §20.4.2.3 requires displacement for every existing object
-    // whose allowOverlap behavior makes it a collision participant.
+  const normativeCollision = !behavior.allowOverlap;
+  const compatibilityCollision = behavior.allowOverlap
+    && options.ordinaryFlow
+    && effectiveWrapBounds !== null;
+  if (normativeCollision || compatibilityCollision) {
+    // §20.4.2.3 object collision is independent of text wrapping. The
+    // allowOverlap=true compatibility path deliberately retains the old
+    // wrap-exclusion policy only for ordinary-flow anchors.
+    // ECMA-376 §20.4.2.3 otherwise requires displacement for every existing
+    // object whose allowOverlap behavior makes it a collision participant.
     // Word has one narrower composition exception: a source-later page-owned
     // member below the already-authored layers in this SAME anchor paragraph
     // retains its authored position. Cross-paragraph entries remain blockers.
@@ -3182,21 +3184,36 @@ function acquireAnchorOccurrence(
         behavior.relativeHeight,
         entry.relativeHeight,
       ));
-    const blockerBounds = [...externalCollisions, ...sameParagraphBlockers]
-      .filter((entry) => entry.occurrenceId !== occurrenceId)
-      .map((entry) => ({
-        occurrenceId: entry.occurrenceId,
-        bounds: entry.bounds,
-      }));
+    const blockerBounds = normativeCollision
+      ? [...externalCollisions, ...sameParagraphBlockers]
+          .filter((entry) => entry.occurrenceId !== occurrenceId)
+          .map((entry) => ({
+            occurrenceId: entry.occurrenceId,
+            bounds: entry.bounds,
+          }))
+      : externalExclusions
+          // Page-owned prescan registers this paragraph's own anchors on the
+          // page before the paragraph lays out. They are same-paragraph
+          // siblings, not different-paragraph blockers, so the compatibility
+          // policy leaves them to overlap as allowOverlap=true permits.
+          .filter((exclusion) => exclusion.anchorOccurrenceId === undefined
+            || !paragraphOccurrenceIds.has(exclusion.anchorOccurrenceId))
+          .map((exclusion) => ({
+            occurrenceId: exclusion.anchorOccurrenceId ?? exclusion.id,
+            bounds: exclusion.bounds,
+          }));
     const blockers: FloatPlacementParticipant[] = blockerBounds.map((entry) => ({
       occurrenceId: entry.occurrenceId,
       kind: 'drawingml',
+      // `externalExclusions` is the already-established other-paragraph
+      // registry; the current paragraph uses a distinct compatibility id.
       paragraphId: 0,
       bounds: entry.bounds,
       exclusionBounds: entry.bounds,
     }));
     const page = options.anchorFrames?.page;
-    const rightBoundary = behavior.layoutInCell
+    const rightBoundary = normativeCollision
+      && behavior.layoutInCell
       && options.anchorCellBounds
       ? options.anchorCellBounds.xPt + options.anchorCellBounds.widthPt
       : page
@@ -3211,7 +3228,9 @@ function acquireAnchorOccurrence(
         exclusionBounds: effectiveWrapBounds ?? rect,
       },
       blockers,
-      avoidance: { kind: 'drawingml-normative' },
+      avoidance: normativeCollision
+        ? { kind: 'drawingml-normative' }
+        : { kind: 'word-different-paragraph', paragraphId: 1 },
       rightBoundaryPt: rightBoundary,
     });
     const delta = displaced.displacement;

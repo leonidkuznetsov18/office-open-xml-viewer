@@ -166,13 +166,12 @@ describe('legacy float transport facts', () => {
       dr: 8,
       dt: 0,
       db: 0,
-      // Frames keep the different-paragraph displacement policy; an
-      // overlap-permitted DrawingML object would keep its authored position.
-      kind: 'frame',
+      kind: 'shape',
       mode: 'square',
       side: 'bothSides',
       imageKey: 'moving',
       paraId: 2,
+      allowOverlap: true,
       avoidOverlap: true,
     });
 

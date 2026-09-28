@@ -22,7 +22,6 @@ import {
   FLOAT_OVERLAP_EPS,
   FLOAT_PAGE_RIGHT_SLACK,
   drawingMLAvoidance,
-  frameAvoidance,
   floatRectParticipant,
   floatingTableAvoidance,
   resolveFloatPlacement,
@@ -366,9 +365,7 @@ export function pushFloatRect(state: FloatRegistrationState, o: PushFloatOpts): 
       blockers: state.floats.map(floatRectParticipant),
       avoidance: o.kind === 'table'
         ? floatingTableAvoidance(o.tableOverlap!, o.paraId)
-        : o.kind === 'frame'
-          ? frameAvoidance(o.paraId)
-          : drawingMLAvoidance(o.allowOverlap ?? true),
+        : drawingMLAvoidance(o.allowOverlap ?? true, o.paraId),
       rightBoundaryPt: state.pageWidth,
       overlapEpsilonPt: FLOAT_OVERLAP_EPS,
       rightBoundarySlackPt: FLOAT_PAGE_RIGHT_SLACK,
