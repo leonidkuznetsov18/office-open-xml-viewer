@@ -37,7 +37,19 @@ const OBSERVED_SUBSTITUTES: Readonly<Record<string, string>> = {
   'helvetica neue': 'Arial',
 };
 
+/**
+ * Resolved shares keyed by face/weight/style. Font names come from document
+ * content, so the cache is a bounded LRU: at most SHARE_CACHE_LIMIT entries,
+ * the least recently used evicted first. A miss only re-reads the static
+ * reference table, so the cap trades a little lookup work for bounded memory.
+ */
+export const SHARE_CACHE_LIMIT = 256;
 const shareCache = new Map<string, number | null>();
+
+/** @internal Test hook: current number of cached face keys. */
+export function powerPointShareCacheSize(): number {
+  return shareCache.size;
+}
 
 export function powerPointAscentShare(
   family: string,
@@ -46,9 +58,17 @@ export function powerPointAscentShare(
 ): number | undefined {
   const key = `${family.trim().toLocaleLowerCase('en-US')}|${bold ? 700 : 400}|${italic ? 'i' : 'n'}`;
   const cached = shareCache.get(key);
-  if (cached !== undefined) return cached ?? undefined;
+  if (cached !== undefined) {
+    shareCache.delete(key);
+    shareCache.set(key, cached);
+    return cached ?? undefined;
+  }
   const share = resolveShare(family, bold, italic);
   shareCache.set(key, share ?? null);
+  if (shareCache.size > SHARE_CACHE_LIMIT) {
+    const oldest = shareCache.keys().next().value;
+    if (oldest !== undefined) shareCache.delete(oldest);
+  }
   return share;
 }
 

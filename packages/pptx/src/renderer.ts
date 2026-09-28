@@ -1523,7 +1523,13 @@ export function layoutParagraph(
     && a.shadow === b.shadow && a.reflection === b.reflection
     && a.outline === b.outline && a.highlight === b.highlight
     && hyperlinkKey(a.hyperlink) === hyperlinkKey(b.hyperlink)
-    && (!a.letterSpacingPx || a.sourceRunId === b.sourceRunId);
+    && (!a.letterSpacingPx || a.sourceRunId === b.sourceRunId)
+    // Every face that sizes the PowerPoint line box is part of the key: two
+    // runs drawn in the same face but carrying different latin slots must
+    // stay apart, or the merged segment would drop one slot's share and a
+    // purely visual difference (colour) would decide the line height.
+    && a.lineMetricShare === b.lineMetricShare
+    && a.lineMetricLatinShare === b.lineMetricLatinShare;
   const marRPx = emuToPx(para.marR, scale);
   const broken = breakDrawingMlText(input, {
     maxWidth: maxWidthPx,

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { TextRunData } from '@silurus/ooxml-core';
 import { renderTextBody } from './renderer.js';
-import { powerPointAscentShare } from './powerpoint-line-metrics.js';
+import {
+  powerPointAscentShare, powerPointShareCacheSize, SHARE_CACHE_LIMIT,
+} from './powerpoint-line-metrics.js';
 import type { Paragraph, TextBody } from './types.js';
 
 // Expected values are PowerPoint 16.113.2 PDF baselines of the #1610
@@ -153,6 +155,39 @@ describe('PowerPoint text-box line metrics (#1610)', () => {
     expect(probe(run('日本語', 'Meiryo', 'MS PGothic'))).toEqual([135, 291, 468]);
     // supplement-2 R-*: Latin only, the unused Meiryo ea face does not count.
     expect(probe(run('Hg2', 'Arial', 'Meiryo'))).toEqual([135, 302, 468]);
+  });
+
+  it('keeps each run latin slot when adjacent runs share a drawn face (colour never moves a line)', () => {
+    // Two ideograph runs drawn in Meiryo, latin slots Calibri and Gabriola.
+    const pair = (secondColor: string) => {
+      const p = paragraph([
+        { text: '日本', font: 'Calibri', size: 60 },
+        { text: '語学', font: 'Gabriola', size: 60 },
+      ]);
+      for (const r of p.runs) (r as { fontFamilyEa: string }).fontFamilyEa = 'Meiryo';
+      (p.runs[1] as { color: string }).color = secondColor;
+      return baselines([p, paragraph([{ text: 'Hg', font: 'Arial', size: 60 }])]);
+    };
+    const same = pair('000000');
+    const recoloured = pair('FF0000');
+    expect(same).toHaveLength(2);
+    expect(recoloured[0]).toBeCloseTo(same[0], 9);
+    expect(recoloured[1]).toBeCloseTo(same[1], 9);
+    // Gabriola's slot contributes: the pair differs from the Calibri-only line.
+    const calibriOnly = paragraph([{ text: '日本語学', font: 'Calibri', size: 60 }]);
+    (calibriOnly.runs[0] as { fontFamilyEa: string }).fontFamilyEa = 'Meiryo';
+    const single = baselines([calibriOnly, paragraph([{ text: 'Hg', font: 'Arial', size: 60 }])]);
+    expect(Math.abs(single[0] - same[0])).toBeGreaterThan(0.5);
+  });
+
+  it('bounds the share cache while many distinct face names are queried', () => {
+    for (let i = 0; i < SHARE_CACHE_LIMIT * 4; i++) {
+      powerPointAscentShare(`Unresolved Face ${i}`, i % 2 === 0, i % 3 === 0);
+      expect(powerPointShareCacheSize()).toBeLessThanOrEqual(SHARE_CACHE_LIMIT);
+    }
+    expect(powerPointShareCacheSize()).toBe(SHARE_CACHE_LIMIT);
+    // Known faces still resolve after eviction.
+    expect(powerPointAscentShare('Arial', false, false)).toBeCloseTo(1854 / 2288, 12);
   });
 
   it('anchors by the last line natural descent and applies normAutofit to the split', () => {
