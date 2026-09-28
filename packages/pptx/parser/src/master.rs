@@ -1124,8 +1124,10 @@ fn master_placeholder_shapes<'a, 'i>(
 /// slide placeholder of another type in the same class inherits that master
 /// placeholder, as placeholder boxes already do (`LayoutPlaceholders::lookup`,
 /// obj → master body per §19.7.9). Observed for text (issue #1620): an obj
-/// slot took the list-style face of the master body placeholder, not the
-/// bodyStyle face.
+/// slot took the master body placeholder's face and its buNone, not the
+/// bodyStyle face and bullet. Applied to the face, size and paragraph-level
+/// maps (bullets, indents, alignment, eaLnBrk); the other character
+/// properties keep the per-type master placeholder lookup of #1625.
 fn inherit_master_placeholder_classes<T: Clone>(map: &mut HashMap<String, T>) {
     for (source, targets) in [
         ("title", &["ctrTitle"][..]),
@@ -1153,6 +1155,7 @@ pub(crate) fn parse_master_alignments(root: roxmltree::Node<'_, '_>) -> HashMap<
             map.entry(ph_type).or_insert(algn);
         }
     }
+    inherit_master_placeholder_classes(&mut map);
     for (style, types) in tx_style_nodes(root) {
         if let Some(algn) = child(style, "lvl1pPr").and_then(|lp| attr(&lp, "algn")) {
             for t in types {
@@ -1177,6 +1180,7 @@ pub(crate) fn parse_master_ea_ln_brk(root: roxmltree::Node<'_, '_>) -> HashMap<S
             map.entry(ph_type).or_insert(v == "1" || v == "true");
         }
     }
+    inherit_master_placeholder_classes(&mut map);
     map
 }
 
@@ -1352,6 +1356,7 @@ pub(crate) fn parse_master_level_indents(
             }
         }
     }
+    inherit_master_placeholder_classes(&mut map);
     for (style_node, ph_types) in tx_style_nodes(root) {
         let indents = read_level_indents(style_node);
         if has_any_level_indent(&indents) {
@@ -1404,11 +1409,12 @@ pub(crate) fn parse_master_level_bullets(
         }
     }
 
-    // Class-style fallback, resolved per bullet group: a per-shape entry that
+    // An obj slot took the master body placeholder's buNone, not the
+    // bodyStyle bullet (#1620 controls).
+    inherit_master_placeholder_classes(&mut map);
+    // txStyles fallback, resolved per bullet group: a per-shape entry that
     // declares only a marker inherits its colour/size/font from the matching
-    // class style level (ECMA-376 §21.1.2.4, the four groups are independent).
-    // The defaultTextStyle is a CT_TextListStyle, so the dt/ftr/sldNum class
-    // reads its bullets exactly like the master styles.
+    // txStyles level (ECMA-376 §21.1.2.4, the four groups are independent).
     for (style_node, ph_types) in tx_style_nodes(root) {
         let bullets = read_level_bullets(style_node, theme, &mut resolve_blip);
         if has_any_level_bullet(&bullets) {
