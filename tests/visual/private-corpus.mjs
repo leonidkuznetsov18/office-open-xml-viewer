@@ -11,8 +11,8 @@ const SCHEMA_VERSION = 1;
 // allowed in this set. Future baselines should be clean and need no exception.
 // The package Vite configs are listed only because they hold the
 // `@ooxml-test-*` aliases through which the fixtures load optional renderers
-// (for example ChartEx). A bootstrap diff there must be limited to those
-// aliases.
+// (for example ChartEx); `harnessBootstrapDiffViolations` enforces that a
+// bootstrap diff there adds or removes nothing but such alias lines.
 const VRT_HARNESS_PATHS = new Set([
   'package.json',
   'packages/docx/package.json',
@@ -33,6 +33,20 @@ const VRT_HARNESS_PATHS = new Set([
   'packages/pptx/tests/visual/visual.spec.ts',
   'tests/visual/private-corpus.mjs',
 ]);
+
+const TEST_RENDERER_ALIAS_LINE =
+  /^[+-]\s*'@ooxml-test-[a-z0-9-]+': resolve\((?:__)?dirname, '\.\.\/\.\.\/src\/[a-z0-9-]+\.ts'\),$/;
+
+/** Lines of a `git diff -U0` for an allowlisted Vite config that are not a
+ * test-renderer alias addition/removal. Any such line makes the harness
+ * bootstrap unsafe, because the config also drives the package build. */
+export function harnessBootstrapDiffViolations(diff) {
+  return diff.split('\n').filter((line) =>
+    (line.startsWith('+') || line.startsWith('-'))
+    && !line.startsWith('+++')
+    && !line.startsWith('---')
+    && !TEST_RENDERER_ALIAS_LINE.test(line));
+}
 
 function gitRevision(revision) {
   return execFileSync('git', ['rev-parse', `${revision}^{commit}`], {
@@ -75,6 +89,17 @@ function baselineRevision(snapshot = false) {
           'private self-VRT snapshot requires a clean renderer checkout; changed paths: '
           + changed.join(', '),
         );
+      }
+      for (const path of changed.filter((changedPath) => changedPath.endsWith('vite.config.ts'))) {
+        const violations = harnessBootstrapDiffViolations(execFileSync(
+          'git', ['diff', '-U0', 'HEAD', '--', path], { cwd: root, encoding: 'utf8' },
+        ));
+        if (violations.length > 0) {
+          throw new Error(
+            `private self-VRT harness bootstrap may only change test renderer aliases in ${path}: `
+            + violations.join(' | '),
+          );
+        }
       }
     }
   }
