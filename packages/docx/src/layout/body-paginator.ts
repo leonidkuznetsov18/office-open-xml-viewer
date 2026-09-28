@@ -2297,6 +2297,12 @@ function changedAnchorKeys(
   return changed;
 }
 
+/** What a header/footer reserve repagination reads of the previous pass. */
+type ReserveRepaginationCarry = Readonly<{
+  fieldContexts: ReturnType<typeof paginationFieldPageContexts>;
+  anchorPlan: ReturnType<typeof pageAnchorDestinationPlan>;
+}>;
+
 function* paginateBodyWithAnchorConvergenceSteps(
   input: BodyLayoutInput,
   services: LayoutServices,
@@ -2318,11 +2324,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
     );
   }
   const converge = function* (initialPlan?: ReturnType<typeof pageAnchorDestinationPlan>) {
-    return (yield* convergeExactStateSteps<Readonly<{
-      pass: BodyPaginationPassResult;
+    type AnchorPassCarry = Readonly<{
       plan: ReturnType<typeof pageAnchorDestinationPlan>;
       minimumTablePageBySource: ReadonlyMap<string, number>;
-    }>, number>({
+    }>;
+    return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
+      pass: BodyPaginationPassResult;
+    }>, number, AnchorPassCarry>({
       ...(initialPlan ? { seedState: anchorPlanIdentity(initialPlan) } : {}),
       step: function* anchorPass(previous) {
         const appliedPlan = previous?.plan ?? initialPlan ?? null;
@@ -2365,6 +2373,12 @@ function* paginateBodyWithAnchorConvergenceSteps(
         });
       },
       stateOf: (value) => anchorPlanIdentity(value.plan),
+      // The next anchor pass reads only the plan and the proven table pages;
+      // the superseded pass (its whole layout) is not carried into it.
+      carry: (value) => Object.freeze({
+        plan: value.plan,
+        minimumTablePageBySource: value.minimumTablePageBySource,
+      }),
       limit: 16,
     })).value.pass;
   };
@@ -2440,7 +2454,7 @@ function* paginateBodyWithColumnBalancingSteps(
   seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
   let plan: BodyBalancePlan = new Map();
-  let pass = yield* paginateBodyWithAnchorConvergenceSteps(
+  let pass: BodyPaginationPassResult | null = yield* paginateBodyWithAnchorConvergenceSteps(
     input,
     services,
     options,
@@ -2451,26 +2465,16 @@ function* paginateBodyWithColumnBalancingSteps(
   );
   if (pass.terminalDiagnostic !== null) return pass;
   for (const boundary of continuousBalanceBoundaries(input)) {
-    const baseline = sharedContinuousBoundaryPage(
-      pass.layout,
-      boundary.outgoingSectionOccurrenceId,
-      boundary.incomingSectionOccurrenceId,
-    );
-    if (baseline === null || baseline.outgoing.flowDomainIds.length < 2) continue;
-    const pageIndex = baseline.page.pageIndex;
-    const targetPt = exactRetainedColumnBalanceTarget(
-      input,
-      pass.allocations,
-      pass.footnoteReserveByPage,
-      baseline.page,
-      baseline.outgoing,
-    );
+    const target = continuousBalanceTarget(input, pass, boundary);
+    if (target === null) continue;
     const nextPlan = new Map(plan);
-    nextPlan.set(boundary.outgoingSectionOccurrenceId, Object.freeze({
-      pageIndex,
-      targetPt,
-    }));
+    nextPlan.set(boundary.outgoingSectionOccurrenceId, target);
     plan = nextPlan;
+    // The rebalanced pass reads only the balance plan and the accepted anchor
+    // plan of this one. Release this pass before the next one builds so two
+    // whole layouts are never live at once.
+    const anchorPlan = pageAnchorDestinationPlan(pass.layout);
+    pass = null;
     pass = yield* paginateBodyWithAnchorConvergenceSteps(
       input,
       services,
@@ -2478,11 +2482,35 @@ function* paginateBodyWithColumnBalancingSteps(
       reserves,
       plan,
       undefined,
-      pageAnchorDestinationPlan(pass.layout),
+      anchorPlan,
     );
     if (pass.terminalDiagnostic !== null) return pass;
   }
   return pass;
+}
+
+/** The exact column-balance target one continuous boundary adds to the plan,
+ * or null when the pass leaves nothing to balance there. */
+function continuousBalanceTarget(
+  input: BodyLayoutInput,
+  pass: BodyPaginationPassResult,
+  boundary: ReturnType<typeof continuousBalanceBoundaries>[number],
+): Readonly<{ pageIndex: number; targetPt: number }> | null {
+  const baseline = sharedContinuousBoundaryPage(
+    pass.layout,
+    boundary.outgoingSectionOccurrenceId,
+    boundary.incomingSectionOccurrenceId,
+  );
+  if (baseline === null || baseline.outgoing.flowDomainIds.length < 2) return null;
+  const pageIndex = baseline.page.pageIndex;
+  const targetPt = exactRetainedColumnBalanceTarget(
+    input,
+    pass.allocations,
+    pass.footnoteReserveByPage,
+    baseline.page,
+    baseline.outgoing,
+  );
+  return Object.freeze({ pageIndex, targetPt });
 }
 
 /** Compose one retained pass through the same layout-to-paint boundary used by
@@ -2620,19 +2648,30 @@ export function* paginateBodySteps(
         },
       }
     : undefined;
-  const seed = yield* paginateBodyWithColumnBalancingSteps(
+  let seed: BodyPaginationPassResult | null = yield* paginateBodyWithColumnBalancingSteps(
     input, services, options, [], passObserver,
   );
-  const converged = (yield* convergeHeaderFooterReserveSteps<
+  const convergence = convergeHeaderFooterReserveSteps<
     BodyPaginationPassResult,
-    number
-  >({
-    seed,
+    number,
+    ReserveRepaginationCarry
+  >(seed, {
     measure: (pass) => headerFooterReserves(pass, owners),
-    repaginate: function* reserveRepagination(reserves, current) {
-      const contexts = paginationFieldPageContexts(current.layout);
+    // A repagination reads only these facts of the pass before it (besides
+    // the measured reserves). Carrying them, rather than the pass, lets that
+    // pass's whole layout and pagination session be collected while the next
+    // one is built.
+    carry: (pass) => Object.freeze({
+      fieldContexts: paginationFieldPageContexts(pass.layout),
+      // Page-owned tables need one geometry-discovery pass and one exclusion
+      // pass. Reuse the accepted geometry for this later reserve iteration
+      // when stable; changed ownership still runs exact convergence anew.
+      anchorPlan: pageAnchorDestinationPlan(pass.layout),
+    }),
+    repaginate: function* reserveRepagination(reserves, carried) {
+      const contexts = carried.fieldContexts;
       const iterationServices = createFieldAcquisitionServicesView(services, {
-        totalPages: current.layout.pages.length,
+        totalPages: contexts.length,
         resolveDestinationPage: (pageIndex) => contexts[pageIndex],
       });
       return yield* paginateBodyWithColumnBalancingSteps(
@@ -2641,15 +2680,14 @@ export function* paginateBodySteps(
         options,
         reserves,
         undefined,
-        // Page-owned tables need one geometry-discovery pass and one exclusion
-        // pass. Reuse the accepted geometry for this later reserve iteration
-        // when stable; changed ownership still runs exact convergence anew.
-        pageAnchorDestinationPlan(current.layout),
+        carried.anchorPlan,
       );
     },
     identity: (pass) => paginationFieldPageContexts(pass.layout),
     requiresConvergence: seed.session.hasPaginationFields,
-  })).result;
+  });
+  seed = null;
+  const converged = (yield* convergence).result;
   return (yield* assertAndDeepFreezeDocumentLayoutSteps(
     composeBodyPaginationResult(converged, input, owners, options, true),
   )) as DocumentLayout;

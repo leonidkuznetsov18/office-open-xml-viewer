@@ -30,6 +30,28 @@ describe('plain layout data snapshots', () => {
     });
   });
 
+  it('freezes an owned projection in place when its source root is deeply frozen', () => {
+    const source = deepFreezePlainData({ shared: { values: [1, 2] }, xPt: 0 });
+    const projected = { ...source, xPt: 10, occurrence: { id: 'page-2' } };
+    const snapshot = snapshotPlainData(projected, 'layout payload', source);
+
+    expect(snapshot).toBe(projected);
+    expect(snapshot.shared).toBe(source.shared);
+    expect(Object.isFrozen(snapshot.occurrence)).toBe(true);
+    expect(structuredClone(snapshot)).toEqual({
+      shared: { values: [1, 2] }, xPt: 10, occurrence: { id: 'page-2' },
+    });
+  });
+
+  it('copies an owned projection whose source root is only shallowly frozen', () => {
+    const source = Object.freeze({ shared: { values: [1, 2] } });
+    const snapshot = snapshotPlainData({ ...source, xPt: 10 }, 'layout payload', source);
+    source.shared.values[0] = 99;
+
+    expect(snapshot.shared).not.toBe(source.shared);
+    expect(snapshot.shared.values).toEqual([1, 2]);
+  });
+
   it('preserves signed unbounded finite DrawingML source-rectangle percentages exactly', () => {
     const authored = { l: -0.25, t: 1.25, r: 1.5, b: -0.75 };
     const source = { srcRect: { ...authored } };
