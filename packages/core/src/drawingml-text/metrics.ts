@@ -83,10 +83,11 @@ export interface DrawingMlLineBox {
  *   keeps d = 9.31 at H 37 and gets 11.98 at 38 (4d = 37.24, k = 2.48);
  *   Yu Gothic 14 pt keeps 6.93 at 27 and gets 8.08 at 28 (4d = 27.74,
  *   k = 1.08); Meiryo 24 pt keeps 15.96 at 63 and gets 20.26 at 64
- *   (4d = 63.83, k = 4.26). Excel rounds exact spacing to whole points before
- *   this rule (the XLSX caller applies that rounding), so no H between those
- *   whole points exists for spcPts. Percentage spacing between L and 4d is
- *   not covered by the controls.
+ *   (4d = 63.83, k = 4.26). Percentage spacing follows the same rule: the
+ *   same faces at 105-140 % kept d below 4d and stepped past it (Meiryo
+ *   14 pt: 136 % kept, 137 % stepped). Excel rounds spcPts to whole points
+ *   and spcPct to whole percent before this rule (the XLSX caller applies
+ *   that rounding); H itself is not rounded.
  * - H = L: the natural box is kept.
  *
  * The ascent is the rest of H. Each baseline pitch is therefore the previous

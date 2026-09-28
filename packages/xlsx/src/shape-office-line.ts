@@ -34,21 +34,36 @@ export function shapeLineFontRuns(text: ShapeText): TextRun[] {
 }
 
 /**
- * The `a:lnSpc` value Excel lays shape text out with. Excel rounds exact
- * spacing (`a:spcPts`) to whole points, halves rounding up, before it builds
- * the spaced line box; percentage spacing is used as authored.
+ * A spacing value (`a:lnSpc`, `a:spcBef`, `a:spcAft`) as Excel lays shape
+ * text out with it. Excel rounds each value on its own to a whole unit,
+ * halves rounding up, before any line box or gap is built: `a:spcPts` to whole
+ * points, `a:spcPct` to whole percent. The percentage's result in points is
+ * not rounded further, and spcAft and spcBef on one gap are rounded one by one,
+ * not as a sum.
  *
- * Observed Excel for Mac 16.113.2 behaviour (#1604 boundary controls):
- * Meiryo 14 pt swept spcPts 36-40 in 0.25 pt steps plus 0.01-0.05 pt steps,
- * Yu Gothic 14 pt 26.5-30.5, and Meiryo 24 pt 62.5-66.5. Every value painted
- * exactly like its nearest whole point: 36.25 like 36, 36.5-37.35 like 37,
- * 37.5-38.25 like 38; 62.5-63.25 like 63, 63.5-64.25 like 64; 26.5-27.25 like
- * 27, 27.5-28.25 like 28. `a:spcBef`/`a:spcAft` were not swept fractionally
- * and stay as authored.
+ * Observed Excel for Mac 16.113.2 behaviour (#1604 boundary and rounding
+ * controls). Neighbouring values painted identically within each whole unit
+ * and differently across units:
+ * - lnSpc spcPts: Meiryo 14 pt 36-40 pt, Yu Gothic 14 pt 26.5-30.5 pt and
+ *   Meiryo 24 pt 62.5-66.5 pt in 0.25 pt steps plus 0.01-0.05 pt steps.
+ *   36.25 painted like 36, 36.5-37.35 like 37, 37.5-38.25 like 38.
+ * - lnSpc spcPct: the same faces across their 4d boundary (Meiryo 132-140 %,
+ *   Yu Gothic 114-122 %) in 0.5 % steps plus 0.1 % steps. 136.1-136.4 %
+ *   painted like 136 %, 136.5-136.7 % like 137 %, 132.5 % like 133 %.
+ *   Meiryo 24 pt at 136.4 % kept its natural descent. Unrounded, its H
+ *   (63.835 pt) would pass 4d (63.834 pt) and step by 4.3 pt. H itself is not
+ *   rounded: Yu Gothic 14 pt at 118 % (H 27.64 pt) kept its descent, which it
+ *   would not if H rounded to 28 pt.
+ * - spcBef/spcAft spcPts 3.0-4.0 pt in 0.1 pt steps: 3.0-3.4 painted like 3,
+ *   3.5-4.0 like 4, 10.5 like 11. Both 3.3 pt on one gap gave 6 pt, not 7.
+ * - spcBef/spcAft spcPct 10-15 % of the natural line in 0.5 % steps plus
+ *   12.2/12.8 %: 10.5 and 11 % painted alike, as did 11.5-12.2 %, 12.5-13 %,
+ *   13.5-14 % and 14.5-15 %.
  */
-export function excelShapeLineSpacing(spacing: SpaceLine | null | undefined): SpaceLine | null | undefined {
-  if (spacing?.type !== 'pts') return spacing;
-  return { type: 'pts', val: Math.floor(spacing.val + 0.5) };
+export function excelShapeSpacing(spacing: SpaceLine | null | undefined): SpaceLine | null | undefined {
+  if (!spacing) return spacing;
+  if (spacing.type === 'pts') return { type: 'pts', val: Math.floor(spacing.val + 0.5) };
+  return { type: 'pct', val: Math.floor(spacing.val / 1000 + 0.5) * 1000 };
 }
 
 /** One key rule for workbook, worker, and synchronous shape paint. */

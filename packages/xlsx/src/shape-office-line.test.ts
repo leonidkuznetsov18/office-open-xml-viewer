@@ -3,7 +3,7 @@ import { PT_TO_PX, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { bindXlsxOfficeFontRoutes, drawShapeText } from './renderer.js';
 import { xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
 import {
-  canvasShapeFontBoxProbe, excelShapeLineSpacing, shapeRunLineRatios, type ShapeFontBoxProbe,
+  canvasShapeFontBoxProbe, excelShapeSpacing, shapeRunLineRatios, type ShapeFontBoxProbe,
 } from './shape-office-line.js';
 import type { ShapeParagraph, ShapeText, ShapeTextRun, Worksheet } from './types.js';
 
@@ -211,9 +211,41 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
     near(first('Meiryo', 24, 63.5), 47.68);   // → 64
     near(first('Yu Gothic', 14, 27.25), 23.56); // → 27 (4d = 27.74)
     near(first('Yu Gothic', 14, 27.5), 23.68);  // → 28
-    expect(excelShapeLineSpacing({ type: 'pts', val: 36.49 })).toEqual({ type: 'pts', val: 36 });
-    expect(excelShapeLineSpacing({ type: 'pts', val: 36.5 })).toEqual({ type: 'pts', val: 37 });
-    expect(excelShapeLineSpacing({ type: 'pct', val: 136400 })).toEqual({ type: 'pct', val: 136400 });
+  });
+
+  it('rounds spcPct line spacing to whole percent before the descent step', () => {
+    const first = (size: number, pct: number) => baselinesPt(body([1, 2, 3].map((n) =>
+      para([run(`P${n}`, 'Meiryo', size)], { spaceLine: { type: 'pct', val: pct * 1000 } }))))[0];
+    const near = (actual: number, office: number) => expect(Math.abs(actual - office)).toBeLessThanOrEqual(0.5);
+    // Excel rounding controls, first baseline. 136.4 % → 136 %: H stays below
+    // 4d and keeps d. Unrounded, H passes 4d by < 0.001 pt and the line jumps
+    // 2.4 pt (14 pt) or 4.3 pt (24 pt).
+    near(first(14, 136.4), 31.48);
+    near(first(14, 137), 29.56);  // stepped: descent 0.25·H + k
+    near(first(24, 136.4), 51.52);
+    near(first(24, 125), 46.6);   // L < H < 4d keeps d
+  });
+
+  it('rounds spcBef and spcAft one by one to whole points or whole percent', () => {
+    // Six natural Meiryo 14 pt paragraphs with the spacing on every gap; the
+    // mean pitch over five gaps carries under 0.1 pt of export noise.
+    const pitch = (bef?: ShapeParagraph['spaceBefore'], aft?: ShapeParagraph['spaceAfter']) => {
+      const lines = baselinesPt(body([0, 1, 2, 3, 4, 5].map((i) => para([run(`S${i}`, 'Meiryo', 14)], {
+        ...(bef && i > 0 ? { spaceBefore: bef } : {}), ...(aft && i < 5 ? { spaceAfter: aft } : {}),
+      }))));
+      return (lines[5] - lines[0]) / 5;
+    };
+    const near = (actual: number, office: number) => expect(Math.abs(actual - office)).toBeLessThanOrEqual(0.15);
+    near(pitch({ type: 'pts', val: 3.4 }), 30.19);           // → 3 pt (raw 3.4 → 30.7)
+    near(pitch(undefined, { type: 'pts', val: 3.5 }), 31.23); // → 4 pt
+    // Both 3.3 pt on each gap: 3 + 3 = 6 pt, not round(6.6) = 7.
+    near(pitch({ type: 'pts', val: 3.3 }, { type: 'pts', val: 3.3 }), 33.22);
+    near(pitch({ type: 'pct', val: 10500 }), 30.43);          // → 11 % of 27.3 pt (raw → 30.17)
+    near(pitch(undefined, { type: 'pct', val: 13500 }), 31.2); // → 14 % (raw → 30.99)
+    expect(excelShapeSpacing({ type: 'pts', val: 36.49 })).toEqual({ type: 'pts', val: 36 });
+    expect(excelShapeSpacing({ type: 'pts', val: 36.5 })).toEqual({ type: 'pts', val: 37 });
+    expect(excelShapeSpacing({ type: 'pct', val: 136400 })).toEqual({ type: 'pct', val: 136000 });
+    expect(excelShapeSpacing({ type: 'pct', val: 12500 })).toEqual({ type: 'pct', val: 13000 });
   });
 
   it('takes spcPct from the natural line even when lnSpc is not 100 %', () => {

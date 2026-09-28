@@ -28,7 +28,7 @@ import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
 import {
-  canvasShapeFontBoxProbe, excelShapeLineSpacing, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios,
+  canvasShapeFontBoxProbe, excelShapeSpacing, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios,
   type ShapeRunLineRatios,
 } from './shape-office-line.js';
 import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
@@ -4943,7 +4943,7 @@ export function drawShapeText(
       };
     };
     const reduction = txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0;
-    const spaceLine = excelShapeLineSpacing(p.spaceLine);
+    const spaceLine = excelShapeSpacing(p.spaceLine);
     const lineHeightOf = (natural: number): number => drawingMlLineHeight(
       natural, spaceLine, PT_TO_PX * cs, reduction,
     );
@@ -5040,12 +5040,13 @@ export function drawShapeText(
     // §21.1.2.2.10 spcBef / §21.1.2.2.9 spcAft. Excel adds the previous
     // paragraph's spcAft and this paragraph's spcBef (#1604: 12 + 18 pt gave
     // 30 pt), and ignores spcBef on the body's first paragraph. A percentage
-    // refers to the natural single-line height of the adjacent line.
+    // refers to the natural single-line height of the adjacent line. Each
+    // value is first rounded to a whole unit (excelShapeSpacing).
     if (lines.length > firstLineIndex) {
       if (previousParagraph && firstLineIndex > 0) {
         lines[firstLineIndex].gapBefore = drawingMlParagraphSpacing(
-          previousParagraph.spaceAfter, previousParagraph.lastNaturalHeight, PT_TO_PX * cs,
-        ) + drawingMlParagraphSpacing(p.spaceBefore, naturalHeights[firstLineIndex], PT_TO_PX * cs);
+          excelShapeSpacing(previousParagraph.spaceAfter), previousParagraph.lastNaturalHeight, PT_TO_PX * cs,
+        ) + drawingMlParagraphSpacing(excelShapeSpacing(p.spaceBefore), naturalHeights[firstLineIndex], PT_TO_PX * cs);
       }
       previousParagraph = { spaceAfter: p.spaceAfter, lastNaturalHeight: naturalHeights[lines.length - 1] };
     }
