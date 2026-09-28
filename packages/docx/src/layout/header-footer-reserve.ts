@@ -139,10 +139,12 @@ export function convergeHeaderFooterReserves<T>(input: Readonly<{
   requiresConvergence?: boolean;
   limit?: number;
 }>): HeaderFooterReserveIteration<T> {
-  const steps = convergeHeaderFooterReserveSteps<T, never>({
-    ...input,
+  const { seed, repaginate, ...rest } = input;
+  const steps = convergeHeaderFooterReserveSteps<T, never, T>(seed, {
+    ...rest,
+    carry: (result) => result,
     repaginate: function* generatorRepaginate(reserves, current) {
-      return input.repaginate(reserves, current);
+      return repaginate(reserves, current);
     },
   });
   let next = steps.next();
@@ -155,15 +157,26 @@ export function convergeHeaderFooterReserves<T>(input: Readonly<{
  *
  * The seed pass is supplied already-computed by the caller (which is itself
  * suspendable), so only the repagination needs to delegate here.
+ *
+ * `carry` projects a pass result to what the next repagination reads besides
+ * the measured reserves (for body pagination: page-field contexts and the
+ * accepted page-anchor plan). The seed is taken as its own argument, not as a
+ * field of `input`, so that once its reserves, fingerprint and carried data are
+ * derived nothing here references it: while a repagination builds, neither the
+ * seed nor any superseded pass result is kept alive by this frame.
  */
-export function* convergeHeaderFooterReserveSteps<T, Y>(input: Readonly<{
-  seed: T;
-  measure: (result: T) => readonly HeaderFooterReserve[];
-  repaginate: (reserves: readonly HeaderFooterReserve[], current: T) => Generator<Y, T, void>;
-  identity: (result: T) => unknown;
-  requiresConvergence?: boolean;
-  limit?: number;
-}>): Generator<Y, HeaderFooterReserveIteration<T>, void> {
+export function* convergeHeaderFooterReserveSteps<T, Y, C>(
+  seed: T,
+  input: Readonly<{
+    measure: (result: T) => readonly HeaderFooterReserve[];
+    carry: (result: T) => C;
+    repaginate: (reserves: readonly HeaderFooterReserve[], carried: C) => Generator<Y, T, void>;
+    identity: (result: T) => unknown;
+    requiresConvergence?: boolean;
+    limit?: number;
+  }>,
+): Generator<Y, HeaderFooterReserveIteration<T>, void> {
+  type Carried = Readonly<{ reserves: readonly HeaderFooterReserve[]; carried: C }>;
   const iteration = (result: T): HeaderFooterReserveIteration<T> => {
     const reserves = Object.freeze(input.measure(result).map((reserve) => Object.freeze({ ...reserve })));
     return Object.freeze({
@@ -175,15 +188,24 @@ export function* convergeHeaderFooterReserveSteps<T, Y>(input: Readonly<{
       }),
     });
   };
-  const initial = iteration(input.seed);
+  let initial: HeaderFooterReserveIteration<T> | null = iteration(seed);
+  seed = undefined as unknown as T;
   if (!input.requiresConvergence && initial.reserves.every(
     (reserve) => reserve.top === 0 && reserve.bottom === 0,
   )) return initial;
-  return yield* convergeLayoutSteps<HeaderFooterReserveIteration<T>, Y>(
+  const steps = convergeLayoutSteps<HeaderFooterReserveIteration<T>, Y, Carried>(
     initial,
     function* reservePass(current) {
-      return iteration(yield* input.repaginate(current.reserves, current.result));
+      return iteration(yield* input.repaginate(current.reserves, current.carried));
     },
     input.limit ?? 16,
+    (current) => Object.freeze({
+      reserves: current.reserves,
+      carried: input.carry(current.result),
+    }),
   );
+  // The convergence generator derives the seed's state and carried data on
+  // its first step; this frame must not keep the seed pass alive meanwhile.
+  initial = null;
+  return yield* steps;
 }
