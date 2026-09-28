@@ -78,6 +78,15 @@ export interface DrawingMlLineBox {
  *   space goes above. Past that point the descent becomes 0.25·H + k.
  *   Examples: Meiryo 14 pt (d 9.31 pt) keeps d up to spcPts 36 and gets
  *   12.5 pt at 40; Arial always gets 0.25·H.
+ *   The switch is a real step of k at H = 4d, not a gradual change. Boundary
+ *   controls swept spcPts across 4d in 0.25 pt and finer steps: Meiryo 14 pt
+ *   keeps d = 9.31 at H 37 and gets 11.98 at 38 (4d = 37.24, k = 2.48);
+ *   Yu Gothic 14 pt keeps 6.93 at 27 and gets 8.08 at 28 (4d = 27.74,
+ *   k = 1.08); Meiryo 24 pt keeps 15.96 at 63 and gets 20.26 at 64
+ *   (4d = 63.83, k = 4.26). Excel rounds exact spacing to whole points before
+ *   this rule (the XLSX caller applies that rounding), so no H between those
+ *   whole points exists for spcPts. Percentage spacing between L and 4d is
+ *   not covered by the controls.
  * - H = L: the natural box is kept.
  *
  * The ascent is the rest of H. Each baseline pitch is therefore the previous

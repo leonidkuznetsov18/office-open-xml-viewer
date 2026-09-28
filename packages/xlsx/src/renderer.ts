@@ -28,7 +28,8 @@ import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
 import {
-  canvasShapeFontBoxProbe, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios, type ShapeRunLineRatios,
+  canvasShapeFontBoxProbe, excelShapeLineSpacing, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios,
+  type ShapeRunLineRatios,
 } from './shape-office-line.js';
 import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
 import { formatCellValueWithColor } from './number-format.js';
@@ -4942,13 +4943,14 @@ export function drawShapeText(
       };
     };
     const reduction = txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0;
+    const spaceLine = excelShapeLineSpacing(p.spaceLine);
     const lineHeightOf = (natural: number): number => drawingMlLineHeight(
-      natural, p.spaceLine, PT_TO_PX * cs, reduction,
+      natural, spaceLine, PT_TO_PX * cs, reduction,
     );
     // A metric line box keeps its natural ascent/descent split, which
     // a:lnSpc then re-divides (drawingMlSpacedLineBox).
     const metricLine = (ascent: number, descent: number): { height: number; ascent: number } => {
-      const box = drawingMlSpacedLineBox({ ascent, descent }, p.spaceLine, PT_TO_PX * cs, reduction);
+      const box = drawingMlSpacedLineBox({ ascent, descent }, spaceLine, PT_TO_PX * cs, reduction);
       return { height: box.ascent + box.descent, ascent: box.ascent };
     };
     const firstLineIndex = lines.length;

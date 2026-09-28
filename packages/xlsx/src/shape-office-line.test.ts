@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { PT_TO_PX, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { bindXlsxOfficeFontRoutes, drawShapeText } from './renderer.js';
 import { xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
-import { canvasShapeFontBoxProbe, shapeRunLineRatios, type ShapeFontBoxProbe } from './shape-office-line.js';
+import {
+  canvasShapeFontBoxProbe, excelShapeLineSpacing, shapeRunLineRatios, type ShapeFontBoxProbe,
+} from './shape-office-line.js';
 import type { ShapeParagraph, ShapeText, ShapeTextRun, Worksheet } from './types.js';
 
 // Expectations below come from Excel for Mac 16.113.2 PDF exports of the
@@ -191,6 +193,27 @@ describe('Excel shape-text line box from font metrics (#1604)', () => {
     expect(Math.abs(baselinesPt(three(14, 40))[0] - 31.6)).toBeLessThanOrEqual(0.6);
     // Supplement E-mei-24-56: first baseline 43.48 pt (0.24 pt export grid).
     expect(Math.abs(baselinesPt(three(24, 56))[0] - 43.48)).toBeLessThanOrEqual(0.3);
+  });
+
+  it('rounds spcPts to whole points before the descent step at 4d', () => {
+    const three = (font: string, size: number, pts: number) =>
+      body([1, 2, 3].map((n) => para([run(`P${n}`, font, size)], { spaceLine: { type: 'pts', val: pts } })));
+    const first = (font: string, size: number, pts: number) => baselinesPt(three(font, size, pts))[0];
+    // Excel boundary controls, first baseline of the spcPts line (0.24 pt export
+    // grid, up to ~0.35 pt off the rule here). Unrounded, the rule would put
+    // Meiryo 14 pt at 37.24 2.5 pt higher, Meiryo 24 pt at 63.5 3.5 pt lower
+    // and Yu Gothic 14 pt at 27.5 0.5 pt lower.
+    const near = (actual: number, office: number) => expect(Math.abs(actual - office)).toBeLessThanOrEqual(0.4);
+    near(first('Meiryo', 14, 37.24), 31.6);   // → 37: keeps d (4d = 37.24)
+    near(first('Meiryo', 14, 37.35), 31.48);
+    near(first('Meiryo', 14, 37.5), 29.68);   // → 38: descent 0.25·H + k
+    near(first('Meiryo', 24, 63.25), 50.56);  // → 63 (4d = 63.83)
+    near(first('Meiryo', 24, 63.5), 47.68);   // → 64
+    near(first('Yu Gothic', 14, 27.25), 23.56); // → 27 (4d = 27.74)
+    near(first('Yu Gothic', 14, 27.5), 23.68);  // → 28
+    expect(excelShapeLineSpacing({ type: 'pts', val: 36.49 })).toEqual({ type: 'pts', val: 36 });
+    expect(excelShapeLineSpacing({ type: 'pts', val: 36.5 })).toEqual({ type: 'pts', val: 37 });
+    expect(excelShapeLineSpacing({ type: 'pct', val: 136400 })).toEqual({ type: 'pct', val: 136400 });
   });
 
   it('takes spcPct from the natural line even when lnSpc is not 100 %', () => {

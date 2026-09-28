@@ -1,6 +1,6 @@
 import { findReferenceFontMetrics } from '@silurus/ooxml-core';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
-import type { OfficeFontFallbackRequest, OfficeFontFallbackRoute } from '@silurus/ooxml-core';
+import type { OfficeFontFallbackRequest, OfficeFontFallbackRoute, SpaceLine } from '@silurus/ooxml-core';
 import type { ShapeText, ShapeTextRun } from './types.js';
 
 type TextRun = Extract<ShapeTextRun, { type: 'text' }>;
@@ -31,6 +31,24 @@ export function shapeLineFontRuns(text: ShapeText): TextRun[] {
     if (run.type === 'text' && soleFace(run)) runs.push(run);
   }
   return runs;
+}
+
+/**
+ * The `a:lnSpc` value Excel lays shape text out with. Excel rounds exact
+ * spacing (`a:spcPts`) to whole points, halves rounding up, before it builds
+ * the spaced line box; percentage spacing is used as authored.
+ *
+ * Observed Excel for Mac 16.113.2 behaviour (#1604 boundary controls):
+ * Meiryo 14 pt swept spcPts 36-40 in 0.25 pt steps plus 0.01-0.05 pt steps,
+ * Yu Gothic 14 pt 26.5-30.5, and Meiryo 24 pt 62.5-66.5. Every value painted
+ * exactly like its nearest whole point: 36.25 like 36, 36.5-37.35 like 37,
+ * 37.5-38.25 like 38; 62.5-63.25 like 63, 63.5-64.25 like 64; 26.5-27.25 like
+ * 27, 27.5-28.25 like 28. `a:spcBef`/`a:spcAft` were not swept fractionally
+ * and stay as authored.
+ */
+export function excelShapeLineSpacing(spacing: SpaceLine | null | undefined): SpaceLine | null | undefined {
+  if (spacing?.type !== 'pts') return spacing;
+  return { type: 'pts', val: Math.floor(spacing.val + 0.5) };
 }
 
 /** One key rule for workbook, worker, and synchronous shape paint. */
