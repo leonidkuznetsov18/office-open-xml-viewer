@@ -460,6 +460,7 @@ function fitToAvailableWidth(
   minimums: readonly number[],
   cells: readonly TableColumnCellConstraint[],
   availableWidthPt: number,
+  outerMarginAllowancePt: number,
 ): number[] {
   const totalPt = widths.reduce((sum, width) => sum + width, 0);
   if (totalPt <= availableWidthPt + EPSILON_PT || totalPt <= EPSILON_PT) return widths;
@@ -506,6 +507,41 @@ function fitToAvailableWidth(
   const afterSlackPt = result.reduce((sum, width) => sum + width, 0);
   if (afterSlackPt <= availableWidthPt + EPSILON_PT || afterSlackPt <= EPSILON_PT) {
     return cleanWidths(result);
+  }
+  const autoNoWrapCell = cells.find((cell) => cell.noWrap === true
+    && cell.preferredWidth === null && cell.columnSpan === 1);
+  if (
+    outerMarginAllowancePt > EPSILON_PT
+    && (autoNoWrapCell?.minContentWidthPt ?? 0)
+      > availableWidthPt - outerMarginAllowancePt + EPSILON_PT
+    && result.length === 2
+    && cells.length === 2
+    && cells.every((cell) => cell.columnSpan === 1)
+    && cells.some((cell) => cell.columnStart === 0)
+    && cells.some((cell) => cell.columnStart === 1)
+    && autoNoWrapCell
+    && cells.filter((cell) => cell.noWrap === true).length === 1
+  ) {
+    // WORD_AUTOFIT_NOWRAP_AUTO_FORCED_FIT (table-compatibility.ts): scale
+    // content-only widths against the text band, then distribute the outer
+    // margin allowance according to the OTHER cell's content width. §17.18.87
+    // does not define the forced-break distribution; the recorded evidence in
+    // that rule is limited to this two-cell case.
+    const margins = [0, 0];
+    for (const cell of cells) margins[cell.columnStart] = finiteNonNegative(cell.horizontalMarginsPt);
+    const contentWidths = result.map((width, column) => Math.max(0, width - (margins[column] ?? 0)));
+    const contentTotalPt = contentWidths.reduce((sum, width) => sum + width, 0);
+    if (contentTotalPt > EPSILON_PT) {
+      const contentBandPt = Math.max(0, availableWidthPt - outerMarginAllowancePt);
+      const scaled = contentWidths.map((width) => width * contentBandPt / contentTotalPt);
+      const noWrapColumn = autoNoWrapCell.columnStart;
+      const ordinaryColumn = 1 - noWrapColumn;
+      scaled[noWrapColumn] += outerMarginAllowancePt
+        * (contentWidths[ordinaryColumn] ?? 0) / contentTotalPt;
+      scaled[ordinaryColumn] += outerMarginAllowancePt
+        * (contentWidths[noWrapColumn] ?? 0) / contentTotalPt;
+      return cleanWidths(scaled);
+    }
   }
   // The jointly retained minima do not fit, so §17.18.87 now permits forced
   // line breaks. It does not prescribe the final track distribution; reuse the
@@ -558,6 +594,7 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
     minimums,
     cells,
     finiteNonNegative(input.availableWidthPt),
+    finiteNonNegative(input.outerMarginAllowancePt),
   ));
 }
 

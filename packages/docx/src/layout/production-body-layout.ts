@@ -2278,12 +2278,46 @@ function resolveColumnWidths(
       return 2 * Math.min(resolvedCenterPt, state.pageWidth - resolvedCenterPt);
     }),
   );
-  const maximumTableWidthPt = isLeadingMarginPageStoryTable
-    ? Math.max(contentWPt, pageFitCeilingPt)
-    : contentWPt;
   const effectiveLayout = format.firstRowException?.layout === 'fixed'
     ? 'fixed'
     : table.layout;
+  // WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND (table-compatibility.ts): an AutoFit
+  // grid can include outer §17.4.42 cell margins beyond the text band, but
+  // Word also preserves a saved grid ending at the band despite those margins.
+  // Use only the margin overhang already represented by §17.4.49 tblGrid.
+  // A row with skipped outer tracks cannot establish that margin ownership.
+  // A nested table's saved overhang belongs to its containing cell; giving it
+  // the page-table allowance enlarges that cell's contents beyond Word's grid.
+  const savedGridWidthPt = table.colWidths.reduce(
+    (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
+  );
+  const possibleOuterCellMarginsPt = effectiveLayout === 'fixed'
+    || !format.ordinaryFlow
+    || isLeadingMarginPageStoryTable
+    || isVerticalTextDirection(state.sectionLayout.textDirection)
+    || state.storyContext?.containers.some((container) => container.kind === 'tableCell')
+    || format.rows.length === 0
+    ? 0
+    : format.rows.reduce((minimumPt, row, rowIndex) => {
+        const sourceRow = table.rows[rowIndex];
+        if (!sourceRow || (sourceRow.gridBefore ?? 0) > 0 || (sourceRow.gridAfter ?? 0) > 0) return 0;
+        const first = row.cells[0]?.marginsPt;
+        const last = row.cells.at(-1)?.marginsPt;
+        const leftPt = first?.left;
+        const rightPt = last?.right;
+        const marginPt = typeof leftPt === 'number' && Number.isFinite(leftPt)
+          && typeof rightPt === 'number' && Number.isFinite(rightPt)
+          ? Math.max(0, leftPt) + Math.max(0, rightPt)
+          : 0;
+        return Math.min(minimumPt, marginPt);
+      }, Number.POSITIVE_INFINITY);
+  const outerCellMarginsPt = Math.min(
+    possibleOuterCellMarginsPt,
+    Math.max(0, savedGridWidthPt - contentWPt),
+  );
+  const maximumTableWidthPt = (isLeadingMarginPageStoryTable
+    ? Math.max(contentWPt, pageFitCeilingPt)
+    : contentWPt) + outerCellMarginsPt;
   const isFixedNestedTable = effectiveLayout === 'fixed'
     && state.storyContext?.containers.some((container) => container.kind === 'tableCell');
 
@@ -2371,7 +2405,7 @@ function resolveColumnWidths(
       ownerLayout,
     );
   };
-  return [...resolveTableColumnWidths(state.acquisitionInputs.tableColumnLayoutInput(
+  const columnInput = state.acquisitionInputs.tableColumnLayoutInput(
     table,
     contentWPt,
     intrinsicWidthsForTable(table, format),
@@ -2385,7 +2419,11 @@ function resolveColumnWidths(
       : state.acquisitionInputs.tableParticipatesInOrdinaryFlow(table)
       ? maximumTableWidthPt
       : Math.max(contentWPt, state.pageWidth),
-  ))];
+  );
+  return [...resolveTableColumnWidths({
+    ...columnInput,
+    outerMarginAllowancePt: outerCellMarginsPt,
+  })];
 }
 
 // ===== Text frames & drop caps (ECMA-376 §17.3.1.11) =====

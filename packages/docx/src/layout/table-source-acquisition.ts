@@ -357,12 +357,16 @@ export function projectTableColumnLayoutInput(
             gridWidthsPt.length,
           );
           const horizontalSpacingPt = spacingInsets.startPt + spacingInsets.endPt;
+          const margins = input.format.rows[rowIndex]?.cells[cellIndex]?.marginsPt;
+          const horizontalMarginsPt = Math.max(0, margins?.left ?? 0)
+            + Math.max(0, margins?.right ?? 0);
           const result = {
             columnStart,
             columnSpan: span,
             preferredWidth: tableWidthConstraintFromLexical(wire?.preferredWidth)
               ?? publicTableCellConstraint(cell),
             ...(cell.noWrap ? { noWrap: true } : {}),
+            ...(horizontalMarginsPt > 0 ? { horizontalMarginsPt } : {}),
             minContentWidthPt: Math.max(0, intrinsic.minWidthPt) + horizontalSpacingPt,
             maxContentWidthPt:
               Math.max(intrinsic.minWidthPt, intrinsic.maxWidthPt) + horizontalSpacingPt,

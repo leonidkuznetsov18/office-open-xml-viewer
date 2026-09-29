@@ -1218,6 +1218,8 @@ export interface TableColumnCellConstraint {
   readonly preferredWidth: TablePreferredWidthConstraint | null;
   /** §17.4.29 protects a dxa preference during AutoFit shrinking. */
   readonly noWrap?: boolean;
+  /** Resolved §17.4.42 horizontal cell margins included in content widths. */
+  readonly horizontalMarginsPt?: number;
   readonly minContentWidthPt: number;
   readonly maxContentWidthPt: number;
 }
@@ -1239,6 +1241,8 @@ export interface TableColumnLayoutInput {
   /** Physical occurrence ceiling. `null` means the containing frame imposes
    * no width ceiling (for example, an authored fixed table nested in a cell). */
   readonly availableWidthPt: number | null;
+  /** The outer-cell margin portion of the physical AutoFit ceiling. */
+  readonly outerMarginAllowancePt?: number;
   readonly gridWidthsPt: readonly number[];
   readonly gridWidthKeys?: readonly (string | null)[];
   readonly tablePreferredWidthPt: number | null;
