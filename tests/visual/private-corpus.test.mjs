@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { PNG } from 'pngjs';
 import {
-  clearPrivateCandidateItemOutput,
+  clearSelfVrtCandidateOutput,
   harnessBootstrapDiffViolations,
   pngPixelsEqual,
+  selfVrtBaselineRoot,
+  selfVrtInputPath,
 } from './private-corpus.mjs';
 
 test('private corpus self-VRT compares decoded pixels, not encoder bytes', () => {
@@ -36,14 +38,16 @@ test('candidate capture discards stale pages without following local evidence sy
     mkdirSync(directory, { recursive: true });
     writeFileSync(join(directory, 'page-29.png'), 'stale');
     writeFileSync(join(directory, 'notes.json'), 'retain');
-    clearPrivateCandidateItemOutput({ stem: 'docx/case', itemKind: 'page', outputRoot: root });
+    clearSelfVrtCandidateOutput({
+      corpus: 'private', stem: 'docx/case', itemKind: 'page', outputRoot: root,
+    });
     assert.equal(existsSync(join(directory, 'page-29.png')), false);
     assert.equal(readFileSync(join(directory, 'notes.json'), 'utf8'), 'retain');
 
     symlinkSync(directory, join(root, 'docx', 'linked'), 'dir');
-    assert.throws(() => clearPrivateCandidateItemOutput({
-      stem: 'docx/linked', itemKind: 'page', outputRoot: root,
-    }), /symlinked private corpus output/);
+    assert.throws(() => clearSelfVrtCandidateOutput({
+      corpus: 'private', stem: 'docx/linked', itemKind: 'page', outputRoot: root,
+    }), /symlinked self-VRT output/);
     assert.equal(readFileSync(join(directory, 'notes.json'), 'utf8'), 'retain');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -67,4 +71,40 @@ test('harness bootstrap allows only test-renderer alias lines in Vite configs', 
     ].join('\n')),
     ["+  define: { __OOXML_MODEL_SOURCES__: 'false' },"],
   );
+});
+
+test('self-VRT corpora keep demo and private stems in their own namespaces', () => {
+  assert.equal(selfVrtInputPath({ corpus: 'demo', file: 'demo/sample-1.docx' }), 'demo/sample-1.docx');
+  assert.equal(selfVrtInputPath({ corpus: 'private', file: 'docx/case.docx' }), 'private/docx/case.docx');
+  assert.throws(() => clearSelfVrtCandidateOutput({
+    corpus: 'demo', stem: 'docx/case', itemKind: 'page',
+  }), /invalid self-VRT output identity/);
+  assert.throws(() => clearSelfVrtCandidateOutput({
+    corpus: 'private', stem: 'demo/sample-1', itemKind: 'page',
+  }), /invalid self-VRT output identity/);
+  assert.throws(() => selfVrtInputPath({ corpus: 'public', file: 'x' }), /unknown self-VRT corpus/);
+});
+
+test('comparison runs can read the previous renderer from another checkout', () => {
+  const previous = process.env.VRT_BASELINE_CHECKOUT;
+  try {
+    delete process.env.VRT_BASELINE_CHECKOUT;
+    assert.equal(selfVrtBaselineRoot(), 'tests/visual/baseline');
+
+    const checkout = mkdtempSync(join(realpathSync(tmpdir()), 'ooxml-vrt-baseline-checkout-'));
+    try {
+      process.env.VRT_BASELINE_CHECKOUT = checkout;
+      // This test runs from the repository root, so the package-relative
+      // prefix is empty.
+      assert.equal(selfVrtBaselineRoot(), resolve(checkout, 'tests/visual/baseline'));
+      assert.throws(() => selfVrtBaselineRoot({ snapshot: true }), /capture snapshots in the baseline checkout/);
+      process.env.VRT_BASELINE_CHECKOUT = process.cwd();
+      assert.throws(() => selfVrtBaselineRoot(), /not this one/);
+    } finally {
+      rmSync(checkout, { recursive: true, force: true });
+    }
+  } finally {
+    if (previous === undefined) delete process.env.VRT_BASELINE_CHECKOUT;
+    else process.env.VRT_BASELINE_CHECKOUT = previous;
+  }
 });

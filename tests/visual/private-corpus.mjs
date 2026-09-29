@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { join, parse, resolve, sep } from 'node:path';
+import { join, parse, relative, resolve, sep } from 'node:path';
 import { PNG } from 'pngjs';
 
 const SCHEMA_VERSION = 1;
@@ -113,10 +113,73 @@ function baselineRevision(snapshot = false) {
   return resolved;
 }
 
-function corpusFiles(files) {
+// Self-VRT corpora. `demo` is the tracked public demo set under `public/demo/`;
+// `private` is the local, gitignored corpus under `public/private/<format>/`.
+// Both use the same exact-pixel previous-renderer oracle and the same manifest
+// binding; they differ only in where the inputs live and where their images go.
+const CORPORA = {
+  demo: {
+    publicPrefix: '',
+    outputPrefix: '',
+    manifestDirectory: 'demo',
+    stemPattern: /^demo\/[^/\\]+$/,
+  },
+  private: {
+    publicPrefix: 'private/',
+    outputPrefix: 'private-corpus/',
+    manifestDirectory: 'private-corpus',
+    stemPattern: /^(docx|xlsx|pptx)\/[^/\\]+$/,
+  },
+};
+
+function corpusConfig(corpus) {
+  const config = CORPORA[corpus];
+  if (!config) throw new Error(`unknown self-VRT corpus: ${corpus}`);
+  return config;
+}
+
+/** Sorted input files of a corpus, relative to that corpus's public prefix
+ * (`demo/sample-1.pptx`, `pptx/deck.pptx`). */
+export function selfVrtCorpusFiles({ corpus, format }) {
+  const directory = corpus === 'demo' ? 'demo' : format;
+  const { publicPrefix } = corpusConfig(corpus);
+  return readdirSync(`public/${publicPrefix}${directory}`)
+    .filter((file) => file.endsWith(`.${format}`) && !file.startsWith('~$'))
+    .map((file) => `${directory}/${file}`)
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+}
+
+/** URL path of a corpus input, relative to the package's public root. */
+export function selfVrtInputPath({ corpus, file }) {
+  return `${corpusConfig(corpus).publicPrefix}${file}`;
+}
+
+/** Directory holding previous-renderer images. Snapshots are always written
+ * into the checkout that renders them. A comparison run reads the same
+ * package's baseline from `VRT_BASELINE_CHECKOUT` (the previous-renderer
+ * worktree) when set, so candidate and baseline never share a checkout. */
+export function selfVrtBaselineRoot({ snapshot = false } = {}) {
+  const checkout = process.env.VRT_BASELINE_CHECKOUT?.trim();
+  if (!checkout) return 'tests/visual/baseline';
+  if (snapshot) {
+    throw new Error(
+      'VRT_BASELINE_CHECKOUT is for comparison runs; capture snapshots in the baseline checkout itself',
+    );
+  }
+  const root = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  const baseline = resolve(checkout, relative(root, process.cwd()), 'tests/visual/baseline');
+  if (resolve(baseline) === resolve('tests/visual/baseline')) {
+    throw new Error('VRT_BASELINE_CHECKOUT must name the previous-renderer checkout, not this one');
+  }
+  return baseline;
+}
+
+function corpusFiles(corpus, files) {
   return files.map((name) => ({
     name,
-    sha256: createHash('sha256').update(readFileSync(`public/private/${name}`)).digest('hex'),
+    sha256: createHash('sha256')
+      .update(readFileSync(`public/${selfVrtInputPath({ corpus, file: name })}`))
+      .digest('hex'),
   }));
 }
 
@@ -137,17 +200,17 @@ function assertExactManifest(actual, expected, path) {
 /** Fail closed on an empty/stale corpus and bind every baseline to an explicit
  * merge-base revision. This prevents a candidate server or unrelated old
  * snapshot from silently becoming its own regression oracle. */
-export function preparePrivateCorpus({ format, files, snapshot }) {
+export function prepareSelfVrtCorpus({ corpus, format, files, snapshot }) {
   if (files.length === 0) {
-    throw new Error(`${format} private corpus is empty; zero-test self-VRT is not coverage`);
+    throw new Error(`${format} ${corpus} corpus is empty; zero-test self-VRT is not coverage`);
   }
-  const root = 'tests/visual/baseline/private-corpus';
+  const root = `${selfVrtBaselineRoot({ snapshot })}/${corpusConfig(corpus).manifestDirectory}`;
   const path = `${root}/manifest.json`;
   const manifest = {
     schemaVersion: SCHEMA_VERSION,
     format,
     baselineRevision: baselineRevision(snapshot),
-    files: corpusFiles(files),
+    files: corpusFiles(corpus, files),
   };
   if (snapshot) {
     mkdirSync(root, { recursive: true });
@@ -161,15 +224,16 @@ export function preparePrivateCorpus({ format, files, snapshot }) {
  * only this input's generated screenshots before capture, so downstream
  * reviews cannot mistake stale page-N files for the current renderer output.
  * Baselines and non-image evidence are never touched. */
-export function clearPrivateCandidateItemOutput({
+export function clearSelfVrtCandidateOutput({
+  corpus,
   stem,
   itemKind,
-  outputRoot = 'tests/visual/screenshots/private-corpus',
+  outputRoot = `tests/visual/screenshots/${corpusConfig(corpus).outputPrefix}`,
 }) {
-  if (!/^(docx|xlsx|pptx)\/[^/\\]+$/.test(stem)
+  if (!corpusConfig(corpus).stemPattern.test(stem)
     || ['.', '..'].includes(stem.split('/')[1])
     || !/^(page|sheet|slide)$/.test(itemKind)) {
-    throw new Error('invalid private corpus output identity');
+    throw new Error('invalid self-VRT output identity');
   }
   const directory = resolve(outputRoot, stem);
   // Generated-output directories can be local symlinks. Never follow one when
@@ -178,7 +242,7 @@ export function clearPrivateCandidateItemOutput({
   for (const component of directory.slice(ancestor.length).split(sep).filter(Boolean)) {
     ancestor = join(ancestor, component);
     if (existsSync(ancestor) && lstatSync(ancestor).isSymbolicLink()) {
-      throw new Error(`refusing to clear symlinked private corpus output: ${ancestor}`);
+      throw new Error(`refusing to clear symlinked self-VRT output: ${ancestor}`);
     }
   }
   if (!existsSync(directory)) return;
@@ -191,14 +255,15 @@ export function clearPrivateCandidateItemOutput({
 /** Verify that the baseline contains exactly the complete page/sheet/slide set
  * reported by the previous renderer. An item-count reduction or stale extra PNG
  * is therefore a hard failure instead of an ignored file. */
-export function verifyPrivateItemManifest({
+export function verifySelfVrtItemManifest({
+  corpus,
   format,
   stem,
   itemKind,
   itemCount,
   snapshot,
 }) {
-  const directory = `tests/visual/baseline/private-corpus/${stem}`;
+  const directory = `${selfVrtBaselineRoot({ snapshot })}/${corpusConfig(corpus).outputPrefix}${stem}`;
   const path = `${directory}/manifest.json`;
   const items = Array.from({ length: itemCount }, (_, index) => `${itemKind}-${index + 1}.png`);
   const manifest = {
@@ -229,13 +294,21 @@ export function verifyPrivateItemManifest({
 /** Persist the candidate artifact and return a diagnostic instead of throwing,
  * so one changed item cannot prevent later items in the same document from
  * being rendered and compared. */
-export function captureOrComparePrivateItem({ stem, itemKind, itemIndex, actual, snapshot }) {
+export function captureOrCompareSelfVrtItem({
+  corpus,
+  stem,
+  itemKind,
+  itemIndex,
+  actual,
+  snapshot,
+}) {
   const key = `${itemKind}-${itemIndex + 1}.png`;
-  const outputDirectory = `tests/visual/${snapshot ? 'baseline' : 'screenshots'}/private-corpus/${stem}`;
+  const { outputPrefix } = corpusConfig(corpus);
+  const outputDirectory = `tests/visual/${snapshot ? 'baseline' : 'screenshots'}/${outputPrefix}${stem}`;
   mkdirSync(outputDirectory, { recursive: true });
   writeFileSync(`${outputDirectory}/${key}`, actual);
   if (snapshot) return null;
-  const baselinePath = `tests/visual/baseline/private-corpus/${stem}/${key}`;
+  const baselinePath = `${selfVrtBaselineRoot()}/${outputPrefix}${stem}/${key}`;
   if (!existsSync(baselinePath)) return `missing previous-renderer baseline: ${baselinePath}`;
   return pngPixelsEqual(actual, readFileSync(baselinePath))
     ? null
