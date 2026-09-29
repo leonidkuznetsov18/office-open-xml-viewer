@@ -27,7 +27,9 @@ import { formatCategoryLabel } from './chart-number-format.js';
 import { resolveCategoryGapWidthPercent } from './category-spacing.js';
 import { planHistogramBins } from './histogram-binning.js';
 import {
+  BOX_WHISKER_DOT_SPACING_PT,
   boxWhiskerGeometry,
+  boxWhiskerObservationDots,
   boxWhiskerPointCount,
   computeBoxWhiskerStats,
 } from './box-whisker.js';
@@ -1473,6 +1475,18 @@ function renderBoxWhiskerChart(
   const statsBySeries = box.series.map(series => series.valuesByCategory.map(values => (
     computeBoxWhiskerStats(values, series.quartileMethod)
   )));
+  const pointSymbol = chart.chartStyleMarkerSymbol ?? chart.chartexMarkerSymbol ?? 'circle';
+  const dotsBySeries = box.series.map((series, si) => (
+    pointSymbol === 'none'
+      ? statsBySeries[si].map(() => [])
+      : boxWhiskerObservationDots(
+        statsBySeries[si],
+        series.showNonoutliers,
+        series.showOutliers,
+        yOf,
+        BOX_WHISKER_DOT_SPACING_PT * ptToPx,
+      )
+  ));
   const boxGeometry = (ci: number, si: number): { bx: number; boxW: number; cx: number } => {
     const geometry = boxWhiskerGeometry(
       px0,
@@ -1576,19 +1590,15 @@ function renderBoxWhiskerChart(
     }
 
     // Observation dots. cx:visibility@nonoutliers shows the raw values
-    // inside the whisker fence and @outliers those beyond it. Their outline
-    // follows the owning box series, not the generic linked marker role
-    // (which may carry a contrasting line intended for ordinary chart
-    // markers). PowerPoint paints a category's shown dots in ascending value
-    // order, its high outlier included, before the mean `×`; the control has
-    // no low outlier, and dots of one series share paint, so their relative
-    // order among themselves is not visible.
-    const pointSymbol = chart.chartStyleMarkerSymbol ?? chart.chartexMarkerSymbol ?? 'circle';
-    const shownPoints = pointSymbol === 'none' ? [] : [
-      ...(s.showNonoutliers ? stats.inner : []),
-      ...(s.showOutliers ? stats.outliers : []),
-    ].sort((left, right) => left - right);
-    for (const point of shownPoints) {
+    // inside the whisker fence and @outliers those beyond it; which of them
+    // PowerPoint paints is selected by boxWhiskerObservationDots. Their
+    // outline follows the owning box series, not the generic linked marker
+    // role (which may carry a contrasting line intended for ordinary chart
+    // markers). PowerPoint paints a category's dots in ascending value order,
+    // its high outlier included, before the mean `×`; the control has no low
+    // outlier, and dots of one series share paint, so their relative order
+    // among themselves is not visible.
+    for (const point of dotsBySeries[si][ci]) {
       const pointY = yOf(point);
       drawMarker(
         ctx,

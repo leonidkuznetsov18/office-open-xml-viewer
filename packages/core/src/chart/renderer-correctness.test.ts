@@ -28,7 +28,12 @@ import {
 } from './chart-ex-renderer.js';
 import { renderSimpleThreeDChart } from './three-d-renderer.js';
 import { formatChartValWithCode } from './chart-number-format.js';
-import { BOX_WHISKER_SLOT_GUTTER_FRACTION } from './box-whisker.js';
+import {
+  BOX_WHISKER_SLOT_GUTTER_FRACTION,
+  boxWhiskerObservationDots,
+  computeBoxWhiskerStats,
+  type BoxWhiskerStats,
+} from './box-whisker.js';
 import {
   chartImageFillKey,
   chartImageFillPaintWork,
@@ -5760,8 +5765,8 @@ describe('classic 3-D compatibility projection', () => {
         }],
       },
     });
-    // IQR body + two visible observation markers.
-    expect(chartEffectConsumerUpperBound(boxDirect)).toBe(4);
+    // IQR body + the middle observation; the whisker ends 1 and 3 get no dot.
+    expect(chartEffectConsumerUpperBound(boxDirect)).toBe(2);
 
     const nonFiniteWaterfall = baseModel({
       chartType: 'waterfall',
@@ -21685,6 +21690,9 @@ describe('CH15 — chartEx box-and-whisker', () => {
   // The sample-24 Category-1 orange series: an obvious outlier at 128 sits far
   // beyond Q3 + 1.5·IQR, so the whisker stops at 34 and 128 is drawn as a dot.
   const CAT1_ORANGE = [-3, 1, -6, 10, 34, 128, 22, -12, -28];
+  // With both visibility flags on, PowerPoint paints -12, -6, -3, 1, 10, 22
+  // and the 128 outlier; the whisker ends -28 and 34 get no dot.
+  const CAT1_ORANGE_DOTS = 7;
 
   function boxModel(over: Partial<ChartModel> = {}): ChartModel {
     return baseModel({
@@ -22032,20 +22040,92 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(rec.arcs[0].y).toBeLessThan(box.y);
   });
 
-  it('draws every non-outlier sample point when the visibility flag is enabled', () => {
-    const rec = markerRecordingCtx();
-    renderChart(rec.ctx, boxModel({
-      chartexBox: {
-        categories: ['Category 1'],
-        series: [{
-          name: 'S1', color: null, valuesByCategory: [CAT1_ORANGE],
-          meanMarker: true, meanLine: false, showOutliers: true, showNonoutliers: true,
-          quartileMethod: 'exclusive',
-        }],
-      },
-    }), RECT, 1);
-    // Eight interior points plus the single outlier at 128.
-    expect(rec.arcs.length).toBe(CAT1_ORANGE.length);
+  // Observed PowerPoint 16.113 dot selection; the evidence is recorded beside
+  // boxWhiskerObservationDots. Positions here are in points (identity map).
+  const observationDots = (values: number[]): number[] => boxWhiskerObservationDots(
+    [computeBoxWhiskerStats(values, 'exclusive')], true, true, value => value, 3,
+  )[0];
+  const fencedStats = (
+    inner: number[], outliers: number[], lowerFence: number, upperFence: number,
+  ): BoxWhiskerStats => ({
+    q1: inner[0], median: inner[0], q3: inner[inner.length - 1], lowerFence, upperFence,
+    whiskerLo: inner[0], whiskerHi: inner[inner.length - 1], mean: inner[0], outliers, inner,
+  });
+
+  it('omits one copy of each whisker end and paints dots at least 3pt from the last dot painted', () => {
+    // Further copies of an end value remain candidates; 1 and 100 collapse
+    // onto the dots below them.
+    expect(observationDots([0, 0, 0, 1, 20, 40, 60, 99, 100, 100])).toEqual([0, 20, 40, 60, 99]);
+    // A chain compares with the last dot painted, not the previous candidate.
+    expect(observationDots([5, 10, 12, 14, 16, 21])).toEqual([10, 14]);
+    expect(observationDots([5, 10, 12.9, 13.1, 16, 21])).toEqual([10, 13.1]);
+    // PowerPoint collapses a pair 2.983pt apart and paints one 3.027pt apart.
+    expect(observationDots([5, 10, 12.9, 20, 23.1, 28])).toEqual([10, 20, 23.1]);
+    // One or two observations are only whisker ends.
+    expect(observationDots([5])).toEqual([]);
+    expect(observationDots([5, 9])).toEqual([]);
+    expect(observationDots([5, 7, 9])).toEqual([7]);
+  });
+
+  it('spaces shown outliers and non-outliers in one pass that ignores hidden kinds', () => {
+    const high = fencedStats([10, 20, 30, 31], [32.5], 0, 32);
+    const low = fencedStats([8, 9.5, 20, 30], [7], 7.5, 40);
+    const dots = (stats: BoxWhiskerStats, inner: boolean, outliers: boolean): number[] =>
+      boxWhiskerObservationDots([stats], inner, outliers, value => value, 3)[0];
+    // The high outlier is 2.5pt above the highest inner dot; the omitted
+    // whisker end between them blocks nothing.
+    expect(dots(high, true, true)).toEqual([20, 30]);
+    expect(dots(high, false, true)).toEqual([32.5]);
+    expect(dots(high, true, false)).toEqual([20, 30]);
+    // The low outlier paints first and suppresses the inner value 2.5pt above.
+    expect(dots(low, true, true)).toEqual([7, 20]);
+    expect(dots(low, true, false)).toEqual([9.5, 20]);
+  });
+
+  it('carries the last painted dot across categories of one series', () => {
+    const stats = (middle: number) => fencedStats([0, middle, 100], [], -100, 200);
+    // A category without observations keeping the carried dot is the chosen
+    // behavior; the controls do not measure it.
+    expect(boxWhiskerObservationDots(
+      [stats(50), stats(51), null, stats(52.9), stats(53.5)], true, true, value => value, 3,
+    )).toEqual([[50], [], [], [], [53.5]]);
+  });
+
+  it('wires box dot spacing in points and restarts it for each series', () => {
+    const series = (name: string, color: string, values: number[][]) => ({
+      name, color, valuesByCategory: values,
+      meanMarker: false, meanLine: false, showOutliers: true, showNonoutliers: true,
+      quartileMethod: 'exclusive',
+    });
+    const render = (values: number[][]) => {
+      const rec = markerRecordingCtx();
+      renderChart(rec.ctx, boxModel({
+        valMin: 0, valMax: 100, valAxisHidden: true, catAxisHidden: true,
+        chartexBox: {
+          categories: values.map((_, index) => `C${index}`),
+          series: [series('S1', 'ED7D31', values), series('S2', '5B9BD5', values)],
+        },
+      }), RECT, 2);
+      return rec.arcs;
+    };
+    const probe = render([[0, 20, 80, 100]]);
+    const pxPerUnit = Math.abs(probe[0].y - probe[1].y) / 60;
+    // 2.5pt and 3.5pt at 2px/pt, expressed in axis units.
+    const near = 5 / pxPerUnit;
+    const far = 7 / pxPerUnit;
+    const arcs = render([
+      [0, 40, 40 + near, 100], [0, 40, 100], [0, 40 + far, 100], [0, 40, 100],
+    ]);
+    // Per series: 40 in C0 (40 + near collapses onto it), nothing in C1 (the
+    // reference carries across categories), 40 + far in C2, 40 in C3. The
+    // second series starts afresh, so its C0 dot paints although the first
+    // series' last dot sits at the same value.
+    expect(arcs).toHaveLength(6);
+    expect(arcs.every(arc => arc.r === 3)).toBe(true);
+    const ys = arcs.map(arc => arc.y);
+    expect(ys[1] - ys[0]).toBeCloseTo(-far * pxPerUnit, 5);
+    expect(ys[3]).toBeCloseTo(ys[0], 5);
+    expect(ys[4]).toBeCloseTo(ys[1], 5);
   });
 
   it('fills box-and-whisker sample points when the marker role uses Chart Style NoStyle', () => {
@@ -22067,8 +22147,8 @@ describe('CH15 — chartEx box-and-whisker', () => {
       },
     }), RECT, 1);
 
-    expect(rec.arcs).toHaveLength(CAT1_ORANGE.length);
-    expect(rec.fillCalls).toBe(CAT1_ORANGE.length);
+    expect(rec.arcs).toHaveLength(CAT1_ORANGE_DOTS);
+    expect(rec.fillCalls).toBe(CAT1_ORANGE_DOTS);
   });
 
   it('keeps box-and-whisker sample points transparent for an explicit marker noFill', () => {
@@ -22085,7 +22165,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
       },
     }), RECT, 1);
 
-    expect(rec.arcs).toHaveLength(CAT1_ORANGE.length);
+    expect(rec.arcs).toHaveLength(CAT1_ORANGE_DOTS);
     expect(rec.fillCalls).toBe(0);
   });
 
@@ -22175,7 +22255,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
       chartexBox: {
         categories: ['Category 1'],
         series: [{
-          name: 'S1', color: 'ED7D31', valuesByCategory: [[1, 2, 3]],
+          name: 'S1', color: 'ED7D31', valuesByCategory: [[0, 1, 2, 3, 4]],
           meanMarker: true, meanLine: false, showOutliers: true, showNonoutliers: true,
           quartileMethod: 'exclusive',
         }],
@@ -22347,7 +22427,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
       chartexBox: {
         categories: ['Category 1'],
         series: [{
-          name: 'S1', color: 'ED7D31', valuesByCategory: [[1, 2, 3]],
+          name: 'S1', color: 'ED7D31', valuesByCategory: [[0, 1, 2, 3, 4]],
           meanMarker: false, meanLine: false, showOutliers: true, showNonoutliers: true,
           quartileMethod: 'exclusive',
         }],
@@ -22355,7 +22435,8 @@ describe('CH15 — chartEx box-and-whisker', () => {
     }), RECT, 1);
 
     expect(rec.arcs).toHaveLength(0);
-    // One IQR box plus three square raw-point markers.
+    // One IQR box plus three square raw-point markers (the whisker ends 0 and
+    // 4 get no dot).
     expect(rec.fillRects.length).toBeGreaterThanOrEqual(4);
   });
 
@@ -22883,7 +22964,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
         categories: ['A'],
         series: [{
           name: 'S', color: 'FFFFFF', lineColor: '000000', lineWidthEmu: 6350,
-          valuesByCategory: [[1, 2, 3]],
+          valuesByCategory: [[0, 1, 2, 3, 4]],
           meanMarker: false, meanLine: false, showOutliers: false, showNonoutliers: true,
           quartileMethod: 'inclusive',
         }],
@@ -22914,7 +22995,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
       chartexBox: {
         categories: ['A'],
         series: [{
-          name: 'S', color: 'FFFFFF', valuesByCategory: [[1, 2, 3]],
+          name: 'S', color: 'FFFFFF', valuesByCategory: [[0, 1, 2, 3, 4]],
           meanMarker: false, meanLine: false, showOutliers: false, showNonoutliers: true,
           quartileMethod: 'inclusive',
         }],
@@ -22942,7 +23023,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
       chartexBox: {
         categories: ['A'],
         series: [{
-          name: 'S', color: 'FFFFFF', valuesByCategory: [[1, 2, 3]],
+          name: 'S', color: 'FFFFFF', valuesByCategory: [[0, 1, 2, 3, 4]],
           meanMarker: false, meanLine: false, showOutliers: false, showNonoutliers: true,
           quartileMethod: 'inclusive', chartexStyle: { shapePropertiesPresent: true },
         }],
