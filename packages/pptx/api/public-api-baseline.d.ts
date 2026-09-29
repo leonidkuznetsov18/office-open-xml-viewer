@@ -2090,6 +2090,7 @@ export interface TabStop {
 export interface TextBody extends TextBody__emitterCollision1 {
     rtlCol?: boolean;
     spcFirstLastPara?: boolean;
+    compatLnSpc?: boolean;
     textWarp?: {
         preset: string;
         adj?: number[];
