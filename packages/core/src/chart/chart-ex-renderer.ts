@@ -1630,13 +1630,25 @@ function renderBoxWhiskerChart(
     const boxH = Math.max(1, Math.abs(yQ1 - yQ3));
 
     // Whiskers: vertical line from box edges to whisker ends, with end caps.
+    // Interpolated quartiles let a whisker end (the most extreme non-outlier)
+    // lie inside the box when the observation beyond it is an outlier.
+    // Observed PowerPoint 16.113 behavior, both quartile methods, both sides
+    // (synthetic controls, 54 groups): a whisker end beyond its box edge gets
+    // a stem and a cap; one equal to the edge gets only a cap (on the edge);
+    // one inside the box gets neither.
     const capW = boxW * 0.4;
     if (applyResolvedChartExLineStyle(ctx, boxLine, ptToPx)) {
+      const yHi = yOf(stats.whiskerHi);
+      const yLo = yOf(stats.whiskerLo);
       ctx.beginPath();
-      ctx.moveTo(cx, yOf(stats.whiskerHi)); ctx.lineTo(cx, yQ3);
-      ctx.moveTo(cx, yQ1); ctx.lineTo(cx, yOf(stats.whiskerLo));
-      ctx.moveTo(cx - capW / 2, yOf(stats.whiskerHi)); ctx.lineTo(cx + capW / 2, yOf(stats.whiskerHi));
-      ctx.moveTo(cx - capW / 2, yOf(stats.whiskerLo)); ctx.lineTo(cx + capW / 2, yOf(stats.whiskerLo));
+      if (stats.whiskerHi > stats.q3) { ctx.moveTo(cx, yHi); ctx.lineTo(cx, yQ3); }
+      if (stats.whiskerLo < stats.q1) { ctx.moveTo(cx, yQ1); ctx.lineTo(cx, yLo); }
+      if (stats.whiskerHi >= stats.q3) {
+        ctx.moveTo(cx - capW / 2, yHi); ctx.lineTo(cx + capW / 2, yHi);
+      }
+      if (stats.whiskerLo <= stats.q1) {
+        ctx.moveTo(cx - capW / 2, yLo); ctx.lineTo(cx + capW / 2, yLo);
+      }
       ctx.stroke();
     }
 

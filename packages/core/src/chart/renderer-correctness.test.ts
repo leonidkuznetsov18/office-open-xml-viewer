@@ -22562,6 +22562,86 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(outlier!.index).toBeLessThan(firstCross);
   });
 
+  it.each([
+    {
+      name: 'inclusive lower end inside the box', method: 'inclusive',
+      values: [0, 120, 124, 200], caps: [200], stems: [[143, 200]],
+    },
+    {
+      name: 'inclusive upper end inside the box', method: 'inclusive',
+      values: [0, 76, 80, 200], caps: [0], stems: [[0, 57]],
+    },
+    {
+      name: 'exclusive lower end inside and upper end on the edge', method: 'exclusive',
+      values: [37, 101, 101, 101, 101, 101], caps: [101], stems: [],
+    },
+    {
+      name: 'exclusive upper end inside and lower end on the edge', method: 'exclusive',
+      values: [90, 90, 90, 90, 90, 170], caps: [90], stems: [],
+    },
+    {
+      name: 'both ends on coincident box edges', method: 'exclusive',
+      values: [20, 100, 100, 100, 100, 100, 100, 100, 180], caps: [100, 100], stems: [],
+    },
+    {
+      name: 'both ends beyond the box edges', method: 'inclusive',
+      values: [10, 55, 100, 145, 190], caps: [10, 190], stems: [[10, 55], [145, 190]],
+    },
+  ])('draws whisker stems and caps for $name', ({ method, values, caps, stems }) => {
+    const rec = segRecordingCtx();
+    renderChart(rec.ctx, boxModel({
+      title: null,
+      valMin: 0, valMax: 200,
+      valAxisLineColor: '123456',
+      valAxisMajorTickMark: 'none', valAxisMinorTickMark: 'none',
+      valAxisMajorGridlines: false, valAxisMinorGridlines: false,
+      chartexBox: {
+        categories: ['A'],
+        series: [{
+          name: 'S1', color: 'ED7D31', lineColor: 'FF00FF', valuesByCategory: [values],
+          meanMarker: false, meanLine: false, showOutliers: false, showNonoutliers: false,
+          quartileMethod: method,
+        }],
+      },
+    }), RECT, 1);
+
+    // Calibrate the data coordinates from the painted value axis, so these
+    // expectations remain independent of automatic plot padding and layout.
+    const axis = rec.segs.find(segment => segment.ss === '#123456');
+    expect(axis).toBeDefined();
+    const { y0: top, y1: bottom } = axis as Seg;
+    const yOf = (value: number) => bottom - (bottom - top) * value / 200;
+    const seriesSegments = rec.segs.filter(segment => segment.ss === '#FF00FF');
+    const horizontal = seriesSegments.filter(segment =>
+      segment.y0 === segment.y1 && segment.x0 !== segment.x1);
+    // The median spans the box width; caps span 40% of that width.
+    const median = horizontal.reduce((widest, segment) =>
+      segment.x1 - segment.x0 > widest.x1 - widest.x0 ? segment : widest);
+    const centerX = (median.x0 + median.x1) / 2;
+    const capWidth = (median.x1 - median.x0) * 0.4;
+    const actualCaps = horizontal.filter(segment => segment !== median)
+      .sort((a, b) => a.y0 - b.y0);
+    expect(actualCaps).toHaveLength(caps.length);
+    const expectedCapYs = caps.map(yOf).sort((a, b) => a - b);
+    actualCaps.forEach((segment, index) => {
+      expect(segment.x0).toBeCloseTo(centerX - capWidth / 2, 8);
+      expect(segment.x1).toBeCloseTo(centerX + capWidth / 2, 8);
+      expect(segment.y0).toBeCloseTo(expectedCapYs[index], 8);
+    });
+
+    // Include zero-length segments: equality must never paint a stem.
+    const actualStems = seriesSegments.filter(segment => segment.x0 === segment.x1)
+      .sort((a, b) => Math.min(a.y0, a.y1) - Math.min(b.y0, b.y1));
+    expect(actualStems).toHaveLength(stems.length);
+    const expectedStemYs = stems.map(([lo, hi]) => [yOf(hi), yOf(lo)])
+      .sort((a, b) => a[0] - b[0]);
+    actualStems.forEach((segment, index) => {
+      expect(segment.x0).toBeCloseTo(centerX, 8);
+      expect(Math.min(segment.y0, segment.y1)).toBeCloseTo(expectedStemYs[index][0], 8);
+      expect(Math.max(segment.y0, segment.y1)).toBeCloseTo(expectedStemYs[index][1], 8);
+    });
+  });
+
   it('strokes the mean × with the whisker line, not the generic marker outline', () => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, boxModel({
@@ -22625,7 +22705,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(rec.fillRects.length).toBeGreaterThanOrEqual(4);
   });
 
-  it('uses median-of-halves quartiles for inclusive and exclusive methods', () => {
+  it('classifies outliers with the fences of the authored quartile method', () => {
     const values = [1, 2, 3, 4, 100];
     const exclusive = markerRecordingCtx();
     renderChart(exclusive.ctx, boxModel({
@@ -22650,8 +22730,8 @@ describe('CH15 — chartEx box-and-whisker', () => {
       },
     }), RECT, 1);
 
-    // Inclusive includes the median in each half: Q3=4, so 100 is an outlier.
-    // Exclusive omits it: Q3=(4+100)/2, so the same point stays inside.
+    // Inclusive puts Q3 at position 4 (the value 4), so 100 is an outlier.
+    // Exclusive puts it at position 4.5 (52), so the same point stays inside.
     expect(exclusive.arcs).toHaveLength(0);
     expect(inclusive.arcs).toHaveLength(1);
   });
