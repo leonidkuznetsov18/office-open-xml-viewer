@@ -4611,6 +4611,34 @@ describe('classic 3-D compatibility projection', () => {
     expect(rec.drawImages).toHaveLength(0);
   });
 
+  it.each(['clusteredColumn', 'pareto'] as const)(
+    'charges repeated ChartEx %s column paint at the 256/257 boundary',
+    chartType => {
+      const stops = Array.from({ length: 4_096 }, (_, index) => ({
+        position: index / 4_095,
+        color: '112233',
+      }));
+      const build = (count: number): ChartModel => baseModel({
+        chartType,
+        categories: Array.from({ length: count }, (_, index) => String(index)),
+        series: [series({ values: Array<number | null>(count).fill(1) })],
+        chartexDataPointStyle: {
+          fillPaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          linePaintAuthored: true,
+        },
+        chartexDataPointLineStyle: { lineHidden: true, linePaintAuthored: true },
+      });
+      expect(chartExDataMarkPaintWorkCount(build(256), RECT, 1)).toBe(1_048_576);
+      expect(chartExDataMarkPaintWorkCount(build(257), RECT, 1)).toBe(1_048_577);
+      const rec = recordingCtx();
+      renderChart(rec.ctx, build(257), RECT, 1);
+      expect(rec.texts.some(text => text.text === '(too many data points)')).toBe(true);
+      expect(rec.gradients).toHaveLength(0);
+    },
+  );
+
   it('atomically bounds repeated ChartEx data-mark paint at the 256/257 boundary', () => {
     const stops = Array.from({ length: 4_096 }, (_, index) => ({
       position: index / 4_095,

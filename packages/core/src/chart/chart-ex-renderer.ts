@@ -175,7 +175,10 @@ export function chartExDataMarkPaintWorkCount(
   chartRect: ChartRect,
   ptToPx = 1,
 ): number | null {
-  if (!['waterfall', 'funnel', 'boxWhisker', 'sunburst', 'treemap'].includes(chart.chartType)) {
+  if (![
+    'waterfall', 'funnel', 'boxWhisker', 'sunburst', 'treemap',
+    'clusteredColumn', 'histogram', 'pareto', 'paretoLine',
+  ].includes(chart.chartType)) {
     return null;
   }
   let total = 0;
@@ -205,7 +208,64 @@ export function chartExDataMarkPaintWorkCount(
     if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
   };
 
-  if (chart.chartType === 'waterfall') {
+  // ChartEx columns (plain, histogram bins, owner-backed Pareto bars) paint a
+  // fill and an outline per non-empty bar through the ChartEx point cascade,
+  // exactly as the bar family's ChartEx column path does.
+  const chargeColumns = (
+    series: ChartSeries,
+    values: readonly (number | null | undefined)[],
+    styleIndex: number,
+    count: number,
+  ): void => {
+    const overrides = indexPointOverrides(series.dataPointOverrides);
+    for (let index = 0; index < values.length; index++) {
+      const value = values[index];
+      if (value == null || !Number.isFinite(value) || value === 0) continue;
+      const point = overrides.get(index);
+      charge(resolveChartExPointFill(chart, series, point, styleIndex, count));
+      const line = resolveChartExPointLine(
+        chart, series, point, styleIndex, count, '#000000',
+        chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
+      );
+      if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
+      if (total > MAX_CHART_PAINT_COMPONENTS) return;
+    }
+  };
+  const chargeParetoLine = (series: ChartSeries | undefined, styleIndex: number): void => {
+    const roles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
+    const line = resolveChartExLineChain(
+      chart, series, roles, roles, styleIndex, 1, '#000000', { linkedNoStyleFallback: true },
+    );
+    if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
+  };
+
+  if (chart.chartType === 'clusteredColumn') {
+    const columns = chart.series.filter(series => series.seriesType !== 'line');
+    columns.forEach((series, index) => chargeColumns(
+      series, series.values, chartExSeriesFormatIndex(series, index), columns.length,
+    ));
+  } else if (chart.chartType === 'histogram') {
+    const source = chart.series[0];
+    if (source) {
+      const plan = planHistogramBins(source.values, chart.chartexHistogramBinning ?? {});
+      if (plan.kind === 'tooManyInputPoints') return MAX_CHART_PAINT_COMPONENTS + 1;
+      chargeColumns(source, plan.counts, chartExSeriesFormatIndex(source, 0), 1);
+    }
+  } else if (chart.chartType === 'pareto') {
+    const owner = chart.series[0];
+    if (owner) {
+      const layout = planParetoLayout(owner, chart.categories);
+      chargeColumns(
+        layout.orderedSeries, layout.orderedSeries.values,
+        chartExSeriesFormatIndex(owner, 0), 1,
+      );
+      const authoredLine = chart.series.find(series => series.seriesType === 'line');
+      chargeParetoLine(authoredLine, authoredLine?.chartexFormatIdx ?? owner.chartexFormatIdx ?? 0);
+    }
+  } else if (chart.chartType === 'paretoLine') {
+    const source = chart.series[0];
+    if (source) chargeParetoLine(source, chartExSeriesFormatIndex(source, 0));
+  } else if (chart.chartType === 'waterfall') {
     const series = chart.series[0];
     const values = series?.values ?? [];
     const overrides = indexPointOverrides(series?.dataPointOverrides);
