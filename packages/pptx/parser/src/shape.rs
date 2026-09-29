@@ -1128,12 +1128,12 @@ pub(crate) fn parse_shape(
         inherited_line_spacing,
     ) = if placeholder_inherits {
         (
-            lph.lookup_bold(&ph_type),
-            lph.lookup_italic(&ph_type),
-            lph.lookup_caps(&ph_type),
-            lph.lookup_reflection(&ph_type),
+            lph.lookup_bold(&ph_type, ph_idx),
+            lph.lookup_italic(&ph_type, ph_idx),
+            lph.lookup_caps(&ph_type, ph_idx),
+            lph.lookup_reflection(&ph_type, ph_idx),
             lph.lookup_alignment(&ph_type, ph_idx),
-            lph.lookup_ea_ln_brk(&ph_type),
+            lph.lookup_ea_ln_brk(&ph_type, ph_idx),
             lph.lookup_space_before(&ph_type, ph_idx),
             lph.lookup_space_after(&ph_type, ph_idx),
             lph.lookup_line_spacing(&ph_type, ph_idx),

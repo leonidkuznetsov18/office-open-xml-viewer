@@ -74,6 +74,8 @@ pub(crate) struct LayoutPlaceholders {
     /// The presentation `defaultTextStyle` levels for ordinary (non-placeholder)
     /// text, resolved against this master's theme.
     pub(crate) default_text: DefaultTextLevels,
+    /// txStyles-only tier for an idx with no layout slot (`MasterStyleTier`).
+    pub(crate) styles: MasterStyleTier,
     /// Per-list-level default font sizes (pt) per placeholder idx — index 0..=8
     /// maps to lvl1pPr..lvl9pPr (ECMA-376 §21.1.2.4). Lets nested bullets shrink
     /// per level (e.g. body 28pt → lvl2 24pt → lvl3 20pt) instead of all using
@@ -334,6 +336,11 @@ impl LayoutPlaceholders {
     /// `lookup_level_font_sizes`.
     pub(crate) fn lookup_level_faces(&self, ph_type: &str, ph_idx: Option<u32>) -> LevelFaces {
         if let Some(i) = ph_idx {
+            // Bound slot: layout -> master placeholder -> class style,
+            // already merged. Unmatched idx: the style tier below.
+            if self.by_idx_placeholder_type.contains_key(&i) {
+                return self.by_idx_level_faces.get(&i).cloned().unwrap_or_default();
+            }
             return self
                 .by_idx_level_faces
                 .get(&i)
@@ -370,6 +377,15 @@ impl LayoutPlaceholders {
         ph_idx: Option<u32>,
     ) -> LevelFontSizes {
         if let Some(i) = ph_idx {
+            // Bound slot: layout -> master placeholder -> class style,
+            // already merged. Unmatched idx: the style tier below.
+            if self.by_idx_placeholder_type.contains_key(&i) {
+                return self
+                    .by_idx_level_sizes
+                    .get(&i)
+                    .copied()
+                    .unwrap_or([None; 9]);
+            }
             return self
                 .by_idx_level_sizes
                 .get(&i)
@@ -399,6 +415,15 @@ impl LayoutPlaceholders {
 
     pub(crate) fn lookup_level_colors(&self, ph_type: &str, ph_idx: Option<u32>) -> LevelColors {
         if let Some(i) = ph_idx {
+            // Bound slot: layout -> master placeholder -> class style,
+            // already merged. Unmatched idx: the style tier below.
+            if self.by_idx_placeholder_type.contains_key(&i) {
+                return self
+                    .by_idx_level_colors
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_else(|| std::array::from_fn(|_| None));
+            }
             return self
                 .by_idx_level_colors
                 .get(&i)
@@ -469,6 +494,15 @@ impl LayoutPlaceholders {
     /// the placeholder has no authored per-level indent.
     pub(crate) fn lookup_level_indents(&self, ph_type: &str, ph_idx: Option<u32>) -> LevelIndents {
         if let Some(i) = ph_idx {
+            // Bound slot: layout -> master placeholder -> class style,
+            // already merged. Unmatched idx: the style tier below.
+            if self.by_idx_placeholder_type.contains_key(&i) {
+                return self
+                    .by_idx_level_indents
+                    .get(&i)
+                    .copied()
+                    .unwrap_or_default();
+            }
             return self
                 .by_idx_level_indents
                 .get(&i)
@@ -500,6 +534,15 @@ impl LayoutPlaceholders {
     /// `lookup_level_font_sizes`. All-None when the placeholder inherits no bullet.
     pub(crate) fn lookup_level_bullets(&self, ph_type: &str, ph_idx: Option<u32>) -> LevelBullets {
         if let Some(i) = ph_idx {
+            // Bound slot: layout -> master placeholder -> class style,
+            // already merged. Unmatched idx: the style tier below.
+            if self.by_idx_placeholder_type.contains_key(&i) {
+                return self
+                    .by_idx_level_bullets
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_else(empty_level_bullets);
+            }
             return self
                 .by_idx_level_bullets
                 .get(&i)
@@ -528,7 +571,12 @@ impl LayoutPlaceholders {
     }
 
     /// Look up inherited bold for this placeholder type.
-    pub(crate) fn lookup_bold(&self, ph_type: &str) -> Option<bool> {
+    pub(crate) fn lookup_bold(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<bool> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.bold, ph_type).cloned();
+            }
+        }
         self.by_type_bold.get(ph_type).copied().or_else(|| {
             if ph_type == "body" {
                 self.by_type_bold.get("").copied()
@@ -539,7 +587,12 @@ impl LayoutPlaceholders {
     }
 
     /// Look up inherited italic for this placeholder type.
-    pub(crate) fn lookup_italic(&self, ph_type: &str) -> Option<bool> {
+    pub(crate) fn lookup_italic(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<bool> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.italic, ph_type).cloned();
+            }
+        }
         self.by_type_italic.get(ph_type).copied().or_else(|| {
             if ph_type == "body" {
                 self.by_type_italic.get("").copied()
@@ -550,7 +603,12 @@ impl LayoutPlaceholders {
     }
 
     /// Look up inherited caps ("all"/"small") for this placeholder type.
-    pub(crate) fn lookup_caps(&self, ph_type: &str) -> Option<String> {
+    pub(crate) fn lookup_caps(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<String> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.caps, ph_type).cloned();
+            }
+        }
         self.by_type_caps.get(ph_type).cloned().or_else(|| {
             if ph_type == "body" {
                 self.by_type_caps.get("").cloned()
@@ -560,7 +618,16 @@ impl LayoutPlaceholders {
         })
     }
 
-    pub(crate) fn lookup_reflection(&self, ph_type: &str) -> Option<Reflection> {
+    pub(crate) fn lookup_reflection(
+        &self,
+        ph_type: &str,
+        ph_idx: Option<u32>,
+    ) -> Option<Reflection> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.reflection, ph_type).cloned();
+            }
+        }
         self.by_type_reflection.get(ph_type).cloned().or_else(|| {
             if ph_type == "body" {
                 self.by_type_reflection.get("").cloned()
@@ -655,6 +722,11 @@ impl LayoutPlaceholders {
     /// typeless sibling's alignment (ECMA-376 §19.3.1.36 idx matching).
     pub(crate) fn lookup_alignment(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<String> {
         if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.alignment, ph_type).cloned();
+            }
+        }
+        if let Some(i) = ph_idx {
             if let Some(a) = self.by_idx_alignment.get(&i) {
                 return Some(a.clone());
             }
@@ -686,7 +758,12 @@ impl LayoutPlaceholders {
     // layout per-type → layout generic ("") for body → master per-type →
     // master generic. None means no ancestor specified it (parse_paragraph then
     // applies the spec default of true).
-    pub(crate) fn lookup_ea_ln_brk(&self, ph_type: &str) -> Option<bool> {
+    pub(crate) fn lookup_ea_ln_brk(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<bool> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.ea_ln_brk, ph_type).cloned();
+            }
+        }
         self.by_type_ea_ln_brk
             .get(ph_type)
             .copied()
@@ -712,6 +789,11 @@ impl LayoutPlaceholders {
         ph_type: &str,
         ph_idx: Option<u32>,
     ) -> Option<ParagraphSpacing> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.space_before, ph_type).cloned();
+            }
+        }
         let layout = if let Some(idx) = ph_idx {
             self.by_idx_space_before.get(&idx).copied()
         } else {
@@ -739,6 +821,11 @@ impl LayoutPlaceholders {
         ph_type: &str,
         ph_idx: Option<u32>,
     ) -> Option<ParagraphSpacing> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.space_after, ph_type).cloned();
+            }
+        }
         let layout = if let Some(idx) = ph_idx {
             self.by_idx_space_after.get(&idx).copied()
         } else {
@@ -845,6 +932,11 @@ impl LayoutPlaceholders {
     /// bodyStyle colour (e.g. `schemeClr bg1` = white on a dark theme). (sample-9 slide 2+)
     pub(crate) fn lookup_color(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<String> {
         if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.color, ph_type).cloned();
+            }
+        }
+        if let Some(i) = ph_idx {
             if let Some(c) = self.by_idx_color.get(&i) {
                 return Some(c.clone());
             }
@@ -932,6 +1024,11 @@ impl LayoutPlaceholders {
     /// Look up inherited line spacing (spcPct val, e.g. 90000 = 90%) for this placeholder.
     /// Idx-strict per ECMA-376 §19.3.1.36 (see `lookup_fill`'s rationale).
     pub(crate) fn lookup_line_spacing(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<f64> {
+        if let Some(i) = ph_idx {
+            if !self.by_idx_placeholder_type.contains_key(&i) {
+                return MasterStyleTier::get(&self.styles.line_spacing, ph_type).cloned();
+            }
+        }
         // The layout placeholder itself inherits the master text style for its
         // type (ECMA-376 §19.3.1.36 / §19.3.1.51), so an idx-matched layout
         // placeholder without lnSpc still yields the master level-1 value.
@@ -1107,10 +1204,21 @@ fn master_without_tx_styles(root: roxmltree::Node<'_, '_>) -> bool {
     child(root, "txStyles").is_none()
 }
 
+/// A master placeholder's `txBody/lstStyle/lvl1pPr`.
+fn master_placeholder_lvl1<'a, 'i>(sp: roxmltree::Node<'a, 'i>) -> Option<roxmltree::Node<'a, 'i>> {
+    child(sp, "txBody")
+        .and_then(|tb| child(tb, "lstStyle"))
+        .and_then(|ls| child(ls, "lvl1pPr"))
+}
+
 /// Master placeholder shapes as (effective type, shape) in document order.
 fn master_placeholder_shapes<'a, 'i>(
     root: roxmltree::Node<'a, 'i>,
+    with_placeholders: bool,
 ) -> Vec<(String, roxmltree::Node<'a, 'i>)> {
+    if !with_placeholders {
+        return Vec::new();
+    }
     let Some(sp_tree) = child(root, "cSld").and_then(|n| child(n, "spTree")) else {
         return Vec::new();
     };
@@ -1134,11 +1242,11 @@ fn master_placeholder_shapes<'a, 'i>(
 /// bodyStyle face and bullet. Applied to the face, size and paragraph-level
 /// maps (bullets, indents, alignment, eaLnBrk); the other character
 /// properties keep the per-type master placeholder lookup of #1625.
+const MASTER_PLACEHOLDER_CLASSES: [(&str, &[&str]); 2] =
+    [("title", &["ctrTitle"]), ("body", &["subTitle", "obj", ""])];
+
 fn inherit_master_placeholder_classes<T: Clone>(map: &mut HashMap<String, T>) {
-    for (source, targets) in [
-        ("title", &["ctrTitle"][..]),
-        ("body", &["subTitle", "obj", ""][..]),
-    ] {
+    for (source, targets) in MASTER_PLACEHOLDER_CLASSES {
         if let Some(value) = map.get(source).cloned() {
             for target in targets {
                 map.entry((*target).to_owned())
@@ -1151,8 +1259,15 @@ fn inherit_master_placeholder_classes<T: Clone>(map: &mut HashMap<String, T>) {
 /// Parse paragraph alignment from master placeholder shapes' lstStyle > lvl1pPr algn,
 /// then the class list styles.
 pub(crate) fn parse_master_alignments(root: roxmltree::Node<'_, '_>) -> HashMap<String, String> {
+    parse_master_alignments_tier(root, true)
+}
+
+pub(crate) fn parse_master_alignments_tier(
+    root: roxmltree::Node<'_, '_>,
+    with_placeholders: bool,
+) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(algn) = child(sp, "txBody")
             .and_then(|tb| child(tb, "lstStyle"))
             .and_then(|ls| child(ls, "lvl1pPr"))
@@ -1176,8 +1291,15 @@ pub(crate) fn parse_master_alignments(root: roxmltree::Node<'_, '_>) -> HashMap<
 /// type from each placeholder shape's lstStyle > lvl1pPr @eaLnBrk
 /// (ECMA-376 §21.1.2.2.7). Mirrors parse_master_alignments. xsd:boolean.
 pub(crate) fn parse_master_ea_ln_brk(root: roxmltree::Node<'_, '_>) -> HashMap<String, bool> {
+    parse_master_ea_ln_brk_tier(root, true)
+}
+
+pub(crate) fn parse_master_ea_ln_brk_tier(
+    root: roxmltree::Node<'_, '_>,
+    with_placeholders: bool,
+) -> HashMap<String, bool> {
     let mut map = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(v) = child(sp, "txBody")
             .and_then(|tb| child(tb, "lstStyle"))
             .and_then(|ls| child(ls, "lvl1pPr"))
@@ -1187,6 +1309,15 @@ pub(crate) fn parse_master_ea_ln_brk(root: roxmltree::Node<'_, '_>) -> HashMap<S
         }
     }
     inherit_master_placeholder_classes(&mut map);
+    // txStyles fallback (the same class mapping as the other paragraph maps).
+    for (style, types) in tx_style_nodes(root) {
+        if let Some(v) = child(style, "lvl1pPr").and_then(|lp| attr(&lp, "eaLnBrk")) {
+            for t in types {
+                map.entry((*t).to_string())
+                    .or_insert(v == "1" || v == "true");
+            }
+        }
+    }
     map
 }
 
@@ -1200,8 +1331,17 @@ pub(crate) fn parse_master_level_faces(
     theme: &HashMap<String, String>,
     default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> HashMap<String, LevelFaces> {
+    parse_master_level_faces_tier(root, theme, default_text_style, true)
+}
+
+pub(crate) fn parse_master_level_faces_tier(
+    root: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    default_text_style: Option<roxmltree::Node<'_, '_>>,
+    with_placeholders: bool,
+) -> HashMap<String, LevelFaces> {
     let mut map: HashMap<String, LevelFaces> = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(tx_body) = child(sp, "txBody") {
             let faces = extract_level_faces(tx_body, theme);
             if has_any_level_face(&faces) {
@@ -1241,8 +1381,16 @@ pub(crate) fn parse_master_level_font_sizes(
     root: roxmltree::Node<'_, '_>,
     default_text_style: Option<roxmltree::Node<'_, '_>>,
 ) -> HashMap<String, LevelFontSizes> {
+    parse_master_level_font_sizes_tier(root, default_text_style, true)
+}
+
+pub(crate) fn parse_master_level_font_sizes_tier(
+    root: roxmltree::Node<'_, '_>,
+    default_text_style: Option<roxmltree::Node<'_, '_>>,
+    with_placeholders: bool,
+) -> HashMap<String, LevelFontSizes> {
     let mut map: HashMap<String, LevelFontSizes> = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(tx_body) = child(sp, "txBody") {
             let sizes = extract_level_font_sizes(tx_body);
             if has_any_level_size(&sizes) {
@@ -1280,8 +1428,16 @@ pub(crate) fn parse_master_level_colors(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
 ) -> HashMap<String, LevelColors> {
+    parse_master_level_colors_tier(root, theme, true)
+}
+
+pub(crate) fn parse_master_level_colors_tier(
+    root: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    with_placeholders: bool,
+) -> HashMap<String, LevelColors> {
     let mut specific: HashMap<String, LevelColors> = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(tx_body) = child(sp, "txBody") {
             let colors = extract_level_colors(tx_body, theme);
             if has_any_level_color(&colors) {
@@ -1320,9 +1476,19 @@ pub(crate) fn parse_master_level_run_properties(
     master_rels: &HashMap<String, String>,
     master_dir: &str,
 ) -> MasterLevelRunProperties {
+    parse_master_level_run_properties_tier(root, theme, master_rels, master_dir, true)
+}
+
+pub(crate) fn parse_master_level_run_properties_tier(
+    root: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    master_rels: &HashMap<String, String>,
+    master_dir: &str,
+    with_placeholders: bool,
+) -> MasterLevelRunProperties {
     let mut specific = HashMap::new();
     let mut styles: HashMap<String, LevelRunProperties> = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(body) = child(sp, "txBody") {
             let props = extract_level_run_properties_with_rels(body, theme, master_rels)
                 .map(|p| p.with_part_targets(master_dir));
@@ -1374,8 +1540,15 @@ pub(crate) struct MasterLevelRunProperties {
 pub(crate) fn parse_master_level_indents(
     root: roxmltree::Node<'_, '_>,
 ) -> HashMap<String, LevelIndents> {
+    parse_master_level_indents_tier(root, true)
+}
+
+pub(crate) fn parse_master_level_indents_tier(
+    root: roxmltree::Node<'_, '_>,
+    with_placeholders: bool,
+) -> HashMap<String, LevelIndents> {
     let mut map: HashMap<String, LevelIndents> = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(tx_body) = child(sp, "txBody") {
             let indents = extract_level_indents(tx_body);
             if has_any_level_indent(&indents) {
@@ -1414,6 +1587,17 @@ pub(crate) fn parse_master_level_bullets(
     master_dir: &str,
     zip: &mut PptxZip,
 ) -> HashMap<String, LevelBullets> {
+    parse_master_level_bullets_tier(root, theme, master_rels, master_dir, zip, true)
+}
+
+pub(crate) fn parse_master_level_bullets_tier(
+    root: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    master_rels: &HashMap<String, String>,
+    master_dir: &str,
+    zip: &mut PptxZip,
+    with_placeholders: bool,
+) -> HashMap<String, LevelBullets> {
     let mut map: HashMap<String, LevelBullets> = HashMap::new();
 
     // A master-level `<a:buBlip>` embed resolves against the master's rels +
@@ -1427,7 +1611,7 @@ pub(crate) fn parse_master_level_bullets(
         Some(path)
     };
 
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(tx_body) = child(sp, "txBody") {
             let bullets = extract_level_bullets(tx_body, theme, &mut resolve_blip);
             if has_any_level_bullet(&bullets) {
@@ -1479,6 +1663,13 @@ type MasterTxStyleRunProperties = (
 pub(crate) fn parse_master_txstyle_run_properties(
     root: roxmltree::Node<'_, '_>,
 ) -> MasterTxStyleRunProperties {
+    parse_master_txstyle_run_properties_tier(root, true)
+}
+
+pub(crate) fn parse_master_txstyle_run_properties_tier(
+    root: roxmltree::Node<'_, '_>,
+    with_placeholders: bool,
+) -> MasterTxStyleRunProperties {
     let mut bold_map: HashMap<String, bool> = HashMap::new();
     let mut italic_map: HashMap<String, bool> = HashMap::new();
     // ECMA-376 §21.1.2.3.9, ST_TextCapsType §20.1.10.64: cap="all"/"small"
@@ -1486,8 +1677,7 @@ pub(crate) fn parse_master_txstyle_run_properties(
     // upper-cases every title.
     let mut caps_map: HashMap<String, String> = HashMap::new();
     let mut reflection_map: HashMap<String, Reflection> = HashMap::new();
-    for (style_node, ph_types) in tx_style_nodes(root) {
-        let def_rpr = child(style_node, "lvl1pPr").and_then(|lp| child(lp, "defRPr"));
+    let mut read = |def_rpr: Option<roxmltree::Node<'_, '_>>, types: &[&str]| {
         let b = def_rpr
             .and_then(|rp| attr(&rp, "b"))
             .map(|v| v == "1" || v == "true");
@@ -1500,28 +1690,39 @@ pub(crate) fn parse_master_txstyle_run_properties(
         let reflection = def_rpr
             .and_then(|rp| child(rp, "effectLst"))
             .and_then(parse_reflection);
-        if let Some(bv) = b {
-            for t in ph_types {
+        for t in types {
+            if let Some(bv) = b {
                 bold_map.entry(t.to_string()).or_insert(bv);
             }
-        }
-        if let Some(iv) = i {
-            for t in ph_types {
+            if let Some(iv) = i {
                 italic_map.entry(t.to_string()).or_insert(iv);
             }
-        }
-        if let Some(cv) = c {
-            for t in ph_types {
+            if let Some(cv) = &c {
                 caps_map.entry(t.to_string()).or_insert(cv.clone());
             }
-        }
-        if let Some(value) = reflection {
-            for t in ph_types {
+            if let Some(value) = &reflection {
                 reflection_map
                     .entry(t.to_string())
                     .or_insert_with(|| value.clone());
             }
         }
+    };
+    // Master placeholder lstStyle first (with the class mapping), then txStyles.
+    let placeholders = master_placeholder_shapes(root, with_placeholders);
+    let lvl1_def_rpr = |sp| master_placeholder_lvl1(sp).and_then(|lp| child(lp, "defRPr"));
+    for (ph_type, sp) in &placeholders {
+        read(lvl1_def_rpr(*sp), &[ph_type.as_str()]);
+    }
+    for (source, targets) in MASTER_PLACEHOLDER_CLASSES {
+        if let Some((_, sp)) = placeholders.iter().find(|(t, _)| t == source) {
+            read(lvl1_def_rpr(*sp), targets);
+        }
+    }
+    for (style_node, ph_types) in tx_style_nodes(root) {
+        read(
+            child(style_node, "lvl1pPr").and_then(|lp| child(lp, "defRPr")),
+            ph_types,
+        );
     }
     (bold_map, italic_map, caps_map, reflection_map)
 }
@@ -1532,8 +1733,16 @@ pub(crate) fn parse_master_txstyle_color(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
 ) -> HashMap<String, String> {
+    parse_master_txstyle_color_tier(root, theme, true)
+}
+
+pub(crate) fn parse_master_txstyle_color_tier(
+    root: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    with_placeholders: bool,
+) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
-    for (ph_type, sp) in master_placeholder_shapes(root) {
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(color) = child(sp, "txBody")
             .and_then(|tb| child(tb, "lstStyle"))
             .and_then(|ls| child(ls, "lvl1pPr"))
@@ -1567,18 +1776,28 @@ pub(crate) fn parse_master_txstyle_spacing(
     HashMap<String, ParagraphSpacing>,
     HashMap<String, f64>,
 ) {
+    parse_master_txstyle_spacing_tier(root, true)
+}
+
+pub(crate) fn parse_master_txstyle_spacing_tier(
+    root: roxmltree::Node<'_, '_>,
+    with_placeholders: bool,
+) -> (
+    HashMap<String, ParagraphSpacing>,
+    HashMap<String, ParagraphSpacing>,
+    HashMap<String, f64>,
+) {
     let mut before_map: HashMap<String, ParagraphSpacing> = HashMap::new();
     let mut after_map: HashMap<String, ParagraphSpacing> = HashMap::new();
     let mut line_map: HashMap<String, f64> = HashMap::new();
-    for (style_node, ph_types) in tx_style_nodes(root) {
-        let lvl1 = child(style_node, "lvl1pPr");
+    let mut read = |lvl1: Option<roxmltree::Node<'_, '_>>, types: &[&str]| {
         let spc_before = lvl1.and_then(|lp| paragraph_spacing(lp, "spcBef"));
         let spc_after = lvl1.and_then(|lp| paragraph_spacing(lp, "spcAft"));
         let line = lvl1
             .and_then(|lp| child(lp, "lnSpc"))
             .and_then(|ls| child(ls, "spcPct"))
             .and_then(|s| attr_f64(&s, "val"));
-        for ph_type in ph_types {
+        for ph_type in types {
             if let Some(v) = line {
                 line_map.entry(ph_type.to_string()).or_insert(v);
             }
@@ -1589,8 +1808,99 @@ pub(crate) fn parse_master_txstyle_spacing(
                 after_map.entry(ph_type.to_string()).or_insert(v);
             }
         }
+    };
+    // Master placeholder lstStyle first (with the class mapping), then txStyles.
+    let placeholders = master_placeholder_shapes(root, with_placeholders);
+    let lvl1 = master_placeholder_lvl1;
+    for (ph_type, sp) in &placeholders {
+        read(lvl1(*sp), &[ph_type.as_str()]);
+    }
+    for (source, targets) in MASTER_PLACEHOLDER_CLASSES {
+        if let Some((_, sp)) = placeholders.iter().find(|(t, _)| t == source) {
+            read(lvl1(*sp), targets);
+        }
+    }
+    for (style_node, ph_types) in tx_style_nodes(root) {
+        read(child(style_node, "lvl1pPr"), ph_types);
     }
     (before_map, after_map, line_map)
+}
+
+/// The txStyles-only tier of every list-style map, for a slide placeholder
+/// whose idx has no layout slot. Observed (#1620 controls): body, obj and
+/// typeless placeholders with an unmatched idx took bodyStyle's colour, bold,
+/// italic, underline and caps, not the master placeholder lstStyle's, while
+/// the same types bound to a layout slot took the master placeholder's values.
+/// Every per-level and paragraph map follows the same two tiers:
+///
+/// * bound to a layout slot: layout slot -> master placeholder (obj, subTitle
+///   and typeless use the master body placeholder) -> class style;
+/// * unmatched idx: class style only (this tier);
+/// * dt/ftr/sldNum: face and size from defaultTextStyle, every other property
+///   from otherStyle (`class_style_nodes` / `tx_style_nodes`).
+#[derive(Clone, Default, serde::Serialize)]
+pub(crate) struct MasterStyleTier {
+    pub(crate) faces: HashMap<String, LevelFaces>,
+    pub(crate) sizes: HashMap<String, LevelFontSizes>,
+    pub(crate) colors: HashMap<String, LevelColors>,
+    pub(crate) indents: HashMap<String, LevelIndents>,
+    pub(crate) bullets: HashMap<String, LevelBullets>,
+    pub(crate) alignment: HashMap<String, String>,
+    pub(crate) ea_ln_brk: HashMap<String, bool>,
+    pub(crate) space_before: HashMap<String, ParagraphSpacing>,
+    pub(crate) space_after: HashMap<String, ParagraphSpacing>,
+    pub(crate) line_spacing: HashMap<String, f64>,
+    pub(crate) color: HashMap<String, String>,
+    pub(crate) bold: HashMap<String, bool>,
+    pub(crate) italic: HashMap<String, bool>,
+    pub(crate) caps: HashMap<String, String>,
+    pub(crate) reflection: HashMap<String, Reflection>,
+}
+
+impl MasterStyleTier {
+    /// Resolve against `theme` (the master's, or a clrMapOvr slide's).
+    pub(crate) fn parse(
+        root: roxmltree::Node<'_, '_>,
+        theme: &HashMap<String, String>,
+        master_rels: &HashMap<String, String>,
+        master_dir: &str,
+        default_text_style: Option<roxmltree::Node<'_, '_>>,
+        zip: &mut PptxZip,
+    ) -> Self {
+        let (space_before, space_after, line_spacing) =
+            parse_master_txstyle_spacing_tier(root, false);
+        let (bold, italic, caps, reflection) =
+            parse_master_txstyle_run_properties_tier(root, false);
+        MasterStyleTier {
+            faces: parse_master_level_faces_tier(root, theme, default_text_style, false),
+            sizes: parse_master_level_font_sizes_tier(root, default_text_style, false),
+            colors: parse_master_level_colors_tier(root, theme, false),
+            indents: parse_master_level_indents_tier(root, false),
+            bullets: parse_master_level_bullets_tier(
+                root,
+                theme,
+                master_rels,
+                master_dir,
+                zip,
+                false,
+            ),
+            alignment: parse_master_alignments_tier(root, false),
+            ea_ln_brk: parse_master_ea_ln_brk_tier(root, false),
+            space_before,
+            space_after,
+            line_spacing,
+            color: parse_master_txstyle_color_tier(root, theme, false),
+            bold,
+            italic,
+            caps,
+            reflection,
+        }
+    }
+
+    pub(crate) fn get<'a, T>(map: &'a HashMap<String, T>, ph_type: &str) -> Option<&'a T> {
+        map.get(ph_type)
+            .or_else(|| if ph_type == "obj" { map.get("") } else { None })
+    }
 }
 
 /// The presentation `defaultTextStyle` levels that ordinary (non-placeholder)
@@ -1658,6 +1968,7 @@ pub(crate) fn parse_layout_placeholders(
     root: roxmltree::Node<'_, '_>,
     master_level_faces: &HashMap<String, LevelFaces>,
     default_text: &DefaultTextLevels,
+    master_styles: &MasterStyleTier,
     master_level_font_sizes: &HashMap<String, LevelFontSizes>,
     master_level_colors: &HashMap<String, LevelColors>,
     master_level_run_properties: &MasterLevelRunProperties,
@@ -1679,13 +1990,14 @@ pub(crate) fn parse_layout_placeholders(
     let theme = theme_source.colors();
     let mut lph = LayoutPlaceholders {
         master_by_type: master_transforms.clone(),
-        by_type_master_level_faces: master_level_faces.clone(),
+        by_type_master_level_faces: master_styles.faces.clone(),
         default_text: default_text.clone(),
-        by_type_master_level_sizes: master_level_font_sizes.clone(),
-        by_type_master_level_colors: master_level_colors.clone(),
+        styles: master_styles.clone(),
+        by_type_master_level_sizes: master_styles.sizes.clone(),
+        by_type_master_level_colors: master_styles.colors.clone(),
         by_type_master_level_run_properties: master_level_run_properties.styles.clone(),
-        by_type_master_level_indents: master_level_indents.clone(),
-        by_type_master_level_bullets: master_level_bullets.clone(),
+        by_type_master_level_indents: master_styles.indents.clone(),
+        by_type_master_level_bullets: master_styles.bullets.clone(),
         by_type_master_anchor: master_anchors.clone(),
         by_type_master_body_pr: master_body_pr.clone(),
         by_type_master_alignment: master_alignments.clone(),
@@ -2254,6 +2566,7 @@ pub(crate) fn parse_layout(
     layout_xml: &str,
     master_level_faces: &HashMap<String, LevelFaces>,
     default_text: &DefaultTextLevels,
+    master_styles: &MasterStyleTier,
     master_level_font_sizes: &HashMap<String, LevelFontSizes>,
     master_level_colors: &HashMap<String, LevelColors>,
     master_level_run_properties: &MasterLevelRunProperties,
@@ -2285,6 +2598,7 @@ pub(crate) fn parse_layout(
         root,
         master_level_faces,
         default_text,
+        master_styles,
         master_level_font_sizes,
         master_level_colors,
         master_level_run_properties,
@@ -2355,6 +2669,8 @@ pub(crate) struct ParsedMaster {
     pub(crate) master_level_faces: HashMap<String, LevelFaces>,
     /// Presentation defaultTextStyle levels resolved against this master's theme.
     pub(crate) default_text: DefaultTextLevels,
+    /// txStyles-only tier, resolved against this master's theme.
+    pub(crate) master_styles: MasterStyleTier,
     pub(crate) master_level_font_sizes: HashMap<String, LevelFontSizes>,
     pub(crate) master_level_colors: HashMap<String, LevelColors>,
     pub(crate) master_level_run_properties: MasterLevelRunProperties,
@@ -2395,6 +2711,8 @@ pub(crate) struct EffectiveMaster {
     pub(crate) master_level_run_properties: MasterLevelRunProperties,
     /// Master per-level bullet colors re-resolved against `theme`.
     pub(crate) master_level_bullets: HashMap<String, LevelBullets>,
+    /// txStyles-only tier re-resolved against `theme`.
+    pub(crate) master_styles: MasterStyleTier,
 }
 
 /// Build a `ParsedMaster` for the master at `master_path` (a ZIP path such as
@@ -2487,6 +2805,9 @@ pub(crate) fn build_master_bundle(
             .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
     });
     let default_text = parse_default_text_levels(dts, &theme);
+    let master_styles = master_root
+        .map(|root| MasterStyleTier::parse(root, &theme, &master_rels, &master_dir, dts, zip))
+        .unwrap_or_default();
     let master_level_faces = master_root
         .map(|root| parse_master_level_faces(root, &theme, dts))
         .unwrap_or_default();
@@ -2553,6 +2874,7 @@ pub(crate) fn build_master_bundle(
         master_decorative,
         master_level_faces,
         default_text,
+        master_styles,
         master_level_font_sizes,
         master_level_colors,
         master_level_run_properties,
@@ -2624,6 +2946,7 @@ mod placeholder_geometry_tests {
             layout_doc.root_element(),
             &HashMap::new(),
             &crate::master::DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &HashMap::new(),
             &HashMap::new(),
             &master_runs,
@@ -2667,6 +2990,10 @@ mod placeholder_geometry_tests {
             doc.root_element(),
             &HashMap::<String, LevelFaces>::new(),
             &DefaultTextLevels::default(),
+            &MasterStyleTier {
+                sizes: master_level_sizes.clone(),
+                ..Default::default()
+            },
             master_level_sizes,
             &HashMap::<String, LevelColors>::new(),
             &MasterLevelRunProperties::default(),
@@ -2739,11 +3066,25 @@ mod placeholder_geometry_tests {
         assert_eq!(lines.get("obj"), Some(&90000.0));
         assert_eq!(lines.get("dt"), None);
 
+        // idx 11 and 12 are bound layout slots; an unmatched idx reads the
+        // txStyles-only tier.
         let placeholders = LayoutPlaceholders {
+            by_idx_placeholder_type: HashMap::from([
+                (11, "body".to_owned()),
+                (12, "body".to_owned()),
+            ]),
             by_idx_line_spacing: HashMap::from([(12, 120000.0)]),
-            by_type_master_line_spacing: lines,
+            by_type_master_line_spacing: lines.clone(),
+            styles: MasterStyleTier {
+                line_spacing: lines,
+                ..Default::default()
+            },
             ..LayoutPlaceholders::default()
         };
+        assert_eq!(
+            placeholders.lookup_line_spacing("body", Some(40)),
+            Some(90000.0)
+        );
         assert_eq!(
             placeholders.lookup_line_spacing("body", Some(11)),
             Some(90000.0)
@@ -2828,10 +3169,19 @@ mod placeholder_geometry_tests {
         );
         let layout_doc = roxmltree::Document::parse(&layout).unwrap();
         let mut zip = empty_zip();
+        let styles = MasterStyleTier::parse(
+            root,
+            &theme,
+            &HashMap::new(),
+            "ppt/slideMasters",
+            None,
+            &mut zip,
+        );
         let placeholders = parse_layout_placeholders(
             layout_doc.root_element(),
             &parse_master_level_faces(root, &theme, None),
             &DefaultTextLevels::default(),
+            &styles,
             &parse_master_level_font_sizes(root, None),
             &HashMap::new(),
             &MasterLevelRunProperties::default(),
@@ -3150,6 +3500,7 @@ mod placeholder_geometry_tests {
             layout_doc.root_element(),
             &HashMap::new(),
             &DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &HashMap::new(),
             &HashMap::new(),
             &parse_master_level_run_properties(
@@ -3201,6 +3552,85 @@ mod placeholder_geometry_tests {
         assert_eq!(run(r#"<p:ph idx="9"/>"#), body_style);
     }
 
+    /// Review regression (#1620 round 3): an idx with no layout slot reads
+    /// the txStyles tier only for every per-level map, colour included; a
+    /// bound slot still reads the master placeholder. Also: a footer's
+    /// eaLnBrk falls back to otherStyle.
+    #[test]
+    fn unmatched_idx_colour_and_footer_ea_ln_brk_follow_the_style_tier() {
+        let master = format!(
+            r#"<p:sldMaster {PML_A}><p:cSld><p:spTree>
+              <p:sp><p:nvSpPr><p:cNvPr id="3" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>
+                <p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr><a:defRPr><a:solidFill><a:srgbClr val="C00000"/></a:solidFill></a:defRPr></a:lvl1pPr></a:lstStyle><a:p/></p:txBody></p:sp>
+              </p:spTree></p:cSld><p:txStyles><p:bodyStyle><a:lvl1pPr><a:defRPr sz="2400"/></a:lvl1pPr></p:bodyStyle>
+              <p:otherStyle><a:lvl1pPr eaLnBrk="0"/></p:otherStyle></p:txStyles></p:sldMaster>"#
+        );
+        let layout = format!(
+            r#"<p:sldLayout {PML_A}><p:cSld><p:spTree>
+              <p:sp><p:nvSpPr><p:cNvPr id="2" name="B"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+              <p:sp><p:nvSpPr><p:cNvPr id="3" name="F"/><p:cNvSpPr/><p:nvPr><p:ph type="ftr" idx="11"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sldLayout>"#
+        );
+        let master_doc = roxmltree::Document::parse(&master).unwrap();
+        let layout_doc = roxmltree::Document::parse(&layout).unwrap();
+        let root = master_doc.root_element();
+        let theme = HashMap::new();
+        let mut zip = empty_zip();
+        let styles = MasterStyleTier::parse(
+            root,
+            &theme,
+            &HashMap::new(),
+            "ppt/slideMasters",
+            None,
+            &mut zip,
+        );
+        let placeholders = parse_layout_placeholders(
+            layout_doc.root_element(),
+            &HashMap::new(),
+            &DefaultTextLevels::default(),
+            &styles,
+            &HashMap::new(),
+            &parse_master_level_colors(root, &theme),
+            &MasterLevelRunProperties::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &parse_master_ea_ln_brk(root),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &theme,
+            "ppt/slideLayouts",
+            &HashMap::new(),
+            &mut zip,
+        );
+        let first_paragraph = |ph: &str| {
+            let shape = parse_shape_with_theme(
+                &format!(
+                    r#"<p:nvSpPr><p:cNvPr id="9" name="x"/><p:cNvSpPr/><p:nvPr>{ph}</p:nvPr></p:nvSpPr><p:spPr/>
+                      <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>t</a:t></a:r></a:p></p:txBody>"#
+                ),
+                &placeholders,
+                &theme,
+            );
+            shape.text_body.unwrap().paragraphs.remove(0)
+        };
+        assert_eq!(
+            first_paragraph(r#"<p:ph type="body" idx="1"/>"#)
+                .def_color
+                .as_deref(),
+            Some("C00000")
+        );
+        assert_eq!(
+            first_paragraph(r#"<p:ph type="body" idx="7"/>"#).def_color,
+            None
+        );
+        assert!(!first_paragraph(r#"<p:ph type="ftr" idx="11"/>"#).ea_ln_brk);
+    }
+
     #[test]
     fn footer_keeps_other_style_character_properties() {
         let master = format!(
@@ -3228,6 +3658,7 @@ mod placeholder_geometry_tests {
             layout_doc.root_element(),
             &parse_master_level_faces(root, &theme, dts),
             &DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &parse_master_level_font_sizes(root, dts),
             &HashMap::new(),
             &parse_master_level_run_properties(root, &theme, &HashMap::new(), "ppt/slideMasters"),
@@ -3471,6 +3902,7 @@ mod placeholder_geometry_tests {
             doc.root_element(),
             &HashMap::new(),
             &crate::master::DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &HashMap::new(),
             &HashMap::new(),
             &MasterLevelRunProperties::default(),
@@ -3642,6 +4074,7 @@ mod placeholder_geometry_tests {
             layout_doc.root_element(),
             &HashMap::new(),
             &crate::master::DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &HashMap::new(),
             &HashMap::new(),
             &MasterLevelRunProperties::default(),

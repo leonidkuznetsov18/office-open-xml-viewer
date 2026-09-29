@@ -3058,6 +3058,25 @@ fn produce_slide_unit_with_journal<T>(
                     )
                 })
                 .unwrap_or_default();
+            let dts_doc = default_text_style
+                .as_deref()
+                .and_then(|xml| parse_preflighted_pptx_xml(xml).ok());
+            let dts = dts_doc.as_ref().and_then(|doc| {
+                doc.descendants()
+                    .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
+            });
+            let master_styles = master_root
+                .map(|root| {
+                    MasterStyleTier::parse(
+                        root,
+                        &theme,
+                        &bundle.master_rels,
+                        &bundle.master_dir,
+                        dts,
+                        zip,
+                    )
+                })
+                .unwrap_or_default();
             EffectiveMaster {
                 theme,
                 master_bg,
@@ -3065,6 +3084,7 @@ fn produce_slide_unit_with_journal<T>(
                 master_level_colors,
                 master_level_run_properties,
                 master_level_bullets,
+                master_styles,
             }
         });
 
@@ -3090,6 +3110,10 @@ fn produce_slide_unit_with_journal<T>(
             .as_ref()
             .map(|e| &e.master_level_run_properties)
             .unwrap_or(&bundle.master_level_run_properties);
+        let layout_master_styles = effective_master
+            .as_ref()
+            .map(|e| &e.master_styles)
+            .unwrap_or(&bundle.master_styles);
         // Build a `ParsedLayout` from a layout XML string with the resolved
         // theme/bullets and this bundle's remaining (theme-independent) maps.
         let build_parsed_layout = |lx: &str, zip: &mut PptxZip| -> ParsedLayout {
@@ -3097,6 +3121,7 @@ fn produce_slide_unit_with_journal<T>(
                 lx,
                 &bundle.master_level_faces,
                 &bundle.default_text,
+                layout_master_styles,
                 &bundle.master_level_font_sizes,
                 layout_master_colors,
                 layout_master_run_properties,
@@ -6799,6 +6824,7 @@ mod tests {
             layout_doc.root_element(),
             &HashMap::new(),
             &crate::master::DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &HashMap::new(),
             &HashMap::new(),
             &MasterLevelRunProperties::default(),
@@ -6876,6 +6902,7 @@ mod tests {
                 layout,
                 &HashMap::new(),
                 &crate::master::DefaultTextLevels::default(),
+                &crate::master::MasterStyleTier::default(),
                 &m_lfs,
                 &HashMap::new(),
                 &MasterLevelRunProperties::default(),
@@ -7233,6 +7260,7 @@ mod tests {
     #[test]
     fn idx_placeholder_inherits_master_txstyle_color() {
         let mut lph = LayoutPlaceholders::default();
+        lph.by_idx_placeholder_type.insert(35, "body".to_string());
         // Master bodyStyle resolves to white and is keyed by type (incl. "" and "body").
         lph.by_type_master_color
             .insert("body".to_string(), "FFFFFF".to_string());
@@ -7295,6 +7323,7 @@ mod tests {
             layout_doc.root_element(),
             &HashMap::new(),
             &crate::master::DefaultTextLevels::default(),
+            &crate::master::MasterStyleTier::default(),
             &HashMap::new(),
             &master_colors,
             &MasterLevelRunProperties::default(),
