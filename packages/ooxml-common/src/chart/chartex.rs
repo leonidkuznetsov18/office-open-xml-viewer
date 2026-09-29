@@ -915,15 +915,21 @@ pub(super) fn parse_chartex_impl(
         Some(unreadable_chart_style_role_table())
     } else {
         style_doc.as_ref().and_then(|document| {
-            parse_chart_style_role_table(
+            parse_chart_style_role_table_for_chart(
                 document.root_element(),
                 resolver,
                 style_palette,
                 chartex_color_style_method.as_deref(),
                 image_resolver,
+                true,
             )
             .or_else(|| {
-                unresolved_chart_style_role_table(document.root_element(), resolver, image_resolver)
+                unresolved_chart_style_role_table_for_chart(
+                    document.root_element(),
+                    resolver,
+                    image_resolver,
+                    true,
+                )
             })
         })
     };
