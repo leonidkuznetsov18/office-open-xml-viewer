@@ -10080,28 +10080,72 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(red.map(rect => rect.lw)).toEqual([0.75, 2.25]);
   });
 
-  it('paints a gradient ChartEx column outline', () => {
+  // PowerPoint-observed structured series outlines (gradient/pattern): classic
+  // columns lay a gradient out per column; ChartEx drops it — body outlines
+  // are omitted and line elements fall back to their default solid colour.
+  const gradientLine = {
+    linePaints: [{
+      fillType: 'gradient' as const, angle: 0, gradType: 'linear',
+      stops: [{ position: 0, color: 'FF0000' }, { position: 1, color: '0000FF' }],
+    }],
+    linePaintAuthored: true,
+    lineWidthEmu: 57150,
+  };
+
+  it('lays a classic column gradient outline out per column', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'clusteredBar',
       categories: ['A', 'B'],
-      showLegend: true,
-      legendPos: 'r',
-      chartexDataPointStyle: unmodifiedLinkedDataPoint,
-      series: [series({
-        values: [2, 1],
-        chartexStyle: {
-          linePaints: [{
-            fillType: 'gradient', angle: 0, gradType: 'linear',
-            stops: [{ position: 0, color: 'FF0000' }, { position: 1, color: '0000FF' }],
-          }],
-          linePaintAuthored: true,
-        },
-      })],
+      series: [series({ values: [2, 1], chartexStyle: gradientLine })],
     }), RECT, 1);
 
-    // Both bars stroke with a Canvas gradient built from the outline paint.
-    expect(rec.gradients.length).toBeGreaterThanOrEqual(2);
+    const strokes = rec.gradients.filter(gradient => gradient.kind === 'linear');
+    expect(strokes).toHaveLength(2);
+    const spans = strokes.map(gradient => gradient.args[2]! - gradient.args[0]!);
+    // Each vector spans one column, not the plot width.
+    expect(spans.every(span => span > 0 && span < RECT.w / 2)).toBe(true);
+    expect(strokes[0]!.args[0]).not.toBe(strokes[1]!.args[0]);
+  });
+
+  it('omits a structured ChartEx column outline', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A', 'B'],
+      chartexDataPointStyle: unmodifiedLinkedDataPoint,
+      series: [series({ values: [2, 1], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects.filter(rect => rect.lw === 4.5)).toHaveLength(0);
+  });
+
+  it('omits structured waterfall bar outlines and draws connectors in their default colour', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      chartexSeriesLineStyle: {
+        lineColors: ['D9D9D9'], linePaintAuthored: true, lineWidthEmu: 9525,
+      },
+      series: [series({ values: [10, 5, 15], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects).toHaveLength(0);
+    const connectors = rec.strokeDetails.filter(detail =>
+      detail.strokeStyle.toUpperCase() === '#D9D9D9');
+    expect(connectors.length).toBeGreaterThan(0);
+    // The authored width survives; only the structured paint is dropped.
+    expect(connectors.every(detail => detail.lineWidth === 4.5)).toBe(true);
   });
 
   it('gives a ChartEx legend key without an authored outline width the 0.75pt default', () => {

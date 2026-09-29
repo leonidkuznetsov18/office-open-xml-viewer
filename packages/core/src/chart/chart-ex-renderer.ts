@@ -60,6 +60,8 @@ import {
 import { planWaterfallPaintSites } from './waterfall-plan.js';
 import {
   CHARTEX_DEFAULT_LINE_WIDTH_EMU,
+  chartExLineIsStructured,
+  chartExSolidLineCarrier,
   resolveChartExLineChain,
   resolveChartExPointFill,
   resolveChartExPointLine,
@@ -227,14 +229,17 @@ export function chartExDataMarkPaintWorkCount(
         chart, series, point, styleIndex, count, '#000000',
         chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
       );
-      if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
+      if (line.visible && !chartExLineIsStructured(line)) {
+        charge(line.paint ?? { fillType: 'solid', color: '000000' });
+      }
       if (total > MAX_CHART_PAINT_COMPONENTS) return;
     }
   };
   const chargeParetoLine = (series: ChartSeries | undefined, styleIndex: number): void => {
     const roles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
     const line = resolveChartExLineChain(
-      chart, series, roles, roles, styleIndex, 1, '#000000', { linkedNoStyleFallback: true },
+      chart, chartExSolidLineCarrier(series, styleIndex), roles, roles, styleIndex, 1, '#000000',
+      { linkedNoStyleFallback: true },
     );
     if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
   };
@@ -283,7 +288,11 @@ export function chartExDataMarkPaintWorkCount(
         chart, series, point, accentIndex, 3, '#000000',
         chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
       );
-      if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
+      // A structured waterfall bar outline is not painted (see
+      // chartExSolidLineCarrier).
+      if (line.visible && !chartExLineIsStructured(line)) {
+        charge(line.paint ?? { fillType: 'solid', color: '000000' });
+      }
     }
   } else if (chart.chartType === 'funnel') {
     const series = chart.series[0];
@@ -314,7 +323,10 @@ export function chartExDataMarkPaintWorkCount(
       for (const values of series.valuesByCategory) {
         if (!computeBoxWhiskerStats(values, series.quartileMethod)) continue;
         charge(fill);
-        chargeLine(chart.chartexDataPointStyle, series, styleIndex, count);
+        chargeLine(
+          chart.chartexDataPointStyle, chartExSolidLineCarrier(series, styleIndex),
+          styleIndex, count,
+        );
       }
     }
   } else {
@@ -645,7 +657,7 @@ function renderWaterfallChart(
             target, paint, { x: bx, y: yTop, w: barW, h: bh }, fallback,
             ptToPx, shapeRotationDeg,
           );
-          if (applyResolvedChartExLineStyle(
+          if (!chartExLineIsStructured(outline) && applyResolvedChartExLineStyle(
             target, outline, ptToPx, { x: bx, y: yTop, w: barW, h: bh }, shapeRotationDeg,
           )) {
             target.strokeRect(bx, yTop, barW, bh);
@@ -665,7 +677,7 @@ function renderWaterfallChart(
       const connectorRoles = [chart.chartexSeriesLineStyle, chart.chartexDataPointLineStyle];
       const connectorLine = resolveChartExLineChain(
         chart,
-        series,
+        chartExSolidLineCarrier(series, accentIndex),
         connectorRoles,
         connectorRoles,
         accentIndex,
@@ -979,7 +991,7 @@ function renderParetoLineChart(
   const paretoRoles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
   const paretoLine = resolveChartExLineChain(
     chart,
-    source,
+    chartExSolidLineCarrier(source, styleIndex),
     paretoRoles,
     paretoRoles,
     styleIndex,
@@ -1470,14 +1482,15 @@ function renderBoxWhiskerChart(
     const series = box.series[si];
     if (!series.meanLine) continue;
     const lineStyle = chart.chartexDataPointLineStyle ?? chart.chartexDataPointStyle;
-    const fallback = series.lineColor ? `#${series.lineColor}` : paletteOf(si);
+    const lineSeries = chartExSolidLineCarrier(series, boxStyleIndices[si]) ?? series;
+    const fallback = lineSeries.lineColor ? `#${lineSeries.lineColor}` : paletteOf(si);
     ctx.save();
     const styleLineVisible = applyChartExSeriesLineStyle(
-      ctx, chart, lineStyle, series, boxStyleIndices[si], nSer, fallback, ptToPx,
+      ctx, chart, lineStyle, lineSeries, boxStyleIndices[si], nSer, fallback, ptToPx,
     );
-    if (styleLineVisible || series.lineColor != null) {
-      if (series.lineColor) ctx.strokeStyle = fallback;
-      if (series.lineWidthEmu) ctx.lineWidth = axisLineWidthPx(series.lineWidthEmu, ptToPx);
+    if (styleLineVisible || lineSeries.lineColor != null) {
+      if (lineSeries.lineColor) ctx.strokeStyle = fallback;
+      if (lineSeries.lineWidthEmu) ctx.lineWidth = axisLineWidthPx(lineSeries.lineWidthEmu, ptToPx);
       let open = false;
       ctx.beginPath();
       for (let ci = 0; ci < nCat; ci++) {
@@ -1527,8 +1540,9 @@ function renderBoxWhiskerChart(
       const lineStyle = chart.chartexDataPointLineStyle ?? pointStyle;
       const markerStyle = chart.chartexDataPointMarkerStyle ?? pointStyle;
       const styleIndex = boxStyleIndices[si];
+      const lineSeries = chartExSolidLineCarrier(s, styleIndex) ?? s;
       const styleLine = chartExStyleColor(chart, pointStyle, 'line', styleIndex, nSer);
-      const edge = s.lineColor ? `#${s.lineColor}` : styleLine ? `#${styleLine}` : fill;
+      const edge = lineSeries.lineColor ? `#${lineSeries.lineColor}` : styleLine ? `#${styleLine}` : fill;
       const lineEdge = chartExStyleColor(chart, lineStyle, 'line', styleIndex, nSer);
       const markerFill = chartExStyleColor(chart, markerStyle, 'fill', styleIndex, nSer);
       const markerFillPaint = chartExMarkerPaint(
@@ -1538,7 +1552,7 @@ function renderBoxWhiskerChart(
       const markerOutline = resolveChartExSeriesLineStyle(
         chart,
         markerStyle,
-        s,
+        lineSeries,
         styleIndex,
         nSer,
         markerEdge ?? edge,
@@ -1552,7 +1566,7 @@ function renderBoxWhiskerChart(
         // noFill paint stays suppressed, while geometry-only direct formatting
         // continues to decorate the semantic line.
         return applyChartExSeriesLineStyle(
-          ctx, chart, style, s, styleIndex, nSer, fallback, ptToPx,
+          ctx, chart, style, lineSeries, styleIndex, nSer, fallback, ptToPx,
           { linkedNoStyleFallback: true },
         );
       };
@@ -1586,7 +1600,7 @@ function renderBoxWhiskerChart(
           if (applyResolvedChartExLineStyle(
             target,
             resolveChartExPointLine(
-              chart, s, undefined, styleIndex, nSer, edge, pointStyle,
+              chart, lineSeries, undefined, styleIndex, nSer, edge, pointStyle,
               { linkedNoStyleFallback: true },
             ),
             ptToPx,

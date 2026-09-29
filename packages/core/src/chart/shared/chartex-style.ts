@@ -364,6 +364,46 @@ export function resolveChartExPointFill(
 }
 
 
+/** Whether a resolved ChartEx outline carries a structured (gradient,
+ * pattern or picture) paint. */
+export function chartExLineIsStructured(line: ResolvedChartExLineStyle): boolean {
+  return line.paint != null && line.paint.fillType !== 'solid';
+}
+
+
+/** Drop a structured direct line paint from a ChartEx series carrier, keeping
+ * its geometry, so the element falls back to its Chart Style/semantic colour.
+ *
+ * PowerPoint-observed (16.113, synthetic waterfall, histogram, Pareto and
+ * box-and-whisker controls; series `a:ln` gradFill linear 0°/90°, path rect,
+ * and pattFill): ChartEx never paints a structured series line. Data-point
+ * body outlines (waterfall bars, histogram and Pareto columns) are omitted
+ * (see chartExLineIsStructured), while line elements — waterfall connectors,
+ * box outlines/whiskers/medians/mean line and marker, and the Pareto line —
+ * are drawn in their default solid colour at the authored width. */
+export function chartExSolidLineCarrier<T extends Partial<ChartExSeriesStyleCarrier>>(
+  carrier: T | null | undefined,
+  index: number,
+): T | null | undefined {
+  const style = carrier?.chartexStyle;
+  const decision = chartStyleLineDecision(style, index);
+  if (!carrier || !decision || decision.fillType === 'solid') return carrier;
+  return {
+    ...carrier,
+    lineColor: null,
+    lineHidden: null,
+    chartexStyle: {
+      ...style,
+      linePaints: null,
+      lineColors: null,
+      lineColorIndex: null,
+      linePaintAuthored: null,
+      lineHidden: null,
+    },
+  };
+}
+
+
 /** Resolve a ChartEx outline through ordered Chart Style role chains.
  * `paintRoles` are tried in order after the direct carrier until one supplies
  * line paint; `geometryRoles` supply `w`, dash, cap and join atoms the direct
