@@ -11,8 +11,6 @@ export function readLegacySourceModuleConfig(
   const record = config as Record<string, unknown>;
   for (const key of Object.keys(record)) {
     if (key !== 'wasmUrl' && key !== 'maxInputBytes'
-      && !(label === 'legacy DOC' && key === 'useBundledOfficeFonts'
-        && record.useBundledOfficeFonts === true)
       && !(label === 'legacy DOC' && key === 'allowFootnoteContinuation'
         && record.allowFootnoteContinuation === true)) {
       throw new TypeError(`${label} source module config has an unknown field`);

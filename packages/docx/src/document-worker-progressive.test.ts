@@ -142,13 +142,12 @@ function progressiveDocument(opts: {
       buffer: ArrayBuffer,
       policy: unknown,
       google: boolean,
-      bundled: boolean,
       timeoutMs: number | undefined,
       onUsage: unknown,
       renderers: unknown,
       progressive: unknown,
     ): Promise<void>;
-  })._parse(new ArrayBuffer(1), undefined, false, false, opts.timeoutMs, undefined, undefined, progressive);
+  })._parse(new ArrayBuffer(1), undefined, false, opts.timeoutMs, undefined, undefined, progressive);
 
   const push = (res: RenderWorkerResponse): void => {
     (document as unknown as {
@@ -701,7 +700,6 @@ describe('worker layout-view metadata switch', () => {
         buffer: ArrayBuffer,
         policy: unknown,
         google: boolean,
-        bundled: boolean,
         timeoutMs: number | undefined,
         onUsage: unknown,
         renderers: unknown,
@@ -710,7 +708,6 @@ describe('worker layout-view metadata switch', () => {
     })._parse(
       new ArrayBuffer(1),
       undefined,
-      false,
       false,
       undefined,
       undefined,

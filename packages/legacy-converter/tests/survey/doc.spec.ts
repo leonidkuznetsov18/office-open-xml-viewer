@@ -10,6 +10,7 @@ import { PNG } from 'pngjs';
 import { packagesDir, viewerOrigin, padded, pdfPages, sideBySide, type Rendered } from './survey.js';
 
 const enabled = process.env.LEGACY_CORPUS === '1';
+const useGoogleFonts = process.env.LEGACY_CORPUS_GOOGLE_FONTS === '1';
 const corpus = resolve(packagesDir, 'docx/public/private/doc');
 const filter = process.env.LEGACY_CORPUS_FILTER;
 const names = enabled && existsSync(corpus)
@@ -33,7 +34,7 @@ test.describe('legacy DOC corpus survey', () => {
       const width = reference[0]?.width ?? 816;
       const directDoc = resolve(packagesDir, 'legacy-converter/src/legacy-doc.ts');
       await page.goto(`${viewerOrigin('doc')}/tests/visual/fixture.html`);
-      const rendered = await page.evaluate(async ({ file, width: requested, module }) => {
+      const rendered = await page.evaluate(async ({ file, width: requested, module, useGoogleFonts: googleFonts }) => {
         const pages: string[] = [];
         try {
           const { DocxDocument } = await import('/src/document.ts');
@@ -45,7 +46,7 @@ test.describe('legacy DOC corpus survey', () => {
           if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
           const bytes = await response.arrayBuffer();
           const document = await DocxDocument.load(bytes, {
-            useGoogleFonts: false,
+            useGoogleFonts: googleFonts,
             math,
             modelSources: [legacyDocSource()],
           });
@@ -62,7 +63,7 @@ test.describe('legacy DOC corpus survey', () => {
         } catch (error) {
           return { pages, error: String(error instanceof Error ? error.message : error) };
         }
-      }, { file: name, width, module: `/@fs${directDoc}` }) as Rendered;
+      }, { file: name, width, module: `/@fs${directDoc}`, useGoogleFonts }) as Rendered;
 
       const pagesReport = [];
       const count = Math.max(reference.length, rendered.pages.length);
@@ -88,6 +89,7 @@ test.describe('legacy DOC corpus survey', () => {
       }
       const summary = {
         name,
+        useGoogleFonts,
         error: rendered.error ?? null,
         referencePages: reference.length,
         renderedPages: rendered.pages.length,

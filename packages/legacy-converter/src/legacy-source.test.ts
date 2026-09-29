@@ -54,7 +54,7 @@ describe.each(factories)('legacy $family source factory', ({ family, target, cre
       target,
       moduleUrl: expect.any(String),
       config: { wasmUrl: expect.any(String), maxInputBytes: MAX_LEGACY_SOURCE_BYTES,
-        ...(family === 'doc' ? { useBundledOfficeFonts: true, allowFootnoteContinuation: true } : {}),
+        ...(family === 'doc' ? { allowFootnoteContinuation: true } : {}),
       },
     });
     expect(new URL(module.moduleUrl).pathname).toContain(`legacy-${family}-source-module`);
@@ -74,7 +74,7 @@ describe.each(factories)('legacy $family source factory', ({ family, target, cre
       target,
       moduleUrl: MODULE,
       config: { wasmUrl: WASM, maxInputBytes: 4096,
-        ...(family === 'doc' ? { useBundledOfficeFonts: true, allowFootnoteContinuation: true } : {}),
+        ...(family === 'doc' ? { allowFootnoteContinuation: true } : {}),
       },
     });
   });
