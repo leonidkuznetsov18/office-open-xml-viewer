@@ -282,6 +282,7 @@ pub(super) fn parse_chartex_histogram_binning(series: Node) -> Option<ChartexHis
             .filter(|value| value == "l" || value == "r"),
         underflow: finite_attr("underflow"),
         overflow: finite_attr("overflow"),
+        edge_format_code: None,
     })
 }
 
@@ -679,7 +680,7 @@ pub(super) fn parse_chartex_impl(
     // CT_Binning child; `histogram` is not an ST_SeriesLayout enumeration.
     // Normalize the semantic family here so raw observations cannot reach the
     // ordinary clustered-column renderer.
-    let chartex_histogram_binning = (pareto_series_node.is_none()
+    let mut chartex_histogram_binning = (pareto_series_node.is_none()
         && layout_id == "clusteredColumn")
         .then(|| parse_chartex_histogram_binning(series_node))
         .flatten();
@@ -909,17 +910,16 @@ pub(super) fn parse_chartex_impl(
         })
         .unwrap_or_else(|| vec![None; pt_count]);
     let source_number_format =
-        chartex_number_format(primary_data, &["size", "val", "colorVal"], references).or_else(
-            || {
-                // Histogram bin edges are formatted with the value dimension's
-                // cached format (measured against PowerPoint); other families
-                // keep the resolved-reference contract.
-                chartex_histogram_binning
-                    .is_some()
-                    .then(|| chartex_cached_number_format(primary_data, &["val"]))
-                    .flatten()
-            },
-        );
+        chartex_number_format(primary_data, &["size", "val", "colorVal"], references);
+    if let Some(binning) = chartex_histogram_binning.as_mut() {
+        // Bin-edge labels use the value dimension's format (measured against
+        // PowerPoint): the formula-resolved source format wins, else the
+        // cached `lvl@formatCode`. Kept apart from `val_format_code` so bin
+        // counts never inherit it.
+        binning.edge_format_code = source_number_format
+            .clone()
+            .or_else(|| chartex_cached_number_format(primary_data, &["val"]));
+    }
 
     let series_name_for = |node: Node, references: &mut dyn ChartReferenceResolver| {
         node.descendants()

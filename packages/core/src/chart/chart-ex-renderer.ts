@@ -362,7 +362,8 @@ function renderHistogramChart(
 ): void {
   const source = chart.series[0];
   if (!source) return;
-  const plan = planHistogramBins(source.values, chart.chartexHistogramBinning ?? {}, source.valFormatCode);
+  const plan = planHistogramBins(source.values, chart.chartexHistogramBinning ?? {}, source.valFormatCode,
+    chart.date1904 === true);
   if (plan.kind === 'tooManyInputPoints') {
     rejectOversizedCanvasChart(ctx, rect, MAX_CANVAS_CHART_POINTS + 1);
     return;
@@ -371,7 +372,8 @@ function renderHistogramChart(
     ...chart,
     chartType: 'clusteredBar',
     categories: plan.categories,
-    series: [{ ...source, categories: undefined, values: plan.counts }],
+    // Counts never inherit the value dimension's bin-edge format.
+    series: [{ ...source, categories: undefined, values: plan.counts, valFormatCode: null }],
   }, rect, ptToPx, { gapPolicy: 'chartex' }, shapeRotationDeg);
 }
 

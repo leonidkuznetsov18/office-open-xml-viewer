@@ -1951,6 +1951,11 @@ export interface ChartexHistogramBinning {
   intervalClosed?: 'l' | 'r' | null;
   underflow?: number | null;
   overflow?: number | null;
+  /**
+   * Number format for the bin-edge category labels only (value dimension's
+   * resolved or cached format). Never applied to the bin counts.
+   */
+  edgeFormatCode?: string | null;
 }
 
 /** Authored axis format, separate from the effective tick format. */

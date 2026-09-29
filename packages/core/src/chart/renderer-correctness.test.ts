@@ -9432,6 +9432,27 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(rec.rects).toHaveLength(2);
   });
 
+  it('formats histogram bin edges with the edge format but never the count labels', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'histogram',
+      categories: [],
+      series: [series({
+        values: [0, 1, 2, 3, 4],
+        valFormatCode: '0.000',
+        seriesDataLabels: {
+          showVal: true, showCatName: false, showSerName: false, showPercent: false,
+        },
+      })],
+      chartexHistogramBinning: { binCount: 2, intervalClosed: 'l', edgeFormatCode: '0.00' },
+    }), RECT, 1);
+    const texts = rec.texts.map(text => text.text);
+    expect(texts).toContain('[0.00, 2.00)');
+    expect(texts.some(text => /^\d+\.\d{3}$/.test(text))).toBe(false);
+    expect(texts).toContain('2');
+    expect(texts).toContain('3');
+  });
+
   it('keeps ChartEx histogram value labels at the observed axis-relative offset', () => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, baseModel({

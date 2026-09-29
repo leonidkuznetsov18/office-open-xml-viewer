@@ -1608,7 +1608,72 @@ mod tests {
                 interval_closed: None,
                 underflow: None,
                 overflow: None,
+                edge_format_code: None,
             }
+        );
+    }
+
+    struct HistogramFormulaResolver;
+
+    impl ChartReferenceResolver for HistogramFormulaResolver {
+        fn resolve_strings(&mut self, _formula: &str) -> Option<Vec<String>> {
+            None
+        }
+
+        fn resolve_numbers(&mut self, _formula: &str) -> Option<Vec<Option<f64>>> {
+            None
+        }
+
+        fn resolve_number_format(&mut self, formula: &str) -> Option<String> {
+            (formula == "Sheet1!$A$2:$A$4").then(|| "0.0%".to_string())
+        }
+    }
+
+    fn histogram_edge_format(
+        dimension_formula: &str,
+        resolver: Option<&mut dyn ChartReferenceResolver>,
+    ) -> Option<String> {
+        let references_absent = resolver.is_none();
+        let xml = format!(
+            r#"<cx:chartSpace xmlns:cx="{CX_NS}">
+              <cx:chartData><cx:data id="0"><cx:numDim type="val">{dimension_formula}<cx:lvl ptCount="3" formatCode="0.000">
+                <cx:pt idx="0">1</cx:pt><cx:pt idx="1">2</cx:pt><cx:pt idx="2">3</cx:pt>
+              </cx:lvl></cx:numDim></cx:data></cx:chartData>
+              <cx:chart><cx:plotArea><cx:plotAreaRegion>
+                <cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr>
+                  <cx:binning intervalClosed="r"/>
+                </cx:layoutPr></cx:series>
+              </cx:plotAreaRegion></cx:plotArea></cx:chart>
+            </cx:chartSpace>"#
+        );
+        let document = chart_space_of(&xml);
+        let model = parse_chartex_part(
+            document.root_element(),
+            &ChartParseContext {
+                color_resolver: Some(&FixtureResolver),
+                style_xml: None,
+                references: std::cell::Cell::new(resolver),
+                ..Default::default()
+            },
+        )
+        .expect("histogram parses");
+        // The cached fallback stays out of the series value format.
+        if references_absent {
+            assert_eq!(model.series[0].val_format_code, None);
+        }
+        model
+            .chartex_histogram_binning
+            .expect("binning")
+            .edge_format_code
+    }
+
+    #[test]
+    fn histogram_edge_format_falls_back_to_cache_and_formula_wins() {
+        assert_eq!(histogram_edge_format("", None).as_deref(), Some("0.000"));
+        let mut resolver = HistogramFormulaResolver;
+        assert_eq!(
+            histogram_edge_format("<cx:f>Sheet1!$A$2:$A$4</cx:f>", Some(&mut resolver)).as_deref(),
+            Some("0.0%")
         );
     }
 
