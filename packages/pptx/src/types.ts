@@ -89,6 +89,11 @@ export interface Paragraph extends CoreParagraph {
    */
   fontAlgn?: 't' | 'ctr' | 'b';
   /**
+   * True when `<a:endParaRPr>` authors its own latin face. Only that face
+   * sizes the paragraph's last line with text (at the last run's size).
+   */
+  endFaceAuthored?: boolean;
+  /**
    * `<a:pPr defTabSz>` (ECMA-376 §21.1.2.2.7) — the default tab-stop interval in
    * EMU. When a `\t` has no reachable explicit `a:tabLst` stop, it advances to
    * the next multiple of this grid (issue #1006). Absent ⇒ the renderer uses the

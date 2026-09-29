@@ -358,7 +358,11 @@ export function powerPointFontAlgnReference(
     boxes.push({ ascent: box.ascent * run.sizePx, descent: box.descent * run.sizePx });
   }
   if (!compatOff) {
-    const height = 1.2 * Math.max(...runs.map((r) => r.sizePx));
+    // Iterative maxima: a long run can contribute 10^5 entries, too many to
+    // spread into Math.max.
+    let largest = 0;
+    for (const run of runs) largest = Math.max(largest, run.sizePx);
+    const height = 1.2 * largest;
     if (fontAlgn === 't') return { ascent: 0, descent: height };
     if (fontAlgn === 'ctr') return { ascent: height / 2, descent: height / 2 };
     const natural = powerPointNaturalLine(runs.map((r) => ({ sizePx: r.sizePx, share: r.face.share })));
@@ -374,7 +378,8 @@ export function powerPointFontAlgnReference(
     }
     return { ascent: above, descent: below };
   }
-  const height = Math.max(...boxes.map((b) => b.ascent + b.descent));
+  let height = 0;
+  for (const b of boxes) height = Math.max(height, b.ascent + b.descent);
   return fontAlgn === 't' ? { ascent: 0, descent: height } : { ascent: height / 2, descent: height / 2 };
 }
 

@@ -1475,7 +1475,10 @@ export function layoutParagraph(
             font: buildFont(bold, italic, sizePx, family, rc, ''),
             underline: false, strikethrough: false,
             lineMetric: lineMetricFor(family, bold, italic, rc),
-            markFace: { family, bold, italic },
+            // Only a face the break authors itself is measured to size its line
+            // at the preceding run's size (#1636); an inherited face keeps the
+            // break's own size.
+            ...(run.fontFamily != null ? { markFace: { family, bold, italic } } : {}),
           }
         : undefined;
       input.push({ type: 'break', style });
@@ -1634,14 +1637,15 @@ export function layoutParagraph(
         font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
         underline: false, strikethrough: false,
         lineMetric: lineMetricFor(endFamily, endBold, endItalic, rc),
-        markFace: { family: endFamily, bold: endBold, italic: endItalic },
+        ...(para.endFaceAuthored ? { markFace: { family: endFamily, bold: endBold, italic: endItalic } } : {}),
       }
     : undefined;
-  // A line-break or end-of-paragraph mark after text sizes its line with its
-  // own face at the size of the run it follows, not at its own size (#1636
-  // PowerPoint controls: a:br and endParaRPr at 16 / 40 / 80 pt after 24 pt
-  // and 60 pt runs, in the same or another face, both line models). A mark
-  // alone on its line keeps its own size (the empty-line rules above).
+  // A line-break or end-of-paragraph mark after text that authors its own face
+  // sizes its line with that face at the size of the run it follows, not at
+  // its own size (#1636 PowerPoint controls: a:br and endParaRPr at 16 / 40 /
+  // 80 pt after 24 pt and 60 pt runs, in the same or another face, both line
+  // models). A mark alone on its line keeps its own size (the empty-line rules
+  // above); a mark with an inherited face keeps the earlier behaviour.
   const followingMark = (mark: LayoutSegment, lineSegments: readonly LayoutSegment[]): LayoutSegment => {
     const previous = lineSegments[lineSegments.length - 1];
     if (!previous || !mark.markFace || previous.sizePx === mark.sizePx) return { ...mark, text: '' };
@@ -1684,7 +1688,7 @@ export function layoutParagraph(
       segments: [
         ...content,
         ...(breakStyle ? [hasText ? followingMark(breakStyle, content) : { ...breakStyle, text: '' }] : []),
-        ...(isLastLine && hasText && endStyle ? [followingMark(endStyle, content)] : []),
+        ...(isLastLine && hasText && endStyle?.markFace ? [followingMark(endStyle, content)] : []),
       ],
       ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
     };

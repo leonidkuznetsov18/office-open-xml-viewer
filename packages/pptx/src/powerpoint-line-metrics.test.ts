@@ -388,6 +388,7 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
         text: (ea(font) ? '日' : 'H') + (k === 0 ? String(i) : ''), font, size,
       })), { spaceLine: null }),
       endRunProperties: end,
+      endFaceAuthored: true,
     } as unknown as Paragraph));
 
   it('sizes an a:br face at the preceding run size', () => {
@@ -408,5 +409,31 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
       [[107, 107, 270, 270], [73, 73, 173, 173]]);
     expectModels(() => withEnd([['Arial', 60], ['Arial', 24]], mark('Arial', 80)),
       [[78, 78, 174, 174], [81, 81, 181, 181]]);
+  });
+
+  it('leaves an inherited end-of-paragraph face out of a line with text', () => {
+    // Size-only endParaRPr over a Meiryo paragraph default: not yet measured,
+    // so the line keeps the run's own Arial box (46 pt pitch under compatLnSpc="0").
+    const plain = () => [1, 2].map((i) => paragraph([{ text: `H${i}`, font: 'Arial', size: 40 }], { spaceLine: null }));
+    const inherited = () => plain().map((p) => ({
+      ...p, defFontFamily: 'Meiryo', endRunProperties: mark('Meiryo', 40),
+    } as unknown as Paragraph));
+    for (const compat of [false, true]) {
+      expect(runBaselines(inherited(), compat)).toEqual(runBaselines(plain(), compat));
+    }
+    expectWithin(runBaselines(inherited(), false), [52, 116]);
+  });
+
+  it('handles lines with 10^5 metric runs without spreading them into Math.max', () => {
+    // Alternating Latin / CJK characters split one run into a segment per
+    // character, each adding its latin face as a second metric entry.
+    const text = 'a日'.repeat(50_000);
+    for (const fontAlgn of ['t', 'ctr', 'b'] as const) {
+      for (const compat of [false, true]) {
+        const p = paragraph([{ text, font: 'Arial', size: 20 }], { spaceLine: null, fontAlgn });
+        p.runs = p.runs.map((r) => ({ ...r, fontFamilyEa: 'Meiryo' }));
+        expect(() => runBaselines([p], compat)).not.toThrow();
+      }
+    }
   });
 });

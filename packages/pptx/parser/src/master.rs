@@ -145,6 +145,9 @@ pub(crate) struct LayoutPlaceholders {
     /// lvl1pPr @fontAlgn (ECMA-376 §21.1.2.2.7). Same tiers as eaLnBrk; the
     /// master tier lives in `styles` (`MasterStyleTier::placeholder_font_algn`).
     pub(crate) by_type_font_algn: HashMap<String, String>,
+    /// fontAlgn per bound layout slot (idx): the slot's own lvl1pPr value,
+    /// else the master value for its type, mirroring `by_idx_alignment`.
+    pub(crate) by_idx_font_algn: HashMap<u32, String>,
     /// Default space-before/after (hundredths of pt) per placeholder idx, from
     /// the matching layout placeholder's lstStyle. The idx tier prevents one of
     /// several same-type layout slots from leaking paragraph spacing into its
@@ -793,6 +796,11 @@ impl LayoutPlaceholders {
         if let Some(i) = ph_idx {
             if !self.by_idx_placeholder_type.contains_key(&i) {
                 return MasterStyleTier::get(&self.styles.font_algn, ph_type).cloned();
+            }
+        }
+        if let Some(i) = ph_idx {
+            if let Some(f) = self.by_idx_font_algn.get(&i) {
+                return Some(f.clone());
             }
         }
         let master = &self.styles.placeholder_font_algn;
@@ -2370,6 +2378,12 @@ pub(crate) fn parse_layout_placeholders(
                     .or_else(|| master_alignments.get(&ph_type).cloned());
                 if let Some(a) = idx_algn {
                     lph.by_idx_alignment.entry(idx).or_insert(a);
+                }
+                let idx_font_algn = layout_font_algn
+                    .clone()
+                    .or_else(|| master_styles.placeholder_font_algn.get(&ph_type).cloned());
+                if let Some(f) = idx_font_algn {
+                    lph.by_idx_font_algn.entry(idx).or_insert(f);
                 }
                 // ECMA-376 §19.3.1.36: idx binds the slide placeholder to this
                 // exact layout slot. Preserve its vertical anchor independently
@@ -4289,6 +4303,10 @@ mod placeholder_geometry_tests {
                   <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
                 <p:sp><p:nvSpPr><p:cNvPr id="4" name="c"/><p:cNvSpPr/><p:nvPr><p:ph type="pic" idx="2"/></p:nvPr></p:nvSpPr>
                   <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="base"/></a:lstStyle><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="5" name="d"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="3"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="t"/></a:lstStyle><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="6" name="e"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="4"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="b"/></a:lstStyle><a:p/></p:txBody></p:sp>
               </p:spTree></p:cSld></p:sldLayout>"#;
         let layout_doc = roxmltree::Document::parse(layout).unwrap();
         let mut zip = empty_zip();
@@ -4362,6 +4380,12 @@ mod placeholder_geometry_tests {
             effective(body, "", r#"<a:pPr fontAlgn="middle"/>"#),
             some("ctr")
         );
+        // Same-type body slots keep their own values (idx binding), and an
+        // idx with no layout slot reads the class tier (bodyStyle).
+        let slot = |idx: u32| format!(r#"<p:nvPr><p:ph type="body" idx="{idx}"/></p:nvPr>"#);
+        assert_eq!(effective(&slot(3), "", ""), some("t"));
+        assert_eq!(effective(&slot(4), "", ""), some("b"));
+        assert_eq!(effective(&slot(9), "", ""), some("ctr"));
         // An ordinary text box takes no placeholder tier.
         assert_eq!(effective("<p:nvPr/>", "", ""), None);
     }

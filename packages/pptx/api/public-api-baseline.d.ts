@@ -1406,6 +1406,7 @@ export function openExternalHyperlink(url: string, allowed?: readonly string[], 
 export interface Paragraph extends Paragraph__emitterCollision1 {
     eaLnBrk: boolean;
     fontAlgn?: 't' | 'ctr' | 'b';
+    endFaceAuthored?: boolean;
     defTabSz?: number;
 }
 interface Paragraph__emitterCollision1 {
