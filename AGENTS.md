@@ -355,15 +355,20 @@ VRT_BASELINE_REVISION=$base VRT_BASELINE_CHECKOUT=/tmp/ooxml-vrt-baseline VRT_PO
 
 The root scripts run every package without stopping at the first failing one,
 and still exit non-zero if any package failed. Filter a single package with
-`pnpm --filter @silurus/ooxml-<fmt> vrt` (and the matching snapshot script). Without `VRT_BASELINE_CHECKOUT`, a run reads the
-package's own `tests/visual/baseline/`. A missing or mismatched baseline fails
-the run; it is not a successful regression check. Remove the baseline worktree
-when done.
+`pnpm --filter @silurus/ooxml-<fmt> vrt` (and the matching snapshot script).
+
+A comparison run requires `VRT_BASELINE_CHECKOUT` and fails closed unless it
+names the root of a Git checkout whose HEAD is exactly `VRT_BASELINE_REVISION`
+and whose renderer is unmodified: no tracked change, and no untracked file
+outside dependencies and the private corpus. A copied or symlinked baseline
+directory is never accepted. A missing or mismatched baseline fails the run; it
+is not a successful regression check. Remove the baseline worktree when done.
 
 For the one-time bootstrap of a harness change against a baseline revision that
 predates it, copy only the allowlisted VRT harness files listed in
 `tests/visual/private-corpus.mjs` into the baseline worktree and set
-`VRT_ALLOW_HARNESS_CHANGES=1`; renderer/parser changes remain forbidden.
+`VRT_ALLOW_HARNESS_CHANGES=1` for both the snapshot and the comparison run;
+renderer/parser changes remain forbidden.
 
 ### Fidelity scores
 

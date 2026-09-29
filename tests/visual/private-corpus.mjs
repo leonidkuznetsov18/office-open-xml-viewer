@@ -1,4 +1,13 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join, parse, relative, resolve, sep } from 'node:path';
@@ -48,67 +57,108 @@ export function harnessBootstrapDiffViolations(diff) {
     && !TEST_RENDERER_ALIAS_LINE.test(line));
 }
 
-function gitRevision(revision) {
-  return execFileSync('git', ['rev-parse', `${revision}^{commit}`], {
+function gitRevision(revision, cwd = process.cwd()) {
+  return execFileSync('git', ['rev-parse', '--verify', `${revision}^{commit}`], {
+    cwd,
     encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
-function baselineRevision(snapshot = false) {
+function requiredBaselineRevision() {
   const revision = process.env.VRT_BASELINE_REVISION?.trim();
   if (!revision) {
     throw new Error('VRT_BASELINE_REVISION is required for self-VRT');
   }
-  const resolved = gitRevision(revision);
-  if (snapshot) {
-    const checkout = gitRevision('HEAD');
-    if (checkout !== resolved) {
+  return gitRevision(revision);
+}
+
+/** Fail unless `root` is a checkout at exactly `revision` whose renderer is
+ * unmodified: no tracked change and no untracked file outside dependencies and
+ * the local private corpus. With VRT_ALLOW_HARNESS_CHANGES=1, only the
+ * allowlisted VRT harness files may differ (the one-time bootstrap), and a Vite
+ * config only by test-renderer alias lines. */
+function assertRendererCheckout({ root, revision, label }) {
+  const head = gitRevision('HEAD', root);
+  if (head !== revision) {
+    throw new Error(`${label} checkout mismatch: expected ${revision}, found ${head} at ${root}`);
+  }
+  const tracked = execFileSync(
+    'git',
+    ['diff', '--name-only', 'HEAD'],
+    { cwd: root, encoding: 'utf8' },
+  ).trim().split('\n').filter(Boolean);
+  const untracked = execFileSync(
+    'git',
+    ['ls-files', '--others', '--exclude-standard'],
+    { cwd: root, encoding: 'utf8' },
+  ).trim().split('\n').filter(Boolean).filter((path) =>
+    !/(^|\/)node_modules(?:\/|$)/.test(path)
+    && !/^packages\/(docx|xlsx|pptx)\/public\/private(?:\/|$)/.test(path));
+  const changed = [...new Set([...tracked, ...untracked])];
+  if (changed.length === 0) return;
+  const harnessBootstrap = process.env.VRT_ALLOW_HARNESS_CHANGES === '1'
+    && changed.every((path) => VRT_HARNESS_PATHS.has(path));
+  if (!harnessBootstrap) {
+    throw new Error(
+      `${label} requires a clean renderer checkout; changed paths at ${root}: ${changed.join(', ')}`,
+    );
+  }
+  for (const path of changed.filter((changedPath) => changedPath.endsWith('vite.config.ts'))) {
+    // An untracked config has no HEAD version to diff against, so its
+    // whole content would escape the alias-only bound.
+    if (untracked.includes(path)) {
+      throw new Error(`${label} harness bootstrap cannot add an untracked ${path}`);
+    }
+    const violations = harnessBootstrapDiffViolations(execFileSync(
+      'git', ['diff', '-U0', 'HEAD', '--', path], { cwd: root, encoding: 'utf8' },
+    ));
+    if (violations.length > 0) {
       throw new Error(
-        `private self-VRT snapshot checkout mismatch: expected ${resolved}, running ${checkout}`,
+        `${label} harness bootstrap may only change test renderer aliases in ${path}: `
+        + violations.join(' | '),
       );
     }
-    const root = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
-    const tracked = execFileSync(
-      'git',
-      ['diff', '--name-only', 'HEAD'],
-      { cwd: root, encoding: 'utf8' },
-    ).trim().split('\n').filter(Boolean);
-    const untracked = execFileSync(
-      'git',
-      ['ls-files', '--others', '--exclude-standard'],
-      { cwd: root, encoding: 'utf8' },
-    ).trim().split('\n').filter(Boolean).filter((path) =>
-      !/(^|\/)node_modules(?:\/|$)/.test(path)
-      && !/^packages\/(docx|xlsx|pptx)\/public\/private(?:\/|$)/.test(path));
-    const changed = [...new Set([...tracked, ...untracked])];
-    if (changed.length > 0) {
-      const harnessBootstrap = process.env.VRT_ALLOW_HARNESS_CHANGES === '1'
-        && changed.every((path) => VRT_HARNESS_PATHS.has(path));
-      if (!harnessBootstrap) {
-        throw new Error(
-          'private self-VRT snapshot requires a clean renderer checkout; changed paths: '
-          + changed.join(', '),
-        );
-      }
-      for (const path of changed.filter((changedPath) => changedPath.endsWith('vite.config.ts'))) {
-        // An untracked config has no HEAD version to diff against, so its
-        // whole content would escape the alias-only bound.
-        if (untracked.includes(path)) {
-          throw new Error(
-            `private self-VRT harness bootstrap cannot add an untracked ${path}`,
-          );
-        }
-        const violations = harnessBootstrapDiffViolations(execFileSync(
-          'git', ['diff', '-U0', 'HEAD', '--', path], { cwd: root, encoding: 'utf8' },
-        ));
-        if (violations.length > 0) {
-          throw new Error(
-            `private self-VRT harness bootstrap may only change test renderer aliases in ${path}: `
-            + violations.join(' | '),
-          );
-        }
-      }
-    }
+  }
+}
+
+function checkoutRoot(path) {
+  return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd: path,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+/** Verify that `checkout` is the root of a Git checkout at the full commit
+ * `revision` with an unmodified renderer, so its images were produced by that
+ * revision's renderer and not copied into an arbitrary directory. */
+export function verifyBaselineCheckout({ checkout, revision }) {
+  if (!/^[0-9a-f]{40}$/.test(revision)) {
+    throw new Error(`baseline revision must be a full commit SHA, got ${revision}`);
+  }
+  const directory = resolve(checkout);
+  if (!existsSync(directory)) {
+    throw new Error(`VRT_BASELINE_CHECKOUT does not exist: ${directory}`);
+  }
+  let root;
+  try {
+    root = checkoutRoot(directory);
+  } catch {
+    throw new Error(`VRT_BASELINE_CHECKOUT is not a Git checkout: ${directory}`);
+  }
+  if (realpathSync(root) !== realpathSync(directory)) {
+    throw new Error(
+      `VRT_BASELINE_CHECKOUT must be the root of a Git checkout: ${directory} is inside ${root}`,
+    );
+  }
+  assertRendererCheckout({ root, revision, label: 'self-VRT baseline' });
+}
+
+function baselineRevision(snapshot = false) {
+  const resolved = requiredBaselineRevision();
+  if (snapshot) {
+    assertRendererCheckout({ root: checkoutRoot(process.cwd()), revision: resolved, label: 'self-VRT snapshot' });
   }
   return resolved;
 }
@@ -154,22 +204,39 @@ export function selfVrtInputPath({ corpus, file }) {
   return `${corpusConfig(corpus).publicPrefix}${file}`;
 }
 
+const verifiedBaselineCheckouts = new Map();
+
 /** Directory holding previous-renderer images. Snapshots are always written
  * into the checkout that renders them. A comparison run reads the same
- * package's baseline from `VRT_BASELINE_CHECKOUT` (the previous-renderer
- * worktree) when set, so candidate and baseline never share a checkout. */
+ * package's baseline only from `VRT_BASELINE_CHECKOUT`, after verifying that
+ * it is a clean checkout at VRT_BASELINE_REVISION; a local or copied baseline
+ * directory is never trusted. */
 export function selfVrtBaselineRoot({ snapshot = false } = {}) {
   const checkout = process.env.VRT_BASELINE_CHECKOUT?.trim();
-  if (!checkout) return 'tests/visual/baseline';
   if (snapshot) {
+    if (checkout) {
+      throw new Error(
+        'VRT_BASELINE_CHECKOUT is for comparison runs; capture snapshots in the baseline checkout itself',
+      );
+    }
+    return 'tests/visual/baseline';
+  }
+  if (!checkout) {
     throw new Error(
-      'VRT_BASELINE_CHECKOUT is for comparison runs; capture snapshots in the baseline checkout itself',
+      'VRT_BASELINE_CHECKOUT is required for self-VRT comparison: name the previous-renderer '
+      + 'checkout at VRT_BASELINE_REVISION',
     );
   }
-  const root = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
-  const baseline = resolve(checkout, relative(root, process.cwd()), 'tests/visual/baseline');
+  const candidateRoot = checkoutRoot(process.cwd());
+  const baseline = resolve(checkout, relative(candidateRoot, process.cwd()), 'tests/visual/baseline');
   if (resolve(baseline) === resolve('tests/visual/baseline')) {
     throw new Error('VRT_BASELINE_CHECKOUT must name the previous-renderer checkout, not this one');
+  }
+  const revision = requiredBaselineRevision();
+  const key = `${resolve(checkout)}\0${revision}`;
+  if (!verifiedBaselineCheckouts.has(key)) {
+    verifyBaselineCheckout({ checkout, revision });
+    verifiedBaselineCheckouts.set(key, true);
   }
   return baseline;
 }
