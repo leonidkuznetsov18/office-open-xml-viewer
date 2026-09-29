@@ -1612,6 +1612,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_chartex_histogram_binning_accepts_val_attribute_form() {
+        let xml = r#"<cx:series xmlns:cx="urn:cx"><cx:layoutPr><cx:binning intervalClosed="r"><cx:binSize val="5"/></cx:binning></cx:layoutPr></cx:series>"#;
+        let document = root_of(xml);
+        let size = parse_chartex_histogram_binning(document.root_element()).expect("parses");
+        assert_eq!(size.bin_size, Some(5.0));
+
+        let xml = r#"<cx:series xmlns:cx="urn:cx"><cx:layoutPr><cx:binning><cx:binCount val="7"/></cx:binning></cx:layoutPr></cx:series>"#;
+        let document = root_of(xml);
+        let count = parse_chartex_histogram_binning(document.root_element()).expect("parses");
+        assert_eq!(count.bin_count, Some(7));
+    }
+
     /// (c) A `<cx:chartSpace>` with no `<cx:series>` is not a chartEx chart —
     /// `parse_chartex_part` returns `None` rather than an empty model.
     #[test]

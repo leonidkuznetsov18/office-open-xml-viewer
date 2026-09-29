@@ -362,7 +362,7 @@ function renderHistogramChart(
 ): void {
   const source = chart.series[0];
   if (!source) return;
-  const plan = planHistogramBins(source.values, chart.chartexHistogramBinning ?? {});
+  const plan = planHistogramBins(source.values, chart.chartexHistogramBinning ?? {}, source.valFormatCode);
   if (plan.kind === 'tooManyInputPoints') {
     rejectOversizedCanvasChart(ctx, rect, MAX_CANVAS_CHART_POINTS + 1);
     return;

@@ -254,10 +254,18 @@ pub(super) fn parse_chartex_data_point_overrides(
 
 pub(super) fn parse_chartex_histogram_binning(series: Node) -> Option<ChartexHistogramBinning> {
     let binning = child(child(series, "layoutPr")?, "binning")?;
+    // Office writes `<cx:binSize val="5"/>` / `<cx:binCount val="7"/>`
+    // (measured: PowerPoint honors the attribute form); the element-text form
+    // is kept for files that carry it.
+    let scalar = |name: &str| -> Option<String> {
+        let node = child(binning, name)?;
+        attr(&node, "val")
+            .map(|value| value.trim().to_string())
+            .or_else(|| node.text().map(|text| text.trim().to_string()))
+    };
     let finite_text = |name: &str| {
-        child(binning, name)
-            .and_then(|node| node.text())
-            .and_then(|text| text.trim().parse::<f64>().ok())
+        scalar(name)
+            .and_then(|text| text.parse::<f64>().ok())
             .filter(|value| value.is_finite())
     };
     let finite_attr = |name: &str| {
@@ -267,9 +275,8 @@ pub(super) fn parse_chartex_histogram_binning(series: Node) -> Option<ChartexHis
     };
     Some(ChartexHistogramBinning {
         bin_size: finite_text("binSize").filter(|value| *value > 0.0),
-        bin_count: child(binning, "binCount")
-            .and_then(|node| node.text())
-            .and_then(|text| text.trim().parse::<u32>().ok())
+        bin_count: scalar("binCount")
+            .and_then(|text| text.parse::<u32>().ok())
             .filter(|value| *value > 0),
         interval_closed: attr(&binning, "intervalClosed")
             .filter(|value| value == "l" || value == "r"),
@@ -902,7 +909,17 @@ pub(super) fn parse_chartex_impl(
         })
         .unwrap_or_else(|| vec![None; pt_count]);
     let source_number_format =
-        chartex_number_format(primary_data, &["size", "val", "colorVal"], references);
+        chartex_number_format(primary_data, &["size", "val", "colorVal"], references).or_else(
+            || {
+                // Histogram bin edges are formatted with the value dimension's
+                // cached format (measured against PowerPoint); other families
+                // keep the resolved-reference contract.
+                chartex_histogram_binning
+                    .is_some()
+                    .then(|| chartex_cached_number_format(primary_data, &["val"]))
+                    .flatten()
+            },
+        );
 
     let series_name_for = |node: Node, references: &mut dyn ChartReferenceResolver| {
         node.descendants()
@@ -2068,6 +2085,19 @@ pub(super) fn chartex_number_values(
         .map(str::trim)
         .filter(|formula| !formula.is_empty())?;
     references.resolve_numbers(formula)
+}
+
+/// `<cx:numDim><cx:lvl formatCode>` cached format of the first matching dimension.
+fn chartex_cached_number_format(root: Node, dimension_types: &[&str]) -> Option<String> {
+    root.descendants()
+        .find(|n| {
+            n.is_element()
+                && n.tag_name().name() == "numDim"
+                && attr(n, "type").is_some_and(|kind| dimension_types.contains(&kind.as_str()))
+        })
+        .and_then(|dimension| child(dimension, "lvl"))
+        .and_then(|lvl| attr(&lvl, "formatCode"))
+        .filter(|code| !code.is_empty())
 }
 
 pub(super) fn chartex_number_format(
