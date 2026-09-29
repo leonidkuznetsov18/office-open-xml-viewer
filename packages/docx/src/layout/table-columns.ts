@@ -387,6 +387,7 @@ export function measureTableIntrinsicWidths(
 function enforceContentConstraint(
   widths: number[],
   minimums: readonly number[],
+  transferFloors: readonly number[],
   maximums: readonly number[],
   cell: TableColumnCellConstraint,
 ): void {
@@ -405,17 +406,53 @@ function enforceContentConstraint(
   // Reclaim toward maximum, then expand the table only as far as its minimum.
   const transferredPt = shrinkOutsideSpan(
     widths,
-    minimums,
+    transferFloors,
     start,
     span,
     Math.max(0, maximumPt - currentPt),
   );
   growSpan(widths, start, span, transferredPt);
 
-  const afterTransferPt = spanSum(widths, start, span);
-  if (afterTransferPt < requiredPt - EPSILON_PT) {
-    growSpan(widths, start, span, requiredPt - afterTransferPt);
+  const afterPreferredTransferPt = spanSum(widths, start, span);
+  if (afterPreferredTransferPt < requiredPt - EPSILON_PT) {
+    // Once other tracks have reached their absolute minima, §17.4.29 allows
+    // reclaiming protected dxa width to satisfy this cell's own minimum, but
+    // not to enlarge it toward its optional maximum.
+    const minimumTransferPt = shrinkOutsideSpan(
+      widths, minimums, start, span, requiredPt - afterPreferredTransferPt,
+    );
+    growSpan(widths, start, span, minimumTransferPt);
+    const afterMinimumTransferPt = spanSum(widths, start, span);
+    if (afterMinimumTransferPt < requiredPt - EPSILON_PT) {
+      growSpan(widths, start, span, requiredPt - afterMinimumTransferPt);
+    }
   }
+}
+
+function noWrapPreferredFloors(
+  widths: readonly number[],
+  minimums: readonly number[],
+  cells: readonly TableColumnCellConstraint[],
+): number[] {
+  const floors = [...minimums];
+  for (const cell of cells) {
+    if (cell.noWrap !== true || cell.preferredWidth?.kind !== 'dxa') continue;
+    const start = Math.max(0, cell.columnStart);
+    const span = Math.max(1, Math.min(cell.columnSpan, widths.length - start));
+    const currentPt = spanSum(widths, start, span);
+    if (currentPt <= EPSILON_PT) continue;
+    const protectedPt = Math.min(currentPt, finiteNonNegative(cell.preferredWidth.value));
+    for (let column = start; column < start + span; column += 1) {
+      // §17.4.29 protects the span's aggregate preferred width. Retain its
+      // existing grid proportions because the rule does not assign that
+      // preference to individual tracks within a merged cell.
+      floors[column] = Math.max(
+        floors[column] ?? 0,
+        widths[column]! * protectedPt / currentPt,
+      );
+    }
+  }
+  return floors;
 }
 
 function fitToAvailableWidth(
@@ -428,14 +465,23 @@ function fitToAvailableWidth(
   if (totalPt <= availableWidthPt + EPSILON_PT || totalPt <= EPSILON_PT) return widths;
 
   const result = [...widths];
-  const slack = result.map((width, column) => Math.max(0, width - (minimums[column] ?? 0)));
-  const totalSlackPt = slack.reduce((sum, value) => sum + value, 0);
-  const shrinkPt = Math.min(totalPt - availableWidthPt, totalSlackPt);
-  if (shrinkPt > EPSILON_PT && totalSlackPt > EPSILON_PT) {
+  // ECMA-376 §17.4.29: a noWrap dxa cell retains its preferred width while
+  // other cells can still shrink to their absolute content minima. A later
+  // pass may shrink that preference if those other minima exhaust the band.
+  const protectedFloors = noWrapPreferredFloors(result, minimums, cells);
+  const shrinkToFloors = (floors: readonly number[], requestedPt: number): number => {
+    const slack = result.map((width, column) => Math.max(0, width - (floors[column] ?? 0)));
+    const totalSlackPt = slack.reduce((sum, value) => sum + value, 0);
+    const shrinkPt = Math.min(requestedPt, totalSlackPt);
+    if (shrinkPt <= EPSILON_PT || totalSlackPt <= EPSILON_PT) return 0;
     result.forEach((_width, column) => {
       result[column] -= shrinkPt * ((slack[column] ?? 0) / totalSlackPt);
     });
-  }
+    return shrinkPt;
+  };
+  const requestedShrinkPt = totalPt - availableWidthPt;
+  const protectedShrinkPt = shrinkToFloors(protectedFloors, requestedShrinkPt);
+  shrinkToFloors(minimums, requestedShrinkPt - protectedShrinkPt);
 
   // A proportional column shrink can violate an otherwise satisfiable minimum
   // on a spanning cell even though another track still has slack. Restore each
@@ -447,7 +493,10 @@ function fitToAvailableWidth(
     const span = Math.max(1, Math.min(cell.columnSpan, result.length - start));
     const deficitPt = finiteNonNegative(cell.minContentWidthPt) - spanSum(result, start, span);
     if (deficitPt <= EPSILON_PT) continue;
-    const transferredPt = shrinkOutsideSpan(result, minimums, start, span, deficitPt);
+    const preferredTransferPt = shrinkOutsideSpan(result, protectedFloors, start, span, deficitPt);
+    const transferredPt = preferredTransferPt + shrinkOutsideSpan(
+      result, minimums, start, span, deficitPt - preferredTransferPt,
+    );
     growSpan(result, start, span, transferredPt);
     if (transferredPt < deficitPt - EPSILON_PT) {
       growSpan(result, start, span, deficitPt - transferredPt);
@@ -500,8 +549,9 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
   const cells = input.rows.flatMap((row) => row.cells);
   // Single-column min/max bounds are established before spanning constraints.
   cells.sort((left, right) => left.columnSpan - right.columnSpan);
+  const transferFloors = noWrapPreferredFloors(widths, minimums, cells);
   for (const cell of cells) {
-    enforceContentConstraint(widths, minimums, maximums, cell);
+    enforceContentConstraint(widths, minimums, transferFloors, maximums, cell);
   }
   return Object.freeze(fitToAvailableWidth(
     widths,

@@ -235,4 +235,51 @@ describe('ECMA-376 §17.18.87 table column solver', () => {
       ] }],
     }))).toEqual([60, 40]);
   });
+
+  it('protects a noWrap dxa preference until the competing column reaches its minimum', () => {
+    const makeInput = (noWrap: boolean) => input({
+      layout: 'autofit',
+      availableWidthPt: 150,
+      gridWidthsPt: [100, 100],
+      rows: [{ before: null, after: null, cells: [
+        { columnStart: 0, columnSpan: 1, preferredWidth: { kind: 'dxa', value: 100 },
+          noWrap, minContentWidthPt: 20, maxContentWidthPt: 100 },
+        { columnStart: 1, columnSpan: 1, preferredWidth: { kind: 'dxa', value: 100 },
+          minContentWidthPt: 20, maxContentWidthPt: 100 },
+      ] }],
+    });
+    expect(resolveTableColumnWidths(makeInput(true))).toEqual([100, 50]);
+    expect(resolveTableColumnWidths(makeInput(false))).toEqual([75, 75]);
+
+    // Once the other column reaches its absolute minimum, the protected
+    // preference can also shrink to fit the remaining available width.
+    expect(resolveTableColumnWidths({ ...makeInput(true), availableWidthPt: 90 }))
+      .toEqual([70, 20]);
+  });
+
+  it('protects the aggregate dxa preference of a spanning noWrap cell', () => {
+    const result = resolveTableColumnWidths(input({
+      layout: 'autofit', availableWidthPt: 150, gridWidthsPt: [60, 40, 100],
+      rows: [{ before: null, after: null, cells: [
+        { columnStart: 0, columnSpan: 2, preferredWidth: { kind: 'dxa', value: 100 },
+          noWrap: true, minContentWidthPt: 20, maxContentWidthPt: 100 },
+        { columnStart: 2, columnSpan: 1, preferredWidth: { kind: 'dxa', value: 100 },
+          minContentWidthPt: 20, maxContentWidthPt: 100 },
+      ] }],
+    }));
+    expect(result).toEqual([60, 40, 50]);
+  });
+
+  it('reclaims protected dxa width only to satisfy another cell minimum', () => {
+    const result = resolveTableColumnWidths(input({
+      layout: 'autofit', availableWidthPt: 220, gridWidthsPt: [100, 100],
+      rows: [{ before: null, after: null, cells: [
+        { columnStart: 0, columnSpan: 1, preferredWidth: { kind: 'dxa', value: 100 },
+          noWrap: true, minContentWidthPt: 20, maxContentWidthPt: 100 },
+        { columnStart: 1, columnSpan: 1, preferredWidth: null,
+          minContentWidthPt: 120, maxContentWidthPt: 150 },
+      ] }],
+    }));
+    expect(result).toEqual([80, 120]);
+  });
 });

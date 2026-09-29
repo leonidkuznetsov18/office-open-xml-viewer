@@ -2342,14 +2342,16 @@ function resolveColumnWidths(
             numbering,
             { preserveWhitespaceOnlyContent: true },
           );
-          if (cell.noWrap !== true || cell.widthPt != null || ownerLayout === 'fixed'
-            || context.firstIndentPt <= 0 || numbering != null) return intrinsic;
+          if (cell.noWrap !== true || cell.widthPt != null || ownerLayout === 'fixed') return intrinsic;
           // The nonbreaking text interval is independent of first-line
-          // positioning. Ordinary min/max still use the authored indent.
+          // positioning. Probe without a line-width ceiling: the ordinary
+          // maxWidthPt is capped at contentWPt, which is too small for an
+          // AutoFit noWrap minimum when tcW is omitted (§17.4.29, §17.4.71).
+          // Ordinary min/max still use the authored indent and width limit.
           const unpositioned = measureParagraphIntrinsicWidths(
             paragraph,
             { ...context, firstIndentPt: 0 },
-            contentWPt,
+            Number.MAX_SAFE_INTEGER,
             { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
             paragraphMeasurementEnvironment(state),
             numbering,

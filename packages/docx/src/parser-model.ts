@@ -474,6 +474,7 @@ function tableColumnSemanticInput(
         colSpan: finiteOrNull(cell.colSpan) ?? 1,
         widthPt: finiteOrNull(cell.widthPt),
         widthPct: finiteOrNull(cell.widthPct),
+        ...(cell.noWrap === true ? { noWrap: true } : {}),
       })),
     })),
   }, 'DOCX table column semantic input') as TableSourceSemanticInput;

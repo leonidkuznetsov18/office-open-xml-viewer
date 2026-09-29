@@ -1216,6 +1216,8 @@ export interface TableColumnCellConstraint {
   readonly columnStart: number;
   readonly columnSpan: number;
   readonly preferredWidth: TablePreferredWidthConstraint | null;
+  /** §17.4.29 protects a dxa preference during AutoFit shrinking. */
+  readonly noWrap?: boolean;
   readonly minContentWidthPt: number;
   readonly maxContentWidthPt: number;
 }

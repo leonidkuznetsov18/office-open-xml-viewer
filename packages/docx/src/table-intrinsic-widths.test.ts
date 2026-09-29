@@ -216,6 +216,33 @@ describe('table intrinsic content widths', () => {
     )).toEqual({ minWidthPt: 30, maxWidthPt: 110 });
   });
 
+  it('measures an omitted-tcW noWrap minimum beyond the available band', () => {
+    const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu';
+    const makeTable = (noWrap: boolean) => table([row([
+      { ...cell([paragraph([textRun(words)]) as CellElement]), noWrap },
+      cell([paragraph([textRun('x')]) as CellElement]),
+    ])], [100, 100]);
+    const ctx = measuringContext();
+    const on = resolveColumnWidths(makeTable(true), 200, columnState(ctx));
+    const off = resolveColumnWidths(makeTable(false), 200, columnState(ctx));
+
+    // The 66 characters measure 330pt. A 200pt-clamped paragraph width
+    // would allocate about 195pt here, so this checks the real probe result.
+    expect(on[0]).toBeCloseTo(200 * 330 / 335, 6);
+    expect(on[0]).toBeGreaterThan(off[0]!);
+    expect(on[1]).toBeLessThan(off[1]!);
+  });
+
+  it('passes dxa noWrap through acquisition to the competing AutoFit columns', () => {
+    const makeTable = (noWrap: boolean) => table([row([
+      { ...cell([paragraph([textRun('first')]) as CellElement]), widthPt: 100, noWrap },
+      { ...cell([paragraph([textRun('other')]) as CellElement]), widthPt: 100 },
+    ])], [100, 100]);
+    const ctx = measuringContext();
+    expect(resolveColumnWidths(makeTable(true), 150, columnState(ctx))).toEqual([100, 50]);
+    expect(resolveColumnWidths(makeTable(false), 150, columnState(ctx))).toEqual([75, 75]);
+  });
+
   it('excludes first-line indent from the noWrap width request', () => {
     const first = (text: string, indentFirst: number): DocTableCell => ({
       ...cell([paragraph([textRun(text)], { indentFirst }) as CellElement]),

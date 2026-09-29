@@ -107,6 +107,7 @@ export interface TableSourceSemanticInput {
       colSpan: number;
       widthPt: number | null;
       widthPct: number | null;
+      noWrap?: boolean;
     }>[];
   }>[];
 }
@@ -361,6 +362,7 @@ export function projectTableColumnLayoutInput(
             columnSpan: span,
             preferredWidth: tableWidthConstraintFromLexical(wire?.preferredWidth)
               ?? publicTableCellConstraint(cell),
+            ...(cell.noWrap ? { noWrap: true } : {}),
             minContentWidthPt: Math.max(0, intrinsic.minWidthPt) + horizontalSpacingPt,
             maxContentWidthPt:
               Math.max(intrinsic.minWidthPt, intrinsic.maxWidthPt) + horizontalSpacingPt,
