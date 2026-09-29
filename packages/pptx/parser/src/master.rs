@@ -4212,10 +4212,11 @@ mod placeholder_geometry_tests {
             parse_layout_placeholders(
                 layout_doc.root_element(),
                 &HashMap::new(),
+                &DefaultTextLevels::default(),
+                &MasterStyleTier::default(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
+                &MasterLevelRunProperties::default(),
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
