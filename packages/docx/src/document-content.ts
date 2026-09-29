@@ -10,15 +10,70 @@ import type {
   ShapeRun,
   ShapeText,
 } from './types.js';
+import {
+  numberingMarkerShapeInput,
+  paragraphMarkShapeInput,
+  type InternalRunSlotMetadata,
+  type InternalShapeRun,
+} from './parser-model.js';
+import { requestedFamily, type TextFontSlots } from './layout/text.js';
+import type { NumberingMarkerShapeInput } from './layout/types.js';
 
-type InternalRenderedFontAxes = Readonly<{
-  fontFamilyHighAnsi?: string | null;
-  langEastAsia?: string;
-  fontFamilyEastAsia?: string | null;
-  fontFamilyCs?: string | null;
-  boldCs?: boolean;
-  italicCs?: boolean;
-}>;
+type InternalRenderedFontAxes = Readonly<InternalRunSlotMetadata>;
+
+type SlotRequest = Pick<NumberingMarkerShapeInput, 'fonts' | 'themeFonts' | 'themeFontPresence'>;
+
+/** The family the text shaper requests for each §17.3.2.26 slot. Resource
+ * collection resolves slots with the shaper's own {@link requestedFamily}, so a
+ * theme reference, a direct/style-resolved face and the ascii fallback reach
+ * the preload set exactly as they reach Canvas font selection. */
+function slotFamilies(
+  request: SlotRequest,
+  slots: readonly ('ascii' | 'highAnsi' | 'eastAsia' | 'complexScript')[],
+): (string | null | undefined)[] {
+  return slots.map((slot) => requestedFamily(request, slot));
+}
+
+/** Slot request for an ordinary text or field result. Parser output carries
+ * the resolved direct/theme slots; hand-built public runs fall back to the
+ * single-axis projection exactly as the segment builder does. */
+function runSlotRequest(
+  ascii: string | null | undefined,
+  facts: InternalRenderedFontAxes,
+): SlotRequest {
+  const base = ascii ?? null;
+  const fallback: TextFontSlots = {
+    ascii: base,
+    highAnsi: facts.fontFamilyHighAnsi ?? base,
+    eastAsia: facts.fontFamilyEastAsia ?? base,
+    complexScript: facts.fontFamilyCs ?? base,
+  };
+  return {
+    fonts: facts.fontSlots?.direct ?? fallback,
+    themeFonts: facts.fontSlots?.theme,
+    themeFontPresence: facts.fontSlots?.themePresent,
+  };
+}
+
+/** Whether a run can shape any character through its complex-script slot:
+ * w:cs/w:rtl force it (§17.3.2.26 step 2), and an authored or themed cs face
+ * governs complex-script characters in the run's text. */
+function runUsesComplexScriptSlot(facts: InternalRenderedFontAxes): boolean {
+  return facts.cs === true || facts.rtl === true || facts.fontFamilyCs != null
+    || facts.fontSlots?.direct.complexScript != null
+    || facts.fontSlots?.themePresent.complexScript === true;
+}
+
+/** Marker and paragraph-mark usage from the production shape projection. */
+function shapeInputUsage(text: string, input: NumberingMarkerShapeInput): DocxRenderedTextUsage {
+  return {
+    text,
+    eastAsiaLanguage: input.eastAsiaLanguage,
+    fontFamilies: slotFamilies(input, ['ascii', 'highAnsi', 'eastAsia', 'complexScript']),
+    bold: input.weight >= 700,
+    italic: input.style === 'italic',
+  };
+}
 
 /** One rendered string and every authored font family that can supply it.
  * Empty text records are intentional: paragraph marks and drawing anchors can
@@ -40,6 +95,14 @@ function* shapeTextUsages(shape: ShapeRun): Generator<DocxRenderedTextUsage> {
       text: shape.textPath.string,
       fontFamilies: [shape.textPath.fontFamily],
     };
+  }
+  // Parser-created text boxes lay out their complete w:txbxContent story
+  // (paragraphs AND tables, recursively). The legacy textBlocks projection
+  // omits tables, so it is consulted only for hand-built public shapes.
+  const content = (shape as InternalShapeRun).textBoxContent;
+  if (content !== undefined) {
+    yield* bodyUsages(content as BodyElement[]);
+    return;
   }
   for (const block of shape.textBlocks ?? []) {
     yield* shapeBlockUsages(block);
@@ -79,43 +142,45 @@ function* shapeBlockUsages(block: ShapeText): Generator<DocxRenderedTextUsage> {
   }
 }
 
+function* textResultUsages(
+  text: string,
+  ascii: string | null | undefined,
+  facts: InternalRenderedFontAxes,
+  bold: boolean | undefined,
+  italic: boolean | undefined,
+): Generator<DocxRenderedTextUsage> {
+  const request = runSlotRequest(ascii, facts);
+  const [asciiFamily, highAnsiFamily, eastAsiaFamily] =
+    slotFamilies(request, ['ascii', 'highAnsi', 'eastAsia']);
+  yield {
+    text,
+    eastAsiaLanguage: facts.langEastAsia,
+    fontFamilies: [asciiFamily, highAnsiFamily, eastAsiaFamily],
+    latinFontFamily: asciiFamily ?? highAnsiFamily ?? null,
+    bold,
+    italic,
+  };
+  if (runUsesComplexScriptSlot(facts)) {
+    const [complexScriptFamily] = slotFamilies(request, ['complexScript']);
+    if (complexScriptFamily) yield {
+      text,
+      eastAsiaLanguage: facts.langEastAsia,
+      fontFamilies: [complexScriptFamily],
+      // ECMA-376 §17.3.2.3/§17.3.2.17: bCs/iCs are independent of b/i.
+      // Probe the tuple that complex-script paint actually requests.
+      bold: facts.boldCs ?? false,
+      italic: facts.italicCs ?? false,
+    };
+  }
+}
+
 function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
   if (run.type === 'text') {
     const text = run as DocxTextRun & InternalRenderedFontAxes;
-    yield {
-      text: run.text,
-      eastAsiaLanguage: text.langEastAsia,
-      fontFamilies: [run.fontFamily, text.fontFamilyHighAnsi, run.fontFamilyEastAsia],
-      latinFontFamily: run.fontFamily ?? text.fontFamilyHighAnsi ?? null,
-      bold: run.bold,
-      italic: run.italic,
-    };
-    if (run.fontFamilyCs) yield {
-      text: run.text,
-      eastAsiaLanguage: text.langEastAsia,
-      fontFamilies: [run.fontFamilyCs],
-      // ECMA-376 §17.3.2.3/§17.3.2.17: bCs/iCs are independent of b/i.
-      // Probe the tuple that complex-script paint actually requests.
-      bold: run.boldCs ?? false,
-      italic: run.italicCs ?? false,
-    };
+    yield* textResultUsages(run.text, run.fontFamily, text, run.bold, run.italic);
   } else if (run.type === 'field') {
     const field = run as FieldRun & InternalRenderedFontAxes;
-    yield {
-      text: field.fallbackText,
-      eastAsiaLanguage: field.langEastAsia,
-      fontFamilies: [field.fontFamily, field.fontFamilyHighAnsi, field.fontFamilyEastAsia],
-      latinFontFamily: field.fontFamily ?? field.fontFamilyHighAnsi ?? null,
-      bold: field.bold,
-      italic: field.italic,
-    };
-    if (field.fontFamilyCs) yield {
-      text: field.fallbackText,
-      eastAsiaLanguage: field.langEastAsia,
-      fontFamilies: [field.fontFamilyCs],
-      bold: field.boldCs ?? false,
-      italic: field.italicCs ?? false,
-    };
+    yield* textResultUsages(field.fallbackText, field.fontFamily, field, field.bold, field.italic);
   } else if (run.type === 'shape') {
     yield* shapeTextUsages(run);
   } else if (run.type === 'anchorHost') {
@@ -134,14 +199,15 @@ function* paragraphUsages(paragraph: DocParagraph): Generator<DocxRenderedTextUs
     text: '',
     fontFamilies: [paragraph.defaultFontFamily, paragraph.defaultFontFamilyEastAsia],
   };
+  const mark = paragraphMarkShapeInput(paragraph);
+  if (mark) yield shapeInputUsage('', mark);
   if (paragraph.numbering) {
-    yield {
-      text: paragraph.numbering.text,
-      fontFamilies: [
-        paragraph.numbering.fontFamily,
-        paragraph.numbering.fontFamilyEastAsia,
-      ],
-    };
+    // Same effective numbering-level rPr projection (all four slots and their
+    // theme references) that production marker shaping consumes.
+    yield shapeInputUsage(
+      paragraph.numbering.text,
+      numberingMarkerShapeInput(paragraph.numbering, paragraph.defaultFontSize ?? 10),
+    );
   }
   for (const run of paragraph.runs) {
     for (const usage of runUsages(run)) {

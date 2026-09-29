@@ -4,30 +4,16 @@ import {
   classifyCjkFont,
   cjkLangFromLanguage,
   scriptPreloadNamesForText,
-  GOOGLE_FONT_SUBSTITUTES,
-  SCRIPT_GOOGLE_FONTS,
-  type FontPreloadEntry,
 } from '@silurus/ooxml-core';
 import type {
   DocxDocumentModel,
 } from './types.js';
 import { docxRenderedTextUsages } from './document-content.js';
+import { DOCX_GOOGLE_FONTS } from './google-font-registry.js';
 
-/** Theme-referenced typefaces commonly used by DOCX templates.
- *
- *  {@link GOOGLE_FONT_SUBSTITUTES} supplies advance-width substitutes for the
- *  base Office text faces (Calibri → Carlito, Cambria → Caladea), popular free
- *  web fonts and the Arabic Noto
- *  fallbacks — shared with pptx/xlsx. {@link SCRIPT_GOOGLE_FONTS} adds the
- *  CJK (KR/SC/TC/JP, plus HK sans) / Cyrillic / Thai / Devanagari / Hebrew
- *  Noto faces the renderer appends to the font chain. CJK fallbacks are ordered
- *  by document language. Both load only when `useGoogleFonts` is on — no binaries
- *  ship in the bundle. DOCX
- *  currently has no format-specific additions. */
-export const DOCX_GOOGLE_FONTS: Record<string, FontPreloadEntry> = {
-  ...GOOGLE_FONT_SUBSTITUTES,
-  ...SCRIPT_GOOGLE_FONTS,
-};
+// Kept in a parser-model-free module: layout font routing reads the registry,
+// while this module traverses parser-owned facts to collect rendered families.
+export { DOCX_GOOGLE_FONTS } from './google-font-registry.js';
 
 function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
   for (const usage of docxRenderedTextUsages(doc)) yield usage.text;
@@ -35,11 +21,24 @@ function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
 
 /**
  * The font-family names to preload for a document: the theme major/minor fonts,
- * plus only the script-fallback Noto faces whose script the document's TEXT
- * actually contains ({@link scriptPreloadNamesForText}). The renderer's font
- * fallback chains still END with the full Noto set, but eagerly fetching the
- * multi-MB CJK families for a document that has no CJK glyphs would block first
- * paint for nothing; an un-preloaded face loads lazily if it ever proves needed.
+ * every family rendered text resolves to, plus only the script-fallback Noto
+ * faces whose script the document's TEXT actually contains
+ * ({@link scriptPreloadNamesForText}).
+ *
+ * Rendered families come from {@link docxRenderedTextUsages}: all four
+ * §17.3.2.26 slots (ascii, hAnsi, eastAsia, cs) resolved through the shaper's
+ * own slot rule, across body, tables, headers/footers, notes, complete text-box
+ * stories and numbering markers. The loader requests only names that have a
+ * {@link DOCX_GOOGLE_FONTS} entry, and the layout font inventory routes only
+ * preloaded names to their loaded substitute, so a rendered Cambria run needs
+ * Cambria here for Caladea to be both fetched and selected. Rendered names
+ * without an entry are omitted (they would be inert). The document font table
+ * alone never adds a name.
+ *
+ * The renderer's font fallback chains still END with the full Noto set, but
+ * eagerly fetching the multi-MB CJK families for a document that has no CJK
+ * glyphs would block first paint for nothing; an un-preloaded face loads
+ * lazily if it ever proves needed.
  *
  * Single source of truth shared by the main-thread `load()` and the render
  * worker. Both derive the set from the SAME parsed {@link DocxDocumentModel}, so
@@ -55,7 +54,18 @@ export function docxFontPreloadNames(
     classifyCjkFont(doc.majorFont) ?? classifyCjkFont(doc.minorFont) ?? fallback ?? null;
   const scripts = new ScriptPreloadAccumulator(cjkLang);
   const languageNames = new Set<string>();
+  const renderedFamilies = new Map<string, string>();
+  const themeKeys = new Set([doc.majorFont, doc.minorFont]
+    .map((family) => family?.trim().toLocaleLowerCase('en-US')));
   for (const usage of docxRenderedTextUsages(doc)) {
+    for (const family of usage.fontFamilies) {
+      const name = family?.trim();
+      const key = name?.toLocaleLowerCase('en-US');
+      if (name && key && key in DOCX_GOOGLE_FONTS && !themeKeys.has(key)
+        && !renderedFamilies.has(key)) {
+        renderedFamilies.set(key, name);
+      }
+    }
     const region = cjkLangFromLanguage(usage.eastAsiaLanguage);
     if (region) {
       for (const name of scriptPreloadNamesForText([usage.text], region, true)) languageNames.add(name);
@@ -63,7 +73,8 @@ export function docxFontPreloadNames(
       scripts.addText([usage.text]);
     }
   }
-  return [doc.majorFont, doc.minorFont, ...new Set([...scripts.names(), ...languageNames])];
+  return [doc.majorFont, doc.minorFont, ...renderedFamilies.values(),
+    ...new Set([...scripts.names(), ...languageNames])];
 }
 
 /** Probe exact local style tuples used by rendered text. The shared loader

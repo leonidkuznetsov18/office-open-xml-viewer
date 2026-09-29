@@ -89,6 +89,20 @@ it('collects the distinct authored font tuples used by rendered text', () => {
   expect(requests.filter((request) => request.family.toLowerCase() === 'calibri')).toHaveLength(2);
 });
 
+it('preloads every registered rendered family without theme names and omits unregistered ones', () => {
+  const doc = docWith('body');
+  doc.majorFont = undefined;
+  doc.minorFont = undefined;
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'a', fontFamily: 'Ubuntu' },
+    { type: 'text', text: 'b', fontFamily: 'Arial', fontFamilyEastAsia: 'Roboto' },
+    { type: 'text', text: 'c', fontFamily: 'Arial', fontFamilyCs: 'Franklin Gothic Book' },
+  ];
+  expect(docxFontPreloadNames(doc)).toEqual([
+    undefined, undefined, 'Ubuntu', 'Roboto', 'Franklin Gothic Book',
+  ]);
+});
+
 it('loads the themed bold face when a run inherits its family', () => {
   const doc = docWith('body');
   (doc.body[0] as { runs: object[] }).runs = [

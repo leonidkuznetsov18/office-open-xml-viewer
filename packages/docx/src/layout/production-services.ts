@@ -6,7 +6,7 @@ import {
 } from '@silurus/ooxml-core';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
 import type { OfficeFontFallbackRoute } from '@silurus/ooxml-core';
-import { DOCX_GOOGLE_FONTS } from '../google-fonts.js';
+import { DOCX_GOOGLE_FONTS } from '../google-font-registry.js';
 import type { LoadedEmbeddedFontRoute } from '../embedded-fonts.js';
 import { normalizeFontFamilyUncached } from '../line-layout.js';
 import type { LayoutSourceStore } from './layout-source-store.js';
