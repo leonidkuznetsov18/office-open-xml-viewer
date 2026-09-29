@@ -4639,6 +4639,59 @@ describe('classic 3-D compatibility projection', () => {
     },
   );
 
+  it.each(['clusteredColumn', 'waterfall', 'funnel'] as const)(
+    'does not charge an unpainted NoStyle outline for ChartEx %s at 256 marks',
+    chartType => {
+      const stops = Array.from({ length: 4_096 }, (_, index) => ({
+        position: index / 4_095,
+        color: '112233',
+      }));
+      const model = baseModel({
+        chartType,
+        categories: Array.from({ length: 256 }, (_, index) => String(index)),
+        series: [series({ values: Array<number | null>(256).fill(1) })],
+        chartexDataPointStyle: {
+          fillPaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          lineNoStyle: true,
+          linePaintAuthored: true,
+        },
+      });
+      // 256 * 4096 gradient components exactly fill the budget; a phantom
+      // solid outline per mark would push it over.
+      expect(chartExDataMarkPaintWorkCount(model, RECT, 1)).toBe(1_048_576);
+      const rec = recordingCtx();
+      renderChart(rec.ctx, model, RECT, 1);
+      expect(rec.texts.some(text => text.text === '(too many data points)')).toBe(false);
+    },
+  );
+
+  it.each(['pareto', 'paretoLine'] as const)(
+    'charges one solid line for a structured %s role line over the recipe limit',
+    chartType => {
+      const stops = Array.from({ length: 4_097 }, (_, index) => ({
+        position: index / 4_096,
+        color: '112233',
+      }));
+      const model = baseModel({
+        chartType,
+        categories: ['A', 'B'],
+        series: [series({ values: [2, 1] })],
+        chartexDataPointLineStyle: {
+          linePaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+          linePaintAuthored: true,
+        },
+      });
+      const work = chartExDataMarkPaintWorkCount(model, RECT, 1);
+      expect(work).not.toBeNull();
+      expect(work!).toBeLessThanOrEqual(1_048_576);
+      const rec = recordingCtx();
+      renderChart(rec.ctx, model, RECT, 1);
+      expect(rec.texts.some(text => text.text === '(too many data points)')).toBe(false);
+    },
+  );
+
   it('atomically bounds repeated ChartEx data-mark paint at the 256/257 boundary', () => {
     const stops = Array.from({ length: 4_096 }, (_, index) => ({
       position: index / 4_095,

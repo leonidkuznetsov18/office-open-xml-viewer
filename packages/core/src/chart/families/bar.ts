@@ -304,6 +304,9 @@ export function renderBarChart(
         styleIndex,
         barSeries.length,
         fill,
+        false,
+        true,
+        true,
       ));
     });
   }
@@ -2084,8 +2087,8 @@ export function renderBarChart(
               { linkedNoStyleFallback: true },
             );
             if (!applyResolvedChartExLineStyle(
-              // No bounds: structured Pareto line paint stays solid, as on
-              // main, because the paint-work budget does not count it.
+              // No bounds: structured Pareto line paint stays solid, and the
+              // paint-work budget charges it as one solid line.
               target, { ...paretoLine, semanticFallback: false }, ptToPx,
             )) return;
             strokeOverlayRuns(target);

@@ -406,6 +406,13 @@ export function chartExSolidLineCarrier<T extends Partial<ChartExSeriesStyleCarr
 
 
 /** Resolve a ChartEx outline through ordered Chart Style role chains.
+ *
+ * Role-level structured line paint (a Chart Style role whose own `a:ln` is a
+ * gradient or pattern) is unmeasured in PowerPoint. This resolver reports it
+ * as-is; each family keeps its pre-existing behaviour (waterfall bars and
+ * ChartEx columns omit it, funnel/treemap/sunburst paint it, box lines and the
+ * Pareto line draw solid).
+ *
  * `paintRoles` are tried in order after the direct carrier until one supplies
  * line paint; `geometryRoles` supply `w`, dash, cap and join atoms the direct
  * `a:ln` omits (see the geometry-role selection below). A semantic-fallback
@@ -441,7 +448,8 @@ export function resolveChartExLineChain(
   // dataPointLine role authors `cap="rnd"`. NoStyle (`lnRef idx=0`) affects
   // paint only, so geometry authored beside it still counts. A semantic
   // fallback outline takes geometry only from its paint roles: PowerPoint
-  // draws no data-point outline from dataPointLine alone (round 2 R02).
+  // draws no data-point outline from dataPointLine alone (a dataPointLine-only
+  // control paints no outline on a data point).
   const geometryCandidates = line.semanticFallback ? paintRoles : geometryRoles;
   const geometryRole = geometryCandidates.find(role => role != null && (
     role.lineWidthEmu != null || role.lineCap != null || role.lineJoin != null
@@ -489,7 +497,7 @@ export function resolveChartExPointLine(
     ? [linkedStyle, chart.chartexDataPointLineStyle]
     : [linkedStyle];
   // A point's structured line paint falls through to the series outline
-  // (PowerPoint round 2: a gradient dataPt `a:ln` over a solid red series
+  // (PowerPoint-observed: a gradient dataPt `a:ln` over a solid red series
   // outline paints that bar red).
   point = chartExSolidLineCarrier(point, index);
   if (!chartExPointAuthorsLine(point)) {
@@ -613,6 +621,7 @@ export function chartExLegendSeries(
   fillColor: string,
   semanticNoStyleFallback = false,
   inheritPlotOutline = true,
+  bodyOmitsStructuredLine = false,
 ): ChartSeries {
   // Legend keys follow the same role chain as the plotted body so their
   // outline geometry (e.g. a dataPointLine 2.25 pt round rule) matches.
@@ -628,10 +637,13 @@ export function chartExLegendSeries(
     fillColor,
     { linkedNoStyleFallback: semanticNoStyleFallback },
   );
-  // PowerPoint omits a gradient/pattern series outline on ChartEx bodies, and
-  // the legend key follows the body: no outline rather than structured paint.
-  // Callers whose body demotes structured lines to solid pass a solid carrier.
-  const outlined = inheritPlotOutline && !chartExLineIsStructured(line);
+  // The key follows its own body. Direct structured paint was already demoted
+  // by the role chain above. Role-level structured line paint (a Chart Style
+  // role whose own `a:ln` is a gradient or pattern) is unmeasured: each family
+  // keeps its pre-existing body behaviour, and only families whose body omits
+  // it (waterfall bars, ChartEx columns) ask the key to omit it too.
+  const outlined = inheritPlotOutline
+    && !(bodyOmitsStructuredLine && chartExLineIsStructured(line));
   return {
     name,
     values: [],

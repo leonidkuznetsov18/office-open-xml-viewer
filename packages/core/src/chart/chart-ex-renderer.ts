@@ -227,7 +227,6 @@ export function chartExDataMarkPaintWorkCount(
       charge(resolveChartExPointFill(chart, series, point, styleIndex, count));
       const line = resolveChartExPointLine(
         chart, series, point, styleIndex, count, '#000000',
-        chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
       );
       if (line.visible && !chartExLineIsStructured(line)) {
         charge(line.paint ?? { fillType: 'solid', color: '000000' });
@@ -235,13 +234,15 @@ export function chartExDataMarkPaintWorkCount(
       if (total > MAX_CHART_PAINT_COMPONENTS) return;
     }
   };
+  // The Pareto line is always painted solid (no bounds), so a structured role
+  // paint costs the same as a solid one.
   const chargeParetoLine = (series: ChartSeries | undefined, styleIndex: number): void => {
     const roles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
     const line = resolveChartExLineChain(
       chart, chartExSolidLineCarrier(series, styleIndex), roles, roles, styleIndex, 1, '#000000',
       { linkedNoStyleFallback: true },
     );
-    if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
+    if (line.visible) charge({ fillType: 'solid', color: '000000' });
   };
 
   if (chart.chartType === 'clusteredColumn') {
@@ -286,7 +287,6 @@ export function chartExDataMarkPaintWorkCount(
       charge(resolveChartExPointFill(chart, series, point, accentIndex, 3));
       const line = resolveChartExPointLine(
         chart, series, point, accentIndex, 3, '#000000',
-        chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
       );
       // A structured waterfall bar outline is not painted (see
       // chartExSolidLineCarrier).
@@ -306,7 +306,6 @@ export function chartExDataMarkPaintWorkCount(
         charge(resolveChartExPointFill(chart, series, point, 0, 1));
         const line = resolveChartExPointLine(
           chart, series, point, 0, 1, '#000000',
-          chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
         );
         if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
       }
@@ -342,7 +341,10 @@ export function chartExDataMarkPaintWorkCount(
       charge(resolveChartExPointFill(chart, series, point, node.branchIndex, branchCount));
       const line = resolveChartExPointLine(
         chart, series, point, node.branchIndex, branchCount, '#000000',
-        chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
+        chart.chartexDataPointStyle,
+        // Match the painters: only the treemap tile resolves NoStyle to its
+        // semantic separator.
+        { linkedNoStyleFallback: chart.chartType === 'treemap' },
       );
       if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
     });
@@ -487,12 +489,15 @@ function renderWaterfallChart(
     series: [
       chartExLegendSeries(
         chart, 'Increase', series, chart.chartexDataPointStyle, 0, 3, colorPos,
+        false, true, true,
       ),
       chartExLegendSeries(
         chart, 'Decrease', series, chart.chartexDataPointStyle, 1, 3, colorNeg,
+        false, true, true,
       ),
       chartExLegendSeries(
         chart, 'Total', series, chart.chartexDataPointStyle, 2, 3, colorSub,
+        false, true, true,
       ),
     ],
   };
