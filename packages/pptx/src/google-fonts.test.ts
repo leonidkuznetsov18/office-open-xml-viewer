@@ -87,7 +87,9 @@ describe('PPTX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
   it('preserves valid pre-consolidation entries byte-for-byte', () => {
     for (const [key, entry] of Object.entries(PPTX_GOOGLE_FONTS_OLD)) {
       if (key === 'calibri light' || key === 'cambria math') continue;
-      expect(PPTX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading fields are frozen; script-scope metadata (core
+      // substitute-script.ts) may be added to a visual substitute.
+      expect(PPTX_GOOGLE_FONTS[key], `entry "${key}"`).toMatchObject(entry);
     }
     expect(PPTX_GOOGLE_FONTS['calibri light']).toBeUndefined();
     expect(PPTX_GOOGLE_FONTS['cambria math']).toBeUndefined();

@@ -1,9 +1,13 @@
 import type { LayoutDiagnostic } from './types.js';
 import {
   classifyFontGeneric,
+  fontSubstituteScriptCoversText,
   graphemeClusterOffsets,
+  isFontSubstituteScriptCodePoint,
+  isFontSubstituteScriptNeutralCodePoint,
   normalizeFontMetricFamily,
   type CjkLang,
+  type FontSubstituteScript,
   type ResolvedFontMetric,
 } from '@silurus/ooxml-core';
 import type {
@@ -653,8 +657,19 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // evidence; every authored direct/theme face remains authoritative above.
       : request.genericFamily ?? defaultGenericForSlot(request.slot);
     const hasHan = containsHanScript(request.text ?? '');
+    // A scoped visual substitute (core substitute-script.ts) answers only text
+    // of its script. A complex-script span belongs to that script as a whole
+    // once it contains one of its characters; any other slot span must consist
+    // of that script (the shaper splits such spans at the script boundary).
+    const scoped = input.fonts.scopedSubstituteScript?.(authoredFamily);
+    const substituteScript = scoped && fontSubstituteScriptCoversText(
+      scoped,
+      request.text ?? '',
+      request.slot === 'complexScript' ? 'any' : 'exclusive',
+    ) ? scoped : undefined;
     return input.fonts.resolve({
       requestedFamily: authoredFamily,
+      ...(substituteScript ? { script: substituteScript } : {}),
       cjkFallback: hasHan ? input.cjkFallback : undefined,
       language: request.slot === 'eastAsia' && hasHan
         ? request.eastAsiaLanguage
@@ -796,7 +811,18 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       if (retainedShape) return retainedShape;
       const grouped: {
         text: string; start: number; end: number; script: FontScriptSlot; breakBefore: boolean;
+        substituteScript: boolean;
       }[] = [];
+      // Split a non-complex-script slot span at the script boundary of a scoped
+      // visual substitute registered for that slot's family, so the substitute
+      // never paints or measures the Latin (or other) characters beside it.
+      // Neutral separators stay with the preceding text. Families without a
+      // scoped substitute keep one span per slot.
+      const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
+      for (const slot of ['ascii', 'highAnsi', 'eastAsia'] as const) {
+        const scoped = input.fonts.scopedSubstituteScript?.(requestedFamily(request, slot));
+        if (scoped) scopedBySlot.set(slot, scoped);
+      }
       const graphemeBoundaries = Object.freeze(
         [...new Set([0, ...graphemeClusterOffsets(request.text), request.text.length])].sort((a, b) => a - b),
       );
@@ -817,11 +843,19 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           eastAsiaCharset,
         );
         const previous = grouped.at(-1);
-        if (previous?.script === script) {
+        const scoped = scopedBySlot.get(script);
+        const codePoint = character.codePointAt(0) ?? 0;
+        const substituteScript = scoped === undefined ? false
+          : isFontSubstituteScriptCodePoint(scoped, codePoint)
+            || (isFontSubstituteScriptNeutralCodePoint(codePoint)
+              && previous?.script === script && previous.substituteScript);
+        if (previous?.script === script && previous.substituteScript === substituteScript) {
           previous.text += character;
           previous.end = end;
         } else {
-          grouped.push({ text: character, start, end, script, breakBefore: graphemeStarts.has(start) });
+          grouped.push({
+            text: character, start, end, script, breakBefore: graphemeStarts.has(start), substituteScript,
+          });
         }
         start = end;
       }

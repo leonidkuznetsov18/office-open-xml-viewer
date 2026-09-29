@@ -1,7 +1,11 @@
 import { cjkLangFromLanguage, type CjkLang } from '@silurus/ooxml-core';
 import type { LayoutDiagnostic } from './types.js';
 import { stableFingerprint } from './fingerprint.js';
-import { createCanvasFontRoute, type CanvasFontRoute } from '@silurus/ooxml-core';
+import {
+  createCanvasFontRoute,
+  type CanvasFontRoute,
+  type FontSubstituteScript,
+} from '@silurus/ooxml-core';
 
 export type FontResolutionSource = 'embedded' | 'local' | 'css' | 'google' | 'substitute' | 'native' | 'generic';
 export type FontStyle = 'normal' | 'italic';
@@ -13,6 +17,10 @@ export interface FontRequest {
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
   readonly weight?: number;
   readonly style?: FontStyle;
+  /** Script that the requested text belongs to, when it belongs to one that a
+   * scoped visual substitute covers. A scoped inventory face answers only such
+   * a request; any other request resolves as if that face did not exist. */
+  readonly script?: FontSubstituteScript;
 }
 
 export interface FontResolution {
@@ -31,6 +39,9 @@ export interface FontResolution {
 export interface FontResolver {
   readonly fingerprint: string;
   resolve(request: Readonly<FontRequest>): FontResolution;
+  /** Script of a scoped substitute registered for this family, if any. The
+   * shaper splits spans at that script's boundary only for such families. */
+  scopedSubstituteScript?(requestedFamily: string | null | undefined): FontSubstituteScript | undefined;
 }
 
 export interface FontInventoryFace {
@@ -40,6 +51,8 @@ export interface FontInventoryFace {
   readonly resourceIdentity?: string;
   readonly weight?: number;
   readonly style?: FontStyle;
+  /** Visual substitute limited to one script (core `substitute-script.ts`). */
+  readonly script?: FontSubstituteScript;
 }
 
 export interface FontResolverOptions {
@@ -148,7 +161,8 @@ export function createFontResolver(
     const weight = normalizedWeight(request.weight);
     const style = request.style ?? 'normal';
     const candidates = byFamily.get(normalizeFamily(requestedFamily)) ?? [];
-    const face = candidates.find((candidate) => candidate.weight === weight && candidate.style === style);
+    const face = candidates.find((candidate) => candidate.weight === weight && candidate.style === style
+      && (candidate.script === undefined || candidate.script === request.script));
     if (face) {
       const diagnostics: LayoutDiagnostic[] = face.source === 'substitute'
         ? [{
@@ -207,6 +221,12 @@ export function createFontResolver(
 
   return Object.freeze({
     fingerprint,
+    scopedSubstituteScript(requestedFamily: string | null | undefined): FontSubstituteScript | undefined {
+      const family = requestedFamily?.trim();
+      return family
+        ? byFamily.get(normalizeFamily(family))?.find((face) => face.script !== undefined)?.script
+        : undefined;
+    },
     resolve(request: Readonly<FontRequest>): FontResolution {
       const key = JSON.stringify([
         request.requestedFamily ?? null,
@@ -215,6 +235,7 @@ export function createFontResolver(
         request.style ?? null,
         request.language ?? null,
         request.cjkFallback ?? null,
+        request.script ?? null,
       ]);
       const retained = resolutions.get(key);
       if (retained) return retained;

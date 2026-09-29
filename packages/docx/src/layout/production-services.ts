@@ -180,6 +180,7 @@ export function createProductionLayoutServices(
           resolvedFamily: loaded.displayFamily,
           source: normalizedFaceFamily(resolvedFamily) === normalizedFaceFamily(name)
             ? 'google' : 'substitute',
+          ...(entry.script === undefined ? {} : { script: entry.script }),
           weight: loaded.weight,
           style: loaded.style,
         });

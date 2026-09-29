@@ -122,6 +122,8 @@ import {
   fillDoubleBorder,
   isOptionalImageCodecUnavailableError,
   paintOptionalImagePlaceholder,
+  GOOGLE_FONT_SUBSTITUTES,
+  substituteEntryCoversText,
 } from '@silurus/ooxml-core';
 import type {
   DecodedBitmapCacheOwner,
@@ -940,7 +942,12 @@ export function cssFontStack(
   const generic = genericFallback(authoredFamily);
   const arabicText = ARABIC_TEXT_RE.test(text);
   const alias = googleSubstitutes ? OFFICE_FONT_SUBSTITUTE[authoredFamily.toLowerCase()] : undefined;
-  const sub = alias?.includes('Arabic') && !arabicText ? undefined : alias;
+  // Script-scoped visual substitutes (core substitute-script.ts) join only a
+  // run that contains their script. A CSS stack cannot split a run, but the
+  // authored family stays first, so an installed authored face still wins.
+  const sub = alias && substituteEntryCoversText(
+    GOOGLE_FONT_SUBSTITUTES[authoredFamily.toLowerCase()], text, 'any',
+  ) ? alias : undefined;
   const subPart = sub ? `"${sub}", ` : '';
   const googleAlias = googleCjkFontAlias(authoredFamily);
   const aliasPart = googleAlias ? `"${googleAlias}", ` : '';

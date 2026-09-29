@@ -3,7 +3,9 @@ import type { CjkLang, OfficeFontFallbackRequest } from '@silurus/ooxml-core';
 import {
   classifyCjkFont,
   cjkLangFromLanguage,
+  findReferenceFontMetrics,
   scriptPreloadNamesForText,
+  substituteEntryCoversText,
 } from '@silurus/ooxml-core';
 import type {
   DocxDocumentModel,

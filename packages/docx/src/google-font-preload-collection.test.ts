@@ -111,10 +111,17 @@ async function paintedFamily(model: DocxDocumentModel, text: string, installedSu
       googleFaces: [loaded('Carlito'), loaded('Caladea')],
       installedSubstituteFamilies,
       measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      ...options,
     }),
   });
-  const call = calls.find((entry) => entry.text.includes(text));
-  return call && /px\s+"?([^",]+)"?/.exec(call.font)?.[1];
+  return texts.map((text) => {
+    const call = calls.find((entry) => entry.text.includes(text));
+    return call && /px\s+"?([^",]+)"?/.exec(call.font)?.[1];
+  });
+}
+
+async function paintedFamily(model: DocxDocumentModel, text: string): Promise<string | undefined> {
+  return (await paintedFamilies(model, [text]))[0];
 }
 
 beforeAll(async () => {
@@ -168,5 +175,38 @@ describe('Google Fonts preload collects every rendered substitute family', () =>
       + '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Calibri"/><w:cs/></w:rPr></w:lvl>'));
     expect(docxFontPreloadNames(model)).toContain('Calibri');
     expect(await paintedFamily(model, '1.')).toBe('Carlito');
+  });
+});
+
+describe('script-scoped Arabic visual substitutes', () => {
+  const sakkal = (text: string, rtl = false) => '<w:p><w:r><w:rPr>'
+    + '<w:rFonts w:ascii="Sakkal Majalla" w:hAnsi="Sakkal Majalla" w:cs="Sakkal Majalla"/>'
+    + `${rtl ? '<w:rtl/>' : ''}</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+
+  it('neither preloads nor paints Noto Naskh Arabic for Latin-only Sakkal Majalla text', async () => {
+    const model = parse(docx(sakkal('Leader')));
+    expect(docxFontPreloadNames(model)).not.toContain('Sakkal Majalla');
+    expect(await paintedFamily(model, 'Leader')).toBe('Sakkal Majalla');
+  });
+
+  it('paints only the Arabic characters of a mixed ascii-slot run with the substitute', async () => {
+    const model = parse(docx(sakkal('مرحبا Leader')));
+    expect(docxFontPreloadNames(model)).toContain('Sakkal Majalla');
+    expect(await paintedFamilies(model, ['مرحبا', 'Leader']))
+      .toEqual(['Noto Naskh Arabic', 'Sakkal Majalla']);
+  });
+
+  it('gives a complex-script span containing Arabic to the substitute as a whole', async () => {
+    // The ASCII "!" shares the Arabic bidi run and the cs slot span.
+    const model = parse(docx(sakkal('مرحبا! بكم', true)));
+    const [family] = await paintedFamilies(model, ['!']);
+    expect(family).toBe('Noto Naskh Arabic');
+  });
+
+  it('never routes an installed authored family to its substitute', async () => {
+    const model = parse(docx(sakkal('مرحبا Leader')));
+    expect(await paintedFamilies(model, ['مرحبا'], {
+      installedSubstituteFamilies: ['sakkal majalla'],
+    })).toEqual(['Sakkal Majalla']);
   });
 });

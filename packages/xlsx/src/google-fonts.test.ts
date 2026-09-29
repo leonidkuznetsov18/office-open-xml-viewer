@@ -60,7 +60,9 @@ const EXPECTED_ADDED = new Set([
 describe('XLSX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
   it('preserves every pre-consolidation entry byte-for-byte', () => {
     for (const [key, entry] of Object.entries(XLSX_GOOGLE_FONTS_OLD)) {
-      expect(XLSX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading fields are frozen; script-scope metadata (core
+      // substitute-script.ts) may be added to a visual substitute.
+      expect(XLSX_GOOGLE_FONTS[key], `entry "${key}"`).toMatchObject(entry);
     }
   });
 
