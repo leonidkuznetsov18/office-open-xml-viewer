@@ -16,41 +16,53 @@
  */
 export type FontSubstituteScript = 'arabic';
 
-/** Arabic-script blocks: Arabic, Supplement, Extended-A/B, Presentation
- * Forms-A/B and Arabic Mathematical Alphabetic Symbols. Hebrew, Syriac and the
- * other complex-script blocks are deliberately excluded: an Arabic substitute
- * has no glyphs for them. */
+const FORMAT_CONTROL = /^\p{Cf}$/u;
+const ARABIC_SCRIPT = /^\p{Script=Arabic}$/u;
+const LETTER_OR_MARK = /^[\p{L}\p{M}]$/u;
+
+/** Arabic-script characters that a substitute actually draws: every visible
+ * Unicode Script=Arabic character (letters, marks, Arabic-Indic digits and
+ * Arabic punctuation). Invisible format controls are excluded even when their
+ * Script property is Arabic (ALM U+061C, the U+0600-U+0605 number signs,
+ * U+06DD, U+08E2). U+FEFF is Script=Common and is excluded anyway. Hebrew,
+ * Syriac and the other complex-script blocks are excluded: an Arabic
+ * substitute has no glyphs for them. */
 function isArabicScriptCodePoint(cp: number): boolean {
-  return (cp >= 0x0600 && cp <= 0x06ff)
-    || (cp >= 0x0750 && cp <= 0x077f)
-    || (cp >= 0x0870 && cp <= 0x08ff)
-    || (cp >= 0xfb50 && cp <= 0xfdff)
-    || (cp >= 0xfe70 && cp <= 0xfeff)
-    || (cp >= 0x1ee00 && cp <= 0x1eeff);
+  const character = String.fromCodePoint(cp);
+  return ARABIC_SCRIPT.test(character) && !FORMAT_CONTROL.test(character);
 }
 
-/** Whether one code point belongs to `script`. */
+/** Whether one code point is a visible character of `script` that the
+ * substitute paints. */
 export function isFontSubstituteScriptCodePoint(script: FontSubstituteScript, cp: number): boolean {
   switch (script) {
     case 'arabic': return isArabicScriptCodePoint(cp);
   }
 }
 
-/** Script-neutral separators inherit the script of the text around them:
- * white space and the joiner/bidi controls (ZWNJ, ZWJ, LRM, RLM, ALM). A space
- * between two Arabic words stays with the Arabic text. Digits and punctuation
- * are Latin-shaped in the substitute, so they are not neutral. */
+/** Whether one code point proves that text is in `script`: a letter or a
+ * combining mark of that script. Digits, punctuation and invisible controls
+ * never enable a scoped substitute on their own. */
+function provesFontSubstituteScript(script: FontSubstituteScript, cp: number): boolean {
+  return isFontSubstituteScriptCodePoint(script, cp) && LETTER_OR_MARK.test(String.fromCodePoint(cp));
+}
+
+/** Script-neutral characters inherit the script of the text around them:
+ * white space and every invisible format control (ZWNJ, ZWJ, LRM, RLM, ALM,
+ * U+FEFF, the bidi embeddings and isolates). A space between two Arabic words
+ * stays with the Arabic text. Latin digits and punctuation are not neutral:
+ * the substitute would draw them with its own Latin-style glyphs. */
 export function isFontSubstituteScriptNeutralCodePoint(cp: number): boolean {
-  return cp === 0x0020 || cp === 0x00a0 || cp === 0x0009
-    || (cp >= 0x2000 && cp <= 0x200f) || cp === 0x202f || cp === 0x061c;
+  const character = String.fromCodePoint(cp);
+  return /^\s$/u.test(character) || FORMAT_CONTROL.test(character);
 }
 
 /**
  * Whether a scoped substitute may supply `text`.
  * - `'exclusive'`: every non-neutral character belongs to the script, and at
- *   least one does. Use this for a span that can mix scripts, such as an
+ *   least one is a letter or mark of the script. Use this for a span that can mix scripts, such as an
  *   ECMA-376 §17.3.2.26 ascii-slot span.
- * - `'any'`: at least one character belongs to the script. Use this for a
+ * - `'any'`: at least one character is a letter or mark of the script. Use this for a
  *   complex-script span that the script owns as a whole, including its neutral
  *   digits and punctuation.
  */
@@ -62,8 +74,9 @@ export function fontSubstituteScriptCoversText(
   let covered = false;
   for (const character of text) {
     const cp = character.codePointAt(0) ?? 0;
-    if (isFontSubstituteScriptCodePoint(script, cp)) covered = true;
-    else if (mode === 'exclusive' && !isFontSubstituteScriptNeutralCodePoint(cp)) return false;
+    if (provesFontSubstituteScript(script, cp)) covered = true;
+    else if (mode === 'exclusive' && !isFontSubstituteScriptCodePoint(script, cp)
+      && !isFontSubstituteScriptNeutralCodePoint(cp)) return false;
   }
   return covered;
 }

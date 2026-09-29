@@ -17,6 +17,12 @@ describe('script-scoped visual substitutes', () => {
     expect(fontSubstituteScriptCoversText('arabic', 'مرحبا 2026', 'any')).toBe(true);
     expect(fontSubstituteScriptCoversText('arabic', 'Leader 2026', 'any')).toBe(false);
     expect(fontSubstituteScriptCoversText('arabic', '   ', 'exclusive')).toBe(false);
+    // Invisible controls and Arabic-script digits/punctuation never prove Arabic.
+    expect(fontSubstituteScriptCoversText('arabic', 'Leader\uFEFF', 'any')).toBe(false);
+    expect(fontSubstituteScriptCoversText('arabic', '\u061C2026', 'any')).toBe(false);
+    expect(fontSubstituteScriptCoversText('arabic', '\u0661\u0662\u060C', 'any')).toBe(false);
+    expect(fontSubstituteScriptCoversText('arabic', '\u061Cمرحبا\u200F\uFEFF', 'exclusive')).toBe(true);
+    expect(fontSubstituteScriptCoversText('arabic', 'مرحبا \u0661\u0662', 'exclusive')).toBe(true);
     // Hebrew is complex script but not Arabic script.
     expect(fontSubstituteScriptCoversText('arabic', 'שלום', 'any')).toBe(false);
   });

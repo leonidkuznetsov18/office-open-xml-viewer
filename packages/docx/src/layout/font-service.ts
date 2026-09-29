@@ -39,7 +39,7 @@ export interface FontResolution {
 export interface FontResolver {
   readonly fingerprint: string;
   resolve(request: Readonly<FontRequest>): FontResolution;
-  /** Script of a scoped substitute registered for this family, if any. The
+  /** Script of a scoped substitute configured for this family, if any. The
    * shaper splits spans at that script's boundary only for such families. */
   scopedSubstituteScript?(requestedFamily: string | null | undefined): FontSubstituteScript | undefined;
 }
@@ -60,6 +60,17 @@ export interface FontResolverOptions {
   readonly regionalFamilyLists?: Partial<Record<CjkLang, Readonly<Record<string, string>>>>;
   /** Stable DOCX fallback routes derived from document metadata and rendered faces. */
   readonly nativeFamilyLists?: Readonly<Record<string, string>>;
+  /**
+   * Authored families (normalized) whose web substitute is script-scoped (core
+   * substitute-script.ts), with the substitute families of that script. For a
+   * request not in that script, those families are removed from EVERY route
+   * of the family (explicit, native and regional CSS lists), so Canvas can
+   * never select them for other characters, even as a CSS fallback.
+   */
+  readonly scriptScopedFamilies?: Readonly<Record<string, Readonly<{
+    script: FontSubstituteScript;
+    substituteFamilies: readonly string[];
+  }>>>;
 }
 
 function normalizeFamily(value: string): string {
@@ -142,7 +153,34 @@ export function createFontResolver(
     return (region ? regionalFamilyLists[region]?.[normalizeFamily(family)] : undefined)
       ?? nativeFamilyLists[normalizeFamily(family)];
   };
-  const fingerprint = stableFingerprint('fonts', { faces, nativeFamilyLists, regionalFamilyLists });
+  const scriptScopedFamilies = Object.freeze(Object.fromEntries(
+    Object.entries(options.scriptScopedFamilies ?? {})
+      .map(([family, scope]) => [normalizeFamily(family), Object.freeze({
+        script: scope.script,
+        substituteFamilies: Object.freeze([...scope.substituteFamilies]
+          .map((name) => normalizeFamily(name)).sort()),
+      })] as const)
+      .sort(([a], [b]) => a.localeCompare(b)),
+  ));
+  // Remove a scoped substitute's families from a CSS family list. Names never
+  // contain commas in these generated lists; each entry is a quoted family or
+  // a CSS generic keyword.
+  const withoutScopedSubstitutes = (
+    familyList: string,
+    requestedFamily: string,
+    script: FontSubstituteScript | undefined,
+  ): string => {
+    const scope = scriptScopedFamilies[normalizeFamily(requestedFamily)];
+    if (!scope || scope.script === script) return familyList;
+    return familyList.split(',').map((entry) => entry.trim())
+      .filter((entry) => !scope.substituteFamilies.includes(
+        normalizeFamily(entry.replace(/^"(.*)"$/u, '$1').replaceAll('\\"', '"').replaceAll('\\\\', '\\')),
+      ))
+      .join(', ');
+  };
+  const fingerprint = stableFingerprint('fonts', {
+    faces, nativeFamilyLists, regionalFamilyLists, scriptScopedFamilies,
+  });
 
   // Every shaped script span, line segment and east-Asian line floor asks for a
   // resolution, and each fresh answer carried its own copy of the complete CSS
@@ -178,7 +216,10 @@ export function createFontResolver(
       return freezeResolution({
         requestedFamily,
         resolvedFamily: face.resolvedFamily,
-        route: createCanvasFontRoute(familyList, 'registered'),
+        route: createCanvasFontRoute(
+          withoutScopedSubstitutes(familyList, requestedFamily, request.script),
+          'registered',
+        ),
         source: face.source,
         ...(face.resourceIdentity === undefined ? {} : { resourceIdentity: face.resourceIdentity }),
         weight,
@@ -196,7 +237,10 @@ export function createFontResolver(
       return freezeResolution({
         requestedFamily,
         resolvedFamily: authored,
-        route: createCanvasFontRoute(familyList, 'native'),
+        route: createCanvasFontRoute(
+          withoutScopedSubstitutes(familyList, authored, request.script),
+          'native',
+        ),
         source: 'native',
         weight,
         style,
@@ -223,9 +267,7 @@ export function createFontResolver(
     fingerprint,
     scopedSubstituteScript(requestedFamily: string | null | undefined): FontSubstituteScript | undefined {
       const family = requestedFamily?.trim();
-      return family
-        ? byFamily.get(normalizeFamily(family))?.find((face) => face.script !== undefined)?.script
-        : undefined;
+      return family ? scriptScopedFamilies[normalizeFamily(family)]?.script : undefined;
     },
     resolve(request: Readonly<FontRequest>): FontResolution {
       const key = JSON.stringify([

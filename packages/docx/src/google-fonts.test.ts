@@ -192,9 +192,10 @@ describe('DOCX_GOOGLE_FONTS — theme typeface coverage', () => {
 describe('DOCX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
   it('preserves every pre-consolidation entry byte-for-byte', () => {
     for (const [key, entry] of Object.entries(DOCX_GOOGLE_FONTS_OLD)) {
-      // Loading fields are frozen; script-scope metadata (core
-      // substitute-script.ts) may be added to a visual substitute.
-      expect(DOCX_GOOGLE_FONTS[key], `entry "${key}"`).toMatchObject(entry);
+      // Strict equality except the one allowed addition: script-scope metadata
+      // (core substitute-script.ts) on a visual substitute.
+      const { script: _script, ...loading } = DOCX_GOOGLE_FONTS[key] ?? {};
+      expect(loading, `entry "${key}"`).toEqual(entry);
     }
   });
 

@@ -65,23 +65,50 @@ function parse(bytes: Uint8Array): DocxDocumentModel {
   }
 }
 
-function recordingCanvas() {
+const GENERIC_FAMILIES = new Set(['serif', 'sans-serif', 'monospace']);
+const ARABIC_LETTER = /\p{Script=Arabic}/u;
+
+function cssFamilies(font: string): string[] {
+  const list = /\d+(?:\.\d+)?px\s+(.*)$/u.exec(font)?.[1] ?? '';
+  return list.split(',').map((entry) => entry.trim().replace(/^"(.*)"$/u, '$1'));
+}
+
+/** Emulated Canvas font selection: the first family in the CSS list that is
+ * available (loaded web face, installed face or generic) and has a glyph for
+ * the character. Every available face covers Latin; Arabic is covered by the
+ * Arabic Noto faces, an installed Sakkal Majalla and the generics. Faces differ in advance and font box, so
+ * a leaked face changes measurement as well as paint. */
+function selectedFace(font: string, text: string, available: ReadonlySet<string>): string {
+  const character = [...text].find((c) => c.trim()) ?? 'x';
+  const arabic = ARABIC_LETTER.test(character);
+  return cssFamilies(font).find((family) => (GENERIC_FAMILIES.has(family) || available.has(family))
+    && (!arabic || GENERIC_FAMILIES.has(family) || /Arabic|Sakkal/u.test(family))) ?? 'serif';
+}
+
+const NASKH_METRICS = { advance: 0.9, ascent: 1.4, descent: 0.6 };
+const DEFAULT_METRICS = { advance: 0.5, ascent: 0.8, descent: 0.2 };
+
+function recordingCanvas(available: ReadonlySet<string>) {
   let font = '10px serif';
-  const calls: { text: string; font: string }[] = [];
+  const calls: { text: string; font: string; face: string }[] = [];
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const noop = () => {};
   const ctx = new Proxy({
     get font() { return font; },
     set font(value: string) { font = value; },
     letterSpacing: '0px',
-    measureText: (text: string) => ({
-      width: [...text].length * px() * 0.5,
-      fontBoundingBoxAscent: px() * 0.8,
-      fontBoundingBoxDescent: px() * 0.2,
-      actualBoundingBoxAscent: px() * 0.8,
-      actualBoundingBoxDescent: px() * 0.2,
-    }) as TextMetrics,
-    fillText(text: string) { calls.push({ text, font }); },
+    measureText: (text: string) => {
+      const metrics = selectedFace(font, text, available) === 'Noto Naskh Arabic'
+        ? NASKH_METRICS : DEFAULT_METRICS;
+      return {
+        width: [...text].length * px() * metrics.advance,
+        fontBoundingBoxAscent: px() * metrics.ascent,
+        fontBoundingBoxDescent: px() * metrics.descent,
+        actualBoundingBoxAscent: px() * metrics.ascent,
+        actualBoundingBoxDescent: px() * metrics.descent,
+      } as TextMetrics;
+    },
+    fillText(text: string) { calls.push({ text, font, face: selectedFace(font, text, available) }); },
     createLinearGradient: () => ({ addColorStop: noop }),
     getTransform: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }),
   } as Record<string | symbol, unknown>, {
@@ -111,13 +138,11 @@ async function paintedFamily(model: DocxDocumentModel, text: string, installedSu
       googleFaces: [loaded('Carlito'), loaded('Caladea')],
       installedSubstituteFamilies,
       measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
-      ...options,
+      ...(options.installedSubstituteFamilies
+        ? { installedSubstituteFamilies: options.installedSubstituteFamilies } : {}),
     }),
   });
-  return texts.map((text) => {
-    const call = calls.find((entry) => entry.text.includes(text));
-    return call && /px\s+"?([^",]+)"?/.exec(call.font)?.[1];
-  });
+  return texts.map((text) => calls.find((entry) => entry.text.includes(text))?.face);
 }
 
 async function paintedFamily(model: DocxDocumentModel, text: string): Promise<string | undefined> {
@@ -186,14 +211,28 @@ describe('script-scoped Arabic visual substitutes', () => {
   it('neither preloads nor paints Noto Naskh Arabic for Latin-only Sakkal Majalla text', async () => {
     const model = parse(docx(sakkal('Leader')));
     expect(docxFontPreloadNames(model)).not.toContain('Sakkal Majalla');
-    expect(await paintedFamily(model, 'Leader')).toBe('Sakkal Majalla');
+    // Naskh is loaded (another run's Arabic text would load it too), but the
+    // missing authored face must fall back past it for Latin.
+    expect(await paintedFamily(model, 'Leader')).toBe('serif');
+    const { canvas } = recordingCanvas(new Set(WEB_FACES));
+    const services = createLayoutServices(model, {
+      useGoogleFonts: true,
+      googleFaces: WEB_FACES.map(loaded),
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+    });
+    const slots = { ascii: 'Sakkal Majalla', highAnsi: 'Sakkal Majalla', complexScript: 'Sakkal Majalla' };
+    const latin = services.text.shape({ text: 'Leader', fontSizePt: 10, fonts: slots, measure: true });
+    expect(latin.advancePt).toBeCloseTo(6 * 10 * DEFAULT_METRICS.advance, 6);
+    expect(latin.ascentPt).toBeCloseTo(10 * DEFAULT_METRICS.ascent, 6);
+    const arabic = services.text.shape({ text: 'مرحبا', fontSizePt: 10, fonts: slots, measure: true });
+    expect(arabic.ascentPt).toBeCloseTo(10 * NASKH_METRICS.ascent, 6);
   });
 
   it('paints only the Arabic characters of a mixed ascii-slot run with the substitute', async () => {
     const model = parse(docx(sakkal('مرحبا Leader')));
     expect(docxFontPreloadNames(model)).toContain('Sakkal Majalla');
     expect(await paintedFamilies(model, ['مرحبا', 'Leader']))
-      .toEqual(['Noto Naskh Arabic', 'Sakkal Majalla']);
+      .toEqual(['Noto Naskh Arabic', 'serif']);
   });
 
   it('gives a complex-script span containing Arabic to the substitute as a whole', async () => {
@@ -203,10 +242,17 @@ describe('script-scoped Arabic visual substitutes', () => {
     expect(family).toBe('Noto Naskh Arabic');
   });
 
+  it('never lets an invisible control enable the substitute for a complex-script span', async () => {
+    const model = parse(docx(sakkal('Leader\uFEFF', true)));
+    expect(docxFontPreloadNames(model)).not.toContain('Sakkal Majalla');
+    expect(await paintedFamily(model, 'Leader')).toBe('serif');
+  });
+
   it('never routes an installed authored family to its substitute', async () => {
     const model = parse(docx(sakkal('مرحبا Leader')));
     expect(await paintedFamilies(model, ['مرحبا'], {
       installedSubstituteFamilies: ['sakkal majalla'],
+      installedFaces: ['Sakkal Majalla'],
     })).toEqual(['Sakkal Majalla']);
   });
 });
