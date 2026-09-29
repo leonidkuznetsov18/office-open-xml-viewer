@@ -4611,6 +4611,87 @@ describe('classic 3-D compatibility projection', () => {
     expect(rec.drawImages).toHaveLength(0);
   });
 
+  it.each(['clusteredColumn', 'pareto'] as const)(
+    'charges repeated ChartEx %s column paint at the 256/257 boundary',
+    chartType => {
+      const stops = Array.from({ length: 4_096 }, (_, index) => ({
+        position: index / 4_095,
+        color: '112233',
+      }));
+      const build = (count: number): ChartModel => baseModel({
+        chartType,
+        categories: Array.from({ length: count }, (_, index) => String(index)),
+        series: [series({ values: Array<number | null>(count).fill(1) })],
+        chartexDataPointStyle: {
+          fillPaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          linePaintAuthored: true,
+        },
+        chartexDataPointLineStyle: { lineHidden: true, linePaintAuthored: true },
+      });
+      expect(chartExDataMarkPaintWorkCount(build(256), RECT, 1)).toBe(1_048_576);
+      expect(chartExDataMarkPaintWorkCount(build(257), RECT, 1)).toBe(1_048_577);
+      const rec = recordingCtx();
+      renderChart(rec.ctx, build(257), RECT, 1);
+      expect(rec.texts.some(text => text.text === '(too many data points)')).toBe(true);
+      expect(rec.gradients).toHaveLength(0);
+    },
+  );
+
+  it.each(['clusteredColumn', 'waterfall', 'funnel'] as const)(
+    'does not charge an unpainted NoStyle outline for ChartEx %s at 256 marks',
+    chartType => {
+      const stops = Array.from({ length: 4_096 }, (_, index) => ({
+        position: index / 4_095,
+        color: '112233',
+      }));
+      const model = baseModel({
+        chartType,
+        categories: Array.from({ length: 256 }, (_, index) => String(index)),
+        series: [series({ values: Array<number | null>(256).fill(1) })],
+        chartexDataPointStyle: {
+          fillPaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          lineNoStyle: true,
+          linePaintAuthored: true,
+        },
+      });
+      // 256 * 4096 gradient components exactly fill the budget; a phantom
+      // solid outline per mark would push it over.
+      expect(chartExDataMarkPaintWorkCount(model, RECT, 1)).toBe(1_048_576);
+      const rec = recordingCtx();
+      renderChart(rec.ctx, model, RECT, 1);
+      expect(rec.texts.some(text => text.text === '(too many data points)')).toBe(false);
+    },
+  );
+
+  it.each(['pareto', 'paretoLine'] as const)(
+    'charges one solid line for a structured %s role line over the recipe limit',
+    chartType => {
+      const stops = Array.from({ length: 4_097 }, (_, index) => ({
+        position: index / 4_096,
+        color: '112233',
+      }));
+      const model = baseModel({
+        chartType,
+        categories: ['A', 'B'],
+        series: [series({ values: [2, 1] })],
+        chartexDataPointLineStyle: {
+          linePaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+          linePaintAuthored: true,
+        },
+      });
+      const work = chartExDataMarkPaintWorkCount(model, RECT, 1);
+      expect(work).not.toBeNull();
+      expect(work!).toBeLessThanOrEqual(1_048_576);
+      const rec = recordingCtx();
+      renderChart(rec.ctx, model, RECT, 1);
+      expect(rec.texts.some(text => text.text === '(too many data points)')).toBe(false);
+    },
+  );
+
   it('atomically bounds repeated ChartEx data-mark paint at the 256/257 boundary', () => {
     const stops = Array.from({ length: 4_096 }, (_, index) => ({
       position: index / 4_095,
@@ -10052,28 +10133,183 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(red.map(rect => rect.lw)).toEqual([0.75, 2.25]);
   });
 
-  it('paints a gradient ChartEx column outline', () => {
+  // PowerPoint-observed structured series outlines (gradient/pattern): classic
+  // columns lay a gradient out per column; ChartEx drops it — body outlines
+  // are omitted and line elements fall back to their default solid colour.
+  const gradientLine = {
+    linePaints: [{
+      fillType: 'gradient' as const, angle: 0, gradType: 'linear',
+      stops: [{ position: 0, color: 'FF0000' }, { position: 1, color: '0000FF' }],
+    }],
+    linePaintAuthored: true,
+    lineWidthEmu: 57150,
+  };
+
+  it('lays a classic column gradient outline out per column', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'clusteredBar',
       categories: ['A', 'B'],
-      showLegend: true,
-      legendPos: 'r',
+      series: [series({ values: [2, 1], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    const strokes = rec.gradients.filter(gradient => gradient.kind === 'linear');
+    expect(strokes).toHaveLength(2);
+    const spans = strokes.map(gradient => gradient.args[2]! - gradient.args[0]!);
+    // Each vector spans one column, not the plot width.
+    expect(spans.every(span => span > 0 && span < RECT.w / 2)).toBe(true);
+    expect(strokes[0]!.args[0]).not.toBe(strokes[1]!.args[0]);
+  });
+
+  it('lets a structured ChartEx column outline fall through to the linked role paint', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A', 'B'],
       chartexDataPointStyle: unmodifiedLinkedDataPoint,
+      series: [series({ values: [2, 1], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    // The role's blue paint at the authored 4.5 pt width.
+    const outlines = rec.strokeRects.filter(rect => rect.lw === 4.5);
+    expect(outlines).toHaveLength(2);
+    expect(outlines.every(rect => rect.ss.toUpperCase() === '#0000FF')).toBe(true);
+  });
+
+  it('omits a structured ChartEx column outline when no role carries a line', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A', 'B'],
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      series: [series({ values: [2, 1], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects).toHaveLength(0);
+  });
+
+  it('lets a structured Waterfall point outline fall through to the series outline', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
       series: [series({
-        values: [2, 1],
+        values: [10, 5, 15],
+        lineWidthEmu: 57150,
         chartexStyle: {
-          linePaints: [{
-            fillType: 'gradient', angle: 0, gradType: 'linear',
-            stops: [{ position: 0, color: 'FF0000' }, { position: 1, color: '0000FF' }],
-          }],
+          linePaints: [{ fillType: 'solid', color: 'FF0000' }],
           linePaintAuthored: true,
+          lineWidthEmu: 57150,
         },
+        dataPointOverrides: [{ idx: 1, chartexStyle: gradientLine }],
       })],
     }), RECT, 1);
 
-    // Both bars stroke with a Canvas gradient built from the outline paint.
-    expect(rec.gradients.length).toBeGreaterThanOrEqual(2);
+    expect(rec.gradients).toHaveLength(0);
+    const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    expect(red).toHaveLength(3);
+  });
+
+  it('omits structured waterfall bar outlines and draws connectors in their default colour', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      chartexSeriesLineStyle: {
+        lineColors: ['D9D9D9'], linePaintAuthored: true, lineWidthEmu: 9525,
+      },
+      series: [series({ values: [10, 5, 15], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects).toHaveLength(0);
+    const connectors = rec.strokeDetails.filter(detail =>
+      detail.strokeStyle.toUpperCase() === '#D9D9D9');
+    expect(connectors.length).toBeGreaterThan(0);
+    // The authored width survives; only the structured paint is dropped.
+    expect(connectors.every(detail => detail.lineWidth === 4.5)).toBe(true);
+  });
+
+  it('omits a structured series outline on the Waterfall legend keys like the bars', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      showLegend: true,
+      legendPos: 'r',
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      series: [series({ values: [10, 5, 15], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects).toHaveLength(0);
+  });
+
+  it('outlines Treemap legend keys like the tiles, with structured paint falling through', () => {
+    const tree = {
+      chartType: 'treemap' as const,
+      showLegend: true,
+      legendPos: 't' as const,
+      chartexTreemap: {
+        parentLabelLayout: 'none' as const,
+        rows: [
+          { path: ['X', 'A'], size: 2 },
+          { path: ['Y', 'B'], size: 1 },
+        ],
+      },
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineColors: ['FFFFFF'], linePaintAuthored: true, lineWidthEmu: 19050,
+      },
+    };
+    const solid = recordingCtx();
+    renderChart(solid.ctx, baseModel({
+      ...tree,
+      series: [series({
+        values: [],
+        chartexStyle: {
+          linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true,
+          lineWidthEmu: 57150,
+        },
+      })],
+    }), RECT, 1);
+    // Two tiles and two legend keys, red at the authored width.
+    expect(solid.strokeRects.filter(rect =>
+      rect.ss.toUpperCase() === '#FF0000' && rect.lw === 4.5)).toHaveLength(4);
+
+    const structured = recordingCtx();
+    renderChart(structured.ctx, baseModel({
+      ...tree,
+      series: [series({ values: [], chartexStyle: gradientLine })],
+    }), RECT, 1);
+    expect(structured.gradients).toHaveLength(0);
+    expect(structured.strokeRects.filter(rect =>
+      rect.ss.toUpperCase() === '#FFFFFF' && rect.lw === 4.5)).toHaveLength(4);
   });
 
   it('gives a ChartEx legend key without an authored outline width the 0.75pt default', () => {
@@ -10318,8 +10554,10 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     )).toBe(true);
   });
 
+  // PowerPoint's treemap legend keys do take the tile outline (see the
+  // Treemap legend key test); sunburst keeps its separator off the keys.
   it.each([
-    'sunburst', 'treemap',
+    'sunburst',
   ])('%s legend does not inherit the hierarchy separator outline', chartType => {
     const rec = recordingCtx();
     renderChart(rec.ctx, chartExLegendModel(chartType, {
@@ -22064,7 +22302,10 @@ describe('CH15 — chartEx box-and-whisker', () => {
     renderChart(rec.ctx, boxModel({
       valAxisHidden: true,
       catAxisHidden: true,
-      chartexDataPointLineStyle: {
+      // Box lines resolve through the linked dataPoint role line (not
+      // dataPointLine), so the whisker paint is authored there.
+      chartexDataPointStyle: {
+        fillColors: ['ED7D31'], fillPaintAuthored: true,
         lineColors: ['104C68'], linePaintAuthored: true, lineWidthEmu: 57150, lineCap: 'rnd',
       },
       chartexDataPointMarkerStyle: {
@@ -22295,10 +22536,12 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(boxFills).toEqual(['#FF0000', '#00FF00', '#0000FF']);
   });
 
-  it('uses dataPointLine for mean connectors and keeps dataPoint paint separate', () => {
+  it('paints mean connectors from the dataPoint role line, not dataPointLine (PowerPoint 16.113)', () => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, boxModel({
-      chartexDataPointStyle: { fillColors: ['F4B183'], lineColors: ['C00000'] },
+      chartexDataPointStyle: {
+        fillColors: ['F4B183'], lineColors: ['C00000'], linePaintAuthored: true,
+      },
       chartexDataPointLineStyle: { lineColors: ['0070C0'], lineWidthEmu: 25400 },
       chartexBox: {
         categories: ['A', 'B'],
@@ -22309,9 +22552,11 @@ describe('CH15 — chartEx box-and-whisker', () => {
         }],
       },
     }), RECT, 1);
-    const lineRole = rec.segs.filter(segment => segment.ss.toLowerCase() === '#0070c0');
+    const lineRole = rec.segs.filter(segment => segment.ss.toLowerCase() === '#c00000');
     expect(lineRole.some(segment => Math.abs(segment.x1 - segment.x0) > 100)).toBe(true);
-    expect(lineRole.every(segment => segment.lw === 2)).toBe(true);
+    // No `w` on the dataPoint role: 0.75 pt, never the dataPointLine 2 pt.
+    expect(lineRole.every(segment => segment.lw === 0.75)).toBe(true);
+    expect(rec.segs.some(segment => segment.ss.toLowerCase() === '#0070c0')).toBe(false);
   });
 
   it('partitions one category into equal series slots with a fixed gutter', () => {
@@ -24186,5 +24431,71 @@ describe('CH — combo chart legends reflect each series chart group', () => {
     expect(keyMarker).toBeDefined();
     expect((keyLine as Array<{ x: number; y: number }>)[1].x - (keyLine as Array<{ x: number; y: number }>)[0].x)
       .toBeGreaterThan((keyMarker as ArcCall).r * 2);
+  });
+});
+
+describe('ChartEx box-and-whisker line paint (PowerPoint 16.113)', () => {
+  const ROLE_LINE_WIDTH_EMU = 28575;
+  const boxLines = (
+    over: {
+      dataPoint?: NonNullable<ChartModel['chartexDataPointStyle']>;
+      style?: NonNullable<ChartModel['chartexDataPointStyle']>;
+      lineWidthEmu?: number;
+    },
+  ) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'boxWhisker',
+      series: [series({ name: 'S', values: [] })],
+      chartexDataPointStyle: over.dataPoint
+        ?? { fillColors: ['156082'], lineColors: ['156082'], linePaintAuthored: true },
+      // dataPointLine carries the 2.25 pt role width that PowerPoint ignores.
+      chartexDataPointLineStyle: {
+        lineColors: ['156082'], linePaintAuthored: true, lineWidthEmu: ROLE_LINE_WIDTH_EMU,
+      },
+      chartexBox: {
+        categories: ['A'],
+        series: [{
+          name: 'S', chartexStyle: over.style, lineWidthEmu: over.lineWidthEmu,
+          valuesByCategory: [[1, 2, 3, 4, 5, 6, 20]],
+          meanMarker: true, meanLine: true,
+          showOutliers: false, showNonoutliers: false, quartileMethod: 'inclusive',
+        }],
+      },
+    }), RECT, 1);
+    // Axis, grid and frame strokes are neutral greys; the chart colours are not.
+    return rec.strokeDetails.filter(detail => {
+      const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(detail.strokeStyle);
+      return hex != null && !(hex[1] === hex[2] && hex[2] === hex[3]);
+    });
+  };
+  const unique = (lines: ReturnType<typeof boxLines>) => [...new Set(
+    lines.map(line => `${line.strokeStyle.toUpperCase()} ${line.lineWidth}`),
+  )];
+
+  it('darkens a dataPoint-role line that equals its own fill by 0.8 per channel', () => {
+    const lines = boxLines({});
+    expect(lines.length).toBeGreaterThan(0);
+    expect(unique(lines)).toEqual(['#114D68 0.75']);
+  });
+
+  it('does not darken a role line whose colour differs from the role fill', () => {
+    expect(unique(boxLines({
+      dataPoint: { fillColors: ['156082'], lineColors: ['00B050'], linePaintAuthored: true },
+    }))).toEqual(['#00B050 0.75']);
+    expect(unique(boxLines({
+      dataPoint: { fillColors: ['FFC000'], lineColors: ['156082'], linePaintAuthored: true },
+    }))).toEqual(['#156082 0.75']);
+  });
+
+  it('keeps direct series width only and still darkens the role paint (B5)', () => {
+    // 57150 EMU = 4.5 pt = 6 px.
+    expect(unique(boxLines({
+      style: { lineWidthEmu: 57150 }, lineWidthEmu: 57150,
+    }))).toEqual(['#114D68 4.5']);
+  });
+
+  it('paints every box line 0.75 pt and ignores the dataPointLine width', () => {
+    expect(boxLines({}).every(line => line.lineWidth === 0.75)).toBe(true);
   });
 });
