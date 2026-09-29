@@ -587,8 +587,10 @@ pub(super) fn parse_chartex_impl(
     image_resolver: &dyn ChartImageResolver,
     host: ChartHost,
 ) -> Option<ChartModel> {
-    // Word currently follows PowerPoint's compatibility policy. This is the
-    // single host-level switch for that choice.
+    // Word follows PowerPoint's compatibility policy until Word controls are
+    // measured. This is the single host-level switch for that choice.
+    // `Unspecified` deliberately stays distinct: it takes the non-Excel
+    // behaviour but none of the quirks gated on a positive PowerPoint identity.
     let host = if host == ChartHost::Word {
         ChartHost::PowerPoint
     } else {
@@ -617,16 +619,36 @@ pub(super) fn parse_chartex_impl(
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "series")
         .collect();
-    // Office 16.113: Excel still paints a hidden clustered-column owner;
-    // PowerPoint suppresses its geometry. Hidden auxiliary lines stay hidden.
+    // Office 16.113 (owner-hidden control): Excel still paints a hidden
+    // clustered-column series when it is the owner of a valid, visible
+    // `paretoLine`; PowerPoint suppresses its geometry. Other hidden series,
+    // including hidden columns that own no Pareto line and hidden auxiliary
+    // lines, keep the generic authored-visibility rule (no measurement says
+    // otherwise).
+    let is_hidden = |node: &Node| {
+        attr(node, "hidden").is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    };
+    let pareto_line_owner = |pareto: &Node| -> Option<Node> {
+        if attr(pareto, "layoutId").as_deref() != Some("paretoLine") {
+            return None;
+        }
+        let index = attr(pareto, "ownerIdx")?.parse::<usize>().ok()?;
+        let owner = *all_series_nodes.get(index)?;
+        // The owner must be a clustered column: a line never borrows a
+        // different layout's data.
+        (owner != *pareto && attr(&owner, "layoutId").as_deref() == Some("clusteredColumn"))
+            .then_some(owner)
+    };
+    let visible_line_owners: Vec<Node> = all_series_nodes
+        .iter()
+        .filter(|node| !is_hidden(node))
+        .filter_map(pareto_line_owner)
+        .collect();
     let series_nodes: Vec<Node> = all_series_nodes
         .iter()
         .copied()
         .filter(|node| {
-            (host == ChartHost::Excel
-                && attr(node, "layoutId").as_deref() == Some("clusteredColumn"))
-                || !attr(node, "hidden")
-                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            (host == ChartHost::Excel && visible_line_owners.contains(node)) || !is_hidden(node)
         })
         .collect();
     // MS-ODRAWXML §2.24.4.19 defines this closed set.  Preserve a future
@@ -649,16 +671,17 @@ pub(super) fn parse_chartex_impl(
     });
     // [MS-ODRAWXML] CT_Series@ownerIdx names a document-order series, not
     // formatIdx. The owner can follow its auxiliary line. A line without a
-    // valid owner never borrows the first column's data.
-    let pareto_pair = series_nodes.iter().copied().find_map(|pareto| {
-        if attr(&pareto, "layoutId").as_deref() != Some("paretoLine") {
-            return None;
-        }
-        let index = attr(&pareto, "ownerIdx")?.parse::<usize>().ok()?;
-        let owner = *all_series_nodes.get(index)?;
-        (owner != pareto && attr(&owner, "layoutId").as_deref() != Some("paretoLine"))
-            .then_some((owner, pareto))
-    });
+    // valid clustered-column owner never borrows the first column's data. An
+    // unknown future layout owns the chart-wide fail-closed result, so no
+    // Pareto pairing (and none of its derived flags) may apply then.
+    let pareto_pair = if unknown_series.is_none() {
+        series_nodes
+            .iter()
+            .copied()
+            .find_map(|pareto| pareto_line_owner(&pareto).map(|owner| (owner, pareto)))
+    } else {
+        None
+    };
     let first_column = series_nodes
         .iter()
         .copied()
@@ -667,10 +690,11 @@ pub(super) fn parse_chartex_impl(
     // owned by a discarded later series is therefore discarded with it.
     let pareto_pair =
         pareto_pair.filter(|(owner, _)| host != ChartHost::Excel || first_column == Some(*owner));
-    // Office 16.113 assigns implicit format slots by owner group: an
-    // owner-backed line immediately follows its owner for style allocation.
-    // The two-owner controls establish that the line takes slot 1 and the
-    // later column slot 2 when ownerIdx=0; ownerIdx=1 keeps source order.
+    // Office 16.113 implicit format slots. Only the measured shape is
+    // implemented: with exactly three series `[owner, column, line]` (line
+    // ownerIdx=0) the line takes slot 1 and the later column slot 2, while
+    // ownerIdx=1 keeps source order. Other arrangements keep source order
+    // because no control establishes a general "line follows its owner" rule.
     let mut format_order = all_series_nodes.clone();
     if let Some((owner, pareto)) = pareto_pair {
         if let (Some(owner_position), Some(line_position)) = (
@@ -755,10 +779,7 @@ pub(super) fn parse_chartex_impl(
                 && child(node, "dataId").is_some()
                 && references_percentage_axis(node)
         });
-    let hidden_pareto_owner = pareto_pair.is_some_and(|(owner, _)| {
-        attr(&owner, "hidden")
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-    });
+    let hidden_pareto_owner = pareto_pair.is_some_and(|(owner, _)| is_hidden(&owner));
     // A standalone line without dataId has no data owner. Office 16.113
     // paints only the chart frame/title even when chartData exists elsewhere.
     let standalone_line_without_data = first_column.is_none()
@@ -769,23 +790,6 @@ pub(super) fn parse_chartex_impl(
     let suppress_geometry = (host == ChartHost::Excel && line_first_without_owner)
         || (host != ChartHost::Excel && hidden_pareto_owner)
         || standalone_line_without_data;
-    let owner_column_index = pareto_pair.and_then(|(owner, _)| {
-        series_nodes
-            .iter()
-            .copied()
-            .filter(|node| attr(node, "layoutId").as_deref() == Some("clusteredColumn"))
-            .position(|node| node == owner)
-    });
-    let owner_aggregates = pareto_pair.is_some_and(|(owner, _)| has_chartex_aggregation(owner));
-    let pareto_sort_descending = if pareto_pair.is_some() {
-        // Office 16.113 two-owner controls: ownerIdx=1 keeps both bar series
-        // in input order, while ownerIdx=0 sorts each aggregated series.
-        owner_aggregates && owner_column_index == Some(0)
-    } else if first_column.is_none() {
-        host != ChartHost::Excel
-    } else {
-        host != ChartHost::Excel && line_first_without_owner && has_chartex_aggregation(series_node)
-    };
     let layout_id = attr(&series_node, "layoutId").unwrap_or_default();
     // [MS-ODRAWXML] represents a histogram as a clusteredColumn series with a
     // CT_Binning child; `histogram` is not an ST_SeriesLayout enumeration.
@@ -1035,12 +1039,58 @@ pub(super) fn parse_chartex_impl(
     // blank category slot; a named category without a value still has a tick
     // label. Formula-backed dimensions use the same indexed rule after host
     // resolution.
+    //
+    // Aggregation that cannot be resolved (missing category dimension, an
+    // undefined formula name, no values, an over-limit or overflowing sum)
+    // falls back to the unaggregated data for that series rather than
+    // discarding the whole chart.
+    let mut primary_aggregated = false;
     if layout_id == "clusteredColumn" && has_chartex_aggregation(series_node) {
-        let (aggregated_categories, aggregated_values) =
-            aggregate_chartex_data(primary_data, references)?;
-        categories = aggregated_categories;
-        raw_values = aggregated_values;
+        if let Some((aggregated_categories, aggregated_values)) =
+            aggregate_chartex_data(primary_data, references)
+        {
+            categories = aggregated_categories;
+            raw_values = aggregated_values;
+            primary_aggregated = true;
+        }
     }
+    // `chartex_pareto_owner_index` is an index into the final model's column
+    // series: `series_node` first, then every other retained clustered column
+    // that resolves a data block (the extra-series loop below skips the rest;
+    // Excel keeps only the first column).
+    let model_columns: Vec<Node> = std::iter::once(series_node)
+        .chain(
+            series_nodes
+                .iter()
+                .copied()
+                .filter(|node| {
+                    *node != series_node
+                        && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+                })
+                .take(if host == ChartHost::Excel {
+                    0
+                } else {
+                    usize::MAX
+                })
+                .filter(|node| data_for_series(*node).is_some()),
+        )
+        .collect();
+    let owner_column_index =
+        pareto_pair.and_then(|(owner, _)| model_columns.iter().position(|node| *node == owner));
+    let pareto_sort_descending = if let Some((owner, _)) = pareto_pair {
+        // Office 16.113 two-owner controls: ownerIdx=1 keeps both bar series
+        // in input order, while ownerIdx=0 sorts each aggregated series.
+        // A `cx:binning` owner has no Office measurement; it keeps the
+        // pre-aggregation behaviour (raw values sorted descending).
+        child(owner, "layoutPr")
+            .and_then(|layout| child(layout, "binning"))
+            .is_some()
+            || (primary_aggregated && owner_column_index == Some(0))
+    } else if first_column.is_none() {
+        host != ChartHost::Excel
+    } else {
+        host != ChartHost::Excel && line_first_without_owner && primary_aggregated
+    };
     let source_number_format =
         chartex_number_format(primary_data, &["size", "val", "colorVal"], references);
     if let Some(binning) = chartex_histogram_binning.as_mut() {
@@ -1211,6 +1261,10 @@ pub(super) fn parse_chartex_impl(
         line_hidden,
     }];
 
+    // PowerPoint additionally paints a short line fragment for a paretoLine
+    // that has its own dataId but no ownerIdx. That fragment is unexplained by
+    // the schema and the controls, so it is intentionally not reproduced.
+    //
     // Preserve the authored Pareto line as a style carrier. Its cached values
     // are retained on the wire for diagnostics, while the core derives stable
     // cumulative fractions from the owner values so invalid/negative filtering
@@ -1294,16 +1348,18 @@ pub(super) fn parse_chartex_impl(
             let Some(extra_data) = data_for_series(extra_node) else {
                 continue;
             };
-            let (extra_categories, extra_values) = if has_chartex_aggregation(extra_node) {
-                aggregate_chartex_data(extra_data, references)?
-            } else {
-                (
-                    chartex_string_levels(extra_data, references)
-                        .and_then(|levels| levels.into_iter().next())
-                        .unwrap_or_default(),
-                    chartex_number_values(extra_data, &["val"], references).unwrap_or_default(),
-                )
-            };
+            // An unresolvable aggregation falls back to the raw series data.
+            let (extra_categories, extra_values) = has_chartex_aggregation(extra_node)
+                .then(|| aggregate_chartex_data(extra_data, references))
+                .flatten()
+                .unwrap_or_else(|| {
+                    (
+                        chartex_string_levels(extra_data, references)
+                            .and_then(|levels| levels.into_iter().next())
+                            .unwrap_or_default(),
+                        chartex_number_values(extra_data, &["val"], references).unwrap_or_default(),
+                    )
+                });
             let extra_name = series_name_for(extra_node, references);
             let extra_color =
                 child(extra_node, "spPr").and_then(|shape| resolver.resolve_shape_fill(shape));

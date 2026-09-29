@@ -1600,6 +1600,204 @@ mod tests {
         );
     }
 
+    fn parse_chartex_xml(
+        chart_data: &str,
+        series_xml: &str,
+        host: ChartHost,
+    ) -> Option<ChartModel> {
+        let xml = format!(
+            r#"<cx:chartSpace xmlns:cx="{CX_NS}">
+          <cx:chartData>{chart_data}</cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>{series_xml}</cx:plotAreaRegion></cx:plotArea></cx:chart>
+        </cx:chartSpace>"#
+        );
+        let document = chart_space_of(&xml);
+        parse_chartex_part(
+            document.root_element(),
+            &ChartParseContext {
+                host,
+                color_resolver: Some(&FixtureResolver),
+                ..Default::default()
+            },
+        )
+    }
+
+    const AGG_OWNER: &str = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>"#;
+    const OWNED_LINE: &str = r#"<cx:series layoutId="paretoLine" ownerIdx="0"/>"#;
+
+    #[test]
+    fn chartex_unresolvable_aggregation_falls_back_instead_of_dropping_the_chart() {
+        let values = r#"<cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">3</cx:pt><cx:pt idx="1">5</cx:pt></cx:lvl></cx:numDim>"#;
+        let cases = [
+            // Undefined `_xlchart` name for the category dimension.
+            format!(r#"<cx:data id="0"><cx:strDim type="cat"><cx:f>_xlchart.missing</cx:f></cx:strDim>{values}</cx:data>"#),
+            // No category dimension at all.
+            format!(r#"<cx:data id="0">{values}</cx:data>"#),
+            // Category dimension but no values.
+            r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">A</cx:pt></cx:lvl></cx:strDim></cx:data>"#.to_string(),
+            // Oversized point count.
+            format!(r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="4294967295"><cx:pt idx="0">A</cx:pt></cx:lvl></cx:strDim>{values}</cx:data>"#),
+            // Sum overflows to infinity.
+            r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">A</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">1e308</cx:pt><cx:pt idx="1">1e308</cx:pt></cx:lvl></cx:numDim></cx:data>"#.to_string(),
+        ];
+        for (index, data) in cases.iter().enumerate() {
+            for host in [ChartHost::PowerPoint, ChartHost::Excel] {
+                let model = parse_chartex_xml(data, &format!("{AGG_OWNER}{OWNED_LINE}"), host)
+                    .unwrap_or_else(|| panic!("case {index} must still parse on {host:?}"));
+                assert_eq!(model.chart_type, "pareto", "case {index}");
+                assert!(!model.series.is_empty(), "case {index}");
+                // The fallback is the unaggregated (main) behaviour: sorted.
+                assert_eq!(
+                    model.chartex_pareto_sort_descending,
+                    Some(false),
+                    "case {index}"
+                );
+            }
+        }
+        // Undefined category name: the raw numeric values survive.
+        let model = parse_chartex_xml(&cases[0], AGG_OWNER, ChartHost::Excel).unwrap();
+        assert_eq!(model.series[0].values, [Some(3.0), Some(5.0)]);
+    }
+
+    #[test]
+    fn chartex_extra_series_without_categories_falls_back_to_raw_data() {
+        let data = r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">1</cx:pt><cx:pt idx="1">2</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">7</cx:pt><cx:pt idx="1">9</cx:pt></cx:lvl></cx:numDim></cx:data>"#;
+        let series = format!(
+            r#"{AGG_OWNER}<cx:series layoutId="clusteredColumn"><cx:dataId val="1"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>"#
+        );
+        let model = parse_chartex_xml(data, &series, ChartHost::PowerPoint)
+            .expect("chart survives an unaggregatable extra series");
+        assert_eq!(model.series.len(), 2);
+        assert_eq!(model.series[1].values, [Some(7.0), Some(9.0)]);
+    }
+
+    #[test]
+    fn chartex_pareto_owner_index_counts_only_series_that_reach_the_model() {
+        let data = r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">1</cx:pt><cx:pt idx="1">2</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">X</cx:pt><cx:pt idx="1">Y</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">8</cx:pt><cx:pt idx="1">12</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="2"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">4</cx:pt></cx:lvl></cx:numDim></cx:data>"#;
+        // Document order: col d0, col d9 (no such data), col d1, col d2, line
+        // owned by document-order series 2 (= d1).
+        let series = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="9"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="2"/></cx:series>
+            <cx:series layoutId="paretoLine" ownerIdx="2"/>"#;
+        let model = parse_chartex_xml(data, series, ChartHost::PowerPoint).unwrap();
+        assert_eq!(model.chart_type, "pareto");
+        let columns: Vec<_> = model
+            .series
+            .iter()
+            .filter(|series| series.series_type.as_deref() != Some("line"))
+            .collect();
+        assert_eq!(columns.len(), 3);
+        let owner = model.chartex_pareto_owner_index.expect("owner index");
+        assert_eq!(owner, 1);
+        assert_eq!(columns[owner].values, [Some(8.0), Some(12.0)]);
+    }
+
+    #[test]
+    fn chartex_pareto_owner_that_is_not_a_column_never_borrows_column_data() {
+        let column = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>"#;
+        let funnel = r#"<cx:series layoutId="funnel"><cx:dataId val="1"/></cx:series>"#;
+        let data = r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">A</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">1</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">2</cx:pt></cx:lvl></cx:numDim></cx:data>"#;
+        let model = parse_chartex_xml(
+            data,
+            &format!(r#"{column}{funnel}<cx:series layoutId="paretoLine" ownerIdx="1"/>"#),
+            ChartHost::PowerPoint,
+        )
+        .unwrap();
+        assert_eq!(model.chart_type, "clusteredColumn");
+        assert_eq!(model.chartex_pareto_owner_index, None);
+        assert!(model
+            .series
+            .iter()
+            .all(|series| series.series_type.as_deref() != Some("line")));
+    }
+
+    #[test]
+    fn chartex_unknown_layout_with_pareto_line_fails_closed_for_the_whole_chart() {
+        let data = r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">A</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">1</cx:pt></cx:lvl></cx:numDim></cx:data>"#;
+        let series = r#"<cx:series layoutId="futureLayout"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="clusteredColumn" hidden="1"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="paretoLine" ownerIdx="1"/>"#;
+        for host in [ChartHost::PowerPoint, ChartHost::Excel] {
+            let model = parse_chartex_xml(data, series, host).unwrap();
+            assert_eq!(model.chart_type, "futureLayout");
+            assert_eq!(model.chartex_pareto_owner_index, None);
+            assert_eq!(model.chartex_suppress_geometry, None);
+            assert_eq!(model.chartex_pareto_outline_owner, None);
+            assert_eq!(model.chartex_pareto_sort_descending, None);
+            assert!(model
+                .series
+                .iter()
+                .all(|series| series.series_type.as_deref() != Some("line")));
+        }
+    }
+
+    #[test]
+    fn chartex_binned_pareto_owner_keeps_the_pre_aggregation_descending_sort() {
+        let binned = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr><cx:binning intervalClosed="r"/></cx:layoutPr></cx:series>"#;
+        for host in [ChartHost::PowerPoint, ChartHost::Excel] {
+            let model = parse_pareto_control(&format!("{binned}{OWNED_LINE}"), host);
+            assert_eq!(model.chart_type, "pareto");
+            assert_eq!(model.chartex_pareto_sort_descending, Some(true), "{host:?}");
+        }
+        let plain = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>"#;
+        let model = parse_pareto_control(&format!("{plain}{OWNED_LINE}"), ChartHost::PowerPoint);
+        assert_eq!(model.chartex_pareto_sort_descending, Some(false));
+    }
+
+    #[test]
+    fn chartex_excel_keeps_a_hidden_column_only_when_it_owns_a_pareto_line() {
+        let hidden = |data: &str| {
+            format!(
+                r#"<cx:series layoutId="clusteredColumn" hidden="1"><cx:dataId val="{data}"/></cx:series>"#
+            )
+        };
+        let visible = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>"#;
+        // A hidden column that owns no line stays hidden (main behaviour).
+        let model = parse_pareto_control(&format!("{}{visible}", hidden("0")), ChartHost::Excel);
+        assert_eq!(model.series.len(), 1);
+        assert_eq!(model.series[0].values, [Some(8.0), Some(12.0)]);
+        // A hidden column owned by a visible paretoLine is still painted.
+        let owned = parse_pareto_control(&format!("{}{OWNED_LINE}", hidden("0")), ChartHost::Excel);
+        assert_eq!(owned.chart_type, "pareto");
+        assert_eq!(owned.chartex_suppress_geometry, None);
+        // PowerPoint suppresses the hidden owner's geometry.
+        let pptx = parse_pareto_control(
+            &format!("{}{OWNED_LINE}", hidden("0")),
+            ChartHost::PowerPoint,
+        );
+        assert_eq!(pptx.chartex_suppress_geometry, Some(true));
+    }
+
+    #[test]
+    fn chartex_word_follows_powerpoint_and_unspecified_stays_host_neutral() {
+        let owner = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>"#;
+        let second = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>"#;
+        let unpaired = r#"<cx:series layoutId="paretoLine"><cx:dataId val="0"/><cx:axisId val="2"/></cx:series>"#;
+        let model = |host| parse_pareto_control(&format!("{owner}{second}{unpaired}"), host);
+        let json = |host| serde_json::to_string(&model(host)).unwrap();
+        // Documented choice: Word == PowerPoint.
+        assert_eq!(json(ChartHost::Word), json(ChartHost::PowerPoint));
+        assert_eq!(
+            model(ChartHost::Word).chartex_show_unpaired_percentage_axis,
+            Some(true)
+        );
+        // Unspecified keeps the non-Excel retention but not PowerPoint-only extras.
+        let unspecified = model(ChartHost::Unspecified);
+        assert_eq!(
+            unspecified.series.len(),
+            model(ChartHost::PowerPoint).series.len()
+        );
+        assert_eq!(unspecified.chartex_show_unpaired_percentage_axis, None);
+        // Excel retains only the first column.
+        assert!(model(ChartHost::Excel).series.len() < unspecified.series.len());
+    }
+
     #[test]
     fn parse_chartex_preserves_an_unknown_future_layout_without_guessing() {
         for series_xml in [

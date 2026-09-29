@@ -4743,6 +4743,28 @@ describe('classic 3-D compatibility projection', () => {
       .toBe(0);
   });
 
+  it('charges no ChartEx column paint when the Pareto renders nothing', () => {
+    const stops = Array.from({ length: 64 }, (_, index) => ({
+      position: index / 63, color: '112233',
+    }));
+    const base = {
+      chartType: 'pareto' as const,
+      categories: ['A', 'B'],
+      chartexDataPointStyle: {
+        fillPaints: [{ fillType: 'gradient' as const, gradType: 'linear' as const, angle: 0, stops }],
+        fillPaintAuthored: true, lineHidden: true, linePaintAuthored: true,
+      },
+    };
+    const painted = baseModel({ ...base, series: [series({ values: [3, 5] })] });
+    expect(chartExDataMarkPaintWorkCount(painted, RECT, 1)).toBeGreaterThan(0);
+    // Out-of-range owner: the renderer returns before painting.
+    expect(chartExDataMarkPaintWorkCount({ ...painted, chartexParetoOwnerIndex: 4 }, RECT, 1))
+      .toBe(0);
+    // Owner with no valued points: empty layout, nothing painted.
+    const empty = baseModel({ ...base, series: [series({ values: [null, null] })] });
+    expect(chartExDataMarkPaintWorkCount(empty, RECT, 1)).toBe(0);
+  });
+
   it('prefetches and paints ChartEx body picture fills', () => {
     const picture = {
       fillType: 'image' as const,
@@ -9702,6 +9724,25 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
 
     expect(rec.texts.map(text => text.text))
       .toEqual(expect.arrayContaining(['B', 'A', 'C', '100%']));
+  });
+
+  it('suppresses the flat endpoint when a named unvalued trailing slot already exists', () => {
+    const polylinePoints = (categories: string[], values: Array<number | null>): number => {
+      const rec = strokedPolylineCtx();
+      renderChart(rec.ctx, baseModel({
+        chartType: 'pareto',
+        categories,
+        series: [series({ values })],
+        chartexParetoFlatEndpoint: true,
+        chartexParetoSortDescending: true,
+      }), RECT, 1);
+      return Math.max(0, ...rec.strokes.map(stroke => stroke.points.length));
+    };
+    // All slots valued: the host synthesizes one flat endpoint (5 + 1).
+    const withEndpoint = polylinePoints(['A', 'B', 'C', 'D', 'E'], [15, 23, 7, 9, 4]);
+    // A named category without a value is itself the trailing slot: no extra point.
+    const withNamedSlot = polylinePoints(['A', 'B', 'C', 'D', 'E', 'F'], [15, 23, 7, 9, 4, null]);
+    expect(withNamedSlot).toBe(withEndpoint);
   });
 
   it('uses the ordinary linear value axis for a standalone Pareto line', () => {

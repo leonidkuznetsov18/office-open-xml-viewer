@@ -271,19 +271,28 @@ export function chartExDataMarkPaintWorkCount(
     }
     const columns = rawColumns.map((series, index) => index === 0
       ? chartExOutlinedOwner(chart, series, index, rawColumns.length) : series);
-    const layouts = chart.chartType === 'pareto' || chart.chartexParetoSortDescending
+    const sorted = chart.chartType === 'pareto' || chart.chartexParetoSortDescending;
+    const layouts = sorted
       ? columns.map(series => planParetoLayout(series, chart.categories, {
         sortDescending: chart.chartexParetoSortDescending ?? true,
         keepUnvaluedCategories: true,
       }))
       : null;
     const displayed = layouts ? layouts.map(layout => layout.orderedSeries) : columns;
-    const categoryCount = chart.chartType === 'pareto'
+    if (chart.chartType === 'pareto') {
+      // Mirror renderParetoChart's early returns: nothing is painted for a
+      // missing owner or an empty owner/first layout, so nothing is charged.
+      const ownerLayout = layouts?.[chart.chartexParetoOwnerIndex ?? 0];
+      const firstLayout = layouts?.[0];
+      if (!ownerLayout || !firstLayout
+        || ownerLayout.points.length === 0 || firstLayout.points.length === 0) return 0;
+    }
+    // The renderer draws the first (reordered) series' categories, in the same
+    // order for the Pareto and the sorted clustered-column paths.
+    const categoryCount = layouts
       ? displayed[0]?.values.length ?? 0
       : chart.categories.length || displayed[0]?.categories?.length
         || Math.max(0, ...displayed.map(series => series.values.length));
-    if (chart.chartType === 'pareto'
-      && displayed[chart.chartexParetoOwnerIndex ?? 0]?.values.length === 0) return 0;
     for (let seriesIndex = 0; seriesIndex < displayed.length; seriesIndex++) {
       const series = displayed[seriesIndex]!;
       chargeColumns(
@@ -292,17 +301,15 @@ export function chartExDataMarkPaintWorkCount(
       );
       if (total > MAX_CHART_PAINT_COMPONENTS) return total;
     }
-    if (chart.chartType === 'pareto' && layouts) {
-      // The renderer paints the cumulative line only when both the owner and
-      // the first column retain frequency points (see renderParetoChart).
+    if (chart.chartType === 'pareto') {
+      // Past the empty-layout return above the renderer paints the cumulative
+      // line (see renderParetoChart), always as one solid stroke.
       const ownerIndex = chart.chartexParetoOwnerIndex ?? 0;
-      const ownerLayout = layouts[ownerIndex];
-      if (ownerLayout && ownerLayout.points.length > 0 && layouts[0]!.points.length > 0) {
-        const authoredLine = chart.series.find(series => series.seriesType === 'line');
-        const owner = displayed[ownerIndex]!;
-        const lineStyleIndex = authoredLine?.chartexFormatIdx ?? columns[ownerIndex]?.chartexFormatIdx ?? 0;
-        chargeParetoLine(authoredLine ?? owner, lineStyleIndex);
-      }
+      const authoredLine = chart.series.find(series => series.seriesType === 'line');
+      chargeParetoLine(
+        authoredLine ?? displayed[ownerIndex],
+        authoredLine?.chartexFormatIdx ?? columns[ownerIndex]?.chartexFormatIdx ?? 0,
+      );
     }
   } else if (chart.chartType === 'histogram') {
     const source = chart.series[0];
@@ -2493,7 +2500,10 @@ export function renderChartExChart(
       const columns = chart.series.map((series, index) => index === 0
         ? chartExOutlinedOwner(chart, series, index, chart.series.length) : series);
       const ordered = chart.chartexParetoSortDescending
-        ? columns.map(series => planParetoLayout(series, chart.categories).orderedSeries)
+        ? columns.map(series => planParetoLayout(series, chart.categories, {
+          sortDescending: true,
+          keepUnvaluedCategories: true,
+        }).orderedSeries)
         : columns;
       const axisOnlyLine: ChartSeries[] = chart.chartexShowUnpairedPercentageAxis && ordered[0]
         ? [{ ...ordered[0], name: '', values: [], seriesType: 'line', useSecondaryAxis: true,

@@ -38,6 +38,22 @@ describe('planParetoLayout', () => {
     expect(layout.series.values).toEqual([4 / 22, 12 / 22, 18 / 22, 1]);
   });
 
+  it('normalises by the maximum when authored order does not start at the maximum', () => {
+    const layout = planParetoLayout(series([0, 10, 20]), ['A', 'B', 'C'], { sortDescending: false });
+    expect(layout.series.values).toEqual([0, 1 / 3, 1]);
+  });
+
+  it('keeps fractions finite for huge magnitudes in authored order', () => {
+    const big = Number.MAX_VALUE;
+    const layout = planParetoLayout(series([big / 4, big, big / 2]), ['A', 'B', 'C'], {
+      sortDescending: false,
+    });
+    expect(layout.series.values.every(value => Number.isFinite(value ?? NaN))).toBe(true);
+    expect(layout.series.values[0]).toBeCloseTo(1 / 7, 12);
+    expect(layout.series.values[1]).toBeCloseTo(5 / 7, 12);
+    expect(layout.series.values[2]).toBe(1);
+  });
+
   it('sorts descending, preserves tie source order, and omits invalid values', () => {
     const layout = planParetoLayout(
       series([5, 20, 10, 20, null, 0, -2, 10]),

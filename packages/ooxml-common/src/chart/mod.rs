@@ -118,21 +118,30 @@ use style::*;
 #[cfg(test)]
 mod tests;
 
+/// Host application whose ChartEx layout policy a chart part follows. Office
+/// applications lay out the same ChartEx part differently (for example Pareto
+/// series retention and ordering), so the parsing host must be named.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartHost {
+    /// The caller did not name a host. Host-neutral: it applies the non-Excel
+    /// behaviour (all columns retained, PowerPoint-style ordering), but none of
+    /// the extras gated on a positive PowerPoint identity (currently the
+    /// unpaired percentage axis). Every shipped package sets its own host, so
+    /// this is only for hosts-agnostic callers and tests.
+    #[default]
+    Unspecified,
+    PowerPoint,
+    Excel,
+    /// Word follows the PowerPoint policy until Office-produced Word controls
+    /// are measured; `parse_chartex_impl` maps it in one place.
+    Word,
+}
+
 /// Package-owned sidecars and lookup hooks for one chart part. All fields are
 /// optional so callers only supply resources present in the host package.
 /// A color resolver is required to parse; omission returns `None`.
 /// Formula lookup uses a cell because the host may memoize range resolution
 /// while the parse entry point accepts a shared context reference.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChartHost {
-    #[default]
-    Unspecified,
-    PowerPoint,
-    Excel,
-    // Word follows PowerPoint until Office-produced Word controls are measured.
-    Word,
-}
-
 #[derive(Default)]
 pub struct ChartParseContext<'a> {
     pub host: ChartHost,

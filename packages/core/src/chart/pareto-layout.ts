@@ -71,7 +71,10 @@ export function planParetoLayout(
 
   // Normalize before summing so finite values near Number.MAX_VALUE cannot
   // overflow the denominator to Infinity and collapse early fractions to 0.
-  const scale = retained[0]?.value ?? 0;
+  // The scale is the maximum retained value: with authored (unsorted) order the
+  // first point need not be the largest, and a leading zero would zero every
+  // fraction.
+  const scale = retained.reduce((max, entry) => Math.max(max, entry.value), 0);
   const normalizedTotal = scale > 0
     ? retained.reduce((sum, entry) => sum + entry.value / scale, 0)
     : 0;
