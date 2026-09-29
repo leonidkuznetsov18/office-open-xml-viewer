@@ -1164,6 +1164,13 @@ pub struct Paragraph {
     /// through the paragraph → body/list-style → layout/master cascade, mirroring
     /// `alignment`, so the renderer receives the effective value.
     pub ea_ln_brk: bool,
+    /// ECMA-376 §21.1.2.2.7 `<a:pPr fontAlgn>` after the paragraph →
+    /// body lstStyle → layout/master cascade (the same tiers as `ea_ln_brk`).
+    /// Only `"t"`, `"ctr"` and `"b"` are emitted: an omitted value, `"auto"`
+    /// and `"base"` lay out identically in PowerPoint (#1619 controls), so the
+    /// renderer treats `None` as baseline alignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_algn: Option<String>,
     pub runs: Vec<TextRun>,
     /// Formatting at the insertion point after the last character.  It is
     /// never merged into existing a:r/a:fld runs (ECMA-376 §21.1.2.2.2).

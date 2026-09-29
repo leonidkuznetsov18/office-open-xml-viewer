@@ -6751,6 +6751,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -7369,6 +7370,7 @@ mod tests {
             None,
             None,
             None,
+            None, // inherited_font_algn
             None,
             None,
             None,
@@ -7797,7 +7799,8 @@ mod tests {
                 None, // inherited_anchor
                 None, // inherited_body_pr
                 None, // inherited_alignment
-                None, // inherited_ea_ln_brk
+                None,
+                None, // inherited_font_algn // inherited_ea_ln_brk
                 None, // inherited_space_before
                 None, // inherited_space_after
                 None, // inherited_line_spacing
@@ -7883,6 +7886,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -7968,6 +7972,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -8057,6 +8062,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -8134,6 +8140,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 inherited,
                 inherited,
                 None,

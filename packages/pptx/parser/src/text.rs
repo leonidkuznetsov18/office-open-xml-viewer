@@ -1211,6 +1211,7 @@ pub(crate) fn parse_text_body(
     inherited_body_pr: Option<InheritedBodyPr>,
     inherited_alignment: Option<String>,
     inherited_ea_ln_brk: Option<bool>,
+    inherited_font_algn: Option<String>,
     inherited_space_before: Option<ParagraphSpacing>,
     inherited_space_after: Option<ParagraphSpacing>,
     inherited_line_spacing: Option<f64>,
@@ -1409,6 +1410,14 @@ pub(crate) fn parse_text_body(
         .map(|v| v == "1" || v == "true")
         .or(inherited_ea_ln_brk);
 
+    // Own lstStyle > lvl1pPr > fontAlgn overrides inherited (ECMA-376
+    // §21.1.2.2.7), mirroring eaLnBrk. A paragraph's own pPr@fontAlgn wins
+    // (resolved below, after parse_paragraph read it).
+    let body_default_font_algn = own_lvl1_ppr
+        .and_then(|lp| attr(&lp, "fontAlgn"))
+        .map(|v| v.to_string())
+        .or(inherited_font_algn);
+
     // Own lstStyle > lvl1pPr spacing overrides inherited
     let own_lvl1_spcbef = own_lvl1_ppr.and_then(|lp| paragraph_spacing(lp, "spcBef"));
     let own_lvl1_spcaft = own_lvl1_ppr.and_then(|lp| paragraph_spacing(lp, "spcAft"));
@@ -1444,6 +1453,10 @@ pub(crate) fn parse_text_body(
             )
         })
         .collect();
+    for para in &mut paragraphs {
+        para.font_algn =
+            effective_font_algn(para.font_algn.take(), body_default_font_algn.as_deref());
+    }
 
     // A paragraph's own pPr > defRPr remains the most specific colour. When
     // absent, inherit the defRPr fill from the matching list level rather than
@@ -1622,6 +1635,12 @@ pub(crate) fn parse_paragraph(
         .map(|v| v == "1" || v == "true")
         .or(body_default_ea_ln_brk)
         .unwrap_or(true);
+
+    // `<a:pPr fontAlgn>` as authored on this paragraph; parse_text_body
+    // completes the cascade with `effective_font_algn`.
+    let font_algn = p_pr
+        .and_then(|n| attr(&n, "fontAlgn"))
+        .map(|v| v.to_string());
 
     // Paragraph's own algn → body/layout/master default → "r" if rtl, else "l"
     let alignment = p_pr
@@ -1859,9 +1878,23 @@ pub(crate) fn parse_paragraph(
         def_tab_sz,
         rtl,
         ea_ln_brk,
+        font_algn,
         runs,
         end_run_properties,
     }
+}
+
+/// The effective `fontAlgn` (ST_TextFontAlignType, ECMA-376 §20.1.10.62):
+/// the paragraph's own value, else the body/layout/master default. Only the
+/// values that change PowerPoint's layout are kept: an omitted value, `auto`
+/// and `base` render identically (#1619 controls in both line models), and an
+/// unknown token is ignored like an omitted one.
+pub(crate) fn effective_font_algn(own: Option<String>, inherited: Option<&str>) -> Option<String> {
+    let valid = |v: &str| matches!(v, "auto" | "t" | "ctr" | "base" | "b");
+    let resolved = own
+        .filter(|v| valid(v))
+        .or_else(|| inherited.filter(|v| valid(v)).map(str::to_string))?;
+    matches!(resolved.as_str(), "t" | "ctr" | "b").then_some(resolved)
 }
 
 /// Parse the marker choice group (ECMA-376 §21.1.2.4 EG_TextBullet) from a pPr /
