@@ -22205,7 +22205,10 @@ describe('CH15 — chartEx box-and-whisker', () => {
     renderChart(rec.ctx, boxModel({
       valAxisHidden: true,
       catAxisHidden: true,
-      chartexDataPointLineStyle: {
+      // Box lines resolve through the linked dataPoint role line (not
+      // dataPointLine), so the whisker paint is authored there.
+      chartexDataPointStyle: {
+        fillColors: ['ED7D31'], fillPaintAuthored: true,
         lineColors: ['104C68'], linePaintAuthored: true, lineWidthEmu: 57150, lineCap: 'rnd',
       },
       chartexDataPointMarkerStyle: {
