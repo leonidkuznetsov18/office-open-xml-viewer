@@ -121,6 +121,13 @@ export interface TextBody extends CoreTextBody {
    */
   spcFirstLastPara?: boolean;
   /**
+   * Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
+   * slide → layout → master placeholder cascade; omitted when no level
+   * authors it. Only `false` changes layout: PowerPoint renders an omitted
+   * value and `true` identically.
+   */
+  compatLnSpc?: boolean;
+  /**
    * `<a:bodyPr><a:prstTxWarp>` (ECMA-376 §20.1.9.19) — WordArt text warp. When
    * present the renderer maps each glyph through the named envelope
    * (presetTextWarpDefinitions) instead of laying text out flat. Omitted from

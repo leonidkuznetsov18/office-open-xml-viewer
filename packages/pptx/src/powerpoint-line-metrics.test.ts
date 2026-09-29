@@ -207,3 +207,67 @@ describe('PowerPoint text-box line metrics (#1610)', () => {
     expect(ys[0]).toBeCloseTo(20 * 1.2 * 0.8, 5);
   });
 });
+
+// #1619: PowerPoint's reference (Windows-style) PDF export of the compatLnSpc
+// controls. Each pair differs only in bodyPr@compatLnSpc; values are the
+// exported baselines in 1/100 in from the text-area top (tIns 0), or from
+// the box top for ctr/b anchors, where the export counts from the unrounded
+// anchored block and the continuous position must lie within half a unit.
+describe('bodyPr compatLnSpc (#1619)', () => {
+  const ea = (font: string, size: number, n: number, spaceLine: Spacing = null, text = '日g') =>
+    lines(font, size, n, spaceLine, text);
+  const off = { compatLnSpc: false } as Partial<TextBody>;
+  const within = (ys: number[], exported: number[]) => {
+    expect(ys).toHaveLength(exported.length);
+    ys.forEach((y, i) => expect(Math.abs(y / U - exported[i])).toBeLessThanOrEqual(0.5));
+  };
+
+  it('keeps the #1610 model for compatLnSpc="1" exactly as when it is omitted', () => {
+    for (const [p, exported] of [
+      [lines('Times New Roman', 100, 1, null), [134]],
+      [ea('Meiryo', 54, 1), [64]],
+      [lines('Gabriola', 100, 1, null), [136]],
+    ] as const) {
+      expect(units(baselines([...p], { compatLnSpc: true }))).toEqual(exported);
+      expect(units(baselines([...p]))).toEqual(exported);
+    }
+  });
+
+  it('switches an explicit compatLnSpc="0" to the Excel natural box per face', () => {
+    // A-*: Times New Roman takes the macOS Supplemental hhea gap (1.150 em).
+    expect(units(baselines(lines('Times New Roman', 100, 1, null), off))).toEqual([130]);
+    expect(units(baselines(lines('Gabriola', 100, 1, null), off))).toEqual([192]);
+    expect(units(baselines(ea('Meiryo', 54, 1), off))).toEqual([96]);
+    expect(units(baselines(ea('MS Gothic', 100, 1), off))).toEqual([140]);
+    expect(units(baselines(lines('Aptos', 60, 2, null), off))).toEqual([78, 180]);
+  });
+
+  it('spaces compatLnSpc="0" lines with the shared rule on the Excel box', () => {
+    const pts = (val: number): Spacing => ({ type: 'pts', val });
+    expect(units(baselines(lines('Calibri', 40, 2, { type: 'pct', val: 80000 }), off))).toEqual([41, 95]);
+    expect(units(baselines(ea('Meiryo', 40, 2, { type: 'pct', val: 150000 }), off))).toEqual([112, 275]);
+    expect(units(baselines(ea('Meiryo', 40, 2, pts(30)), off))).toEqual([21, 63]);
+    expect(units(baselines(lines('Arial', 100, 2, pts(100)), off))).toEqual([109, 248]);
+  });
+
+  it('bases compatLnSpc="0" percentage paragraph spacing on the natural box', () => {
+    const bef = (font: string, text: string, extra: Partial<Paragraph>) => [0, 1, 2].map((i) =>
+      paragraph([{ text: `${text}${i}`, font, size: 40 }], { spaceLine: null, ...extra }));
+    // D-mei-bef50pct: 50 % of Meiryo's 1.95 em natural line, not of 1.2 em.
+    expect(units(baselines(bef('Meiryo', '日g', { spaceBeforePct: 50000 } as Partial<Paragraph>), off)))
+      .toEqual([71, 234, 396]);
+    expect(units(baselines(bef('Arial', 'Hg', { spaceBefore: 1800 }), { ...off, spcFirstLastPara: true })))
+      .toEqual([77, 166, 255]);
+  });
+
+  it('unions mixed faces without rescaling and anchors by the natural descent', () => {
+    const mixed = [1, 2].map((i) => paragraph([
+      { text: `Hg${i}`, font: 'Arial', size: 24 }, { text: '日g', font: 'Meiryo', size: 60 },
+    ], { spaceLine: null }));
+    expect(units(baselines(mixed, off))).toEqual([107, 270]);
+    within(baselines(ea('Meiryo', 40, 2), { ...off, verticalAnchor: 'b' }, 200), [132.09, 241.13]);
+    within(baselines(lines('Arial', 40, 2, null), { ...off, verticalAnchor: 'b' }, 200), [202.02, 266.01]);
+    within(baselines(ea('Meiryo', 40, 2, { type: 'pct', val: 80000 }), { ...off, verticalAnchor: 'ctr' }, 200),
+      [104.52, 191.52]);
+  });
+});

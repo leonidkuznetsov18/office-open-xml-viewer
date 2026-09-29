@@ -4176,6 +4176,114 @@ mod placeholder_geometry_tests {
         );
     }
 
+    /// Issue #1619: compatLnSpc follows the placeholder cascade, reproducing
+    /// the PowerPoint control slides G1-G6. Master M1 authors compatLnSpc="1";
+    /// under it layout idx 11 omits the value (G4) and idx 12 authors "0" (G5),
+    /// and a slide "0" overrides the master (G6). Master M0 authors nothing;
+    /// under it the value can only come from the layout (idx 13, G3) or the
+    /// slide (G2), otherwise it stays unset (G1). A non-placeholder text box
+    /// never takes it from the master or layout.
+    #[test]
+    fn compat_ln_spc_cascades_through_layout_and_master() {
+        let placeholders = |master_attr: &str| {
+            let master = format!(
+                r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <p:cSld><p:spTree><p:sp>
+                    <p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+                    <p:spPr/><p:txBody><a:bodyPr{master_attr}/><a:lstStyle/><a:p/></p:txBody>
+                  </p:sp></p:spTree></p:cSld></p:sldMaster>"#
+            );
+            let master_doc = roxmltree::Document::parse(&master).unwrap();
+            let master_body_pr = parse_master_text_body_properties(master_doc.root_element());
+            let layout = r#"<p:sldLayout
+                  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <p:cSld><p:spTree>
+                    <p:sp><p:nvSpPr><p:cNvPr id="2" name="a"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="11"/></p:nvPr></p:nvSpPr>
+                      <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                    <p:sp><p:nvSpPr><p:cNvPr id="3" name="b"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="12"/></p:nvPr></p:nvSpPr>
+                      <p:spPr/><p:txBody><a:bodyPr compatLnSpc="0"/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                    <p:sp><p:nvSpPr><p:cNvPr id="4" name="c"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="13"/></p:nvPr></p:nvSpPr>
+                      <p:spPr/><p:txBody><a:bodyPr compatLnSpc="1"/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                  </p:spTree></p:cSld></p:sldLayout>"#;
+            let layout_doc = roxmltree::Document::parse(layout).unwrap();
+            let mut zip = empty_zip();
+            parse_layout_placeholders(
+                layout_doc.root_element(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &master_body_pr,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                "ppt/slideLayouts",
+                &HashMap::new(),
+                &mut zip,
+            )
+        };
+        let effective = |placeholders: &LayoutPlaceholders, nv_pr: &str, body_pr: &str| {
+            parse_slide_shape(
+                &format!(
+                    r#"<p:nvSpPr><p:cNvPr id="5" name="s"/><p:cNvSpPr/>{nv_pr}</p:nvSpPr>
+                    <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm></p:spPr>
+                    <p:txBody>{body_pr}<a:lstStyle/><a:p><a:r><a:t>Hg</a:t></a:r></a:p></p:txBody>"#
+                ),
+                placeholders,
+            )
+            .text_body
+            .expect("text body")
+            .compat_ln_spc
+        };
+        let ph = |idx: u32| format!(r#"<p:nvPr><p:ph type="body" idx="{idx}"/></p:nvPr>"#);
+        let text_box = "<p:nvPr/>";
+
+        let m1 = placeholders(r#" compatLnSpc="1""#);
+        assert_eq!(
+            effective(&m1, &ph(11), "<a:bodyPr/>"),
+            Some(true),
+            "G4 master"
+        );
+        assert_eq!(
+            effective(&m1, &ph(12), "<a:bodyPr/>"),
+            Some(false),
+            "G5 layout over master"
+        );
+        assert_eq!(
+            effective(&m1, &ph(11), r#"<a:bodyPr compatLnSpc="0"/>"#),
+            Some(false),
+            "G6 slide over master"
+        );
+        assert_eq!(effective(&m1, text_box, "<a:bodyPr/>"), None, "text box");
+
+        let m0 = placeholders("");
+        assert_eq!(effective(&m0, &ph(11), "<a:bodyPr/>"), None, "G1 control");
+        assert_eq!(
+            effective(&m0, &ph(11), r#"<a:bodyPr compatLnSpc="1"/>"#),
+            Some(true),
+            "G2 slide"
+        );
+        assert_eq!(
+            effective(&m0, &ph(13), "<a:bodyPr/>"),
+            Some(true),
+            "G3 layout"
+        );
+        assert_eq!(
+            effective(&m0, &ph(12), r#"<a:bodyPr compatLnSpc="true"/>"#),
+            Some(true)
+        );
+    }
+
     /// Several same-type master placeholders: each bodyPr field comes from the
     /// first placeholder in document order that sets it, so an inset on one
     /// and an autofit child on another both survive.
