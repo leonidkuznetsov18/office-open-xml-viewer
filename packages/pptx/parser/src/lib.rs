@@ -5222,7 +5222,8 @@ mod tests {
             };
             assert_eq!(run.bold, Some(true));
             assert_eq!(run.italic, Some(true));
-            assert_eq!(run.font_size, Some(22.0));
+            // A defPPr size has no effect in PowerPoint (#1620 controls).
+            assert_eq!(run.font_size, None);
             assert_eq!(run.color.as_deref(), Some("AA2200"));
             assert_eq!(run.font_family_cs.as_deref(), Some("Amiri"));
             assert_eq!(run.character_attributes["lang"], "ja-JP");
@@ -6800,7 +6801,7 @@ mod tests {
             &crate::master::DefaultTextLevels::default(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
+            &MasterLevelRunProperties::default(),
             &master_indents,
             &HashMap::new(),
             &HashMap::new(),
@@ -6877,7 +6878,7 @@ mod tests {
                 &crate::master::DefaultTextLevels::default(),
                 &m_lfs,
                 &HashMap::new(),
-                &HashMap::new(),
+                &MasterLevelRunProperties::default(),
                 &m_li,
                 &m_lb,
                 &m_str,
@@ -7296,7 +7297,7 @@ mod tests {
             &crate::master::DefaultTextLevels::default(),
             &HashMap::new(),
             &master_colors,
-            &HashMap::new(),
+            &MasterLevelRunProperties::default(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),

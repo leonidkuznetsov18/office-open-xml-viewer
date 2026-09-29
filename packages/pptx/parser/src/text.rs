@@ -1134,9 +1134,19 @@ pub(crate) fn read_level_run_properties_with_rels(
 ) -> LevelRunProperties {
     // CT_TextListStyle.defPPr supplies the run defaults for every level.  A
     // level's defRPr overlays it one property at a time (§21.1.2.4).
+    // Observed with PowerPoint for Mac PDF export (#1620 controls): a defPPr
+    // Latin face or size had no effect in any tier — shape lstStyle, layout
+    // slot, master placeholder, txStyles and defaultTextStyle — neither alone
+    // nor under an lvlNpPr that omits it; the level fell through as if defPPr
+    // were absent. Other defPPr character properties were not observable
+    // there and keep the §21.1.2.4 base role.
     let base = child(list_style, "defPPr")
         .and_then(|p| child(p, "defRPr"))
-        .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
+        .map(|r| {
+            RunProperties::from_xml(r, theme)
+                .with_relationships(rels)
+                .with_chain_face_and_size(None, None)
+        })
         .unwrap_or_default();
     std::array::from_fn(|level| {
         child(list_style, &format!("lvl{}pPr", level + 1))
@@ -2222,7 +2232,7 @@ mod relationship_owner_tests {
             &master_rels,
             "ppt/slideMasters",
         );
-        let master_default = &master_levels["body"][0];
+        let master_default = &master_levels.placeholders["body"][0];
         let layout_levels =
             extract_level_run_properties_with_rels(layout.root_element(), &theme, &layout_rels);
         let layout_default = layout_levels[0].over(master_default);
