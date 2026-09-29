@@ -89,6 +89,17 @@ it('collects the distinct authored font tuples used by rendered text', () => {
   expect(requests.filter((request) => request.family.toLowerCase() === 'calibri')).toHaveLength(2);
 });
 
+it('preloads directly used Calibri when the theme has no font name', () => {
+  const doc = docWith('body');
+  doc.majorFont = undefined;
+  doc.minorFont = undefined;
+  (doc.body[0] as { runs: Array<{ fontFamily?: string }> }).runs[0]!.fontFamily = 'Calibri';
+  expect(docxFontPreloadNames(doc)).toEqual([undefined, undefined, 'Calibri']);
+
+  (doc.body[0] as { runs: Array<{ fontFamily?: string }> }).runs[0]!.fontFamily = 'Arial';
+  expect(docxFontPreloadNames(doc)).toEqual([undefined, undefined]);
+});
+
 it('loads the themed bold face when a run inherits its family', () => {
   const doc = docWith('body');
   (doc.body[0] as { runs: object[] }).runs = [

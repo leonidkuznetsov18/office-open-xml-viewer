@@ -35,8 +35,8 @@ function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
 
 /**
  * The font-family names to preload for a document: the theme major/minor fonts,
- * plus only the script-fallback Noto faces whose script the document's TEXT
- * actually contains ({@link scriptPreloadNamesForText}). The renderer's font
+ * directly used Calibri, plus only the script-fallback Noto faces whose script
+ * the document's TEXT actually contains ({@link scriptPreloadNamesForText}). The renderer's font
  * fallback chains still END with the full Noto set, but eagerly fetching the
  * multi-MB CJK families for a document that has no CJK glyphs would block first
  * paint for nothing; an un-preloaded face loads lazily if it ever proves needed.
@@ -55,7 +55,15 @@ export function docxFontPreloadNames(
     classifyCjkFont(doc.majorFont) ?? classifyCjkFont(doc.minorFont) ?? fallback ?? null;
   const scripts = new ScriptPreloadAccumulator(cjkLang);
   const languageNames = new Set<string>();
+  let directCalibri = false;
   for (const usage of docxRenderedTextUsages(doc)) {
+    // Library web-font policy: Calibri → Carlito only when useGoogleFonts is
+    // enabled. Direct run/paragraph fonts can be used with absent theme names
+    // (including direct DOC model sources). The theme-only preload previously
+    // missed those requests and silently measured a different local fallback.
+    // Inspect only rendered usage, not the document's unused font table.
+    if (!directCalibri) directCalibri = usage.fontFamilies.some((family) =>
+      family?.trim().toLocaleLowerCase('en-US') === 'calibri');
     const region = cjkLangFromLanguage(usage.eastAsiaLanguage);
     if (region) {
       for (const name of scriptPreloadNamesForText([usage.text], region, true)) languageNames.add(name);
@@ -63,7 +71,9 @@ export function docxFontPreloadNames(
       scripts.addText([usage.text]);
     }
   }
-  return [doc.majorFont, doc.minorFont, ...new Set([...scripts.names(), ...languageNames])];
+  return [doc.majorFont, doc.minorFont,
+    ...(directCalibri ? ['Calibri'] : []),
+    ...new Set([...scripts.names(), ...languageNames])];
 }
 
 /** Probe exact local style tuples used by rendered text. The shared loader
