@@ -8092,6 +8092,7 @@ mod tests {
         let doc = roxmltree::Document::parse(xml).unwrap();
         let mut inherited = LevelSpacing::default();
         inherited.before[2] = Some(ParagraphSpacing::Points(500));
+        inherited.line[2] = Some(SpaceLine::Pts { val: 30.0 });
         let body = parse_text_body(
             doc.root_element(),
             &theme,
@@ -8121,7 +8122,8 @@ mod tests {
         assert!(matches!(a.space_line, Some(SpaceLine::Pct { val }) if val == 90000.0));
         assert_eq!(a.space_before, Some(1000));
         assert_eq!((b.space_line.is_none(), b.space_before), (true, None));
-        assert_eq!((c.space_line.is_none(), c.space_before), (true, Some(500)));
+        assert_eq!(c.space_line, Some(SpaceLine::Pts { val: 30.0 }));
+        assert_eq!(c.space_before, Some(500));
     }
 
     /// ECMA-376 §21.1.2.2.9-.10: `a:spcBef`/`a:spcAft` hold one CT_TextSpacing

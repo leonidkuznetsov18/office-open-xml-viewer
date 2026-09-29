@@ -75,18 +75,18 @@ impl ParagraphSpacing {
 }
 
 /// Per-list-level paragraph spacing from `<a:lvlNpPr>`: `spcBef`, `spcAft`
-/// and the `lnSpc/spcPct` value (e.g. 90000 = 90 %). Index 0..=8 → lvl1pPr..
+/// and `lnSpc`, each a percentage or points (CT_TextSpacing). Index 0..=8 → lvl1pPr..
 /// lvl9pPr. Each level and property inherits independently (ECMA-376
 /// §21.1.2.4): a paragraph at level N takes level N of the nearest list style
 /// that sets it, never another level's value. Observed (#1630): a title whose
 /// titleStyle set 90 % line spacing on level 1 only laid level-2 paragraphs
 /// out at single spacing, and body levels 2-5 took their own 5 pt space before
 /// rather than level 1's 10 pt.
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub(crate) struct LevelSpacing {
     pub(crate) before: [Option<ParagraphSpacing>; 9],
     pub(crate) after: [Option<ParagraphSpacing>; 9],
-    pub(crate) line: [Option<f64>; 9],
+    pub(crate) line: [Option<SpaceLine>; 9],
 }
 
 impl LevelSpacing {
@@ -104,20 +104,18 @@ impl LevelSpacing {
             };
             out.before[lvl] = paragraph_spacing(lp, "spcBef");
             out.after[lvl] = paragraph_spacing(lp, "spcAft");
-            out.line[lvl] = child(lp, "lnSpc")
-                .and_then(|ls| child(ls, "spcPct"))
-                .and_then(|s| attr_f64(&s, "val"));
+            out.line[lvl] = child(lp, "lnSpc").and_then(parse_lnspc);
         }
         out
     }
 
     /// Per level and property, `self` where set, else `fallback`.
     pub(crate) fn or(&self, fallback: &Self) -> Self {
-        let mut out = *self;
+        let mut out = self.clone();
         for lvl in 0..9 {
             out.before[lvl] = out.before[lvl].or(fallback.before[lvl]);
             out.after[lvl] = out.after[lvl].or(fallback.after[lvl]);
-            out.line[lvl] = out.line[lvl].or(fallback.line[lvl]);
+            out.line[lvl] = out.line[lvl].take().or_else(|| fallback.line[lvl].clone());
         }
         out
     }
@@ -1759,7 +1757,7 @@ pub(crate) fn parse_paragraph(
     let space_line = p_pr
         .and_then(|n| child(n, "lnSpc"))
         .and_then(parse_lnspc)
-        .or_else(|| level_spacing.line[lvl.min(8) as usize].map(|v| SpaceLine::Pct { val: v }));
+        .or_else(|| level_spacing.line[lvl.min(8) as usize].clone());
 
     // Tab stops from pPr > tabLst
     let tab_stops: Vec<TabStop> = p_pr

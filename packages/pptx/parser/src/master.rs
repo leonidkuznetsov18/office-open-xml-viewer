@@ -784,20 +784,20 @@ impl LayoutPlaceholders {
         if let Some(i) = ph_idx {
             if !self.by_idx_placeholder_type.contains_key(&i) {
                 return MasterStyleTier::get(&self.styles.spacing, ph_type)
-                    .copied()
+                    .cloned()
                     .unwrap_or_default();
             }
         }
         let by_type = |map: &HashMap<String, LevelSpacing>| -> LevelSpacing {
-            let own = map.get(ph_type).copied().unwrap_or_default();
+            let own = map.get(ph_type).cloned().unwrap_or_default();
             if ph_type == "body" {
-                own.or(&map.get("").copied().unwrap_or_default())
+                own.or(&map.get("").cloned().unwrap_or_default())
             } else {
                 own
             }
         };
         let layout = match ph_idx {
-            Some(idx) => self.by_idx_spacing.get(&idx).copied().unwrap_or_default(),
+            Some(idx) => self.by_idx_spacing.get(&idx).cloned().unwrap_or_default(),
             None => by_type(&self.by_type_spacing),
         };
         layout.or(&by_type(&self.by_type_master_spacing))
@@ -1505,8 +1505,12 @@ pub(crate) fn parse_master_level_indents_tier(
     for (style_node, ph_types) in tx_style_nodes(root) {
         let indents = read_level_indents(style_node);
         if has_any_level_indent(&indents) {
+            // Per level and axis: a master placeholder that indents only
+            // some levels keeps the class style's other levels (§21.1.2.4).
             for ph_type in ph_types {
-                map.entry(ph_type.to_string()).or_insert(indents);
+                map.entry(ph_type.to_string())
+                    .and_modify(|existing| *existing = merge_level_indents(existing, &indents))
+                    .or_insert(indents);
             }
         }
     }
@@ -2164,7 +2168,7 @@ pub(crate) fn parse_layout_placeholders(
                         .entry(idx)
                         .or_insert_with(|| layout_picture_properties.clone());
                 }
-                if let Some(v) = layout_spacing {
+                if let Some(v) = layout_spacing.clone() {
                     lph.by_idx_spacing.entry(idx).or_insert(v);
                 }
                 if !effective_body_pr.is_empty() {
@@ -2937,23 +2941,24 @@ mod placeholder_geometry_tests {
               <a:lvl2pPr><a:lnSpc><a:spcPct val="80000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef></a:lvl2pPr></p:bodyStyle>
           </p:txStyles>
         </p:sldMaster>"#;
+        let pct = |val: f64| Some(ooxml_common::text::SpaceLine::Pct { val });
         let doc = roxmltree::Document::parse(xml).unwrap();
         let spacing = parse_master_txstyle_spacing(doc.root_element());
-        assert_eq!(spacing["title"].line[0], Some(85000.0));
+        assert_eq!(spacing["title"].line[0], pct(85000.0));
         // The title style sets level 1 only; level 2 is not borrowed from it.
         assert_eq!(spacing["title"].line[1], None);
-        assert_eq!(spacing["body"].line[..2], [Some(90000.0), Some(80000.0)]);
+        assert_eq!(spacing["body"].line[..2], [pct(90000.0), pct(80000.0)]);
         assert_eq!(
             spacing["body"].before[1],
             Some(ParagraphSpacing::Points(500))
         );
-        assert_eq!(spacing["obj"].line[0], Some(90000.0));
+        assert_eq!(spacing["obj"].line[0], pct(90000.0));
         assert!(!spacing.contains_key("dt"));
 
         // idx 11 and 12 are bound layout slots; an unmatched idx reads the
         // txStyles-only tier.
         let mut layout_12 = LevelSpacing::default();
-        layout_12.line[0] = Some(120000.0);
+        layout_12.line[0] = pct(120000.0);
         let placeholders = LayoutPlaceholders {
             by_idx_placeholder_type: HashMap::from([
                 (11, "body".to_owned()),
@@ -2969,19 +2974,62 @@ mod placeholder_geometry_tests {
         };
         assert_eq!(
             placeholders.lookup_spacing("body", Some(40)).line[0],
-            Some(90000.0)
+            pct(90000.0)
         );
         assert_eq!(
             placeholders.lookup_spacing("body", Some(11)).line[0],
-            Some(90000.0)
+            pct(90000.0)
         );
         let slot_12 = placeholders.lookup_spacing("body", Some(12));
-        assert_eq!(slot_12.line[..2], [Some(120000.0), Some(80000.0)]);
+        assert_eq!(slot_12.line[..2], [pct(120000.0), pct(80000.0)]);
         assert_eq!(
             placeholders.lookup_spacing("title", None).line[0],
-            Some(85000.0)
+            pct(85000.0)
         );
         assert!(placeholders.lookup_spacing("dt", Some(3)).is_empty());
+    }
+
+    /// Review regression (#1630): list-level indents and spacing merge per
+    /// level and per axis. A master placeholder that indents only level 1 keeps
+    /// the built-in body style's other levels, and an authored point value
+    /// (`spcPts`) of lnSpc / spcBef / spcAft survives the cascade.
+    #[test]
+    fn partial_master_list_levels_merge_per_level_and_axis() {
+        use ooxml_common::text::SpaceLine;
+        let xml = r#"<p:sldMaster
+          xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:cSld><p:spTree>
+            <p:sp><p:nvSpPr><p:cNvPr id="3" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+              <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle>
+                <a:lvl1pPr marL="342900"><a:spcAft><a:spcPct val="20000"/></a:spcAft></a:lvl1pPr>
+                <a:lvl3pPr><a:lnSpc><a:spcPts val="3000"/></a:lnSpc><a:spcBef><a:spcPts val="700"/></a:spcBef></a:lvl3pPr>
+              </a:lstStyle><a:p/></p:txBody></p:sp>
+          </p:spTree></p:cSld>
+        </p:sldMaster>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let indents = parse_master_level_indents(doc.root_element());
+        let body = indents["body"];
+        // Level 1: marL from the placeholder, indent from the built-in style.
+        assert_eq!(
+            (body[0].mar_l, body[0].indent),
+            (Some(342_900), Some(-228_600))
+        );
+        // Level 3 untouched by the placeholder: the built-in (90 pt, -18 pt).
+        assert_eq!(
+            (body[2].mar_l, body[2].indent),
+            (Some(1_143_000), Some(-228_600))
+        );
+
+        let spacing = parse_master_txstyle_spacing(doc.root_element());
+        let body = &spacing["body"];
+        assert_eq!(body.line[2], Some(SpaceLine::Pts { val: 30.0 }));
+        assert_eq!(body.before[2], Some(ParagraphSpacing::Points(700)));
+        assert_eq!(body.after[0], Some(ParagraphSpacing::Percent(20000.0)));
+        // Unset properties keep the built-in values per level.
+        assert_eq!(body.line[0], Some(SpaceLine::Pct { val: 90000.0 }));
+        assert_eq!(body.before[0], Some(ParagraphSpacing::Points(1000)));
+        assert_eq!(body.line[1], Some(SpaceLine::Pct { val: 90000.0 }));
     }
 
     const PML_A: &str = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
