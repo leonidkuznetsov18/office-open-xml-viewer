@@ -2477,6 +2477,10 @@ pub struct ChartexHistogramBinning {
     pub underflow: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overflow: Option<f64>,
+    /// Format for bin-edge labels only; filled by the chartEx series parser
+    /// (resolved source format, else the cached `lvl@formatCode`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_format_code: Option<String>,
 }
 
 /// Mirror of TS `ChartManualLayout`.
