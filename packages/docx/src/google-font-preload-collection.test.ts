@@ -261,6 +261,40 @@ describe('script-scoped Arabic visual substitutes', () => {
     }
   });
 
+  it('decides slot and face per grapheme cluster across the slot boundary', async () => {
+    const drawn = async (text: string) => {
+      const { canvas, calls } = recordingCanvas(new Set(WEB_FACES));
+      const model = parse(docx(sakkal(text)));
+      await renderDocumentToCanvas(model, canvas, 0, {
+        dpr: 1, width: 612,
+        layoutServices: createLayoutServices(model, {
+          useGoogleFonts: true,
+          googleFaces: WEB_FACES.map(loaded),
+          measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+        }),
+      });
+      return calls.filter((call) => [...call.text].some((c) => text.includes(c)))
+        .map((call) => [call.text, call.face]).sort();
+    };
+    const arabic = '\u0645\u0631\u062D\u0628\u0627'; // مرحبا
+    // A generic combining mark on an Arabic letter stays with it in Naskh.
+    expect(await drawn('\u0645\u0301\u0631\u062D\u0628\u0627'))
+      .toEqual([['\u0645\u0301\u0631\u062D\u0628\u0627', 'Noto Naskh Arabic']]);
+    // An Arabic mark on a Latin base or on Latin punctuation stays with its base.
+    expect(await drawn(`${arabic}\u00E9\u064E`))
+      .toEqual([[arabic, 'Noto Naskh Arabic'], ['\u00E9\u064E', 'serif']].sort());
+    expect(await drawn(`${arabic}\u2019\u064E`))
+      .toEqual([[arabic, 'Noto Naskh Arabic'], ['\u2019\u064E', 'serif']].sort());
+    // A Latin base with a combining acute next to Arabic.
+    expect(await drawn(`${arabic}e\u0301`))
+      .toEqual([[arabic, 'Noto Naskh Arabic'], ['e\u0301', 'serif']].sort());
+    // Joiner contexts are shaped and painted as one string.
+    for (const joiner of ['\u200D', '\u200C']) {
+      const text = `\u0644${joiner}\u0627`;
+      expect(await drawn(text)).toEqual([[text, 'Noto Naskh Arabic']]);
+    }
+  });
+
   it('splits mixed Latin and vocalised Arabic only at the script boundary', async () => {
     const vocalised = '\u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B\u0627';
     const model = parse(docx(sakkal(`${vocalised}Leader`)));

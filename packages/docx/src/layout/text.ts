@@ -301,6 +301,10 @@ export interface TextFontResolveRequest {
   readonly weight?: number;
   readonly style?: FontStyle;
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
+  /** Carried decision whether a script-scoped substitute covers this text,
+   * made per grapheme cluster by the shaper. When omitted, it is derived from
+   * `text` as a whole. */
+  readonly substituteScope?: boolean;
 }
 
 export interface GlyphMeasureRequest {
@@ -517,6 +521,26 @@ const LATIN1_CHINESE_EAST_ASIA = new Set([
   0x00f2, 0x00f3, 0x00f9, 0x00fa, 0x00fc,
 ]);
 
+const CLUSTER_EXTENDER = /^[\p{M}\p{Cf}\u200c\u200d\ufe00-\ufe0f\u{e0100}-\u{e01ef}]$/u;
+
+/** The base of a grapheme cluster: its first code point that is not a
+ * combining mark, joiner, variation selector or format control (the first code
+ * point when the cluster has no such base). */
+function clusterBaseCodePoint(cluster: string): number {
+  for (const character of cluster) {
+    if (!CLUSTER_EXTENDER.test(character)) return character.codePointAt(0) ?? 0;
+  }
+  return cluster.codePointAt(0) ?? 0;
+}
+
+/** Two resolutions select the same Canvas face and features. */
+function sameResolvedFace(a: FontResolution, b: FontResolution): boolean {
+  return a === b || (a.route.familyList === b.route.familyList && a.route.scope === b.route.scope
+    && a.route.fingerprint === b.route.fingerprint && a.weight === b.weight && a.style === b.style
+    && a.source === b.source && a.resolvedFamily === b.resolvedFamily
+    && a.resourceIdentity === b.resourceIdentity);
+}
+
 function scriptSlot(
   codePoint: number,
   forceComplex: boolean,
@@ -660,12 +684,15 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     // of its script. A complex-script span belongs to that script as a whole
     // once it contains one of its characters; any other slot span must consist
     // of that script (the shaper splits such spans at the script boundary).
+    // The shaper carries the per-cluster decision (substituteScope) so that a
+    // fragment is never re-judged out of its cluster context.
     const scoped = input.fonts.scopedSubstituteScript?.(authoredFamily);
-    const substituteScript = scoped && fontSubstituteScriptCoversText(
+    const covered = request.substituteScope ?? (scoped !== undefined && fontSubstituteScriptCoversText(
       scoped,
       request.text ?? '',
       request.slot === 'complexScript' ? 'any' : 'exclusive',
-    ) ? scoped : undefined;
+    ));
+    const substituteScript = scoped && covered ? scoped : undefined;
     return input.fonts.resolve({
       requestedFamily: authoredFamily,
       ...(substituteScript ? { script: substituteScript } : {}),
@@ -815,8 +842,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // Split a non-complex-script slot span at the script boundary of a scoped
       // visual substitute registered for that slot's family, so the substitute
       // never paints or measures the Latin (or other) characters beside it.
-      // Neutral separators stay with the preceding text. Families without a
-      // scoped substitute keep one span per slot.
+      // Families without a scoped substitute keep one span per slot.
       const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
       for (const slot of ['ascii', 'highAnsi', 'eastAsia'] as const) {
         const scoped = input.fonts.scopedSubstituteScript?.(requestedFamily(request, slot));
@@ -825,19 +851,22 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       const graphemeBoundaries = Object.freeze(
         [...new Set([0, ...graphemeClusterOffsets(request.text), request.text.length])].sort((a, b) => a - b),
       );
-      const graphemeStarts = new Set(graphemeBoundaries);
-      let start = 0;
-      let clusterSubstitute: boolean | undefined;
-      let clusterIndex = 0;
-      for (const character of request.text) {
-        const end = start + character.length;
-        const eastAsiaFamily = requestedFamily(request, 'eastAsia');
-        const eastAsiaCharset = request.eastAsiaFontCharset
-          ?? (eastAsiaFamily
-            ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
-            : undefined);
+      const eastAsiaFamily = requestedFamily(request, 'eastAsia');
+      const eastAsiaCharset = request.eastAsiaFontCharset
+        ?? (eastAsiaFamily
+          ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
+          : undefined);
+      // ECMA-376 §17.3.2.26 classifies characters, but a grapheme cluster is one
+      // user-perceived character: its slot (and so its font) is decided by the
+      // base. Combining marks, joiners (ZWJ/ZWNJ), variation selectors and
+      // format controls never start a new span, so a mark keeps its base's
+      // face and a joining context is shaped as one string (UAX #24 §5.2).
+      for (let index = 0; index + 1 < graphemeBoundaries.length; index += 1) {
+        const start = graphemeBoundaries[index]!;
+        const end = graphemeBoundaries[index + 1]!;
+        const cluster = request.text.slice(start, end);
         const script = scriptSlot(
-          character.codePointAt(0) ?? 0,
+          clusterBaseCodePoint(cluster),
           request.complexScript ?? false,
           request.fontHint,
           request.eastAsiaLanguage,
@@ -845,31 +874,22 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         );
         const previous = grouped.at(-1);
         const scoped = scopedBySlot.get(script);
-        // The scope is decided once per grapheme cluster (UAX #24: a mark
-        // inherits its base's script), so a mark is never split from its base.
-        // A neutral cluster continues the preceding text of the same slot.
-        if (scoped !== undefined && (graphemeStarts.has(start) || clusterSubstitute === undefined)) {
-          while (graphemeBoundaries[clusterIndex + 1] !== undefined
-            && graphemeBoundaries[clusterIndex + 1]! <= start) clusterIndex += 1;
-          const clusterEnd = graphemeBoundaries[clusterIndex + 1] ?? request.text.length;
-          const clusterClass = fontSubstituteScriptClusterClass(scoped, request.text.slice(start, clusterEnd));
-          clusterSubstitute = clusterClass === 'script'
-            || (clusterClass === 'neutral' && previous?.script === script && previous.substituteScript);
-        }
-        const substituteScript = scoped !== undefined && clusterSubstitute === true;
+        // A neutral cluster (white space, controls) continues the preceding
+        // text of the same slot.
+        const clusterClass = scoped === undefined ? 'other' : fontSubstituteScriptClusterClass(scoped, cluster);
+        const substituteScript = scoped !== undefined && (clusterClass === 'script'
+          || (clusterClass === 'neutral' && previous?.script === script && previous.substituteScript));
         if (previous?.script === script && previous.substituteScript === substituteScript) {
-          previous.text += character;
+          previous.text += cluster;
           previous.end = end;
         } else {
-          grouped.push({
-            text: character, start, end, script, breakBefore: graphemeStarts.has(start), substituteScript,
-          });
+          grouped.push({ text: cluster, start, end, script, breakBefore: true, substituteScript });
         }
-        start = end;
       }
 
-      const spans = grouped.map((group): TextShapeSpan => {
-        const font = resolve({
+      const resolvedGroups = grouped.map((group) => ({
+        ...group,
+        font: resolve({
           fonts: request.fonts,
           themeFonts: request.themeFonts,
           themeFontPresence: request.themeFontPresence,
@@ -879,7 +899,33 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           weight: request.weight,
           style: request.style,
           genericFamily: request.genericFamily,
-        });
+          // A complex-script span owns its script as a whole, so its intact
+          // clusters are judged together; other slots carry the per-cluster
+          // decision instead of re-judging a fragment.
+          ...(scopedBySlot.has(group.script) ? { substituteScope: group.substituteScript } : {}),
+        }),
+      }));
+      // Within a script-scoped substitute's text, adjacent ascii/highAnsi spans
+      // that resolve to the same face are one string for Canvas: shaping and
+      // painting them apart would break joining forms across the slot
+      // boundary. Complex-script and East Asian spans keep their own slot
+      // formatting. The merge is limited to the scoped script's text: merging
+      // every same-face Latin span changes measurement across all documents
+      // and needs its own evaluation.
+      const merged: typeof resolvedGroups = [];
+      for (const group of resolvedGroups) {
+        const previous = merged.at(-1);
+        const latin = (slot: FontScriptSlot) => slot === 'ascii' || slot === 'highAnsi';
+        if (previous && previous.substituteScript && group.substituteScript
+          && (previous.script === group.script || (latin(previous.script) && latin(group.script)))
+          && sameResolvedFace(previous.font, group.font)) {
+          merged[merged.length - 1] = { ...previous, text: previous.text + group.text, end: group.end };
+        } else {
+          merged.push(group);
+        }
+      }
+
+      const spans = merged.map(({ substituteScript: _substituteScript, font, ...group }): TextShapeSpan => {
         const measurement = request.measure === false ? {
           advancePt: 0,
           ascentPt: 0,
