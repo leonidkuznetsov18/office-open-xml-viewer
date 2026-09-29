@@ -353,8 +353,9 @@ VRT_BASELINE_REVISION=$base VRT_BASELINE_CHECKOUT=/tmp/ooxml-vrt-baseline VRT_PO
 VRT_BASELINE_REVISION=$base VRT_BASELINE_CHECKOUT=/tmp/ooxml-vrt-baseline VRT_PORT=5191 pnpm vrt:private
 ```
 
-Filter a single package with `pnpm --filter @silurus/ooxml-<fmt> vrt` (and the
-matching snapshot script). Without `VRT_BASELINE_CHECKOUT`, a run reads the
+The root scripts run every package without stopping at the first failing one,
+and still exit non-zero if any package failed. Filter a single package with
+`pnpm --filter @silurus/ooxml-<fmt> vrt` (and the matching snapshot script). Without `VRT_BASELINE_CHECKOUT`, a run reads the
 package's own `tests/visual/baseline/`. A missing or mismatched baseline fails
 the run; it is not a successful regression check. Remove the baseline worktree
 when done.

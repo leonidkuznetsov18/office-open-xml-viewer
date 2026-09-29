@@ -57,7 +57,7 @@ function gitRevision(revision) {
 function baselineRevision(snapshot = false) {
   const revision = process.env.VRT_BASELINE_REVISION?.trim();
   if (!revision) {
-    throw new Error('VRT_BASELINE_REVISION is required for private corpus self-VRT');
+    throw new Error('VRT_BASELINE_REVISION is required for self-VRT');
   }
   const resolved = gitRevision(revision);
   if (snapshot) {
