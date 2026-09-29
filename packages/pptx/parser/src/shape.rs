@@ -1009,6 +1009,19 @@ pub(crate) fn parse_shape(
     // cy=0 means "auto-height" for body-text shapes, but connector-type
     // geometries (line, *Connector*) legitimately use cy=0 to represent
     // a perfectly horizontal segment — don't inflate their height.
+    // A shape without text has nothing to grow for either: PowerPoint draws
+    // a zero-height rectangle as a horizontal rule (its top and bottom edges
+    // coincide), so inflating it would paint a tall outlined box instead.
+    let has_text = child(sp_node, "txBody").is_some_and(|text_body| {
+        text_body.descendants().any(|node| {
+            node.is_element()
+                && match node.tag_name().name() {
+                    "t" => node.text().is_some_and(|text| !text.is_empty()),
+                    "fld" => true,
+                    _ => false,
+                }
+        })
+    });
     let is_connector_geom = matches!(
         geometry.as_str(),
         "line"
@@ -1022,7 +1035,7 @@ pub(crate) fn parse_shape(
             | "curvedConnector4"
             | "curvedConnector5"
     );
-    let cy = if t.cy == 0 && !is_connector_geom {
+    let cy = if t.cy == 0 && has_text && !is_connector_geom {
         if is_bottom_anchor {
             0_i64
         } else {
@@ -3570,6 +3583,54 @@ mod style_ref_tests {
             writer.finish().unwrap();
         }
         PptxZip::new(Cursor::new(bytes)).unwrap()
+    }
+
+    fn zero_height_rect_height(text_body: &str) -> i64 {
+        let xml = format!(
+            r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:nvSpPr><p:cNvPr id="1" name="Rule"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+              <p:spPr>
+                <a:xfrm><a:off x="731520" y="1737360"/><a:ext cx="1280160" cy="0"/></a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                <a:noFill/>
+                <a:ln w="25400"><a:solidFill><a:srgbClr val="C9A227"/></a:solidFill></a:ln>
+              </p:spPr>
+              {text_body}
+            </p:sp>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let mut zip = empty_zip();
+        parse_shape(
+            doc.root_element(),
+            &LayoutPlaceholders::default(),
+            &PptxTheme::default(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            &mut zip,
+        )
+        .expect("zero-height rect is drawn")
+        .height
+    }
+
+    #[test]
+    fn zero_height_rect_without_text_stays_a_rule() {
+        assert_eq!(zero_height_rect_height(""), 0);
+        assert_eq!(
+            zero_height_rect_height(
+                r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr/></a:p></p:txBody>"#
+            ),
+            0,
+            "an empty paragraph has nothing to grow for"
+        );
+        assert_eq!(
+            zero_height_rect_height(
+                r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Caption</a:t></a:r></a:p></p:txBody>"#
+            ),
+            2_000_000,
+            "text keeps the auto-height fallback"
+        );
     }
 
     #[test]
