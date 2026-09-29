@@ -116,7 +116,17 @@ export function referenceFontLineMetrics(
   style: 'normal' | 'italic' = 'normal',
   platform: ReferenceFontPlatform = runtimeReferenceFontPlatform,
 ): ReferenceFontLineMetrics | undefined {
-  return identicalProjection(preferredProfiles(family, weight, style, platform));
+  // Word's Japanese display name for BIZ UDGothic selects the same PostScript
+  // face and 1.3 × hhea box as its Latin family name. The published static
+  // regular/bold faces have UPM 2048, hhea (1802, -246, 0), and Far East
+  // code-page bit 17. A Word PDF from the Japanese display name embeds the
+  // BIZUDGothic PostScript face and follows those line advances;
+  // when the browser instead paints Noto Sans JP, its larger Canvas box must
+  // not alter automatic/atLeast line allocation. Keep this a vertical metadata
+  // alias only: it does not claim an exact local resource or its glyph widths.
+  const verticalFamily = family?.normalize('NFKC').trim().toLocaleLowerCase('en-US') === 'biz udゴシック'
+    ? 'BIZ UDGothic' : family;
+  return identicalProjection(preferredProfiles(verticalFamily, weight, style, platform));
 }
 
 /** Metadata-only OS/2 average width for a native face selected by Canvas.

@@ -404,6 +404,25 @@ describe('native reference font vertical layout', () => {
     expect(referenceFontLineMetrics('BIZ UDMincho', 400, 'italic')).toBeUndefined();
   });
 
+  it('uses the BIZ Gothic line box for its Japanese display name while retaining substitute glyph widths', () => {
+    const layoutServices = services();
+    for (const bold of [false, true]) {
+      const segments = buildSegments([{
+        type: 'text', text: '資料を確認します。',
+        fontFamily: 'BIZ UDゴシック', fontFamilyEastAsia: 'BIZ UDゴシック',
+        fontSize: 10.5, bold, italic: false, underline: false,
+        strikethrough: false,
+      }] as DocRun[], { pageIndex: 0, totalPages: 1, layoutServices });
+      const segment = segments[0] as LayoutTextSeg;
+      const line = layoutLines(context, segments, 200, 0, 1)[0]!;
+      expect(segment.referenceFontVerticalMetric).toBe(true);
+      expect(segment.resolvedLineHeightRatio).toBeCloseTo(1.3, 8);
+      expect(line.ascent + line.descent).toBeCloseTo(13.65, 8);
+      expect(line.segments[0]?.measuredWidth).toBe(45);
+    }
+    expect(referenceFontLineMetrics('BIZ UDゴシック', 400, 'italic')).toBeUndefined();
+  });
+
   it('allocates an auto table row from BIZ UDGothic normal spacing and cell margins', () => {
     const section = {
       pageWidth: 612, pageHeight: 792, marginTop: 72, marginRight: 72,
