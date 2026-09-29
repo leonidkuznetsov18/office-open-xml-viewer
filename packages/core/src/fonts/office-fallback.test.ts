@@ -158,6 +158,24 @@ describe('loadOfficeFontFallbacks', () => {
     unloadOfficeFontFallbacks(result.faces);
   });
 
+  it('resolves the Japanese BIZ UD names through the English-named installed faces', async () => {
+    // The macOS asset faces carry only English name records.
+    const { set } = fontSet(['BIZUDMincho-Regular', 'BIZUDGothic-Bold']);
+    const result = await loadOfficeFontFallbacks([
+      { family: 'BIZ UD明朝' }, { family: 'BIZ UDゴシック', weight: 700 },
+    ], set);
+    expect(result.routes['biz ud明朝']).toMatchObject({
+      requestedFamily: 'BIZ UD明朝', source: 'local', weight: 400,
+    });
+    expect(result.routes['biz ud明朝'].resourceIdentity).toContain('local("BIZUDMincho-Regular")');
+    expect(result.routes['biz udゴシック:700:normal'].resourceIdentity)
+      .toContain('local("BIZUDGothic-Bold")');
+    // A family name shared by regular and bold never proves the bold face.
+    expect(result.routes['biz udゴシック:700:normal'].resourceIdentity)
+      .not.toContain('local("BIZ UDゴシック")');
+    unloadOfficeFontFallbacks(result.faces);
+  });
+
   it('bounds independent local probes and cleans up failed faces', async () => {
     const { set, added, deleted, peak } = fontSet([], 3);
     const result = await loadOfficeFontFallbacks([
