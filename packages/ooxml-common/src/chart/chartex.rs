@@ -254,10 +254,18 @@ pub(super) fn parse_chartex_data_point_overrides(
 
 pub(super) fn parse_chartex_histogram_binning(series: Node) -> Option<ChartexHistogramBinning> {
     let binning = child(child(series, "layoutPr")?, "binning")?;
+    // Office writes `<cx:binSize val="5"/>` / `<cx:binCount val="7"/>`
+    // (measured: PowerPoint honors the attribute form); the element-text form
+    // is kept for files that carry it.
+    let scalar = |name: &str| -> Option<String> {
+        let node = child(binning, name)?;
+        attr(&node, "val")
+            .map(|value| value.trim().to_string())
+            .or_else(|| node.text().map(|text| text.trim().to_string()))
+    };
     let finite_text = |name: &str| {
-        child(binning, name)
-            .and_then(|node| node.text())
-            .and_then(|text| text.trim().parse::<f64>().ok())
+        scalar(name)
+            .and_then(|text| text.parse::<f64>().ok())
             .filter(|value| value.is_finite())
     };
     let finite_attr = |name: &str| {
@@ -267,14 +275,14 @@ pub(super) fn parse_chartex_histogram_binning(series: Node) -> Option<ChartexHis
     };
     Some(ChartexHistogramBinning {
         bin_size: finite_text("binSize").filter(|value| *value > 0.0),
-        bin_count: child(binning, "binCount")
-            .and_then(|node| node.text())
-            .and_then(|text| text.trim().parse::<u32>().ok())
+        bin_count: scalar("binCount")
+            .and_then(|text| text.parse::<u32>().ok())
             .filter(|value| *value > 0),
         interval_closed: attr(&binning, "intervalClosed")
             .filter(|value| value == "l" || value == "r"),
         underflow: finite_attr("underflow"),
         overflow: finite_attr("overflow"),
+        edge_format_code: None,
     })
 }
 
@@ -672,7 +680,7 @@ pub(super) fn parse_chartex_impl(
     // CT_Binning child; `histogram` is not an ST_SeriesLayout enumeration.
     // Normalize the semantic family here so raw observations cannot reach the
     // ordinary clustered-column renderer.
-    let chartex_histogram_binning = (pareto_series_node.is_none()
+    let mut chartex_histogram_binning = (pareto_series_node.is_none()
         && layout_id == "clusteredColumn")
         .then(|| parse_chartex_histogram_binning(series_node))
         .flatten();
@@ -903,6 +911,15 @@ pub(super) fn parse_chartex_impl(
         .unwrap_or_else(|| vec![None; pt_count]);
     let source_number_format =
         chartex_number_format(primary_data, &["size", "val", "colorVal"], references);
+    if let Some(binning) = chartex_histogram_binning.as_mut() {
+        // Bin-edge labels use the value dimension's format (measured against
+        // PowerPoint): the formula-resolved source format wins, else the
+        // cached `lvl@formatCode`. Kept apart from `val_format_code` so bin
+        // counts never inherit it.
+        binning.edge_format_code = source_number_format
+            .clone()
+            .or_else(|| chartex_cached_number_format(primary_data, &["val"]));
+    }
 
     let series_name_for = |node: Node, references: &mut dyn ChartReferenceResolver| {
         node.descendants()
@@ -2068,6 +2085,19 @@ pub(super) fn chartex_number_values(
         .map(str::trim)
         .filter(|formula| !formula.is_empty())?;
     references.resolve_numbers(formula)
+}
+
+/// `<cx:numDim><cx:lvl formatCode>` cached format of the first matching dimension.
+fn chartex_cached_number_format(root: Node, dimension_types: &[&str]) -> Option<String> {
+    root.descendants()
+        .find(|n| {
+            n.is_element()
+                && n.tag_name().name() == "numDim"
+                && attr(n, "type").is_some_and(|kind| dimension_types.contains(&kind.as_str()))
+        })
+        .and_then(|dimension| child(dimension, "lvl"))
+        .and_then(|lvl| attr(&lvl, "formatCode"))
+        .filter(|code| !code.is_empty())
 }
 
 pub(super) fn chartex_number_format(
