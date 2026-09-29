@@ -360,9 +360,14 @@ and still exit non-zero if any package failed. Filter a single package with
 A comparison run requires `VRT_BASELINE_CHECKOUT` and fails closed unless it
 names the root of a Git checkout whose HEAD is exactly `VRT_BASELINE_REVISION`
 and whose renderer is unmodified: no tracked change, and no untracked file
-outside dependencies and the private corpus. A copied or symlinked baseline
-directory is never accepted. A missing or mismatched baseline fails the run; it
-is not a successful regression check. Remove the baseline worktree when done.
+outside dependencies and the private corpus. The checkout is re-verified
+before every item is read, so a baseline that changes mid-run fails. Snapshot
+manifests record the checkout's real path and each image's SHA-256; the
+comparison requires both to match, and rejects any symlink below the baseline
+checkout, so copied, replaced or redirected images are never accepted. The
+harness runs Git with every `GIT_*` variable removed. A missing or mismatched
+baseline fails the run; it is not a successful regression check. Remove the
+baseline worktree when done.
 
 For the one-time bootstrap of a harness change against a baseline revision that
 predates it, copy only the allowlisted VRT harness files listed in
