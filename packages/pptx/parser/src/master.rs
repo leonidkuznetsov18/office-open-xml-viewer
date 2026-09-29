@@ -792,16 +792,18 @@ impl LayoutPlaceholders {
     }
 
     // ECMA-376 §21.1.2.2.7 fontAlgn inheritance, mirroring lookup_ea_ln_brk.
+    // A placeholder bound to a layout slot by idx reads exactly that slot,
+    // then the master placeholder of the slot's class, then txStyles; it never
+    // reads a same-type sibling slot. An idx without a layout slot reads the
+    // class list style only. Only an idx-less placeholder uses the type maps.
     pub(crate) fn lookup_font_algn(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<String> {
         if let Some(i) = ph_idx {
-            if !self.by_idx_placeholder_type.contains_key(&i) {
-                return MasterStyleTier::get(&self.styles.font_algn, ph_type).cloned();
-            }
-        }
-        if let Some(i) = ph_idx {
-            if let Some(f) = self.by_idx_font_algn.get(&i) {
-                return Some(f.clone());
-            }
+            return match self.by_idx_placeholder_type.get(&i) {
+                None => MasterStyleTier::get(&self.styles.font_algn, ph_type).cloned(),
+                Some(slot_type) => self.by_idx_font_algn.get(&i).cloned().or_else(|| {
+                    MasterStyleTier::get(&self.styles.placeholder_font_algn, slot_type).cloned()
+                }),
+            };
         }
         let master = &self.styles.placeholder_font_algn;
         self.by_type_font_algn
@@ -2379,9 +2381,9 @@ pub(crate) fn parse_layout_placeholders(
                 if let Some(a) = idx_algn {
                     lph.by_idx_alignment.entry(idx).or_insert(a);
                 }
-                let idx_font_algn = layout_font_algn
-                    .clone()
-                    .or_else(|| master_styles.placeholder_font_algn.get(&ph_type).cloned());
+                let idx_font_algn = layout_font_algn.clone().or_else(|| {
+                    MasterStyleTier::get(&master_styles.placeholder_font_algn, &ph_type).cloned()
+                });
                 if let Some(f) = idx_font_algn {
                     lph.by_idx_font_algn.entry(idx).or_insert(f);
                 }
@@ -4271,6 +4273,52 @@ mod placeholder_geometry_tests {
     /// under it the value can only come from the layout (idx 13, G3) or the
     /// slide (G2), otherwise it stays unset (G1). A non-placeholder text box
     /// never takes it from the master or layout.
+    /// Review probe (#1636): a bound slot whose own chain has no fontAlgn must
+    /// not read a same-type sibling slot's value.
+    #[test]
+    fn bound_slot_font_algn_ignores_sibling_slots() {
+        let layout = r#"<p:sldLayout
+              xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:cSld><p:spTree>
+                <p:sp><p:nvSpPr><p:cNvPr id="2" name="a"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="3" name="b"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="3"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="t"/></a:lstStyle><a:p/></p:txBody></p:sp>
+              </p:spTree></p:cSld></p:sldLayout>"#;
+        let layout_doc = roxmltree::Document::parse(layout).unwrap();
+        let mut zip = empty_zip();
+        let placeholders = parse_layout_placeholders(
+            layout_doc.root_element(),
+            &HashMap::new(),
+            &DefaultTextLevels::default(),
+            &MasterStyleTier::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &MasterLevelRunProperties::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slideLayouts",
+            &HashMap::new(),
+            &mut zip,
+        );
+        assert_eq!(placeholders.lookup_font_algn("body", Some(1)), None);
+        assert_eq!(
+            placeholders.lookup_font_algn("body", Some(3)),
+            Some("t".to_owned())
+        );
+        assert_eq!(placeholders.lookup_font_algn("body", Some(7)), None);
+    }
+
     /// ECMA-376 §21.1.2.2.7 pPr@fontAlgn follows the eaLnBrk tiers: the
     /// paragraph, the body lstStyle, the layout placeholder, the master
     /// placeholder and then the master txStyles. Only t / ctr / b survive:
@@ -4386,6 +4434,9 @@ mod placeholder_geometry_tests {
         assert_eq!(effective(&slot(3), "", ""), some("t"));
         assert_eq!(effective(&slot(4), "", ""), some("b"));
         assert_eq!(effective(&slot(9), "", ""), some("ctr"));
+        // Probe: the untouched idx 1 slot keeps the master body value even
+        // though its siblings (idx 3, 4) author fontAlgn.
+        assert_eq!(effective(&slot(1), "", ""), some("ctr"));
         // An ordinary text box takes no placeholder tier.
         assert_eq!(effective("<p:nvPr/>", "", ""), None);
     }

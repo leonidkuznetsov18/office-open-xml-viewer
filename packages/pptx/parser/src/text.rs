@@ -1830,10 +1830,11 @@ pub(crate) fn parse_paragraph(
     // For paragraphs with no visible text content, use endParaRPr sz to set line height.
     // This ensures empty spacer paragraphs have the correct height (e.g. between sections).
     let end_rpr = child(p_node, "endParaRPr");
+    // The mark authors a face only when its own a:latin resolves (a theme
+    // token against this master's theme); an unresolved token inherits.
     let end_face_authored = end_rpr
-        .and_then(|n| child(n, "latin"))
-        .and_then(|l| attr(&l, "typeface"))
-        .is_some_and(|t| !t.is_empty());
+        .and_then(|n| run_properties_latin_face(n, theme))
+        .is_some_and(|f| !f.is_empty());
     let end_run_properties = end_rpr.map(|node| {
         Box::new(resolve_run_properties(
             String::new(),
