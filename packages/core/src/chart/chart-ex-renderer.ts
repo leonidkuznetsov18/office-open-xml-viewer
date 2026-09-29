@@ -1082,7 +1082,12 @@ function renderParetoLineChart(
     // Pareto's ordinal category labels are suppressed, but its authored
     // category-axis rule remains visible. Keep those two concerns separate.
     catAxisHidden: false,
-    catAxisTickLabelPos: chart.chartexParetoSortDescending == null ? 'none' : 'nextTo',
+    // Excel shows no ordinal labels when the category dimension resolves to
+    // no text (for example an undefined `_xlchart` name); only authored
+    // category text is labelled.
+    catAxisTickLabelPos: chart.chartexParetoSortDescending == null
+      || !(source.categories ?? chart.categories).some(category => category != null && category !== '')
+      ? 'none' : 'nextTo',
     showLegend: false,
     // A standalone paretoLine carries cumulative fractions as its actual
     // values, but Office lays them out on an ordinary decimal axis. Two vector

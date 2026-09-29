@@ -10564,6 +10564,24 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
       .toHaveLength(0);
   });
 
+  it.each([
+    [['A', 'B', 'C'], true],
+    [[], false],
+  ] as const)('labels a standalone Excel Pareto line only with category text (%j)', (categories, labelled) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'paretoLine',
+      categories: [...categories],
+      chartexParetoSortDescending: false,
+      series: [series({ values: [3, 2, 1] })],
+    }), RECT, 1);
+
+    const texts = rec.texts.map(call => call.text);
+    expect(texts.includes('A')).toBe(labelled);
+    // No ordinal fallback labels for an unresolved category dimension.
+    expect(texts.includes('2')).toBe(false);
+  });
+
   it('draws a standalone ChartEx Pareto line without a width at 0.75pt', () => {
     const rec = strokedPolylineCtx();
     renderChart(rec.ctx, baseModel({
