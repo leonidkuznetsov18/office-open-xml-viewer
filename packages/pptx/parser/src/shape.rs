@@ -11,7 +11,9 @@ use crate::fill::{
     parse_style_matrix_effects, parse_style_matrix_fill_from_source, parse_table_style_fill,
     parse_xfrm, EffectLst,
 };
-use crate::master::{DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders};
+use crate::master::{
+    DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders, TableTextLevels,
+};
 use crate::text::{
     complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
     resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes, LevelIndents,
@@ -1273,6 +1275,7 @@ pub(crate) fn parse_shape(
             inherited_anchor,
             inherited_body_pr,
             inherited_alignment,
+            &Default::default(),
             inherited_ea_ln_brk,
             inherited_space_before,
             inherited_space_after,
@@ -2115,24 +2118,25 @@ pub(crate) fn resolve_table_cell_style(
 
 /// Give every paragraph of a table cell a Latin face: the cell's own formatting
 /// (run, paragraph defRPr, lstStyle — already on the paragraph), else the table
-/// style's tcTxStyle face, else the presentation defaultTextStyle level, else
-/// the hard default. Observed (issue #1620): a cell of a built-in table style
-/// rendered in the master theme's minor font even when defaultTextStyle named
-/// another face.
+/// style's tcTxStyle face, else the theme minor font, else the hard default.
+/// Observed: a cell of a built-in table style rendered in the master theme's
+/// minor font even when defaultTextStyle named another face (issue #1620). A
+/// cell of no table style, or of a custom style whose tcTxStyle names no font,
+/// also rendered in the theme minor font at every level, not in the
+/// defaultTextStyle or master otherStyle face (issue #1628).
 pub(crate) fn complete_table_cell_faces(
     cell: &mut TableCell,
     style_face: Option<&str>,
-    default_text: &DefaultTextLevels,
+    theme_minor: Option<&str>,
 ) {
     let Some(body) = cell.text_body.as_mut() else {
         return;
     };
     for paragraph in &mut body.paragraphs {
         if paragraph.def_font_family.is_none() {
-            let level = (paragraph.lvl as usize).min(8);
             paragraph.def_font_family = style_face
+                .or(theme_minor)
                 .map(str::to_owned)
-                .or_else(|| default_text.faces[level].clone())
                 .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
         }
     }
@@ -2246,11 +2250,12 @@ pub(crate) fn parse_table(
     let mut rows: Vec<TableRow> = tbl
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "tr")
-        .map(|tr| parse_table_row(tr, theme, rels, source_dir, zip))
+        .map(|tr| parse_table_row(tr, theme, rels, source_dir, &default_text.table, zip))
         .collect();
 
     let row_count = rows.len();
     let last_row_idx = row_count.saturating_sub(1);
+    let theme_minor = resolve_latin_face("+mn-lt", theme);
     let style_flags = TableStyleFlags {
         first_row,
         last_row,
@@ -2271,14 +2276,14 @@ pub(crate) fn parse_table(
                     .font
                     .as_deref()
                     .and_then(|face| resolve_latin_face(face, theme));
-                complete_table_cell_faces(cell, style_face.as_deref(), default_text);
+                complete_table_cell_faces(cell, style_face.as_deref(), theme_minor.as_deref());
 
                 // Direct `tcPr` formatting is the final tier. The presence flags
                 // preserve an authored noFill/no-line, which is not equivalent to
                 // an omitted property inheriting the table style.
                 apply_resolved_table_cell_style(cell, effective);
             } else {
-                complete_table_cell_faces(cell, None, default_text);
+                complete_table_cell_faces(cell, None, theme_minor.as_deref());
                 // ── Fallback for built-in styles not defined in tableStyles.xml ──
                 // Approximate "Medium Style 2": accent1 header fill + thin outer box + row separators.
                 let thin = Stroke {
@@ -2346,13 +2351,14 @@ pub(crate) fn parse_table_row(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
+    table_text: &TableTextLevels,
     zip: &mut PptxZip,
 ) -> TableRow {
     let height = attr_i64(&tr, "h").unwrap_or(0);
     let cells: Vec<TableCell> = tr
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "tc")
-        .map(|tc| parse_table_cell(tc, theme, rels, source_dir, zip))
+        .map(|tc| parse_table_cell(tc, theme, rels, source_dir, table_text, zip))
         .collect();
     TableRow { height, cells }
 }
@@ -2362,6 +2368,7 @@ pub(crate) fn parse_table_cell(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
+    table_text: &TableTextLevels,
     zip: &mut PptxZip,
 ) -> TableCell {
     let tc_pr = child(tc, "tcPr");
@@ -2388,13 +2395,13 @@ pub(crate) fn parse_table_cell(
             rels,
             source_dir,
             None,
-            // Faces are completed after the table style is resolved
-            // (`complete_table_cell_faces`): the style tier sits between the
-            // cell's own formatting and defaultTextStyle.
-            [None; 9],
+            // The master otherStyle levels (`TableTextLevels`), each ending at
+            // 18 pt and marL 0. Faces are completed after the table style is
+            // resolved (`complete_table_cell_faces`).
+            table_text.sizes,
             std::array::from_fn(|_| None),
             std::array::from_fn(|_| Default::default()),
-            Default::default(), // inherited_level_indents
+            table_text.indents,
             &empty_level_bullets(),
             None,
             None,
@@ -2403,6 +2410,7 @@ pub(crate) fn parse_table_cell(
             anchor,
             text_insets,
             None, // inherited_alignment
+            &table_text.alignments,
             None, // inherited_ea_ln_brk
             None, // inherited_space_before
             None, // inherited_space_after
@@ -3878,6 +3886,7 @@ mod style_ref_tests {
             &HashMap::new(),
             &HashMap::new(),
             "ppt/slides",
+            &crate::master::TableTextLevels::default(),
             &mut zip,
         );
         let body = cell.text_body.expect("table cell text body");
@@ -3981,6 +3990,7 @@ mod style_ref_tests {
             &theme,
             &HashMap::new(),
             "ppt/slides",
+            &crate::master::TableTextLevels::default(),
             &mut zip,
         );
         let tb = cell.text_body.expect("table cell text body");
