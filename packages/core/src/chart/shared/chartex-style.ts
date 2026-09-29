@@ -371,16 +371,17 @@ export function chartExLineIsStructured(line: ResolvedChartExLineStyle): boolean
 }
 
 
-/** Drop a structured direct line paint from a ChartEx series carrier, keeping
- * its geometry, so the element falls back to its Chart Style/semantic colour.
+/** Drop a structured direct line paint from a ChartEx series or point
+ * carrier, keeping its geometry, so the paint falls through to the next layer
+ * (point → series → Chart Style roles → semantic colour).
  *
- * PowerPoint-observed (16.113, synthetic waterfall, histogram, Pareto and
- * box-and-whisker controls; series `a:ln` gradFill linear 0°/90°, path rect,
- * and pattFill): ChartEx never paints a structured series line. Data-point
- * body outlines (waterfall bars, histogram and Pareto columns) are omitted
- * (see chartExLineIsStructured), while line elements — waterfall connectors,
- * box outlines/whiskers/medians/mean line and marker, and the Pareto line —
- * are drawn in their default solid colour at the authored width. */
+ * PowerPoint-observed (16.113, synthetic waterfall, histogram, Pareto,
+ * box-and-whisker, funnel, treemap and sunburst controls; `a:ln` gradFill
+ * linear 0°/90°, path rect, and pattFill): ChartEx never paints a structured
+ * line. Bodies whose style roles carry no line (waterfall bars, histogram and
+ * Pareto columns, funnel bars) end up unoutlined; line elements — waterfall
+ * connectors, box lines, the Pareto line — take their default solid colour at
+ * the authored width; a structured point line takes the series outline. */
 export function chartExSolidLineCarrier<T extends Partial<ChartExSeriesStyleCarrier>>(
   carrier: T | null | undefined,
   index: number,
@@ -419,6 +420,9 @@ export function resolveChartExLineChain(
   fallbackColor: string,
   options: { linkedNoStyleFallback?: boolean } = {},
 ): ResolvedChartExLineStyle {
+  // A structured direct line paint is not an authored paint for ChartEx; its
+  // geometry stays and the paint falls through to the roles below.
+  carrier = chartExSolidLineCarrier(carrier, index);
   let line = resolveChartExSeriesLineStyle(
     chart, paintRoles[0], carrier, index, count, fallbackColor, options,
   );
@@ -484,6 +488,10 @@ export function resolveChartExPointLine(
   const geometryRoles = linkedStyle === chart.chartexDataPointStyle
     ? [linkedStyle, chart.chartexDataPointLineStyle]
     : [linkedStyle];
+  // A point's structured line paint falls through to the series outline
+  // (PowerPoint round 2: a gradient dataPt `a:ln` over a solid red series
+  // outline paints that bar red).
+  point = chartExSolidLineCarrier(point, index);
   if (!chartExPointAuthorsLine(point)) {
     return resolveChartExLineChain(
       chart, series, [linkedStyle], geometryRoles, index, count, fallbackColor, options,

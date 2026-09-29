@@ -2158,8 +2158,6 @@ function renderTreemapChart(
         node.branchIndex,
         root.children.length,
         fill,
-        true,
-        false,
       );
     }),
   };

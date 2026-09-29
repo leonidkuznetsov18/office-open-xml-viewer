@@ -10108,7 +10108,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(strokes[0]!.args[0]).not.toBe(strokes[1]!.args[0]);
   });
 
-  it('omits a structured ChartEx column outline', () => {
+  it('lets a structured ChartEx column outline fall through to the linked role paint', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'clusteredBar',
@@ -10118,7 +10118,55 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     }), RECT, 1);
 
     expect(rec.gradients).toHaveLength(0);
-    expect(rec.strokeRects.filter(rect => rect.lw === 4.5)).toHaveLength(0);
+    // The role's blue paint at the authored 4.5 pt width.
+    const outlines = rec.strokeRects.filter(rect => rect.lw === 4.5);
+    expect(outlines).toHaveLength(2);
+    expect(outlines.every(rect => rect.ss.toUpperCase() === '#0000FF')).toBe(true);
+  });
+
+  it('omits a structured ChartEx column outline when no role carries a line', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A', 'B'],
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      series: [series({ values: [2, 1], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects).toHaveLength(0);
+  });
+
+  it('lets a structured Waterfall point outline fall through to the series outline', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      series: [series({
+        values: [10, 5, 15],
+        lineWidthEmu: 57150,
+        chartexStyle: {
+          linePaints: [{ fillType: 'solid', color: 'FF0000' }],
+          linePaintAuthored: true,
+          lineWidthEmu: 57150,
+        },
+        dataPointOverrides: [{ idx: 1, chartexStyle: gradientLine }],
+      })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    const red = rec.strokeRects.filter(rect => rect.ss.toUpperCase() === '#FF0000');
+    expect(red).toHaveLength(3);
   });
 
   it('omits structured waterfall bar outlines and draws connectors in their default colour', () => {
@@ -10167,6 +10215,48 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
 
     expect(rec.gradients).toHaveLength(0);
     expect(rec.strokeRects).toHaveLength(0);
+  });
+
+  it('outlines Treemap legend keys like the tiles, with structured paint falling through', () => {
+    const tree = {
+      chartType: 'treemap' as const,
+      showLegend: true,
+      legendPos: 't' as const,
+      chartexTreemap: {
+        parentLabelLayout: 'none' as const,
+        rows: [
+          { path: ['X', 'A'], size: 2 },
+          { path: ['Y', 'B'], size: 1 },
+        ],
+      },
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineColors: ['FFFFFF'], linePaintAuthored: true, lineWidthEmu: 19050,
+      },
+    };
+    const solid = recordingCtx();
+    renderChart(solid.ctx, baseModel({
+      ...tree,
+      series: [series({
+        values: [],
+        chartexStyle: {
+          linePaints: [{ fillType: 'solid', color: 'FF0000' }], linePaintAuthored: true,
+          lineWidthEmu: 57150,
+        },
+      })],
+    }), RECT, 1);
+    // Two tiles and two legend keys, red at the authored width.
+    expect(solid.strokeRects.filter(rect =>
+      rect.ss.toUpperCase() === '#FF0000' && rect.lw === 4.5)).toHaveLength(4);
+
+    const structured = recordingCtx();
+    renderChart(structured.ctx, baseModel({
+      ...tree,
+      series: [series({ values: [], chartexStyle: gradientLine })],
+    }), RECT, 1);
+    expect(structured.gradients).toHaveLength(0);
+    expect(structured.strokeRects.filter(rect =>
+      rect.ss.toUpperCase() === '#FFFFFF' && rect.lw === 4.5)).toHaveLength(4);
   });
 
   it('gives a ChartEx legend key without an authored outline width the 0.75pt default', () => {
@@ -10411,8 +10501,10 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     )).toBe(true);
   });
 
+  // PowerPoint's treemap legend keys do take the tile outline (see the
+  // Treemap legend key test); sunburst keeps its separator off the keys.
   it.each([
-    'sunburst', 'treemap',
+    'sunburst',
   ])('%s legend does not inherit the hierarchy separator outline', chartType => {
     const rec = recordingCtx();
     renderChart(rec.ctx, chartExLegendModel(chartType, {
