@@ -74,15 +74,6 @@ impl ParagraphSpacing {
     }
 }
 
-/// Extract the lvl1pPr defRPr font size from a txBody node.
-pub(crate) fn extract_lvl1_font_size(tx_body: roxmltree::Node<'_, '_>) -> Option<f64> {
-    child(tx_body, "lstStyle")
-        .and_then(|ls| child(ls, "lvl1pPr"))
-        .and_then(|lp| child(lp, "defRPr"))
-        .and_then(|rp| attr_f64(&rp, "sz"))
-        .map(|v| v / 100.0)
-}
-
 /// Per-list-level default font sizes (pt). Index 0..=8 → lvl1pPr..lvl9pPr
 /// (ECMA-376 §21.1.2.4). `None` where the level isn't specified.
 pub(crate) type LevelFontSizes = [Option<f64>; 9];
@@ -126,6 +117,107 @@ pub(crate) fn merge_level_sizes(
         out[lvl] = primary[lvl].or(fallback[lvl]);
     }
     out
+}
+
+/// Typeface PowerPoint uses when no tier of the list-style chain names a Latin
+/// face. Observed with PowerPoint for Mac PDF export (issue #1620): a style
+/// level that is present without `<a:latin>`, a level that is absent, a theme
+/// font slot that is empty, and a placeholder cut off from the master by a
+/// layout slot without a txBody all render in Arial. It is not the theme minor
+/// font: those decks had Calibri, Verdana, Tw Cen MT or Bookman themes.
+pub(crate) const HARD_DEFAULT_LATIN_FACE: &str = "Arial";
+/// Size (pt) under the same conditions as [`HARD_DEFAULT_LATIN_FACE`].
+pub(crate) const HARD_DEFAULT_FONT_SIZE: f64 = 18.0;
+
+/// Per-list-level Latin typefaces. Index 0..=8 maps to `lvl1pPr`..`lvl9pPr`.
+/// Each level is independent: PowerPoint does not reuse the level-1 face for a
+/// deeper level whose style omits `<a:latin>` (issue #1620 controls).
+pub(crate) type LevelFaces = [Option<String>; 9];
+
+/// Resolve one authored `<a:latin typeface>` value.
+///
+/// * A theme token (`+mj-lt`, `+mn-lt`, …, ECMA-376 §20.1.4.1.16-.17) resolves
+///   through the slide master's own theme. A token naming an absent or empty
+///   theme slot counts as unspecified (`None`), so the next tier of the chain
+///   applies: with an empty theme minor font a text-box run carrying `+mn-lt`
+///   took the presentation `defaultTextStyle` face, and a placeholder took the
+///   hard default.
+/// * A literal empty `typeface=""` is an authored face that no installed font
+///   matches. PowerPoint rendered it in Arial in a run, in master txStyles and
+///   in a shape lstStyle, never falling through to the inherited face.
+pub(crate) fn resolve_latin_face(
+    typeface: &str,
+    theme: &HashMap<String, String>,
+) -> Option<String> {
+    if typeface.is_empty() {
+        return Some(HARD_DEFAULT_LATIN_FACE.to_owned());
+    }
+    if typeface.starts_with('+') {
+        return theme.get(typeface).filter(|face| !face.is_empty()).cloned();
+    }
+    Some(typeface.to_owned())
+}
+
+/// The resolved Latin face of a `defRPr` / `rPr`, or `None` when unspecified.
+pub(crate) fn run_properties_latin_face(
+    properties: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> Option<String> {
+    child(properties, "latin")
+        .and_then(|latin| attr(&latin, "typeface"))
+        .and_then(|face| resolve_latin_face(&face, theme))
+}
+
+/// Read `<a:lvlNpPr><a:defRPr><a:latin>` for levels 1..9 from a list-style
+/// node (a txBody `<a:lstStyle>`, a master txStyles style, or the presentation
+/// `<p:defaultTextStyle>`).
+pub(crate) fn read_level_faces(
+    list_style: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> LevelFaces {
+    std::array::from_fn(|lvl| {
+        let tag = format!("lvl{}pPr", lvl + 1);
+        list_style
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == tag)
+            .and_then(|lp| child(lp, "defRPr"))
+            .and_then(|rp| run_properties_latin_face(rp, theme))
+    })
+}
+
+/// Per-level faces from a txBody's own `<a:lstStyle>`.
+pub(crate) fn extract_level_faces(
+    tx_body: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+) -> LevelFaces {
+    child(tx_body, "lstStyle")
+        .map(|ls| read_level_faces(ls, theme))
+        .unwrap_or_default()
+}
+
+pub(crate) fn has_any_level_face(faces: &LevelFaces) -> bool {
+    faces.iter().any(Option::is_some)
+}
+
+/// Per-level merge: `primary[lvl]` wins, else `fallback[lvl]`.
+pub(crate) fn merge_level_faces(primary: &LevelFaces, fallback: &LevelFaces) -> LevelFaces {
+    std::array::from_fn(|lvl| primary[lvl].clone().or_else(|| fallback[lvl].clone()))
+}
+
+/// End a face chain at the hard default so every level names a face.
+pub(crate) fn complete_level_faces(faces: &LevelFaces) -> LevelFaces {
+    std::array::from_fn(|lvl| {
+        Some(
+            faces[lvl]
+                .clone()
+                .unwrap_or_else(|| HARD_DEFAULT_LATIN_FACE.to_owned()),
+        )
+    })
+}
+
+/// End a size chain at the hard default so every level has a size.
+pub(crate) fn complete_level_sizes(sizes: &LevelFontSizes) -> LevelFontSizes {
+    std::array::from_fn(|lvl| Some(sizes[lvl].unwrap_or(HARD_DEFAULT_FONT_SIZE)))
 }
 
 /// Per-list-level default text colours. Index 0..=8 maps to
@@ -767,9 +859,11 @@ impl RunProperties {
             fill: fill_choice.and_then(|_| parse_fill(node, theme)),
             color: fill_choice.and_then(|_| text_property_color(node, theme)),
             fill_authored: fill_choice.is_some(),
+            // See `resolve_latin_face`: an empty theme slot is unspecified,
+            // a literal empty typeface is Arial.
             font_family: child(node, "latin")
                 .and_then(|n| attr(&n, "typeface"))
-                .map(|v| resolve_theme_typeface(&v, theme)),
+                .and_then(|v| resolve_latin_face(&v, theme)),
             font_family_ea: child(node, "ea")
                 .and_then(|n| attr(&n, "typeface"))
                 .map(|v| resolve_theme_typeface(&v, theme)),
@@ -851,6 +945,20 @@ impl RunProperties {
 
     /// `self` has higher priority. Every field, including explicit false/none,
     /// is independently chosen; a present effect list is one OOXML choice.
+    /// Replace the Latin face and size with the resolved list-style chain
+    /// (placeholder or defaultTextStyle tiers, see shape.rs). The chain is
+    /// authoritative for these two attributes; every other character
+    /// property keeps its own cascade.
+    pub(crate) fn with_chain_face_and_size(
+        mut self,
+        face: Option<String>,
+        size: Option<f64>,
+    ) -> Self {
+        self.font_family = face;
+        self.font_size = size;
+        self
+    }
+
     pub(crate) fn over(&self, lower: &Self) -> Self {
         macro_rules! pick {
             ($field:ident) => {
@@ -1031,9 +1139,19 @@ pub(crate) fn read_level_run_properties_with_rels(
 ) -> LevelRunProperties {
     // CT_TextListStyle.defPPr supplies the run defaults for every level.  A
     // level's defRPr overlays it one property at a time (§21.1.2.4).
+    // Observed with PowerPoint for Mac PDF export (#1620 controls): a defPPr
+    // Latin face or size had no effect in any tier — shape lstStyle, layout
+    // slot, master placeholder, txStyles and defaultTextStyle — neither alone
+    // nor under an lvlNpPr that omits it; the level fell through as if defPPr
+    // were absent. Other defPPr character properties were not observable
+    // there and keep the §21.1.2.4 base role.
     let base = child(list_style, "defPPr")
         .and_then(|p| child(p, "defRPr"))
-        .map(|r| RunProperties::from_xml(r, theme).with_relationships(rels))
+        .map(|r| {
+            RunProperties::from_xml(r, theme)
+                .with_relationships(rels)
+                .with_chain_face_and_size(None, None)
+        })
         .unwrap_or_default();
     std::array::from_fn(|level| {
         child(list_style, &format!("lvl{}pPr", level + 1))
@@ -1080,7 +1198,6 @@ pub(crate) fn parse_text_body(
     rels: &HashMap<String, String>,
     source_dir: &str,
     inherited_font_size: Option<f64>,
-    inherited_font_family: Option<String>,
     inherited_level_font_sizes: LevelFontSizes,
     inherited_level_colors: LevelColors,
     inherited_level_run_properties: LevelRunProperties,
@@ -1237,11 +1354,6 @@ pub(crate) fn parse_text_body(
         .and_then(|rp| attr_f64(&rp, "sz"))
         .map(|v| v / 100.0)
         .or(inherited_font_size);
-    let default_font_family = own_def_rpr
-        .and_then(|rp| child(rp, "latin"))
-        .and_then(|latin| attr(&latin, "typeface"))
-        .map(|face| resolve_theme_typeface(&face, theme))
-        .or(inherited_font_family);
     // Effective per-list-level default sizes: this shape's own lstStyle wins per
     // level, else the layout/master inherited per-level sizes. Paragraphs pick
     // their size by `lvl` so nested bullets shrink (ECMA-376 §21.1.2.4).
@@ -1323,7 +1435,6 @@ pub(crate) fn parse_text_body(
                 body_default_space_before,
                 body_default_space_after,
                 body_default_line_spacing,
-                default_font_family.as_deref(),
                 default_reflection.as_ref(),
                 &effective_level_sizes,
                 &effective_level_run_properties,
@@ -1485,7 +1596,6 @@ pub(crate) fn parse_paragraph(
     body_default_space_before: Option<ParagraphSpacing>,
     body_default_space_after: Option<ParagraphSpacing>,
     body_default_line_spacing: Option<f64>,
-    body_default_font_family: Option<&str>,
     body_default_reflection: Option<&Reflection>,
     level_font_sizes: &LevelFontSizes,
     level_run_properties: &LevelRunProperties,
@@ -1641,10 +1751,9 @@ pub(crate) fn parse_paragraph(
     let def_color = defaults.color.clone();
     let def_bold = defaults.bold;
     let def_italic = defaults.italic;
-    let def_font_family = defaults
-        .font_family
-        .clone()
-        .or_else(|| body_default_font_family.map(str::to_owned));
+    // The list-level face already ends the placeholder / defaultTextStyle
+    // chain (shape.rs); levels never borrow the level-1 face (#1620).
+    let def_font_family = defaults.font_family.clone();
 
     let mut runs = Vec::new();
     for node in p_node.children().filter(|n| n.is_element()) {
@@ -2139,7 +2248,7 @@ mod relationship_owner_tests {
             &master_rels,
             "ppt/slideMasters",
         );
-        let master_default = &master_levels["body"][0];
+        let master_default = &master_levels.placeholders["body"][0];
         let layout_levels =
             extract_level_run_properties_with_rels(layout.root_element(), &theme, &layout_rels);
         let layout_default = layout_levels[0].over(master_default);

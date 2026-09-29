@@ -308,7 +308,6 @@ fn append_point_paragraphs(
         &empty_rels,
         "",
         None,
-        None,
         Default::default(),
         std::array::from_fn(|_| None),
         Default::default(),
