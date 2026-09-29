@@ -992,6 +992,14 @@ pub struct TextBody {
     #[serde(skip_serializing_if = "is_false")]
     #[serde(default)]
     pub spc_first_last_para: bool,
+    /// Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
+    /// slide → layout → master placeholder cascade. None when no level
+    /// authors it. Only `Some(false)` changes layout (see the renderer's
+    /// PowerPoint line model): PowerPoint renders an omitted value and `1`
+    /// identically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub compat_ln_spc: Option<bool>,
     /// `<a:bodyPr><a:prstTxWarp>` — WordArt text warp (ECMA-376 §20.1.9.19).
     /// None when the body has no warp (the common case), so existing text bodies
     /// serialize byte-identically. When present the renderer maps each glyph
