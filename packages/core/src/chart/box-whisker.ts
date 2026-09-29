@@ -92,6 +92,87 @@ export function computeBoxWhiskerStats(
   };
 }
 
+/**
+ * Minimum value-axis distance, in points, between two painted observation
+ * dots of one box-and-whisker series. It equals the fixed 3pt dot diameter.
+ */
+export const BOX_WHISKER_DOT_SPACING_PT = 3;
+
+/**
+ * Select the observation dots PowerPoint paints for one series, category by
+ * category in axis order. `positionOf` maps a value to its device coordinate
+ * on the value axis; `minSpacing` is BOX_WHISKER_DOT_SPACING_PT in the same
+ * device units. Each result lists its category's dot values in ascending order.
+ *
+ * Neither ECMA-376 nor [MS-ODRAWXML] defines which observations
+ * CT_SeriesElementVisibilities@nonoutliers/@outliers paint. This is observed
+ * PowerPoint 16.113 behavior (vector PDF, electronic-distribution engine) on
+ * synthetic three-series controls: 171 series/category groups and 869 dots,
+ * every dot count and position (within 1pt) reproduced when the inner/outlier
+ * split uses PowerPoint's own quartiles. computeBoxWhiskerStats' quartiles
+ * still differ from PowerPoint for some sample sizes, and there the split,
+ * and so the dots, differ too (2 of the measured groups).
+ *
+ * - One instance of the lowest and of the highest non-outlier value is the
+ *   whisker end and gets no dot. Further copies of an end value, and values
+ *   near it, remain candidates; the omitted end blocks nothing.
+ * - Shown non-outliers and outliers form one ascending pass. A candidate is
+ *   painted only when it lies at least 3pt from the last dot painted, so
+ *   duplicates and near-coincident values collapse onto the lower dot. The
+ *   boundary lies between 2.983pt (collapses) and 3.027pt (both paint) over
+ *   80 value pairs, each drawn at two value scales fourfold apart with the
+ *   same point gaps (identical results, so not axis values), and again
+ *   between 2.994pt and 3.033pt in a plot shrunk to 0.71 of the height (so
+ *   not a fraction of the plot). Which side 3pt itself falls on is not
+ *   measured. Chains compare with the last painted dot: dots spaced 2pt
+ *   apart paint every second one.
+ * - The last painted dot carries across categories and restarts for each
+ *   series. In an outliers-only series, the same outlier in each category
+ *   paints only in the first category; the next series paints it again.
+ * - Hidden non-outliers up to 2.65pt below an outlier do not suppress it.
+ *   That hidden outliers likewise take no part, and that a category without
+ *   observations keeps the carried dot, are inferred, not measured.
+ */
+export function boxWhiskerObservationDots(
+  statsByCategory: readonly (BoxWhiskerStats | null)[],
+  showNonoutliers: boolean,
+  showOutliers: boolean,
+  positionOf: (value: number) => number,
+  minSpacing: number,
+): number[][] {
+  let lastPosition: number | null = null;
+  return statsByCategory.map(stats => {
+    if (!stats || (!showNonoutliers && !showOutliers)) return [];
+    // `inner` and `outliers` are each sorted, and every outlier lies outside
+    // the inner range, so the pass is low outliers, inner values, high ones.
+    const inner = showNonoutliers ? stats.inner.slice(1, -1) : [];
+    const low = showOutliers ? stats.outliers.filter(value => value < stats.lowerFence) : [];
+    const high = showOutliers ? stats.outliers.filter(value => value > stats.upperFence) : [];
+    const dots: number[] = [];
+    for (const value of [...low, ...inner, ...high]) {
+      const position = positionOf(value);
+      if (lastPosition !== null && Math.abs(position - lastPosition) < minSpacing) continue;
+      dots.push(value);
+      lastPosition = position;
+    }
+    return dots;
+  });
+}
+
+/**
+ * Upper bound on the dots boxWhiskerObservationDots can select for one
+ * category, without layout: every shown observation except the two whisker
+ * ends, which never get a dot. The spacing rule can only lower the count.
+ */
+export function boxWhiskerDotCandidateCount(
+  stats: BoxWhiskerStats,
+  showNonoutliers: boolean,
+  showOutliers: boolean,
+): number {
+  return (showNonoutliers ? Math.max(0, stats.inner.length - 2) : 0)
+    + (showOutliers ? stats.outliers.length : 0);
+}
+
 /** Count raw observations with overflow-safe early termination. */
 export function boxWhiskerPointCount(
   groups: readonly (readonly (readonly unknown[])[])[],
