@@ -242,6 +242,42 @@ describe('script-scoped Arabic visual substitutes', () => {
     expect(family).toBe('Noto Naskh Arabic');
   });
 
+  it('draws vocalised Arabic once with the substitute, never splitting marks from letters', async () => {
+    const vocalised = '\u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B\u0627'; // مَرْحَبًا
+    const tatweel = '\u0645\u0640\u0640\u0627';
+    for (const text of [vocalised, tatweel, '\u064E']) {
+      const { canvas, calls } = recordingCanvas(new Set(WEB_FACES));
+      const model = parse(docx(sakkal(text)));
+      await renderDocumentToCanvas(model, canvas, 0, {
+        dpr: 1, width: 612,
+        layoutServices: createLayoutServices(model, {
+          useGoogleFonts: true,
+          googleFaces: WEB_FACES.map(loaded),
+          measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+        }),
+      });
+      const drawn = calls.filter((call) => [...call.text].some((c) => text.includes(c)));
+      expect(drawn.map((call) => [call.text, call.face])).toEqual([[text, 'Noto Naskh Arabic']]);
+    }
+  });
+
+  it('splits mixed Latin and vocalised Arabic only at the script boundary', async () => {
+    const vocalised = '\u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B\u0627';
+    const model = parse(docx(sakkal(`${vocalised}Leader`)));
+    expect(await paintedFamilies(model, [vocalised, 'Leader'])).toEqual(['Noto Naskh Arabic', 'serif']);
+    const { canvas } = recordingCanvas(new Set(WEB_FACES));
+    const services = createLayoutServices(model, {
+      useGoogleFonts: true,
+      googleFaces: WEB_FACES.map(loaded),
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+    });
+    const shaped = services.text.shape({
+      text: `${vocalised}Leader`, fontSizePt: 10, measure: true,
+      fonts: { ascii: 'Sakkal Majalla', highAnsi: 'Sakkal Majalla', complexScript: 'Sakkal Majalla' },
+    });
+    expect(shaped.spans.map((span) => span.text)).toEqual([vocalised, 'Leader']);
+  });
+
   it('never lets an invisible control enable the substitute for a complex-script span', async () => {
     const model = parse(docx(sakkal('Leader\uFEFF', true)));
     expect(docxFontPreloadNames(model)).not.toContain('Sakkal Majalla');

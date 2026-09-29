@@ -14,55 +14,70 @@
  * substitution implementation-defined), not an Office layout rule. It is shared
  * by every format that consults {@link GOOGLE_FONT_SUBSTITUTES}.
  */
+import { graphemeClusterOffsets } from '../text/sea-break.js';
+
 export type FontSubstituteScript = 'arabic';
 
 const FORMAT_CONTROL = /^\p{Cf}$/u;
-const ARABIC_SCRIPT = /^\p{Script=Arabic}$/u;
-const LETTER_OR_MARK = /^[\p{L}\p{M}]$/u;
+const WHITE_SPACE = /^\s$/u;
+const MARK = /^\p{M}$/u;
+const ARABIC_EXTENSIONS = /^\p{Script_Extensions=Arabic}$/u;
+const ARABIC_LETTER = /^(?=\p{Script=Arabic})\p{L}$/u;
 
-/** Arabic-script characters that a substitute actually draws: every visible
- * Unicode Script=Arabic character (letters, marks, Arabic-Indic digits and
- * Arabic punctuation). Invisible format controls are excluded even when their
- * Script property is Arabic (ALM U+061C, the U+0600-U+0605 number signs,
- * U+06DD, U+08E2). U+FEFF is Script=Common and is excluded anyway. Hebrew,
- * Syriac and the other complex-script blocks are excluded: an Arabic
- * substitute has no glyphs for them. */
-function isArabicScriptCodePoint(cp: number): boolean {
-  const character = String.fromCodePoint(cp);
-  return ARABIC_SCRIPT.test(character) && !FORMAT_CONTROL.test(character);
-}
-
-/** Whether one code point is a visible character of `script` that the
- * substitute paints. */
-export function isFontSubstituteScriptCodePoint(script: FontSubstituteScript, cp: number): boolean {
-  switch (script) {
-    case 'arabic': return isArabicScriptCodePoint(cp);
+/** Class of one grapheme cluster for a script-scoped substitute.
+ * - `'script'`: the cluster's base belongs to the script by UAX #24
+ *   Script_Extensions. This includes Arabic letters, Arabic combining marks
+ *   (Script=Inherited, scx=Arab: fatha, sukun, tanwin, superscript alef...),
+ *   tatweel, the Arabic comma and Arabic-Indic digits.
+ * - `'neutral'`: white space, invisible format controls (ZWNJ, ZWJ, LRM, RLM,
+ *   ALM, U+FEFF, the bidi controls), or a lone combining mark with no script of
+ *   its own. It inherits the script of the preceding text, as UAX #24
+ *   prescribes for Inherited characters.
+ * - `'other'`: anything else, such as Latin letters, Latin digits and
+ *   punctuation, which the substitute would draw with its own Latin-style glyphs.
+ * The base is the first code point that is not white space or a format control.
+ * Classifying whole clusters means a mark is never split from its base. */
+export function fontSubstituteScriptClusterClass(
+  script: FontSubstituteScript,
+  cluster: string,
+): 'script' | 'neutral' | 'other' {
+  for (const character of cluster) {
+    if (WHITE_SPACE.test(character) || FORMAT_CONTROL.test(character)) continue;
+    switch (script) {
+      case 'arabic':
+        if (ARABIC_EXTENSIONS.test(character)) return 'script';
+        return MARK.test(character) ? 'neutral' : 'other';
+    }
   }
+  return 'neutral';
 }
 
-/** Whether one code point proves that text is in `script`: a letter or a
- * combining mark of that script. Digits, punctuation and invisible controls
- * never enable a scoped substitute on their own. */
-function provesFontSubstituteScript(script: FontSubstituteScript, cp: number): boolean {
-  return isFontSubstituteScriptCodePoint(script, cp) && LETTER_OR_MARK.test(String.fromCodePoint(cp));
+/** Whether a `'script'` cluster proves the text is in that script: its base is
+ * a letter of the script, or a combining mark whose Script_Extensions include
+ * it (a lone vowel sign). Tatweel, Arabic punctuation and Arabic-Indic digits
+ * belong to Arabic text but never enable the substitute on their own. */
+function clusterProvesScript(script: FontSubstituteScript, cluster: string): boolean {
+  for (const character of cluster) {
+    if (WHITE_SPACE.test(character) || FORMAT_CONTROL.test(character)) continue;
+    switch (script) {
+      case 'arabic':
+        return ARABIC_LETTER.test(character) || (MARK.test(character) && ARABIC_EXTENSIONS.test(character));
+    }
+  }
+  return false;
 }
 
-/** Script-neutral characters inherit the script of the text around them:
- * white space and every invisible format control (ZWNJ, ZWJ, LRM, RLM, ALM,
- * U+FEFF, the bidi embeddings and isolates). A space between two Arabic words
- * stays with the Arabic text. Latin digits and punctuation are not neutral:
- * the substitute would draw them with its own Latin-style glyphs. */
-export function isFontSubstituteScriptNeutralCodePoint(cp: number): boolean {
-  const character = String.fromCodePoint(cp);
-  return /^\s$/u.test(character) || FORMAT_CONTROL.test(character);
+function graphemeClusters(text: string): string[] {
+  const offsets = [...new Set([0, ...graphemeClusterOffsets(text), text.length])].sort((x, y) => x - y);
+  return offsets.slice(0, -1).map((start, index) => text.slice(start, offsets[index + 1]));
 }
 
 /**
- * Whether a scoped substitute may supply `text`.
- * - `'exclusive'`: every non-neutral character belongs to the script, and at
- *   least one is a letter or mark of the script. Use this for a span that can mix scripts, such as an
+ * Whether a scoped substitute may supply `text`, judged by grapheme cluster.
+ * - `'exclusive'`: every cluster is `'script'` or `'neutral'`, and at least
+ *   one proves the script. Use this for a span that can mix scripts, such as an
  *   ECMA-376 §17.3.2.26 ascii-slot span.
- * - `'any'`: at least one character is a letter or mark of the script. Use this for a
+ * - `'any'`: at least one cluster proves the script. Use this for a
  *   complex-script span that the script owns as a whole, including its neutral
  *   digits and punctuation.
  */
@@ -72,11 +87,9 @@ export function fontSubstituteScriptCoversText(
   mode: 'exclusive' | 'any',
 ): boolean {
   let covered = false;
-  for (const character of text) {
-    const cp = character.codePointAt(0) ?? 0;
-    if (provesFontSubstituteScript(script, cp)) covered = true;
-    else if (mode === 'exclusive' && !isFontSubstituteScriptCodePoint(script, cp)
-      && !isFontSubstituteScriptNeutralCodePoint(cp)) return false;
+  for (const cluster of graphemeClusters(text)) {
+    if (clusterProvesScript(script, cluster)) covered = true;
+    else if (mode === 'exclusive' && fontSubstituteScriptClusterClass(script, cluster) === 'other') return false;
   }
   return covered;
 }

@@ -1,10 +1,9 @@
 import type { LayoutDiagnostic } from './types.js';
 import {
   classifyFontGeneric,
+  fontSubstituteScriptClusterClass,
   fontSubstituteScriptCoversText,
   graphemeClusterOffsets,
-  isFontSubstituteScriptCodePoint,
-  isFontSubstituteScriptNeutralCodePoint,
   normalizeFontMetricFamily,
   type CjkLang,
   type FontSubstituteScript,
@@ -828,6 +827,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       );
       const graphemeStarts = new Set(graphemeBoundaries);
       let start = 0;
+      let clusterSubstitute: boolean | undefined;
+      let clusterIndex = 0;
       for (const character of request.text) {
         const end = start + character.length;
         const eastAsiaFamily = requestedFamily(request, 'eastAsia');
@@ -844,11 +845,18 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         );
         const previous = grouped.at(-1);
         const scoped = scopedBySlot.get(script);
-        const codePoint = character.codePointAt(0) ?? 0;
-        const substituteScript = scoped === undefined ? false
-          : isFontSubstituteScriptCodePoint(scoped, codePoint)
-            || (isFontSubstituteScriptNeutralCodePoint(codePoint)
-              && previous?.script === script && previous.substituteScript);
+        // The scope is decided once per grapheme cluster (UAX #24: a mark
+        // inherits its base's script), so a mark is never split from its base.
+        // A neutral cluster continues the preceding text of the same slot.
+        if (scoped !== undefined && (graphemeStarts.has(start) || clusterSubstitute === undefined)) {
+          while (graphemeBoundaries[clusterIndex + 1] !== undefined
+            && graphemeBoundaries[clusterIndex + 1]! <= start) clusterIndex += 1;
+          const clusterEnd = graphemeBoundaries[clusterIndex + 1] ?? request.text.length;
+          const clusterClass = fontSubstituteScriptClusterClass(scoped, request.text.slice(start, clusterEnd));
+          clusterSubstitute = clusterClass === 'script'
+            || (clusterClass === 'neutral' && previous?.script === script && previous.substituteScript);
+        }
+        const substituteScript = scoped !== undefined && clusterSubstitute === true;
         if (previous?.script === script && previous.substituteScript === substituteScript) {
           previous.text += character;
           previous.end = end;

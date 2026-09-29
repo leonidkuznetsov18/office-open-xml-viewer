@@ -176,9 +176,8 @@ export {
 // SCRIPT_GOOGLE_FONTS below.
 export { GOOGLE_FONT_SUBSTITUTES, loadedGoogleRegularAliases } from './fonts/google-fonts';
 export {
+  fontSubstituteScriptClusterClass,
   fontSubstituteScriptCoversText,
-  isFontSubstituteScriptCodePoint,
-  isFontSubstituteScriptNeutralCodePoint,
   substituteEntryCoversText,
   type FontSubstituteScript,
 } from './fonts/substitute-script';
