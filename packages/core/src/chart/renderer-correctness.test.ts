@@ -4721,6 +4721,50 @@ describe('classic 3-D compatibility projection', () => {
     expect(rec.gradients).toHaveLength(0);
   });
 
+  it('charges ChartEx column paint for aggregated displayed bars across retained series', () => {
+    const stops = Array.from({ length: 4_096 }, (_, index) => ({
+      position: index / 4_095, color: '112233',
+    }));
+    const model = baseModel({
+      chartType: 'pareto',
+      categories: ['A', 'B', 'C', 'D', '', 'E'],
+      series: [
+        series({ values: [15, 23, 7, 9, 4, null] }),
+        series({ values: [8, 12, null, null, null, null] }),
+        series({ seriesType: 'line', values: [] }),
+      ],
+      chartexDataPointStyle: {
+        fillPaints: [{ fillType: 'gradient', gradType: 'linear', angle: 0, stops }],
+        fillPaintAuthored: true, lineHidden: true, linePaintAuthored: true,
+      },
+    });
+    expect(chartExDataMarkPaintWorkCount(model, RECT, 1)).toBe(7 * 4_096);
+    expect(chartExDataMarkPaintWorkCount({ ...model, chartexSuppressGeometry: true }, RECT, 1))
+      .toBe(0);
+  });
+
+  it('charges no ChartEx column paint when the Pareto renders nothing', () => {
+    const stops = Array.from({ length: 64 }, (_, index) => ({
+      position: index / 63, color: '112233',
+    }));
+    const base = {
+      chartType: 'pareto' as const,
+      categories: ['A', 'B'],
+      chartexDataPointStyle: {
+        fillPaints: [{ fillType: 'gradient' as const, gradType: 'linear' as const, angle: 0, stops }],
+        fillPaintAuthored: true, lineHidden: true, linePaintAuthored: true,
+      },
+    };
+    const painted = baseModel({ ...base, series: [series({ values: [3, 5] })] });
+    expect(chartExDataMarkPaintWorkCount(painted, RECT, 1)).toBeGreaterThan(0);
+    // Out-of-range owner: the renderer returns before painting.
+    expect(chartExDataMarkPaintWorkCount({ ...painted, chartexParetoOwnerIndex: 4 }, RECT, 1))
+      .toBe(0);
+    // Owner with no valued points: empty layout, nothing painted.
+    const empty = baseModel({ ...base, series: [series({ values: [null, null] })] });
+    expect(chartExDataMarkPaintWorkCount(empty, RECT, 1)).toBe(0);
+  });
+
   it('prefetches and paints ChartEx body picture fills', () => {
     const picture = {
       fillType: 'image' as const,
@@ -9665,6 +9709,42 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     )).toBe(true);
   });
 
+  it('uses host-resolved standalone Pareto order and shows its categories', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'paretoLine',
+      categories: ['A', 'B', 'C'],
+      chartexParetoSortDescending: true,
+      chartexParetoFlatEndpoint: true,
+      valMin: 0,
+      valMax: 1,
+      valAxisFormatCode: '0%',
+      series: [series({ values: [2, 3, 1] })],
+    }), RECT, 1);
+
+    expect(rec.texts.map(text => text.text))
+      .toEqual(expect.arrayContaining(['B', 'A', 'C', '100%']));
+  });
+
+  it('suppresses the flat endpoint when a named unvalued trailing slot already exists', () => {
+    const polylinePoints = (categories: string[], values: Array<number | null>): number => {
+      const rec = strokedPolylineCtx();
+      renderChart(rec.ctx, baseModel({
+        chartType: 'pareto',
+        categories,
+        series: [series({ values })],
+        chartexParetoFlatEndpoint: true,
+        chartexParetoSortDescending: true,
+      }), RECT, 1);
+      return Math.max(0, ...rec.strokes.map(stroke => stroke.points.length));
+    };
+    // All slots valued: the host synthesizes one flat endpoint (5 + 1).
+    const withEndpoint = polylinePoints(['A', 'B', 'C', 'D', 'E'], [15, 23, 7, 9, 4]);
+    // A named category without a value is itself the trailing slot: no extra point.
+    const withNamedSlot = polylinePoints(['A', 'B', 'C', 'D', 'E', 'F'], [15, 23, 7, 9, 4, null]);
+    expect(withNamedSlot).toBe(withEndpoint);
+  });
+
   it('uses the ordinary linear value axis for a standalone Pareto line', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
@@ -9702,6 +9782,72 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     ]);
     const texts = rec.texts.map(text => text.text);
     expect(texts).toEqual(expect.arrayContaining(['Twenty', 'Ten', 'Five', '0%', '100%']));
+  });
+
+  it('places ChartEx value axes by first series order', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'pareto',
+      categories: ['A', 'B'],
+      valMin: 0,
+      valMax: 20,
+      chartexPrimaryAxisRight: true,
+      series: [series({ values: [10, 20] }), series({ seriesType: 'line' })],
+    }), RECT, 1);
+    const primary = rec.texts.find(text => text.text === '20');
+    const secondary = rec.texts.find(text => text.text === '100%');
+    expect(primary).toBeDefined();
+    expect(secondary).toBeDefined();
+    expect(secondary!.x).toBeLessThan(primary!.x);
+  });
+
+  it('keeps the primary value axis on the right for a line-first chart without a line', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredColumn',
+      categories: ['A', 'B'],
+      valMin: 0,
+      valMax: 20,
+      chartexPrimaryAxisRight: true,
+      series: [series({ values: [10, 20] })],
+    }), RECT, 1);
+    const primary = rec.texts.find(text => text.text === '20');
+    expect(primary).toBeDefined();
+    expect(primary!.x).toBeGreaterThan(Math.max(...rec.rects.map(rect => rect.x + rect.w)));
+    expect(rec.texts.some(text => text.text === '100%')).toBe(false);
+  });
+
+  it('keeps a data-bearing unpaired PowerPoint line axis without painting its line', () => {
+    const pptx = recordingCtx();
+    const chart = baseModel({
+      chartType: 'clusteredColumn',
+      categories: ['A', 'B'],
+      series: [series({ values: [10, 20] })],
+      chartexShowUnpairedPercentageAxis: true,
+    });
+    renderChart(pptx.ctx, chart, RECT, 1);
+    expect(pptx.texts.map(text => text.text)).toContain('100%');
+    expect(pptx.rects).toHaveLength(2);
+
+    const excel = recordingCtx();
+    renderChart(excel.ctx, { ...chart, chartexShowUnpairedPercentageAxis: false }, RECT, 1);
+    expect(excel.texts.map(text => text.text)).not.toContain('100%');
+  });
+
+  it('places the last aggregated bar in a blank category slot before E', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'pareto',
+      categories: ['A', 'B', 'C', 'D', '', 'E'],
+      series: [series({ values: [15, 23, 7, 9, 4, null] })],
+      chartexParetoFlatEndpoint: false,
+      chartexParetoSortDescending: true,
+    }), RECT, 1);
+    expect(rec.rects).toHaveLength(5);
+    const lastBarRight = Math.max(...rec.rects.map(rect => rect.x + rect.w));
+    const e = rec.texts.find(text => text.text === 'E');
+    expect(e).toBeDefined();
+    expect(e!.x).toBeGreaterThan(lastBarRight);
   });
 
   // PowerPoint-observed Pareto line chain: direct `a:ln`, then the dataPoint
@@ -10457,6 +10603,24 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(collectChartImageFillUsages(model(null))).toHaveLength(1);
     expect(collectChartImageFillUsages(model({ fillHidden: true, fillPaintAuthored: true })))
       .toHaveLength(0);
+  });
+
+  it.each([
+    [['A', 'B', 'C'], true],
+    [[], false],
+  ] as const)('labels a standalone Excel Pareto line only with category text (%j)', (categories, labelled) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'paretoLine',
+      categories: [...categories],
+      chartexParetoSortDescending: false,
+      series: [series({ values: [3, 2, 1] })],
+    }), RECT, 1);
+
+    const texts = rec.texts.map(call => call.text);
+    expect(texts.includes('A')).toBe(labelled);
+    // No ordinal fallback labels for an unresolved category dimension.
+    expect(texts.includes('2')).toBe(false);
   });
 
   it('draws a standalone ChartEx Pareto line without a width at 0.75pt', () => {

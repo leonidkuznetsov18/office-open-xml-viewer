@@ -169,6 +169,7 @@ export function renderBarChart(
   const sec = !isH && chart.secondaryValAxis && hasSecondarySeries
     ? chart.secondaryValAxis
     : null;
+  const primaryAxisRight = !isH && chart.chartexPrimaryAxisRight === true;
   const secondaryBarSeries = sec
     ? barSeries.filter(series => series.useSecondaryAxis === true)
     : [];
@@ -714,7 +715,8 @@ export function renderBarChart(
 
   const pad = {
     t: padT,
-    r: legRightW + w * 0.03 + secLabelBandW + secTitleBandW,
+    r: legRightW + w * 0.03 + (primaryAxisRight
+      ? valLabelBandW + valTitleW : secLabelBandW + secTitleBandW),
     b: padB,
     // Column charts: title band + measured label band, tight to the axis.
     // Horizontal bars: keep the wider left band for the category labels
@@ -724,7 +726,9 @@ export function renderBarChart(
         (chart.catAxisHidden ? w * 0.03 : automaticHorizontalCategoryLabelBandW) + valTitleW,
         dataTableHeaderW,
       )
-      : legLeftW + Math.max(valTitleW + valLabelBandW, dataTableHeaderW),
+      : legLeftW + Math.max(primaryAxisRight
+        ? secLabelBandW + secTitleBandW : valTitleW + valLabelBandW,
+      dataTableHeaderW),
   };
   pad.t = manualTopLegendPlotInset(
     chart, leg, x, y, w, h, titleH, pad.t,
@@ -945,13 +949,13 @@ export function renderBarChart(
         const gy = valY(val);
         if (drawMajorGrid) strokeValueGridlineH(ctx, px0, pw, gy, isZero, grid);
         if (drawLabels) {
-          ctx.textAlign = 'right';
+          ctx.textAlign = primaryAxisRight ? 'left' : 'right';
           const gap = options.gapPolicy === 'chartex'
             ? chartExValueTickLabelOffsetPx(ptToPx)
             : chart.valAxisFontSizeHpt != null
               ? valueTickLabelGapPx(drawnValTickFontPx)
               : 12;
-          ctx.fillText(label, px0 - gap, gy);
+          ctx.fillText(label, primaryAxisRight ? px0 + pw + gap : px0 - gap, gy);
         }
       } else {
         const gx = valX(val);
@@ -1045,7 +1049,10 @@ export function renderBarChart(
   const drawAxesOnTop = (): void => {
     if (!isH) {
       if (drawCatLine) strokeAxisSegment(ctx, px0, primaryCatAxisY, px0 + pw, primaryCatAxisY, catLineColor, catLineW, chart.catAxisLineDash);
-      if (drawValLine) strokeAxisSegment(ctx, px0, py0, px0, py0 + ph, valLineColor, valLineW, chart.valAxisLineDash);           // left
+      if (drawValLine) {
+        const axisX = primaryAxisRight ? px0 + pw : px0;
+        strokeAxisSegment(ctx, axisX, py0, axisX, py0 + ph, valLineColor, valLineW, chart.valAxisLineDash);
+      }
     } else {
       if (drawCatLine) strokeAxisSegment(ctx, primaryCatAxisX, py0, primaryCatAxisX, py0 + ph, catLineColor, catLineW, chart.catAxisLineDash);
       if (drawValLine) strokeAxisSegment(ctx, px0, py0 + ph, px0 + pw, py0 + ph, valLineColor, valLineW, chart.valAxisLineDash); // bottom
@@ -1061,7 +1068,7 @@ export function renderBarChart(
     if (!chart.valAxisHidden && chart.valAxisMajorTickMark && chart.valAxisMajorTickMark !== 'none') {
       for (const val of plan.majorLines) {
         if (!isH) {
-          drawAxisTick(ctx, chart.valAxisMajorTickMark, 'val', px0, valY(val), valLineColor, valLineW, false, chart.valAxisLineHidden, 'major', ptToPx, chart.valAxisLineDash);
+          drawAxisTick(ctx, chart.valAxisMajorTickMark, 'val', primaryAxisRight ? px0 + pw : px0, valY(val), valLineColor, valLineW, primaryAxisRight, chart.valAxisLineHidden, 'major', ptToPx, chart.valAxisLineDash);
         } else {
           drawAxisTick(ctx, chart.valAxisMajorTickMark, 'cat', py0 + ph, valX(val), valLineColor, valLineW, false, chart.valAxisLineHidden, 'major', ptToPx, chart.valAxisLineDash);
         }
@@ -1070,7 +1077,7 @@ export function renderBarChart(
     if (!chart.valAxisHidden && chart.valAxisMinorTickMark && chart.valAxisMinorTickMark !== 'none') {
       for (const value of plan.minorTicks) {
         if (!isH) {
-          drawAxisTick(ctx, chart.valAxisMinorTickMark, 'val', px0, valY(value), valLineColor, valLineW, false, chart.valAxisLineHidden, 'minor', ptToPx, chart.valAxisLineDash);
+          drawAxisTick(ctx, chart.valAxisMinorTickMark, 'val', primaryAxisRight ? px0 + pw : px0, valY(value), valLineColor, valLineW, primaryAxisRight, chart.valAxisLineHidden, 'minor', ptToPx, chart.valAxisLineDash);
         } else {
           drawAxisTick(ctx, chart.valAxisMinorTickMark, 'cat', py0 + ph, valX(value), valLineColor, valLineW, false, chart.valAxisLineHidden, 'minor', ptToPx, chart.valAxisLineDash);
         }
@@ -2277,6 +2284,7 @@ export function renderBarChart(
     drawSecondaryValueAxis(
       ctx, chart, sec, secScale, toYSecondary, r, px0, py0, pw, ph, ptToPx,
       secFontPx, secLabelBandW, valLabelColor, chart.date1904, secondaryPercentAxis,
+      primaryAxisRight ? 'left' : 'right',
     );
   }
 

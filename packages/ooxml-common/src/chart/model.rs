@@ -1065,6 +1065,26 @@ pub struct ChartModel {
     /// `series[0].values` so the renderer can derive a bounded frequency plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chartex_histogram_binning: Option<ChartexHistogramBinning>,
+    /// Office 16.113 ChartEx owner resolution. The index is among retained
+    /// column series (line style carriers do not count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_pareto_owner_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_pareto_sort_descending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_pareto_flat_endpoint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_suppress_geometry: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_pareto_outline_owner: Option<bool>,
+    /// ChartEx paints the first series' percentage axis on the left when a
+    /// paretoLine precedes its column owner; the column axis moves right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_primary_axis_right: Option<bool>,
+    /// PowerPoint retains an unpaired Pareto line's percentage ticks when it
+    /// has its own dataId and axisId, even though the line has no owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chartex_show_unpaired_percentage_axis: Option<bool>,
     /// Theme accent palette (`accent1..6` resolved to hex, no `#`) for chartEx
     /// charts that color by branch/series index (boxWhisker series and
     /// sunburst/treemap branches). `None` when the resolver supplies no default palette (pptx);

@@ -1537,6 +1537,13 @@ export interface ChartModel {
   chartexRegionMap?: ChartexRegionMap | null;
   /** ChartEx histogram controls; raw observations remain in `series[0]`. */
   chartexHistogramBinning?: ChartexHistogramBinning | null;
+  chartexParetoOwnerIndex?: number | null;
+  chartexParetoSortDescending?: boolean | null;
+  chartexParetoFlatEndpoint?: boolean | null;
+  chartexSuppressGeometry?: boolean | null;
+  chartexParetoOutlineOwner?: boolean | null;
+  chartexPrimaryAxisRight?: boolean | null;
+  chartexShowUnpairedPercentageAxis?: boolean | null;
   /**
    * Theme accent palette (`accent1..6`, hex without '#') for chartEx charts
    * that color by branch/series index (boxWhisker series and
