@@ -22200,6 +22200,103 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(Math.abs((meanCross as Array<{ x: number; y: number }>)[3].y - (meanCross as Array<{ x: number; y: number }>)[2].y)).toBe(12);
   });
 
+  /** Ordered paint log: every fill/stroke with its current paint and path. */
+  function paintOrderCtx(): {
+    ctx: CanvasRenderingContext2D;
+    ops: Array<{ op: string; style: string; points: Array<[number, number]> }>;
+  } {
+    const ops: Array<{ op: string; style: string; points: Array<[number, number]> }> = [];
+    let points: Array<[number, number]> = [];
+    const state: Record<string, unknown> = {
+      font: '10px sans-serif', fillStyle: '#000', strokeStyle: '#000', lineWidth: 1,
+      textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1,
+    };
+    const log = (op: string, style: unknown) => {
+      ops.push({ op, style: String(style).toUpperCase(), points });
+    };
+    const handler: ProxyHandler<Record<string, unknown>> = {
+      get(_target, prop: string) {
+        if (prop in state && typeof state[prop] !== 'function') return state[prop];
+        switch (prop) {
+          case 'measureText': return (text: string) => ({ width: String(text).length * 6 });
+          case 'beginPath': return () => { points = []; };
+          case 'moveTo': case 'lineTo':
+            return (x: number, y: number) => { points = [...points, [x, y]]; };
+          case 'arc': case 'ellipse': return (x: number, y: number) => { points = [...points, [x, y]]; };
+          case 'stroke': return () => log('stroke', state.strokeStyle);
+          case 'fill': return () => log('fill', state.fillStyle);
+          case 'fillRect': return () => log('fillRect', state.fillStyle);
+          case 'strokeRect': return () => log('strokeRect', state.strokeStyle);
+          case 'getLineDash': return () => [];
+          case 'createLinearGradient': case 'createRadialGradient':
+            return () => ({ addColorStop() {} });
+          default: return () => undefined;
+        }
+      },
+      set(_target, prop: string, value) { state[prop] = value; return true; },
+    };
+    return { ctx: new Proxy(state, handler) as unknown as CanvasRenderingContext2D, ops };
+  }
+
+  it('paints each series and its mean line before the next series, with outliers before the mean ×', () => {
+    const rec = paintOrderCtx();
+    renderChart(rec.ctx, boxModel({
+      valAxisHidden: true,
+      catAxisHidden: true,
+      chartexBox: {
+        categories: ['A', 'B'],
+        series: [
+          {
+            name: 'S1', color: 'AA0000', lineColor: 'FF0000',
+            // Category A carries an outlier (40) above the mean.
+            valuesByCategory: [[1, 2, 3, 4, 5, 40], [2, 3, 4]],
+            meanMarker: true, meanLine: true, showOutliers: true, showNonoutliers: true,
+            quartileMethod: 'exclusive',
+          },
+          {
+            name: 'S2', color: '00AA00', lineColor: '00FF00',
+            valuesByCategory: [[3, 4, 5], [4, 5, 6]],
+            meanMarker: true, meanLine: true, showOutliers: true, showNonoutliers: true,
+            quartileMethod: 'exclusive',
+          },
+        ],
+      },
+    }), RECT, 1);
+
+    const isMeanLine = (op: { op: string; points: Array<[number, number]> }) =>
+      op.op === 'stroke' && op.points.length === 2
+      && Math.abs(op.points[1][0] - op.points[0][0]) > 20
+      // Unlike median/cap strokes, it joins two different category means.
+      && Math.abs(op.points[1][1] - op.points[0][1]) > 0.001;
+    const isCross = (op: { op: string; points: Array<[number, number]> }) =>
+      op.op === 'stroke' && op.points.length === 4
+      && [0, 2].every(index =>
+        op.points[index + 1][0] !== op.points[index][0]
+        && op.points[index + 1][1] !== op.points[index][1]);
+    const firstMeanLine = rec.ops.findIndex(op => isMeanLine(op) && op.style === '#FF0000');
+    const secondMeanLine = rec.ops.findIndex(op => isMeanLine(op) && op.style === '#00FF00');
+    const firstSeriesPaint = rec.ops.map((op, index) => ({ op, index }))
+      .filter(({ op }) => op.style === '#FF0000' || op.style === '#AA0000');
+    const secondSeriesBody = rec.ops.findIndex(op => op.op === 'fillRect' && op.style === '#00AA00');
+    expect(firstMeanLine).toBeGreaterThan(-1);
+    expect(secondMeanLine).toBeGreaterThan(firstMeanLine);
+    // Series 1's mean line follows all of series 1 and precedes series 2's
+    // boxes, so later boxes paint over it.
+    expect(firstSeriesPaint[firstSeriesPaint.length - 1].index).toBe(firstMeanLine);
+    expect(secondSeriesBody).toBeGreaterThan(firstMeanLine);
+
+    // In category A, the outlier dot is painted before that category's mean ×.
+    const firstCross = rec.ops.findIndex(op => isCross(op) && op.style === '#FF0000');
+    const firstCrossX = (rec.ops[firstCross].points[0][0] + rec.ops[firstCross].points[1][0]) / 2;
+    const dotsA = rec.ops.map((op, index) => ({ op, index })).filter(({ op }) =>
+      op.op === 'fill' && op.points.length === 1
+      && Math.abs(op.points[0][0] - firstCrossX) < 0.001);
+    const outlierY = Math.min(...dotsA.map(({ op }) => op.points[0][1]));
+    const outlier = dotsA.find(({ op }) => op.points[0][1] === outlierY);
+    expect(outlier).toBeDefined();
+    expect(outlier!.index).toBeLessThan(firstCross);
+  });
+
   it('strokes the mean × with the whisker line, not the generic marker outline', () => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, boxModel({
