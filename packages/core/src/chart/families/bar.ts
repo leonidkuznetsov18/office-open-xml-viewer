@@ -78,7 +78,7 @@ import { drawScatterSeriesLayer } from '../shared/scatter-paint.js';
 import { drawChartMarker, seriesHasResolvedMarkerDetail } from '../shared/markers.js';
 import { clamp, appendCurve, dashPatternForPreset } from '../shared/geometry.js';
 
-import { chartExDataPointFill, chartExDataPointPaint, paintClassicDataPointPath, paintClassicDataPointRect, applyChartExSeriesLineStyle, applyResolvedChartExLineStyle, chartExLegendSeries, resolveChartExLineChain, resolveChartExPointFill, resolveChartExPointLine } from '../shared/chartex-style.js';
+import { chartExDataPointFill, chartExDataPointPaint, paintClassicDataPointPath, paintClassicDataPointRect, applyChartExSeriesLineStyle, applyResolvedChartExLineStyle, chartExLegendSeries, resolveChartExLineChain, resolveChartExPointFill, resolveChartExPointLine, chartExSolidLineCarrier } from '../shared/chartex-style.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Bar chart — vertical columns + horizontal bars, clustered + stacked +
@@ -304,6 +304,9 @@ export function renderBarChart(
         styleIndex,
         barSeries.length,
         fill,
+        false,
+        true,
+        true,
       ));
     });
   }
@@ -1367,17 +1370,22 @@ export function renderBarChart(
           : invertedPaint !== undefined
             ? invertedPaint
             : styleFill;
-      const applyPointOutline = (target: CanvasRenderingContext2D): boolean => {
+      // PowerPoint-observed (16.113, synthetic column/bar controls): a
+      // gradient outline is laid out per column/bar, and a path gradient
+      // fills each bar's own rectangle. Pattern outlines keep a phase shared
+      // across the chart, which resolveFill anchors to the slide root.
+      // ChartEx columns (histogram, Pareto) do not retain a structured
+      // outline at all: gradient and pattern outlines are omitted.
+      const applyPointOutline = (
+        target: CanvasRenderingContext2D,
+        bounds: ChartRect,
+      ): boolean => {
         if (isChartExColumn) {
-          return applyResolvedChartExLineStyle(
-            target,
-            resolveChartExPointLine(
-              chart, s, pointOverride, pointStyleIndex, barSeries.length, color,
-            ),
-            ptToPx,
-            { x: px0, y: py0, w: pw, h: ph },
-            shapeRotationDeg,
+          const outline = resolveChartExPointLine(
+            chart, s, pointOverride, pointStyleIndex, barSeries.length, color,
           );
+          if (outline.paint && outline.paint.fillType !== 'solid') return false;
+          return applyResolvedChartExLineStyle(target, outline, ptToPx);
         }
         const hasPointLine = pointOverride?.lineHidden != null
           || pointOverride?.lineColor != null
@@ -1388,7 +1396,7 @@ export function renderBarChart(
         if (hasPointLine) {
           return applyClassicStyleLine(
             target, chart, 'dataPoint', s, pointOverride, pointStyleIndex, color,
-            1, ptToPx, { x: px0, y: py0, w: pw, h: ph }, shapeRotationDeg, false,
+            1, ptToPx, bounds, shapeRotationDeg, false,
           );
         }
         if (useNegativeStyle
@@ -1448,7 +1456,7 @@ export function renderBarChart(
         }
         return applyClassicStyleLine(
           target, chart, 'dataPoint', s, pointOverride, pointStyleIndex, color,
-          1, ptToPx, { x: px0, y: py0, w: pw, h: ph }, shapeRotationDeg, false,
+          1, ptToPx, bounds, shapeRotationDeg, false,
         );
       };
       const pointEffect = chartStyleEffectOwner(
@@ -1470,7 +1478,9 @@ export function renderBarChart(
           ptToPx,
           shapeRotationDeg,
         );
-        if (barPaintWidth > 0 && barPaintHeight > 0 && applyPointOutline(target)) {
+        if (barPaintWidth > 0 && barPaintHeight > 0 && applyPointOutline(
+          target, { x: bx, y: by, w: barPaintWidth, h: barPaintHeight },
+        )) {
           const outlineW = target.lineWidth;
           target.strokeRect(
             bx + outlineW / 2,
@@ -2071,13 +2081,14 @@ export function renderBarChart(
             // colour at the 0.75 pt default. Geometry follows the same roles.
             const roles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
             const paretoLine = resolveChartExLineChain(
-              chart, s, roles, roles, styleIndex, lineSeries.length,
+              chart, chartExSolidLineCarrier(s, styleIndex), roles, roles, styleIndex,
+              lineSeries.length,
               `#${chartExDataPointFill(chart, styleIndex, lineSeries.length, s.chartexStyle)}`,
               { linkedNoStyleFallback: true },
             );
             if (!applyResolvedChartExLineStyle(
-              // No bounds: structured Pareto line paint stays solid, as on
-              // main, because the paint-work budget does not count it.
+              // No bounds: structured Pareto line paint stays solid, and the
+              // paint-work budget charges it as one solid line.
               target, { ...paretoLine, semanticFallback: false }, ptToPx,
             )) return;
             strokeOverlayRuns(target);
