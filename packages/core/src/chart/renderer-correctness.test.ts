@@ -21962,6 +21962,45 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(Math.abs((meanCross as Array<{ x: number; y: number }>)[3].y - (meanCross as Array<{ x: number; y: number }>)[2].y)).toBe(12);
   });
 
+  it('strokes the mean × with the whisker line, not the generic marker outline', () => {
+    const rec = segRecordingCtx();
+    renderChart(rec.ctx, boxModel({
+      valAxisHidden: true,
+      catAxisHidden: true,
+      chartexDataPointLineStyle: {
+        lineColors: ['104C68'], linePaintAuthored: true, lineWidthEmu: 57150, lineCap: 'rnd',
+      },
+      chartexDataPointMarkerStyle: {
+        lineColors: ['FFFFFF'], linePaintAuthored: true, lineWidthEmu: 9525,
+      },
+      chartexBox: {
+        categories: ['Category 1'],
+        series: [{
+          name: 'S1', color: 'ED7D31', valuesByCategory: [[1, 2, 3, 4, 5, 6, 7, 8, 9]],
+          meanMarker: true, meanLine: false, showOutliers: false, showNonoutliers: false,
+          quartileMethod: 'exclusive',
+        }],
+      },
+    }), RECT, 2);
+
+    const whisker = rec.segs.find(segment =>
+      Math.abs(segment.x0 - segment.x1) < 0.001 && Math.abs(segment.y0 - segment.y1) > 1);
+    const cross = rec.segs.filter(segment =>
+      Math.abs(segment.x0 - segment.x1) > 0.001 && Math.abs(segment.y0 - segment.y1) > 0.001);
+    expect(whisker).toBeDefined();
+    expect(cross).toHaveLength(2);
+    for (const stroke of cross) {
+      expect(stroke.ss.toUpperCase()).toBe(whisker!.ss.toUpperCase());
+      expect(stroke.ss.toUpperCase()).toBe('#104C68');
+      expect(stroke.lw).toBeCloseTo(whisker!.lw, 5);
+      expect(stroke.lw).toBeCloseTo(9, 5);
+      expect(stroke.cap).toBe(whisker!.cap);
+      // The glyph stays a 6pt square (12px at 2px/pt) at a 4.5pt stroke.
+      expect(Math.abs(stroke.x1 - stroke.x0)).toBeCloseTo(12, 5);
+      expect(Math.abs(stroke.y1 - stroke.y0)).toBeCloseTo(12, 5);
+    }
+  });
+
   it('uses the authored Chart Style marker symbol for box sample points', () => {
     const rec = markerRecordingCtx();
     renderChart(rec.ctx, boxModel({

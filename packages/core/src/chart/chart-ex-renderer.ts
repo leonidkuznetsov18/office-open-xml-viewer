@@ -1106,7 +1106,8 @@ function renderBoxWhiskerChart(
   // ChartEx's linked dataPointMarkerLayout is a generic marker recipe. Office
   // does not use its size for box-and-whisker observations: vector output uses
   // 3pt observation/outlier dots and a 6pt mean `x`, independent of box width.
-  // The linked recipe still supplies the marker symbol and paint.
+  // The linked recipe still supplies the observation marker symbol and paint;
+  // the mean `x` is not a recipe marker (see its paint site below).
   const observationMarkerSizePt = 3;
   const meanMarkerRadiusPx = 3 * ptToPx;
   const box = chart.chartexBox;
@@ -1586,11 +1587,20 @@ function renderBoxWhiskerChart(
         }
       }
 
-      // Mean `×` marker (same accent×0.8 as the rest of the outline).
+      // Mean `×` marker. [MS-ODRAWXML] CT_SeriesElementVisibilities@meanMarker
+      // only toggles visibility; glyph and paint are observed PowerPoint 16.113
+      // behavior. In vector PDF exports (both export engines) across 27 box
+      // controls — series line widths 0.5–6pt, solid/theme/direct paints,
+      // round and flat caps, linked Chart Styles whose dataPointMarker role
+      // carries a contrasting 0.75pt lt1 outline — the mean is always two
+      // diagonals spanning a 6×6pt square centred on the mean, stroked with the
+      // same color, width, cap and join as the whiskers/median; none of these
+      // controls takes the dataPointMarker outline, so it resolves through the
+      // whisker line.
       if (s.meanMarker) {
         const mY = yOf(stats.mean);
         const mR = meanMarkerRadiusPx;
-        if (applySeriesLine(markerStyle, markerEdge ?? edge)) {
+        if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
           ctx.beginPath();
           ctx.moveTo(cx - mR, mY - mR); ctx.lineTo(cx + mR, mY + mR);
           ctx.moveTo(cx + mR, mY - mR); ctx.lineTo(cx - mR, mY + mR);
