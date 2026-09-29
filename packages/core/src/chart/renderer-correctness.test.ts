@@ -22383,10 +22383,12 @@ describe('CH15 — chartEx box-and-whisker', () => {
     expect(boxFills).toEqual(['#FF0000', '#00FF00', '#0000FF']);
   });
 
-  it('uses dataPointLine for mean connectors and keeps dataPoint paint separate', () => {
+  it('paints mean connectors from the dataPoint role line, not dataPointLine (PowerPoint 16.113)', () => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, boxModel({
-      chartexDataPointStyle: { fillColors: ['F4B183'], lineColors: ['C00000'] },
+      chartexDataPointStyle: {
+        fillColors: ['F4B183'], lineColors: ['C00000'], linePaintAuthored: true,
+      },
       chartexDataPointLineStyle: { lineColors: ['0070C0'], lineWidthEmu: 25400 },
       chartexBox: {
         categories: ['A', 'B'],
@@ -22397,9 +22399,11 @@ describe('CH15 — chartEx box-and-whisker', () => {
         }],
       },
     }), RECT, 1);
-    const lineRole = rec.segs.filter(segment => segment.ss.toLowerCase() === '#0070c0');
+    const lineRole = rec.segs.filter(segment => segment.ss.toLowerCase() === '#c00000');
     expect(lineRole.some(segment => Math.abs(segment.x1 - segment.x0) > 100)).toBe(true);
-    expect(lineRole.every(segment => segment.lw === 2)).toBe(true);
+    // No `w` on the dataPoint role: 0.75 pt, never the dataPointLine 2 pt.
+    expect(lineRole.every(segment => segment.lw === 0.75)).toBe(true);
+    expect(rec.segs.some(segment => segment.ss.toLowerCase() === '#0070c0')).toBe(false);
   });
 
   it('partitions one category into equal series slots with a fixed gutter', () => {
@@ -24274,5 +24278,71 @@ describe('CH — combo chart legends reflect each series chart group', () => {
     expect(keyMarker).toBeDefined();
     expect((keyLine as Array<{ x: number; y: number }>)[1].x - (keyLine as Array<{ x: number; y: number }>)[0].x)
       .toBeGreaterThan((keyMarker as ArcCall).r * 2);
+  });
+});
+
+describe('ChartEx box-and-whisker line paint (PowerPoint 16.113)', () => {
+  const ROLE_LINE_WIDTH_EMU = 28575;
+  const boxLines = (
+    over: {
+      dataPoint?: NonNullable<ChartModel['chartexDataPointStyle']>;
+      style?: NonNullable<ChartModel['chartexDataPointStyle']>;
+      lineWidthEmu?: number;
+    },
+  ) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'boxWhisker',
+      series: [series({ name: 'S', values: [] })],
+      chartexDataPointStyle: over.dataPoint
+        ?? { fillColors: ['156082'], lineColors: ['156082'], linePaintAuthored: true },
+      // dataPointLine carries the 2.25 pt role width that PowerPoint ignores.
+      chartexDataPointLineStyle: {
+        lineColors: ['156082'], linePaintAuthored: true, lineWidthEmu: ROLE_LINE_WIDTH_EMU,
+      },
+      chartexBox: {
+        categories: ['A'],
+        series: [{
+          name: 'S', chartexStyle: over.style, lineWidthEmu: over.lineWidthEmu,
+          valuesByCategory: [[1, 2, 3, 4, 5, 6, 20]],
+          meanMarker: true, meanLine: true,
+          showOutliers: false, showNonoutliers: false, quartileMethod: 'inclusive',
+        }],
+      },
+    }), RECT, 1);
+    // Axis, grid and frame strokes are neutral greys; the chart colours are not.
+    return rec.strokeDetails.filter(detail => {
+      const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(detail.strokeStyle);
+      return hex != null && !(hex[1] === hex[2] && hex[2] === hex[3]);
+    });
+  };
+  const unique = (lines: ReturnType<typeof boxLines>) => [...new Set(
+    lines.map(line => `${line.strokeStyle.toUpperCase()} ${line.lineWidth}`),
+  )];
+
+  it('darkens a dataPoint-role line that equals its own fill by 0.8 per channel', () => {
+    const lines = boxLines({});
+    expect(lines.length).toBeGreaterThan(0);
+    expect(unique(lines)).toEqual(['#114D68 0.75']);
+  });
+
+  it('does not darken a role line whose colour differs from the role fill', () => {
+    expect(unique(boxLines({
+      dataPoint: { fillColors: ['156082'], lineColors: ['00B050'], linePaintAuthored: true },
+    }))).toEqual(['#00B050 0.75']);
+    expect(unique(boxLines({
+      dataPoint: { fillColors: ['FFC000'], lineColors: ['156082'], linePaintAuthored: true },
+    }))).toEqual(['#156082 0.75']);
+  });
+
+  it('keeps direct series width only and still darkens the role paint (B5)', () => {
+    // 57150 EMU = 4.5 pt = 6 px.
+    expect(unique(boxLines({
+      style: { lineWidthEmu: 57150 }, lineWidthEmu: 57150,
+    }))).toEqual(['#114D68 4.5']);
+  });
+
+  it('paints every box line 0.75 pt and ignores the dataPointLine width', () => {
+    expect(boxLines({}).every(line => line.lineWidth === 0.75)).toBe(true);
   });
 });

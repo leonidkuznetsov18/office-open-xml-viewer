@@ -654,3 +654,62 @@ export function chartExLegendSeries(
     },
   };
 }
+
+
+/** Channel multiplier PowerPoint applies to a box-and-whisker line whose
+ * paint comes from the linked dataPoint role and equals that role's own fill. */
+const CHARTEX_BOX_SELF_LINE_DARKEN = 0.8;
+
+
+/** Resolve the outline shared by every box-and-whisker line: the IQR box
+ * outline, whiskers and caps, median, mean line and mean marker.
+ *
+ * PowerPoint-observed (16.113, synthetic box-and-whisker controls):
+ * - paint and geometry come from the direct series `a:ln`, then the linked
+ *   `dataPoint` role's line; `dataPointLine` supplies no width (the default
+ *   is 0.75 pt, not its 2.25 pt), and structured direct paint falls through
+ *   (chartExSolidLineCarrier);
+ * - when the paint comes from the linked dataPoint role and that role's line
+ *   colour equals its own fill colour for the series index, every sRGB
+ *   channel is multiplied by 0.8 and rounded (156082 -> 114D68). Roles whose
+ *   line and fill colours differ are not darkened, and the comparison uses
+ *   the role colours, never a direct series fill. */
+export function resolveChartExBoxLine(
+  chart: ChartModel,
+  series: Partial<ChartExSeriesStyleCarrier> | null | undefined,
+  index: number,
+  count: number,
+  fallbackColor: string,
+): { line: ResolvedChartExLineStyle; darkened: boolean } {
+  const role = chart.chartexDataPointStyle;
+  const carrier = chartExSolidLineCarrier(series, index);
+  const line = resolveChartExPointLine(
+    chart, carrier, undefined, index, count, fallbackColor, role,
+    { linkedNoStyleFallback: true },
+  );
+  const directPaint = carrier != null && (
+    carrier.lineColor != null
+    || carrier.lineHidden === true
+    || chartStyleLineDecision(carrier.chartexStyle, index) !== undefined
+  );
+  const roleLine = chartStyleLineDecision(role, index);
+  const roleFill = chartStyleFillDecision(role, index);
+  if (
+    directPaint || !line.visible || line.paint != null
+    || roleLine?.fillType !== 'solid' || roleFill?.fillType !== 'solid'
+  ) {
+    return { line, darkened: false };
+  }
+  const normalize = (color: string): string => color.replace(/^#/, '').toUpperCase();
+  const lineHex = normalize(roleLine.color);
+  if (!/^[0-9A-F]{6}$/.test(lineHex) || lineHex !== normalize(roleFill.color)) {
+    return { line, darkened: false };
+  }
+  const channel = (offset: number): string => Math.round(
+    parseInt(lineHex.slice(offset, offset + 2), 16) * CHARTEX_BOX_SELF_LINE_DARKEN,
+  ).toString(16).padStart(2, '0');
+  return {
+    line: { ...line, color: `#${channel(0)}${channel(2)}${channel(4)}`.toUpperCase() },
+    darkened: true,
+  };
+}

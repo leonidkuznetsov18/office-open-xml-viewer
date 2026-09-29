@@ -64,12 +64,12 @@ import {
   chartExSolidLineCarrier,
   resolveChartExLineChain,
   resolveChartExPointFill,
+  resolveChartExBoxLine,
   resolveChartExPointLine,
 } from './shared/chartex-style.js';
 import { paintPlotAreaFrame } from './plot-area-frame.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
 import {
-  applyChartExSeriesLineStyle,
   applyResolvedChartExLineStyle,
   axisLabelPx,
   chartExDataPointFill,
@@ -1307,7 +1307,7 @@ function renderBoxWhiskerChart(
     const fill = series.color ?? chartExDataPointFill(
       chart, styleIndex, nSer, series.chartexStyle,
     );
-    return chartExLegendSeries(
+    const legend = chartExLegendSeries(
       chart,
       series.name,
       chartExSolidLineCarrier(series, styleIndex) ?? series,
@@ -1317,6 +1317,12 @@ function renderBoxWhiskerChart(
       fill,
       true,
     );
+    // The key's outline follows the plotted box outline, including the
+    // dataPoint-role self-colour darkening.
+    const boxLine = resolveChartExBoxLine(chart, series, styleIndex, nSer, fill);
+    return boxLine.darkened && legend.lineColor != null
+      ? { ...legend, lineColor: boxLine.line.color.replace(/^#/, '') }
+      : legend;
   });
   const legendChart: ChartModel = {
     ...chart,
@@ -1481,16 +1487,11 @@ function renderBoxWhiskerChart(
   for (let si = 0; si < nSer; si++) {
     const series = box.series[si];
     if (!series.meanLine) continue;
-    const lineStyle = chart.chartexDataPointLineStyle ?? chart.chartexDataPointStyle;
-    const lineSeries = chartExSolidLineCarrier(series, boxStyleIndices[si]) ?? series;
-    const fallback = lineSeries.lineColor ? `#${lineSeries.lineColor}` : paletteOf(si);
+    const meanLine = resolveChartExBoxLine(
+      chart, series, boxStyleIndices[si], nSer, paletteOf(si),
+    ).line;
     ctx.save();
-    const styleLineVisible = applyChartExSeriesLineStyle(
-      ctx, chart, lineStyle, lineSeries, boxStyleIndices[si], nSer, fallback, ptToPx,
-    );
-    if (styleLineVisible || lineSeries.lineColor != null) {
-      if (lineSeries.lineColor) ctx.strokeStyle = fallback;
-      if (lineSeries.lineWidthEmu) ctx.lineWidth = axisLineWidthPx(lineSeries.lineWidthEmu, ptToPx);
+    if (applyResolvedChartExLineStyle(ctx, meanLine, ptToPx)) {
       let open = false;
       ctx.beginPath();
       for (let ci = 0; ci < nCat; ci++) {
@@ -1537,13 +1538,12 @@ function renderBoxWhiskerChart(
       const fill = paletteOf(si);
       const fillPaint = paintOf(si);
       const pointStyle = chart.chartexDataPointStyle;
-      const lineStyle = chart.chartexDataPointLineStyle ?? pointStyle;
       const markerStyle = chart.chartexDataPointMarkerStyle ?? pointStyle;
       const styleIndex = boxStyleIndices[si];
       const lineSeries = chartExSolidLineCarrier(s, styleIndex) ?? s;
       const styleLine = chartExStyleColor(chart, pointStyle, 'line', styleIndex, nSer);
       const edge = lineSeries.lineColor ? `#${lineSeries.lineColor}` : styleLine ? `#${styleLine}` : fill;
-      const lineEdge = chartExStyleColor(chart, lineStyle, 'line', styleIndex, nSer);
+      const boxLine = resolveChartExBoxLine(chart, s, styleIndex, nSer, edge).line;
       const markerFill = chartExStyleColor(chart, markerStyle, 'fill', styleIndex, nSer);
       const markerFillPaint = chartExMarkerPaint(
         chart, styleIndex, nSer, s.chartexStyle, s.color, markerStyle,
@@ -1559,17 +1559,6 @@ function renderBoxWhiskerChart(
         { linkedNoStyleFallback: true },
       );
       const markerEffect = chartStyleEffectOwner(s.chartexStyle);
-      const applySeriesLine = (style: ChartExStyle | null | undefined, fallback: string): boolean => {
-        // Chart Style `NoStyle` means that this role supplies no decorative
-        // override, so box/whisker's semantic outline still exists. Resolve
-        // that fallback inside the shared line cascade: authored unresolved or
-        // noFill paint stays suppressed, while geometry-only direct formatting
-        // continues to decorate the semantic line.
-        return applyChartExSeriesLineStyle(
-          ctx, chart, style, lineSeries, styleIndex, nSer, fallback, ptToPx,
-          { linkedNoStyleFallback: true },
-        );
-      };
       const yQ1 = yOf(stats.q1);
       const yQ3 = yOf(stats.q3);
       const boxTop = Math.min(yQ1, yQ3);
@@ -1577,7 +1566,7 @@ function renderBoxWhiskerChart(
 
       // Whiskers: vertical line from box edges to whisker ends, with end caps.
       const capW = boxW * 0.4;
-      if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
+      if (applyResolvedChartExLineStyle(ctx, boxLine, ptToPx)) {
         ctx.beginPath();
         ctx.moveTo(cx, yOf(stats.whiskerHi)); ctx.lineTo(cx, yQ3);
         ctx.moveTo(cx, yQ1); ctx.lineTo(cx, yOf(stats.whiskerLo));
@@ -1599,10 +1588,7 @@ function renderBoxWhiskerChart(
           );
           if (applyResolvedChartExLineStyle(
             target,
-            resolveChartExPointLine(
-              chart, lineSeries, undefined, styleIndex, nSer, edge, pointStyle,
-              { linkedNoStyleFallback: true },
-            ),
+            boxLine,
             ptToPx,
             { x: bx, y: boxTop, w: boxW, h: boxH },
             shapeRotationDeg,
@@ -1620,7 +1606,7 @@ function renderBoxWhiskerChart(
 
       // Median line across the box.
       const yMed = yOf(stats.median);
-      if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
+      if (applyResolvedChartExLineStyle(ctx, boxLine, ptToPx)) {
         ctx.beginPath(); ctx.moveTo(bx, yMed); ctx.lineTo(bx + boxW, yMed); ctx.stroke();
       }
 
@@ -1670,11 +1656,11 @@ function renderBoxWhiskerChart(
       // diagonals spanning a 6×6pt square centred on the mean, stroked with the
       // same color, width, cap and join as the whiskers/median; none of these
       // controls takes the dataPointMarker outline, so it resolves through the
-      // whisker line.
+      // same box line as the whiskers/median (`boxLine`).
       if (s.meanMarker) {
         const mY = yOf(stats.mean);
         const mR = meanMarkerRadiusPx;
-        if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
+        if (applyResolvedChartExLineStyle(ctx, boxLine, ptToPx)) {
           ctx.beginPath();
           ctx.moveTo(cx - mR, mY - mR); ctx.lineTo(cx + mR, mY + mR);
           ctx.moveTo(cx + mR, mY - mR); ctx.lineTo(cx - mR, mY + mR);
