@@ -1310,7 +1310,7 @@ function renderBoxWhiskerChart(
     return chartExLegendSeries(
       chart,
       series.name,
-      series,
+      chartExSolidLineCarrier(series, styleIndex) ?? series,
       chart.chartexDataPointStyle,
       styleIndex,
       nSer,

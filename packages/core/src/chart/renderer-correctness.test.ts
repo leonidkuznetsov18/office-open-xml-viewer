@@ -10148,6 +10148,27 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(connectors.every(detail => detail.lineWidth === 4.5)).toBe(true);
   });
 
+  it('omits a structured series outline on the Waterfall legend keys like the bars', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'waterfall',
+      categories: ['A', 'B', 'C'],
+      subtotalIndices: [2],
+      showLegend: true,
+      legendPos: 'r',
+      catAxisHidden: true,
+      valAxisHidden: true,
+      chartexDataPointStyle: {
+        fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
+        lineHidden: true, lineNoStyle: true,
+      },
+      series: [series({ values: [10, 5, 15], chartexStyle: gradientLine })],
+    }), RECT, 1);
+
+    expect(rec.gradients).toHaveLength(0);
+    expect(rec.strokeRects).toHaveLength(0);
+  });
+
   it('gives a ChartEx legend key without an authored outline width the 0.75pt default', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({

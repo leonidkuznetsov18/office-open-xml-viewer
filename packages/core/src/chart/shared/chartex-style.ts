@@ -620,25 +620,29 @@ export function chartExLegendSeries(
     fillColor,
     { linkedNoStyleFallback: semanticNoStyleFallback },
   );
+  // PowerPoint omits a gradient/pattern series outline on ChartEx bodies, and
+  // the legend key follows the body: no outline rather than structured paint.
+  // Callers whose body demotes structured lines to solid pass a solid carrier.
+  const outlined = inheritPlotOutline && !chartExLineIsStructured(line);
   return {
     name,
     values: [],
     color: fillColor.replace(/^#/, ''),
-    lineHidden: !inheritPlotOutline || !line.visible,
-    lineColor: inheritPlotOutline && line.visible ? line.color.replace(/^#/, '') : null,
+    lineHidden: !outlined || !line.visible,
+    lineColor: outlined && line.visible ? line.color.replace(/^#/, '') : null,
     // A visible authored outline without `w` is 0.75 pt on the body; give
     // the legend key the same default rather than the legend's 1 px rule.
-    lineWidthEmu: inheritPlotOutline
+    lineWidthEmu: outlined
       ? line.widthEmu ?? (line.visible && !line.semanticFallback
         ? CHARTEX_DEFAULT_LINE_WIDTH_EMU : null)
       : null,
     chartexStyle: {
-      linePaints: inheritPlotOutline && line.paint !== undefined ? [line.paint] : null,
-      linePaintAuthored: inheritPlotOutline && line.paint !== undefined ? true : null,
-      lineDash: inheritPlotOutline ? line.dash : null,
-      lineCustomDash: inheritPlotOutline ? line.customDash : null,
-      lineCap: inheritPlotOutline ? line.cap : null,
-      lineJoin: inheritPlotOutline ? line.join : null,
+      linePaints: outlined && line.paint !== undefined ? [line.paint] : null,
+      linePaintAuthored: outlined && line.paint !== undefined ? true : null,
+      lineDash: outlined ? line.dash : null,
+      lineCustomDash: outlined ? line.customDash : null,
+      lineCap: outlined ? line.cap : null,
+      lineJoin: outlined ? line.join : null,
     },
   };
 }
