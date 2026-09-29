@@ -2341,7 +2341,8 @@ pub struct ChartexBoxSeries {
     /// (interior) points as dots in addition to the box.
     pub show_nonoutliers: bool,
     /// `<cx:layoutPr><cx:statistics quartileMethod>` — `"exclusive"` (Excel
-    /// default, median excluded when splitting halves) or `"inclusive"`.
+    /// default; QUARTILE.EXC-style interpolation) or `"inclusive"`
+    /// (QUARTILE.INC-style). See `computeBoxWhiskerStats` in packages/core.
     pub quartile_method: String,
 }
 
