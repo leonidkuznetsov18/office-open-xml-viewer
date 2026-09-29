@@ -1404,11 +1404,177 @@ function renderBoxWhiskerChart(
     return { bx: geometry.boxX, boxW: geometry.boxWidth, cx: geometry.centerX };
   };
 
+  // Paint order observed in PowerPoint 16.113 vector PDF exports (tagged
+  // electronic-distribution engine, three series with outliers, inner points,
+  // mean markers and mean lines): series by series, each category's whiskers,
+  // IQR box, median, observation dots and mean `×`, then that series' mean
+  // line. A mean line is therefore above its own boxes but beneath later
+  // series' boxes. An Excel print-engine PDF of a two-series box chart
+  // (outliers, inner points, mean markers) shows the same series-major,
+  // dots-before-`×` order.
+  const paintBox = (si: number, ci: number): void => {
+    const s = box.series[si];
+    const stats = statsBySeries[si][ci];
+    if (!stats) return;
+    const { bx, boxW, cx } = boxGeometry(ci, si);
+    const fill = paletteOf(si);
+    const fillPaint = paintOf(si);
+    const pointStyle = chart.chartexDataPointStyle;
+    const lineStyle = chart.chartexDataPointLineStyle ?? pointStyle;
+    const markerStyle = chart.chartexDataPointMarkerStyle ?? pointStyle;
+    const styleIndex = boxStyleIndices[si];
+    const styleLine = chartExStyleColor(chart, pointStyle, 'line', styleIndex, nSer);
+    const edge = s.lineColor ? `#${s.lineColor}` : styleLine ? `#${styleLine}` : fill;
+    const lineEdge = chartExStyleColor(chart, lineStyle, 'line', styleIndex, nSer);
+    const markerFill = chartExStyleColor(chart, markerStyle, 'fill', styleIndex, nSer);
+    const markerFillPaint = chartExMarkerPaint(
+      chart, styleIndex, nSer, s.chartexStyle, s.color, markerStyle,
+    );
+    const markerEdge = chartExStyleColor(chart, markerStyle, 'line', styleIndex, nSer);
+    const markerOutline = resolveChartExSeriesLineStyle(
+      chart,
+      markerStyle,
+      s,
+      styleIndex,
+      nSer,
+      markerEdge ?? edge,
+      { linkedNoStyleFallback: true },
+    );
+    const markerEffect = chartStyleEffectOwner(s.chartexStyle);
+    const applySeriesLine = (style: ChartExStyle | null | undefined, fallback: string): boolean => {
+      // Chart Style `NoStyle` means that this role supplies no decorative
+      // override, so box/whisker's semantic outline still exists. Resolve
+      // that fallback inside the shared line cascade: authored unresolved or
+      // noFill paint stays suppressed, while geometry-only direct formatting
+      // continues to decorate the semantic line.
+      return applyChartExSeriesLineStyle(
+        ctx, chart, style, s, styleIndex, nSer, fallback, ptToPx,
+        { linkedNoStyleFallback: true },
+      );
+    };
+    const yQ1 = yOf(stats.q1);
+    const yQ3 = yOf(stats.q3);
+    const boxTop = Math.min(yQ1, yQ3);
+    const boxH = Math.max(1, Math.abs(yQ1 - yQ3));
+
+    // Whiskers: vertical line from box edges to whisker ends, with end caps.
+    const capW = boxW * 0.4;
+    if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
+      ctx.beginPath();
+      ctx.moveTo(cx, yOf(stats.whiskerHi)); ctx.lineTo(cx, yQ3);
+      ctx.moveTo(cx, yQ1); ctx.lineTo(cx, yOf(stats.whiskerLo));
+      ctx.moveTo(cx - capW / 2, yOf(stats.whiskerHi)); ctx.lineTo(cx + capW / 2, yOf(stats.whiskerHi));
+      ctx.moveTo(cx - capW / 2, yOf(stats.whiskerLo)); ctx.lineTo(cx + capW / 2, yOf(stats.whiskerLo));
+      ctx.stroke();
+    }
+
+    // IQR box: linked/direct DrawingML paint and effects share one body
+    // callback, so picture fills and composed effects preserve the same
+    // silhouette and precedence as classic data marks.
+    paintChartStyleEffects(
+      ctx, s.chartexStyle, pointStyle, styleIndex,
+      { x: bx, y: boxTop, w: boxW, h: boxH }, ptToPx,
+      target => {
+        if (fillPaint) paintClassicDataPointRect(
+          target, fillPaint, { x: bx, y: boxTop, w: boxW, h: boxH }, fill,
+          ptToPx, shapeRotationDeg,
+        );
+        if (applyResolvedChartExLineStyle(
+          target,
+          resolveChartExPointLine(
+            chart, s, undefined, styleIndex, nSer, edge, pointStyle,
+            { linkedNoStyleFallback: true },
+          ),
+          ptToPx,
+          { x: bx, y: boxTop, w: boxW, h: boxH },
+          shapeRotationDeg,
+        )) {
+          const edgeWidth = target.lineWidth;
+          target.strokeRect(
+            bx + edgeWidth / 2,
+            boxTop + edgeWidth / 2,
+            boxW - edgeWidth,
+            boxH - edgeWidth,
+          );
+        }
+      },
+    );
+
+    // Median line across the box.
+    const yMed = yOf(stats.median);
+    if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
+      ctx.beginPath(); ctx.moveTo(bx, yMed); ctx.lineTo(bx + boxW, yMed); ctx.stroke();
+    }
+
+    // Observation dots. cx:visibility@nonoutliers shows the raw values
+    // inside the whisker fence and @outliers those beyond it. Their outline
+    // follows the owning box series, not the generic linked marker role
+    // (which may carry a contrasting line intended for ordinary chart
+    // markers). PowerPoint paints a category's shown dots in ascending value
+    // order, its high outlier included, before the mean `×`; the control has
+    // no low outlier, and dots of one series share paint, so their relative
+    // order among themselves is not visible.
+    const pointSymbol = chart.chartStyleMarkerSymbol ?? chart.chartexMarkerSymbol ?? 'circle';
+    const shownPoints = pointSymbol === 'none' ? [] : [
+      ...(s.showNonoutliers ? stats.inner : []),
+      ...(s.showOutliers ? stats.outliers : []),
+    ].sort((left, right) => left - right);
+    for (const point of shownPoints) {
+      const pointY = yOf(point);
+      drawMarker(
+        ctx,
+        cx,
+        pointY,
+        pointSymbol,
+        observationMarkerSizePt,
+        markerFillPaint ? (markerFill ? `#${markerFill}` : fill) : 'transparent',
+        markerOutline.visible ? markerOutline.color : null,
+        ptToPx,
+        markerOutline.widthEmu != null
+          ? axisLineWidthPx(markerOutline.widthEmu, ptToPx) : 1,
+        markerFillPaint,
+        shapeRotationDeg,
+        markerOutline.visible ? markerOutline.paint : null,
+        markerOutline.dash,
+        markerOutline.customDash,
+        markerOutline.cap,
+        markerOutline.join,
+        false,
+        markerEffect,
+        markerStyle,
+        styleIndex,
+        styleIndex,
+      );
+    }
+
+    // Mean `×` marker. [MS-ODRAWXML] CT_SeriesElementVisibilities@meanMarker
+    // only toggles visibility; glyph and paint are observed PowerPoint 16.113
+    // behavior. In vector PDF exports (both export engines) across 27 box
+    // controls — series line widths 0.5–6pt, solid/theme/direct paints,
+    // round and flat caps, linked Chart Styles whose dataPointMarker role
+    // carries a contrasting 0.75pt lt1 outline — the mean is always two
+    // diagonals spanning a 6×6pt square centred on the mean, stroked with the
+    // same color, width, cap and join as the whiskers/median; none of these
+    // controls takes the dataPointMarker outline, so it resolves through the
+    // whisker line.
+    if (s.meanMarker) {
+      const mY = yOf(stats.mean);
+      const mR = meanMarkerRadiusPx;
+      if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
+        ctx.beginPath();
+        ctx.moveTo(cx - mR, mY - mR); ctx.lineTo(cx + mR, mY + mR);
+        ctx.moveTo(cx + mR, mY - mR); ctx.lineTo(cx - mR, mY + mR);
+        ctx.stroke();
+      }
+    }
+
+  };
+
   // `<cx:visibility meanLine>` connects the category means for one series.
   // It is a data-point-line role, so it shares the whisker/median style.
-  for (let si = 0; si < nSer; si++) {
+  const paintMeanLine = (si: number): void => {
     const series = box.series[si];
-    if (!series.meanLine) continue;
+    if (!series.meanLine) return;
     const lineStyle = chart.chartexDataPointLineStyle ?? chart.chartexDataPointStyle;
     const fallback = series.lineColor ? `#${series.lineColor}` : paletteOf(si);
     ctx.save();
@@ -1435,7 +1601,14 @@ function renderBoxWhiskerChart(
       ctx.stroke();
     }
     ctx.restore();
+  };
+
+  for (let si = 0; si < nSer; si++) {
+    for (let ci = 0; ci < nCat; ci++) paintBox(si, ci);
+    paintMeanLine(si);
   }
+  // The same control paints the category labels (and the value-axis line)
+  // after every series; category ticks follow their axis labels here.
   const catFontPx = axisLabelPx(chart.catAxisFontSizeHpt, h, ptToPx);
   const catTickLabelGap = categoryTickLabelGapPx(catFontPx);
   for (let ci = 0; ci < nCat; ci++) {
@@ -1456,192 +1629,6 @@ function renderBoxWhiskerChart(
         chart.catAxisLineDash,
       );
     }
-    for (let si = 0; si < nSer; si++) {
-      const s = box.series[si];
-      const stats = statsBySeries[si][ci];
-      if (!stats) continue;
-      const { bx, boxW, cx } = boxGeometry(ci, si);
-      const fill = paletteOf(si);
-      const fillPaint = paintOf(si);
-      const pointStyle = chart.chartexDataPointStyle;
-      const lineStyle = chart.chartexDataPointLineStyle ?? pointStyle;
-      const markerStyle = chart.chartexDataPointMarkerStyle ?? pointStyle;
-      const styleIndex = boxStyleIndices[si];
-      const styleLine = chartExStyleColor(chart, pointStyle, 'line', styleIndex, nSer);
-      const edge = s.lineColor ? `#${s.lineColor}` : styleLine ? `#${styleLine}` : fill;
-      const lineEdge = chartExStyleColor(chart, lineStyle, 'line', styleIndex, nSer);
-      const markerFill = chartExStyleColor(chart, markerStyle, 'fill', styleIndex, nSer);
-      const markerFillPaint = chartExMarkerPaint(
-        chart, styleIndex, nSer, s.chartexStyle, s.color, markerStyle,
-      );
-      const markerEdge = chartExStyleColor(chart, markerStyle, 'line', styleIndex, nSer);
-      const markerOutline = resolveChartExSeriesLineStyle(
-        chart,
-        markerStyle,
-        s,
-        styleIndex,
-        nSer,
-        markerEdge ?? edge,
-        { linkedNoStyleFallback: true },
-      );
-      const markerEffect = chartStyleEffectOwner(s.chartexStyle);
-      const applySeriesLine = (style: ChartExStyle | null | undefined, fallback: string): boolean => {
-        // Chart Style `NoStyle` means that this role supplies no decorative
-        // override, so box/whisker's semantic outline still exists. Resolve
-        // that fallback inside the shared line cascade: authored unresolved or
-        // noFill paint stays suppressed, while geometry-only direct formatting
-        // continues to decorate the semantic line.
-        return applyChartExSeriesLineStyle(
-          ctx, chart, style, s, styleIndex, nSer, fallback, ptToPx,
-          { linkedNoStyleFallback: true },
-        );
-      };
-      const yQ1 = yOf(stats.q1);
-      const yQ3 = yOf(stats.q3);
-      const boxTop = Math.min(yQ1, yQ3);
-      const boxH = Math.max(1, Math.abs(yQ1 - yQ3));
-
-      // Whiskers: vertical line from box edges to whisker ends, with end caps.
-      const capW = boxW * 0.4;
-      if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
-        ctx.beginPath();
-        ctx.moveTo(cx, yOf(stats.whiskerHi)); ctx.lineTo(cx, yQ3);
-        ctx.moveTo(cx, yQ1); ctx.lineTo(cx, yOf(stats.whiskerLo));
-        ctx.moveTo(cx - capW / 2, yOf(stats.whiskerHi)); ctx.lineTo(cx + capW / 2, yOf(stats.whiskerHi));
-        ctx.moveTo(cx - capW / 2, yOf(stats.whiskerLo)); ctx.lineTo(cx + capW / 2, yOf(stats.whiskerLo));
-        ctx.stroke();
-      }
-
-      // IQR box: linked/direct DrawingML paint and effects share one body
-      // callback, so picture fills and composed effects preserve the same
-      // silhouette and precedence as classic data marks.
-      paintChartStyleEffects(
-        ctx, s.chartexStyle, pointStyle, styleIndex,
-        { x: bx, y: boxTop, w: boxW, h: boxH }, ptToPx,
-        target => {
-          if (fillPaint) paintClassicDataPointRect(
-            target, fillPaint, { x: bx, y: boxTop, w: boxW, h: boxH }, fill,
-            ptToPx, shapeRotationDeg,
-          );
-          if (applyResolvedChartExLineStyle(
-            target,
-            resolveChartExPointLine(
-              chart, s, undefined, styleIndex, nSer, edge, pointStyle,
-              { linkedNoStyleFallback: true },
-            ),
-            ptToPx,
-            { x: bx, y: boxTop, w: boxW, h: boxH },
-            shapeRotationDeg,
-          )) {
-            const edgeWidth = target.lineWidth;
-            target.strokeRect(
-              bx + edgeWidth / 2,
-              boxTop + edgeWidth / 2,
-              boxW - edgeWidth,
-              boxH - edgeWidth,
-            );
-          }
-        },
-      );
-
-      // Median line across the box.
-      const yMed = yOf(stats.median);
-      if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
-        ctx.beginPath(); ctx.moveTo(bx, yMed); ctx.lineTo(bx + boxW, yMed); ctx.stroke();
-      }
-
-      // Interior sample points. Excel overlays the raw non-outlier values on
-      // the box/whiskers when cx:visibility@nonoutliers is enabled. Their
-      // outline follows the owning box series, not the generic linked marker
-      // role (which may carry a contrasting line intended for ordinary chart
-      // markers).
-      if (s.showNonoutliers) {
-        const pointSymbol = chart.chartStyleMarkerSymbol ?? chart.chartexMarkerSymbol ?? 'circle';
-        for (const point of stats.inner) {
-          if (pointSymbol === 'none') continue;
-          const pointY = yOf(point);
-          drawMarker(
-            ctx,
-            cx,
-            pointY,
-            pointSymbol,
-            observationMarkerSizePt,
-            markerFillPaint ? (markerFill ? `#${markerFill}` : fill) : 'transparent',
-            markerOutline.visible ? markerOutline.color : null,
-            ptToPx,
-            markerOutline.widthEmu != null
-              ? axisLineWidthPx(markerOutline.widthEmu, ptToPx) : 1,
-            markerFillPaint,
-            shapeRotationDeg,
-            markerOutline.visible ? markerOutline.paint : null,
-            markerOutline.dash,
-            markerOutline.customDash,
-            markerOutline.cap,
-            markerOutline.join,
-            false,
-            markerEffect,
-            markerStyle,
-            styleIndex,
-            styleIndex,
-          );
-        }
-      }
-
-      // Mean `×` marker. [MS-ODRAWXML] CT_SeriesElementVisibilities@meanMarker
-      // only toggles visibility; glyph and paint are observed PowerPoint 16.113
-      // behavior. In vector PDF exports (both export engines) across 27 box
-      // controls — series line widths 0.5–6pt, solid/theme/direct paints,
-      // round and flat caps, linked Chart Styles whose dataPointMarker role
-      // carries a contrasting 0.75pt lt1 outline — the mean is always two
-      // diagonals spanning a 6×6pt square centred on the mean, stroked with the
-      // same color, width, cap and join as the whiskers/median; none of these
-      // controls takes the dataPointMarker outline, so it resolves through the
-      // whisker line.
-      if (s.meanMarker) {
-        const mY = yOf(stats.mean);
-        const mR = meanMarkerRadiusPx;
-        if (applySeriesLine(lineStyle, lineEdge ?? edge)) {
-          ctx.beginPath();
-          ctx.moveTo(cx - mR, mY - mR); ctx.lineTo(cx + mR, mY + mR);
-          ctx.moveTo(cx + mR, mY - mR); ctx.lineTo(cx - mR, mY + mR);
-          ctx.stroke();
-        }
-      }
-
-      // Outlier dots.
-      if (s.showOutliers) {
-        const pointSymbol = chart.chartStyleMarkerSymbol ?? chart.chartexMarkerSymbol ?? 'circle';
-        for (const o of stats.outliers) {
-          if (pointSymbol === 'none') continue;
-          const outlierY = yOf(o);
-          drawMarker(
-            ctx,
-            cx,
-            outlierY,
-            pointSymbol,
-            observationMarkerSizePt,
-            markerFillPaint ? (markerFill ? `#${markerFill}` : fill) : 'transparent',
-            markerOutline.visible ? markerOutline.color : null,
-            ptToPx,
-            markerOutline.widthEmu != null
-              ? axisLineWidthPx(markerOutline.widthEmu, ptToPx) : 1,
-            markerFillPaint,
-            shapeRotationDeg,
-            markerOutline.visible ? markerOutline.paint : null,
-            markerOutline.dash,
-            markerOutline.customDash,
-            markerOutline.cap,
-            markerOutline.join,
-            false,
-            markerEffect,
-            markerStyle,
-            styleIndex,
-            styleIndex,
-          );
-        }
-      }
-    }
-
     // Category label (centered under the slot), word-wrapped like the other
     // cartesian renderers.
     if (!chart.catAxisHidden) {
