@@ -79,6 +79,17 @@ describe('PowerPoint text-box line metrics (#1610)', () => {
     expect(units(baselines(lines('Courier New', 200, 2)))).toEqual([245, 578]);
   });
 
+  it('resolves a face name that is one cut of its family to that cut (#1630)', () => {
+    // "Calibri Light" names the weight-300 Calibri cut. Controls: a 44 pt
+    // Calibri Light title's first baseline sat 41.16 pt below the text top at
+    // single spacing, 0.7795 of the 52.8 pt line box (usWin 1950 / 2500).
+    expect(powerPointAscentShare('Calibri Light', false, false)).toBeCloseTo(1950 / 2500, 12);
+    expect(powerPointAscentShare('Calibri Light', false, true)).toBeCloseTo(1950 / 2500, 12);
+    expect(powerPointAscentShare('Calibri Light', true, false)).toBeCloseTo(1950 / 2500, 12);
+    // A name shared by several cuts still needs the requested weight.
+    expect(powerPointAscentShare('Calibri', false, false)).toBeCloseTo(1950 / 2500, 12);
+  });
+
   it('follows PowerPoint substitutions for faces only macOS itself provides', () => {
     expect(units(baselines(lines('Palatino', 200, 2)))).toEqual([259, 593]);
     expect(units(baselines(lines('Helvetica', 200, 2)))).toEqual([270, 603]);
