@@ -123,8 +123,19 @@ mod tests;
 /// A color resolver is required to parse; omission returns `None`.
 /// Formula lookup uses a cell because the host may memoize range resolution
 /// while the parse entry point accepts a shared context reference.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartHost {
+    #[default]
+    Unspecified,
+    PowerPoint,
+    Excel,
+    // Word follows PowerPoint until Office-produced Word controls are measured.
+    Word,
+}
+
 #[derive(Default)]
 pub struct ChartParseContext<'a> {
+    pub host: ChartHost,
     pub color_resolver: Option<&'a dyn ColorResolver>,
     pub style_xml: Option<&'a str>,
     pub color_style_xml: Option<&'a str>,
@@ -143,6 +154,7 @@ impl<'a> ChartParseContext<'a> {
         references: Option<&'a mut dyn ChartReferenceResolver>,
     ) -> Self {
         Self {
+            host: ChartHost::Unspecified,
             color_resolver: Some(color_resolver),
             style_xml,
             color_style_xml,
@@ -159,22 +171,26 @@ pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<C
 
 /// Parse a Microsoft chartEx part into the shared wire model.
 pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
-    parse_part(root, context, parse_chartex_impl)
+    parse_part(
+        root,
+        context,
+        |root, resolver, style, colors, refs, images| {
+            parse_chartex_impl(root, resolver, style, colors, refs, images, context.host)
+        },
+    )
 }
-
-type ChartPartParser = fn(
-    Node<'_, '_>,
-    &dyn ColorResolver,
-    Option<&str>,
-    Option<&str>,
-    &mut dyn ChartReferenceResolver,
-    &dyn ChartImageResolver,
-) -> Option<ChartModel>;
 
 fn parse_part(
     root: Node,
     context: &ChartParseContext<'_>,
-    parser: ChartPartParser,
+    parser: impl FnOnce(
+        Node<'_, '_>,
+        &dyn ColorResolver,
+        Option<&str>,
+        Option<&str>,
+        &mut dyn ChartReferenceResolver,
+        &dyn ChartImageResolver,
+    ) -> Option<ChartModel>,
 ) -> Option<ChartModel> {
     let color_resolver = context.color_resolver?;
     let images = context.images.unwrap_or(&EmptyChartImageResolver);

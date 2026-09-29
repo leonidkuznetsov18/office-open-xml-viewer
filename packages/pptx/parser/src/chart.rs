@@ -86,6 +86,7 @@ fn parse_chart_with_images(
         theme_format_scheme,
     };
     let context = ooxml_common::chart::ChartParseContext {
+        host: ooxml_common::chart::ChartHost::PowerPoint,
         color_resolver: Some(&resolver),
         style_xml,
         color_style_xml,

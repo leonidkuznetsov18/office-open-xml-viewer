@@ -753,7 +753,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                             session: context.session,
                             visibility_cache: HashMap::new(),
                         });
-                let chart_context = ooxml_common::chart::ChartParseContext::new(
+                let mut chart_context = ooxml_common::chart::ChartParseContext::new(
                     &resolver,
                     related_parts.style_xml.as_deref(),
                     related_parts.color_style_xml.as_deref(),
@@ -762,6 +762,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                         resolver as &mut dyn ooxml_common::chart::ChartReferenceResolver
                     }),
                 );
+                chart_context.host = ooxml_common::chart::ChartHost::Excel;
                 let chart_opt = if is_chartex {
                     ooxml_common::chart::parse_chartex_part(
                         chart_doc.root_element(),

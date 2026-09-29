@@ -12797,13 +12797,16 @@ fn parse_docx_chart_with_style_parts_and_images(
         // associated chartStyle part when the `<cx:title>` itself carries none.
         ooxml_common::chart::parse_chartex_part(
             root,
-            &ooxml_common::chart::ChartParseContext::new(
-                &resolver,
-                style_xml,
-                color_style_xml,
-                Some(image_resolver),
-                None,
-            ),
+            &ooxml_common::chart::ChartParseContext {
+                host: ooxml_common::chart::ChartHost::Word,
+                ..ooxml_common::chart::ChartParseContext::new(
+                    &resolver,
+                    style_xml,
+                    color_style_xml,
+                    Some(image_resolver),
+                    None,
+                )
+            },
         )
     } else {
         let mut chart = ooxml_common::chart::parse_chart_part(

@@ -585,7 +585,15 @@ pub(super) fn parse_chartex_impl(
     color_style_xml: Option<&str>,
     references: &mut dyn ChartReferenceResolver,
     image_resolver: &dyn ChartImageResolver,
+    host: ChartHost,
 ) -> Option<ChartModel> {
+    // Word currently follows PowerPoint's compatibility policy. This is the
+    // single host-level switch for that choice.
+    let host = if host == ChartHost::Word {
+        ChartHost::PowerPoint
+    } else {
+        host
+    };
     let root = chartspace_root;
     let chart_node = root
         .descendants()
@@ -609,25 +617,18 @@ pub(super) fn parse_chartex_impl(
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "series")
         .collect();
+    // Office 16.113: Excel still paints a hidden clustered-column owner;
+    // PowerPoint suppresses its geometry. Hidden auxiliary lines stay hidden.
     let series_nodes: Vec<Node> = all_series_nodes
         .iter()
         .copied()
         .filter(|node| {
-            !attr(node, "hidden")
-                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            (host == ChartHost::Excel
+                && attr(node, "layoutId").as_deref() == Some("clusteredColumn"))
+                || !attr(node, "hidden")
+                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         })
         .collect();
-    let series_format_index = |series: Node| -> u32 {
-        attr(&series, "formatIdx")
-            .and_then(|value| value.parse::<u32>().ok())
-            .or_else(|| {
-                all_series_nodes
-                    .iter()
-                    .position(|candidate| *candidate == series)
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .unwrap_or(0)
-    };
     // MS-ODRAWXML §2.24.4.19 defines this closed set.  Preserve a future
     // identifier verbatim, but let it own the chart-wide fail-closed result:
     // otherwise a preceding known series or a trailing `paretoLine` could
@@ -646,34 +647,144 @@ pub(super) fn parse_chartex_impl(
         !attr(node, "layoutId")
             .is_some_and(|layout| KNOWN_SERIES_LAYOUTS.contains(&layout.as_str()))
     });
-    // A Pareto plot is represented by an ordinary owner series plus an
-    // auxiliary `paretoLine` whose `ownerIdx` names the owner's original
-    // document-order series index (CT_Series@ownerIdx, [MS-ODRAWXML]
-    // 2.24.3.77). This is independent of `formatIdx`; select the linked owner
-    // even when a hidden or auxiliary series appears first.
-    let pareto_pair = if unknown_series.is_none() {
-        series_nodes.iter().copied().find_map(|pareto| {
-            if attr(&pareto, "layoutId").as_deref() != Some("paretoLine") {
-                return None;
-            }
-            let owner_idx = attr(&pareto, "ownerIdx")?.parse::<usize>().ok()?;
-            let owner = *all_series_nodes.get(owner_idx)?;
-            let owner_is_hidden = attr(&owner, "hidden")
-                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-            (owner != pareto
-                && !owner_is_hidden
-                && attr(&owner, "layoutId").as_deref() != Some("paretoLine"))
+    // [MS-ODRAWXML] CT_Series@ownerIdx names a document-order series, not
+    // formatIdx. The owner can follow its auxiliary line. A line without a
+    // valid owner never borrows the first column's data.
+    let pareto_pair = series_nodes.iter().copied().find_map(|pareto| {
+        if attr(&pareto, "layoutId").as_deref() != Some("paretoLine") {
+            return None;
+        }
+        let index = attr(&pareto, "ownerIdx")?.parse::<usize>().ok()?;
+        let owner = *all_series_nodes.get(index)?;
+        (owner != pareto && attr(&owner, "layoutId").as_deref() != Some("paretoLine"))
             .then_some((owner, pareto))
-        })
-    } else {
-        None
+    });
+    let first_column = series_nodes
+        .iter()
+        .copied()
+        .find(|node| attr(node, "layoutId").as_deref() == Some("clusteredColumn"));
+    // Excel 16.113 retains only the first clustered column series. A line
+    // owned by a discarded later series is therefore discarded with it.
+    let pareto_pair =
+        pareto_pair.filter(|(owner, _)| host != ChartHost::Excel || first_column == Some(*owner));
+    // Office 16.113 assigns implicit format slots by owner group: an
+    // owner-backed line immediately follows its owner for style allocation.
+    // The two-owner controls establish that the line takes slot 1 and the
+    // later column slot 2 when ownerIdx=0; ownerIdx=1 keeps source order.
+    let mut format_order = all_series_nodes.clone();
+    if let Some((owner, pareto)) = pareto_pair {
+        if let (Some(owner_position), Some(line_position)) = (
+            format_order.iter().position(|node| *node == owner),
+            format_order.iter().position(|node| *node == pareto),
+        ) {
+            if format_order.len() == 3
+                && owner_position == 0
+                && line_position == 2
+                && attr(&format_order[1], "layoutId").as_deref() == Some("clusteredColumn")
+            {
+                format_order.swap(1, 2);
+            }
+        }
+    }
+    let series_format_index = |series: Node| -> u32 {
+        attr(&series, "formatIdx")
+            .and_then(|value| value.parse::<u32>().ok())
+            .or_else(|| {
+                format_order
+                    .iter()
+                    .position(|candidate| *candidate == series)
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .unwrap_or(0)
     };
     let (series_node, pareto_series_node) = if let Some(unknown) = unknown_series {
         (unknown, None)
+    } else if let Some((_, pareto)) = pareto_pair {
+        (
+            first_column.or_else(|| pareto_pair.map(|pair| pair.0))?,
+            Some(pareto),
+        )
     } else {
-        pareto_pair
-            .map(|(owner, pareto)| (owner, Some(pareto)))
-            .unwrap_or((*series_nodes.first()?, None))
+        (first_column.unwrap_or(*series_nodes.first()?), None)
+    };
+    let line_first_without_owner = series_nodes
+        .first()
+        .is_some_and(|node| attr(node, "layoutId").as_deref() == Some("paretoLine"))
+        && first_column.is_some()
+        && pareto_pair.is_none();
+    // [MS-ODRAWXML] CT_Series/axisId identifies the value axis and CT_Axis
+    // supplies its percentage units. Office 16.113 uses the first series'
+    // axis on the left: a line-first plot therefore moves its column axis to
+    // the right, even when that line has no valid owner.
+    let percentage_axis = root.descendants().find(|axis| {
+        axis.is_element()
+            && axis.tag_name().name() == "axis"
+            && child(*axis, "valScaling").is_some()
+            && child(*axis, "units")
+                .and_then(|units| attr(&units, "unit"))
+                .as_deref()
+                == Some("percentage")
+    });
+    let references_percentage_axis = |series: Node| {
+        let Some(axis_id) = percentage_axis.and_then(|axis| attr(&axis, "id")) else {
+            return false;
+        };
+        series
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "axisId")
+            .any(|node| attr(&node, "val").as_deref() == Some(axis_id.as_str()))
+    };
+    let primary_axis_right = first_column.is_some()
+        && series_nodes.first().is_some_and(|node| {
+            attr(node, "layoutId").as_deref() == Some("paretoLine")
+                && references_percentage_axis(*node)
+        });
+    // A data-bearing, unowned paretoLine keeps axis 2's ticks in PowerPoint,
+    // but Excel suppresses that axis with the line. The axis itself must opt
+    // into tick labels; its mere declaration is insufficient.
+    let show_unpaired_percentage_axis = host == ChartHost::PowerPoint
+        && first_column.is_some()
+        && pareto_pair.is_none()
+        && percentage_axis.is_some_and(|axis| {
+            child(axis, "tickLabels").is_some()
+                && !attr(&axis, "hidden")
+                    .is_some_and(|hidden| hidden == "1" || hidden.eq_ignore_ascii_case("true"))
+        })
+        && series_nodes.iter().copied().any(|node| {
+            attr(&node, "layoutId").as_deref() == Some("paretoLine")
+                && child(node, "dataId").is_some()
+                && references_percentage_axis(node)
+        });
+    let hidden_pareto_owner = pareto_pair.is_some_and(|(owner, _)| {
+        attr(&owner, "hidden")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    });
+    // A standalone line without dataId has no data owner. Office 16.113
+    // paints only the chart frame/title even when chartData exists elsewhere.
+    let standalone_line_without_data = first_column.is_none()
+        && attr(&series_node, "layoutId").as_deref() == Some("paretoLine")
+        && child(series_node, "dataId").is_none();
+    // In the line-first/no-owner control Excel paints no plot geometry,
+    // whereas PowerPoint retains the sorted outline columns.
+    let suppress_geometry = (host == ChartHost::Excel && line_first_without_owner)
+        || (host != ChartHost::Excel && hidden_pareto_owner)
+        || standalone_line_without_data;
+    let owner_column_index = pareto_pair.and_then(|(owner, _)| {
+        series_nodes
+            .iter()
+            .copied()
+            .filter(|node| attr(node, "layoutId").as_deref() == Some("clusteredColumn"))
+            .position(|node| node == owner)
+    });
+    let owner_aggregates = pareto_pair.is_some_and(|(owner, _)| has_chartex_aggregation(owner));
+    let pareto_sort_descending = if pareto_pair.is_some() {
+        // Office 16.113 two-owner controls: ownerIdx=1 keeps both bar series
+        // in input order, while ownerIdx=0 sorts each aggregated series.
+        owner_aggregates && owner_column_index == Some(0)
+    } else if first_column.is_none() {
+        host != ChartHost::Excel
+    } else {
+        host != ChartHost::Excel && line_first_without_owner && has_chartex_aggregation(series_node)
     };
     let layout_id = attr(&series_node, "layoutId").unwrap_or_default();
     // [MS-ODRAWXML] represents a histogram as a clusteredColumn series with a
@@ -689,7 +800,7 @@ pub(super) fn parse_chartex_impl(
     } else if chartex_histogram_binning.is_some() {
         "histogram".to_string()
     } else {
-        layout_id
+        layout_id.clone()
     };
     let data_by_id: std::collections::HashMap<String, Node> = root
         .descendants()
@@ -710,13 +821,20 @@ pub(super) fn parse_chartex_impl(
     // visible series that this parser will retain before resolving any of its
     // gradient/pattern recipes, so several individually valid series cannot
     // multiply the chart-wide allocation ceiling.
-    let retained_extra_label_series = (chart_type == "clusteredColumn")
+    let retained_extra_label_series = (chart_type == "clusteredColumn" || chart_type == "pareto")
         .then(|| {
             series_nodes
                 .iter()
                 .copied()
-                .skip(1)
-                .filter(|node| attr(node, "layoutId").as_deref() == Some(chart_type.as_str()))
+                .filter(|node| {
+                    *node != series_node
+                        && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+                })
+                .take(if host == ChartHost::Excel {
+                    0
+                } else {
+                    usize::MAX
+                })
                 .filter(|node| data_for_series(*node).is_some())
         })
         .into_iter()
@@ -877,7 +995,7 @@ pub(super) fn parse_chartex_impl(
         .as_ref()
         .map(|data| data.rows.as_slice())
         .or_else(|| chartex_sunburst.as_ref().map(|data| data.rows.as_slice()));
-    let categories: Vec<String> = hierarchy_rows
+    let mut categories: Vec<String> = hierarchy_rows
         .map(|rows| {
             rows.iter()
                 .map(|row| row.path.last().cloned().unwrap_or_default())
@@ -897,7 +1015,7 @@ pub(super) fn parse_chartex_impl(
 
     let pt_count = categories.len().max(1);
 
-    let raw_values: Vec<Option<f64>> = hierarchy_rows
+    let mut raw_values: Vec<Option<f64>> = hierarchy_rows
         .map(|rows| rows.iter().map(|row| Some(row.size)).collect())
         .or_else(|| {
             if chartex_box.is_some() {
@@ -909,6 +1027,20 @@ pub(super) fn parse_chartex_impl(
             }
         })
         .unwrap_or_else(|| vec![None; pt_count]);
+
+    // [MS-ODRAWXML] CT_Aggregation is an empty layout marker; CT_StringValue
+    // and CT_NumericValue carry source `idx`. Office 16.113 groups values by
+    // category at the same source point index, then sums duplicate category
+    // text in first-seen order. A value at an absent category point occupies a
+    // blank category slot; a named category without a value still has a tick
+    // label. Formula-backed dimensions use the same indexed rule after host
+    // resolution.
+    if layout_id == "clusteredColumn" && has_chartex_aggregation(series_node) {
+        let (aggregated_categories, aggregated_values) =
+            aggregate_chartex_data(primary_data, references)?;
+        categories = aggregated_categories;
+        raw_values = aggregated_values;
+    }
     let source_number_format =
         chartex_number_format(primary_data, &["size", "val", "colorVal"], references);
     if let Some(binning) = chartex_histogram_binning.as_mut() {
@@ -1055,6 +1187,9 @@ pub(super) fn parse_chartex_impl(
         marker_line: None,
         marker_line_width_emu: None,
         marker_line_paint_authored: None,
+        // [MS-ODRAWXML] CT_DataPoint@idx is the index of a point in its
+        // series. The text does not define a pre/post-aggregation remap, so
+        // keep authored indices on the aggregated output series.
         data_point_overrides: {
             let overrides = parse_chartex_data_point_overrides(
                 series_node,
@@ -1143,21 +1278,32 @@ pub(super) fn parse_chartex_impl(
     // A flat clustered-column ChartEx plot may contain several CT_Series, each
     // selecting its own CT_Data through dataId. Preserve every visible series
     // rather than silently collapsing the plot to the first one.
-    if chart_type == "clusteredColumn" {
+    if chart_type == "clusteredColumn" || chart_type == "pareto" {
         for extra_node in series_nodes
             .iter()
             .copied()
-            .skip(1)
-            .filter(|node| attr(node, "layoutId").as_deref() == Some(chart_type.as_str()))
+            .filter(|node| {
+                *node != series_node && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+            })
+            .take(if host == ChartHost::Excel {
+                0
+            } else {
+                usize::MAX
+            })
         {
             let Some(extra_data) = data_for_series(extra_node) else {
                 continue;
             };
-            let extra_values =
-                chartex_number_values(extra_data, &["val"], references).unwrap_or_default();
-            let extra_categories = chartex_string_levels(extra_data, references)
-                .and_then(|levels| levels.into_iter().next())
-                .unwrap_or_default();
+            let (extra_categories, extra_values) = if has_chartex_aggregation(extra_node) {
+                aggregate_chartex_data(extra_data, references)?
+            } else {
+                (
+                    chartex_string_levels(extra_data, references)
+                        .and_then(|levels| levels.into_iter().next())
+                        .unwrap_or_default(),
+                    chartex_number_values(extra_data, &["val"], references).unwrap_or_default(),
+                )
+            };
             let extra_name = series_name_for(extra_node, references);
             let extra_color =
                 child(extra_node, "spPr").and_then(|shape| resolver.resolve_shape_fill(shape));
@@ -1224,13 +1370,26 @@ pub(super) fn parse_chartex_impl(
                 .children()
                 .any(|child| child.is_element() && child.tag_name().name() == "catScaling")
     });
-    let val_axis = root.descendants().find(|axis| {
-        axis.is_element()
-            && axis.tag_name().name() == "axis"
-            && axis
-                .children()
-                .any(|child| child.is_element() && child.tag_name().name() == "valScaling")
-    });
+    let standalone_axis_id = (chart_type == "paretoLine")
+        .then(|| child(series_node, "axisId").and_then(|node| attr(&node, "val")))
+        .flatten();
+    let val_axis = root
+        .descendants()
+        .find(|axis| {
+            axis.is_element()
+                && axis.tag_name().name() == "axis"
+                && child(*axis, "valScaling").is_some()
+                && standalone_axis_id
+                    .as_deref()
+                    .is_some_and(|id| attr(axis, "id").as_deref() == Some(id))
+        })
+        .or_else(|| {
+            root.descendants().find(|axis| {
+                axis.is_element()
+                    && axis.tag_name().name() == "axis"
+                    && child(*axis, "valScaling").is_some()
+            })
+        });
     let cat_axis_major_tick_mark = extract_chartex_axis_tick_mark(cat_axis, "majorTickMarks");
     let val_axis_major_tick_mark = extract_chartex_axis_tick_mark(val_axis, "majorTickMarks");
     let val_axis_minor_tick_mark = extract_chartex_axis_tick_mark(val_axis, "minorTickMarks");
@@ -1369,7 +1528,15 @@ pub(super) fn parse_chartex_impl(
         .unwrap_or((None, None, None));
     let val_axis_format_code = val_axis
         .and_then(|axis| child(axis, "numFmt"))
-        .and_then(|format| attr(&format, "formatCode"));
+        .and_then(|format| attr(&format, "formatCode"))
+        .or_else(|| {
+            val_axis
+                .and_then(|axis| child(axis, "units"))
+                .and_then(|units| {
+                    (attr(&units, "unit").as_deref() == Some("percentage"))
+                        .then_some("0%".to_string())
+                })
+        });
     let legend = root
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "legend");
@@ -1419,7 +1586,7 @@ pub(super) fn parse_chartex_impl(
     }
 
     Some(ChartModel {
-        chart_type,
+        chart_type: chart_type.clone(),
         title: chartex_title,
         title_rich_runs: None,
         title_present: chartex_title_present,
@@ -1708,6 +1875,26 @@ pub(super) fn parse_chartex_impl(
         chartex_treemap,
         chartex_region_map,
         chartex_histogram_binning,
+        chartex_pareto_owner_index: owner_column_index,
+        chartex_pareto_sort_descending: matches!(
+            chart_type.as_str(),
+            "pareto" | "paretoLine" | "clusteredColumn"
+        )
+        .then_some(pareto_sort_descending),
+        chartex_pareto_flat_endpoint: matches!(chart_type.as_str(), "pareto" | "paretoLine")
+            .then_some(host != ChartHost::Excel),
+        chartex_suppress_geometry: suppress_geometry.then_some(true),
+        // Office 16.113 line-first controls render their first column owner
+        // as an outline, whether or not the line has ownerIdx.
+        chartex_pareto_outline_owner: (child(series_node, "spPr").is_none()
+            && (line_first_without_owner
+                || (pareto_pair.is_some()
+                    && all_series_nodes.first().is_some_and(|node| {
+                        attr(node, "layoutId").as_deref() == Some("paretoLine")
+                    }))))
+        .then_some(true),
+        chartex_primary_axis_right: primary_axis_right.then_some(true),
+        chartex_show_unpaired_percentage_axis: show_unpaired_percentage_axis.then_some(true),
         chartex_accents,
         chart_style_roles,
         classic_chart_style_roles: None,
@@ -1971,6 +2158,81 @@ pub(super) fn bounded_chartex_point_count(level: Node) -> Option<usize> {
         count = count.max(required);
     }
     Some(count)
+}
+
+fn has_chartex_aggregation(series: Node) -> bool {
+    child(series, "layoutPr")
+        .and_then(|layout| child(layout, "aggregation"))
+        .is_some()
+}
+
+// Empty or absent category slots with no numeric point are padding. A numeric
+// point at that index makes the blank category a displayed group.
+fn aggregation_category_present(value: Option<&str>, numeric: Option<f64>) -> bool {
+    value.is_some_and(|text| !text.is_empty()) || numeric.is_some()
+}
+
+fn aggregate_chartex_data(
+    data: Node,
+    references: &mut dyn ChartReferenceResolver,
+) -> Option<(Vec<String>, Vec<Option<f64>>)> {
+    let cat = data.descendants().find(|node| {
+        node.is_element()
+            && node.tag_name().name() == "strDim"
+            && attr(node, "type").as_deref() == Some("cat")
+    })?;
+    let category_slots: Vec<Option<String>> = if let Some(level) = child(cat, "lvl") {
+        let count = bounded_chartex_point_count(level)?;
+        let mut slots = vec![None; count];
+        for point in level
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "pt")
+        {
+            if let Some(index) = attr(&point, "idx").and_then(|value| value.parse::<usize>().ok()) {
+                if index < count {
+                    slots[index] = Some(point.text().unwrap_or("").replace('\n', " "));
+                }
+            }
+        }
+        slots
+    } else {
+        chartex_string_levels(data, references)?
+            .into_iter()
+            .next()?
+            .into_iter()
+            .map(Some)
+            .collect()
+    };
+    let values = chartex_number_values(data, &["val"], references)?;
+    let mut categories = Vec::<String>::new();
+    let mut sums = Vec::<Option<f64>>::new();
+    let mut by_category = std::collections::HashMap::<String, usize>::new();
+    for index in 0..category_slots.len().max(values.len()) {
+        let value = values
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|value| value.is_finite());
+        let category = category_slots.get(index).and_then(Option::as_deref);
+        if !aggregation_category_present(category, value) {
+            continue;
+        }
+        let category = category.unwrap_or_default().to_string();
+        if let Some(&index) = by_category.get(&category) {
+            if let Some(value) = value {
+                let sum = sums[index].unwrap_or(0.0) + value;
+                if !sum.is_finite() {
+                    return None;
+                }
+                sums[index] = Some(sum);
+            }
+        } else {
+            by_category.insert(category.clone(), categories.len());
+            categories.push(category);
+            sums.push(value);
+        }
+    }
+    Some((categories, sums))
 }
 
 pub(super) fn chartex_string_levels_for_types(
