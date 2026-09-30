@@ -1138,9 +1138,7 @@ pub(crate) fn parse_shape(
         inherited_alignment,
         inherited_ea_ln_brk,
         inherited_font_algn,
-        inherited_space_before,
-        inherited_space_after,
-        inherited_line_spacing,
+        inherited_spacing,
     ) = if placeholder_inherits {
         (
             lph.lookup_bold(&ph_type, ph_idx),
@@ -1150,12 +1148,10 @@ pub(crate) fn parse_shape(
             lph.lookup_alignment(&ph_type, ph_idx),
             lph.lookup_ea_ln_brk(&ph_type, ph_idx),
             lph.lookup_font_algn(&ph_type, ph_idx),
-            lph.lookup_space_before(&ph_type, ph_idx),
-            lph.lookup_space_after(&ph_type, ph_idx),
-            lph.lookup_line_spacing(&ph_type, ph_idx),
+            lph.lookup_spacing(&ph_type, ph_idx),
         )
     } else {
-        (None, None, None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, Default::default())
     };
     // Shape-level bodyPr values are not list-style properties; a placeholder
     // keeps them even when its layout slot has no txBody.
@@ -1298,9 +1294,15 @@ pub(crate) fn parse_shape(
             inherited_alignment,
             inherited_ea_ln_brk,
             inherited_font_algn,
-            inherited_space_before,
-            inherited_space_after,
-            inherited_line_spacing,
+            inherited_spacing,
+            // A placeholder paragraph that no list style indents starts at the
+            // inset (#1630: title levels 2-5); ordinary text takes its
+            // defaultTextStyle level.
+            if ph_node.is_some() {
+                [0; 9]
+            } else {
+                lph.default_text.mar_l
+            },
             zip,
         )
     });
@@ -2452,12 +2454,11 @@ pub(crate) fn parse_table_cell(
             None, // inherited_reflection
             anchor,
             text_insets,
-            None, // inherited_alignment
-            None, // inherited_ea_ln_brk
-            None, // inherited_font_algn
-            None, // inherited_space_before
-            None, // inherited_space_after
-            None, // inherited_line_spacing
+            None,                                  // inherited_alignment
+            None,                                  // inherited_ea_ln_brk
+            None,                                  // inherited_font_algn
+            Default::default(),                    // inherited_spacing
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L, // implicit_mar_l
             zip,
         );
         // Table-cell text direction is authored on tcPr rather than txBody's
