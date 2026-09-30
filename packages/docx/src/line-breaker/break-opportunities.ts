@@ -30,7 +30,7 @@ import {
   slicedTextMetadata,
   snapToCharsClass,
 } from './advance.js';
-import { nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
+import { applyBidiTabPostPass, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
 import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
@@ -60,6 +60,9 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'tabStops'
   | 'defaultTabPt'
   | 'tabFollowingMetrics'
+  | 'bidiCustomStopsPx'
+  | 'bidiIntervalPx'
+  | 'decimalAlignmentPoint'
   | 'availW'
   | 'setMeasureFont'
   | 'fontFamilyClasses'
@@ -422,6 +425,35 @@ function processImageSegment(context: BreakOpportunityIteratorContext, seg: Layo
   return;
 }
 
+/** Commit a cell already proven to fit its band. Keeping the aligned cell's
+ * measurement path preserves ordinary TOC/field allocation, while callers leave
+ * oversized cells in the queue for normal legal-break and emergency fitting. */
+function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
+  const { breakerState, scale, addToLine, measureText, verticalInkExtra, characterGrid } = context;
+  while (breakerState.queue.length > 0) {
+    const q = breakerState.queue[0];
+    if ('isTab' in q || 'lineBreak' in q) break;
+    breakerState.queue.shift();
+    if ('imagePath' in q) {
+      const w = q.widthPt * scale;
+      q.measuredWidth = w;
+      addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
+    } else if ('math' in q) {
+      addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
+    } else {
+      const m = measureText(q);
+      // #1014 — fold the vo=Tr ink deficit into the committed advance too.
+      const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
+      q.measuredWidth = w;
+      const asc =
+        m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
+      const desc =
+        m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
+      addToLine(q, w, q.fontSize, asc, desc);
+    }
+  }
+}
+
 function processTabSegment(context: BreakOpportunityIteratorContext, seg: LayoutTabSeg): void {
   const {
     breakerState,
@@ -434,23 +466,36 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     maxWidth,
     marginRightPx,
     tabFollowWidth,
-    measureText,
-    verticalInkExtra,
-    characterGrid,
     tabStops,
     defaultTabPt,
     tabFollowingMetrics,
     availW,
   } = context;
 
-  // ── ECMA-376 §17.3.1.6 base-RTL tab ──────────────────────────────────
-  // The LTR pen math below resolves stops in LOGICAL order, which mis-places
-  // a bidi paragraph's tab-delimited cells (they reorder visually — see
-  // `layoutBidiTabStops`). Add the tab with a PROVISIONAL width of 0 and do
-  // NOT wrap on it; the per-line post-pass (`applyBidiTabs`, run in `flush`)
-  // recomputes every tab width in the visual frame once the line's content
-  // is known, including the retained `<w:ptab>` descriptor.
+  // Ordinary RTL stops still require the complete cell's visual order. A
+  // positional tab additionally owns a normative next-line decision, which
+  // must happen here, while the queue can still move (§17.3.3.23).
   if (baseRtl) {
+    if (seg.ptab) {
+      const input = { ...context, ...breakerState };
+      breakerState.currentWidth += applyBidiTabPostPass(input);
+      const { startPen, leftLimit, frame } = bidiTabFrame(input);
+      let followingWidth = 0;
+      for (const q of breakerState.queue) {
+        if ('isTab' in q || 'lineBreak' in q) break;
+        followingWidth += tabFollowWidth(q);
+      }
+      const box = wordPositionalTabReferenceBox(
+        seg.ptab.relativeTo === 'indent' ? frame.indentStart : 0,
+        seg.ptab.relativeTo === 'indent' ? frame.indentEnd : leftLimit,
+        frame.bandStart, frame.bandEnd, frame.narrowed);
+      const target = positionalTabTarget(seg.ptab.alignment, box.start, box.end, followingWidth);
+      if (target < startPen + breakerState.currentWidth && breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        return;
+      }
+    }
     seg.measuredWidth = 0;
     addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
     return;
@@ -504,32 +549,11 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    // Commit the trailing content onto this line without a wrap re-check, so
-    // it sits exactly at the aligned position (mirrors the custom right/center
-    // tab path below).
-    if (seg.ptab.alignment !== 'left') {
-      while (breakerState.queue.length > 0) {
-        const q = breakerState.queue[0];
-        if ('isTab' in q || 'lineBreak' in q) break;
-        breakerState.queue.shift();
-        if ('imagePath' in q) {
-          const w = q.widthPt * scale;
-          q.measuredWidth = w;
-          addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
-        } else if ('math' in q) {
-          addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
-        } else {
-          const m = measureText(q);
-          // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-          const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
-          q.measuredWidth = w;
-          const asc =
-            m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
-          const desc =
-            m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
-          addToLine(q, w, q.fontSize, asc, desc);
-        }
-      }
+    // §17.3.3.23 margin references ignore paragraph indents. A cell fitting
+    // that reference band retains its allocation at the target; a wider
+    // cell uses ordinary line breaking instead of an unlimited atomic commit.
+    if (seg.ptab.alignment !== 'left' && followW <= box.end - box.start) {
+      commitAlignedTabCell(context);
     }
     return;
   }
@@ -551,13 +575,13 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // Convert the chosen margin-space stop back to paraX-relative px.
   const stopParaX = stop ? stop.pos - tabOriginPx : absFromParaX;
   // Right/center/decimal tab: place the tab + its trailing content (up to the next
-  // tab / line end) so the content ends at / centers on the stop, and commit that
-  // content directly so the normal wrap check doesn't push it past the stop
+  // tab / line end) so the content ends at / centers on the stop. An oversized
+  // cell still uses ordinary break opportunities
   // (ECMA-376 §17.3.1.37). This is what makes TOC "heading …… page" lines work.
   // Automatic stops returned by nextTabStop are left-aligned, so they fall
   // through to the left-tab path below.
   const alignmentRole = stop ? tabAlignmentRole(stop.alignment) : 'leading';
-  if (stop && (alignmentRole !== 'leading' || breakerState.lineMaxWidth !== maxWidth || breakerState.lineXOffset !== 0)) {
+  if (stop && alignmentRole !== 'leading') {
     const stopX = stopParaX;
     seg.leader = stop.leader;
     const following = tabFollowingMetrics();
@@ -566,33 +590,20 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
         ? following.totalWidth / 2
         : alignmentRole === 'decimal'
           ? (following.decimalPrefixWidth ?? following.totalWidth)
-          : alignmentRole === 'leading' ? 0 : following.totalWidth;
+          : following.totalWidth;
     let tabW = stopX - absFromParaX - alignmentWidth;
     if (tabW <= 0) tabW = 0;
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    // Commit the trailing content onto this line without a wrap re-check.
-    while (breakerState.queue.length > 0) {
-      const q = breakerState.queue[0];
-      if ('isTab' in q || 'lineBreak' in q) break;
-      breakerState.queue.shift();
-      if ('imagePath' in q) {
-        const w = q.widthPt * scale;
-        q.measuredWidth = w;
-        addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
-      } else if ('math' in q) {
-        addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
-      } else {
-        const m = measureText(q);
-        // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-        const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
-        q.measuredWidth = w;
-        const asc =
-          m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
-        const desc =
-          m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
-        addToLine(q, w, q.fontSize, asc, desc);
-      }
+    // Keep an aligned cell atomic only when it fits the available band.
+    // Oversized cells return to the iterator at their ordinary break sites.
+    // §17.3.1.37 stops use text-margin coordinates, independent of the
+    // paragraph's right indent. Only a float exclusion narrows this reference
+    // band; an indented footer can still align a fitting cell at the margin.
+    const cellBandWidth = breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== maxWidth
+      ? availW() : marginRightPx + tabOriginPx;
+    if (following.totalWidth <= cellBandWidth) {
+      commitAlignedTabCell(context);
     }
     return;
   }
@@ -603,16 +614,20 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   let tabWidth = stopParaX - absFromParaX;
   if (stop) seg.leader = stop.leader;
   // Clamp to avoid negative widths; if tab would overflow the line, wrap instead
-  if (tabWidth <= 0) {
+  if (tabWidth <= 0 && breakerState.lineXOffset === 0 && breakerState.lineMaxWidth === maxWidth) {
     flush(undefined, false, seg.src);
     breakerState.queue.unshift(seg);
     return;
   }
-  if (breakerState.currentWidth + tabWidth > availW() && breakerState.currentLine.length > 0) {
+  if (breakerState.currentWidth + tabWidth > availW() && breakerState.currentLine.length > 0
+    && breakerState.lineXOffset === 0 && breakerState.lineMaxWidth === maxWidth) {
     flush(undefined, false, seg.src);
     breakerState.queue.unshift(seg);
     return;
   }
+  // Word permits the tab advance itself beyond a displaced band. Content
+  // continues through normal fitting; this is not an unbounded cell allowance.
+  tabWidth = Math.max(0, tabWidth);
   seg.measuredWidth = tabWidth;
   addToLine(seg, tabWidth, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
   return;
@@ -660,6 +675,21 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     fitsMeasuredWidth(breakerState.currentWidth + wForFit, availW())
   ) {
     // Fits on current line as-is
+    s.measuredWidth = w;
+    addToLine(s, w, h, asc, desc);
+    appendQueuedIdeographicSpaceSegment(s);
+  } else if (
+    breakerState.currentLine.some((segment) => 'isTab' in segment &&
+      (segment.ptab?.alignment !== undefined && segment.ptab.alignment !== 'left' ||
+        segment.resolvedAlignment !== undefined && tabAlignmentRole(segment.resolvedAlignment) !== 'leading' ||
+        breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== context.maxWidth)) &&
+    breakerState.currentLine.every((segment) => 'isTab' in segment || ('text' in segment && segment.metricOnly === true)) &&
+    wForFit <= availW()
+  ) {
+    // Aligned margin tabs and the Word float/tab controls retain the first
+    // atomic token even beyond the paragraph band. Keep it with the tab; the
+    // next legal break is still fitted normally, rather than committing the
+    // entire tab-delimited remainder without any width budget.
     s.measuredWidth = w;
     addToLine(s, w, h, asc, desc);
     appendQueuedIdeographicSpaceSegment(s);

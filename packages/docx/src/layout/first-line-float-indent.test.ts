@@ -12,7 +12,7 @@ function documentBytes(
   indent: string,
   rtl: boolean,
   xPt: number,
-  tab?: { alignment: string; count: number; text: string; positional?: boolean; relativeTo?: 'margin' | 'indent'; noFloat?: boolean; fontSizePt?: number },
+  tab?: { alignment: string; count: number; text: string; positional?: boolean; relativeTo?: 'margin' | 'indent'; noFloat?: boolean; fontSizePt?: number; automatic?: boolean; prefix?: string },
 ): Uint8Array {
   const seed = CONFORMANCE_CASES.find(({ axes }) => axes.story === 'body'
     && axes.container === 'paragraph' && axes.object === 'floating');
@@ -34,7 +34,7 @@ function documentBytes(
     const tabXml = tab.positional
       ? `<w:ptab w:alignment="${tab.alignment}" w:relativeTo="${tab.relativeTo ?? 'margin'}" w:leader="none"/>`
       : '<w:tab/>'.repeat(tab.count);
-    xml = xml.replace('<w:t', `${tabXml}<w:t`)
+    xml = xml.replace('<w:t', `${tab.prefix ? `<w:t>${tab.prefix}</w:t>` : ""}${tabXml}<w:t`)
       .replace('</w:pPr>', `<w:tabs><w:tab w:val="${tab.alignment}" w:pos="5600"/></w:tabs></w:pPr>`);
     // CT_PPrBase requires tabs before bidi/spacing/ind (§A.1).
     xml = xml.replace(/<w:pPr>([\s\S]*?)<\/w:pPr>/, (_match, properties: string) => {
@@ -48,6 +48,7 @@ function documentBytes(
     xml = xml.replace(drawingRun, '').replace('</w:pPr>', `</w:pPr>${drawingRun}`);
   }
   if (tab?.fontSizePt) xml = xml.replace(/<w:sz(?:Cs)? w:val="\d+"\/>/g, (tag) => tag.replace(/\d+/, String((tab.fontSizePt ?? 12) * 2)));
+  if (tab?.automatic) xml = xml.replace(/<w:tabs>[\s\S]*?<\/w:tabs>/g, '');
   if (tab?.noFloat) xml = xml.replace(/<w:drawing>[\s\S]*?<\/w:drawing>/g, '');
   parts.set('word/document.xml', encoder.encode(xml));
   return storeZip(parts);
@@ -137,6 +138,60 @@ describe('first-line indents beside floats through the DOCX parser', () => {
       expect(texts.map((text) => text.bounds)).toEqual([
         { xPt: floatStarts[entry.tabIndex][index], yPt: 72, widthPt: 20, heightPt: 12 },
       ]);
+    }
+  });
+
+  it.each([false, true])('fits a margin-aligned cell independently of the paragraph right indent, positional=%s', (positional) => {
+    const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
+      { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional, noFloat: true }));
+    expect(paragraph.lines).toHaveLength(1);
+    const texts = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
+    const last = texts.at(-1);
+    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(positional ? 540 : 352);
+  });
+
+  it('wraps content after an automatic tab in a narrowed float window', () => {
+    const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', false, 268,
+      { alignment: 'left', count: 1, text: 'word '.repeat(100).trim(), automatic: true }), 6);
+    expect(paragraph.lines).toHaveLength(12);
+    for (const line of paragraph.lines) {
+      for (const placement of line.placements) {
+        if (placement.kind === 'text') expect(placement.bounds.xPt + placement.bounds.widthPt).toBeLessThanOrEqual(540);
+      }
+    }
+  });
+
+  it.each(['margin', 'indent'].flatMap((relativeTo) => [false, true].map((long) => ({ relativeTo: relativeTo as 'margin' | 'indent', long }))))('moves an RTL positional tab past its $relativeTo target to the next line, long=$long', ({ relativeTo, long }) => {
+    const paragraph = layoutParagraph(documentBytes('', true, 0,
+      { alignment: 'left', count: 1, text: long ? 'word '.repeat(100).trim() : 'word', positional: true, relativeTo, noFloat: true, prefix: 'prefix' }), 6);
+    const text = paragraph.lines.flatMap((line) => line.placements).find((node) => node.kind === 'text' && node.text.startsWith('word'));
+    expect(text?.kind === 'text' ? text.bounds.yPt : undefined).toBe(84);
+    if (long) expect(paragraph.lines.length).toBeGreaterThan(2);
+    else expect(paragraph.lines).toHaveLength(2);
+  });
+
+  it.each(matrix)('long $kind $alignment ($count), rtl=$rtl, float=$float retains legal line breaks', (entry) => {
+    const relativeTo = 'relativeTo' in entry ? entry.relativeTo : undefined;
+    const content = (entry.alignment === 'decimal' ? '12.3 ' : 'word ').repeat(100).trim();
+    const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', entry.rtl,
+      entry.float === 'right' ? 268 : 0, {
+        alignment: entry.alignment, count: entry.count, text: content,
+        positional: relativeTo !== undefined, relativeTo, noFloat: entry.float === 'none',
+      }));
+    expect(paragraph.lines.length).toBeGreaterThan(1);
+    const textLines = paragraph.lines.map((line) => line.placements.filter((node) => node.kind === 'text'));
+    expect(textLines.flat().map((text) => text.text).join('').replace(/\s/g, ''))
+      .toBe(content.replace(/\s/g, ''));
+    // A displaced tab may itself pass the margin, as the short Word controls
+    // demonstrate. That does not grant its entire following cell infinite room.
+    for (const texts of textLines) {
+      expect(texts.reduce((total, text) => total + text.bounds.widthPt, 0)).toBeLessThanOrEqual(468);
+    }
+    for (const texts of textLines.slice(1)) {
+      for (const text of texts) {
+        expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+        expect(text.bounds.xPt + text.bounds.widthPt).toBeLessThanOrEqual(540);
+      }
     }
   });
 

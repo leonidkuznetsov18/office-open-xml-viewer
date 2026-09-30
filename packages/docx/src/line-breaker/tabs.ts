@@ -196,6 +196,8 @@ export function layoutBidiTabStops(
       const box = wordPositionalTabReferenceBox(referenceStart, referenceEnd,
         frame.bandStart, frame.bandEnd, frame.narrowed);
       const target = positionalTabTarget(it.ptab.alignment, box.start, box.end, following);
+      // §17.3.3.23 reachability was checked by the queue-owning iterator.
+      // An unreachable target on an empty line can only contribute zero gap.
       width[i] = Math.max(0, target - pen);
       pen += width[i];
       continue;
@@ -265,19 +267,33 @@ export interface BidiTabPostPassInput {
 }
 
 
+/** One reading-frame projection for positional-tab reachability and the
+ * final bidi walk. Both must compare the pen with the same float/indent band. */
+export function bidiTabFrame(input: Pick<BidiTabPostPassInput,
+  'marginRightPx' | 'maxWidth' | 'scale' | 'lineXOffset' | 'lineMaxWidth' |
+  'isFirst' | 'firstIndent' | 'tabOriginPx'>) {
+  const { marginRightPx, maxWidth, scale, lineXOffset, lineMaxWidth, isFirst, firstIndent, tabOriginPx } = input;
+  const startPen = marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? firstIndent : 0);
+  return {
+    startPen,
+    leftLimit: marginRightPx + tabOriginPx,
+    frame: {
+      leadingShift: maxWidth - (lineXOffset + lineMaxWidth),
+      indentStart: marginRightPx - maxWidth,
+      indentEnd: marginRightPx,
+      bandStart: marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? Math.min(0, firstIndent) : 0),
+      bandEnd: marginRightPx - lineXOffset,
+      narrowed: lineXOffset !== 0 || lineMaxWidth !== maxWidth,
+      scale,
+    },
+  };
+}
+
 /** Resolve bidi tab positions after line content is known, in the visual frame. */
 export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
   const {
     baseRtl,
     currentLine,
-    marginRightPx,
-    maxWidth,
-    scale,
-    lineXOffset,
-    lineMaxWidth,
-    isFirst,
-    firstIndent,
-    tabOriginPx,
     bidiCustomStopsPx,
     bidiIntervalPx,
     decimalAlignmentPoint,
@@ -325,17 +341,8 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
   // (which narrows the leading edge under an RTL base, mirroring the draw
   // loop's `effAvailW`). The left text margin sits tabOriginPx past the
   // paragraph box (its trailing indent).
-  const startPen = marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? firstIndent : 0);
-  const leftLimit = marginRightPx + tabOriginPx;
-  const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx, {
-    leadingShift: maxWidth - (lineXOffset + lineMaxWidth),
-    indentStart: marginRightPx - maxWidth,
-    indentEnd: marginRightPx,
-    bandStart: marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? Math.min(0, firstIndent) : 0),
-    bandEnd: marginRightPx - lineXOffset,
-    narrowed: lineXOffset !== 0 || lineMaxWidth !== maxWidth,
-    scale,
-  });
+  const { startPen, leftLimit, frame } = bidiTabFrame(input);
+  const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx, frame);
   let delta = 0;
   for (let i = 0; i < currentLine.length; i++) {
     const s = currentLine[i];
