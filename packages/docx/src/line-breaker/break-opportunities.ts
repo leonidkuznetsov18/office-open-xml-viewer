@@ -508,14 +508,14 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     }
     const input = { ...context, ...breakerState };
     const { startPen, frame } = bidiTabFrame(input);
-    if (frame.narrowed || oversizedMarginLeading || seg.ptab?.relativeTo === 'indent'
-      || breakerState.currentLine.some((item) => 'isTab' in item)) {
+    if (frame.narrowed || oversizedMarginLeading || seg.ptab?.relativeTo === 'indent') {
       // Resolve leading gaps before fitting, in the same reading frame as
       // paint. A provisional zero gap can fit text that the final tab would
-      // push into the exclusion. In an unnarrowed ordinary first cell the
-      // existing post-pass can reduce its gap as text fills the band, so keep
-      // that in-band fitting contract. Before another tab, preceding gaps must
-      // be fixed; an indent-relative leading ptab has an authored fixed gap.
+      // push into the exclusion. Without float exclusion, the final ordinary
+      // tab gap stays provisional, even after multiple tabs: the bidi walk can
+      // reduce the last gap as its cell fills the band. Freezing that gap here
+      // prematurely wraps otherwise in-band text. An indent-relative leading
+      // ptab instead has an authored fixed gap.
       // Aligned cells retain post-pass alignment,
       // bounded by the actual band after normal text fitting.
       breakerState.currentWidth += applyBidiTabPostPass(input);
@@ -543,6 +543,11 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
         addToLine(seg, gap, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
         return;
       }
+    } else if (!seg.ptab) {
+      // Earlier cells are complete when another ordinary tab is reached. Charge
+      // their resolved gaps so the next cell cannot overflow the line, but leave
+      // this final gap provisional: the bidi walk may shrink it as text fits.
+      breakerState.currentWidth += applyBidiTabPostPass(input);
     }
     seg.measuredWidth = 0;
     addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
