@@ -220,35 +220,80 @@ describe('§17.4.50 tblInd — table indent from the leading margin', () => {
     },
   );
 
+  const autoWidthTable = (options: {
+    sideMarginPt: number;
+    indentPt: number;
+    gridPt: number;
+    compatibilityMode?: number;
+    text?: string;
+  }) => {
+    const source = tableDoc(options.gridPt, options.indentPt, false);
+    const { widthPt: _preferred, ...sourceTable } = source.body[0] as DocTable;
+    const sourceRow = sourceTable.rows[0]!;
+    const { widthPt: _cellPreferred, ...sourceCell } = sourceRow.cells[0]!;
+    const cell = options.text === undefined
+      ? sourceRow.cells[0]!
+      : { ...sourceCell, content: [{ type: 'paragraph', ...bodyParagraph(options.text) }] } as DocTableCell;
+    const doc = {
+      ...source,
+      ...(options.compatibilityMode === undefined
+        ? {}
+        : { settings: { compatibilityMode: options.compatibilityMode } }),
+      section: { ...source.section, marginLeft: options.sideMarginPt, marginRight: options.sideMarginPt },
+      body: [{
+        ...sourceTable,
+        cellMarginLeft: 5.4,
+        cellMarginRight: 5.4,
+        rows: [{ ...sourceRow, cells: [cell] }],
+      }],
+    } as DocxDocumentModel;
+    const recording = makeRecordingCanvas();
+    const services = createLayoutServices(doc, {
+      measureContext: recording.canvas.getContext('2d') as CanvasRenderingContext2D,
+    });
+    const retained = layoutDocument(doc, services, { currentDateMs: 0 }).pages[0]?.layers.body[0];
+    if (retained?.kind !== 'table') throw new Error('expected retained table geometry');
+    return retained.flowBounds;
+  };
+
   it.each([
-    // Word controls (auto tblW, 478.8pt saved grid, 5.4pt outer cell margins,
-    // 468pt page) scaled here to a 200pt page with a 210.8pt saved grid.
-    ['zero side margins overflow the physical page', 0, 0, { xPt: 0, widthPt: 210.8 }],
-    ['a positive indent keeps the trailing band edge', 10, 20, { xPt: 30, widthPt: 170.8 }],
-    ['a negative indent crosses the leading page edge', 10, -20, { xPt: -10, widthPt: 210.8 }],
+    // Word controls (auto tblW, 5.4pt outer cell margins, 468pt page, saved
+    // grid past the band) scaled here to a 200pt page with a 210.8pt grid.
+    // Mode 14 (and an omitted mode) hangs both outer margins outside the
+    // band - tblInd text area; mode 15 keeps the table inside it.
+    ['zero side margins, mode 14, overflow the page', undefined, 0, 0, { xPt: 0, widthPt: 210.8 }],
+    ['a positive indent, mode 14', 14, 10, 20, { xPt: 30, widthPt: 170.8 }],
+    ['a negative indent, mode 14, crosses the page edge', 14, 10, -20, { xPt: -10, widthPt: 210.8 }],
+    ['zero side margins, mode 15', 15, 0, 0, { xPt: 0, widthPt: 200 }],
+    ['a positive indent, mode 15', 15, 10, 20, { xPt: 30, widthPt: 160 }],
+    ['a negative indent, mode 15, crosses the page edge', 15, 10, -20, { xPt: -10, widthPt: 200 }],
   ] as const)(
     'auto-width AutoFit: %s',
-    (_case, sideMarginPt, indentPt, expected) => {
-      const source = tableDoc(210.8, indentPt, false);
-      const { widthPt: _preferred, ...sourceTable } = source.body[0] as DocTable;
-      const doc = {
-        ...source,
-        section: { ...source.section, marginLeft: sideMarginPt, marginRight: sideMarginPt },
-        body: [{ ...sourceTable, cellMarginLeft: 5.4, cellMarginRight: 5.4 }],
-      } as DocxDocumentModel;
-      const recording = makeRecordingCanvas();
-      const services = createLayoutServices(doc, {
-        measureContext: recording.canvas.getContext('2d') as CanvasRenderingContext2D,
+    (_case, compatibilityMode, sideMarginPt, indentPt, expected) => {
+      const bounds = autoWidthTable({
+        sideMarginPt, indentPt, gridPt: 210.8,
+        ...(compatibilityMode === undefined ? {} : { compatibilityMode }),
       });
-      const retained = layoutDocument(doc, services, { currentDateMs: 0 }).pages[0]?.layers.body[0];
-      if (retained?.kind !== 'table') throw new Error('expected retained table geometry');
+      // WORD_AUTOFIT_LEADING_INDENT_BAND: no physical page clamp.
+      expect(bounds.xPt).toBeCloseTo(expected.xPt, 6);
+      expect(bounds.widthPt).toBeCloseTo(expected.widthPt, 6);
+    },
+  );
 
-      // WORD_AUTOFIT_LEADING_INDENT_BAND: the text band minus tblInd plus the
-      // saved outer-margin overhang, with no physical page clamp.
-      expect(retained.flowBounds.xPt).toBeCloseTo(expected.xPt, 6);
-      expect(retained.flowBounds.widthPt).toBeCloseTo(expected.widthPt, 6);
-      expect(retained.flowBounds.xPt + retained.flowBounds.widthPt)
-        .toBeCloseTo(200 - sideMarginPt + 10.8, 6);
+  it.each([
+    [14, 185.8],
+    [15, 175],
+  ] as const)(
+    'mode %s: an unpreferred content column grows past a saved grid at band - tblInd',
+    (compatibilityMode, expectedWidthPt) => {
+      // The Word gridmatch controls save a grid of exactly band - tblInd. A
+      // long first cell without tcW still fits to the mode's AutoFit ceiling.
+      const bounds = autoWidthTable({
+        sideMarginPt: 10, indentPt: 5, gridPt: 175, compatibilityMode,
+        text: Array.from({ length: 40 }, () => 'ab').join(' '),
+      });
+      expect(bounds.xPt).toBeCloseTo(15, 6);
+      expect(bounds.widthPt).toBeCloseTo(expectedWidthPt, 6);
     },
   );
 

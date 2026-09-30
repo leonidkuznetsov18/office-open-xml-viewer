@@ -314,6 +314,35 @@ describe('table intrinsic content widths', () => {
     expect(reversed[1]).toBeCloseTo(widths[0]!, 6);
   });
 
+  it('shares the outer margins in a mode-15 forced fit without widening the ceiling', () => {
+    const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu';
+    const long = { ...cell([paragraph([textRun(words)]) as CellElement]),
+      noWrap: true, marginLeft: 5.4, marginRight: 5.4 };
+    const ordinary = { ...cell([paragraph([textRun('other')]) as CellElement]),
+      marginLeft: 5.4, marginRight: 5.4 };
+    const base = columnState(measuringContext());
+    const pageStory = (compatibilityMode: number) => ({
+      ...base,
+      layoutSettings: {
+        ...base.layoutSettings,
+        compat: { ...base.layoutSettings.compat, compatibilityMode },
+      },
+      storyContext: { story: 'body', containers: [], lineNumberingEligible: false },
+    } as ColumnState);
+    const widths = (mode: number) =>
+      resolveColumnWidths(table([row([long, ordinary])], [105.4, 105.4]), 200, pageStory(mode));
+
+    // WORD_AUTOFIT_LEADING_INDENT_BAND: mode 14 hangs the 10.8pt outer margins
+    // outside the 200pt band; mode 15 keeps the table at 200pt but still
+    // distributes those margins by the opposing content width (330pt, 25pt).
+    const m14 = widths(14);
+    const m15 = widths(15);
+    expect(m14[0]).toBeCloseTo((200 * 330 + 10.8 * 25) / 355, 6);
+    expect(m14[0]! + m14[1]!).toBeCloseTo(210.8, 6);
+    expect(m15[0]).toBeCloseTo((189.2 * 330 + 10.8 * 25) / 355, 6);
+    expect(m15[0]! + m15[1]!).toBeCloseTo(200, 6);
+  });
+
   it('excludes first-line indent from the noWrap width request', () => {
     const first = (text: string, indentFirst: number): DocTableCell => ({
       ...cell([paragraph([textRun(text)], { indentFirst }) as CellElement]),

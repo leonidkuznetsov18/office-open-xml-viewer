@@ -1243,6 +1243,9 @@ export interface TableColumnLayoutInput {
   readonly availableWidthPt: number | null;
   /** The outer-cell margin portion of the physical AutoFit ceiling. */
   readonly outerMarginAllowancePt?: number;
+  /** WORD_AUTOFIT_CONTENT_COLUMN_GROWTH: let unpreferred content columns grow
+   * past the saved grid toward their maximum content width. */
+  readonly growUnpreferredColumns?: boolean;
   readonly gridWidthsPt: readonly number[];
   readonly gridWidthKeys?: readonly (string | null)[];
   readonly tablePreferredWidthPt: number | null;

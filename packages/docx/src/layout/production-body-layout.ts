@@ -2285,10 +2285,12 @@ function resolveColumnWidths(
   // WORD_AUTOFIT_LEADING_INDENT_BAND (table-compatibility.ts): for an
   // AutoFit table with no preferred tblW (§17.4.63 auto), a leading §17.4.50
   // tblInd moves only the leading edge while the trailing edge stays at the
-  // text band. The band available to the grid is contentW - tblInd for either
-  // sign, and the physical page is not a ceiling (see the rule's evidence).
-  // Centered and trailing justifications are outside that evidence and keep
-  // the whole text band.
+  // text band. The text band available to the grid is contentW - tblInd for
+  // either sign, and the physical page is not a ceiling. Below compatibility
+  // mode 15 the outer cell margins hang outside that text band, so the table
+  // adds them in full; from mode 15 the table edges stay inside it. Centered
+  // and trailing justifications are outside that evidence and keep the whole
+  // text band.
   const hasPreferredTableWidth = (Number.isFinite(table.widthPt) && (table.widthPt ?? 0) > 0)
     || (Number.isFinite(table.widthPct) && (table.widthPct ?? 0) > 0);
   const usesLeadingIndentBand = effectiveLayout !== 'fixed'
@@ -2304,9 +2306,9 @@ function resolveColumnWidths(
       })))
     : contentWPt;
   // WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND (table-compatibility.ts): an AutoFit
-  // grid can include outer §17.4.42 cell margins beyond the text band, but
-  // Word also preserves a saved grid ending at the band despite those margins.
-  // Use only the margin overhang already represented by §17.4.49 tblGrid.
+  // grid can include outer §17.4.42 cell margins beyond the text band. For a
+  // preferred-width table, only the margin overhang already represented by
+  // §17.4.49 tblGrid is used (that class is not covered by the mode controls).
   // A row with skipped outer tracks cannot establish that margin ownership.
   // A nested table's saved overhang belongs to its containing cell; giving it
   // the page-table allowance enlarges that cell's contents beyond Word's grid.
@@ -2333,10 +2335,18 @@ function resolveColumnWidths(
           : 0;
         return Math.min(minimumPt, marginPt);
       }, Number.POSITIVE_INFINITY);
-  const outerCellMarginsPt = Math.min(
-    possibleOuterCellMarginsPt,
-    Math.max(0, savedGridWidthPt - textBandPt),
-  );
+  // compatSetting compatibilityMode: WORD_AUTOFIT_LEADING_INDENT_BAND treats
+  // an omitted setting like an explicit 14.
+  const compatibilityMode = state.layoutSettings.compat.compatibilityMode;
+  const outerCellMarginsHangOutsideBand = compatibilityMode === undefined || compatibilityMode < 15;
+  // The two-cell forced-fit distribution always shares the actual outer
+  // margins; only the ceiling differs by compatibility mode.
+  const forcedFitOuterMarginsPt = usesLeadingIndentBand
+    ? possibleOuterCellMarginsPt
+    : Math.min(possibleOuterCellMarginsPt, Math.max(0, savedGridWidthPt - contentWPt));
+  const outerCellMarginsPt = usesLeadingIndentBand
+    ? (outerCellMarginsHangOutsideBand ? possibleOuterCellMarginsPt : 0)
+    : Math.min(possibleOuterCellMarginsPt, Math.max(0, savedGridWidthPt - contentWPt));
   // A preferred-width table with a negative indent keeps the older physical
   // page ceiling (its authored width may reach the page edge); the auto-width
   // band above supersedes it for tables without a preferred width.
@@ -2447,7 +2457,8 @@ function resolveColumnWidths(
   );
   return [...resolveTableColumnWidths({
     ...columnInput,
-    outerMarginAllowancePt: outerCellMarginsPt,
+    outerMarginAllowancePt: forcedFitOuterMarginsPt,
+    growUnpreferredColumns: usesLeadingIndentBand,
   })];
 }
 

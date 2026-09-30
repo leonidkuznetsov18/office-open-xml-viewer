@@ -35,19 +35,31 @@ export const WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND = defineCompatibilityRule({
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'For top-level ordinary AutoFit tables, Word permits a saved grid to extend beyond the text band by the resolved outer cell margins. Two-cell controls with 0, 2.7, and 5.4pt margins, dxa 250/300pt and auto cell widths, short/long text, and noWrap on/off establish that allowance. A Word-produced table with 5.4pt margins but a saved grid exactly at the text band retains that narrower grid on current Word PDF export. A nested table with saved grid overhang retains its containing-cell width rather than receiving the page-table allowance. Therefore only a top-level outer-margin overhang already present in tblGrid increases the physical ceiling. Skipped outer grid tracks, leading-margin placement, vertical text, and floating tables remain outside this observation.',
+  description: 'For top-level ordinary AutoFit tables, Word permits a saved grid to extend beyond the text band by the resolved outer cell margins. Two-cell controls with 0, 2.7, and 5.4pt margins, dxa 250/300pt and auto cell widths, short/long text, and noWrap on/off establish that allowance. A Word-produced table with 5.4pt margins but a saved grid exactly at the text band retains that narrower grid on current Word PDF export. A nested table with saved grid overhang retains its containing-cell width rather than receiving the page-table allowance. Auto-width tables are now governed by WORD_AUTOFIT_LEADING_INDENT_BAND (compatibility-mode dependent); for a preferred-width table only a top-level outer-margin overhang already present in tblGrid increases the physical ceiling. Skipped outer grid tracks, leading-margin placement, vertical text, and floating tables remain outside this observation.',
 });
 
 export const WORD_AUTOFIT_LEADING_INDENT_BAND = defineCompatibilityRule({
   id: 'word-autofit-leading-indent-band',
   evidence: {
     kind: 'office-observation',
-    syntheticFixtureId: 'autofit-nowrap-page-boundary-matrix',
+    syntheticFixtureId: 'autofit-nowrap-page-boundary-compat-mode-matrix',
     application: 'Microsoft Word',
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'For a top-level left-justified AutoFit table with an auto preferred table width, Word keeps the trailing table edge at the text band plus the outer-margin overhang already present in tblGrid; a leading tblInd moves only the leading edge. The fitted width is therefore the text band minus tblInd plus that overhang. Controls on a 468pt page with a 478.8pt saved grid and 5.4pt outer cell margins cover 0pt and 18pt side margins, tblInd of +36pt and -36pt, and noWrap on and off: with zero side margins the table overflows the physical page by its right cell margin, and a -36pt indent carries it past the left page edge, so the physical page is not a ceiling. Centered, trailing, preferred-width, floating, nested, and vertical-text tables are outside this observation.',
+  description: 'For a top-level left-justified AutoFit table with an auto preferred table width, Word keeps the text area of the table inside the text band minus the leading tblInd, for either sign, and ignores the physical page. In compatibility mode 14 (and with compatibilityMode omitted) the outer cell margins hang outside that band, so the fitted width is band - tblInd + left + right outer cell margins, independent of the saved grid; in mode 15 the table edges stay inside the band, so the fitted width is band - tblInd. Controls on a 468pt page with 5.4pt outer cell margins cover 0pt and 18pt side margins, tblInd of +5.4pt, +36pt and -36pt, saved grids of 478.8pt and of exactly band - tblInd, noWrap on and off, and compatibility modes 14 and 15; with zero side margins a mode-14 table overflows the page and a -36pt indent carries the table past the left page edge in both modes. The two-cell forced-fit margin distribution uses the outer margins in both modes. Centered, trailing, preferred-width, floating, nested, and vertical-text tables are outside this observation.',
+});
+
+export const WORD_AUTOFIT_CONTENT_COLUMN_GROWTH = defineCompatibilityRule({
+  id: 'word-autofit-content-column-growth',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'autofit-nowrap-page-boundary-compat-mode-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'In a top-level auto-width AutoFit table, Word grows a column whose cells have no preferred width past its saved tblGrid width toward its content width, up to the AutoFit ceiling. The mode-14 control with a 426.6pt saved grid on a 432pt text band and a +5.4pt tblInd fits to 437.4pt with a long unbroken-at-band first cell. Only one growing column is observed; sharing room among several growing columns in proportion to their deficits is a solver policy, not an observation.',
 });
 
 export const WORD_AUTOFIT_NOWRAP_AUTO_FORCED_FIT = defineCompatibilityRule({

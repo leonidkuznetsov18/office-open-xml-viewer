@@ -2610,26 +2610,31 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
     let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
     // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
     // direct `w:compat` boolean. The setting is off when absent.
-    let enable_open_type_features = compat
-        .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
-        .and_then(|compat| {
-            compat
-                .children()
-                .find(|node| {
+    let word_compat_setting = |name: &str| -> Option<String> {
+        compat
+            .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
+            .and_then(|compat| {
+                compat.children().find(|node| {
                     node.is_element()
                         && node.tag_name().name() == "compatSetting"
                         && node.tag_name().namespace() == root.tag_name().namespace()
-                        && attr_w(*node, "name").as_deref() == Some("enableOpenTypeFeatures")
+                        && attr_w(*node, "name").as_deref() == Some(name)
                         && attr_w(*node, "uri").as_deref()
                             == Some("http://schemas.microsoft.com/office/word")
                 })
-                .and_then(|node| attr_w(node, "val"))
-                .and_then(|value| match value.as_str() {
-                    "1" | "true" | "on" => Some(true),
-                    "0" | "false" | "off" => Some(false),
-                    _ => None,
-                })
+            })
+            .and_then(|node| attr_w(node, "val"))
+    };
+    let enable_open_type_features =
+        word_compat_setting("enableOpenTypeFeatures").and_then(|value| match value.as_str() {
+            "1" | "true" | "on" => Some(true),
+            "0" | "false" | "off" => Some(false),
+            _ => None,
         });
+    // [MS-DOCX] `compatibilityMode` names the Word version whose layout rules
+    // apply. Absence is surfaced as None; the renderer owns that default.
+    let compatibility_mode =
+        word_compat_setting("compatibilityMode").and_then(|value| value.trim().parse::<u32>().ok());
     let use_fe_layout = compat_bool("useFELayout");
     let balance_single_byte_double_byte_width = compat_bool("balanceSingleByteDoubleByteWidth");
     let adjust_line_height_in_table = compat_bool("adjustLineHeightInTable");
@@ -2658,6 +2663,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
         && adjust_line_height_in_table.is_none()
+        && compatibility_mode.is_none()
     {
         return None;
     }
@@ -2673,6 +2679,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         use_fe_layout,
         balance_single_byte_double_byte_width,
         adjust_line_height_in_table,
+        compatibility_mode,
     })
 }
 
@@ -17363,6 +17370,41 @@ mod math_jc_tests {
 
         let empty = r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         assert!(parse_document_settings(empty).is_none());
+    }
+
+    // [MS-DOCX] compatibilityMode is a Word-namespace compatSetting; only a
+    // well-formed integer value with the Word URI is surfaced.
+    #[test]
+    fn settings_compatibility_mode_surfaces() {
+        let settings = |body: &str| {
+            format!(
+                r#"<w:settings xmlns:w="{w}"><w:compat>{body}</w:compat></w:settings>"#,
+                w = W_NS
+            )
+        };
+        let word = r#"w:uri="http://schemas.microsoft.com/office/word""#;
+        let mode = |body: String| {
+            parse_document_settings(&settings(&body)).and_then(|s| s.compatibility_mode)
+        };
+        assert_eq!(
+            mode(format!(
+                r#"<w:compatSetting w:name="compatibilityMode" {word} w:val="15"/>"#
+            )),
+            Some(15)
+        );
+        assert_eq!(
+            mode(format!(
+                r#"<w:compatSetting w:name="compatibilityMode" {word} w:val="x"/>"#
+            )),
+            None
+        );
+        assert_eq!(
+            mode(
+                r#"<w:compatSetting w:name="compatibilityMode" w:uri="urn:other" w:val="15"/>"#
+                    .to_string()
+            ),
+            None,
+        );
     }
 
     // ECMA-376 Part 1 §17.15.1.18 / §17.15.3.3 and Part 4 §14.8.3.50 — East

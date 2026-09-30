@@ -455,6 +455,39 @@ function noWrapPreferredFloors(
   return floors;
 }
 
+/** WORD_AUTOFIT_CONTENT_COLUMN_GROWTH (table-compatibility.ts): §17.4.49
+ * makes tblGrid only the initial grid. A column whose every cell lacks a
+ * preferred width (§17.4.71 auto or omitted) and wants more than its saved
+ * width grows toward its maximum content width while the table stays within
+ * the AutoFit ceiling. §17.18.87 does not prescribe how simultaneous deficits
+ * share the room; splitting it by each deficit is a deterministic solver
+ * policy, not a compatibility constant. */
+function growUnpreferredColumns(
+  widths: number[],
+  maximums: readonly number[],
+  cells: readonly TableColumnCellConstraint[],
+  availableWidthPt: number,
+): void {
+  const roomPt = availableWidthPt - widths.reduce((sum, width) => sum + width, 0);
+  if (roomPt <= EPSILON_PT) return;
+  const eligible = widths.map(() => true);
+  for (const cell of cells) {
+    if (cell.preferredWidth === null && cell.columnSpan === 1) continue;
+    const start = Math.max(0, cell.columnStart);
+    const end = Math.min(widths.length, start + Math.max(1, cell.columnSpan));
+    for (let column = start; column < end; column += 1) eligible[column] = false;
+  }
+  const deficits = widths.map((width, column) => (eligible[column]
+    ? Math.max(0, (maximums[column] ?? 0) - width)
+    : 0));
+  const totalDeficitPt = deficits.reduce((sum, deficit) => sum + deficit, 0);
+  if (totalDeficitPt <= EPSILON_PT) return;
+  const growPt = Math.min(roomPt, totalDeficitPt);
+  deficits.forEach((deficit, column) => {
+    widths[column] = (widths[column] ?? 0) + growPt * deficit / totalDeficitPt;
+  });
+}
+
 function fitToAvailableWidth(
   widths: number[],
   minimums: readonly number[],
@@ -588,6 +621,9 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
   const transferFloors = noWrapPreferredFloors(widths, minimums, cells);
   for (const cell of cells) {
     enforceContentConstraint(widths, minimums, transferFloors, maximums, cell);
+  }
+  if (input.growUnpreferredColumns === true && input.tablePreferredWidthPt === null) {
+    growUnpreferredColumns(widths, maximums, cells, finiteNonNegative(input.availableWidthPt));
   }
   return Object.freeze(fitToAvailableWidth(
     widths,
