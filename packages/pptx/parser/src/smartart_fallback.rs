@@ -497,6 +497,8 @@ fn default_run() -> TextRunData {
         font_family_ea: None,
         font_family_cs: None,
         font_family_sym: None,
+        lang: None,
+        alt_lang: None,
         baseline: None,
         caps: None,
         letter_spacing: None,

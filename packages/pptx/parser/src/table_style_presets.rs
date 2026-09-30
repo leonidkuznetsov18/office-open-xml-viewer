@@ -960,7 +960,7 @@ pub fn lookup_builtin_table_style(
     // built-in style that PowerPoint wrote into a deck's tableStyles.xml does,
     // and an un-copied Medium Style 2 cell rendered in the master's minor font
     // (issue #1620).
-    style.whole_tbl.text.font = Some("+mn-lt".to_owned());
+    style.whole_tbl.text.font = Some(crate::TableStyleFont::Collection("+mn"));
     Some(style)
 }
 

@@ -209,6 +209,13 @@ pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
                 map.insert(format!("{prefix}-{axis}"), typeface.clone());
             }
         }
+        // CT_SupplementalFont (§20.1.4.1.16): the per-script faces a theme
+        // token resolves to for a run whose language selects that script
+        // (issue #1627). A script with conflicting duplicates is ambiguous
+        // and names no face.
+        for (script, typeface) in unique_script_faces(&group.supplemental) {
+            map.insert(theme_script_key(prefix, script), typeface.to_owned());
+        }
     }
 
     let root = doc.root_element();
@@ -353,6 +360,37 @@ pub(crate) fn parse_clr_map_ovr(xml: &str) -> Option<HashMap<String, String>> {
     Some(parse_clr_map_node(override_node))
 }
 
+/// Aggregate supplemental fonts in one pass: each script maps to its face, or
+/// to nothing when duplicate entries disagree (the same semantics as
+/// `ThemeFontGroup::typeface_for_script`, without its per-script rescan).
+fn unique_script_faces(fonts: &[ooxml_common::theme::ThemeSupplementalFont]) -> Vec<(&str, &str)> {
+    let mut faces: HashMap<&str, Option<&str>> = HashMap::with_capacity(fonts.len());
+    let mut order = Vec::new();
+    for font in fonts {
+        match faces.get_mut(font.script.as_str()) {
+            Some(existing) => {
+                if existing.is_some_and(|face| face != font.typeface) {
+                    *existing = None;
+                }
+            }
+            None => {
+                faces.insert(&font.script, Some(&font.typeface));
+                order.push(font.script.as_str());
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|script| faces[script].map(|face| (script, face)))
+        .collect()
+}
+
+/// Theme-map key of a major (`+mj`) or minor (`+mn`) supplemental script
+/// font, e.g. `+mn-script-Jpan`.
+pub(crate) fn theme_script_key(set_prefix: &str, script: &str) -> String {
+    format!("{set_prefix}-script-{script}")
+}
+
 /// Resolve a theme typeface reference (e.g. "+mj-lt") to the actual font family name.
 /// If the typeface starts with '+' and has a matching entry in the theme map (added by
 /// parse_theme_colors from the fontScheme), returns the resolved name; otherwise returns
@@ -422,6 +460,49 @@ impl ooxml_common::color::ThemeResolver for PptxSchemeResolver<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supplemental_script_fonts_are_aggregated_once_and_conflicts_name_no_face() {
+        use ooxml_common::theme::ThemeSupplementalFont;
+        let font = |script: &str, typeface: &str| ThemeSupplementalFont {
+            script: script.to_owned(),
+            typeface: typeface.to_owned(),
+        };
+        let mut fonts: Vec<_> = (0..48_000)
+            .map(|i| font(&format!("S{i}"), &format!("F{i}")))
+            .collect();
+        fonts.extend([
+            font("Jpan", "Yu Mincho"),
+            font("Jpan", "Yu Mincho"),
+            font("Hebr", "David"),
+            font("Hebr", "Arial"),
+        ]);
+        // One pass: the former per-entry rescan was quadratic in the entry
+        // count (48,000 entries took seconds).
+        let started = std::time::Instant::now();
+        let faces: HashMap<_, _> = unique_script_faces(&fonts).into_iter().collect();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(faces.get("S47999"), Some(&"F47999"));
+        assert_eq!(faces.get("Jpan"), Some(&"Yu Mincho"));
+        assert_eq!(
+            faces.get("Hebr"),
+            None,
+            "conflicting duplicates name no face"
+        );
+
+        let map = parse_theme_colors(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="F"><a:majorFont><a:latin typeface="A"/></a:majorFont><a:minorFont><a:latin typeface="B"/><a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Hebr" typeface="David"/><a:font script="Hebr" typeface="Arial"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
+        );
+        assert_eq!(
+            map.get("+mn-script-Jpan").map(String::as_str),
+            Some("Yu Mincho")
+        );
+        assert_eq!(map.get("+mn-script-Hebr"), None);
+    }
+
     use super::*;
     use std::io::{Cursor, Write};
 
