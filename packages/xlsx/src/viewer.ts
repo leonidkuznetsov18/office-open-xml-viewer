@@ -80,7 +80,10 @@ import {
 } from './internal/sheet-viewer-runtime.js';
 import { CanvasSurface, SheetOverlayHost } from './internal/sheet-surface.js';
 import { withXlsxRenderCommitGuard } from './render-orchestrator.js';
-import { worksheetContentBounds } from './internal/worksheet-content-bounds.js';
+import {
+  DEFAULT_WORKSHEET_CONTENT_MINIMUMS,
+  worksheetContentBounds,
+} from './internal/worksheet-content-bounds.js';
 import type { XlsxSheetLoadOptions } from './delimited-text.js';
 
 export type { XlsxSheetLoadOptions } from './delimited-text.js';
@@ -163,6 +166,21 @@ export interface XlsxSheetViewerOptions extends LoadOptions {
    * disabled.
    */
   showScrollbars?: boolean;
+  /**
+   * Minimum number of worksheet rows included in the grid and fit calculations.
+   * Content, drawings, and frozen panes can extend it further. Default: 50.
+   */
+  minRows?: number;
+  /**
+   * Minimum number of worksheet columns included in the grid and fit
+   * calculations. Content, drawings, and frozen panes can extend it further.
+   * Default: 26.
+   */
+  minCols?: number;
+  /** Additional blank rows after the resolved grid extent. Default: 30. */
+  marginRows?: number;
+  /** Additional blank columns after the resolved grid extent. Default: 10. */
+  marginCols?: number;
   /** Lower/upper bounds for the zoom slider as scale factors. Default 0.1–4
    *  (10%–400%, matching Excel's zoom range). Also the clamp range for the IX9
    *  {@link ZoomableViewer} zoom contract ({@link XlsxViewer.setScale} etc.). */
@@ -292,6 +310,38 @@ export interface XlsxViewerOptions extends XlsxSheetViewerOptions {
 type InternalXlsxViewerOptions = (XlsxViewerOptions | XlsxSheetViewerOptions) & {
   [borrowedWorkbookOption]?: XlsxWorkbook;
 };
+
+interface GridExtentOptions {
+  readonly minRows: number;
+  readonly minCols: number;
+  readonly marginRows: number;
+  readonly marginCols: number;
+}
+
+function gridExtentOption(value: number | undefined, fallback: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+  return resolved;
+}
+
+function resolveGridExtentOptions(options: XlsxSheetViewerOptions): GridExtentOptions {
+  return {
+    minRows: gridExtentOption(
+      options.minRows,
+      DEFAULT_WORKSHEET_CONTENT_MINIMUMS.minRows,
+      'minRows',
+    ),
+    minCols: gridExtentOption(
+      options.minCols,
+      DEFAULT_WORKSHEET_CONTENT_MINIMUMS.minCols,
+      'minCols',
+    ),
+    marginRows: gridExtentOption(options.marginRows, 30, 'marginRows'),
+    marginCols: gridExtentOption(options.marginCols, 10, 'marginCols'),
+  };
+}
 
 export interface XlsxViewportOffset {
   /** Horizontal CSS-pixel offset from the logical start edge (column A side). */
@@ -448,6 +498,7 @@ class XlsxViewerEngine implements ZoomableViewer {
   private readonly notifier: SelectionNotifier;
   /** Bounded range-context extraction for getSelectionContext(). */
   private readonly contextReader = new SelectionContextReader();
+  private readonly gridExtent: GridExtentOptions;
   private elementContext: XlsxElementContext | null = null;
   /** Selection / object-context overlay painter. */
   private readonly selectionPaint: SelectionOverlay;
@@ -484,6 +535,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (!hostWindow) throw new Error('XlsxViewer requires a document with an active Window');
     this.hostWindow = hostWindow;
     this.opts = opts;
+    this.gridExtent = resolveGridExtentOptions(opts);
     this._mountKind = mount.kind;
     this._nativeScrollbars = opts.showScrollbars ?? true;
     const borrowedWorkbook = (opts as InternalXlsxViewerOptions)[borrowedWorkbookOption];
@@ -2053,11 +2105,11 @@ class XlsxViewerEngine implements ZoomableViewer {
   }
 
   /** Natural (unscaled, cs=1) CSS-px extent of a worksheet's used data range:
-   *  the row/column header plus every used column width / row height. Mirrors
-   *  {@link updateSpacerSize} at cs=1 (same used-range detection) so the fit
-   *  targets exactly the region the spacer/scroll extent covers. */
+   *  the row/column header plus every used column width / row height. Uses the
+   *  same content bounds and configured minimums as {@link updateSpacerSize},
+   *  but deliberately excludes its trailing scroll headroom. */
   private _naturalContentExtent(ws: Worksheet): { width: number; height: number } {
-    const { maxRow, maxCol } = worksheetContentBounds(ws);
+    const { maxRow, maxCol } = worksheetContentBounds(ws, this.gridExtent);
     return getGridGeometryForWorksheet(ws).logicalContentExtent(
       maxRow,
       maxCol,
@@ -2072,9 +2124,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     const freezeCols = ws.freezeCols ?? 0;
 
     // Find actual scrollable data extent
-    let { maxRow, maxCol } = worksheetContentBounds(ws);
-    maxRow += 30;
-    maxCol += 10;
+    let { maxRow, maxCol } = worksheetContentBounds(ws, this.gridExtent);
+    maxRow += this.gridExtent.marginRows;
+    maxCol += this.gridExtent.marginCols;
 
     // Spacer = rounded header + cumulative per-band-rounded geometry.
     const extent = getGridGeometryForWorksheet(ws).roundedContentExtent(
