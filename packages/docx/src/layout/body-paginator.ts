@@ -2522,8 +2522,24 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
     // Exclusions of drawings anchored in earlier paragraphs of this page, with
     // the top of their anchor paragraph.
     const earlier: Array<Readonly<{ paragraphTopPt: number; bounds: LayoutRect }>> = [];
+    // Line bands of the paragraphs already laid out on this page: a carry
+    // that meets none of them cannot change the page.
+    const earlierBands: Array<Readonly<{ topPt: number; bottomPt: number }>> = [];
     for (const node of page.layers.body) {
-      if (node.kind !== 'paragraph' || node.drawings.length === 0) continue;
+      if (node.kind !== 'paragraph') continue;
+      const bands = node.lines.length > 0
+        ? node.lines.map((line) => Object.freeze({
+          topPt: line.bounds.yPt,
+          bottomPt: line.bounds.yPt + line.bounds.heightPt,
+        }))
+        : [Object.freeze({
+          topPt: node.flowBounds.yPt,
+          bottomPt: node.flowBounds.yPt + node.flowBounds.heightPt,
+        })];
+      if (node.drawings.length === 0) {
+        earlierBands.push(...bands);
+        continue;
+      }
       const owned = new Set((node.anchorCollisions ?? []).map((entry) => entry.occurrenceId));
       const ownedExclusions = node.exclusions.filter((exclusion) => (
         exclusion.anchorOccurrenceId !== undefined && owned.has(exclusion.anchorOccurrenceId)
@@ -2534,6 +2550,7 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
       })));
       if (node.continuation?.continuesFromPrevious) {
         pending();
+        earlierBands.push(...bands);
         continue;
       }
       const exclusions = new Map(node.exclusions.flatMap((exclusion) => (
@@ -2574,6 +2591,12 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
           : undefined;
         const touch = touchFromPt !== undefined;
         if (!(topPt < paragraphTopPt) && !touch) continue;
+        const bottomPt = topPt + exclusion.bounds.heightPt;
+        const meetsEarlierLine = earlierBands.some((band) => (
+          (band.topPt < bottomPt && band.bottomPt > topPt)
+          || (touch && band.bottomPt === topPt && band.topPt >= touchFromPt!)
+        ));
+        if (!meetsEarlierLine) continue;
         const occurrenceId = acquisitionIds.get(collision.occurrenceId);
         if (occurrenceId === undefined) continue;
         plan.set(occurrenceId, Object.freeze({
@@ -2600,6 +2623,7 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
         }));
       }
       pending();
+      earlierBands.push(...bands);
     }
   }
   return plan;
