@@ -456,8 +456,12 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     return;
   }
 
-  // Absolute position on the line measured from paraX (line origin for continuation lines)
-  const absFromParaX = breakerState.currentWidth + (breakerState.isFirst ? firstIndent : 0);
+  // §17.3.1.37 / §17.3.3.23: tab targets retain their paragraph/margin
+  // reference even when a float shifts this line's start. Use the same
+  // paraX-relative origin as planLine; omitting the window offset adds it
+  // again to every target at placement, and aligned cells bypass text fitting.
+  const absFromParaX = breakerState.lineXOffset + breakerState.currentWidth
+    + (breakerState.isFirst ? firstIndent : 0);
 
   // ── ECMA-376 §17.3.3.23 absolute-position tab (<w:ptab>) ──────────────
   // A ptab ignores the paragraph's custom tab stops and the default-tab
