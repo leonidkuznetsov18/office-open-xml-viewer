@@ -91,6 +91,7 @@ const DEFAULT_METRICS = { advance: 0.5, ascent: 0.8, descent: 0.2 };
 function recordingCanvas(available: ReadonlySet<string>) {
   let font = '10px serif';
   const calls: { text: string; font: string; face: string }[] = [];
+  const measurements: { text: string; face: string; width: number }[] = [];
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const noop = () => {};
   const ctx = new Proxy({
@@ -100,8 +101,10 @@ function recordingCanvas(available: ReadonlySet<string>) {
     measureText: (text: string) => {
       const metrics = selectedFace(font, text, available) === 'Noto Naskh Arabic'
         ? NASKH_METRICS : DEFAULT_METRICS;
+      const width = [...text].length * px() * metrics.advance;
+      measurements.push({ text, face: selectedFace(font, text, available), width });
       return {
-        width: [...text].length * px() * metrics.advance,
+        width,
         fontBoundingBoxAscent: px() * metrics.ascent,
         fontBoundingBoxDescent: px() * metrics.descent,
         actualBoundingBoxAscent: px() * metrics.ascent,
@@ -122,7 +125,7 @@ function recordingCanvas(available: ReadonlySet<string>) {
     },
   });
   const canvas = { width: 0, height: 0, style: {}, getContext: () => ctx };
-  return { canvas: canvas as unknown as HTMLCanvasElement, calls };
+  return { canvas: canvas as unknown as HTMLCanvasElement, calls, measurements };
 }
 
 const loaded = (family: string) =>
@@ -227,6 +230,67 @@ describe('script-scoped Arabic visual substitutes', () => {
       .map((call) => [call.text, call.face, cssFamilies(call.font)[0]]);
   };
 
+  it.each([
+    ['ما ١٢a', false, false],
+    ['م\u0301رحبا', true, true],
+    ['ما ١٢', true, false],
+    ['ما ' + '١٢'.repeat(60) + 'a', false, false],
+  ])('retains the same scoped face in measurement and paint: %s', async (text, rtl, hint) => {
+    const body = '<w:p><w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
+      + ' w:hAnsi="Sakkal Majalla" w:eastAsia="Sakkal Majalla" w:cs="Sakkal Majalla"'
+      + `${hint ? ' w:hint="eastAsia"' : ''}/>${rtl ? '<w:rtl/>' : ''}<w:sz w:val="20"/>`
+      + `</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+    const model = parse(docx(body));
+    const { canvas, calls, measurements } = recordingCanvas(new Set(WEB_FACES));
+    await renderDocumentToCanvas(model, canvas, 0, {
+      dpr: 1, width: 612,
+      layoutServices: createLayoutServices(model, {
+        useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+        measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      }),
+    });
+    const probe = hint ? '\u0301' : '١';
+    const measured = measurements.filter((entry) => entry.text.includes(probe));
+    expect(measured.length).toBeGreaterThan(0);
+    expect(measured.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
+    const painted = calls.filter((entry) => entry.text.includes(probe));
+    expect(painted.length).toBeGreaterThan(0);
+    expect(painted.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
+    if (!hint && text.length < 10) {
+      expect(measurements).toContainEqual({ text: '١٢', face: 'Noto Naskh Arabic', width: 18 });
+    }
+  });
+
+  it('shares scoped word shapes across 4,000 offsets and different run contexts', async () => {
+    const context = 'ما ' + '١٢ '.repeat(4000);
+    const model = parse(docx(sakkal(context)));
+    const { canvas, calls, measurements } = recordingCanvas(new Set(WEB_FACES));
+    const services = createLayoutServices(model, {
+      useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+    });
+    const fonts = { ascii: 'Sakkal Majalla', highAnsi: 'Sakkal Majalla', complexScript: 'Sakkal Majalla' };
+    const shape = (text: string, context: string, offset: number) => services.text.shape({
+      text, fonts, fontSizePt: 10, measure: false, substituteContext: { text: context, offset },
+    });
+    const first = shape('١٢', context, 3);
+    for (let index = 1; index < 4000; index += 1) {
+      expect(shape('١٢', context, 3 + index * 3)).toBe(first);
+    }
+    expect(shape('١٢', 'مرحبا ١٢', 6)).toBe(first);
+    expect(first.spans[0]?.font.resolvedFamily).toBe('Noto Naskh Arabic');
+    // Identical text outside proven Arabic must never alias that cached shape.
+    const unproven = shape('١٢', 'Leader ١٢', 7);
+    expect(unproven).not.toBe(first);
+    expect(unproven.spans[0]?.font.resolvedFamily).not.toBe('Noto Naskh Arabic');
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 612, layoutServices: services });
+    expect(calls.some((entry) => entry.text.includes('١٢'))).toBe(true);
+    expect(calls.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
+    const digitMeasurements = measurements.filter((entry) => entry.text.includes('١٢'));
+    expect(digitMeasurements.length).toBeGreaterThan(0);
+    expect(digitMeasurements.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
+  }, 20_000);
+
   it('merges joined Arabic across slots when both resolve to the same substitute face', async () => {
     // U+08A0 is a highAnsi scalar; the two requested families both resolve to
     // the Noto Naskh Arabic substitute face.
@@ -294,11 +358,11 @@ describe('script-scoped Arabic visual substitutes', () => {
       .toEqual(['Noto Naskh Arabic', 'serif']);
   });
 
-  it('gives a complex-script span containing Arabic to the substitute as a whole', async () => {
-    // The ASCII "!" shares the Arabic bidi run and the cs slot span.
+  it('uses the shared scope rule for Latin punctuation in complex-script spans', async () => {
+    // ASCII punctuation is other in the shared rule, even in the cs slot.
     const model = parse(docx(sakkal('مرحبا! بكم', true)));
     const [family] = await paintedFamilies(model, ['!']);
-    expect(family).toBe('Noto Naskh Arabic');
+    expect(family).toBe('serif');
   });
 
   it('draws vocalised Arabic once with the substitute, never splitting marks from letters', async () => {

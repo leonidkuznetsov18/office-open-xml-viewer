@@ -6,7 +6,7 @@ import {
   computePreparedLineFloatWindow,
   type PreparedFloatWrap,
 } from '../float-layout.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
@@ -729,8 +729,7 @@ export function performStrNaturalAdvance(
   };
   if (s.textLayoutService && s.textShapeRequest) {
     const shaped = s.textLayoutService.shape({
-      ...s.textShapeRequest,
-      text,
+      ...sliceTextShapeRequest(s.textShapeRequest, Math.max(0, start), Math.max(0, start) + text.length),
       fontSizePt: effectiveFontPx(s),
       measure: true,
       clusterGeometry: false,

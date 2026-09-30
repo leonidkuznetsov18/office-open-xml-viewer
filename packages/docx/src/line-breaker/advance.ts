@@ -1,5 +1,5 @@
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { EAST_ASIAN_RE } from '../layout/text.js';
+import { EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
 import { wordBalancedSpaceCellAdjustmentApplies } from '../layout/line-compatibility.js';
 import { type DocGridCtx, type LayoutSeg, type LayoutTextSeg } from './model.js';
 
@@ -209,9 +209,12 @@ export function slicedTextMetadata(
   start: number,
   end: number,
 ): Pick<LayoutTextSeg,
-  'punctuationCompressions' | 'noBreakRanges' | 'externalLinkBreakOffsets'
+  'punctuationCompressions' | 'noBreakRanges' | 'externalLinkBreakOffsets' | 'textShapeRequest'
 > {
   return {
+    ...(seg.textShapeRequest
+      ? { textShapeRequest: sliceTextShapeRequest(seg.textShapeRequest, start, end) }
+      : {}),
     punctuationCompressions: slicedPunctuationCompressions(seg, start, end),
     noBreakRanges: slicedNoBreakRanges(seg, start, end),
     externalLinkBreakOffsets: slicedExternalLinkBreakOffsets(seg, start, end),
@@ -234,13 +237,13 @@ export function slicedExternalLinkBreakOffsets(
 export function tightHorizontalGraphemeInk(
   segment: LayoutTextSeg,
   grapheme: string,
+  start = 0,
 ): Readonly<{ advancePt: number; xMinPt: number; xMaxPt: number }> | undefined {
   if (!segment.textLayoutService || !segment.textShapeRequest || grapheme.length === 0) {
     return undefined;
   }
   const shaped = segment.textLayoutService.shape({
-    ...segment.textShapeRequest,
-    text: grapheme,
+    ...sliceTextShapeRequest(segment.textShapeRequest, start, start + grapheme.length),
     measure: true,
     clusterGeometry: false,
   });
@@ -325,7 +328,7 @@ export function retainHorizontalPunctuationInkClearance(segs: LayoutSeg[]): void
       if (end <= start) continue;
       const compressionIndex = compressionIndexByEnd.get(end);
       const currentInk = pending || compressionIndex !== undefined
-        ? tightHorizontalGraphemeInk(segment, segment.text.slice(start, end))
+        ? tightHorizontalGraphemeInk(segment, segment.text.slice(start, end), start)
         : undefined;
       if (pending && currentInk) {
         const adjustments = adjustedBySegment.get(pending.segment)

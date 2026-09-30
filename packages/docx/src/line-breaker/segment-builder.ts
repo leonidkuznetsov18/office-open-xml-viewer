@@ -18,7 +18,7 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
@@ -830,6 +830,7 @@ function pushSegmentPiece(
   authoritativeSpan?: TextShapeSpan,
   compressCharacterWhitespace = false,
   mappedSymbolUnicode = false,
+  substituteContext?: TextShapeRequest['substituteContext'],
 ): void {
   const {
     base,
@@ -915,13 +916,19 @@ function pushSegmentPiece(
   const style = italic ? ('italic' as const) : ('normal' as const);
   // Locate this piece in the run's display text (pieces are emitted in order).
   const scopeContext = emissionState.scopeContext;
-  const contextOffset = scopeContext ? scopeContext.text.indexOf(text, scopeContext.cursor) : -1;
-  if (scopeContext && contextOffset >= 0) scopeContext.cursor = contextOffset + text.length;
+  const contextOffset = substituteContext?.offset
+    ?? (scopeContext ? scopeContext.text.indexOf(text, scopeContext.cursor) : -1);
+  // A parent token advances the cursor once. Children receive its exact range;
+  // re-searching after that advance loses proof outside the child span.
+  if (!substituteContext && scopeContext && contextOffset >= 0) {
+    scopeContext.cursor = contextOffset + text.length;
+  }
+  const retainedContext = substituteContext
+    ?? (scopeContext && contextOffset >= 0
+      ? Object.freeze({ text: scopeContext.text, offset: contextOffset }) : undefined);
   const textShapeRequest: TextShapeRequest = Object.freeze({
     text,
-    ...(scopeContext && contextOffset >= 0 && scopeContext.text.length > text.length
-      ? { substituteContext: Object.freeze({ text: scopeContext.text, offset: contextOffset }) }
-      : {}),
+    ...(retainedContext ? { substituteContext: retainedContext } : {}),
     fontSizePt: cs ? csFontSize : base.fontSize,
     // A successfully decoded Symbol/Wingdings code point is Unicode text,
     // not a request for the legacy font encoding. Clear every authored
@@ -968,8 +975,7 @@ function pushSegmentPiece(
             )
               continue;
             const measured = environment.layoutServices?.text.shape({
-              ...textShapeRequest,
-              text: compressedGrapheme,
+              ...sliceTextShapeRequest(textShapeRequest, start, end),
               measure: true,
               clusterGeometry: false,
             });
@@ -1139,7 +1145,10 @@ function emitResolvedTextSegment(
         [...span.text].some((grapheme) =>
           characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
         );
-      pushSegmentPiece(emissionState, span.text, spanCs, spanFamily, span, compressedSpan);
+      pushSegmentPiece(
+        emissionState, span.text, spanCs, spanFamily, span, compressedSpan, mappedSymbolUnicode,
+        sliceTextShapeRequest(textShapeRequest, span.start, span.end).substituteContext,
+      );
     }
     return;
   }
