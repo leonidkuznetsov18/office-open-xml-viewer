@@ -2161,18 +2161,18 @@ pub(crate) fn resolve_table_cell_style(
 /// * No list-style language: cells take neither the defaultTextStyle nor the
 ///   otherStyle faces (#1628), so only the cell's own lang / altLang apply.
 pub(crate) fn table_cell_chain(
-    style_face: Option<&str>,
+    style_font: Option<&str>,
     theme: &HashMap<String, String>,
 ) -> LevelRunProperties {
-    let set = style_face
-        .and_then(theme_token_set)
-        .or(if style_face.is_none() {
-            Some("+mn")
-        } else {
-            None
-        });
-    let face = style_face
-        .map(str::to_owned)
+    // The collection a tcTxStyle fontRef names holds for ea/cs whether or not
+    // its Latin face is usable: take it from the authored value before the
+    // Latin face falls back.
+    let set = match style_font {
+        Some(font) => theme_token_set(font),
+        None => Some("+mn"),
+    };
+    let face = style_font
+        .and_then(|font| resolve_latin_face(font, theme))
         .or_else(|| resolve_latin_face("+mn-lt", theme))
         .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
     std::array::from_fn(|_| {
@@ -2308,13 +2308,11 @@ pub(crate) fn parse_table(
     let last_row_idx = row_count.saturating_sub(1);
     // The table-style tier of each cell's text is known from its position, so
     // the cell text is parsed over it (see `table_cell_chain`).
-    let cell_face = |ri: usize, ci: usize| -> Option<String> {
+    let cell_font = |ri: usize, ci: usize| -> Option<String> {
         let s = style?;
         resolve_table_cell_style(s, style_flags, ri, ci, row_count, col_count)
             .text
             .font
-            .as_deref()
-            .and_then(|face| resolve_latin_face(face, theme))
     };
     let mut rows: Vec<TableRow> = row_nodes
         .iter()
@@ -2327,7 +2325,7 @@ pub(crate) fn parse_table(
                 source_dir,
                 &default_text.table,
                 zip,
-                |ci| table_cell_chain(cell_face(ri, ci).as_deref(), theme),
+                |ci| table_cell_chain(cell_font(ri, ci).as_deref(), theme),
             )
         })
         .collect();
@@ -3670,6 +3668,52 @@ mod style_ref_tests {
     use crate::master::LayoutPlaceholders;
     use crate::theme::PptxTheme;
     use std::io::Cursor;
+
+    /// Issue #1627 review: a tcTxStyle fontRef names its theme collection for
+    /// ea/cs even when that collection's Latin face is empty, so the Latin
+    /// face falls back (theme minor) while Japanese and Hebrew keep the MAJOR
+    /// script fonts.
+    #[test]
+    fn table_style_font_ref_collection_survives_an_empty_latin_face() {
+        let theme: HashMap<String, String> = [
+            ("+mn-lt", "Corbel"),
+            ("+mj-script-Jpan", "MajorJpan"),
+            ("+mj-script-Hebr", "MajorHebr"),
+            ("+mn-script-Jpan", "MinorJpan"),
+            ("+mn-script-Hebr", "MinorHebr"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let xml = r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:txBody><a:bodyPr/>
+            <a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+            <a:p><a:r><a:rPr lang="he-IL"/><a:t>b</a:t></a:r></a:p></a:txBody></a:tc>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = empty_zip();
+        let chain = table_cell_chain(Some("+mj-lt"), &theme);
+        let cell = parse_table_cell_with_chain(
+            doc.root_element(),
+            &theme,
+            &HashMap::new(),
+            "ppt/slides",
+            &crate::master::TableTextLevels::default(),
+            &chain,
+            &mut zip,
+        );
+        let runs: Vec<_> = cell
+            .text_body
+            .unwrap()
+            .paragraphs
+            .into_iter()
+            .map(|p| match p.runs.into_iter().next() {
+                Some(TextRun::Text(t)) => t,
+                other => panic!("expected text, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(runs[0].font_family.as_deref(), Some("Corbel"));
+        assert_eq!(runs[0].font_family_ea.as_deref(), Some("MajorJpan"));
+        assert_eq!(runs[1].font_family_cs.as_deref(), Some("MajorHebr"));
+    }
 
     fn empty_zip() -> PptxZip {
         let mut bytes = Vec::new();
