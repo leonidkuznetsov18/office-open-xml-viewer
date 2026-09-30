@@ -6,7 +6,7 @@ import {
 } from '@silurus/ooxml-core';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
 import type { OfficeFontFallbackRoute } from '@silurus/ooxml-core';
-import { DOCX_GOOGLE_FONTS } from '../google-fonts.js';
+import { DOCX_GOOGLE_FONTS } from '../google-font-registry.js';
 import type { LoadedEmbeddedFontRoute } from '../embedded-fonts.js';
 import { normalizeFontFamilyUncached } from '../line-layout.js';
 import type { LayoutSourceStore } from './layout-source-store.js';
@@ -57,6 +57,9 @@ export interface ProductionLayoutServiceOptions {
   /** Exact local registrations, scoped to this FontFaceSet. */
   readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
   readonly googleFaces?: readonly LoadedFontFaceRecord[];
+  /** Normalized families whose authored face is installed; they are never
+   * routed to a different-family Google substitute (`docxGoogleFontPlan`). */
+  readonly installedSubstituteFamilies?: readonly string[];
 }
 
 export function createProductionLayoutServices(
@@ -167,6 +170,8 @@ export function createProductionLayoutServices(
       const entry = DOCX_GOOGLE_FONTS[key];
       const resolvedFamily = entry?.loadFamily ?? name;
       if (!entry) continue;
+      if (normalizedFaceFamily(resolvedFamily) !== normalizedFaceFamily(name)
+        && options.installedSubstituteFamilies?.includes(key)) continue;
       for (const loaded of successfulGoogle.filter(
         (face) => face.family === normalizedFaceFamily(resolvedFamily),
       )) {

@@ -584,7 +584,11 @@ function scriptSlot(
   return tableSlot;
 }
 
-function requestedFamily(
+/** ECMA-376 §17.3.2.26 slot family: a present theme reference (even one that
+ * resolved to no name) governs its slot, then the direct slot, then the ascii
+ * theme/direct fallback. Exported so resource preloading requests exactly the
+ * families this shaper will ask the font resolver for. */
+export function requestedFamily(
   request: Readonly<Pick<TextShapeRequest, 'fonts' | 'themeFonts' | 'themeFontPresence'>>,
   slot: FontScriptSlot,
 ): string | null | undefined {
