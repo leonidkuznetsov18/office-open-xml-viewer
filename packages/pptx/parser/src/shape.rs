@@ -12,11 +12,11 @@ use crate::fill::{
     parse_xfrm, EffectLst,
 };
 use crate::master::{DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders};
-use crate::script_font::{resolve_slot_face, theme_token_set, FontSlot};
+use crate::script_font::theme_token_set;
 use crate::text::{
-    complete_level_faces, complete_level_sizes, empty_level_bullets, finalize_latin_face,
-    parse_text_body, resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes,
-    LevelIndents, LevelRunProperties, RunProperties, HARD_DEFAULT_LATIN_FACE,
+    complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
+    resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes, LevelIndents,
+    LevelRunProperties, RunProperties, HARD_DEFAULT_LATIN_FACE,
 };
 use crate::theme::{PptxRawSchemeResolver, PptxSchemeResolver, PptxThemeSource};
 use crate::types::*;
@@ -2139,33 +2139,28 @@ pub(crate) fn resolve_table_cell_style(
     resolved
 }
 
-/// Give every paragraph of a table cell a Latin face: the cell's own formatting
-/// (run, paragraph defRPr, lstStyle — already on the paragraph), else the table
-/// style's tcTxStyle face, else the presentation defaultTextStyle level, else
-/// the hard default. Observed (issue #1620): a cell of a built-in table style
-/// rendered in the master theme's minor font even when defaultTextStyle named
-/// another face. Runs without their own ea/cs face take the tcTxStyle fontRef
-/// collection's ea/cs tokens, else the defaultTextStyle level's, resolved for
-/// the run language like a text box's (issue #1627).
-pub(crate) fn complete_table_cell_faces(
-    cell: &mut TableCell,
+/// The list-level base a table cell's text inherits, built before the cell's
+/// own text is parsed so its lstStyle, paragraph defRPr and runs apply over it
+/// and every theme token resolves with the completed cascade (issue #1627).
+///
+/// * Latin: the table style's tcTxStyle face, else the presentation
+///   defaultTextStyle level, else the hard default. Observed (issue #1620): a
+///   cell of a built-in table style rendered in the master theme's minor font
+///   even when defaultTextStyle named another face.
+/// * ea/cs: a tcTxStyle `fontRef` (CT_FontReference, the element a shape's
+///   p:style uses) names a whole theme collection; the text-box controls
+///   (#1627 N13, N20, I26, P31-P35) show PowerPoint applies a fontRef's
+///   collection to the ea and cs slots as well as Latin, and #1620 S20 shows
+///   the table style's fontRef collection replacing defaultTextStyle for the
+///   cell's Latin face. Without a style fontRef, the defaultTextStyle level's
+///   ea/cs.
+/// * lang / altLang: the defaultTextStyle level's, as for text boxes.
+pub(crate) fn table_cell_chain(
     style_face: Option<&str>,
     default_text: &DefaultTextLevels,
-    theme: &HashMap<String, String>,
-) {
-    let Some(body) = cell.text_body.as_mut() else {
-        return;
-    };
+) -> LevelRunProperties {
     let style_set = style_face.and_then(theme_token_set);
-    for paragraph in &mut body.paragraphs {
-        let level = (paragraph.lvl as usize).min(8);
-        if paragraph.def_font_family.is_none() {
-            let face = style_face
-                .map(str::to_owned)
-                .or_else(|| default_text.faces[level].clone())
-                .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
-            paragraph.def_font_family = finalize_latin_face(face.as_deref(), theme, None);
-        }
+    std::array::from_fn(|level| {
         let (ea, cs) = match style_set {
             Some(set) => (Some(format!("{set}-ea")), Some(format!("{set}-cs"))),
             None => (
@@ -2173,21 +2168,18 @@ pub(crate) fn complete_table_cell_faces(
                 default_text.complex_script[level].clone(),
             ),
         };
-        for run in &mut paragraph.runs {
-            let TextRun::Text(run) = run else { continue };
-            let (lang, alt) = (run.lang.as_deref(), run.alt_lang.as_deref());
-            if run.font_family_ea.is_none() {
-                run.font_family_ea = ea
-                    .as_deref()
-                    .and_then(|f| resolve_slot_face(f, FontSlot::EastAsian, theme, lang, alt));
-            }
-            if run.font_family_cs.is_none() {
-                run.font_family_cs = cs
-                    .as_deref()
-                    .and_then(|f| resolve_slot_face(f, FontSlot::ComplexScript, theme, lang, alt));
-            }
-        }
-    }
+        let face = style_face
+            .map(str::to_owned)
+            .or_else(|| default_text.faces[level].clone())
+            .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
+        RunProperties::script_base(
+            ea,
+            cs,
+            default_text.lang[level].clone(),
+            default_text.alt_lang[level].clone(),
+        )
+        .with_chain_face_and_size(face, None)
+    })
 }
 
 /// Apply the resolved style below direct `tcPr` formatting. This separate step
@@ -2295,14 +2287,6 @@ pub(crate) fn parse_table(
     let col_count = cols.len();
     let last_col_idx = col_count.saturating_sub(1);
 
-    let mut rows: Vec<TableRow> = tbl
-        .children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "tr")
-        .map(|tr| parse_table_row(tr, theme, rels, source_dir, zip))
-        .collect();
-
-    let row_count = rows.len();
-    let last_row_idx = row_count.saturating_sub(1);
     let style_flags = TableStyleFlags {
         first_row,
         last_row,
@@ -2311,6 +2295,31 @@ pub(crate) fn parse_table(
         band_row,
         band_col,
     };
+    let row_nodes: Vec<_> = tbl
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "tr")
+        .collect();
+    let row_count = row_nodes.len();
+    let last_row_idx = row_count.saturating_sub(1);
+    // The table-style tier of each cell's text is known from its position, so
+    // the cell text is parsed over it (see `table_cell_chain`).
+    let cell_face = |ri: usize, ci: usize| -> Option<String> {
+        let s = style?;
+        resolve_table_cell_style(s, style_flags, ri, ci, row_count, col_count)
+            .text
+            .font
+            .as_deref()
+            .and_then(|face| resolve_latin_face(face, theme))
+    };
+    let mut rows: Vec<TableRow> = row_nodes
+        .iter()
+        .enumerate()
+        .map(|(ri, tr)| {
+            parse_table_row_with(*tr, theme, rels, source_dir, zip, |ci| {
+                table_cell_chain(cell_face(ri, ci).as_deref(), default_text)
+            })
+        })
+        .collect();
 
     // Apply table style fills and borders to each cell
     for (ri, row) in rows.iter_mut().enumerate() {
@@ -2318,19 +2327,12 @@ pub(crate) fn parse_table(
             if let Some(s) = style {
                 let effective =
                     resolve_table_cell_style(s, style_flags, ri, ci, row_count, col_count);
-                let style_face = effective
-                    .text
-                    .font
-                    .as_deref()
-                    .and_then(|face| resolve_latin_face(face, theme));
-                complete_table_cell_faces(cell, style_face.as_deref(), default_text, theme);
 
                 // Direct `tcPr` formatting is the final tier. The presence flags
                 // preserve an authored noFill/no-line, which is not equivalent to
                 // an omitted property inheriting the table style.
                 apply_resolved_table_cell_style(cell, effective);
             } else {
-                complete_table_cell_faces(cell, None, default_text, theme);
                 // ── Fallback for built-in styles not defined in tableStyles.xml ──
                 // Approximate "Medium Style 2": accent1 header fill + thin outer box + row separators.
                 let thin = Stroke {
@@ -2393,27 +2395,45 @@ pub(crate) fn parse_table(
     })
 }
 
-pub(crate) fn parse_table_row(
+fn parse_table_row_with(
     tr: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
     zip: &mut PptxZip,
+    chain_for: impl Fn(usize) -> LevelRunProperties,
 ) -> TableRow {
     let height = attr_i64(&tr, "h").unwrap_or(0);
     let cells: Vec<TableCell> = tr
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "tc")
-        .map(|tc| parse_table_cell(tc, theme, rels, source_dir, zip))
+        .enumerate()
+        .map(|(ci, tc)| {
+            parse_table_cell_with_chain(tc, theme, rels, source_dir, &chain_for(ci), zip)
+        })
         .collect();
     TableRow { height, cells }
 }
 
+/// A table cell outside any table-style context (tests).
+#[cfg(test)]
 pub(crate) fn parse_table_cell(
     tc: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
+    zip: &mut PptxZip,
+) -> TableCell {
+    let chain = table_cell_chain(None, &DefaultTextLevels::default());
+    parse_table_cell_with_chain(tc, theme, rels, source_dir, &chain, zip)
+}
+
+fn parse_table_cell_with_chain(
+    tc: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    rels: &HashMap<String, String>,
+    source_dir: &str,
+    chain: &LevelRunProperties,
     zip: &mut PptxZip,
 ) -> TableCell {
     let tc_pr = child(tc, "tcPr");
@@ -2440,12 +2460,11 @@ pub(crate) fn parse_table_cell(
             rels,
             source_dir,
             None,
-            // Faces are completed after the table style is resolved
-            // (`complete_table_cell_faces`): the style tier sits between the
-            // cell's own formatting and defaultTextStyle.
             [None; 9],
             std::array::from_fn(|_| None),
-            std::array::from_fn(|_| Default::default()),
+            // Table style / defaultTextStyle tier (`table_cell_chain`); the
+            // cell's own formatting applies over it.
+            chain.clone(),
             Default::default(), // inherited_level_indents
             &empty_level_bullets(),
             None,

@@ -8489,6 +8489,117 @@ mod tests {
         assert_eq!(face(&unstyled, 0).as_deref(), Some("Century Gothic"));
     }
 
+    /// Issue #1627: a table cell's text is parsed over the table-style /
+    /// defaultTextStyle tier, so the cell cascade completes before theme
+    /// tokens resolve. An authored empty ea/cs stays empty, the run language
+    /// (own or defaultTextStyle) picks the script font, and a tcTxStyle
+    /// fontRef supplies its collection's ea/cs like a shape style's fontRef.
+    #[test]
+    fn table_cell_scripts_resolve_after_the_cell_cascade() {
+        let theme = HashMap::from(
+            [
+                ("+mn-lt", "Corbel"),
+                ("+mn-ea", "Meiryo"),
+                ("+mn-cs", "Microsoft Sans Serif"),
+                ("+mn-script-Jpan", "Yu Mincho"),
+                ("+mn-script-Hebr", "David"),
+                ("+mn-script-Viet", "Palatino Linotype"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let parse = |tbl_xml: &str, dts_lang: Option<&str>| -> TableElement {
+            let xml = format!(
+                r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{tbl_xml}</root>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let tbl = doc
+                .root_element()
+                .children()
+                .find(|n| n.is_element() && n.tag_name().name() == "tbl")
+                .unwrap();
+            let t = Transform {
+                x: 0,
+                y: 0,
+                cx: 100,
+                cy: 100,
+                rot: 0.0,
+                flip_h: false,
+                flip_v: false,
+            };
+            let mut dts = crate::master::DefaultTextLevels::default();
+            dts.faces[0] = Some("+mn-lt".to_owned());
+            dts.east_asian[0] = Some("+mn-ea".to_owned());
+            dts.complex_script[0] = Some("+mn-cs".to_owned());
+            dts.lang[0] = dts_lang.map(str::to_owned);
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            parse_table(
+                tbl,
+                &t,
+                &theme,
+                &HashMap::new(),
+                "ppt/slides",
+                &dts,
+                &mut zip,
+            )
+            .unwrap()
+        };
+        let run = |table: &TableElement, row: usize| -> TextRunData {
+            match &table.rows[row].cells[0]
+                .text_body
+                .as_ref()
+                .unwrap()
+                .paragraphs[0]
+                .runs[0]
+            {
+                TextRun::Text(t) => t.clone(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let rows = r#"<a:tblGrid><a:gridCol w="100"/></a:tblGrid>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface=""/><a:cs typeface=""/></a:rPr><a:t>a</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="vi-VN"/><a:t>b</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr/><a:t>c</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="he-IL"/><a:t>d</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
+        for tbl_pr in [
+            r#"<a:tblPr firstRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr>"#,
+            "<a:tblPr/>",
+        ] {
+            let table = parse(&format!("<a:tbl>{tbl_pr}{rows}</a:tbl>"), Some("ja-JP"));
+            let empty = run(&table, 0);
+            assert_eq!(
+                empty.font_family_ea, None,
+                "{tbl_pr}: authored ea=\"\" stays empty"
+            );
+            assert_eq!(
+                empty.font_family_cs, None,
+                "{tbl_pr}: authored cs=\"\" stays empty"
+            );
+            assert_eq!(
+                run(&table, 1).font_family.as_deref(),
+                Some("Palatino Linotype"),
+                "{tbl_pr}: vi-VN"
+            );
+            let inherited = run(&table, 2);
+            assert_eq!(
+                inherited.lang.as_deref(),
+                Some("ja-JP"),
+                "{tbl_pr}: defaultTextStyle lang"
+            );
+            assert_eq!(
+                inherited.font_family_ea.as_deref(),
+                Some("Yu Mincho"),
+                "{tbl_pr}"
+            );
+            assert_eq!(
+                run(&table, 3).font_family_cs.as_deref(),
+                Some("David"),
+                "{tbl_pr}"
+            );
+        }
+        let no_lang = parse(&format!("<a:tbl><a:tblPr/>{rows}</a:tbl>"), None);
+        assert_eq!(run(&no_lang, 2).font_family_ea.as_deref(), Some("Meiryo"));
+    }
+
     /// The presentation defaultTextStyle is copied out with the namespace
     /// declarations in scope on presentation.xml.
     #[test]
