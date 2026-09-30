@@ -2610,26 +2610,31 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
     let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
     // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
     // direct `w:compat` boolean. The setting is off when absent.
-    let enable_open_type_features = compat
-        .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
-        .and_then(|compat| {
-            compat
-                .children()
-                .find(|node| {
+    let word_compat_setting = |name: &str| -> Option<String> {
+        compat
+            .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
+            .and_then(|compat| {
+                compat.children().find(|node| {
                     node.is_element()
                         && node.tag_name().name() == "compatSetting"
                         && node.tag_name().namespace() == root.tag_name().namespace()
-                        && attr_w(*node, "name").as_deref() == Some("enableOpenTypeFeatures")
+                        && attr_w(*node, "name").as_deref() == Some(name)
                         && attr_w(*node, "uri").as_deref()
                             == Some("http://schemas.microsoft.com/office/word")
                 })
-                .and_then(|node| attr_w(node, "val"))
-                .and_then(|value| match value.as_str() {
-                    "1" | "true" | "on" => Some(true),
-                    "0" | "false" | "off" => Some(false),
-                    _ => None,
-                })
+            })
+            .and_then(|node| attr_w(node, "val"))
+    };
+    let enable_open_type_features =
+        word_compat_setting("enableOpenTypeFeatures").and_then(|value| match value.as_str() {
+            "1" | "true" | "on" => Some(true),
+            "0" | "false" | "off" => Some(false),
+            _ => None,
         });
+    // [MS-DOCX] `compatibilityMode` names the Word version whose layout rules
+    // apply. Absence is surfaced as None; the renderer owns that default.
+    let compatibility_mode =
+        word_compat_setting("compatibilityMode").and_then(|value| value.trim().parse::<u32>().ok());
     let use_fe_layout = compat_bool("useFELayout");
     let balance_single_byte_double_byte_width = compat_bool("balanceSingleByteDoubleByteWidth");
     let adjust_line_height_in_table = compat_bool("adjustLineHeightInTable");
@@ -2658,6 +2663,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
         && adjust_line_height_in_table.is_none()
+        && compatibility_mode.is_none()
     {
         return None;
     }
@@ -2673,6 +2679,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         use_fe_layout,
         balance_single_byte_double_byte_width,
         adjust_line_height_in_table,
+        compatibility_mode,
     })
 }
 
@@ -13472,6 +13479,9 @@ fn parse_table_with_diagnostics(
                     .clone()
                     .unwrap_or_else(|| "top".to_string());
             }
+            if cell.no_wrap.is_none() {
+                cell.no_wrap = eff.no_wrap.or(tstyle.cell_no_wrap);
+            }
         }
     }
 
@@ -13816,6 +13826,9 @@ fn parse_table_cell(
             }
         })
         .unwrap_or((None, None));
+    // ECMA-376 17.4.29: retain explicit false so it can cancel a style's
+    // noWrap; AutoFit uses only a resolved true in its width constraints.
+    let no_wrap = tc_pr.and_then(|p| bool_prop(p, "noWrap"));
 
     // Per-cell margins (ECMA-376 §17.4.42 `<w:tcPr><w:tcMar>`). Each edge,
     // when present, overrides the table-level `<w:tblCellMar>` default; absent
@@ -13914,6 +13927,7 @@ fn parse_table_cell(
         v_align,
         width_pt,
         width_pct,
+        no_wrap,
         margin_top,
         margin_bottom,
         margin_left,
@@ -14762,6 +14776,41 @@ mod tests {
         let cell = &t.rows[0].cells[0];
         assert_eq!(cell.width_pt, None);
         assert_eq!(cell.width_pct, Some(2500.0));
+    }
+
+    #[test]
+    fn cell_no_wrap_preserves_explicit_on_and_off_values() {
+        let table = parse_tbl(
+            r#"<w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid>
+               <w:tr><w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/><w:noWrap/></w:tcPr><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/><w:noWrap w:val="0"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+        assert_eq!(table.rows[0].cells[0].no_wrap, Some(true));
+        assert_eq!(table.rows[1].cells[0].no_wrap, Some(false));
+    }
+
+    #[test]
+    fn cell_no_wrap_layers_table_style_condition_and_inline_clearing() {
+        let styles = format!(
+            r#"<w:styles xmlns:w="{ns}">
+              <w:style w:type="table" w:styleId="Base"><w:tcPr><w:noWrap/></w:tcPr></w:style>
+              <w:style w:type="table" w:styleId="Derived"><w:basedOn w:val="Base"/>
+                <w:tblStylePr w:type="firstRow"><w:tcPr><w:noWrap w:val="0"/></w:tcPr></w:tblStylePr>
+              </w:style>
+            </w:styles>"#,
+            ns = W_NS
+        );
+        let table = parse_tbl_with_styles(
+            r#"<w:tblPr><w:tblStyle w:val="Derived"/><w:tblLook w:firstRow="1"/></w:tblPr>
+               <w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:noWrap w:val="0"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+            &styles,
+        );
+        assert_eq!(table.rows[0].cells[0].no_wrap, Some(false));
+        assert_eq!(table.rows[1].cells[0].no_wrap, Some(true));
+        assert_eq!(table.rows[2].cells[0].no_wrap, Some(false));
     }
 
     // ECMA-376 §17.4.52 — absent `<w:tblLayout>` ⇒ None (renderer default autofit).
@@ -17321,6 +17370,41 @@ mod math_jc_tests {
 
         let empty = r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         assert!(parse_document_settings(empty).is_none());
+    }
+
+    // [MS-DOCX] compatibilityMode is a Word-namespace compatSetting; only a
+    // well-formed integer value with the Word URI is surfaced.
+    #[test]
+    fn settings_compatibility_mode_surfaces() {
+        let settings = |body: &str| {
+            format!(
+                r#"<w:settings xmlns:w="{w}"><w:compat>{body}</w:compat></w:settings>"#,
+                w = W_NS
+            )
+        };
+        let word = r#"w:uri="http://schemas.microsoft.com/office/word""#;
+        let mode = |body: String| {
+            parse_document_settings(&settings(&body)).and_then(|s| s.compatibility_mode)
+        };
+        assert_eq!(
+            mode(format!(
+                r#"<w:compatSetting w:name="compatibilityMode" {word} w:val="15"/>"#
+            )),
+            Some(15)
+        );
+        assert_eq!(
+            mode(format!(
+                r#"<w:compatSetting w:name="compatibilityMode" {word} w:val="x"/>"#
+            )),
+            None
+        );
+        assert_eq!(
+            mode(
+                r#"<w:compatSetting w:name="compatibilityMode" w:uri="urn:other" w:val="15"/>"#
+                    .to_string()
+            ),
+            None,
+        );
     }
 
     // ECMA-376 Part 1 §17.15.1.18 / §17.15.3.3 and Part 4 §14.8.3.50 — East

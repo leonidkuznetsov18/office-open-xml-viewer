@@ -331,6 +331,7 @@ const EXACT_ACQUISITION_SURFACE_MEMBERS = new Map([
       'numberingMarkerShapeInput',
       'paragraphMarkShapeInput',
       'tableFormatInput',
+      'effectiveTablePreferredWidthPt',
       'tableColumnLayoutInput',
       'tableParticipatesInOrdinaryFlow',
       'paragraphAcquisitionInput',

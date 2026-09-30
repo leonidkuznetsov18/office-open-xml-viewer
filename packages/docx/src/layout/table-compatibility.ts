@@ -26,6 +26,54 @@ export const WORD_AUTOFIT_EMPTY_PARAGRAPH_CONTENT_WIDTH = defineCompatibilityRul
   description: 'For table AutoFit content width, Word gives an empty unnumbered paragraph no intrinsic content width regardless of effective right, left, first-line, or hanging indentation. Cell margins still contribute, while whitespace, non-breaking space, visible text, and numbering remain content-bearing controls.',
 });
 
+export const WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND = defineCompatibilityRule({
+  id: 'word-autofit-outer-cell-margin-band',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'autofit-nowrap-identical-grid-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'For top-level ordinary AutoFit tables, Word permits a saved grid to extend beyond the text band by the resolved outer cell margins. Two-cell controls with 0, 2.7, and 5.4pt margins, dxa 250/300pt and auto cell widths, short/long text, and noWrap on/off establish that allowance. A Word-produced table with 5.4pt margins but a saved grid exactly at the text band retains that narrower grid on current Word PDF export. A nested table with saved grid overhang retains its containing-cell width rather than receiving the page-table allowance. Auto-width tables are now governed by WORD_AUTOFIT_LEADING_INDENT_BAND (compatibility-mode dependent); for a preferred-width table only a top-level outer-margin overhang already present in tblGrid increases the physical ceiling. Skipped outer grid tracks, leading-margin placement, vertical text, and floating tables remain outside this observation.',
+});
+
+export const WORD_AUTOFIT_LEADING_INDENT_BAND = defineCompatibilityRule({
+  id: 'word-autofit-leading-indent-band',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'autofit-nowrap-page-boundary-compat-mode-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'For top-level left-justified auto-width AutoFit tables, the measured ceiling is text band - tblInd + outer cell margins in mode 14 (and with the mode omitted), and text band - tblInd in mode 15. The physical page is not a ceiling. Other explicit compatibility modes retain the established solver contract because they are unmeasured. The original controls cover a 468pt page, 0/18pt side margins, 5.4pt outer cell margins, indents of +5.4/+36/-36pt, wide and band-minus-indent grids, and noWrap on/off. Eight additional wrapping controls reverse the content distribution, vary an omitted first tcW versus a 100.55pt dxa first tcW, and vary grid totals of 426.6/432pt on a 432pt band with +5.4pt indent. Neither that cell preference nor the grid-total equality changes the resulting column starts or line partitions within a mode. The second cell remains auto throughout. An all-dxa multirow mode-15 table also agrees with this ceiling: Word PDF cell clipping bounds constrain its width to approximately 482pt, and the fitted 481.9pt width reproduces both inspected two-line paragraphs with the same Calibri face. Substituting a different face can move those line boundaries; retaining the old wider table would hide that font dependency. Four centered/right controls at that same positive indent and band-minus-indent grid match a 437.4pt mode-14 ceiling and a full-band 432pt mode-15 ceiling. In mode 14 those four controls cannot distinguish band-minus-indent-plus-margins from saved-grid-plus-margins. Other nonleading alignment/grid/indent combinations remain unverified and retain their established solver contract; the new nonleading ceiling is gated to grid-plus-indent equaling the band, where both mode-14 hypotheses agree. These borderless PDFs establish column starts and line partitions. Their integer-point clipping rectangles bound cell/table extents but do not establish an exact trailing table edge. Absolute leading-origin differences remain separate from width fitting. Floating, nested, vertical-text and preferred-table-width tables are outside this rule.',
+});
+
+export const WORD_AUTOFIT_CONTENT_COLUMN_GROWTH = defineCompatibilityRule({
+  id: 'word-autofit-content-column-growth',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'autofit-nowrap-page-boundary-compat-mode-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'In the measured top-level auto-width AutoFit tables, a column without preferred cells grows beyond its initial tblGrid toward maximum content width, up to the occurrence ceiling. Two unpreferred tracks also release saved width beyond a short column maximum. Twelve simultaneous-growth controls in modes 14/15 start at 25/25pt and use breakable ii tokens in ratios 3:2, 1:1 and 5:1, with totals of 30 (nonbinding) and 90 (binding). Nonbinding columns reach their content maxima. Binding column widths match min_i + fraction * (max_i - min_i), where fraction = (ceiling - sum(min)) / sum(max - min), capped at 1. The unequal cases distinguish this from sharing deficits over saved widths, sharing absolute maxima, equal room and sequential growth. Intrinsic maxima must be unbounded by the text band. First-column differences are at most 0.228pt and both cells have identical Word line partitions. Only two nonspanning, wholly unpreferred tracks establish simultaneous sharing; larger grids, spans, and mixed preferred/unpreferred simultaneous growth retain the previous solver result. This is a measured content-interval rule, not an empirical scale factor or an observation of arbitrary multi-column growth.',
+});
+
+export const WORD_AUTOFIT_NOWRAP_AUTO_FORCED_FIT = defineCompatibilityRule({
+  id: 'word-autofit-nowrap-auto-forced-fit',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'autofit-nowrap-identical-grid-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'When a two-cell AutoFit table has one auto-width noWrap cell whose unbroken minimum alone exceeds the text band, Word scales the content-only widths to that band. It assigns the extra outer-margin width to each cell in proportion to the other cell content width. The observed matrix varies the ordinary cell text width from 5 to 85pt, outer margins from 0 to 5.4pt, and which side owns noWrap. Short noWrap text that fits the band is a counterexample and retains ordinary proportional fitting. More than two cells and spans are outside this compatibility claim.',
+});
+
 export function wordAutofitEmptyParagraphHasNoIntrinsicContent(
   paragraph: Pick<ParagraphLayoutSource, 'runs' | 'numbering'>,
 ): boolean {
@@ -222,13 +270,22 @@ export const WORD_TABLE_MARGIN_SCOPE_SHADOW = defineCompatibilityRule({
   description: 'Preserve the documented scope-specific treatment of non-dxa table cell margins: leading/trailing defaults may resolve to zero while cell/exception and nil top/bottom values remain ignored.',
 });
 
+export const WORD_TABLE_CELL_ZERO_NIL_WIDTH_AUTO = defineCompatibilityRule({
+  id: 'word-table-cell-zero-nil-width-auto',
+  evidence: {
+    kind: 'microsoft-note',
+    reference: '[MS-OI29500] §2.1.171(a-b)',
+  },
+  description: 'Interpret tcW with a zero w attribute, including dxa and pct, or nil type as auto. Intrinsic measurement and column constraints share the effective cell preference; noWrap uses an unbroken content minimum for these automatic cells instead of dxa width protection.',
+});
+
 export const WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE = defineCompatibilityRule({
   id: 'word-first-row-table-exception-scope',
   evidence: {
     kind: 'microsoft-note',
     reference: '[MS-OI29500] §§2.1.156, 2.1.158, 2.1.167',
   },
-  description: 'Apply the supported first-row table-property exception facts at table scope, including authored preferred-width shadowing.',
+  description: 'Apply the supported first-row table-property exception facts at table scope. An authored first-row tblPrEx/tblW shadows the body width, including auto/nil/zero clearing it; width ceiling selection and column fitting share this effective preference.',
 });
 
 export const WORD_TRAILING_STRUCTURAL_CELL_MARKER = defineCompatibilityRule({

@@ -65,6 +65,7 @@ describe('parser-to-body-acquisition projection capability', () => {
   it('is one frozen identity-preserving record without compatibility wrappers', () => {
     expect(Object.isFrozen(bodyAcquisitionInputProjections)).toBe(true);
     expect(Object.keys(bodyAcquisitionInputProjections).sort()).toEqual([
+      'effectiveTablePreferredWidthPt',
       'numberingMarkerShapeInput',
       'paragraphAcquisitionInput',
       'paragraphMarkShapeInput',

@@ -49,9 +49,9 @@ import {
 import {
   effectiveTableWidthKind,
   projectTableColumnLayoutInput,
+  projectEffectiveTablePreferredWidthPt,
   tableDxaPtFromLexical,
   tableWidthConstraintFromLexical,
-  type CellIntrinsicWidths,
   type TableAcquisitionInput,
   type TableCellLayoutAcquisitionWire,
   type TableLayoutAcquisitionWire,
@@ -474,6 +474,7 @@ function tableColumnSemanticInput(
         colSpan: finiteOrNull(cell.colSpan) ?? 1,
         widthPt: finiteOrNull(cell.widthPt),
         widthPct: finiteOrNull(cell.widthPct),
+        ...(cell.noWrap === true ? { noWrap: true } : {}),
       })),
     })),
   }, 'DOCX table column semantic input') as TableSourceSemanticInput;
@@ -950,18 +951,26 @@ function bodyLayoutSequenceInput(
   }));
 }
 
+/** Resolve the shared whole-table preference without acquiring cell contents. */
+export function effectiveTablePreferredWidthPt(
+  table: TableLayoutSource,
+  availableWidthPt: number,
+): number | null {
+  return projectEffectiveTablePreferredWidthPt(tableSourceAcquisitionInput(table), availableWidthPt);
+}
+
 /** Project normalized parser/model facts into the pure §17.18.87 solver contract. */
 export function tableColumnLayoutInput(
   table: TableLayoutSource,
   availableWidthPt: number,
-  intrinsicWidths: (cell: TableLayoutSource['rows'][number]['cells'][number]) => CellIntrinsicWidths,
+  intrinsicWidths: Parameters<BodyAcquisitionInputProjections['tableColumnLayoutInput']>[2],
   maximumWidthPt: number | null = availableWidthPt,
 ): import('./layout/types.js').TableColumnLayoutInput {
   const source = tableSourceAcquisitionInput(table);
   return projectTableColumnLayoutInput(
     source,
     availableWidthPt,
-    (rowIndex, cellIndex) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!),
+    (rowIndex, cellIndex, preferredWidth) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferredWidth),
     maximumWidthPt,
   );
 }
@@ -1945,6 +1954,7 @@ export const bodyAcquisitionInputProjections = Object.freeze({
   numberingMarkerShapeInput,
   paragraphMarkShapeInput,
   tableFormatInput,
+  effectiveTablePreferredWidthPt,
   tableColumnLayoutInput,
   tableParticipatesInOrdinaryFlow,
   paragraphAcquisitionInput,

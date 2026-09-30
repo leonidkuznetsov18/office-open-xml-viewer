@@ -124,6 +124,9 @@ export interface DocSettings {
   /** §17.15.3.1 `w:compat/w:adjustLineHeightInTable` — apply the section
    *  document-grid line pitch to text in table cells. */
   adjustLineHeightInTable?: boolean;
+  /** `w:compat/w:compatSetting[@w:name="compatibilityMode"]` (Word URI) — the
+   *  Word version whose layout rules the document uses (for example 14, 15). */
+  compatibilityMode?: number;
 }
 
 export interface DocRevision {
@@ -1595,6 +1598,9 @@ export interface DocTableCell {
   widthPt: number | null;
   /** `<w:tcW>` type="pct": 50ths of a percent of the final table width. */
   widthPct?: number;
+  /** ECMA-376 §17.4.29 `<w:noWrap>`: in AutoFit, auto/pct cell content
+   *  contributes its unbroken width as the minimum content constraint. */
+  noWrap?: boolean;
   /** Per-cell margins (pt) from `<w:tcPr><w:tcMar>` (ECMA-376 §17.4.42). Each
    *  edge overrides the table-level `cellMargin*` default when set; null/absent
    *  = inherit the table default. */
