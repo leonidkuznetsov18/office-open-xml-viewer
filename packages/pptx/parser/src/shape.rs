@@ -1197,9 +1197,13 @@ pub(crate) fn parse_shape(
         // major/minor collection (idx none names none). Observed (#1620): a
         // text box's defaultTextStyle face yields to fontRef minor/major, and
         // fontRef none leaves the defaultTextStyle face; sizes still come from
-        // defaultTextStyle.
-        let style_face =
-            style_font_set.and_then(|set| resolve_latin_face(&format!("{set}-lt"), theme));
+        // defaultTextStyle. A fontRef naming a collection whose Latin face is
+        // empty draws in Arial, not the defaultTextStyle face (#1627
+        // table-lang controls XE*).
+        let style_face = style_font_set.map(|set| {
+            resolve_latin_face(&format!("{set}-lt"), theme)
+                .unwrap_or_else(|| HARD_DEFAULT_LATIN_FACE.to_owned())
+        });
         let faces = match style_face {
             Some(face) => std::array::from_fn(|_| Some(face.clone())),
             None => lph.default_text.faces.clone(),
@@ -2151,15 +2155,19 @@ pub(crate) fn resolve_table_cell_style(
 ///   the master theme's minor font even when defaultTextStyle named another
 ///   face (issue #1620); a cell of no table style, or of a custom style whose
 ///   tcTxStyle names no font, also rendered in the theme minor font at every
-///   level, not in the defaultTextStyle or master otherStyle face (#1628).
+///   level, not in the defaultTextStyle or master otherStyle face (#1628). A
+///   style fontRef whose collection has an empty Latin face gives Arial.
 /// * ea/cs: the same theme collection as the Latin face. A tcTxStyle
 ///   `fontRef` is the CT_FontReference a shape's p:style uses, and the
 ///   text-box controls (#1627 N13, N20, I26, P31-P35) show a fontRef naming
 ///   the collection for the ea and cs slots as well as Latin; a cell without
 ///   a style font takes the minor collection like its Latin face. A token or
 ///   literal authored in the cell overrides it, `typeface=""` included.
-/// * No list-style language: cells take neither the defaultTextStyle nor the
-///   otherStyle faces (#1628), so only the cell's own lang / altLang apply.
+/// * No list-style language or faces: cells take neither the defaultTextStyle
+///   nor the otherStyle faces (#1628), and the #1627 table-lang controls show
+///   no defaultTextStyle lang (ja-JP, ko-KR, he-IL) or literal ea/cs reaching
+///   a cell, styled or not, while the text-box twins took them. Only the
+///   cell's own lang / altLang apply.
 pub(crate) fn table_cell_chain(
     style_font: Option<&str>,
     theme: &HashMap<String, String>,
@@ -2171,10 +2179,13 @@ pub(crate) fn table_cell_chain(
         Some(font) => theme_token_set(font),
         None => Some("+mn"),
     };
-    let face = style_font
-        .and_then(|font| resolve_latin_face(font, theme))
-        .or_else(|| resolve_latin_face("+mn-lt", theme))
-        .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
+    // A style font naming a collection with an empty Latin face draws in
+    // Arial (#1627 table-lang controls TE*), like a shape's fontRef.
+    let face = match style_font {
+        Some(font) => resolve_latin_face(font, theme),
+        None => resolve_latin_face("+mn-lt", theme),
+    }
+    .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
     std::array::from_fn(|_| {
         let (ea, cs) = match set {
             Some(set) => (Some(format!("{set}-ea")), Some(format!("{set}-cs"))),
@@ -3671,7 +3682,7 @@ mod style_ref_tests {
 
     /// Issue #1627 review: a tcTxStyle fontRef names its theme collection for
     /// ea/cs even when that collection's Latin face is empty, so the Latin
-    /// face falls back (theme minor) while Japanese and Hebrew keep the MAJOR
+    /// face falls back (Arial) while Japanese and Hebrew keep the MAJOR
     /// script fonts.
     #[test]
     fn table_style_font_ref_collection_survives_an_empty_latin_face() {
@@ -3710,7 +3721,8 @@ mod style_ref_tests {
                 other => panic!("expected text, got {other:?}"),
             })
             .collect();
-        assert_eq!(runs[0].font_family.as_deref(), Some("Corbel"));
+        // #1627 table-lang TE*: the empty major Latin face draws in Arial.
+        assert_eq!(runs[0].font_family.as_deref(), Some("Arial"));
         assert_eq!(runs[0].font_family_ea.as_deref(), Some("MajorJpan"));
         assert_eq!(runs[1].font_family_cs.as_deref(), Some("MajorHebr"));
     }

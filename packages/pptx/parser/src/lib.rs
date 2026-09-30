@@ -8564,6 +8564,45 @@ mod tests {
         );
     }
 
+    /// Issue #1627 table-lang controls (XE*, TE*): a fontRef naming a theme
+    /// collection whose Latin face is empty draws its Latin text in Arial, not
+    /// the defaultTextStyle face, while ea/cs keep that collection.
+    #[test]
+    fn font_ref_to_an_empty_latin_collection_draws_arial() {
+        let theme = HashMap::from(
+            [("+mn-lt", "Corbel"), ("+mj-script-Jpan", "MajorJpan")]
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let mut default_text = crate::master::DefaultTextLevels::default();
+        default_text.faces[0] = Some("+mn-lt".to_owned());
+        let placeholders = LayoutPlaceholders {
+            default_text,
+            ..LayoutPlaceholders::default()
+        };
+        let xml = r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:nvSpPr><p:cNvPr id="2" name="A"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="500000"/></a:xfrm></p:spPr>
+          <p:style><a:lnRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:lnRef><a:fillRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:fillRef><a:effectRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:effectRef><a:fontRef idx="major"><a:schemeClr val="tx1"/></a:fontRef></p:style>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p></p:txBody></p:sp>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let shape = parse_shape(
+            doc.root_element(),
+            &placeholders,
+            &theme,
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            &mut zip,
+        )
+        .expect("autoshape");
+        let TextRun::Text(run) = &shape.text_body.expect("body").paragraphs[0].runs[0] else {
+            panic!("text run expected")
+        };
+        assert_eq!(run.font_family.as_deref(), Some("Arial"));
+        assert_eq!(run.font_family_ea.as_deref(), Some("MajorJpan"));
+    }
+
     /// Issue #1627: a table cell's text is parsed over the table-style tier,
     /// so the cell cascade completes before theme tokens resolve. An authored
     /// empty ea/cs stays empty, the run's own language picks the script font,
