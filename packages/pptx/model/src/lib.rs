@@ -1181,11 +1181,6 @@ pub struct Paragraph {
     /// never merged into existing a:r/a:fld runs (ECMA-376 §21.1.2.2.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_run_properties: Option<Box<TextRunData>>,
-    /// Whether `endParaRPr` authors its own latin face (`a:latin@typeface`).
-    /// Only such a face is known to join the paragraph's last line with text
-    /// (#1636 controls); an inherited one keeps the previous behaviour.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub end_face_authored: bool,
 }
 
 // serde-facing parser output enum; same rationale as SlideElement — the Text

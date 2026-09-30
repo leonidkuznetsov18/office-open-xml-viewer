@@ -472,7 +472,6 @@ fn default_paragraph() -> Paragraph {
         font_algn: None,
         runs: Vec::new(),
         end_run_properties: None,
-        end_face_authored: false,
     }
 }
 
