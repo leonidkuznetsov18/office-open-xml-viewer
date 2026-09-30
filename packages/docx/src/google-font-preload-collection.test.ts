@@ -135,15 +135,23 @@ function recordingCanvas(available: ReadonlySet<string>) {
 const loaded = (family: string) =>
   ({ family, weight: '400', style: 'normal', status: 'loaded' }) as FontFace;
 
-async function paintedFamily(model: DocxDocumentModel, text: string, installedSubstituteFamilies: readonly string[] = []): Promise<string | undefined> {
-  const { canvas, calls } = recordingCanvas();
+const WEB_FACES = ['Carlito', 'Caladea', 'Noto Naskh Arabic'];
+
+/** The face Canvas actually selects for each painted text, plus the layout
+ * service used, so a test can also inspect shaped measurement. */
+async function paintedFamilies(
+  model: DocxDocumentModel,
+  texts: readonly string[],
+  options: Readonly<{ installedSubstituteFamilies?: readonly string[]; installedFaces?: readonly string[] }> = {},
+): Promise<(string | undefined)[]> {
+  const available = new Set([...WEB_FACES, ...(options.installedFaces ?? [])]);
+  const { canvas, calls } = recordingCanvas(available);
   await renderDocumentToCanvas(model, canvas, 0, {
     dpr: 1,
     width: 612,
     layoutServices: createLayoutServices(model, {
       useGoogleFonts: true,
-      googleFaces: [loaded('Carlito'), loaded('Caladea')],
-      installedSubstituteFamilies,
+      googleFaces: WEB_FACES.map(loaded),
       measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
       ...(options.installedSubstituteFamilies
         ? { installedSubstituteFamilies: options.installedSubstituteFamilies } : {}),
@@ -175,7 +183,9 @@ describe('Google Fonts preload collects every rendered substitute family', () =>
     const model = parse(docx(
       '<w:p><w:r><w:rPr><w:rFonts w:ascii="Cambria" w:hAnsi="Cambria"/></w:rPr><w:t>InstalledSerif</w:t></w:r></w:p>',
     ));
-    expect(await paintedFamily(model, 'InstalledSerif', ['cambria'])).toBe('Cambria');
+    expect(await paintedFamilies(model, ['InstalledSerif'], {
+      installedSubstituteFamilies: ['cambria'], installedFaces: ['Cambria'],
+    })).toEqual(['Cambria']);
   });
 
   it('collects Calibri from a table nested in a text box story', async () => {
