@@ -2233,12 +2233,13 @@ function resolveColumnWidths(
       : baseIndentPt;
   });
   // §17.18.87 lets AutoFit override its preferred width up to the page width.
-  // Keep the ordinary text-band ceiling unless §17.4.50 placement moves a
-  // top-level page-owned story table into its semantic leading margin. The
-  // promoted ceiling is the physical page distance left after resolving jc +
-  // tblInd, rather than the page width in isolation: a partial negative indent
-  // does not move the table origin all the way to the page edge. Test the
-  // authored indent before bidiVisual reverses its physical translation;
+  // For a table with a preferred tblW, keep the ordinary text-band ceiling
+  // unless §17.4.50 placement moves a top-level page-owned story table into
+  // its semantic leading margin (auto-width tables use the leading-indent band
+  // below instead). The promoted ceiling is the physical page distance left
+  // after resolving jc + tblInd, rather than the page width in isolation: a
+  // partial negative indent does not move the table origin all the way to the
+  // page edge. Test the authored indent before bidiVisual reverses its physical translation;
   // table justification reverses under bidiVisual as well. Body tables must
   // also remain in a single-column page band; headers and footers are
   // page-owned stories and do not inherit the body's newspaper columns.
@@ -2281,6 +2282,27 @@ function resolveColumnWidths(
   const effectiveLayout = format.firstRowException?.layout === 'fixed'
     ? 'fixed'
     : table.layout;
+  // WORD_AUTOFIT_LEADING_INDENT_BAND (table-compatibility.ts): for an
+  // AutoFit table with no preferred tblW (§17.4.63 auto), a leading §17.4.50
+  // tblInd moves only the leading edge while the trailing edge stays at the
+  // text band. The band available to the grid is contentW - tblInd for either
+  // sign, and the physical page is not a ceiling (see the rule's evidence).
+  // Centered and trailing justifications are outside that evidence and keep
+  // the whole text band.
+  const hasPreferredTableWidth = (Number.isFinite(table.widthPt) && (table.widthPt ?? 0) > 0)
+    || (Number.isFinite(table.widthPct) && (table.widthPct ?? 0) > 0);
+  const usesLeadingIndentBand = effectiveLayout !== 'fixed'
+    && format.ordinaryFlow
+    && isTopLevelPageOwnedStory
+    && !isVerticalTextDirection(state.sectionLayout.textDirection)
+    && !hasPreferredTableWidth;
+  const textBandPt = usesLeadingIndentBand
+    ? Math.max(0, Math.min(...rowPlacements.map(({ justification, indentPt }) => {
+        const trailing = justification === 'right' || justification === 'end';
+        const leading = justification !== 'center' && !trailing;
+        return leading ? contentWPt - indentPt : contentWPt;
+      })))
+    : contentWPt;
   // WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND (table-compatibility.ts): an AutoFit
   // grid can include outer §17.4.42 cell margins beyond the text band, but
   // Word also preserves a saved grid ending at the band despite those margins.
@@ -2293,7 +2315,7 @@ function resolveColumnWidths(
   );
   const possibleOuterCellMarginsPt = effectiveLayout === 'fixed'
     || !format.ordinaryFlow
-    || isLeadingMarginPageStoryTable
+    || (isLeadingMarginPageStoryTable && !usesLeadingIndentBand)
     || isVerticalTextDirection(state.sectionLayout.textDirection)
     || state.storyContext?.containers.some((container) => container.kind === 'tableCell')
     || format.rows.length === 0
@@ -2313,11 +2335,14 @@ function resolveColumnWidths(
       }, Number.POSITIVE_INFINITY);
   const outerCellMarginsPt = Math.min(
     possibleOuterCellMarginsPt,
-    Math.max(0, savedGridWidthPt - contentWPt),
+    Math.max(0, savedGridWidthPt - textBandPt),
   );
-  const maximumTableWidthPt = (isLeadingMarginPageStoryTable
+  // A preferred-width table with a negative indent keeps the older physical
+  // page ceiling (its authored width may reach the page edge); the auto-width
+  // band above supersedes it for tables without a preferred width.
+  const maximumTableWidthPt = (isLeadingMarginPageStoryTable && !usesLeadingIndentBand
     ? Math.max(contentWPt, pageFitCeilingPt)
-    : contentWPt) + outerCellMarginsPt;
+    : textBandPt) + outerCellMarginsPt;
   const isFixedNestedTable = effectiveLayout === 'fixed'
     && state.storyContext?.containers.some((container) => container.kind === 'tableCell');
 

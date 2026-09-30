@@ -220,6 +220,38 @@ describe('§17.4.50 tblInd — table indent from the leading margin', () => {
     },
   );
 
+  it.each([
+    // Word controls (auto tblW, 478.8pt saved grid, 5.4pt outer cell margins,
+    // 468pt page) scaled here to a 200pt page with a 210.8pt saved grid.
+    ['zero side margins overflow the physical page', 0, 0, { xPt: 0, widthPt: 210.8 }],
+    ['a positive indent keeps the trailing band edge', 10, 20, { xPt: 30, widthPt: 170.8 }],
+    ['a negative indent crosses the leading page edge', 10, -20, { xPt: -10, widthPt: 210.8 }],
+  ] as const)(
+    'auto-width AutoFit: %s',
+    (_case, sideMarginPt, indentPt, expected) => {
+      const source = tableDoc(210.8, indentPt, false);
+      const { widthPt: _preferred, ...sourceTable } = source.body[0] as DocTable;
+      const doc = {
+        ...source,
+        section: { ...source.section, marginLeft: sideMarginPt, marginRight: sideMarginPt },
+        body: [{ ...sourceTable, cellMarginLeft: 5.4, cellMarginRight: 5.4 }],
+      } as DocxDocumentModel;
+      const recording = makeRecordingCanvas();
+      const services = createLayoutServices(doc, {
+        measureContext: recording.canvas.getContext('2d') as CanvasRenderingContext2D,
+      });
+      const retained = layoutDocument(doc, services, { currentDateMs: 0 }).pages[0]?.layers.body[0];
+      if (retained?.kind !== 'table') throw new Error('expected retained table geometry');
+
+      // WORD_AUTOFIT_LEADING_INDENT_BAND: the text band minus tblInd plus the
+      // saved outer-margin overhang, with no physical page clamp.
+      expect(retained.flowBounds.xPt).toBeCloseTo(expected.xPt, 6);
+      expect(retained.flowBounds.widthPt).toBeCloseTo(expected.widthPt, 6);
+      expect(retained.flowBounds.xPt + retained.flowBounds.widthPt)
+        .toBeCloseTo(200 - sideMarginPt + 10.8, 6);
+    },
+  );
+
   it('RTL (bidiVisual): negative tblInd pushes the RIGHT leading edge into the right margin', async () => {
     // No indent, bidiVisual, colW=160=content: table fills [20,180]; right edge 180.
     const noInd = makeRecordingCanvas();
