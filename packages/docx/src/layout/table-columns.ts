@@ -183,6 +183,17 @@ function fixedWidths(input: TableColumnLayoutInput, columnCount: number): number
     return widths.map(() => targetPt / widths.length);
   }
   if (targetPt !== null && targetPt >= 0 && totalPt > EPSILON_PT) {
+    if (input.layout === 'autofit' && targetPt < totalPt) {
+      const cells = input.rows.flatMap((row) => row.cells);
+      if (cells.some((cell) => cell.noWrap === true && cell.preferredWidth?.kind === 'dxa')) {
+        // §17.4.29's dxa priority also applies to the initial tblW fit. Use
+        // authored track geometry before proportional shrink loses it, and
+        // reduce unprotected neighbours to their content minima first. Fixed
+        // layout and AutoFit without dxa noWrap retain the proportional pass.
+        const { minimums } = singleColumnBounds(input.rows, columnCount, totalPt);
+        return fitToAvailableWidth(widths, minimums, cells, targetPt, 0);
+      }
+    }
     const scale = targetPt / totalPt;
     return widths.map((width) => width * scale);
   }
@@ -441,7 +452,9 @@ function noWrapPreferredFloors(
     const span = Math.max(1, Math.min(cell.columnSpan, widths.length - start));
     const currentPt = spanSum(widths, start, span);
     if (currentPt <= EPSILON_PT) continue;
-    const protectedPt = Math.min(currentPt, finiteNonNegative(cell.preferredWidth.value));
+    // The authored preference survives earlier fitting; a shrunken track
+    // cannot redefine the protected width (§17.4.29).
+    const protectedPt = finiteNonNegative(cell.preferredWidth.value);
     for (let column = start; column < start + span; column += 1) {
       // §17.4.29 protects the span's aggregate preferred width. Retain its
       // existing grid proportions because the rule does not assign that

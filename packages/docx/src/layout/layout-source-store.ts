@@ -417,7 +417,7 @@ function sealLayoutSourceStoreWithBody(
       return projectTableColumnLayoutInput(
         fact.input,
         availableWidthPt,
-        (rowIndex, cellIndex) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!),
+        (rowIndex, cellIndex, preferredWidth) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferredWidth),
         maximumWidthPt,
       );
     },

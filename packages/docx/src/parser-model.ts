@@ -52,7 +52,6 @@ import {
   projectEffectiveTablePreferredWidthPt,
   tableDxaPtFromLexical,
   tableWidthConstraintFromLexical,
-  type CellIntrinsicWidths,
   type TableAcquisitionInput,
   type TableCellLayoutAcquisitionWire,
   type TableLayoutAcquisitionWire,
@@ -964,14 +963,14 @@ export function effectiveTablePreferredWidthPt(
 export function tableColumnLayoutInput(
   table: TableLayoutSource,
   availableWidthPt: number,
-  intrinsicWidths: (cell: TableLayoutSource['rows'][number]['cells'][number]) => CellIntrinsicWidths,
+  intrinsicWidths: Parameters<BodyAcquisitionInputProjections['tableColumnLayoutInput']>[2],
   maximumWidthPt: number | null = availableWidthPt,
 ): import('./layout/types.js').TableColumnLayoutInput {
   const source = tableSourceAcquisitionInput(table);
   return projectTableColumnLayoutInput(
     source,
     availableWidthPt,
-    (rowIndex, cellIndex) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!),
+    (rowIndex, cellIndex, preferredWidth) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferredWidth),
     maximumWidthPt,
   );
 }

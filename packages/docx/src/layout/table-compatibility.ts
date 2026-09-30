@@ -270,6 +270,15 @@ export const WORD_TABLE_MARGIN_SCOPE_SHADOW = defineCompatibilityRule({
   description: 'Preserve the documented scope-specific treatment of non-dxa table cell margins: leading/trailing defaults may resolve to zero while cell/exception and nil top/bottom values remain ignored.',
 });
 
+export const WORD_TABLE_CELL_ZERO_NIL_WIDTH_AUTO = defineCompatibilityRule({
+  id: 'word-table-cell-zero-nil-width-auto',
+  evidence: {
+    kind: 'microsoft-note',
+    reference: '[MS-OI29500] §2.1.171(a-b)',
+  },
+  description: 'Interpret tcW with a zero w attribute, including dxa and pct, or nil type as auto. Intrinsic measurement and column constraints share the effective cell preference; noWrap uses an unbroken content minimum for these automatic cells instead of dxa width protection.',
+});
+
 export const WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE = defineCompatibilityRule({
   id: 'word-first-row-table-exception-scope',
   evidence: {

@@ -30,6 +30,7 @@ import type {
   StoryLayout,
   TableLayout,
   TableLayoutInput,
+  TablePreferredWidthConstraint,
 } from './types.js';
 import {
   floatingTableRegistryDelta,
@@ -2379,7 +2380,7 @@ function resolveColumnWidths(
   const intrinsicWidthsForTable = (
     owner: TableLayoutSource,
     ownerFormat = state.acquisitionInputs.tableFormatInput(owner),
-  ): ((cell: DeepReadonly<DocTableCell>) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
+  ): ((cell: DeepReadonly<DocTableCell>, preferredWidth: TablePreferredWidthConstraint | null) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
     const ownerLayout = ownerFormat.firstRowException?.layout === 'fixed'
       || owner.layout === 'fixed' ? 'fixed' : 'autofit';
     const ownerMargins = new WeakMap<object, Readonly<{ left: number; right: number }>>();
@@ -2387,7 +2388,7 @@ function resolveColumnWidths(
       const acquired = ownerFormat.rows[rowIndex]?.cells[cellIndex]?.marginsPt;
       ownerMargins.set(cell, acquired ?? effCellMargins(cell, owner));
     }));
-    return (cell) => measureTableCellIntrinsicWidths(
+    return (cell, preferredWidth) => measureTableCellIntrinsicWidths(
       cell,
       ownerMargins.get(cell as object) ?? effCellMargins(cell, owner),
       {
@@ -2431,7 +2432,7 @@ function resolveColumnWidths(
             // growth path needs this uncapped interval; preferred and nested
             // paths retain their existing measurement ceiling.
             usesLeadingIndentBand && owner === table && ownerLayout !== 'fixed'
-              && cell.widthPt == null && cell.widthPct == null
+              && preferredWidth === null
               ? Number.MAX_SAFE_INTEGER
               : contentWPt,
             { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
@@ -2439,7 +2440,7 @@ function resolveColumnWidths(
             numbering,
             { preserveWhitespaceOnlyContent: true },
           );
-          if (cell.noWrap !== true || cell.widthPt != null || ownerLayout === 'fixed') return intrinsic;
+          if (cell.noWrap !== true || preferredWidth?.kind === 'dxa' || ownerLayout === 'fixed') return intrinsic;
           // The nonbreaking text interval is independent of first-line
           // positioning. Probe without a line-width ceiling: the ordinary
           // maxWidthPt is capped at contentWPt, which is too small for an
@@ -2466,6 +2467,7 @@ function resolveColumnWidths(
         ),
       },
       ownerLayout,
+      preferredWidth,
     );
   };
   const columnInput = state.acquisitionInputs.tableColumnLayoutInput(

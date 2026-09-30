@@ -24,8 +24,8 @@ import { paragraphCharacterGrid } from '../paragraph-measure.js';
 import { calcEffectiveFontPx } from './text.js';
 import { wordSnapToCharsEastAsianCellCount } from './line-compatibility.js';
 import type { ParagraphLayoutSource, TextFontSlots } from './text.js';
-import type { TableLayoutSource } from './table-source-acquisition.js';
-import type { DeepReadonly } from './types.js';
+import { projectEffectiveCellPreferredWidth, type TableLayoutSource } from './table-source-acquisition.js';
+import type { DeepReadonly, TablePreferredWidthConstraint } from './types.js';
 import { stableFingerprint } from './fingerprint.js';
 import {
   numberingMarkerLogicalInterval,
@@ -56,14 +56,15 @@ export interface ParagraphIntrinsicWidthOptions {
   readonly preserveWhitespaceOnlyContent?: boolean;
 }
 
-/** Fold public cell content into one intrinsic interval. OOXML width/style
- * precedence is deliberately absent: parser/model projection and the column
- * solver own those separate responsibilities. */
+/** Fold public cell content into one intrinsic interval using the effective
+ * tcW acquired before measurement. Public-model-only callers use the same
+ * width interpreter; lexical/style precedence remains in source projection. */
 export function measureTableCellIntrinsicWidths(
   cell: DeepReadonly<DocTableCell>,
   margins: Readonly<{ left: number; right: number }>,
   dependencies: TableCellIntrinsicWidthDependencies,
   tableLayout: 'autofit' | 'fixed' = 'autofit',
+  preferredWidth: TablePreferredWidthConstraint | null = projectEffectiveCellPreferredWidth(cell),
 ): TableCellIntrinsicWidths {
   let minContentWidthPt = 0;
   let maxContentWidthPt = 0;
@@ -94,7 +95,7 @@ export function measureTableCellIntrinsicWidths(
   // Hanging indents and numbering markers have not been measured here.
   const unbrokenMinimum = tableLayout === 'autofit'
     && cell.noWrap === true
-    && cell.widthPt == null;
+    && preferredWidth?.kind !== 'dxa';
   return {
     minWidthPt: (unbrokenMinimum ? noWrapContentWidthPt : minContentWidthPt) + horizontalMarginsPt,
     maxWidthPt: Math.max(minContentWidthPt, maxContentWidthPt) + horizontalMarginsPt,

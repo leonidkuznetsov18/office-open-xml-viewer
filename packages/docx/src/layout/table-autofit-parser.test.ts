@@ -119,6 +119,65 @@ describe('parsed AutoFit occurrence width constraints', () => {
     },
   );
 
+  it('preserves a noWrap dxa preference through the initial tblW fit', () => {
+    const preferredCell = (noWrap: boolean, text = 'x') => cell
+      .replace('w:type="auto" w:w="0"', 'w:type="dxa" w:w="1600"')
+      .replace('</w:tcPr>', `${noWrap ? '<w:noWrap/>' : ''}</w:tcPr>`)
+      .replace('>cell<', `>${text}<`);
+    const table = (first: string, second: string) => `<w:tbl><w:tblPr>
+      <w:tblW w:type="dxa" w:w="2000"/>
+      <w:tblCellMar><w:left w:type="dxa" w:w="0"/><w:right w:type="dxa" w:w="0"/></w:tblCellMar></w:tblPr>
+      <w:tblGrid><w:gridCol w:w="1600"/><w:gridCol w:w="1600"/></w:tblGrid>
+      <w:tr>${first}${second}</w:tr></w:tbl>`;
+    expect(layoutTable(table(preferredCell(true), preferredCell(false))).columnWidthsPt)
+      .toEqual([80, 20]);
+    expect(layoutTable(table(preferredCell(false), preferredCell(false))).columnWidthsPt)
+      .toEqual([50, 50]);
+    const fixed = table(preferredCell(true), preferredCell(false))
+      .replace('</w:tblPr>', '<w:tblLayout w:type="fixed"/></w:tblPr>');
+    expect(layoutTable(fixed).columnWidthsPt).toEqual([50, 50]);
+    // Once the neighbour reaches its absolute minimum (7 * 6pt glyph
+    // advances, with explicit zero margins), the preference can shrink.
+    const constrained = layoutTable(table(preferredCell(true), preferredCell(false, 'xxxxxxx')));
+    expect(constrained.columnWidthsPt[0]).toBeCloseTo(58, 8);
+    expect(constrained.columnWidthsPt[1]).toBeCloseTo(42, 8);
+  });
+
+  it('preserves a spanning noWrap dxa preference during the initial tblW fit', () => {
+    const spanning = cell.replace('w:type="auto" w:w="0"', 'w:type="dxa" w:w="1600"')
+      .replace('</w:tcPr>', '<w:gridSpan w:val="2"/><w:noWrap/></w:tcPr>');
+    const neighbour = cell.replace('w:type="auto" w:w="0"', 'w:type="dxa" w:w="1600"')
+      .replace('>cell<', '>x<');
+    const table = layoutTable(`<w:tbl><w:tblPr><w:tblW w:type="dxa" w:w="2000"/></w:tblPr>
+      <w:tblGrid><w:gridCol w:w="1200"/><w:gridCol w:w="400"/><w:gridCol w:w="1600"/></w:tblGrid>
+      <w:tr>${spanning}${neighbour}</w:tr></w:tbl>`);
+    expect(table.columnWidthsPt).toEqual([60, 20, 20]);
+  });
+
+  it.each(['dxa', 'nil', 'pct'] as const)('treats noWrap tcW %s zero as auto in measurement and fitting', (kind) => {
+    const noWrapCell = cell.replace('</w:tcPr>', '<w:noWrap/></w:tcPr>')
+      .replace('>cell<', `>${'alpha beta gamma delta '.repeat(20).trim()}<`);
+    const table = (first: string) => `<w:tbl><w:tblPr>${auto}
+      <w:tblInd w:type="dxa" w:w="108"/></w:tblPr>
+      <w:tblGrid><w:gridCol w:w="4000"/><w:gridCol w:w="4532"/></w:tblGrid>
+      <w:tr>${first}${cell}</w:tr></w:tbl>`;
+    const automatic = layoutTable(table(noWrapCell));
+    const equivalent = layoutTable(table(noWrapCell.replace('w:type="auto"', `w:type="${kind}"`)));
+    expect(automatic.columnWidthsPt[0]).toBeGreaterThan(350);
+    expect(equivalent.columnWidthsPt).toEqual(automatic.columnWidthsPt);
+    const lines = (layout: TableLayout) => layout.rows[0]!.cells.map((c) => c.blocks.flatMap((b) =>
+      b.layout.kind === 'paragraph' ? b.layout.lines.map((l) => l.placements
+        .filter((placement) => placement.kind === 'text').map((placement) => placement.text).join('')) : []));
+    expect(lines(equivalent)).toEqual(lines(automatic));
+    if (kind === 'nil') {
+      // nil ignores the numeric width even when it is nonzero.
+      const nilWidth = noWrapCell.replace('w:type="auto" w:w="0"', 'w:type="nil" w:w="1600"');
+      const nonzeroNil = layoutTable(table(nilWidth));
+      expect(nonzeroNil.columnWidthsPt).toEqual(automatic.columnWidthsPt);
+      expect(lines(nonzeroNil)).toEqual(lines(automatic));
+    }
+  });
+
   it('retains a saved track with no cell even without an explicit row skip element', () => {
     const table = layoutTable(`<w:tbl><w:tblPr>${auto}</w:tblPr>
       <w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid>

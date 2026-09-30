@@ -173,12 +173,20 @@ export function tableDxaPtFromLexical(
   return constraint?.kind === 'dxa' ? constraint.value : null;
 }
 
-function publicTableCellConstraint(
-  cell: TableSourceSemanticInput['rows'][number]['cells'][number],
+/** WORD_TABLE_CELL_ZERO_NIL_WIDTH_AUTO (table-compatibility.ts): lexical
+ * tcW zero and nil mean auto. Project this once before intrinsic measurement
+ * and carry the same preference into the solver; raw widthPt=0 is not dxa
+ * protection. Without lexical facts, public zero widths have the same meaning. */
+export function projectEffectiveCellPreferredWidth(
+  cell: Readonly<{ widthPt: number | null; widthPct?: number | null }>,
+  lexicalWidth?: TableWidthAcquisitionWire | null,
 ): TablePreferredWidthConstraint | null {
-  if (cell.widthPt != null) return { kind: 'dxa', value: cell.widthPt };
-  if (cell.widthPct != null) return { kind: 'pct', value: cell.widthPct / 5000 };
-  return null;
+  const constraint = lexicalWidth
+    ? tableWidthConstraintFromLexical(lexicalWidth)
+    : cell.widthPt != null ? { kind: 'dxa' as const, value: cell.widthPt }
+    : cell.widthPct != null ? { kind: 'pct' as const, value: cell.widthPct / 5000 }
+    : null;
+  return constraint?.value === 0 ? null : constraint;
 }
 
 /** WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE: an authored first-row tblPrEx/tblW governs the
@@ -298,7 +306,9 @@ function skippedTableWidthConstraint(
 export function projectTableColumnLayoutInput(
   input: TableSourceAcquisitionInput,
   availableWidthPt: number,
-  intrinsicWidths: (rowIndex: number, cellIndex: number) => CellIntrinsicWidths,
+  intrinsicWidths: (
+    rowIndex: number, cellIndex: number, preferredWidth: TablePreferredWidthConstraint | null,
+  ) => CellIntrinsicWidths,
   maximumWidthPt: number | null = availableWidthPt,
 ): TableColumnLayoutInput {
   const table = input.semantic;
@@ -350,9 +360,10 @@ export function projectTableColumnLayoutInput(
         cells: row.cells.map((cell, cellIndex) => {
           const wire = rowInput?.cells[cellIndex] ?? null;
           const span = Math.max(1, cell.colSpan);
+          const preferredWidth = projectEffectiveCellPreferredWidth(cell, wire?.preferredWidth);
           const intrinsic = layoutKind === 'fixed'
             ? { minWidthPt: 0, maxWidthPt: 0 }
-            : intrinsicWidths(rowIndex, cellIndex);
+            : intrinsicWidths(rowIndex, cellIndex, preferredWidth);
           const spacingInsets = tableCellHorizontalSpacingInsets(
             input.format.rows[rowIndex]?.cellSpacingPt ?? 0,
             columnStart,
@@ -366,8 +377,7 @@ export function projectTableColumnLayoutInput(
           const result = {
             columnStart,
             columnSpan: span,
-            preferredWidth: tableWidthConstraintFromLexical(wire?.preferredWidth)
-              ?? publicTableCellConstraint(cell),
+            preferredWidth,
             ...(cell.noWrap ? { noWrap: true } : {}),
             ...(horizontalMarginsPt > 0 ? { horizontalMarginsPt } : {}),
             minContentWidthPt: Math.max(0, intrinsic.minWidthPt) + horizontalSpacingPt,
