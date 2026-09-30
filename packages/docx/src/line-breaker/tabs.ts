@@ -236,11 +236,16 @@ export function layoutBidiTabStops(
       // edge on the stop.
       target = stop.pos;
     }
-    // Pin content that would fall past the left text margin onto the margin: the
-    // following cell spans [target, target + fw] in reading-frame margins, so its
-    // far (left) edge must stay within the paragraph/float band. This is
-    // library containment policy, including for margin-reference targets.
-    const trailingLimit = frame?.bandEnd ?? leftLimitPx;
+    // Preserve the established text-margin clamp when no float narrows the
+    // line. §17.3.1.12 allows a negative trailing indent to extend the authored
+    // band past that margin; expanding the clamp to that edge would move cells
+    // that already fit (and charge larger earlier gaps before later-cell fit).
+    // A positive trailing indent still limits allocation to its authored band.
+    // Only a narrowed float window replaces the margin clamp with its available
+    // edge. This is library containment policy, not an Office overflow rule.
+    const trailingLimit = frame?.narrowed
+      ? frame.bandEnd
+      : Math.min(leftLimitPx, frame?.bandEnd ?? leftLimitPx);
     if (target + fw > trailingLimit) target = trailingLimit - fw;
     // Never let a tab move the pen backwards (right).
     if (target < pen) target = pen;

@@ -95,6 +95,21 @@ describe('first-line indents beside floats through the DOCX parser', () => {
     }
   });
 
+  it.each([
+    { name: 'short trailing cell', stop: 11000, cells: ['title', '12.3'], xPt: 72 },
+    { name: 'long interleaved CJK cell', stop: 2400, cells: ['aaa', '漢'.repeat(90), 'b'], xPt: 67 },
+  ])('preserves contained RTL tabs with a negative trailing indent: $name', ({ stop, cells, xPt }) => {
+    const paragraph = layoutParagraph(documentBytes('w:right="-720"', true, 0,
+      { alignment: 'left', count: cells.length - 1, stop, text: cells.join(''), cells, noFloat: true }));
+    expect(paragraph.lines).toHaveLength(1);
+    const texts = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
+    expect(texts[0].bounds.xPt).toBe(xPt);
+    for (const node of texts) {
+      expect(node.bounds.xPt).toBeGreaterThanOrEqual(36);
+      expect(node.bounds.xPt + node.bounds.widthPt).toBeLessThanOrEqual(540);
+    }
+  });
+
   it.each([false, true])('wraps a margin-aligned cell wider than the paragraph band, positional=%s', (positional) => {
     const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
       { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional, noFloat: true }));

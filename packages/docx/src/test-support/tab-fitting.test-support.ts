@@ -5,7 +5,7 @@ export function documentBytes(
   indent: string,
   rtl: boolean,
   xPt: number,
-  tab?: { alignment: string; count: number; text: string; positional?: boolean; relativeTo?: 'margin' | 'indent'; noFloat?: boolean; fontSizePt?: number; automatic?: boolean; prefix?: string; stop?: number },
+  tab?: { alignment: string; count: number; text: string; positional?: boolean; relativeTo?: 'margin' | 'indent'; noFloat?: boolean; fontSizePt?: number; automatic?: boolean; prefix?: string; stop?: number; cells?: readonly string[]; mirrorIndents?: boolean },
 ): Uint8Array {
   const seed = CONFORMANCE_CASES.find(({ axes }) => axes.story === 'body'
     && axes.container === 'paragraph' && axes.object === 'floating');
@@ -40,6 +40,11 @@ export function documentBytes(
     if (!drawingRun) throw new Error('Missing floating drawing run');
     xml = xml.replace(drawingRun, '').replace('</w:pPr>', `</w:pPr>${drawingRun}`);
   }
+  if (tab?.cells) {
+    xml = xml.replace(/(<w:tab\/>)+(?=<w:t)/, '')
+      .replace(/<w:t\b[^>]*>[\s\S]*?<\/w:t>/, tab.cells.map((cell) => `<w:t xml:space="preserve">${cell}</w:t>`).join('<w:tab/>'));
+  }
+  if (tab?.mirrorIndents) xml = xml.replace(/<w:ind[^>]*\/>/, '$&<w:mirrorIndents/>');
   if (tab?.fontSizePt) xml = xml.replace(/<w:sz(?:Cs)? w:val="\d+"\/>/g, (tag) => tag.replace(/\d+/, String((tab.fontSizePt ?? 12) * 2)));
   if (tab?.automatic) xml = xml.replace(/<w:tabs>[\s\S]*?<\/w:tabs>/g, '');
   if (tab?.noFloat) xml = xml.replace(/<w:drawing>[\s\S]*?<\/w:drawing>/g, '');
