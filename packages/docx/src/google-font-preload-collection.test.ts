@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 import init, { DocxArchive } from './wasm/docx_parser.js';
 import { storeZip } from './conformance/generate.js';
 import { createLayoutServices } from './layout-runtime.js';
-import { normalizeInternalDocumentModel } from './parser-model.js';
+import { normalizeInternalDocumentModel, paragraphMarkShapeInput } from './parser-model.js';
 import { renderDocumentToCanvas } from './renderer.js';
 import { docxFontPreloadNames } from './google-fonts.js';
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
@@ -232,6 +232,45 @@ describe('script-scoped Arabic visual substitutes', () => {
     return calls.filter((call) => [...call.text].some((c) => text.includes(c)))
       .map((call) => [call.text, call.face, cssFamilies(call.font)[0]]);
   };
+
+  it('keeps paragraph marks and non-Arabic runs independent of body Arabic proof', async () => {
+    const univers = '<w:rFonts w:ascii="Univers Next Arabic" w:hAnsi="Univers Next Arabic" w:cs="Arial"/>';
+    const mark = `<w:pPr><w:rPr>${univers}<w:sz w:val="22"/></w:rPr></w:pPr>`;
+    const model = parse(docx(
+      `<w:p>${mark}<w:r><w:rPr>${univers}</w:rPr><w:t>مرحبا</w:t></w:r></w:p>`
+      + `<w:p>${mark}</w:p>`
+      + `<w:p>${mark}<w:r><w:rPr>${univers}<w:sz w:val="44"/></w:rPr>`
+      + '<w:t xml:space="preserve">   Caption</w:t></w:r>'
+      + '<w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla" w:hAnsi="Sakkal Majalla"/>'
+      + '</w:rPr><w:t>ما</w:t></w:r></w:p>',
+    ));
+    const faces = [...WEB_FACES, 'Noto Sans Arabic', 'Sakkal Majalla'];
+    const { canvas, calls, measurements } = recordingCanvas(new Set(faces));
+    const options = { measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      installedSubstituteFamilies: ['sakkal majalla'] };
+    const services = createLayoutServices(model, {
+      ...options, useGoogleFonts: true, googleFaces: faces.map(loaded),
+    });
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 612, layoutServices: services });
+    expect(calls.some(({ text, face }) => text.includes('مرحبا') && face === 'Noto Sans Arabic')).toBe(true);
+    expect(calls.some(({ text, face }) => text.includes('ما') && face === 'Sakkal Majalla')).toBe(true);
+    expect(calls.filter(({ text }) => text.includes('Caption')).map(({ face }) => face)).toEqual(['sans-serif']);
+    const neutral = measurements.filter(({ text }) => text === 'x' || /^ +$/u.test(text));
+    expect(neutral.length).toBeGreaterThan(0);
+    expect(neutral.every(({ face }) => !face.includes('Arabic'))).toBe(true);
+    const withoutGoogle = createLayoutServices(model, options);
+    // §17.3.1.29 marks are independent shape inputs. A paragraph/body Arabic
+    // substitute must not change the empty mark's line box or borrow its proof.
+    for (const paragraph of model.body) {
+      if (paragraph.type !== 'paragraph') continue;
+      const input = paragraphMarkShapeInput(paragraph)!;
+      const request = { ...input, text: 'x' };
+      const expected = withoutGoogle.text.shape(request);
+      const actual = services.text.shape(request);
+      expect([actual.advancePt, actual.ascentPt, actual.descentPt])
+        .toEqual([expected.advancePt, expected.ascentPt, expected.descentPt]);
+    }
+  });
 
   it('measures emphasis clusters at their retained run offsets', async () => {
     const model = parse(docx('<w:p><w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
