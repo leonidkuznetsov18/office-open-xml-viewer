@@ -17,7 +17,13 @@ import {
   type LayoutTextSeg,
   type WrapLayoutCtx,
 } from './line-layout.js';
-import { lineGridAfter } from './layout/float-wrap.js';
+import {
+  lineGridAfter,
+  lineSearchPitch,
+  LINE_SEARCH_MAX_PITCH_PT,
+  LINE_SEARCH_MIN_PITCH_PT,
+  LINE_SEARCH_Y_LIMIT_PT,
+} from './layout/float-wrap.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Word's measured minimum line-start rule beside a float (issue #676).
@@ -492,53 +498,70 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     expect(diagnostics.evaluatedYCount).toBeLessThan(20_020);
   }, 30_000);
 
-  it('terminates on a tiny line height and on coordinates beyond the line height ulp', () => {
-    const rectangle = (y0: number, y1: number) => polygonFloat('tight', [
+  it('retries a sub-twip line on the one-twip pitch and stays finite outside the grid domain', () => {
+    const rectangle = (y0: number, y1: number, extra = {}) => polygonFloat('tight', [
       { xPt: 0, yPt: y0 }, { xPt: 100, yPt: y0 }, { xPt: 100, yPt: y1 }, { xPt: 0, yPt: y1 },
-    ]);
-    // 1e17 grid steps would be needed and k + 1 === k in binary64 there.
+    ], extra);
+    // 1e-14 pt: a 1e17-step grid collapses in binary64; the domain pitch is
+    // one twip, so the first fit is the first twip step past the bottom edge.
     const tiny = computePreparedLineFloatWindowWithDiagnostics(
       0, 10, 1e-14, 0, 100, prepareFloatWrap([rectangle(0, 1000)]),
     );
-    expect(tiny.window.topY).toBeGreaterThan(1000);
-    expect(tiny.window.topY).toBeLessThan(1000 + 1e-9);
+    expect(tiny.window.topY).toBe(lineGridAfter(0, LINE_SEARCH_MIN_PITCH_PT, 1000));
     expect(tiny.diagnostics.evaluatedYCount).toBeLessThanOrEqual(20_000 + 16);
-    // 0.05 pt is far below the ulp (16 pt) of these coordinates.
-    const base = 2 ** 56;
-    const large = computePreparedLineFloatWindow(
-      base, 10, 0.05, 0, 100, prepareFloatWrap([rectangle(base, base + 2 ** 14)]),
+    // Number.MIN_VALUE height with an exempt line one ulp below the start:
+    // that line top is not on the domain grid, so the earliest in-domain fit
+    // is the first twip step past the bottom edge, found within the cap.
+    const exempt = 100.00000000000001;
+    const minimum = computePreparedLineFloatWindowWithDiagnostics(
+      100, 10, Number.MIN_VALUE, 0, 100,
+      prepareFloatWrap([rectangle(99, 101, { exemptLineTopPt: exempt })]),
     );
-    // At this magnitude the bottom-edge probe collapses onto the edge, so the
-    // bottom itself is the first grid position that fits.
-    expect(large.topY).toBeGreaterThanOrEqual(base + 2 ** 14);
-    expect(large.topY).toBeLessThanOrEqual(base + 2 ** 14 + 16);
+    const expected = lineGridAfter(100, LINE_SEARCH_MIN_PITCH_PT, 101);
+    expect(minimum.window.topY).toBe(expected);
+    expect(minimum.diagnostics.evaluatedYCount).toBeLessThanOrEqual(Math.ceil(1 / 0.05) + 8);
+    // Outside the grid domain (off every page) the exact sweep alone places
+    // the line, so coordinates near the binary64 limit stay finite.
+    const huge = computePreparedLineFloatWindow(
+      1e308, 10, 1e308, 0, 100, prepareFloatWrap([rectangle(0, 1e308)]),
+    );
+    expect(Number.isFinite(huge.topY)).toBe(true);
+    expect(huge.topY).toBeGreaterThanOrEqual(1e308);
+    const far = computePreparedLineFloatWindow(
+      2 ** 56, 10, 0.05, 0, 100, prepareFloatWrap([rectangle(2 ** 56, 2 ** 56 + 2 ** 14)]),
+    );
+    expect(far.topY).toBeGreaterThanOrEqual(2 ** 56 + 2 ** 14);
+    expect(far.topY).toBeLessThanOrEqual(2 ** 56 + 2 ** 14 + 16);
   }, 30_000);
 
-  it('finds the first line-grid position strictly below any finite Y with bounded work', () => {
+  it('finds the first line-grid position strictly below any Y of the search domain', () => {
     let seed = 0x1ea5;
     const random = () => {
       seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
       return seed / 2 ** 32;
     };
-    for (let trial = 0; trial < 2000; trial += 1) {
-      const origin = (random() - 0.5) * 10 ** Math.floor(random() * 20);
-      const step = 10 ** (Math.floor(random() * 30) - 20) * (0.5 + random());
-      const y = origin + random() * 10 ** Math.floor(random() * 22);
-      const next = lineGridAfter(origin, step, y);
-      expect(next, `trial ${trial}`).toBeGreaterThan(y);
-      expect(Number.isFinite(next), `trial ${trial}`).toBe(true);
-      // Small index ranges: the smallest k >= 1 by direct enumeration.
-      const k = (y - origin) / step;
-      if (k < 1000) {
-        let direct = 1;
-        while (direct < 2000 && origin + direct * step <= y) direct += 1;
-        if (direct < 2000) expect(next, `trial ${trial}`).toBe(origin + direct * step);
-      }
+    const span = (limit: number) => (random() * 2 - 1) * limit * random() ** 8;
+    for (let trial = 0; trial < 5000; trial += 1) {
+      const origin = span(LINE_SEARCH_Y_LIMIT_PT);
+      const pitch = LINE_SEARCH_MIN_PITCH_PT
+        + random() ** 4 * (LINE_SEARCH_MAX_PITCH_PT - LINE_SEARCH_MIN_PITCH_PT);
+      const y = Math.min(LINE_SEARCH_Y_LIMIT_PT, Math.max(-LINE_SEARCH_Y_LIMIT_PT,
+        origin + random() ** 6 * 3000 * pitch * (random() < 0.1 ? -1 : 1)));
+      const next = lineGridAfter(origin, pitch, y);
+      const label = `trial ${trial}`;
+      expect(next, label).toBeGreaterThan(y);
+      // Earliest: the previous index (if any) does not pass y.
+      const k = Math.round((next - origin) / pitch);
+      expect(origin + k * pitch, label).toBe(next);
+      if (k > 1) expect(origin + (k - 1) * pitch, label).toBeLessThanOrEqual(y);
+      expect(k, label).toBeGreaterThanOrEqual(1);
     }
-    // Grid positions collapse onto one binary64 value above the step's ulp.
-    expect(lineGridAfter(2 ** 60, 0.05, 2 ** 60)).toBeGreaterThan(2 ** 60);
-    // No finite index reaches past y: the next binary64 value is used.
-    expect(lineGridAfter(0, Number.MIN_VALUE, 1e300)).toBeGreaterThan(1e300);
+    expect(lineSearchPitch(Number.MIN_VALUE)).toBe(LINE_SEARCH_MIN_PITCH_PT);
+    expect(lineSearchPitch(1e308)).toBe(LINE_SEARCH_MAX_PITCH_PT);
+    expect(lineSearchPitch(12)).toBe(12);
+    expect(lineSearchPitch(0)).toBeNull();
+    expect(() => lineGridAfter(1e308, 1e308, 1e308)).toThrow(RangeError);
+    expect(() => lineGridAfter(100, Number.MIN_VALUE, 100)).toThrow(RangeError);
   });
 
   it('keeps the search invariants on random square, topAndBottom and tight sets against a brute-force grid oracle', () => {
@@ -550,8 +573,8 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     const sides = ['bothSides', 'left', 'right', 'largest'] as const;
     const heights = [0, 1e-3, 0.05, 0.7, 2.5, 12];
     for (let trial = 0; trial < 300; trial += 1) {
-      // Occasionally shift everything to a large coordinate.
-      const offset = trial % 10 === 0 ? 2 ** 40 : 0;
+      // Occasionally shift everything to a large in-domain coordinate.
+      const offset = trial % 10 === 0 ? 2 ** 32 : 0;
       const floats: FloatRect[] = [];
       const count = 1 + Math.floor(random() * 5);
       for (let index = 0; index < count; index += 1) {
@@ -590,10 +613,12 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       // The answer fits: re-querying at it returns it unchanged.
       expect(computePreparedLineFloatWindow(window.topY, required, height, 0, 100, prepared), label)
         .toEqual(window);
-      // Nothing above the answer on the line grid fits (within the step cap).
-      if (!(height > 0) || (window.topY - start) / height > 5_000) continue;
-      for (let k = 0; start + k * height < window.topY; k += 1) {
-        const y = start + k * height;
+      // Nothing above the answer on the domain grid (start + k * pitch) fits
+      // (within the step cap).
+      const pitch = lineSearchPitch(height);
+      if (pitch === null || (window.topY - start) / pitch > 5_000) continue;
+      for (let k = 0; start + k * pitch < window.topY; k += 1) {
+        const y = start + k * pitch;
         expect(computePreparedLineFloatWindow(y, required, height, 0, 100, prepared).topY, `${label} k=${k}`)
           .not.toBe(y);
       }

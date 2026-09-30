@@ -1313,58 +1313,59 @@ function nextLocalSweepEvent(
  * failed band meets (see `computePreparedLineFloatWindowCore`). */
 const TIGHT_LINE_STEP_LIMIT = 20_000;
 
-/** Upper bound on the integer step index searched by `lineGridAfter`. */
-const LINE_GRID_MAX_INDEX = 2 ** 1023;
+/** Upper bound on the magnitude of line-top Ys the float line search visits.
+ * DrawingML positions and extents are ST_CoordinateUnqualified (ECMA-376
+ * §20.1.10.19), bounded by ±27,273,042,316,900 EMU = ±(2^31 − 1) pt, and a
+ * page-relative line or object Y is a sum of a few such terms, so 2^33 pt is
+ * past every page. Beyond it the search stops (see the domain contract in
+ * `computePreparedLineFloatWindowCore`). */
+export const LINE_SEARCH_Y_LIMIT_PT = 2 ** 33;
+/** Finest retry pitch: one twip, the smallest positive integer
+ * ST_SignedTwipsMeasure (§17.18.81) a w:spacing/@w:line exact or atLeast
+ * value can express. Finer pitches (universal measures, small auto
+ * multiples) retry at this pitch. */
+export const LINE_SEARCH_MIN_PITCH_PT = 0.05;
+/** Coarsest retry pitch: 1,584 pt (22 in), Word's largest page height and
+ * its largest exact/atLeast line spacing. A taller line cannot sit on any
+ * page, so a finer retry cannot move it onto one. */
+export const LINE_SEARCH_MAX_PITCH_PT = 1584;
+
+/** The line-retry pitch for a line of height `probeH`, clamped to the search
+ * domain, or null when the line has no positive finite height (no retries). */
+export function lineSearchPitch(probeH: number): number | null {
+  if (!(probeH > 0) || !Number.isFinite(probeH)) return null;
+  return Math.min(Math.max(probeH, LINE_SEARCH_MIN_PITCH_PT), LINE_SEARCH_MAX_PITCH_PT);
+}
 
 /**
- * The first line-grid position strictly below `y`: `originY + k * stepPt`
+ * The first line-grid position strictly below `y`: `originY + k * pitchPt`
  * for the smallest integer k >= 1 whose binary64 value exceeds `y`.
  *
- * The grid value is non-decreasing in k, so the index is found by an
- * estimate, exponential growth and bisection over integer indices: at most
- * about 2 * 1024 grid evaluations for any finite input, independent of how
- * many grid positions collapse onto one binary64 value (a tiny step at a
- * large coordinate). When no finite index reaches past `y` (a step far below
- * the coordinate's ulp), the grid is not representable there and the next
- * binary64 value above `y` is used. The result is always strictly greater
- * than `y`. Requires finite `originY`, `y` and a finite `stepPt > 0`.
+ * Domain (asserted): |originY|, |y| <= LINE_SEARCH_Y_LIMIT_PT and pitchPt in
+ * [LINE_SEARCH_MIN_PITCH_PT, LINE_SEARCH_MAX_PITCH_PT]. There every relevant
+ * index is below 2^40, so k and k * pitchPt are exact integers times a pitch
+ * at least 2^14 ulps of any coordinate: grid values strictly increase with k
+ * and are finite. The quotient estimate is then off by at most one, so each
+ * correction loop runs at most twice (asserted).
  */
-export function lineGridAfter(originY: number, stepPt: number, y: number): number {
-  const at = (k: number): number => originY + k * stepPt;
-  const estimate = Math.floor((y - originY) / stepPt) + 1;
-  let hi = Number.isFinite(estimate) && estimate > 1
-    ? Math.min(estimate, LINE_GRID_MAX_INDEX)
-    : 1;
-  let lo = 0;
-  if (at(hi) <= y) {
-    lo = hi;
-    while (at(hi) <= y) {
-      if (hi >= LINE_GRID_MAX_INDEX) {
-        return y + Math.max(Math.abs(y) * Number.EPSILON, Number.MIN_VALUE);
-      }
-      lo = hi;
-      hi = Math.min(hi * 2, LINE_GRID_MAX_INDEX);
-    }
-  } else if (hi > 1 && at(hi - 1) > y) {
-    // The estimate overshot: search down, keeping at(hi) > y.
-    let span = 1;
-    lo = hi - 1;
-    while (lo > 1 && at(lo) > y) {
-      hi = lo;
-      span *= 2;
-      lo = Math.max(1, hi - span);
-    }
-    if (at(lo) > y) return at(lo);
-  } else {
-    return at(hi);
+export function lineGridAfter(originY: number, pitchPt: number, y: number): number {
+  if (!(Math.abs(originY) <= LINE_SEARCH_Y_LIMIT_PT && Math.abs(y) <= LINE_SEARCH_Y_LIMIT_PT
+    && pitchPt >= LINE_SEARCH_MIN_PITCH_PT && pitchPt <= LINE_SEARCH_MAX_PITCH_PT)) {
+    throw new RangeError('Line grid query outside the float line-search domain');
   }
-  // Invariant: at(lo) <= y < at(hi), lo < hi, both integers.
-  for (;;) {
-    const mid = Math.floor(lo / 2 + hi / 2);
-    if (mid <= lo || mid >= hi) return at(hi);
-    if (at(mid) > y) hi = mid;
-    else lo = mid;
+  const at = (k: number): number => originY + k * pitchPt;
+  let k = Math.max(1, Math.floor((y - originY) / pitchPt) + 1);
+  let corrections = 0;
+  while (at(k) <= y) {
+    k += 1;
+    corrections += 1;
   }
+  while (k > 1 && at(k - 1) > y) {
+    k -= 1;
+    corrections += 1;
+  }
+  if (corrections > 2) throw new Error('Line grid estimate violated its one-step error bound');
+  return at(k);
 }
 
 /**
@@ -1445,22 +1446,33 @@ function computePreparedLineFloatWindowCore(
   // the next step is such a jump, or past the slab's upper event (at most E
   // such steps). Sweep candidates consume the finite
   // structural and local events. Each candidate costs one `lineWindowAtY`,
-  // one O(B) region test and an O(log) grid search, so a query is
-  // O((LIMIT + E + B + local events) * B log B) regardless of coordinate
-  // magnitude or line height. Grid positions skipped by a past-the-cap jump
+  // one O(B) region test and an O(1) grid search (`lineGridAfter`), so a
+  // query is O((LIMIT + E + B + local events) * B log B) for every input in
+  // the domain below. Grid positions skipped by a past-the-cap jump
   // are the only positions not tested; below the cap the walk never returns a
   // Y above the first usable candidate.
-  const gridStep = probeH > 0 && Number.isFinite(probeH) && Number.isFinite(topY);
+  //
+  // Numeric domain of the line grid: retries use the pitch
+  // `lineSearchPitch(probeH)` (1 twip to 1,584 pt; bands keep the line's own
+  // height), and a line top takes part in tight retries only within
+  // [-LIMIT, LIMIT] (LINE_SEARCH_Y_LIMIT_PT, past every page), where
+  // `lineGridAfter` is exact, finite and O(1). "Earliest" is stated on that
+  // grid. Beyond the domain (off every page) the exact sweep alone places the
+  // line, so extreme binary64 inputs keep origin/main's behaviour.
+  const pitch = Math.abs(topY) <= LINE_SEARCH_Y_LIMIT_PT ? lineSearchPitch(probeH) : null;
   const tightAt = (y: number): boolean =>
-    gridStep && bandMeetsTightPolygon(prepared, y, probeH, paraXLeft, paraXRight);
+    pitch !== null && Math.abs(y) <= LINE_SEARCH_Y_LIMIT_PT
+    && bandMeetsTightPolygon(prepared, y, probeH, paraXLeft, paraXRight);
+  const gridAfter = (y: number): number =>
+    lineGridAfter(topY, pitch!, Math.min(y, LINE_SEARCH_Y_LIMIT_PT));
   let stepBudget = TIGHT_LINE_STEP_LIMIT;
   const lineStepAfter = (y: number): number => {
     if (stepBudget > 0) {
       stepBudget -= 1;
-      return lineGridAfter(topY, probeH, y);
+      return gridAfter(y);
     }
     const bottom = lowestMetTightBottom(prepared, y, probeH, paraXLeft, paraXRight);
-    return lineGridAfter(topY, probeH, bottom === null ? y : Math.max(bottom, y));
+    return gridAfter(bottom === null ? y : Math.max(bottom, y));
   };
   let cursor = topY;
   // topY is grid position 0.
@@ -1496,9 +1508,10 @@ function computePreparedLineFloatWindowCore(
       // below every object. Keep layout total rather than throwing when the
       // last event itself is blocked (a line resting on a tight bottom edge).
       const lowest = Math.max(cursor, ...prepared.floats.map(({ rect }) => rect.yBottom));
-      const terminalY = gridStep
-        ? lineGridAfter(topY, probeH, lowest)
+      let terminalY = pitch !== null && lowest <= LINE_SEARCH_Y_LIMIT_PT
+        ? gridAfter(lowest)
         : lowest + Number.EPSILON * Math.max(1, Math.abs(lowest));
+      if (!Number.isFinite(terminalY)) terminalY = lowest;
       return evaluate(terminalY) ?? { topY: terminalY, xOffset: 0, maxWidth };
     }
     if (!(next > cursor)) {

@@ -147,17 +147,52 @@ pub fn signed_half_pt_to_pt(s: &str) -> Option<f64> {
     universal_measure_to_pt(value, true)
 }
 
-/// Parse `ST_SignedTwipsMeasure` (§17.18.81) to twips.
-///
-/// The bare member is the XSD `integer` lexical form in twentieths of a point;
-/// the unit-bearing member is `ST_UniversalMeasure`. Anything else (decimals,
-/// exponents, NaN/inf) is outside the lexical union and yields `None`.
-pub fn signed_twips_measure(s: &str) -> Option<f64> {
+/// A parsed `ST_SignedTwipsMeasure` (§17.18.81), kept in its authored unit so
+/// that no conversion overflows an intermediate: every lexeme whose value is a
+/// finite binary64 in its own unit stays finite.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignedTwipsMeasure {
+    /// The bare `xsd:integer` member, in twentieths of a point.
+    Twips(f64),
+    /// The `ST_UniversalMeasure` member, converted to points.
+    Points(f64),
+}
+
+impl SignedTwipsMeasure {
+    /// The value in points (twips / 20).
+    pub fn to_pt(self) -> f64 {
+        match self {
+            Self::Twips(twips) => twips / 20.0,
+            Self::Points(pt) => pt,
+        }
+    }
+
+    /// The value divided by 240 twips (one single line of w:spacing/@w:line
+    /// with `lineRule="auto"`): twips / 240, or points / 12.
+    pub fn to_240ths(self) -> f64 {
+        match self {
+            Self::Twips(twips) => twips / 240.0,
+            Self::Points(pt) => pt / 12.0,
+        }
+    }
+}
+
+/// Parse `ST_SignedTwipsMeasure` (§17.18.81): the bare member is the XSD
+/// `integer` lexical form in twips; the unit-bearing member is
+/// `ST_UniversalMeasure`. Anything else (decimals, exponents, NaN/inf) is
+/// outside the lexical union and yields `None`. A valid lexeme beyond the
+/// binary64 range saturates at `±f64::MAX` in its unit rather than becoming
+/// infinite or absent; layout clamps it to its own domain.
+pub fn signed_twips_measure(s: &str) -> Option<SignedTwipsMeasure> {
+    let saturate = |number: f64| number.clamp(-f64::MAX, f64::MAX);
     let value = s.trim();
     if is_xsd_integer_lexeme(value) {
-        return parse_finite(value);
+        return value
+            .parse::<f64>()
+            .ok()
+            .map(|twips| SignedTwipsMeasure::Twips(saturate(twips)));
     }
-    universal_measure_to_pt(value, true).map(|pt| pt * 20.0)
+    universal_measure_to_pt(value, true).map(|pt| SignedTwipsMeasure::Points(saturate(pt)))
 }
 
 fn is_xsd_integer_lexeme(value: &str) -> bool {
@@ -299,11 +334,12 @@ mod measure_tests {
 
     #[test]
     fn signed_twips_measure_accepts_only_its_lexical_union() {
-        assert_eq!(signed_twips_measure("240"), Some(240.0));
-        assert_eq!(signed_twips_measure("-20"), Some(-20.0));
-        assert_eq!(signed_twips_measure("+20"), Some(20.0));
-        assert_eq!(signed_twips_measure("12pt"), Some(240.0));
-        assert_eq!(signed_twips_measure("-1in"), Some(-1440.0));
+        use super::SignedTwipsMeasure::{Points, Twips};
+        assert_eq!(signed_twips_measure("240"), Some(Twips(240.0)));
+        assert_eq!(signed_twips_measure("-20"), Some(Twips(-20.0)));
+        assert_eq!(signed_twips_measure("+20"), Some(Twips(20.0)));
+        assert_eq!(signed_twips_measure("12pt"), Some(Points(12.0)));
+        assert_eq!(signed_twips_measure("-1in"), Some(Points(-72.0)));
         for invalid in ["2e-13", "1.5", "NaN", "inf", "", "+12pt", "12PT"] {
             assert_eq!(
                 signed_twips_measure(invalid),
@@ -311,6 +347,20 @@ mod measure_tests {
                 "{invalid:?} is outside ST_SignedTwipsMeasure's lexical union"
             );
         }
+        // A representable universal measure never overflows in conversion.
+        let huge = format!("1{}pt", "0".repeat(307));
+        let parsed = signed_twips_measure(&huge).expect("valid lexeme");
+        assert_eq!(parsed.to_pt(), 1e307);
+        assert!(parsed.to_240ths().is_finite());
+        assert_eq!(
+            signed_twips_measure("259").unwrap().to_240ths(),
+            259.0 / 240.0
+        );
+        // Beyond binary64 in its own unit: saturated, never infinite or absent.
+        let beyond = format!("1{}in", "0".repeat(307));
+        assert_eq!(signed_twips_measure(&beyond), Some(Points(f64::MAX)));
+        let beyond = format!("-1{}", "0".repeat(400));
+        assert_eq!(signed_twips_measure(&beyond), Some(Twips(-f64::MAX)));
     }
 
     #[test]

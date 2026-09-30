@@ -1341,8 +1341,9 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
             let rule = attr_w(sp, "lineRule").unwrap_or_else(|| "auto".to_string());
             // §17.3.1.33: w:line is ST_SignedTwipsMeasure. A value outside
             // its lexical union (e.g. an exponent or NaN) keeps the historical
-            // single-spacing fallback instead of reaching layout.
-            let raw: f64 = signed_twips_measure(&v).unwrap_or(240.0);
+            // single-spacing fallback instead of reaching layout. Converting
+            // from the authored unit keeps every valid lexeme finite.
+            let measure = signed_twips_measure(&v).unwrap_or(SignedTwipsMeasure::Twips(240.0));
             // OOXML encodes line spacing as:
             //   auto      → raw / 240   = multiplier (1.0 = single, 1.5 = 1½, 2.0 = double)
             //   atLeast   → raw / 20    = pt (minimum line height)
@@ -1354,9 +1355,9 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
             // the section enables a line grid, which is where those oversized
             // values are actually authored.
             let (val, effective_rule) = match rule.as_str() {
-                "exact" => (raw / 20.0, "exact".to_string()),
-                "atLeast" => (raw / 20.0, "atLeast".to_string()),
-                _ => (raw / 240.0, "auto".to_string()),
+                "exact" => (measure.to_pt(), "exact".to_string()),
+                "atLeast" => (measure.to_pt(), "atLeast".to_string()),
+                _ => (measure.to_240ths(), "auto".to_string()),
             };
             fmt.line_spacing_val = Some(val);
             fmt.line_spacing_rule = Some(effective_rule);
@@ -3571,6 +3572,12 @@ mod tests {
             ));
             assert_eq!(f.line_spacing_val, Some(12.0), "{invalid:?}");
         }
+        // A valid, representable universal measure stays finite.
+        let f = para_fmt_from(&format!(
+            r#"<w:spacing w:line="1{}pt" w:lineRule="exact"/>"#,
+            "0".repeat(307)
+        ));
+        assert_eq!(f.line_spacing_val, Some(1e307));
     }
 
     #[test]
