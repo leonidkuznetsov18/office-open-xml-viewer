@@ -1397,12 +1397,29 @@ function computePreparedLineFloatWindowCore(
   let stepBudget = TIGHT_LINE_STEP_LIMIT;
   type Stepped =
     | Readonly<{ kind: 'fits'; window: { topY: number; xOffset: number; maxWidth: number } }>
-    | Readonly<{ kind: 'left'; y: number }>
-    | Readonly<{ kind: 'limit'; y: number }>;
+    | Readonly<{ kind: 'left'; y: number }>;
+  /** Resource policy, not an OOXML rule: after the line-step budget is
+   * exhausted, skip to the first grid position past the lowest bottom met by
+   * the band. Test each position before skipping another region or resuming
+   * the event sweep, so unrelated events cannot hide a usable grid position.
+   * At an open top-touch boundary the slab can be tight while its cursor is
+   * not: advance one grid step to enter it rather than handing the unchanged
+   * cursor back to the sweep. Every iteration strictly advances; every jump
+   * past a met bottom leaves at least one polygon permanently behind. */
+  const stepLimitFallback = (after: number): Stepped => {
+    let y = after;
+    for (;;) {
+      const bottom = lowestMetTightBottom(prepared, y, probeH, paraXLeft, paraXRight);
+      y = gridAfter(Math.max(bottom ?? y, y));
+      const window = evaluate(y);
+      if (window) return { kind: 'fits', window };
+      if (!inTightRegion(y)) return { kind: 'left', y };
+    }
+  };
   const stepThroughTight = (after: number): Stepped => {
     let y = after;
     for (;;) {
-      if (stepBudget <= 0) return { kind: 'limit', y };
+      if (stepBudget <= 0) return stepLimitFallback(y);
       stepBudget -= 1;
       y = gridAfter(y);
       const window = evaluate(y);
@@ -1411,21 +1428,17 @@ function computePreparedLineFloatWindowCore(
     }
   };
   /** Earliest usable Y after `start` by the exact event sweep; tight regions
-   * hand off to line stepping unless `stepping` is false. */
-  const sweep = (
-    start: number,
-    stepping: boolean,
-  ): { topY: number; xOffset: number; maxWidth: number } => {
+   * hand off to line stepping, then resume this loop at an advanced cursor. */
+  const sweep = (start: number): { topY: number; xOffset: number; maxWidth: number } => {
     let cursor = start;
     let structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
     while (structuralIndex >= 0 && structuralIndex < structuralEvents.length) {
       const upper = structuralEvents[structuralIndex]!;
       // Tight-region membership changes only at structural events, so the
       // midpoint decides the whole open slab (cursor, upper).
-      if (stepping && inTightRegion(exactBinary64Midpoint(cursor, upper))) {
+      if (inTightRegion(exactBinary64Midpoint(cursor, upper))) {
         const stepped = stepThroughTight(cursor);
         if (stepped.kind === 'fits') return stepped.window;
-        if (stepped.kind === 'limit') return stepLimitFallback(stepped.y);
         cursor = stepped.y;
         structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
         continue;
@@ -1459,29 +1472,12 @@ function computePreparedLineFloatWindowCore(
     }
     return evaluate(terminalY) ?? { topY: terminalY, xOffset: 0, maxWidth };
   };
-  /** Resource limit: after TIGHT_LINE_STEP_LIMIT steps the remaining steps
-   * of the tight region are not tested. The line moves to the first grid step
-   * past the lowest bottom of the polygons its band still meets (repeated
-   * while the band stays in a tight region), tests that step with
-   * lineWindowAtY, and only then resumes the sweep. */
-  const stepLimitFallback = (y: number): { topY: number; xOffset: number; maxWidth: number } => {
-    let cursor = y;
-    for (;;) {
-      const bottom = lowestMetTightBottom(prepared, cursor, probeH, paraXLeft, paraXRight);
-      if (bottom === null) break;
-      const next = gridAfter(Math.max(bottom, cursor));
-      if (!(next > cursor)) break;
-      cursor = next;
-    }
-    return evaluate(cursor) ?? sweep(cursor, true);
-  };
   if (inTightRegion(topY)) {
     const stepped = stepThroughTight(topY);
     if (stepped.kind === 'fits') return stepped.window;
-    if (stepped.kind === 'limit') return stepLimitFallback(stepped.y);
-    return sweep(stepped.y, true);
+    return sweep(stepped.y);
   }
-  return sweep(topY, true);
+  return sweep(topY);
 }
 
 export function computePreparedLineFloatWindow(

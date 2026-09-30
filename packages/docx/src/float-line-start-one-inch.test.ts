@@ -479,6 +479,72 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     )).toEqual(alone);
   }, 60_000);
 
+  it('terminates after the step limit when a square bridges separated tight regions', () => {
+    const rectangle = (y0: number, y1: number) => polygonFloat('tight', [
+      { xPt: 0, yPt: y0 }, { xPt: 100, yPt: y0 }, { xPt: 100, yPt: y1 }, { xPt: 0, yPt: y1 },
+    ]);
+    const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+      0, 10, 0.5, 0, 100,
+      prepareFloatWrap([rectangle(0, 10_000), squareRect(0, 9000, 100, 30_000), rectangle(20_000, 25_000)]),
+    );
+    expect(window).toEqual({ topY: 30_000, xOffset: 0, maxWidth: 100 });
+    expect(diagnostics.evaluatedYCount).toBeLessThan(20_020);
+  }, 30_000);
+
+  it('terminates and returns a usable position no earlier than the direct rectangle oracle after the limit', () => {
+    let seed = 0x1623;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    for (let trial = 0; trial < 16; trial += 1) {
+      const height = [0.25, 0.5, 1][trial % 3]!;
+      const start = trial % 4 / 8;
+      const firstBottom = start + (20_000 + Math.floor(random() * 1000)) * height;
+      const regions = [{ top: start, bottom: firstBottom, tight: true }];
+      let bottom = firstBottom;
+      const count = 1 + Math.floor(random() * 4);
+      for (let index = 0; index < count; index += 1) {
+        const nextTop = bottom + (10 + Math.floor(random() * 20)) * height;
+        const nextBottom = nextTop + (10 + Math.floor(random() * 20)) * height;
+        // Alternate a square ending inside the next tight region and one
+        // covering it. Fractional tops exercise slab entry between grid steps.
+        regions.push({ top: bottom - height, bottom: nextBottom + (trial % 2 ? 5 : -5) * height, tight: false });
+        regions.push({ top: nextTop + (trial % 2) * height / 2, bottom: nextBottom, tight: true });
+        bottom = Math.max(...regions.map((region) => region.bottom));
+      }
+      const floats = regions.map(({ top, bottom: end, tight }) => tight
+        ? polygonFloat('tight', [
+          { xPt: 0, yPt: top }, { xPt: 100, yPt: top }, { xPt: 100, yPt: end }, { xPt: 0, yPt: end },
+        ])
+        : squareRect(0, top, 100, end));
+      // Independent direct rectangle test: squares have an open bottom;
+      // tight rectangles also block a line resting on their bottom edge.
+      const usable = (y: number) => !regions.some((region) =>
+        y + height > region.top && (region.tight ? y <= region.bottom : y < region.bottom));
+      const squareBottoms = regions.filter((region) => !region.tight).map((region) => region.bottom);
+      let earliest = Number.POSITIVE_INFINITY;
+      for (const y of squareBottoms) if (usable(y)) earliest = Math.min(earliest, y);
+      for (let step = 0; step <= Math.ceil((bottom - start) / height) + 1; step += 1) {
+        const y = start + step * height;
+        if (usable(y)) {
+          earliest = Math.min(earliest, y);
+          break;
+        }
+      }
+      const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+        start, 10, height, 0, 100, prepareFloatWrap(floats),
+      );
+      expect(Number.isFinite(window.topY), `trial ${trial}`).toBe(true);
+      expect(usable(window.topY), `trial ${trial}`).toBe(true);
+      expect(window.topY, `trial ${trial}`).toBeGreaterThanOrEqual(earliest);
+      // These full-width rectangles cannot open an interior gap, so the
+      // resource fallback must also retain the first directly usable position.
+      expect(window.topY, `trial ${trial}`).toBe(earliest);
+      expect(diagnostics.evaluatedYCount, `trial ${trial}`).toBeLessThan(20_000 + 12 * regions.length);
+    }
+  }, 60_000);
+
   it('keeps sweeping to the earliest contour root for through wrap', () => {
     const triangle = polygonFloat('through', [
       { xPt: 20, yPt: 0 }, { xPt: 80, yPt: 0 }, { xPt: 50, yPt: 100 },

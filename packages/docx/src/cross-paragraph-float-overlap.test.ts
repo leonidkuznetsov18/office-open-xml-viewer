@@ -47,6 +47,7 @@ interface Control {
   readonly mode: 14 | 15;
   readonly pictures: readonly Picture[];
   readonly empty?: readonly number[];
+  readonly lineHeightPt?: number;
 }
 
 const encoder = new TextEncoder();
@@ -82,7 +83,7 @@ function docx(control: Control): Uint8Array {
       .map((picture, index) => (picture.paragraph === p ? anchor(picture, index) : ''))
       .join('');
     paragraphs.push('<w:p><w:pPr><w:widowControl w:val="0"/>'
-      + '<w:spacing w:before="0" w:after="0" w:line="480" w:lineRule="exact"/></w:pPr>'
+      + `<w:spacing w:before="0" w:after="0" w:line="${(control.lineHeightPt ?? 24) * 20}" w:lineRule="exact"/></w:pPr>`
       + `${label}${drawings}</w:p>`);
   }
   const document = `<w:document xmlns:w="${W}" xmlns:r="${R}" xmlns:wp="${WP}" xmlns:a="${A}" xmlns:pic="${PIC}">`
@@ -196,6 +197,22 @@ beforeAll(async () => {
 });
 
 describe('issue #1623 Word placement of floats from different paragraphs', () => {
+  // Resource-policy regression, not a new Office compatibility claim: the
+  // parser-backed layout must remain total after exhausting tight line steps.
+  it('lays out separated tight regions bridged by a square after the step limit', () => {
+    const placed = layOut({
+      mode: 15,
+      lineHeightPt: 0.5,
+      pictures: [
+        { paragraph: 0, wrap: 'tight', hFrom: 'margin', xPt: 0, yPt: 0, widthPt: 468, heightPt: 10_000 },
+        { paragraph: 0, wrap: 'square', hFrom: 'margin', xPt: 0, yPt: 9000, widthPt: 468, heightPt: 21_000 },
+        { paragraph: 0, wrap: 'tight', hFrom: 'margin', xPt: 0, yPt: 20_000, widthPt: 468, heightPt: 5000 },
+      ],
+    });
+    expect(placed.lines.size).toBeGreaterThan(0);
+    for (const line of placed.lines.values()) expect(Number.isFinite(line.yPt)).toBe(true);
+  }, 30_000);
+
   it('keeps overlap-permitted pictures from different paragraphs at their resolved positions', () => {
     const placed = layOut({ mode: 15, pictures: pair('tight', 'column') });
     close(placed.pictures[0]?.xPt, 56.8);
