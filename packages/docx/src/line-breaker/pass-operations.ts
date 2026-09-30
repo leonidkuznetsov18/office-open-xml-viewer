@@ -167,7 +167,7 @@ export function performMaterializeLatinSpaceCompression(operationState: PassOper
 }
 
 export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
-  const { breakerState, maxWidth, wrapCtx, baseRtl, probeHeights, preparedFloatWrap } =
+  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
     operationState;
 
   breakerState.snapBlock = null;
@@ -179,6 +179,17 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
   // resolves it only once that exact line index has an observed line-box
   // height; newly-created lines are likewise measured before they are probed.
   if (probeH === undefined) return;
+  // §17.3.1.12 removes a hanging indent from the paragraph's first-line
+  // indentation, not from an object's exclusion (§20.4.2.17–.19). Query the
+  // expanded first-line band before subtracting floats; applying the hanging
+  // offset after that subtraction would move text back inside an object.
+  // Positive first-line indents remain an inset within the selected window.
+  // The measured-line contract still carries the authored firstIndent: restore
+  // it in the returned width so fit/tab arithmetic and planLine consume the
+  // same safe window, including the mirrored logical start of RTL paragraphs.
+  const hangingOffset = breakerState.isFirst ? Math.min(0, firstIndent) : 0;
+  const lineBandX = wrapCtx.paraX + (baseRtl ? 0 : hangingOffset);
+  const lineBandWidth = maxWidth - hangingOffset;
   const reference = {
     xLeftPt: wrapCtx.referenceXPt ?? wrapCtx.paraX,
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
@@ -190,21 +201,21 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
       minimumStartWidthPt: MIN_LINE_GAP,
       squareMinimumStartWidthPt: minWidth,
       probeHeightPt: probeH,
-      paragraphXPt: wrapCtx.paraX,
-      maximumWidthPt: maxWidth,
+      paragraphXPt: lineBandX,
+      maximumWidthPt: lineBandWidth,
       columnXPt: wrapCtx.columnXPt,
       columnWidthPt: wrapCtx.columnWidthPt,
     });
     breakerState.currentLineTopY = win.topYPt;
     breakerState.lineXOffset = win.xOffsetPt;
-    breakerState.lineMaxWidth = win.maximumWidthPt;
+    breakerState.lineMaxWidth = win.maximumWidthPt + hangingOffset;
   } else {
     const win = computePreparedLineFloatWindow(
       breakerState.currentLineTopY,
       MIN_LINE_GAP,
       probeH,
-      wrapCtx.paraX,
-      maxWidth,
+      lineBandX,
+      lineBandWidth,
       preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
       wrapCtx.columnXPt,
       wrapCtx.columnXPt + wrapCtx.columnWidthPt,
@@ -213,7 +224,7 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
     );
     breakerState.currentLineTopY = win.topY;
     breakerState.lineXOffset = win.xOffset;
-    breakerState.lineMaxWidth = win.maxWidth;
+    breakerState.lineMaxWidth = win.maxWidth + hangingOffset;
   }
 }
 

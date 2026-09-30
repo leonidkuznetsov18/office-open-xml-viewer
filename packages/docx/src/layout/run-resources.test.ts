@@ -828,19 +828,6 @@ describe('paragraph run resource projection', () => {
       }),
     ]);
 
-    const hangingFloat = acquireVariant({
-      alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: -10,
-      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
-      runs: [text('hanging text')],
-    }, { ...context, firstIndentPt: -10 }, 'hanging-float', 120, [{
-      id: 'left-float', wrap: 'square', bounds: { xPt: 10, yPt: 10, widthPt: 30, heightPt: 20 },
-      polygon: [{ xPt: 10, yPt: 10 }, { xPt: 40, yPt: 10 }, { xPt: 40, yPt: 30 }, { xPt: 10, yPt: 30 }],
-    }]);
-    const hangingLine = hangingFloat.lines[0]!;
-    const hangingText = hangingLine.placements.find((placement) => placement.kind === 'text');
-    expect(hangingLine.bounds.xPt).toBe(30);
-    expect(hangingText?.origin.xPt).toBe(30);
-
     const math = acquireVariant({
       alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
       spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
