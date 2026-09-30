@@ -111,6 +111,9 @@ importers:
       pngjs:
         specifier: ^7.0.0
         version: 7.0.0
+      skia-canvas:
+        specifier: ^2.0.0
+        version: 2.0.2
       typescript:
         specifier: ^7.0.2
         version: 7.0.2

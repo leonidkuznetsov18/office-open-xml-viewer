@@ -18,6 +18,7 @@ import { indexSealedPaintResourceDescriptors } from './paint-resources.js';
 import { sealPlainData } from './plain-data.js';
 import {
   projectTableColumnLayoutInput,
+  projectEffectiveTablePreferredWidthPt,
   type TableLayoutSource,
   type TableSourceAcquisitionInput,
 } from './table-source-acquisition.js';
@@ -405,13 +406,18 @@ function sealLayoutSourceStoreWithBody(
       if (!fact) throw new Error('Unknown table acquisition input');
       return fact.input.format;
     },
+    effectiveTablePreferredWidthPt(table, availableWidthPt) {
+      const fact = tableByIdentity.get(table);
+      if (!fact) throw new Error('Unknown table acquisition input');
+      return projectEffectiveTablePreferredWidthPt(fact.input, availableWidthPt);
+    },
     tableColumnLayoutInput(table, availableWidthPt, intrinsicWidths, maximumWidthPt) {
       const fact = tableByIdentity.get(table);
       if (!fact) throw new Error('Unknown table acquisition input');
       return projectTableColumnLayoutInput(
         fact.input,
         availableWidthPt,
-        (rowIndex, cellIndex) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!),
+        (rowIndex, cellIndex, preferredWidth) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferredWidth),
         maximumWidthPt,
       );
     },

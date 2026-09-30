@@ -322,11 +322,6 @@ pub struct DocumentSettings {
     /// Absent defaults to disabled; explicit `w:kern` remains authoritative.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_open_type_features: Option<bool>,
-    /// [MS-DOCX] §2.3.3 `compatibilityMode` compatibility setting (the Word
-    /// version whose layout behaviour applies, e.g. 14 or 15). `None` when the
-    /// setting is absent or its value is not a non-negative integer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compatibility_mode: Option<u32>,
     /// ECMA-376 Part 4 §14.8.3.50 `w:compat` / `w:useFELayout` — enable Far
     /// East layout compatibility behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -339,6 +334,12 @@ pub struct DocumentSettings {
     /// document-grid line pitch to text in table cells.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adjust_line_height_in_table: Option<bool>,
+    /// [MS-DOCX] `w:compat/w:compatSetting[@w:name="compatibilityMode"]`
+    /// (`@w:uri="http://schemas.microsoft.com/office/word"`) — the Word
+    /// version whose layout rules the document uses (for example 14 or 15).
+    /// `None` when absent or not a non-negative integer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_mode: Option<u32>,
 }
 
 /// Single track-changes event extracted from a body revision wrapper.
@@ -3378,6 +3379,11 @@ pub struct DocTableCell {
     /// table width). None unless the cell uses type="pct".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width_pct: Option<f64>,
+    /// ECMA-376 17.4.29 noWrap: AutoFit treats auto/pct cell content as one
+    /// unbroken string for its minimum-width constraint. Fixed cell widths
+    /// have a different preferred-width priority rule in the column solver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_wrap: Option<bool>,
     /// Per-cell margins from `<w:tcPr><w:tcMar>` (ECMA-376 §17.4.42), in pt.
     /// Each edge overrides the table-level `<w:tblCellMar>` default (§17.4.41)
     /// when present; None = inherit the table default. Used e.g. by résumé

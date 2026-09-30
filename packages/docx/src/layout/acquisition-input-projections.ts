@@ -8,6 +8,7 @@ import type {
   SourceRef,
   TableColumnLayoutInput,
   TableFormatInput,
+  TablePreferredWidthConstraint,
 } from './types.js';
 
 /** Parser-owned fact projections needed by otherwise parser-independent body
@@ -24,11 +25,17 @@ export interface BodyAcquisitionInputProjections {
   readonly tableFormatInput: (
     table: TableLayoutSource,
   ) => TableFormatInput;
+  /** Effective whole-table preference, including the first-row exception. */
+  readonly effectiveTablePreferredWidthPt: (
+    table: TableLayoutSource,
+    availableWidthPt: number,
+  ) => number | null;
   readonly tableColumnLayoutInput: (
     table: TableLayoutSource,
     availableWidthPt: number,
     intrinsicWidths: (
       cell: TableLayoutSource['rows'][number]['cells'][number],
+      preferredWidth: TablePreferredWidthConstraint | null,
     ) => Readonly<{ minWidthPt: number; maxWidthPt: number }>,
     maximumWidthPt?: number | null,
   ) => TableColumnLayoutInput;
