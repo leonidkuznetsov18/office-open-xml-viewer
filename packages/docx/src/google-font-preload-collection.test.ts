@@ -101,7 +101,7 @@ function recordingCanvas() {
 const loaded = (family: string) =>
   ({ family, weight: '400', style: 'normal', status: 'loaded' }) as FontFace;
 
-async function paintedFamily(model: DocxDocumentModel, text: string): Promise<string | undefined> {
+async function paintedFamily(model: DocxDocumentModel, text: string, installedSubstituteFamilies: readonly string[] = []): Promise<string | undefined> {
   const { canvas, calls } = recordingCanvas();
   await renderDocumentToCanvas(model, canvas, 0, {
     dpr: 1,
@@ -109,6 +109,7 @@ async function paintedFamily(model: DocxDocumentModel, text: string): Promise<st
     layoutServices: createLayoutServices(model, {
       useGoogleFonts: true,
       googleFaces: [loaded('Carlito'), loaded('Caladea')],
+      installedSubstituteFamilies,
       measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
     }),
   });
@@ -129,6 +130,13 @@ describe('Google Fonts preload collects every rendered substitute family', () =>
     expect(docxFontPreloadNames(model)).toContain('Cambria');
     expect(docxFontPreloadNames(model)).not.toContain('Calibri');
     expect(await paintedFamily(model, 'SerifBody')).toBe('Caladea');
+  });
+
+  it('keeps an installed authored family even when its web substitute is already loaded', async () => {
+    const model = parse(docx(
+      '<w:p><w:r><w:rPr><w:rFonts w:ascii="Cambria" w:hAnsi="Cambria"/></w:rPr><w:t>InstalledSerif</w:t></w:r></w:p>',
+    ));
+    expect(await paintedFamily(model, 'InstalledSerif', ['cambria'])).toBe('Cambria');
   });
 
   it('collects Calibri from a table nested in a text box story', async () => {

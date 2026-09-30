@@ -57,6 +57,9 @@ export interface ProductionLayoutServiceOptions {
   /** Exact local registrations, scoped to this FontFaceSet. */
   readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
   readonly googleFaces?: readonly LoadedFontFaceRecord[];
+  /** Normalized families whose authored face is installed; they are never
+   * routed to a different-family Google substitute (`docxGoogleFontPlan`). */
+  readonly installedSubstituteFamilies?: readonly string[];
 }
 
 export function createProductionLayoutServices(
@@ -167,6 +170,8 @@ export function createProductionLayoutServices(
       const entry = DOCX_GOOGLE_FONTS[key];
       const resolvedFamily = entry?.loadFamily ?? name;
       if (!entry) continue;
+      if (normalizedFaceFamily(resolvedFamily) !== normalizedFaceFamily(name)
+        && options.installedSubstituteFamilies?.includes(key)) continue;
       for (const loaded of successfulGoogle.filter(
         (face) => face.family === normalizedFaceFamily(resolvedFamily),
       )) {

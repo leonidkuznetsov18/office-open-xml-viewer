@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { FontPreloadEntry } from '@silurus/ooxml-core';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames, docxOfficeFontFallbackRequests } from './google-fonts.js';
+import {
+  DOCX_GOOGLE_FONTS,
+  docxFontPreloadNames,
+  docxGoogleFontPlan,
+  docxOfficeFontFallbackRequests,
+} from './google-fonts.js';
 import type { DocxDocumentModel } from './types.js';
 
 // Verbatim snapshot of the DOCX Office-font substitute map BEFORE the shared
@@ -101,6 +106,32 @@ it('preloads every registered rendered family without theme names and omits unre
   expect(docxFontPreloadNames(doc)).toEqual([
     undefined, undefined, 'Ubuntu', 'Roboto', 'Franklin Gothic Book',
   ]);
+});
+
+it('checks substitute family presence independent of the styles used', () => {
+  const doc = docWith('body');
+  doc.majorFont = undefined;
+  doc.minorFont = undefined;
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'Bold only', fontFamily: 'Franklin Gothic Book', bold: true },
+  ];
+  // Only the bold tuple is a style request; presence is asked for the family.
+  const requests = docxOfficeFontFallbackRequests(doc, { useGoogleFonts: true });
+  expect(requests.filter((request) => request.family === 'Franklin Gothic Book')).toEqual([
+    { family: 'Franklin Gothic Book', weight: 700, style: 'normal' },
+    { family: 'Franklin Gothic Book', presenceOnly: true },
+  ]);
+  expect(docxOfficeFontFallbackRequests(doc).some((request) => request.presenceOnly)).toBe(false);
+
+  for (const officeFonts of [
+    { routes: {}, installed: ['franklin gothic book'] },
+    { routes: { 'franklin gothic book:700:normal': {} } },
+  ]) {
+    const plan = docxGoogleFontPlan(doc, undefined, officeFonts);
+    expect(plan.names).not.toContain('Franklin Gothic Book');
+    expect(plan.installedSubstituteFamilies).toEqual(['franklin gothic book']);
+  }
+  expect(docxGoogleFontPlan(doc, undefined, { routes: {} }).names).toContain('Franklin Gothic Book');
 });
 
 it('loads the themed bold face when a run inherits its family', () => {
@@ -209,4 +240,29 @@ it('preloads the explicit Chinese region even when the same run contains kana', 
   Object.assign((doc.body[0] as { runs: object[] }).runs[0], { langEastAsia: 'zh-CN' });
   expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans SC');
   expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans JP');
+});
+
+it('keeps Arabic visual substitutes at legacy theme-only collection', () => {
+  const families = ['Sakkal Majalla', 'Traditional Arabic', 'Simplified Arabic',
+    'Arabic Typesetting', 'Univers Next Arabic'];
+  for (const family of families) {
+    const doc = docWith('مرحبا', 'Aptos', 'Aptos');
+    (doc.body[0] as { runs: object[] }).runs = [{ type: 'text', text: 'مرحبا',
+      fontFamily: family, fontFamilyHighAnsi: family, fontFamilyEastAsia: family, fontFamilyCs: family }];
+    expect(docxFontPreloadNames(doc)).not.toContain(family);
+    doc.majorFont = family;
+    expect(docxFontPreloadNames(doc).filter((name) => name === family)).toEqual([family]);
+  }
+});
+
+
+it('keeps default native preflight at its existing slot projection', () => {
+  const doc = docWith('body');
+  (doc.body[0] as { runs: object[] }).runs = [{ type: 'text', text: 'body',
+    fontFamily: 'Arial', fontSlots: { direct: { ascii: 'Arial', highAnsi: 'Cambria',
+      eastAsia: 'Arial', complexScript: 'Arial' }, themePresent: {} } }];
+  expect(docxOfficeFontFallbackRequests(doc).some((request) => request.family === 'Cambria')).toBe(false);
+  expect(docxOfficeFontFallbackRequests(doc, { useGoogleFonts: true }))
+    .toContainEqual({ family: 'Cambria', weight: 400, style: 'normal' });
+  expect(docxFontPreloadNames(doc)).toContain('Cambria');
 });

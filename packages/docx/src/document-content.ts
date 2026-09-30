@@ -21,6 +21,11 @@ import type { NumberingMarkerShapeInput } from './layout/types.js';
 
 type InternalRenderedFontAxes = Readonly<InternalRunSlotMetadata>;
 
+// Web preload admits newly resolved slot families. Native preflight retains
+// its existing projection so enabling this optional resource feature cannot
+// change default local registrations or layout.
+type FontCollection = 'native-preflight' | 'google-preload';
+
 type SlotRequest = Pick<NumberingMarkerShapeInput, 'fonts' | 'themeFonts' | 'themeFontPresence'>;
 
 /** The family the text shaper requests for each §17.3.2.26 slot. Resource
@@ -89,7 +94,7 @@ export interface DocxRenderedTextUsage {
   italic?: boolean;
 }
 
-function* shapeTextUsages(shape: ShapeRun): Generator<DocxRenderedTextUsage> {
+function* shapeTextUsages(shape: ShapeRun, collection: FontCollection): Generator<DocxRenderedTextUsage> {
   if (shape.textPath) {
     yield {
       text: shape.textPath.string,
@@ -100,8 +105,8 @@ function* shapeTextUsages(shape: ShapeRun): Generator<DocxRenderedTextUsage> {
   // (paragraphs AND tables, recursively). The legacy textBlocks projection
   // omits tables, so it is consulted only for hand-built public shapes.
   const content = (shape as InternalShapeRun).textBoxContent;
-  if (content !== undefined) {
-    yield* bodyUsages(content as BodyElement[]);
+  if (collection === 'google-preload' && content !== undefined) {
+    yield* bodyUsages(content as BodyElement[], collection);
     return;
   }
   for (const block of shape.textBlocks ?? []) {
@@ -148,10 +153,13 @@ function* textResultUsages(
   facts: InternalRenderedFontAxes,
   bold: boolean | undefined,
   italic: boolean | undefined,
+  collection: FontCollection,
 ): Generator<DocxRenderedTextUsage> {
   const request = runSlotRequest(ascii, facts);
   const [asciiFamily, highAnsiFamily, eastAsiaFamily] =
-    slotFamilies(request, ['ascii', 'highAnsi', 'eastAsia']);
+    collection === 'google-preload'
+      ? slotFamilies(request, ['ascii', 'highAnsi', 'eastAsia'])
+      : [ascii, facts.fontFamilyHighAnsi, facts.fontFamilyEastAsia];
   yield {
     text,
     eastAsiaLanguage: facts.langEastAsia,
@@ -160,8 +168,9 @@ function* textResultUsages(
     bold,
     italic,
   };
-  if (runUsesComplexScriptSlot(facts)) {
-    const [complexScriptFamily] = slotFamilies(request, ['complexScript']);
+  if (collection === 'google-preload' ? runUsesComplexScriptSlot(facts) : facts.fontFamilyCs != null) {
+    const complexScriptFamily = collection === 'google-preload'
+      ? requestedFamily(request, 'complexScript') : facts.fontFamilyCs;
     if (complexScriptFamily) yield {
       text,
       eastAsiaLanguage: facts.langEastAsia,
@@ -174,15 +183,15 @@ function* textResultUsages(
   }
 }
 
-function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
+function* runUsages(run: DocRun, collection: FontCollection): Generator<DocxRenderedTextUsage> {
   if (run.type === 'text') {
     const text = run as DocxTextRun & InternalRenderedFontAxes;
-    yield* textResultUsages(run.text, run.fontFamily, text, run.bold, run.italic);
+    yield* textResultUsages(run.text, run.fontFamily, text, run.bold, run.italic, collection);
   } else if (run.type === 'field') {
     const field = run as FieldRun & InternalRenderedFontAxes;
-    yield* textResultUsages(field.fallbackText, field.fontFamily, field, field.bold, field.italic);
+    yield* textResultUsages(field.fallbackText, field.fontFamily, field, field.bold, field.italic, collection);
   } else if (run.type === 'shape') {
-    yield* shapeTextUsages(run);
+    yield* shapeTextUsages(run, collection);
   } else if (run.type === 'anchorHost') {
     yield {
       text: '',
@@ -193,24 +202,30 @@ function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
   }
 }
 
-function* paragraphUsages(paragraph: DocParagraph): Generator<DocxRenderedTextUsage> {
+function* paragraphUsages(paragraph: DocParagraph, collection: FontCollection): Generator<DocxRenderedTextUsage> {
   // Empty paragraphs still reserve the resolved paragraph-mark line box.
   yield {
     text: '',
     fontFamilies: [paragraph.defaultFontFamily, paragraph.defaultFontFamilyEastAsia],
   };
-  const mark = paragraphMarkShapeInput(paragraph);
-  if (mark) yield shapeInputUsage('', mark);
+  if (collection === 'google-preload') {
+    const mark = paragraphMarkShapeInput(paragraph);
+    if (mark) yield shapeInputUsage('', mark);
+  }
   if (paragraph.numbering) {
     // Same effective numbering-level rPr projection (all four slots and their
     // theme references) that production marker shaping consumes.
-    yield shapeInputUsage(
+    if (collection === 'google-preload') yield shapeInputUsage(
       paragraph.numbering.text,
       numberingMarkerShapeInput(paragraph.numbering, paragraph.defaultFontSize ?? 10),
     );
+    else yield {
+      text: paragraph.numbering.text,
+      fontFamilies: [paragraph.numbering.fontFamily, paragraph.numbering.fontFamilyEastAsia],
+    };
   }
   for (const run of paragraph.runs) {
-    for (const usage of runUsages(run)) {
+    for (const usage of runUsages(run, collection)) {
       const inherited = usage.fontFamilies.some(Boolean) ? usage.fontFamilies
         : [paragraph.defaultFontFamily, paragraph.defaultFontFamilyEastAsia];
       yield {
@@ -224,34 +239,35 @@ function* paragraphUsages(paragraph: DocParagraph): Generator<DocxRenderedTextUs
   }
 }
 
-function* tableUsages(table: DocTable): Generator<DocxRenderedTextUsage> {
+function* tableUsages(table: DocTable, collection: FontCollection): Generator<DocxRenderedTextUsage> {
   for (const row of table.rows) {
     for (const cell of row.cells) {
-      yield* bodyUsages(cell.content as BodyElement[]);
+      yield* bodyUsages(cell.content as BodyElement[], collection);
     }
   }
 }
 
 function* headerFooterUsages(
   stories: HeadersFooters | null | undefined,
+  collection: FontCollection,
 ): Generator<DocxRenderedTextUsage> {
   if (!stories) return;
   for (const story of [stories.default, stories.first, stories.even]) {
-    if (story) yield* bodyUsages(story.body);
+    if (story) yield* bodyUsages(story.body, collection);
   }
 }
 
-function* bodyUsages(body: readonly BodyElement[]): Generator<DocxRenderedTextUsage> {
+function* bodyUsages(body: readonly BodyElement[], collection: FontCollection): Generator<DocxRenderedTextUsage> {
   for (const element of body) {
     if (element.type === 'paragraph') {
-      yield* paragraphUsages(element);
+      yield* paragraphUsages(element, collection);
     } else if (element.type === 'table') {
-      yield* tableUsages(element);
+      yield* tableUsages(element, collection);
     } else if (element.type === 'sectionBreak') {
       // Non-final sections keep their resolved header/footer stories on the
       // marker; the top-level sets represent only the final section.
-      yield* headerFooterUsages(element.headers);
-      yield* headerFooterUsages(element.footers);
+      yield* headerFooterUsages(element.headers, collection);
+      yield* headerFooterUsages(element.footers, collection);
     }
   }
 }
@@ -262,12 +278,13 @@ function* bodyUsages(body: readonly BodyElement[]): Generator<DocxRenderedTextUs
  * Comments are excluded because the page renderer does not paint them. */
 export function* docxRenderedTextUsages(
   doc: DocxDocumentModel,
+  collection: FontCollection = 'native-preflight',
 ): Generator<DocxRenderedTextUsage> {
-  yield* bodyUsages(doc.body ?? []);
-  yield* headerFooterUsages(doc.headers);
-  yield* headerFooterUsages(doc.footers);
+  yield* bodyUsages(doc.body ?? [], collection);
+  yield* headerFooterUsages(doc.headers, collection);
+  yield* headerFooterUsages(doc.footers, collection);
   for (const note of [...(doc.footnotes ?? []), ...(doc.endnotes ?? [])]) {
-    yield* bodyUsages(note.content);
+    yield* bodyUsages(note.content, collection);
   }
 }
 

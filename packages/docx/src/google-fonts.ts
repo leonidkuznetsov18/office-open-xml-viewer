@@ -15,6 +15,14 @@ import { DOCX_GOOGLE_FONTS } from './google-font-registry.js';
 // while this module traverses parser-owned facts to collect rendered families.
 export { DOCX_GOOGLE_FONTS } from './google-font-registry.js';
 
+// Collection policy, not script inference or a font-slot override. These
+// existing visual alternatives remain available through theme names exactly
+// as before this expanded preload; their rendering policy is a separate change.
+const THEME_ONLY_VISUAL_SUBSTITUTES = new Set([
+  'sakkal majalla', 'traditional arabic', 'simplified arabic',
+  'arabic typesetting', 'univers next arabic',
+]);
+
 function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
   for (const usage of docxRenderedTextUsages(doc)) yield usage.text;
 }
@@ -31,7 +39,10 @@ function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
  * stories and numbering markers. The loader requests only names that have a
  * {@link DOCX_GOOGLE_FONTS} entry, and the layout font inventory routes only
  * preloaded names to their loaded substitute, so a rendered Cambria run needs
- * Cambria here for Caladea to be both fetched and selected. Rendered names
+ * Cambria here for Caladea to be both fetched and selected. The five Arabic
+ * visual substitutes retain legacy theme-only collection: broadening their
+ * preload would also broaden their unscoped visual substitution. That separate
+ * policy must be implemented before collecting their rendered families. Names
  * without an entry are omitted (they would be inert). The document font table
  * alone never adds a name.
  *
@@ -57,12 +68,14 @@ export function docxFontPreloadNames(
   const renderedFamilies = new Map<string, string>();
   const themeKeys = new Set([doc.majorFont, doc.minorFont]
     .map((family) => family?.trim().toLocaleLowerCase('en-US')));
-  for (const usage of docxRenderedTextUsages(doc)) {
+  for (const usage of docxRenderedTextUsages(doc, 'google-preload')) {
     for (const family of usage.fontFamilies) {
       const name = family?.trim();
       const key = name?.toLocaleLowerCase('en-US');
-      if (name && key && key in DOCX_GOOGLE_FONTS && !themeKeys.has(key)
-        && !renderedFamilies.has(key)) {
+      const entry = key ? DOCX_GOOGLE_FONTS[key] : undefined;
+      // Preserve the legacy collection boundary for Arabic visual substitutes.
+      if (name && key && entry && !themeKeys.has(key) && !renderedFamilies.has(key)
+        && !THEME_ONLY_VISUAL_SUBSTITUTES.has(key)) {
         renderedFamilies.set(key, name);
       }
     }
@@ -77,11 +90,66 @@ export function docxFontPreloadNames(
     ...new Set([...scripts.names(), ...languageNames])];
 }
 
+export interface DocxGoogleFontPlan {
+  /** Names to pass to `preloadGoogleFonts`. */
+  readonly names: readonly (string | null | undefined)[];
+  /** Normalized authored families whose own face is installed. The layout font
+   * inventory must not route these families to a different-family substitute. */
+  readonly installedSubstituteFamilies: readonly string[];
+}
+
+/** Different-family substitutes (Calibri → Carlito, Cambria →
+ * Caladea) among the preload names, keyed by normalized family. */
+function differentFamilySubstitutes(
+  names: readonly (string | null | undefined)[],
+): Map<string, string> {
+  const substitutes = new Map<string, string>();
+  for (const name of names) {
+    const family = name?.trim();
+    const key = family?.toLocaleLowerCase('en-US');
+    const loadFamily = key ? DOCX_GOOGLE_FONTS[key]?.loadFamily : undefined;
+    if (family && key && loadFamily && loadFamily.toLocaleLowerCase('en-US') !== key) {
+      substitutes.set(key, family);
+    }
+  }
+  return substitutes;
+}
+
+/**
+ * Google Fonts preload plan shared by the main-thread and worker loaders.
+ *
+ * A different-family substitute stands in only for a face that the host
+ * lacks. When the authored face is installed, library policy keeps the
+ * authored face: the substitute is neither fetched nor routed. Presence is a
+ * property of the family, not of the styles the document uses. It is proven by
+ * any exact local route of the family, or by the family `presenceOnly` probe
+ * that {@link docxOfficeFontFallbackRequests} queues with useGoogleFonts.
+ * Same-name Google families (Roboto, Ubuntu, ...) are the authored face itself
+ * and are unaffected.
+ */
+export function docxGoogleFontPlan(
+  doc: DocxDocumentModel,
+  cjkFallback: CjkLang | undefined,
+  officeFonts: Readonly<{ routes: Readonly<Record<string, unknown>>; installed?: readonly string[] }>,
+): DocxGoogleFontPlan {
+  const names = docxFontPreloadNames(doc, cjkFallback);
+  const probed = new Set(officeFonts.installed ?? []);
+  // Any proven face of the family counts, whichever styles produced it.
+  const routedFamilies = new Set(Object.keys(officeFonts.routes).map((key) => key.split(':')[0]));
+  const installed = new Set([...differentFamilySubstitutes(names).keys()]
+    .filter((key) => routedFamilies.has(key) || probed.has(key)));
+  return {
+    names: names.filter((name) => !installed.has(name?.trim().toLocaleLowerCase('en-US') ?? '')),
+    installedSubstituteFamilies: [...installed].sort(),
+  };
+}
+
 /** Probe exact local style tuples used by rendered text. The shared loader
  * declines uncatalogued names, and the document font table alone never queues
  * a face that rendered content does not use. No font bytes are packaged. */
 export function docxOfficeFontFallbackRequests(
   doc: DocxDocumentModel,
+  options: Readonly<{ useGoogleFonts?: boolean; cjkFallback?: CjkLang }> = {},
 ): OfficeFontFallbackRequest[] {
   const tuples = new Map<string, OfficeFontFallbackRequest>();
   const add = (family: string | null | undefined, bold = false, italic = false) => {
@@ -95,7 +163,7 @@ export function docxOfficeFontFallbackRequests(
   // particular authored run does not repeat its font name.
   add(doc.majorFont);
   add(doc.minorFont);
-  for (const usage of docxRenderedTextUsages(doc)) {
+  for (const usage of docxRenderedTextUsages(doc, options.useGoogleFonts ? 'google-preload' : 'native-preflight')) {
     for (const family of usage.fontFamilies) add(family, usage.bold, usage.italic);
     if (usage.text && (usage.latinFontFamily === null ||
       (usage.latinFontFamily === undefined && !usage.fontFamilies.some(Boolean)))) {
@@ -104,7 +172,14 @@ export function docxOfficeFontFallbackRequests(
       add(doc.minorFont, usage.bold, usage.italic);
     }
   }
-  return [...tuples.values()];
+  // With useGoogleFonts, every family served by a different-family substitute
+  // is checked for installation as a family, independent of the styles the
+  // document uses (docxGoogleFontPlan).
+  const presence = options.useGoogleFonts
+    ? [...differentFamilySubstitutes(docxFontPreloadNames(doc, options.cjkFallback)).values()]
+      .map((family): OfficeFontFallbackRequest => ({ family, presenceOnly: true }))
+    : [];
+  return [...tuples.values(), ...presence];
 }
 
 
