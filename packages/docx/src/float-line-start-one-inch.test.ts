@@ -269,7 +269,7 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     expect(compared).toBeGreaterThan(200);
   }, 120_000);
 
-  it('keeps the tight line-step search near-linear in the number of overlapping polygons', () => {
+  it('bounds tight line stepping by the polygons it has to pass', () => {
     for (const count of [10, 50, 75]) {
       const floats = Array.from({ length: count }, (_, index) => polygonFloat('tight', [
         { xPt: index - 10, yPt: index * 2 },
@@ -284,9 +284,12 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       );
       const elapsedMs = performance.now() - started;
       if (count === 10) expect(window).toEqual(perStepReference(floats, 0, 60, 1, 0, 100));
-      expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(4 * count + 8);
+      // One evaluation per line step until the band clears the lowest polygon
+      // (bottom 2 * (count - 1) + 300), plus the structural events.
+      const lowestBottom = 2 * (count - 1) + 300;
+      expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(lowestBottom + 2 * count + 8);
       // Generous: the evaluation count is the real bound; this only catches a
-      // return of the quartic enumeration (seconds) without flaking under load.
+      // pathological regression without flaking under load.
       expect(elapsedMs).toBeLessThan(5_000);
     }
   });
@@ -303,8 +306,9 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
    * Independent oracle for a stack of square rectangles and tight polygons:
    * a line tests its own top; while a tight polygon meets its band it retries
    * on the grid start + k * lineHeight; otherwise it moves to the next square
-   * bottom, or, when the next thing it reaches is a tight polygon, onto the
-   * first grid step inside that polygon's band.
+   * bottom or exempt anchor line, or, when the next thing it reaches is a
+   * tight polygon, onto the first grid step inside that polygon's band. An
+   * exempt anchor line changes only its own window, never the tight region.
    */
   const mixedReference = (
     floats: FloatRect[],
@@ -335,14 +339,20 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
         y = gridAfter(y);
         continue;
       }
-      const nextBottom = Math.min(...squares.map((float) => float.yBottom).filter((bottom) => bottom > y));
+      // Outside tight regions only square rectangles block, so the window can
+      // improve only at a square bottom or an exempt anchor line.
+      const candidates = [
+        ...squares.map((float) => float.yBottom),
+        ...inColumn.flatMap((float) => (float.exemptLineTopPt === undefined ? [] : [float.exemptLineTopPt])),
+      ].filter((candidate) => candidate > y);
+      const next = candidates.length > 0 ? Math.min(...candidates) : Number.POSITIVE_INFINITY;
       const entries = tight.map((float) => float.yTop - lineHeight).filter((entry) => entry >= y);
       const entry = entries.length > 0 ? Math.min(...entries) : Number.POSITIVE_INFINITY;
-      if (entry < nextBottom) {
+      if (entry < next) {
         y = gridAfter(entry);
-      } else if (Number.isFinite(nextBottom)) {
-        if (entry === nextBottom && !fits(nextBottom)) y = gridAfter(entry);
-        else y = nextBottom;
+      } else if (Number.isFinite(next)) {
+        if (entry === next && !fits(next)) y = gridAfter(entry);
+        else y = next;
       } else {
         throw new Error('oracle found no candidate');
       }
@@ -372,6 +382,17 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     expect(window).toEqual(mixedReference(floats, 0, 40, 5));
   });
 
+  it('keeps an exempt anchor line inside the tight line-step region', () => {
+    const floats = [
+      squareRect(0, 0, 100, 30),
+      polygonFloat('tight', [{ xPt: 0, yPt: 30 }, { xPt: 60, yPt: 30 }, { xPt: 60, yPt: 100 }, { xPt: 0, yPt: 100 }],
+        { exemptLineTopPt: 25 }),
+    ];
+    const window = computePreparedLineFloatWindow(3, 30, 10, 0, 100, prepareFloatWrap(floats));
+    expect(window.topY).toBe(33);
+    expect(window).toEqual(mixedReference(floats, 3, 30, 10));
+  });
+
   it('matches the oracle on random mixed square and tight stacks from varied line tops', () => {
     let seed = 0x5eed;
     const random = () => {
@@ -380,7 +401,7 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     };
     const sides = ['bothSides', 'left', 'right', 'largest'] as const;
     let compared = 0;
-    for (let trial = 0; trial < 300; trial += 1) {
+    for (let trial = 0; trial < 400; trial += 1) {
       const floats: FloatRect[] = [];
       const count = 1 + Math.floor(random() * 4);
       for (let index = 0; index < count; index += 1) {
@@ -391,6 +412,9 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
         const y1 = y0 + 5 + Math.round(random() * 60);
         if (random() < 0.5) {
           floats.push(squareRect(x0, y0, x1, y1, side));
+          if (random() < 0.25) {
+            floats[floats.length - 1] = { ...floats.at(-1)!, exemptLineTopPt: Math.round(random() * 130) };
+          }
         } else if (random() < 0.5) {
           floats.push(polygonFloat('tight', [
             { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
@@ -405,25 +429,35 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       const start = Math.round(random() * 60);
       const required = 5 + Math.round(random() * 60);
       const lineHeight = [0.7, 1, 2.5, 5, 12][Math.floor(random() * 5)]!;
+      // Exempt anchor lines on tight polygons: on the retry grid or off it.
+      for (let index = 0; index < floats.length; index += 1) {
+        if (floats[index]!.authoredWrap !== 'tight' || random() >= 0.35) continue;
+        const exempt = random() < 0.5
+          ? start + Math.floor(random() * 12) * lineHeight
+          : Math.round(random() * 130);
+        floats[index] = { ...floats[index]!, exemptLineTopPt: exempt };
+      }
       const expected = mixedReference(floats, start, required, lineHeight);
       const actual = computePreparedLineFloatWindow(start, required, lineHeight, 0, 100, prepareFloatWrap(floats));
       expect(actual, `trial ${trial}`).toEqual(expected);
       compared += 1;
     }
-    expect(compared).toBe(300);
+    expect(compared).toBe(400);
   }, 120_000);
 
-  it('bounds the tight line-step search by geometry, not by the number of steps', () => {
+  it('caps tight line steps and falls back to the sweep aligned to the line grid', () => {
     const tall = polygonFloat('tight', [
       { xPt: 0, yPt: 0 }, { xPt: 100, yPt: 0 }, { xPt: 100, yPt: 10_000 }, { xPt: 0, yPt: 10_000 },
     ]);
     const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
       0, 10, 0.05, 0, 100, prepareFloatWrap([tall]),
     );
+    // 200,000 steps would be needed; the 20,000-step resource limit hands the
+    // rest to the sweep, whose answer lands on the next grid step.
     expect(window.topY).toBeGreaterThan(10_000);
     expect(window.topY).toBeLessThanOrEqual(10_000 + 0.05 + 1e-6);
-    expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(8);
-  });
+    expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(20_000 + 16);
+  }, 30_000);
 
   it('keeps sweeping to the earliest contour root for through wrap', () => {
     const triangle = polygonFloat('through', [
