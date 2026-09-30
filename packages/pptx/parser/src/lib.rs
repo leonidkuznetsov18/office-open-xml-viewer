@@ -4999,6 +4999,7 @@ mod tests {
             &HashMap::new(),
             "ppt/slides",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5050,6 +5051,7 @@ mod tests {
             &HashMap::new(),
             "ppt/slides",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5122,6 +5124,7 @@ mod tests {
             &rels,
             "ppt/slides",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5233,6 +5236,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             "ppt/slides",
+            &crate::master::TableTextLevels::default(),
             &mut zip,
         );
         let runs = &cell.text_body.unwrap().paragraphs[0].runs;
@@ -5265,6 +5269,7 @@ mod tests {
             &HashMap::new(),
             "ppt/slides",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -6744,6 +6749,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -7354,6 +7360,7 @@ mod tests {
             None,
             None,
             None,
+            &Default::default(),
             None,
             None, // inherited_font_algn
             Default::default(),
@@ -7682,7 +7689,14 @@ mod tests {
         let theme = HashMap::new();
         let rels = HashMap::new();
         let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).expect("empty OOXML zip");
-        let mut cell = parse_table_cell(doc.root_element(), &theme, &rels, "ppt/slides", &mut zip);
+        let mut cell = parse_table_cell(
+            doc.root_element(),
+            &theme,
+            &rels,
+            "ppt/slides",
+            &crate::master::TableTextLevels::default(),
+            &mut zip,
+        );
 
         assert!(cell.has_direct_fill);
         assert!(cell.has_direct_border_l);
@@ -7782,11 +7796,12 @@ mod tests {
                 None, // inherited_reflection
                 None, // inherited_anchor
                 None, // inherited_body_pr
-                None, // inherited_alignment
-                None, // inherited_ea_ln_brk
-                None, // inherited_font_algn
-                Default::default(),
-                crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
+                None,
+                &Default::default(), // inherited_alignment
+                None,                // inherited_ea_ln_brk
+                None,                // inherited_font_algn
+                Default::default(),  // inherited_spacing
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             )
         };
@@ -7868,6 +7883,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -7945,6 +7961,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None,
                 Default::default(),
@@ -8010,6 +8027,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -8099,6 +8117,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -8174,6 +8193,7 @@ mod tests {
             None,
             None,
             None,
+            &Default::default(),
             None,
             None,
             inherited,
@@ -8227,6 +8247,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 {
@@ -8281,12 +8302,21 @@ mod tests {
 
     /// ECMA-376 §21.1.3.13 (`a:tblPr@rtl`): a right-to-left table sets `rtl=true`
     /// so the renderer can place column 0 at the right edge. Absent/false must be
-    /// Issue #1620: table-cell text takes the table style's tcTxStyle face
-    /// (built-in styles reference the theme minor font of the slide's master),
-    /// then the defaultTextStyle level; the cell's own formatting wins.
+    /// Issue #1620 / #1628: table-cell text takes the table style's tcTxStyle
+    /// face (built-in styles reference the theme minor font of the slide's
+    /// master), else the theme minor font, never the defaultTextStyle face; the
+    /// cell's own formatting wins. Its size, alignment and marL come from its
+    /// own level of the master otherStyle, ending at 18 pt and no indent.
     #[test]
-    fn table_cell_faces_follow_table_style_then_default_text_style() {
-        let parse = |tbl_xml: &str| -> TableElement {
+    fn table_cell_text_follows_table_style_theme_minor_and_other_style() {
+        let master = r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:txStyles><p:otherStyle>
+            <a:defPPr><a:defRPr sz="1500"/></a:defPPr>
+            <a:lvl1pPr algn="ctr"><a:defRPr sz="1300"><a:latin typeface="Trebuchet MS"/></a:defRPr></a:lvl1pPr>
+            <a:lvl2pPr><a:defRPr sz="1100"/></a:lvl2pPr></p:otherStyle></p:txStyles></p:sldMaster>"#;
+        let master_doc = roxmltree::Document::parse(master).unwrap();
+        let other = crate::master::parse_table_text_levels(master_doc.root_element());
+        let parse = |tbl_xml: &str, table: &crate::master::TableTextLevels| -> TableElement {
             let xml = format!(
                 r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{tbl_xml}</root>"#
             );
@@ -8310,8 +8340,9 @@ mod tests {
             faces[0] = Some("Century Gothic".to_owned());
             let dts = crate::master::DefaultTextLevels {
                 faces,
-                sizes: [None; 9],
+                sizes: [Some(21.0); 9],
                 mar_l: [0; 9],
+                table: table.clone(),
             };
             let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
             parse_table(
@@ -8325,25 +8356,69 @@ mod tests {
             )
             .unwrap()
         };
-        let face = |table: &TableElement, row: usize| {
+        let paragraph = |table: &TableElement, row: usize, index: usize| {
             table.rows[row].cells[0]
                 .text_body
                 .as_ref()
                 .unwrap()
-                .paragraphs[0]
-                .def_font_family
+                .paragraphs[index]
                 .clone()
         };
         let rows = r#"<a:tblGrid><a:gridCol w="100"/></a:tblGrid>
-            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>a</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
-            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:pPr><a:defRPr><a:latin typeface="Rockwell"/></a:defRPr></a:pPr><a:r><a:t>b</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
-        let styled = parse(&format!(
-            r#"<a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}</a:tableStyleId></a:tblPr>{rows}</a:tbl>"#
-        ));
-        assert_eq!(face(&styled, 0).as_deref(), Some("Candara"));
-        assert_eq!(face(&styled, 1).as_deref(), Some("Rockwell"));
-        let unstyled = parse(&format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#));
-        assert_eq!(face(&unstyled, 0).as_deref(), Some("Century Gothic"));
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>a</a:t></a:r></a:p>
+              <a:p><a:pPr lvl="1"/><a:r><a:t>b</a:t></a:r></a:p><a:p><a:pPr lvl="2"/><a:r><a:t>c</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:pPr><a:defRPr><a:latin typeface="Rockwell"/></a:defRPr></a:pPr><a:r><a:t>d</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
+        let styled = parse(
+            &format!(
+                r#"<a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}</a:tableStyleId></a:tblPr>{rows}</a:tbl>"#
+            ),
+            &other,
+        );
+        assert_eq!(
+            paragraph(&styled, 0, 0).def_font_family.as_deref(),
+            Some("Candara")
+        );
+        assert_eq!(
+            paragraph(&styled, 1, 0).def_font_family.as_deref(),
+            Some("Rockwell")
+        );
+        let unstyled = parse(&format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#), &other);
+        for index in 0..3 {
+            assert_eq!(
+                paragraph(&unstyled, 0, index).def_font_family.as_deref(),
+                Some("Candara")
+            );
+        }
+        // otherStyle levels: 13 pt centred, 11 pt left; level 3 is not defined
+        // (defPPr has no effect) and ends at 18 pt with no indent.
+        let sizes: Vec<_> = (0..3)
+            .map(|i| paragraph(&unstyled, 0, i).def_font_size)
+            .collect();
+        assert_eq!(sizes, [Some(13.0), Some(11.0), Some(18.0)]);
+        let alignments: Vec<_> = (0..3)
+            .map(|i| paragraph(&unstyled, 0, i).alignment)
+            .collect();
+        assert_eq!(alignments, ["ctr", "l", "l"]);
+        assert!((0..3).all(|i| paragraph(&unstyled, 0, i).mar_l == 0));
+        // Without an otherStyle: PowerPoint's default, 18 pt and 0.5" per level.
+        let built_in = parse(
+            &format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#),
+            &crate::master::TableTextLevels::default(),
+        );
+        let levels: Vec<_> = (0..3)
+            .map(|i| {
+                let p = paragraph(&built_in, 0, i);
+                (p.def_font_size, p.mar_l)
+            })
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                (Some(18.0), 0),
+                (Some(18.0), 457_200),
+                (Some(18.0), 914_400)
+            ]
+        );
     }
 
     /// The presentation defaultTextStyle is copied out with the namespace

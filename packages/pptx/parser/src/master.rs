@@ -13,14 +13,15 @@ use crate::shape::{
     extract_decorative_shapes, resolve_picture_shape_properties, PictureShapeProperties,
 };
 use crate::text::{
-    empty_level_bullets, extract_level_bullets, extract_level_colors, extract_level_faces,
-    extract_level_font_sizes, extract_level_indents, extract_level_run_properties_with_rels,
-    has_any_level_bullet, has_any_level_color, has_any_level_face, has_any_level_indent,
-    has_any_level_run_properties, has_any_level_size, merge_level_bullets, merge_level_colors,
-    merge_level_faces, merge_level_indents, merge_level_run_properties, merge_level_sizes,
-    read_level_bullets, read_level_colors, read_level_faces, read_level_font_sizes,
-    read_level_indents, read_level_run_properties_with_rels, resolve_latin_face,
-    text_property_color, InheritedBodyPr, LevelBullets, LevelColors, LevelFaces, LevelFontSizes,
+    complete_level_sizes, empty_level_bullets, extract_level_bullets, extract_level_colors,
+    extract_level_faces, extract_level_font_sizes, extract_level_indents,
+    extract_level_run_properties_with_rels, has_any_level_bullet, has_any_level_color,
+    has_any_level_face, has_any_level_indent, has_any_level_run_properties, has_any_level_size,
+    merge_level_bullets, merge_level_colors, merge_level_faces, merge_level_indents,
+    merge_level_run_properties, merge_level_sizes, read_level_alignments, read_level_bullets,
+    read_level_colors, read_level_faces, read_level_font_sizes, read_level_indents,
+    read_level_run_properties_with_rels, resolve_latin_face, text_property_color, InheritedBodyPr,
+    LevelAlignments, LevelBullets, LevelColors, LevelFaces, LevelFontSizes, LevelIndent,
     LevelIndents, LevelRunProperties, LevelSpacing, DEFAULT_TEXT_STYLE_MAR_L,
     HARD_DEFAULT_FONT_SIZE,
 };
@@ -1899,6 +1900,68 @@ pub(crate) struct DefaultTextLevels {
     /// defaultTextStyle level set no marL started at the inset at levels 2
     /// and 3).
     pub(crate) mar_l: [i64; 9],
+    /// The list style table-cell text inherits (`parse_table_text_levels`).
+    pub(crate) table: TableTextLevels,
+}
+
+/// The list-level properties table-cell text inherits: the slide master's
+/// `otherStyle`, which ECMA-376 §19.3.1.35 describes as the style of text
+/// that is neither title nor body.
+///
+/// Observed (issue #1628, PowerPoint's reference PDF export), with every
+/// source at a distinct size:
+/// * A cell paragraph took the size, alignment and marL of its own level of
+///   the master's otherStyle, in every table style (built-in, custom, none)
+///   and in placeholder graphic frames. The size did not come from
+///   defaultTextStyle, bodyStyle or the layout slot.
+/// * A level otherStyle does not define ended at 18 pt with no indent. Its
+///   defPPr had no effect.
+/// * otherStyle's Latin face and colour did not apply: the face is the table
+///   style's, else the theme minor font (`complete_table_cell_faces`).
+/// * A master with no otherStyle (no txStyles, or txStyles without one) laid
+///   cells out at 18 pt with marL 0.5" per level, PowerPoint's default
+///   otherStyle.
+///
+/// Only size, alignment and indents were observable; the other paragraph and
+/// character properties of otherStyle are not applied here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TableTextLevels {
+    pub(crate) sizes: LevelFontSizes,
+    pub(crate) indents: LevelIndents,
+    pub(crate) alignments: LevelAlignments,
+}
+
+impl Default for TableTextLevels {
+    /// PowerPoint's default otherStyle: 18 pt, marL 0.5" per level.
+    fn default() -> Self {
+        let mut indents: LevelIndents = Default::default();
+        for (lvl, indent) in indents.iter_mut().enumerate() {
+            indent.mar_l = Some(lvl as i64 * 457_200);
+            indent.indent = Some(0);
+        }
+        TableTextLevels {
+            sizes: [Some(HARD_DEFAULT_FONT_SIZE); 9],
+            indents,
+            alignments: Default::default(),
+        }
+    }
+}
+
+/// Build [`TableTextLevels`] from a slide master's `txStyles/otherStyle`.
+pub(crate) fn parse_table_text_levels(root: roxmltree::Node<'_, '_>) -> TableTextLevels {
+    let Some(other) = child(root, "txStyles").and_then(|tx| child(tx, "otherStyle")) else {
+        return TableTextLevels::default();
+    };
+    let indents = read_level_indents(other);
+    TableTextLevels {
+        sizes: complete_level_sizes(&read_level_font_sizes(other)),
+        indents: std::array::from_fn(|lvl| LevelIndent {
+            mar_l: Some(indents[lvl].mar_l.unwrap_or(0)),
+            mar_r: indents[lvl].mar_r,
+            indent: Some(indents[lvl].indent.unwrap_or(0)),
+        }),
+        alignments: read_level_alignments(other),
+    }
 }
 
 /// Build [`DefaultTextLevels`]. When the presentation has no defaultTextStyle
@@ -1916,12 +1979,14 @@ pub(crate) fn parse_default_text_levels(
                 faces: read_level_faces(node, theme),
                 sizes: read_level_font_sizes(node),
                 mar_l: std::array::from_fn(|level| indents[level].mar_l.unwrap_or(0)),
+                table: TableTextLevels::default(),
             }
         }
         None => DefaultTextLevels {
             faces: std::array::from_fn(|_| resolve_latin_face("+mn-lt", theme)),
             sizes: [Some(HARD_DEFAULT_FONT_SIZE); 9],
             mar_l: DEFAULT_TEXT_STYLE_MAR_L,
+            table: TableTextLevels::default(),
         },
     }
 }
@@ -2782,7 +2847,10 @@ pub(crate) fn build_master_bundle(
         doc.descendants()
             .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
     });
-    let default_text = parse_default_text_levels(dts, &theme);
+    let mut default_text = parse_default_text_levels(dts, &theme);
+    if let Some(root) = master_root {
+        default_text.table = parse_table_text_levels(root);
+    }
     let master_styles = master_root
         .map(|root| MasterStyleTier::parse(root, &theme, &master_rels, &master_dir, dts, zip))
         .unwrap_or_default();
