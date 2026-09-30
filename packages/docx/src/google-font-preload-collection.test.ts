@@ -208,6 +208,65 @@ describe('script-scoped Arabic visual substitutes', () => {
     + '<w:rFonts w:ascii="Sakkal Majalla" w:hAnsi="Sakkal Majalla" w:cs="Sakkal Majalla"/>'
     + `${rtl ? '<w:rtl/>' : ''}</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
 
+  const run = (text: string, ascii: string, hAnsi: string) => '<w:p><w:r><w:rPr>'
+    + `<w:rFonts w:ascii="${ascii}" w:hAnsi="${hAnsi}" w:cs="${ascii}"/>`
+    + `</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+  /** Every paint call that draws part of `text`, with the face Canvas selects. */
+  const draws = async (body: string, text: string, useGoogleFonts = true, installed: string[] = []) => {
+    const { canvas, calls } = recordingCanvas(new Set([...WEB_FACES, ...installed]));
+    const model = parse(docx(body));
+    await renderDocumentToCanvas(model, canvas, 0, {
+      dpr: 1, width: 612,
+      layoutServices: createLayoutServices(model, {
+        useGoogleFonts,
+        ...(useGoogleFonts ? { googleFaces: WEB_FACES.map(loaded) } : {}),
+        measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      }),
+    });
+    return calls.filter((call) => [...call.text].some((c) => text.includes(c)))
+      .map((call) => [call.text, call.face, cssFamilies(call.font)[0]]);
+  };
+
+  it('merges joined Arabic across slots when both resolve to the same substitute face', async () => {
+    // U+08A0 is a highAnsi scalar; the two requested families both resolve to
+    // the Noto Naskh Arabic substitute face.
+    const text = '\u0644\u08A0\u0627';
+    expect((await draws(run(text, 'Sakkal Majalla', 'Traditional Arabic'), text))
+      .map(([drawnText, face]) => [drawnText, face])).toEqual([[text, 'Noto Naskh Arabic']]);
+  });
+
+  it('keeps transparent controls inside joined Arabic across slot boundaries', async () => {
+    for (const control of ['\u200F', '\uFEFF', '\u200D', '\u200C']) {
+      const text = `\u0644${control}\u0627`;
+      expect((await draws(sakkal(text), text)).map(([drawnText, face]) => [drawnText, face]))
+        .toEqual([[text, 'Noto Naskh Arabic']]);
+    }
+  });
+
+  it('never lets Arabic digits, comma or tatweel alone enable the substitute', async () => {
+    for (const [text, probe] of [
+      ['Leader\u0661\u0662', '\u0661'], ['\u0661\u0662', '\u0661'], ['\u060C', '\u060C'], ['\u0640', '\u0640'],
+    ] as const) {
+      const drawnFaces = (await draws(sakkal(text), probe)).map(([, face]) => face);
+      expect(drawnFaces.length).toBeGreaterThan(0);
+      expect(drawnFaces).not.toContain('Noto Naskh Arabic');
+    }
+    // Inside proven Arabic text they continue the scope.
+    const proven = '\u0645\u0640\u0627 \u0661\u0662';
+    const provenDraws = await draws(sakkal(proven), proven);
+    expect(provenDraws.length).toBeGreaterThan(0);
+    expect(provenDraws.every(([, face]) => face === 'Noto Naskh Arabic')).toBe(true);
+  });
+
+  it('keeps main\'s per-scalar slots for general text without a scoped family', async () => {
+    // ECMA-376 §17.3.2.26 per code point: the combining acute is a highAnsi
+    // scalar and keeps the hAnsi face, as on main.
+    const text = 'a\u0301';
+    const painted = await draws(run(text, 'Courier New', 'Arial'), text, false, ['Courier New', 'Arial']);
+    expect(painted.map(([drawnText, , first]) => [drawnText, first]))
+      .toEqual([['a', 'Courier New'], ['\u0301', 'Arial']]);
+  });
+
   it('neither preloads nor paints Noto Naskh Arabic for Latin-only Sakkal Majalla text', async () => {
     const model = parse(docx(sakkal('Leader')));
     expect(docxFontPreloadNames(model)).not.toContain('Sakkal Majalla');
@@ -280,14 +339,17 @@ describe('script-scoped Arabic visual substitutes', () => {
     // A generic combining mark on an Arabic letter stays with it in Naskh.
     expect(await drawn('\u0645\u0301\u0631\u062D\u0628\u0627'))
       .toEqual([['\u0645\u0301\u0631\u062D\u0628\u0627', 'Noto Naskh Arabic']]);
-    // An Arabic mark on a Latin base or on Latin punctuation stays with its base.
-    expect(await drawn(`${arabic}\u00E9\u064E`))
-      .toEqual([[arabic, 'Noto Naskh Arabic'], ['\u00E9\u064E', 'serif']].sort());
-    expect(await drawn(`${arabic}\u2019\u064E`))
-      .toEqual([[arabic, 'Noto Naskh Arabic'], ['\u2019\u064E', 'serif']].sort());
-    // A Latin base with a combining acute next to Arabic.
-    expect(await drawn(`${arabic}e\u0301`))
-      .toEqual([[arabic, 'Noto Naskh Arabic'], ['e\u0301', 'serif']].sort());
+    // An Arabic mark on a Latin base or on Latin punctuation takes its base's
+    // (out-of-scope) face, never Naskh. Outside the Arabic scope each scalar
+    // keeps its own ECMA-376 §17.3.2.26 slot, as on main.
+    const facesByScalar = (draws: string[][]) => Object.fromEntries(
+      draws.flatMap(([text, face]) => [...text!].map((scalar) => [scalar, face])),
+    );
+    for (const [base, mark] of [['\u00E9', '\u064E'], ['\u2019', '\u064E'], ['e', '\u0301']]) {
+      const draws = await drawn(`${arabic}${base}${mark}`);
+      expect(draws).toContainEqual([arabic, 'Noto Naskh Arabic']);
+      expect(facesByScalar(draws)).toMatchObject({ [base!]: 'serif', [mark!]: 'serif' });
+    }
     // Joiner contexts are shaped and painted as one string.
     for (const joiner of ['\u200D', '\u200C']) {
       const text = `\u0644${joiner}\u0627`;

@@ -91,7 +91,7 @@ describe('production layout service integration', () => {
     expect(lines).toHaveLength(1);
   });
 
-  it('keeps a combining mark in its base grapheme and face', () => {
+  it('keeps cross-slot scalar spans in one unbreakable grapheme', () => {
     const ctx = measureContext();
     const services = createLayoutServices(model(), { measureContext: ctx });
     const segments = buildSegments([textRun('a\u0301', {
@@ -103,11 +103,12 @@ describe('production layout service integration', () => {
     expect(text.map((segment) => 'text' in segment
       ? [segment.text, segment.fontFamily, segment.joinPrev ?? false]
       : null)).toEqual([
-        ['a\u0301', 'ASCII Face', false],
+        ['a', 'ASCII Face', false],
+        ['\u0301', 'HANSI Face', true],
       ]);
     const lines = layoutLines(ctx, segments, 8, 0, 1);
     expect(lines).toHaveLength(1);
-    expect(lines[0].segments.map((segment) => 'text' in segment ? segment.text : '')).toEqual(['a\u0301']);
+    expect(lines[0].segments.map((segment) => 'text' in segment ? segment.text : '')).toEqual(['a', '\u0301']);
   });
 
   it('normalizes service-backed w:sym private encoding before measurement and paint', () => {

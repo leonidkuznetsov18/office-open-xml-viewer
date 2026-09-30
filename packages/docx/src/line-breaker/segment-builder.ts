@@ -282,6 +282,7 @@ export function appendTextPiece(
     reduced: false,
     firstSeg: true,
     gluePending: false,
+    scopeContext: undefined,
   };
   // True while the next emitted segment should be GLUED to the previous one
   // (a small-caps case-piece that continues the same word). Consumed by the
@@ -369,6 +370,7 @@ export function appendTextPiece(
     emissionState.gluePending = prevPieceText.length > 0 && !/\s$/.test(prevPieceText);
     prevPieceText = piece.text;
     const displayText = base.allCaps || base.smallCaps ? piece.text.toUpperCase() : piece.text;
+    emissionState.scopeContext = { text: displayText, cursor: 0 };
     for (const word of splitTextForLayout(displayText)) {
       if (forceCs) {
         // When the run's digits are AN-classified, split a token into maximal
@@ -814,6 +816,10 @@ interface SegmentEmissionState {
   reduced: boolean;
   firstSeg: boolean;
   gluePending: boolean;
+  /** The run's display text around the emitted pieces, with a cursor. The
+   * text service decides a script-scoped substitute's scope over this whole
+   * contiguous context, not over one word (core fontSubstituteScriptScope). */
+  scopeContext: { text: string; cursor: number } | undefined;
 }
 
 function pushSegmentPiece(
@@ -907,8 +913,15 @@ function pushSegmentPiece(
   const italic = cs ? csItalic : base.italic;
   const weight = bold ? 700 : 400;
   const style = italic ? ('italic' as const) : ('normal' as const);
+  // Locate this piece in the run's display text (pieces are emitted in order).
+  const scopeContext = emissionState.scopeContext;
+  const contextOffset = scopeContext ? scopeContext.text.indexOf(text, scopeContext.cursor) : -1;
+  if (scopeContext && contextOffset >= 0) scopeContext.cursor = contextOffset + text.length;
   const textShapeRequest: TextShapeRequest = Object.freeze({
     text,
+    ...(scopeContext && contextOffset >= 0 && scopeContext.text.length > text.length
+      ? { substituteContext: Object.freeze({ text: scopeContext.text, offset: contextOffset }) }
+      : {}),
     fontSizePt: cs ? csFontSize : base.fontSize,
     // A successfully decoded Symbol/Wingdings code point is Unicode text,
     // not a request for the legacy font encoding. Clear every authored

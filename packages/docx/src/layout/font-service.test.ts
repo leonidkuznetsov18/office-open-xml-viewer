@@ -463,15 +463,13 @@ describe('font layout services', () => {
       },
     });
 
-    // A grapheme cluster takes its base's slot: the combining acute (a
-    // highAnsi scalar on its own) stays in the ascii face of its base.
     expect(shape('a\u0301').spans.map((span) => [span.text, span.script]))
-      .toEqual([['a\u0301', 'ascii']]);
+      .toEqual([['a', 'ascii'], ['\u0301', 'highAnsi']]);
     expect(shape('a\u0301').graphemeBoundaries).toEqual([0, 2]);
     expect(shape('a\u0301').clusters).toEqual([
       { range: { start: 0, end: 2 }, offsetPt: 0, advancePt: 2 },
     ]);
-    expect(shape('a\u0301').spans.map((span) => span.breakBefore)).toEqual([true]);
+    expect(shape('a\u0301').spans.map((span) => span.breakBefore)).toEqual([true, false]);
     expect(shape('国\u{E0100}').spans.map((span) => [span.text, span.script]))
       .toEqual([['国\u{E0100}', 'eastAsia']]);
     expect(shape('\u{20000}').spans.map((span) => [span.text, span.script]))
@@ -480,9 +478,8 @@ describe('font layout services', () => {
       { range: { start: 0, end: 2 }, offsetPt: 0, advancePt: 1 },
       { range: { start: 2, end: 3 }, offsetPt: 1, advancePt: 1 },
     ]);
-    // The ZWJ sequence is one cluster, shaped as one string in its base's slot.
     expect(shape('👩‍💻').spans.map((span) => [span.text, span.script]))
-      .toEqual([['👩‍💻', 'eastAsia']]);
+      .toEqual([['👩', 'eastAsia'], ['\u200d', 'highAnsi'], ['💻', 'eastAsia']]);
     expect(shape('𠀀').spans.flatMap((span) => [...span.text])).toEqual(['𠀀']);
     expect(shape('ش-12').spans.every((span) => span.script !== 'complexScript')).toBe(true);
   });

@@ -36,9 +36,9 @@ describe('script-scoped visual substitutes', () => {
     expect(fontSubstituteScriptCoversText('arabic', vocalised, 'exclusive')).toBe(true);
     // A lone vowel sign proves Arabic; a lone tatweel or comma does not.
     expect(fontSubstituteScriptCoversText('arabic', '\u064E', 'any')).toBe(true);
-    expect(fontSubstituteScriptClusterClass('arabic', '\u064E')).toBe('script');
+    expect(fontSubstituteScriptClusterClass('arabic', '\u064E')).toBe('proof');
     expect(fontSubstituteScriptCoversText('arabic', '\u0640', 'any')).toBe(false);
-    expect(fontSubstituteScriptClusterClass('arabic', '\u0640')).toBe('script');
+    expect(fontSubstituteScriptClusterClass('arabic', '\u0640')).toBe('extension');
     expect(fontSubstituteScriptCoversText('arabic', '\u0645\u0640\u0640\u0627\u060C', 'exclusive')).toBe(true);
     // A Latin base keeps its script even with an Arabic mark attached.
     expect(fontSubstituteScriptClusterClass('arabic', 'e\u064E')).toBe('other');

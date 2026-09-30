@@ -1,8 +1,8 @@
 import type { LayoutDiagnostic } from './types.js';
 import {
   classifyFontGeneric,
-  fontSubstituteScriptClusterClass,
   fontSubstituteScriptCoversText,
+  fontSubstituteScriptScope,
   graphemeClusterOffsets,
   normalizeFontMetricFamily,
   type CjkLang,
@@ -287,6 +287,11 @@ export interface TextShapeRequest {
   /** Aggregate-only acquisition may omit per-grapheme contextual advances.
    * Script spans and aggregate metrics remain authoritative. */
   readonly clusterGeometry?: boolean;
+  /** The same run's surrounding text, with this request's offset in it. A
+   * script-scoped substitute's scope is decided over the whole contiguous
+   * context, so a word of Arabic digits after proven Arabic text continues it,
+   * while digits alone never enable the substitute. */
+  readonly substituteContext?: Readonly<{ text: string; offset: number }>;
 }
 
 export interface TextFontResolveRequest {
@@ -302,8 +307,8 @@ export interface TextFontResolveRequest {
   readonly style?: FontStyle;
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
   /** Carried decision whether a script-scoped substitute covers this text,
-   * made per grapheme cluster by the shaper. When omitted, it is derived from
-   * `text` as a whole. */
+   * made by the shaper with the shared per-cluster scope rule. When omitted,
+   * the same rule judges `text` as a whole. */
   readonly substituteScope?: boolean;
 }
 
@@ -521,24 +526,18 @@ const LATIN1_CHINESE_EAST_ASIA = new Set([
   0x00f2, 0x00f3, 0x00f9, 0x00fa, 0x00fc,
 ]);
 
-const CLUSTER_EXTENDER = /^[\p{M}\p{Cf}\u200c\u200d\ufe00-\ufe0f\u{e0100}-\u{e01ef}]$/u;
+const SCOPE_NEUTRAL_SCALAR = /^[\s\p{Cf}\p{M}]$/u;
+/** Recent run contexts whose substitute scope is retained (one per run). */
+const SCOPE_CACHE_LIMIT = 64;
 
-/** The base of a grapheme cluster: its first code point that is not a
- * combining mark, joiner, variation selector or format control (the first code
- * point when the cluster has no such base). */
-function clusterBaseCodePoint(cluster: string): number {
-  for (const character of cluster) {
-    if (!CLUSTER_EXTENDER.test(character)) return character.codePointAt(0) ?? 0;
-  }
-  return cluster.codePointAt(0) ?? 0;
-}
-
-/** Two resolutions select the same Canvas face and features. */
-function sameResolvedFace(a: FontResolution, b: FontResolution): boolean {
-  return a === b || (a.route.familyList === b.route.familyList && a.route.scope === b.route.scope
-    && a.route.fingerprint === b.route.fingerprint && a.weight === b.weight && a.style === b.style
-    && a.source === b.source && a.resolvedFamily === b.resolvedFamily
-    && a.resourceIdentity === b.resourceIdentity);
+/** Two resolutions select the same registered face: the same resource,
+ * weight, style and source. Native and generic routes name no resource, so
+ * Canvas's eventual choice is unknown and they never compare equal. */
+function sameEffectiveFace(a: FontResolution, b: FontResolution): boolean {
+  if (a === b) return true;
+  if (a.source === 'native' || a.source === 'generic') return false;
+  return a.source === b.source && a.resolvedFamily === b.resolvedFamily
+    && a.resourceIdentity === b.resourceIdentity && a.weight === b.weight && a.style === b.style;
 }
 
 function scriptSlot(
@@ -681,11 +680,10 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       : request.genericFamily ?? defaultGenericForSlot(request.slot);
     const hasHan = containsHanScript(request.text ?? '');
     // A scoped visual substitute (core substitute-script.ts) answers only text
-    // of its script. A complex-script span belongs to that script as a whole
-    // once it contains one of its characters; any other slot span must consist
-    // of that script (the shaper splits such spans at the script boundary).
-    // The shaper carries the per-cluster decision (substituteScope) so that a
-    // fragment is never re-judged out of its cluster context.
+    // of its script. The shaper carries the shared per-cluster scope
+    // (`substituteScope`); otherwise the same shared rule judges `text` as a
+    // whole: a complex-script span is covered once it proves the script, any
+    // other span only when all of it belongs to the proven script.
     const scoped = input.fonts.scopedSubstituteScript?.(authoredFamily);
     const covered = request.substituteScope ?? (scoped !== undefined && fontSubstituteScriptCoversText(
       scoped,
@@ -791,6 +789,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     request: Readonly<GlyphMeasureRequest>,
   ): number => input.measurer.measure(request).advancePt;
   const shapeCache = new Map<string, TextShapeResult>();
+  const scopeCache = new Map<string, Uint8Array>();
   const service: TextLayoutService = Object.freeze({
     fingerprint,
     fontMetrics,
@@ -799,6 +798,11 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     shape(request: Readonly<TextShapeRequest>): TextShapeResult {
       if (!Number.isFinite(request.fontSizePt) || request.fontSizePt < 0) {
         throw new RangeError('fontSizePt must be a finite non-negative number');
+      }
+      const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
+      for (const slot of ['ascii', 'highAnsi', 'eastAsia'] as const) {
+        const scoped = input.fonts.scopedSubstituteScript?.(requestedFamily(request, slot));
+        if (scoped) scopedBySlot.set(slot, scoped);
       }
       const shapeKey = JSON.stringify([
         request.text,
@@ -832,6 +836,11 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.kerning ?? null,
         request.measure ?? null,
         request.clusterGeometry ?? null,
+        // The run context matters only for a family with a scoped substitute;
+        // keep it out of every other key so words still share cache entries.
+        ...(scopedBySlot.size > 0
+          ? [request.substituteContext?.text ?? null, request.substituteContext?.offset ?? null]
+          : []),
       ]);
       const retainedShape = cached(shapeCache, shapeKey);
       if (retainedShape) return retainedShape;
@@ -839,51 +848,124 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         text: string; start: number; end: number; script: FontScriptSlot; breakBefore: boolean;
         substituteScript: boolean;
       }[] = [];
-      // Split a non-complex-script slot span at the script boundary of a scoped
-      // visual substitute registered for that slot's family, so the substitute
-      // never paints or measures the Latin (or other) characters beside it.
-      // Families without a scoped substitute keep one span per slot.
-      const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
-      for (const slot of ['ascii', 'highAnsi', 'eastAsia'] as const) {
-        const scoped = input.fonts.scopedSubstituteScript?.(requestedFamily(request, slot));
-        if (scoped) scopedBySlot.set(slot, scoped);
-      }
       const graphemeBoundaries = Object.freeze(
         [...new Set([0, ...graphemeClusterOffsets(request.text), request.text.length])].sort((a, b) => a - b),
       );
+      const graphemeStarts = new Set(graphemeBoundaries);
       const eastAsiaFamily = requestedFamily(request, 'eastAsia');
       const eastAsiaCharset = request.eastAsiaFontCharset
         ?? (eastAsiaFamily
           ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
           : undefined);
-      // ECMA-376 §17.3.2.26 classifies characters, but a grapheme cluster is one
-      // user-perceived character: its slot (and so its font) is decided by the
-      // base. Combining marks, joiners (ZWJ/ZWNJ), variation selectors and
-      // format controls never start a new span, so a mark keeps its base's
-      // face and a joining context is shaped as one string (UAX #24 §5.2).
-      for (let index = 0; index + 1 < graphemeBoundaries.length; index += 1) {
-        const start = graphemeBoundaries[index]!;
-        const end = graphemeBoundaries[index + 1]!;
-        const cluster = request.text.slice(start, end);
-        const script = scriptSlot(
-          clusterBaseCodePoint(cluster),
-          request.complexScript ?? false,
-          request.fontHint,
-          request.eastAsiaLanguage,
-          eastAsiaCharset,
-        );
+      // ECMA-376 §17.3.2.26 (and the MS-OI29500 table) selects the rFonts slot
+      // per code point, including rFonts@hint. General text keeps that exactly.
+      type Scalar = { text: string; start: number; end: number; slot: FontScriptSlot; inScope: boolean };
+      const scalarsOf = (text: string): Scalar[] => {
+        const result: Scalar[] = [];
+        let offset = 0;
+        for (const character of text) {
+          const end = offset + character.length;
+          result.push({
+            text: character,
+            start: offset,
+            end,
+            slot: scriptSlot(
+              character.codePointAt(0) ?? 0,
+              request.complexScript ?? false,
+              request.fontHint,
+              request.eastAsiaLanguage,
+              eastAsiaCharset,
+            ),
+            inScope: false,
+          });
+          offset = end;
+        }
+        return result;
+      };
+      const scalars = scalarsOf(request.text);
+      // A script-scoped visual substitute (core substitute-script.ts) paints
+      // only its script's text. Its scope comes from the one shared rule
+      // (fontSubstituteScriptScope), decided per grapheme cluster across slot
+      // boundaries. A cluster joins the scoped context only when its base
+      // scalar's slot uses a scoped family. Neutral scalars (white space,
+      // format controls such as ZWJ/ZWNJ/RLM/U+FEFF, and combining marks) inside
+      // the scope take the slot of the adjacent in-scope scalar, so a slot
+      // switch never cuts joined text.
+      if (scopedBySlot.size > 0) {
+        const isNeutralScalar = (text: string) => SCOPE_NEUTRAL_SCALAR.test(text);
+        const context = request.substituteContext
+          && request.substituteContext.text.slice(
+            request.substituteContext.offset,
+            request.substituteContext.offset + request.text.length,
+          ) === request.text
+          ? request.substituteContext : { text: request.text, offset: 0 };
+        // A run's context is shared by every word emitted from it, so the scope
+        // over the whole context is computed once per run formatting.
+        const scopeKey = JSON.stringify([
+          context.text, [...scopedBySlot], request.complexScript ?? false, request.fontHint ?? null,
+          request.eastAsiaLanguage ?? null, eastAsiaCharset ?? null,
+        ]);
+        let inScopeAt = cached(scopeCache, scopeKey);
+        if (!inScopeAt) {
+          const contextScalars = context.text === request.text ? scalars : scalarsOf(context.text);
+          const indexAt = new Map(contextScalars.map((scalar, index) => [scalar.start, index]));
+          const computed = new Uint8Array(context.text.length);
+          for (const script of new Set(scopedBySlot.values())) {
+            const baseSlot = (start: number, end: number): FontScriptSlot | undefined => {
+              let first: FontScriptSlot | undefined;
+              for (let index = indexAt.get(start) ?? contextScalars.length; index < contextScalars.length
+                && contextScalars[index]!.start < end; index += 1) {
+                first ??= contextScalars[index]!.slot;
+                if (!isNeutralScalar(contextScalars[index]!.text)) return contextScalars[index]!.slot;
+              }
+              return first;
+            };
+            const scope = fontSubstituteScriptScope(script, context.text, (start, end) => {
+              const slot = baseSlot(start, end);
+              return slot !== undefined && scopedBySlot.get(slot) === script;
+            });
+            for (const cluster of scope) {
+              if (cluster.inScope) computed.fill(1, cluster.start, cluster.end);
+            }
+          }
+          inScopeAt = computed;
+          retain(scopeCache, scopeKey, computed, SCOPE_CACHE_LIMIT);
+        }
+        for (const scalar of scalars) {
+          if (inScopeAt[scalar.start + context.offset] === 1) scalar.inScope = true;
+        }
+        let host: FontScriptSlot | undefined;
+        const pending: number[] = [];
+        scalars.forEach((scalar, index) => {
+          if (!scalar.inScope) {
+            host = undefined;
+            pending.length = 0;
+            return;
+          }
+          if (isNeutralScalar(scalar.text)) {
+            if (host !== undefined) scalar.slot = host;
+            else pending.push(index);
+            return;
+          }
+          host = scalar.slot;
+          for (const waiting of pending) scalars[waiting]!.slot = host;
+          pending.length = 0;
+        });
+      }
+      for (const scalar of scalars) {
         const previous = grouped.at(-1);
-        const scoped = scopedBySlot.get(script);
-        // A neutral cluster (white space, controls) continues the preceding
-        // text of the same slot.
-        const clusterClass = scoped === undefined ? 'other' : fontSubstituteScriptClusterClass(scoped, cluster);
-        const substituteScript = scoped !== undefined && (clusterClass === 'script'
-          || (clusterClass === 'neutral' && previous?.script === script && previous.substituteScript));
-        if (previous?.script === script && previous.substituteScript === substituteScript) {
-          previous.text += cluster;
-          previous.end = end;
+        if (previous?.script === scalar.slot && previous.substituteScript === scalar.inScope) {
+          previous.text += scalar.text;
+          previous.end = scalar.end;
         } else {
-          grouped.push({ text: cluster, start, end, script, breakBefore: true, substituteScript });
+          grouped.push({
+            text: scalar.text,
+            start: scalar.start,
+            end: scalar.end,
+            script: scalar.slot,
+            breakBefore: graphemeStarts.has(scalar.start),
+            substituteScript: scalar.inScope,
+          });
         }
       }
 
@@ -899,26 +981,21 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           weight: request.weight,
           style: request.style,
           genericFamily: request.genericFamily,
-          // A complex-script span owns its script as a whole, so its intact
-          // clusters are judged together; other slots carry the per-cluster
-          // decision instead of re-judging a fragment.
+          // Carry the shared per-cluster scope; a fragment is never re-judged.
           ...(scopedBySlot.has(group.script) ? { substituteScope: group.substituteScript } : {}),
         }),
       }));
-      // Within a script-scoped substitute's text, adjacent ascii/highAnsi spans
-      // that resolve to the same face are one string for Canvas: shaping and
-      // painting them apart would break joining forms across the slot
-      // boundary. Complex-script and East Asian spans keep their own slot
-      // formatting. The merge is limited to the scoped script's text: merging
-      // every same-face Latin span changes measurement across all documents
-      // and needs its own evaluation.
+      // Scoped text that resolves to the same effective face (same registered
+      // resource, weight, style and source) is one string for Canvas, whichever
+      // family name or slot requested it and whatever CSS fallback list follows.
+      // Shaping it apart would break Arabic joining. Only in-scope, non
+      // complex-script spans merge; all other spans keep main's per-slot runs.
       const merged: typeof resolvedGroups = [];
       for (const group of resolvedGroups) {
         const previous = merged.at(-1);
-        const latin = (slot: FontScriptSlot) => slot === 'ascii' || slot === 'highAnsi';
         if (previous && previous.substituteScript && group.substituteScript
-          && (previous.script === group.script || (latin(previous.script) && latin(group.script)))
-          && sameResolvedFace(previous.font, group.font)) {
+          && previous.script !== 'complexScript' && group.script !== 'complexScript'
+          && sameEffectiveFace(previous.font, group.font)) {
           merged[merged.length - 1] = { ...previous, text: previous.text + group.text, end: group.end };
         } else {
           merged.push(group);

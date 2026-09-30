@@ -24,74 +24,114 @@ const MARK = /^\p{M}$/u;
 const ARABIC_EXTENSIONS = /^\p{Script_Extensions=Arabic}$/u;
 const ARABIC_LETTER = /^(?=\p{Script=Arabic})\p{L}$/u;
 
-/** Class of one grapheme cluster for a script-scoped substitute.
- * - `'script'`: the cluster's base belongs to the script by UAX #24
- *   Script_Extensions. This includes Arabic letters, Arabic combining marks
- *   (Script=Inherited, scx=Arab: fatha, sukun, tanwin, superscript alef...),
- *   tatweel, the Arabic comma and Arabic-Indic digits.
+/** Class of one grapheme cluster for a script-scoped substitute, by its base
+ * (the first code point that is not white space or a format control):
+ * - `'proof'`: a letter of the script, or a combining mark whose UAX #24
+ *   Script_Extensions include it (a lone Arabic vowel sign).
+ * - `'extension'`: another character whose Script_Extensions include the
+ *   script: tatweel, the Arabic comma, Arabic-Indic digits. It belongs to the
+ *   script's text but never proves it.
  * - `'neutral'`: white space, invisible format controls (ZWNJ, ZWJ, LRM, RLM,
- *   ALM, U+FEFF, the bidi controls), or a lone combining mark with no script of
- *   its own. It inherits the script of the preceding text, as UAX #24
- *   prescribes for Inherited characters.
+ *   ALM, U+FEFF and the other Cf characters, all Joining_Type=Transparent or
+ *   non-joining controls), or a lone combining mark with no script of its
+ *   own. It inherits the adjacent script (UAX #24 §5.2).
  * - `'other'`: anything else, such as Latin letters, Latin digits and
- *   punctuation, which the substitute would draw with its own Latin-style glyphs.
- * The base is the first code point that is not white space or a format control.
+ *   punctuation.
  * Classifying whole clusters means a mark is never split from its base. */
 export function fontSubstituteScriptClusterClass(
   script: FontSubstituteScript,
   cluster: string,
-): 'script' | 'neutral' | 'other' {
+): 'proof' | 'extension' | 'neutral' | 'other' {
   for (const character of cluster) {
     if (WHITE_SPACE.test(character) || FORMAT_CONTROL.test(character)) continue;
     switch (script) {
       case 'arabic':
-        if (ARABIC_EXTENSIONS.test(character)) return 'script';
+        if (ARABIC_LETTER.test(character)) return 'proof';
+        if (ARABIC_EXTENSIONS.test(character)) return MARK.test(character) ? 'proof' : 'extension';
         return MARK.test(character) ? 'neutral' : 'other';
     }
   }
   return 'neutral';
 }
 
-/** Whether a `'script'` cluster proves the text is in that script: its base is
- * a letter of the script, or a combining mark whose Script_Extensions include
- * it (a lone vowel sign). Tatweel, Arabic punctuation and Arabic-Indic digits
- * belong to Arabic text but never enable the substitute on their own. */
-function clusterProvesScript(script: FontSubstituteScript, cluster: string): boolean {
-  for (const character of cluster) {
-    if (WHITE_SPACE.test(character) || FORMAT_CONTROL.test(character)) continue;
-    switch (script) {
-      case 'arabic':
-        return ARABIC_LETTER.test(character) || (MARK.test(character) && ARABIC_EXTENSIONS.test(character));
-    }
-  }
-  return false;
-}
-
-function graphemeClusters(text: string): string[] {
-  const offsets = [...new Set([0, ...graphemeClusterOffsets(text), text.length])].sort((x, y) => x - y);
-  return offsets.slice(0, -1).map((start, index) => text.slice(start, offsets[index + 1]));
+export interface FontSubstituteScopeCluster {
+  readonly start: number;
+  readonly end: number;
+  readonly cls: 'proof' | 'extension' | 'neutral' | 'other';
+  /** Whether the scoped substitute may paint and measure this cluster. */
+  readonly inScope: boolean;
 }
 
 /**
- * Whether a scoped substitute may supply `text`, judged by grapheme cluster.
- * - `'exclusive'`: every cluster is `'script'` or `'neutral'`, and at least
- *   one proves the script. Use this for a span that can mix scripts, such as an
- *   ECMA-376 §17.3.2.26 ascii-slot span.
- * - `'any'`: at least one cluster proves the script. Use this for a
- *   complex-script span that the script owns as a whole, including its neutral
- *   digits and punctuation.
+ * THE scope rule for a script-scoped substitute, shared by coverage checks and
+ * the shaper so they cannot diverge.
+ *
+ * `text` is split into grapheme clusters. A contiguous context of the script is
+ * a maximal run of clusters that are not `'other'` (a caller may mark more
+ * clusters `'other'` with `eligible`, for example those whose font slot does
+ * not use the scoped family). A context is in scope only when it contains a
+ * `'proof'` cluster. Then:
+ * - its proof and extension clusters are in scope;
+ * - a neutral cluster is in scope when it follows an in-scope cluster of the
+ *   same context, so joiners, bidi marks and spaces continue joined text.
+ * Digits, the Arabic comma or tatweel alone therefore never enable the
+ * substitute, while inside proven Arabic text they stay with it.
+ */
+export function fontSubstituteScriptScope(
+  script: FontSubstituteScript,
+  text: string,
+  eligible?: (start: number, end: number) => boolean,
+): FontSubstituteScopeCluster[] {
+  const offsets = [...new Set([0, ...graphemeClusterOffsets(text), text.length])].sort((x, y) => x - y);
+  const classes = offsets.slice(0, -1).map((start, index) => {
+    const end = offsets[index + 1]!;
+    const cls = fontSubstituteScriptClusterClass(script, text.slice(start, end));
+    return {
+      start,
+      end,
+      cls: cls !== 'neutral' && cls !== 'other' && eligible && !eligible(start, end) ? 'other' as const : cls,
+    };
+  });
+  const result: FontSubstituteScopeCluster[] = [];
+  let contextStart = 0;
+  while (contextStart < classes.length) {
+    if (classes[contextStart]!.cls === 'other') {
+      result.push({ ...classes[contextStart]!, inScope: false });
+      contextStart += 1;
+      continue;
+    }
+    let contextEnd = contextStart;
+    while (contextEnd < classes.length && classes[contextEnd]!.cls !== 'other') contextEnd += 1;
+    const proven = classes.slice(contextStart, contextEnd).some((cluster) => cluster.cls === 'proof');
+    let previousInScope = false;
+    for (let index = contextStart; index < contextEnd; index += 1) {
+      const cluster = classes[index]!;
+      const inScope: boolean = proven && (cluster.cls === 'neutral' ? previousInScope : true);
+      result.push({ ...cluster, inScope });
+      previousInScope = inScope;
+    }
+    contextStart = contextEnd;
+  }
+  return result;
+}
+
+/**
+ * Whether a scoped substitute may supply `text` as a whole, by
+ * {@link fontSubstituteScriptScope}.
+ * - `'exclusive'`: no cluster is `'other'` and the text is proven. Use this for
+ *   a span that can mix scripts, such as an ECMA-376 §17.3.2.26 ascii-slot span.
+ * - `'any'`: some cluster proves the script. Use this for a complex-script
+ *   span that the script owns as a whole, including its neutral digits and
+ *   punctuation.
  */
 export function fontSubstituteScriptCoversText(
   script: FontSubstituteScript,
   text: string,
   mode: 'exclusive' | 'any',
 ): boolean {
-  let covered = false;
-  for (const cluster of graphemeClusters(text)) {
-    if (clusterProvesScript(script, cluster)) covered = true;
-    else if (mode === 'exclusive' && fontSubstituteScriptClusterClass(script, cluster) === 'other') return false;
-  }
-  return covered;
+  const scope = fontSubstituteScriptScope(script, text);
+  const proven = scope.some((cluster) => cluster.cls === 'proof');
+  return mode === 'any' ? proven : proven && scope.every((cluster) => cluster.cls !== 'other');
 }
 
 /** Whether a registry entry may supply `text`. Unscoped entries always may. */
