@@ -2441,6 +2441,10 @@ export interface XlsxSheetViewerOptions extends LoadOptions {
     cellScale?: number;
     resizable?: boolean;
     showScrollbars?: boolean;
+    minRows?: number;
+    minCols?: number;
+    marginRows?: number;
+    marginCols?: number;
     zoomMin?: number;
     zoomMax?: number;
     onScaleChange?: (scale: number) => void;
