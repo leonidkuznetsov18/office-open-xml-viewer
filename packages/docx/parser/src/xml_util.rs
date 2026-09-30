@@ -147,6 +147,19 @@ pub fn signed_half_pt_to_pt(s: &str) -> Option<f64> {
     universal_measure_to_pt(value, true)
 }
 
+/// Parse `ST_SignedTwipsMeasure` (§17.18.81) to twips.
+///
+/// The bare member is the XSD `integer` lexical form in twentieths of a point;
+/// the unit-bearing member is `ST_UniversalMeasure`. Anything else (decimals,
+/// exponents, NaN/inf) is outside the lexical union and yields `None`.
+pub fn signed_twips_measure(s: &str) -> Option<f64> {
+    let value = s.trim();
+    if is_xsd_integer_lexeme(value) {
+        return parse_finite(value);
+    }
+    universal_measure_to_pt(value, true).map(|pt| pt * 20.0)
+}
+
 fn is_xsd_integer_lexeme(value: &str) -> bool {
     let digits = value
         .strip_prefix('+')
@@ -225,7 +238,7 @@ pub fn on_off_attr(node: Node, name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod measure_tests {
-    use super::{half_pt_to_pt, signed_half_pt_to_pt, twips_to_pt};
+    use super::{half_pt_to_pt, signed_half_pt_to_pt, signed_twips_measure, twips_to_pt};
 
     #[test]
     fn half_pt_to_pt_accepts_positive_universal_measures() {
@@ -282,6 +295,22 @@ mod measure_tests {
         assert_eq!(twips_to_pt("240"), 12.0, "240 twips = 12pt");
         assert_eq!(twips_to_pt("12pt"), 12.0);
         assert_eq!(twips_to_pt("1in"), 72.0);
+    }
+
+    #[test]
+    fn signed_twips_measure_accepts_only_its_lexical_union() {
+        assert_eq!(signed_twips_measure("240"), Some(240.0));
+        assert_eq!(signed_twips_measure("-20"), Some(-20.0));
+        assert_eq!(signed_twips_measure("+20"), Some(20.0));
+        assert_eq!(signed_twips_measure("12pt"), Some(240.0));
+        assert_eq!(signed_twips_measure("-1in"), Some(-1440.0));
+        for invalid in ["2e-13", "1.5", "NaN", "inf", "", "+12pt", "12PT"] {
+            assert_eq!(
+                signed_twips_measure(invalid),
+                None,
+                "{invalid:?} is outside ST_SignedTwipsMeasure's lexical union"
+            );
+        }
     }
 
     #[test]

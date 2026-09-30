@@ -17,6 +17,7 @@ import {
   type LayoutTextSeg,
   type WrapLayoutCtx,
 } from './line-layout.js';
+import { lineGridAfter } from './layout/float-wrap.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Word's measured minimum line-start rule beside a float (issue #676).
@@ -490,6 +491,114 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     expect(window).toEqual({ topY: 30_000, xOffset: 0, maxWidth: 100 });
     expect(diagnostics.evaluatedYCount).toBeLessThan(20_020);
   }, 30_000);
+
+  it('terminates on a tiny line height and on coordinates beyond the line height ulp', () => {
+    const rectangle = (y0: number, y1: number) => polygonFloat('tight', [
+      { xPt: 0, yPt: y0 }, { xPt: 100, yPt: y0 }, { xPt: 100, yPt: y1 }, { xPt: 0, yPt: y1 },
+    ]);
+    // 1e17 grid steps would be needed and k + 1 === k in binary64 there.
+    const tiny = computePreparedLineFloatWindowWithDiagnostics(
+      0, 10, 1e-14, 0, 100, prepareFloatWrap([rectangle(0, 1000)]),
+    );
+    expect(tiny.window.topY).toBeGreaterThan(1000);
+    expect(tiny.window.topY).toBeLessThan(1000 + 1e-9);
+    expect(tiny.diagnostics.evaluatedYCount).toBeLessThanOrEqual(20_000 + 16);
+    // 0.05 pt is far below the ulp (16 pt) of these coordinates.
+    const base = 2 ** 56;
+    const large = computePreparedLineFloatWindow(
+      base, 10, 0.05, 0, 100, prepareFloatWrap([rectangle(base, base + 2 ** 14)]),
+    );
+    // At this magnitude the bottom-edge probe collapses onto the edge, so the
+    // bottom itself is the first grid position that fits.
+    expect(large.topY).toBeGreaterThanOrEqual(base + 2 ** 14);
+    expect(large.topY).toBeLessThanOrEqual(base + 2 ** 14 + 16);
+  }, 30_000);
+
+  it('finds the first line-grid position strictly below any finite Y with bounded work', () => {
+    let seed = 0x1ea5;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    for (let trial = 0; trial < 2000; trial += 1) {
+      const origin = (random() - 0.5) * 10 ** Math.floor(random() * 20);
+      const step = 10 ** (Math.floor(random() * 30) - 20) * (0.5 + random());
+      const y = origin + random() * 10 ** Math.floor(random() * 22);
+      const next = lineGridAfter(origin, step, y);
+      expect(next, `trial ${trial}`).toBeGreaterThan(y);
+      expect(Number.isFinite(next), `trial ${trial}`).toBe(true);
+      // Small index ranges: the smallest k >= 1 by direct enumeration.
+      const k = (y - origin) / step;
+      if (k < 1000) {
+        let direct = 1;
+        while (direct < 2000 && origin + direct * step <= y) direct += 1;
+        if (direct < 2000) expect(next, `trial ${trial}`).toBe(origin + direct * step);
+      }
+    }
+    // Grid positions collapse onto one binary64 value above the step's ulp.
+    expect(lineGridAfter(2 ** 60, 0.05, 2 ** 60)).toBeGreaterThan(2 ** 60);
+    // No finite index reaches past y: the next binary64 value is used.
+    expect(lineGridAfter(0, Number.MIN_VALUE, 1e300)).toBeGreaterThan(1e300);
+  });
+
+  it('keeps the search invariants on random square, topAndBottom and tight sets against a brute-force grid oracle', () => {
+    let seed = 0xb1a5;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const sides = ['bothSides', 'left', 'right', 'largest'] as const;
+    const heights = [0, 1e-3, 0.05, 0.7, 2.5, 12];
+    for (let trial = 0; trial < 300; trial += 1) {
+      // Occasionally shift everything to a large coordinate.
+      const offset = trial % 10 === 0 ? 2 ** 40 : 0;
+      const floats: FloatRect[] = [];
+      const count = 1 + Math.floor(random() * 5);
+      for (let index = 0; index < count; index += 1) {
+        const side = sides[Math.floor(random() * sides.length)]!;
+        const x0 = Math.round(-30 + random() * 120);
+        const x1 = x0 + 10 + Math.round(random() * 100);
+        const y0 = offset + Math.round(random() * 40) / 2;
+        const y1 = y0 + 1 + Math.round(random() * 30) / 2;
+        const kind = random();
+        if (kind < 0.35) floats.push(squareRect(x0, y0, x1, y1, side));
+        else if (kind < 0.5) floats.push({ ...squareRect(x0, y0, x1, y1, side), mode: 'topAndBottom' });
+        else if (kind < 0.8) {
+          floats.push(polygonFloat('tight', [
+            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
+          ], { side }));
+        } else {
+          floats.push(polygonFloat('tight', [
+            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 + Math.round(random() * 10) },
+            { xPt: Math.round((x0 + x1) / 2), yPt: y1 },
+          ], { side }));
+        }
+      }
+      const start = offset + Math.round(random() * 20) / 4;
+      const required = 5 + Math.round(random() * 60);
+      const height = heights[Math.floor(random() * heights.length)]!;
+      const prepared = prepareFloatWrap(floats);
+      const started = performance.now();
+      const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+        start, required, height, 0, 100, prepared,
+      );
+      const label = `trial ${trial} (height ${height})`;
+      expect(performance.now() - started, label).toBeLessThan(5_000);
+      expect(diagnostics.evaluatedYCount, label).toBeLessThanOrEqual(20_000 + 64 * count + 64);
+      expect(Number.isFinite(window.topY), label).toBe(true);
+      expect(window.topY, label).toBeGreaterThanOrEqual(start);
+      // The answer fits: re-querying at it returns it unchanged.
+      expect(computePreparedLineFloatWindow(window.topY, required, height, 0, 100, prepared), label)
+        .toEqual(window);
+      // Nothing above the answer on the line grid fits (within the step cap).
+      if (!(height > 0) || (window.topY - start) / height > 5_000) continue;
+      for (let k = 0; start + k * height < window.topY; k += 1) {
+        const y = start + k * height;
+        expect(computePreparedLineFloatWindow(y, required, height, 0, 100, prepared).topY, `${label} k=${k}`)
+          .not.toBe(y);
+      }
+    }
+  }, 120_000);
 
   it('terminates and returns a usable position no earlier than the direct rectangle oracle after the limit', () => {
     let seed = 0x1623;

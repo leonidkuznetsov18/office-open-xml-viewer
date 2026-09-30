@@ -1339,7 +1339,10 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         }
         if let Some(v) = attr_w(sp, "line") {
             let rule = attr_w(sp, "lineRule").unwrap_or_else(|| "auto".to_string());
-            let raw: f64 = v.parse().unwrap_or(240.0);
+            // §17.3.1.33: w:line is ST_SignedTwipsMeasure. A value outside
+            // its lexical union (e.g. an exponent or NaN) keeps the historical
+            // single-spacing fallback instead of reaching layout.
+            let raw: f64 = signed_twips_measure(&v).unwrap_or(240.0);
             // OOXML encodes line spacing as:
             //   auto      → raw / 240   = multiplier (1.0 = single, 1.5 = 1½, 2.0 = double)
             //   atLeast   → raw / 20    = pt (minimum line height)
@@ -3552,6 +3555,23 @@ mod tests {
     }
 
     // ── WD4: run-level character metrics (§17.3.2.35 / .43 / .24 / .19) ──────
+
+    #[test]
+    fn spacing_line_accepts_only_signed_twips_measure_lexemes() {
+        // §17.3.1.33: w:line is ST_SignedTwipsMeasure (§17.18.81).
+        let f = para_fmt_from(r#"<w:spacing w:line="20" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(1.0));
+        let f = para_fmt_from(r#"<w:spacing w:line="12pt" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(12.0));
+        // Exponents, decimals and non-finite values are outside the union and
+        // keep the single-spacing fallback rather than a sub-ulp line pitch.
+        for invalid in ["2e-13", "0.5", "NaN", "inf"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="{invalid}" w:lineRule="exact"/>"#
+            ));
+            assert_eq!(f.line_spacing_val, Some(12.0), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn char_spacing_parses_signed_twips_to_pt() {

@@ -1307,25 +1307,65 @@ function nextLocalSweepEvent(
   return Math.min(...roots);
 }
 
-/**
- * The first Y in (lower, upper) at which `lineWindowAtY` can change, or null
- * when it is constant on the whole open interval; lower and upper lie within
- * one structural slab.
- *
- * Kinetic counterpart of `nextLocalSweepEvent` for the tight line-step
- * search. It reads the state just after `lower` and reports the earliest
- * change of: the blocked-interval order and merge structure (adjacent
- * boundaries only, plus contour envelope switches), a gap edge crossing a
- * paragraph bound (gaps are clipped to the paragraph as in `lineWindowAtY`),
- * a clipped gap opening or closing, a clipped gap width crossing its required
- * width in either direction, or another gap overtaking the widest one. Each
- * call is O(B log B) in the blocked-interval boundaries.
- */
-/** Resource limit on tight line steps per line query. A band leaves every
- * tight polygon after at most (lowest polygon bottom - line top) / line
- * height steps; this cap only bounds pathological geometry (for example a
- * 10,000 pt polygon with a 0.05 pt line) before the sweep fallback. */
+/** Resource limit on ordinary tight line steps per line query (library
+ * policy, not an OOXML rule). Within it every grid position is tested; past
+ * it, a step jumps to the first grid position below the tight polygons the
+ * failed band meets (see `computePreparedLineFloatWindowCore`). */
 const TIGHT_LINE_STEP_LIMIT = 20_000;
+
+/** Upper bound on the integer step index searched by `lineGridAfter`. */
+const LINE_GRID_MAX_INDEX = 2 ** 1023;
+
+/**
+ * The first line-grid position strictly below `y`: `originY + k * stepPt`
+ * for the smallest integer k >= 1 whose binary64 value exceeds `y`.
+ *
+ * The grid value is non-decreasing in k, so the index is found by an
+ * estimate, exponential growth and bisection over integer indices: at most
+ * about 2 * 1024 grid evaluations for any finite input, independent of how
+ * many grid positions collapse onto one binary64 value (a tiny step at a
+ * large coordinate). When no finite index reaches past `y` (a step far below
+ * the coordinate's ulp), the grid is not representable there and the next
+ * binary64 value above `y` is used. The result is always strictly greater
+ * than `y`. Requires finite `originY`, `y` and a finite `stepPt > 0`.
+ */
+export function lineGridAfter(originY: number, stepPt: number, y: number): number {
+  const at = (k: number): number => originY + k * stepPt;
+  const estimate = Math.floor((y - originY) / stepPt) + 1;
+  let hi = Number.isFinite(estimate) && estimate > 1
+    ? Math.min(estimate, LINE_GRID_MAX_INDEX)
+    : 1;
+  let lo = 0;
+  if (at(hi) <= y) {
+    lo = hi;
+    while (at(hi) <= y) {
+      if (hi >= LINE_GRID_MAX_INDEX) {
+        return y + Math.max(Math.abs(y) * Number.EPSILON, Number.MIN_VALUE);
+      }
+      lo = hi;
+      hi = Math.min(hi * 2, LINE_GRID_MAX_INDEX);
+    }
+  } else if (hi > 1 && at(hi - 1) > y) {
+    // The estimate overshot: search down, keeping at(hi) > y.
+    let span = 1;
+    lo = hi - 1;
+    while (lo > 1 && at(lo) > y) {
+      hi = lo;
+      span *= 2;
+      lo = Math.max(1, hi - span);
+    }
+    if (at(lo) > y) return at(lo);
+  } else {
+    return at(hi);
+  }
+  // Invariant: at(lo) <= y < at(hi), lo < hi, both integers.
+  for (;;) {
+    const mid = Math.floor(lo / 2 + hi / 2);
+    if (mid <= lo || mid >= hi) return at(hi);
+    if (at(mid) > y) hi = mid;
+    else lo = mid;
+  }
+}
 
 /**
  * Hot line query over immutable, acquisition-compiled float geometry.
@@ -1381,103 +1421,94 @@ function computePreparedLineFloatWindowCore(
   };
   const current = evaluate(topY);
   if (current) return current;
-  // WORD_TIGHT_WRAP_LINE_STEP_ADVANCE: while a line band meets a tight
-  // polygon, Word retries one line height lower. Inside that region every
-  // step is tested with `lineWindowAtY` itself, on the grid measured from the
-  // original line top; outside it the exact event sweep below finds the
-  // earliest usable Y, as before.
-  const gridAfter = (y: number): number => {
-    let k = Math.max(1, Math.floor((y - topY) / probeH) + 1);
-    while (k > 1 && topY + (k - 1) * probeH > y) k -= 1;
-    while (topY + k * probeH <= y) k += 1;
-    return topY + k * probeH;
-  };
-  const inTightRegion = (y: number): boolean =>
-    probeH > 0 && bandMeetsTightPolygon(prepared, y, probeH, paraXLeft, paraXRight);
+  // One candidate walk, WORD_TIGHT_WRAP_LINE_STEP_ADVANCE included. Every
+  // candidate is tested with the same predicate (`evaluate`, i.e.
+  // `lineWindowAtY`); the first one that fits is the answer, so no returned
+  // line collides with a wrap region. Candidates come from two sources:
+  //   - line steps: while a failed candidate reached on the line grid
+  //     (topY + k * probeH, the Word retry) still meets a tight polygon, or
+  //     while the open structural slab ahead is a tight-region slab, the next
+  //     candidate is the next grid position (`lineGridAfter`);
+  //   - the exact event sweep elsewhere: the earliest local root of the slab
+  //     ahead (`nextLocalSweepEvent`), else the slab's upper structural event.
+  // Tight-region membership of a band changes only at structural events
+  // (polygon top - probeH, bottom, exempt and top-touch Ys), so a slab
+  // midpoint decides the whole open slab.
+  //
+  // Termination and bounds: every candidate is strictly greater than the
+  // previous one (checked below). Ordinary line steps are capped by
+  // TIGHT_LINE_STEP_LIMIT. Past the cap a line step jumps to the first grid
+  // position below the lowest bottom of the tight polygons the failed band
+  // meets, which leaves at least one polygon permanently behind (at most B
+  // such jumps), or, when the band meets none (a tight slab entered from its
+  // top edge), advances one grid position: that lands inside the slab, where
+  // the next step is such a jump, or past the slab's upper event (at most E
+  // such steps). Sweep candidates consume the finite
+  // structural and local events. Each candidate costs one `lineWindowAtY`,
+  // one O(B) region test and an O(log) grid search, so a query is
+  // O((LIMIT + E + B + local events) * B log B) regardless of coordinate
+  // magnitude or line height. Grid positions skipped by a past-the-cap jump
+  // are the only positions not tested; below the cap the walk never returns a
+  // Y above the first usable candidate.
+  const gridStep = probeH > 0 && Number.isFinite(probeH) && Number.isFinite(topY);
+  const tightAt = (y: number): boolean =>
+    gridStep && bandMeetsTightPolygon(prepared, y, probeH, paraXLeft, paraXRight);
   let stepBudget = TIGHT_LINE_STEP_LIMIT;
-  type Stepped =
-    | Readonly<{ kind: 'fits'; window: { topY: number; xOffset: number; maxWidth: number } }>
-    | Readonly<{ kind: 'left'; y: number }>;
-  /** Resource policy, not an OOXML rule: after the line-step budget is
-   * exhausted, skip to the first grid position past the lowest bottom met by
-   * the band. Test each position before skipping another region or resuming
-   * the event sweep, so unrelated events cannot hide a usable grid position.
-   * At an open top-touch boundary the slab can be tight while its cursor is
-   * not: advance one grid step to enter it rather than handing the unchanged
-   * cursor back to the sweep. Every iteration strictly advances; every jump
-   * past a met bottom leaves at least one polygon permanently behind. */
-  const stepLimitFallback = (after: number): Stepped => {
-    let y = after;
-    for (;;) {
-      const bottom = lowestMetTightBottom(prepared, y, probeH, paraXLeft, paraXRight);
-      y = gridAfter(Math.max(bottom ?? y, y));
-      const window = evaluate(y);
-      if (window) return { kind: 'fits', window };
-      if (!inTightRegion(y)) return { kind: 'left', y };
-    }
-  };
-  const stepThroughTight = (after: number): Stepped => {
-    let y = after;
-    for (;;) {
-      if (stepBudget <= 0) return stepLimitFallback(y);
+  const lineStepAfter = (y: number): number => {
+    if (stepBudget > 0) {
       stepBudget -= 1;
-      y = gridAfter(y);
-      const window = evaluate(y);
-      if (window) return { kind: 'fits', window };
-      if (!inTightRegion(y)) return { kind: 'left', y };
+      return lineGridAfter(topY, probeH, y);
     }
+    const bottom = lowestMetTightBottom(prepared, y, probeH, paraXLeft, paraXRight);
+    return lineGridAfter(topY, probeH, bottom === null ? y : Math.max(bottom, y));
   };
-  /** Earliest usable Y after `start` by the exact event sweep; tight regions
-   * hand off to line stepping, then resume this loop at an advanced cursor. */
-  const sweep = (start: number): { topY: number; xOffset: number; maxWidth: number } => {
-    let cursor = start;
-    let structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
-    while (structuralIndex >= 0 && structuralIndex < structuralEvents.length) {
+  let cursor = topY;
+  // topY is grid position 0.
+  let cursorOnGrid = true;
+  let structuralIndex = 0;
+  for (;;) {
+    while (structuralIndex < structuralEvents.length
+      && structuralEvents[structuralIndex]! <= cursor) structuralIndex += 1;
+    let next: number;
+    let nextOnGrid: boolean;
+    if (cursorOnGrid && tightAt(cursor)) {
+      next = lineStepAfter(cursor);
+      nextOnGrid = true;
+    } else if (structuralIndex < structuralEvents.length) {
       const upper = structuralEvents[structuralIndex]!;
-      // Tight-region membership changes only at structural events, so the
-      // midpoint decides the whole open slab (cursor, upper).
-      if (inTightRegion(exactBinary64Midpoint(cursor, upper))) {
-        const stepped = stepThroughTight(cursor);
-        if (stepped.kind === 'fits') return stepped.window;
-        cursor = stepped.y;
-        structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
-        continue;
+      const midpoint = exactBinary64Midpoint(cursor, upper);
+      // An open slab with no binary64 value inside has no line tops.
+      if (midpoint > cursor && midpoint < upper && tightAt(midpoint)) {
+        next = lineStepAfter(cursor);
+        nextOnGrid = true;
+      } else {
+        const localEvent = nextLocalSweepEvent(
+          cursor, upper, probeH, paraXLeft, paraXRight, prepared,
+          columnXLeftPt, columnXRightPt, reference,
+          polygonRequiredWidth, squareRequiredWidth, diagnostics,
+        );
+        if (localEvent !== null && diagnostics) diagnostics.localRootEventCount += 1;
+        next = localEvent ?? upper;
+        nextOnGrid = false;
       }
-      const localEvent = nextLocalSweepEvent(
-        cursor, upper, probeH, paraXLeft, paraXRight, prepared,
-        columnXLeftPt, columnXRightPt, reference,
-        polygonRequiredWidth, squareRequiredWidth, diagnostics,
-      );
-      if (localEvent !== null) {
-        if (diagnostics) diagnostics.localRootEventCount += 1;
-        const candidate = evaluate(localEvent);
-        if (candidate) return candidate;
-        cursor = localEvent;
-        continue;
-      }
-      const candidate = evaluate(upper);
-      if (candidate) return candidate;
-      cursor = upper;
-      do structuralIndex += 1;
-      while (structuralIndex < structuralEvents.length
-        && structuralEvents[structuralIndex]! <= cursor);
+    } else {
+      // Past the last event no object meets a band that starts strictly
+      // below every object. Keep layout total rather than throwing when the
+      // last event itself is blocked (a line resting on a tight bottom edge).
+      const lowest = Math.max(cursor, ...prepared.floats.map(({ rect }) => rect.yBottom));
+      const terminalY = gridStep
+        ? lineGridAfter(topY, probeH, lowest)
+        : lowest + Number.EPSILON * Math.max(1, Math.abs(lowest));
+      return evaluate(terminalY) ?? { topY: terminalY, xOffset: 0, maxWidth };
     }
-    // Past the last event no object meets a band that starts strictly below
-    // every object. Keep layout total rather than throwing when the last
-    // event itself is blocked (a line resting on a tight bottom edge).
-    const lowest = Math.max(cursor, ...prepared.floats.map(({ rect }) => rect.yBottom));
-    let terminalY = probeH > 0 ? gridAfter(lowest) : lowest;
-    if (!(terminalY > lowest)) {
-      terminalY = lowest + Math.max(probeH, Number.EPSILON * Math.max(1, Math.abs(lowest)));
+    if (!(next > cursor)) {
+      throw new Error('Float line-window search violated strictly increasing candidate progress');
     }
-    return evaluate(terminalY) ?? { topY: terminalY, xOffset: 0, maxWidth };
-  };
-  if (inTightRegion(topY)) {
-    const stepped = stepThroughTight(topY);
-    if (stepped.kind === 'fits') return stepped.window;
-    return sweep(stepped.y);
+    const window = evaluate(next);
+    if (window) return window;
+    cursor = next;
+    cursorOnGrid = nextOnGrid;
   }
-  return sweep(topY);
 }
 
 export function computePreparedLineFloatWindow(
