@@ -191,6 +191,69 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     }
   });
 
+  /** First grid Y (start + k * lineHeight, k >= 0) at which the line fits,
+   * testing every step while the band can still meet a polygon. */
+  const perStepReference = (
+    floats: FloatRect[],
+    start: number,
+    required: number,
+    lineHeight: number,
+    left: number,
+    width: number,
+  ) => {
+    const prepared = prepareFloatWrap(floats);
+    const bottom = Math.max(...floats.map((float) => float.yBottom));
+    for (let k = 0; ; k += 1) {
+      const y = start + k * lineHeight;
+      const window = computePreparedLineFloatWindow(y, required, lineHeight, left, width, prepared);
+      if (window.topY === y) return window;
+      if (y > bottom) return null;
+    }
+  };
+
+  it('keeps usable steps where a contour crosses the paragraph bounds', () => {
+    const floats = [
+      polygonFloat('tight', [{ xPt: 120, yPt: 30 }, { xPt: 70, yPt: 100 }, { xPt: 0, yPt: 60 }]),
+      polygonFloat('tight', [{ xPt: 60, yPt: 0 }, { xPt: 0, yPt: 100 }, { xPt: 20, yPt: 70 }], { side: 'right' }),
+    ];
+    const actual = computePreparedLineFloatWindow(20, 58, 1, 0, 100, prepareFloatWrap(floats));
+    expect(actual.topY).toBe(32);
+    expect(actual.maxWidth).toBeCloseTo(58.2857, 3);
+    expect(actual).toEqual(perStepReference(floats, 20, 58, 1, 0, 100));
+  });
+
+  it('matches per-step retries on random tight polygons that cross the paragraph bounds', () => {
+    let seed = 0x1623;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const sides = ['bothSides', 'left', 'right', 'largest'] as const;
+    let compared = 0;
+    for (let trial = 0; trial < 200; trial += 1) {
+      const floats = Array.from({ length: 1 + Math.floor(random() * 3) }, () => polygonFloat(
+        'tight',
+        Array.from({ length: 3 + Math.floor(random() * 3) }, () => ({
+          xPt: Math.round(-40 + random() * 180),
+          yPt: Math.round(random() * 120),
+        })),
+        { side: sides[Math.floor(random() * sides.length)]! },
+      )).filter((float) => float.yBottom > float.yTop && float.xRight > float.xLeft);
+      if (floats.length === 0) continue;
+      const start = Math.round(random() * 30);
+      const required = 5 + Math.round(random() * 70);
+      const lineHeight = [0.7, 1, 2.5, 5][Math.floor(random() * 4)]!;
+      const expected = perStepReference(floats, start, required, lineHeight, 0, 100);
+      if (expected === null) continue;
+      const actual = computePreparedLineFloatWindow(
+        start, required, lineHeight, 0, 100, prepareFloatWrap(floats),
+      );
+      expect(actual, `trial ${trial}`).toEqual(expected);
+      compared += 1;
+    }
+    expect(compared).toBeGreaterThan(100);
+  }, 120_000);
+
   it('bounds the tight line-step search by geometry, not by the number of steps', () => {
     const tall = polygonFloat('tight', [
       { xPt: 0, yPt: 0 }, { xPt: 100, yPt: 0 }, { xPt: 100, yPt: 10_000 }, { xPt: 0, yPt: 10_000 },

@@ -19,6 +19,8 @@ import {
 import {
   compareExactRational,
   decodeBinary64,
+  exactRationalKey,
+  normalizeExactRational,
   exactRationalToNumberDown,
   exactRationalToNumber,
   exactRationalToNumberUp,
@@ -1265,15 +1267,110 @@ function nextLocalSweepEvent(
   return Math.min(...roots);
 }
 
+type ExactAffine = Readonly<{ slope: ExactRational; intercept: ExactRational }>;
+
+const reducedExact = (value: ExactRational): ExactRational =>
+  normalizeExactRational(value.numerator, value.denominator);
+
+/**
+ * Every Y strictly inside (lower, upper) at which the result of
+ * `lineWindowAtY` can change within one structural slab.
+ *
+ * Inside a structural slab each blocked-interval boundary is affine in the
+ * line top (`objectAffineIntervals`, with its envelope switch points). The
+ * window depends only on the order of these boundaries and of the paragraph
+ * bounds (which the gaps are clipped to), on which gap is widest, and on
+ * whether that gap reaches its required width. So it can change only where two
+ * boundaries meet, where a boundary difference equals a required width, or
+ * where two boundary differences are equal. Collecting all those roots makes
+ * the window constant between consecutive critical Ys, including when a
+ * contour crosses the paragraph bounds.
+ */
+function slabCriticalYs(
+  lower: number,
+  upper: number,
+  probeH: number,
+  paraXLeft: number,
+  paraXRight: number,
+  prepared: PreparedFloatWrap,
+  reference: LineFloatReference,
+  polygonRequiredWidth: number,
+  squareRequiredWidth: number,
+): number[] {
+  const envelopeRoots: number[] = [];
+  const boundaries: ExactAffine[] = [
+    { slope: { numerator: 0n, denominator: 1n }, intercept: unreducedExactFromNumber(paraXLeft) },
+    { slope: { numerator: 0n, denominator: 1n }, intercept: unreducedExactFromNumber(paraXRight) },
+  ];
+  for (const float of prepared.floats) {
+    if (float.rect.mode !== 'square') continue;
+    if (!floatOverlapsColumnX(float.rect as FloatRect, paraXLeft, paraXRight)) continue;
+    for (const interval of objectAffineIntervals(
+      float, probeH, lower, upper, paraXLeft, paraXRight, reference, envelopeRoots, null,
+    )) {
+      boundaries.push(interval.left.exact, interval.right.exact);
+    }
+  }
+  const unique = new Map<string, ExactAffine>();
+  for (const boundary of boundaries) {
+    const slope = reducedExact(boundary.slope);
+    const intercept = reducedExact(boundary.intercept);
+    unique.set(`${exactRationalKey(slope)}|${exactRationalKey(intercept)}`, { slope, intercept });
+  }
+  const affine = [...unique.values()];
+  const differences: ExactAffine[] = [];
+  for (let i = 0; i < affine.length; i += 1) {
+    for (let j = 0; j < affine.length; j += 1) {
+      if (i === j) continue;
+      differences.push({
+        slope: reducedExact(subtractUnreducedExact(affine[j]!.slope, affine[i]!.slope)),
+        intercept: reducedExact(subtractUnreducedExact(affine[j]!.intercept, affine[i]!.intercept)),
+      });
+    }
+  }
+  const requirements = [...new Set([
+    Math.max(MIN_LINE_GAP, polygonRequiredWidth),
+    Math.max(MIN_LINE_GAP, squareRequiredWidth),
+    0,
+  ])].map(unreducedExactFromNumber);
+  const exactLower = unreducedExactFromNumber(lower);
+  const exactUpper = unreducedExactFromNumber(upper);
+  const roots: number[] = [...envelopeRoots.filter((y) => y > lower && y < upper)];
+  const addRoot = (slope: ExactRational, intercept: ExactRational) => {
+    // slope * y + intercept = 0
+    if (slope.numerator === 0n) return;
+    const root = reducedExact(divideUnreducedExact(
+      subtractUnreducedExact({ numerator: 0n, denominator: 1n }, intercept),
+      slope,
+    ));
+    if (compareExactRational(root, exactLower) <= 0 || compareExactRational(root, exactUpper) >= 0) return;
+    roots.push(exactRationalToNumberDown(root), exactRationalToNumberUp(root));
+  };
+  for (const difference of differences) {
+    for (const requirement of requirements) {
+      addRoot(difference.slope, subtractUnreducedExact(difference.intercept, requirement));
+    }
+  }
+  for (let i = 0; i < differences.length; i += 1) {
+    for (let j = i + 1; j < differences.length; j += 1) {
+      addRoot(
+        subtractUnreducedExact(differences[i]!.slope, differences[j]!.slope),
+        subtractUnreducedExact(differences[i]!.intercept, differences[j]!.intercept),
+      );
+    }
+  }
+  return [...new Set(roots)].filter((y) => y > lower && y < upper).sort((left, right) => left - right);
+}
+
 /**
  * WORD_TIGHT_WRAP_LINE_STEP_ADVANCE without visiting every line step.
  *
  * The retry grid is topY + k * probeH, k >= 1, and it runs while the band meets
  * a tight polygon. `stepEndY` is the first grid Y whose band meets none: a grid
- * Y just past a polygon bottom or at an exempt anchor-line top. Between two
- * consecutive critical Ys (structural events, local contour roots, exempt
- * line tops, top-touch thresholds) the window is constant, so only the first
- * grid Y inside each open slab and a grid Y on a critical Y can be the first
+ * Y just past a polygon bottom or at an exempt anchor-line top. The window is
+ * constant between consecutive critical Ys (structural events, exempt line
+ * tops, top-touch thresholds and `slabCriticalYs`), so only the first grid Y
+ * inside each open interval and a grid Y on a critical Y can be the first
  * usable step. That bounds the work by the critical Ys, not by the number of
  * line steps, and returns the same Y as testing every step.
  */
@@ -1284,12 +1381,9 @@ function tightLineStepWindow(
   paraXRight: number,
   prepared: PreparedFloatWrap,
   structuralEvents: readonly number[],
-  columnXLeftPt: number,
-  columnXRightPt: number,
   reference: LineFloatReference,
   polygonRequiredWidth: number,
   squareRequiredWidth: number,
-  diagnostics: MutableLineFloatSweepDiagnostics | null,
   evaluate: (y: number) => { topY: number; xOffset: number; maxWidth: number } | null,
 ): Readonly<{
   window: { topY: number; xOffset: number; maxWidth: number } | null;
@@ -1329,30 +1423,39 @@ function tightLineStepWindow(
     throw new Error('Tight line-step advance found no step below its polygons');
   }
   const stepEndY = grid(stepEnd);
-  const critical = [...new Set([...structuralEvents, ...extraCritical])]
+  const slabBounds = [...new Set([...structuralEvents, ...extraCritical])]
     .filter((y) => y > topY && y < stepEndY)
     .sort((left, right) => left - right);
-  let cursor = topY;
-  let criticalIndex = 0;
-  while (cursor < stepEndY) {
-    const upper = criticalIndex < critical.length ? critical[criticalIndex]! : stepEndY;
-    const local = nextLocalSweepEvent(
-      cursor, upper, probeH, paraXLeft, paraXRight, prepared,
-      columnXLeftPt, columnXRightPt, reference,
-      polygonRequiredWidth, squareRequiredWidth, diagnostics,
-    );
-    const next = local ?? upper;
-    const inside = grid(stepAfter(cursor));
-    if (inside < next) {
-      const window = evaluate(inside);
-      if (window) return Object.freeze({ window, stepEndY });
+  slabBounds.push(stepEndY);
+  const evaluated = new Set<number>();
+  const tryStep = (y: number) => {
+    if (y <= topY || y > stepEndY || evaluated.has(y)) return null;
+    evaluated.add(y);
+    return evaluate(y);
+  };
+  let lower = topY;
+  for (const upper of slabBounds) {
+    const points = [
+      ...slabCriticalYs(
+        lower, upper, probeH, paraXLeft, paraXRight, prepared, reference,
+        polygonRequiredWidth, squareRequiredWidth,
+      ),
+      upper,
+    ];
+    let cursor = lower;
+    for (const point of points) {
+      const inside = grid(stepAfter(cursor));
+      if (inside < point) {
+        const window = tryStep(inside);
+        if (window) return Object.freeze({ window, stepEndY });
+      }
+      if (isStep(point)) {
+        const window = tryStep(point);
+        if (window) return Object.freeze({ window, stepEndY });
+      }
+      cursor = point;
     }
-    if (isStep(next)) {
-      const window = evaluate(next);
-      if (window) return Object.freeze({ window, stepEndY });
-    }
-    cursor = next;
-    if (local === null) criticalIndex += 1;
+    lower = upper;
   }
   return Object.freeze({ window: null, stepEndY });
 }
@@ -1416,9 +1519,8 @@ function computePreparedLineFloatWindowCore(
   // Word retries one line height lower instead of sweeping to an edge event.
   if (probeH > 0 && bandMeetsTightPolygon(prepared, topY, probeH, paraXLeft, paraXRight)) {
     const stepped = tightLineStepWindow(
-      topY, probeH, paraXLeft, paraXRight, prepared, structuralEvents,
-      columnXLeftPt, columnXRightPt, reference,
-      polygonRequiredWidth, squareRequiredWidth, diagnostics, evaluate,
+      topY, probeH, paraXLeft, paraXRight, prepared, structuralEvents, reference,
+      polygonRequiredWidth, squareRequiredWidth, evaluate,
     );
     if (stepped.window) return stepped.window;
     cursor = stepped.stepEndY;
