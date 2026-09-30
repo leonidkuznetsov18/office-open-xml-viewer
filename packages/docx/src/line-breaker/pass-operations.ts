@@ -6,7 +6,7 @@ import {
   computePreparedLineFloatWindow,
   type PreparedFloatWrap,
 } from '../float-layout.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
@@ -785,7 +785,7 @@ export function performEastAsianSnapCellCount(
     const measuredSegment = {
       ...s,
       text,
-      punctuationCompressions: slicedPunctuationCompressions(s, start, end),
+      ...slicedTextMetadata(s, start, end),
     };
     let naturalAdvancePx: number;
     if (range.advancePx != null) {
@@ -817,9 +817,13 @@ export function performStrAdvance(
 ): number {
   const { standaloneSnapAdvance, strNaturalAdvance } = operationState;
 
+  const start = retainTrailingPunctuationCompression ? s.text.length - text.length : 0;
   const candidate = {
     ...s,
     text,
+    // Snap-cell acquisition can remeasure this candidate, so it needs the
+    // same retained range as strNaturalAdvance, not the parent word request.
+    ...slicedTextMetadata(s, Math.max(0, start), Math.max(0, start) + text.length),
     shapedClusters: text === s.text ? s.shapedClusters : undefined,
   };
   return standaloneSnapAdvance(
@@ -917,8 +921,7 @@ export function performTextSegmentBox(
   if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
     if (s.textLayoutService && s.textShapeRequest) {
       const shaped = s.textLayoutService.shape({
-        ...s.textShapeRequest,
-        text: s.text || 'X',
+        ...(s.text ? s.textShapeRequest : independentTextShapeRequest(s.textShapeRequest, 'X')),
         fontSizePt: fullPx,
         measure: true,
         clusterGeometry: false,

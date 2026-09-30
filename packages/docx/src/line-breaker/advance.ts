@@ -273,7 +273,6 @@ export function contextualHorizontalGraphemeAdvances(
   }
   const shaped = segment.textLayoutService.shape({
     ...segment.textShapeRequest,
-    text: segment.text,
     measure: true,
     clusterGeometry: true,
   });

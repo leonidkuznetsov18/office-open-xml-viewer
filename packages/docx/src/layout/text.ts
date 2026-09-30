@@ -309,6 +309,29 @@ export function sliceTextShapeRequest(
   };
 }
 
+/** A generated probe or ruby guide is independent text, even when its glyphs
+ * happen to occur in the base run. It must not inherit that run's Arabic proof. */
+export function independentTextShapeRequest(
+  request: Readonly<TextShapeRequest>,
+  text: string,
+): TextShapeRequest {
+  return { ...request, text, substituteContext: { text, offset: 0 } };
+}
+
+/** Transform this range in its run (e.g. inserting justification kashidas),
+ * keeping proof on either side and recomputing scope for the transformed run. */
+export function replaceTextShapeRequest(
+  request: Readonly<TextShapeRequest>,
+  text: string,
+): TextShapeRequest {
+  const context = request.substituteContext ?? { text: request.text, offset: 0 };
+  return { ...request, text, substituteContext: {
+    text: context.text.slice(0, context.offset) + text
+      + context.text.slice(context.offset + request.text.length),
+    offset: context.offset,
+  } };
+}
+
 export interface TextFontResolveRequest {
   /** Text covered by this request. Language-selected regional fallback applies
    * only when the text actually contains Han; it must not capture Latin glyphs. */
@@ -702,7 +725,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     // (`substituteScope`); otherwise the same shared rule judges `text` as a
     // whole: a complex-script span is covered once it proves the script, any
     // other span only when all of it belongs to the proven script.
-    const scoped = input.fonts.scopedSubstituteScript?.(authoredFamily);
+    const scoped = input.fonts.scopedSubstituteScript?.(authoredFamily, request.weight, request.style);
     const covered = request.substituteScope ?? (scoped !== undefined && fontSubstituteScriptCoversText(
       scoped,
       request.text ?? '',
@@ -817,9 +840,22 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       if (!Number.isFinite(request.fontSizePt) || request.fontSizePt < 0) {
         throw new RangeError('fontSizePt must be a finite non-negative number');
       }
+      // Retained partial measurements must use sliceTextShapeRequest. Failing
+      // closed prevents a stale offset from silently selecting a different face
+      // than paint. Independent and transformed text have explicit helpers.
+      const context = request.substituteContext ?? { text: request.text, offset: 0 };
+      if (!Number.isInteger(context.offset) || context.offset < 0
+        || context.offset + request.text.length > context.text.length
+        || context.text.slice(context.offset, context.offset + request.text.length) !== request.text) {
+        throw new Error('Text shape request does not match its run context; project the range explicitly');
+      }
+      const configuredBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
       const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
       for (const slot of SCOPE_SLOTS) {
-        const scoped = input.fonts.scopedSubstituteScript?.(requestedFamily(request, slot));
+        const family = requestedFamily(request, slot);
+        const configured = input.fonts.configuredSubstituteScript?.(family);
+        if (configured) configuredBySlot.set(slot, configured);
+        const scoped = input.fonts.scopedSubstituteScript?.(family, request.weight, request.style);
         if (scoped) scopedBySlot.set(slot, scoped);
       }
       const eastAsiaFamily = requestedFamily(request, 'eastAsia');
@@ -858,14 +894,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // and transparent controls, so word/span cuts cannot change the face.
       let scopeDescriptor: string | undefined;
       if (scopedBySlot.size > 0) {
-        const context = request.substituteContext
-          && request.substituteContext.text.slice(
-            request.substituteContext.offset,
-            request.substituteContext.offset + request.text.length,
-          ) === request.text
-          ? request.substituteContext : { text: request.text, offset: 0 };
         const key = JSON.stringify([
-          [...scopedBySlot], request.complexScript ?? false, request.fontHint ?? null,
+          [...scopedBySlot], [...configuredBySlot], request.complexScript ?? false, request.fontHint ?? null,
           request.eastAsiaLanguage ?? null, eastAsiaCharset ?? null,
         ]);
         // The raw run string is a Map key only once, never JSON-serialized or
@@ -889,7 +919,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
             };
             const scope = fontSubstituteScriptScope(script, context.text, (start, end) => {
               const slot = baseSlot(start, end);
-              return slot !== undefined && scopedBySlot.get(slot) === script;
+              return slot !== undefined && (configuredBySlot.get(slot) ?? scopedBySlot.get(slot)) === script;
             });
             let host: FontScriptSlot | undefined;
             for (const cluster of scope) {
@@ -898,7 +928,10 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
                 continue;
               }
               if (cluster.cls !== 'neutral') host = baseSlot(cluster.start, cluster.end);
-              if (host !== undefined) slots.fill(SCOPE_SLOTS.indexOf(host) + 1, cluster.start, cluster.end);
+              // Surrounding Arabic can prove the run even when its own face
+              // is unavailable or authored. Only an actually selected scoped
+              // substitute may replace this cluster's normative scalar slots.
+              if (host !== undefined && scopedBySlot.get(host) === script) slots.fill(SCOPE_SLOTS.indexOf(host) + 1, cluster.start, cluster.end);
             }
           }
           retain(scopeCache, context.text, { key, slots }, SCOPE_CACHE_LIMIT);

@@ -356,6 +356,26 @@ test('accepts the final canonical producer, retained model, selected variant, an
   assert.equal(result.status, 0, result.output);
 });
 
+test('retained shape ranges cannot replace text without projecting run context', () => {
+  for (const [spread, textMember] of [[true, 'text: request.text.slice(1)'], [true, 'text: fragment'], [true, 'text'], [false, 'text: request.text.substring(1)']]) {
+    const root = initializeCanonicalFixture();
+    write(root, 'packages/docx/src/layout/fragment.ts',
+      `export function measure(service, request, fragment, text) {
+        return service.shape({ ${spread ? '...request,' : 'fonts: request.fonts,'} ${textMember}, measure: true });
+      }`);
+    const result = runChecker(root, '--final');
+    assert.notEqual(result.status, 0);
+    assert.match(result.output, /TEXT_SHAPE_RANGE_CONTEXT/u);
+  }
+  const root = initializeCanonicalFixture();
+  write(root, 'packages/docx/src/layout/fragment.ts',
+    `export function measure(service, request) {
+      return service.shape({ ...sliceTextShapeRequest(request, 1, 2), measure: true });
+    }`);
+  const result = runChecker(root, '--final');
+  assert.equal(result.status, 0, result.output);
+});
+
 test('requires one private concrete body-kernel owner with exact loud attachment', () => {
   for (const [name, source] of [
     ['missing implementation', canonicalLayoutRuntime.replace(

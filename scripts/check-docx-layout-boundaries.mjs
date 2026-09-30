@@ -2959,11 +2959,44 @@ function parseArguments(argv) {
   return options;
 }
 
+/** Retained shaping ranges carry run offsets. A spread plus a text override
+ * bypasses that authority, even when a caller hides its substring in a local
+ * variable. Use sliceTextShapeRequest, or the explicit independent/transform
+ * helpers when the new text is not a retained range. */
+function assertTextShapeRangeContext(root) {
+  for (const path of listFiles(join(root, DOCX_SOURCE))) {
+    if (!path.endsWith('.ts') || /\.(?:test|stories)\.tsx?$/u.test(path)) continue;
+    const source = sourceFile(path);
+    const visit = (node) => {
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+        && node.expression.name.text === 'shape') {
+        const argument = node.arguments[0];
+        if (argument && ts.isObjectLiteralExpression(argument)) {
+          const textProperty = argument.properties.find((property) =>
+            (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property))
+            && property.name.getText(source).replace(/['"]/gu, '') === 'text');
+          const textValue = textProperty && ts.isPropertyAssignment(textProperty)
+            ? textProperty.initializer : undefined;
+          const directSubstring = textValue && ts.isCallExpression(textValue)
+            && ts.isPropertyAccessExpression(textValue.expression)
+            && ['slice', 'substring', 'substr'].includes(textValue.expression.name.text);
+          if (textProperty && (argument.properties.some(ts.isSpreadAssignment) || directSubstring)) {
+            fail('TEXT_SHAPE_RANGE_CONTEXT', posixPath(relative(root, path)));
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(source, visit);
+  }
+}
+
 export function checkDocxLayoutBoundaries(options) {
   const root = resolve(options.root);
   const baselinePath = resolve(root, BASELINE_PATH);
   const baselineExists = existsSync(baselinePath);
   assertNoProductionTestSupportImports(root);
+  assertTextShapeRangeContext(root);
   assertAcquisitionContextBoundary(root);
   assertProductionBodyAcquisitionAuthority(root);
   assertRendererAcquisitionProjectionBoundary(root);

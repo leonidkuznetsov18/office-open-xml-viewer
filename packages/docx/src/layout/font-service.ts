@@ -39,9 +39,12 @@ export interface FontResolution {
 export interface FontResolver {
   readonly fingerprint: string;
   resolve(request: Readonly<FontRequest>): FontResolution;
-  /** Script of a scoped substitute configured for this family, if any. The
-   * shaper splits spans at that script's boundary only for such families. */
-  scopedSubstituteScript?(requestedFamily: string | null | undefined): FontSubstituteScript | undefined;
+  /** Registry scope used only to delimit the shared run-context proof rule.
+   * It does not authorize changing a scalar's slot or selected face. */
+  configuredSubstituteScript?(requestedFamily: string | null | undefined): FontSubstituteScript | undefined;
+  /** Script of the scoped substitute that actually wins this resource tuple.
+   * Authored embedded/local/installed faces retain §17.3.2.26 scalar slots. */
+  scopedSubstituteScript?(requestedFamily: string | null | undefined, weight?: number, style?: FontStyle): FontSubstituteScript | undefined;
 }
 
 export interface FontInventoryFace {
@@ -194,13 +197,17 @@ export function createFontResolver(
   // The bound only caps pathological documents; a miss recomputes.
   const resolutionMemoLimit = 4096;
   const resolutions = new Map<string, FontResolution>();
+  // One resource selector serves resolution and the scope gate. Inventory
+  // priority, exact tuple matching and script admission cannot diverge.
+  const selectedFace = (family: string, weight: number, style: FontStyle, script?: FontSubstituteScript) =>
+    (byFamily.get(normalizeFamily(family)) ?? []).find((candidate) =>
+      candidate.weight === weight && candidate.style === style
+      && (candidate.script === undefined || candidate.script === script));
   const resolveUncached = (request: Readonly<FontRequest>): FontResolution => {
     const requestedFamily = request.requestedFamily?.trim() || request.genericFamily || 'sans-serif';
     const weight = normalizedWeight(request.weight);
     const style = request.style ?? 'normal';
-    const candidates = byFamily.get(normalizeFamily(requestedFamily)) ?? [];
-    const face = candidates.find((candidate) => candidate.weight === weight && candidate.style === style
-      && (candidate.script === undefined || candidate.script === request.script));
+    const face = selectedFace(requestedFamily, weight, style, request.script);
     if (face) {
       const diagnostics: LayoutDiagnostic[] = face.source === 'substitute'
         ? [{
@@ -265,9 +272,18 @@ export function createFontResolver(
 
   return Object.freeze({
     fingerprint,
-    scopedSubstituteScript(requestedFamily: string | null | undefined): FontSubstituteScript | undefined {
+    configuredSubstituteScript(requestedFamily: string | null | undefined): FontSubstituteScript | undefined {
+      return requestedFamily ? scriptScopedFamilies[normalizeFamily(requestedFamily)]?.script : undefined;
+    },
+    scopedSubstituteScript(requestedFamily: string | null | undefined, weight?: number, style?: FontStyle): FontSubstituteScript | undefined {
       const family = requestedFamily?.trim();
-      return family ? scriptScopedFamilies[normalizeFamily(family)]?.script : undefined;
+      if (!family) return undefined;
+      const script = scriptScopedFamilies[normalizeFamily(family)]?.script;
+      if (!script) return undefined;
+      // Same priority and tuple selection as resolveUncached: a configured
+      // substitute is insufficient when an authored resource outranks it.
+      const face = selectedFace(family, normalizedWeight(weight), style ?? 'normal', script);
+      return face?.source === 'substitute' && face.script === script ? script : undefined;
     },
     resolve(request: Readonly<FontRequest>): FontResolution {
       const key = JSON.stringify([

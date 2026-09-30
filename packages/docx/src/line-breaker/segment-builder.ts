@@ -18,7 +18,7 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
@@ -516,15 +516,13 @@ export function finalizeBuiltSegments(
       const cached = metricCache.get(key);
       if (cached !== undefined) return cached;
       const naturalSpace = service.shape({
-        ...request,
-        text: ' ',
+        ...independentTextShapeRequest(request, ' '),
         fontSizePt: effectiveFontSizePt,
         measure: true,
         clusterGeometry: false,
       }).advancePt;
       const ideographicCell = service.shape({
-        ...request,
-        text: '\u4e00',
+        ...independentTextShapeRequest(request, '\u4e00'),
         fontSizePt: effectiveFontSizePt,
         fontHint: 'eastAsia',
         measure: true,
@@ -1004,13 +1002,12 @@ function pushSegmentPiece(
                     }
                     const punctuationRoute = measured.spans[0]?.fontRoute.fingerprint;
                     const ideographicCell = environment.layoutServices?.text.shape({
-                      ...textShapeRequest,
+                      ...independentTextShapeRequest(textShapeRequest, '\u4e00'),
                       // U+3000 is semantically an ideographic space, but several
                       // proportional East Asian faces expose it to Canvas with
                       // the same narrow advance as their punctuation. The grid's
                       // full-width character cell is represented by an
                       // ideograph, not by that platform-specific space metric.
-                      text: '\u4e00',
                       fontHint: 'eastAsia',
                       measure: true,
                       clusterGeometry: false,

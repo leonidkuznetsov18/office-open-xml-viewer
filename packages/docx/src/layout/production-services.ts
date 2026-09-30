@@ -64,7 +64,10 @@ export interface ProductionLayoutServiceOptions {
 
 /** Registry families with a script-scoped visual substitute (core
  * substitute-script.ts), mapped to every substitute family of that script. An
- * installed authored face is never substituted, so it is not scoped either. */
+ * installed authored face is never substituted, so it is not scoped either.
+ * This registry delimits proof, not slot overrides: the resolver permits an
+ * override only when a loaded scoped substitute wins the exact resource tuple,
+ * after embedded, local and authored CSS inventory precedence. */
 function docxScriptScopedFamilies(
   installed: readonly string[],
 ): Record<string, { script: FontSubstituteScript; substituteFamilies: string[] }> {

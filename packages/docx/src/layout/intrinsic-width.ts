@@ -207,7 +207,9 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
           ? punctuationCompressions
           : undefined,
         textShapeRequest: previous.textShapeRequest
-          ? { ...previous.textShapeRequest, text }
+          ? { ...previous.textShapeRequest, text,
+              substituteContext: previous.substituteScope
+                ? previous.textShapeRequest.substituteContext : { text, offset: 0 } }
           : undefined,
       };
       continue;
@@ -266,7 +268,6 @@ function measureTextRange(
       if (measured.textLayoutService && measured.textShapeRequest) {
         const shaped = measured.textLayoutService.shape({
           ...measured.textShapeRequest,
-          text: measured.text,
           fontSizePt: calcEffectiveFontPx(measured, 1),
           measure: true,
           clusterGeometry: false,
@@ -294,7 +295,6 @@ function measureTextRange(
       const shapedClusters = candidate.textLayoutService && candidate.textShapeRequest
         ? candidate.textLayoutService.shape({
             ...candidate.textShapeRequest,
-            text,
             fontSizePt: calcEffectiveFontPx(candidate, 1),
             measure: true,
             clusterGeometry: true,
