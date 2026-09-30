@@ -3578,6 +3578,15 @@ mod tests {
             "0".repeat(307)
         ));
         assert_eq!(f.line_spacing_val, Some(1e307));
+        // A valid unit-bearing lexeme beyond binary64 saturates, as bare
+        // integers do, instead of falling back to single spacing.
+        for unit in ["pt", "in", "mm", "cm", "pc", "pi"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="1{}{unit}" w:lineRule="exact"/>"#,
+                "0".repeat(400)
+            ));
+            assert_eq!(f.line_spacing_val, Some(f64::MAX), "{unit}");
+        }
     }
 
     #[test]

@@ -192,7 +192,12 @@ pub fn signed_twips_measure(s: &str) -> Option<SignedTwipsMeasure> {
             .ok()
             .map(|twips| SignedTwipsMeasure::Twips(saturate(twips)));
     }
-    universal_measure_to_pt(value, true).map(|pt| SignedTwipsMeasure::Points(saturate(pt)))
+    // Validate the lexeme first, then convert: a valid decimal always parses
+    // (to infinity when it overflows), and every unit scale is >= 1 pt, so
+    // saturating after scaling keeps the sign and the binary64 bound.
+    let (number, scale) = universal_measure_lexeme(value, true)?;
+    let pt = number.parse::<f64>().ok()? * scale;
+    Some(SignedTwipsMeasure::Points(saturate(pt)))
 }
 
 fn is_xsd_integer_lexeme(value: &str) -> bool {
@@ -204,6 +209,13 @@ fn is_xsd_integer_lexeme(value: &str) -> bool {
 }
 
 fn universal_measure_to_pt(value: &str, signed: bool) -> Option<f64> {
+    let (number, scale) = universal_measure_lexeme(value, signed)?;
+    parse_finite(number).map(|number| number * scale)
+}
+
+/// Validate an `ST_UniversalMeasure` (or its positive form) lexeme: returns
+/// the decimal number text and its points-per-unit scale.
+fn universal_measure_lexeme(value: &str, signed: bool) -> Option<(&str, f64)> {
     let (number, scale) = if let Some(number) = value.strip_suffix("pt") {
         (number, 1.0)
     } else if let Some(number) = value.strip_suffix("in") {
@@ -244,7 +256,7 @@ fn universal_measure_to_pt(value: &str, signed: bool) -> Option<f64> {
         return None;
     }
 
-    parse_finite(number).map(|number| number * scale)
+    Some((number, scale))
 }
 
 /// Parse a ST_OnOff-style toggle child element. ECMA-376 §17.3.2.22 allows
@@ -361,6 +373,20 @@ mod measure_tests {
         assert_eq!(signed_twips_measure(&beyond), Some(Points(f64::MAX)));
         let beyond = format!("-1{}", "0".repeat(400));
         assert_eq!(signed_twips_measure(&beyond), Some(Twips(-f64::MAX)));
+        for unit in ["pt", "in", "mm", "cm", "pc", "pi"] {
+            let beyond = format!("1{}{unit}", "0".repeat(400));
+            assert_eq!(
+                signed_twips_measure(&beyond),
+                Some(Points(f64::MAX)),
+                "{unit}"
+            );
+            let beyond = format!("-1{}.5{unit}", "0".repeat(400));
+            assert_eq!(
+                signed_twips_measure(&beyond),
+                Some(Points(-f64::MAX)),
+                "-{unit}"
+            );
+        }
     }
 
     #[test]
