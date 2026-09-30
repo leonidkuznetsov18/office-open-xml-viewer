@@ -761,16 +761,31 @@ function bandMeetsTightPolygon(
   paraXLeft: number,
   paraXRight: number,
 ): boolean {
+  return lowestMetTightBottom(prepared, topY, probeH, paraXLeft, paraXRight) !== null;
+}
+
+/** The lowest bottom of the tight polygons whose line-step region contains
+ * the band [topY, topY + probeH] (see bandMeetsTightPolygon), or null. */
+function lowestMetTightBottom(
+  prepared: PreparedFloatWrap,
+  topY: number,
+  probeH: number,
+  paraXLeft: number,
+  paraXRight: number,
+): number | null {
   const exactTop = unreducedExactFromNumber(topY);
   const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(probeH));
-  return prepared.floats.some((float) => {
+  let lowest: number | null = null;
+  for (const float of prepared.floats) {
     const { rect } = float;
-    if (float.polygon?.kind !== 'tight' || rect.mode !== 'square') return false;
-    if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) return false;
-    if (tightEdgeTouch(float, exactTop, exactBottom) !== null) return true;
-    return compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) > 0
-      && compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) < 0;
-  });
+    if (float.polygon?.kind !== 'tight' || rect.mode !== 'square') continue;
+    if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) continue;
+    const meets = tightEdgeTouch(float, exactTop, exactBottom) !== null
+      || (compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) > 0
+        && compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) < 0);
+    if (meets) lowest = Math.max(lowest ?? Number.NEGATIVE_INFINITY, rect.yBottom);
+  }
+  return lowest;
 }
 
 function lineWindowAtY(
@@ -1444,19 +1459,21 @@ function computePreparedLineFloatWindowCore(
     }
     return evaluate(terminalY) ?? { topY: terminalY, xOffset: 0, maxWidth };
   };
-  /** Resource limit: after TIGHT_LINE_STEP_LIMIT steps, take the exact
-   * sweep's answer without stepping, raised to the next grid step when that
-   * step is usable. */
-  const stepLimitFallback = (y: number) => {
-    const swept = sweep(y, false);
-    let aligned = swept.topY;
-    if (probeH > 0 && swept.topY > topY) {
-      let k = Math.max(1, Math.ceil((swept.topY - topY) / probeH));
-      while (k > 1 && topY + (k - 1) * probeH >= swept.topY) k -= 1;
-      while (topY + k * probeH < swept.topY) k += 1;
-      aligned = topY + k * probeH;
+  /** Resource limit: after TIGHT_LINE_STEP_LIMIT steps the remaining steps
+   * of the tight region are not tested. The line moves to the first grid step
+   * past the lowest bottom of the polygons its band still meets (repeated
+   * while the band stays in a tight region), tests that step with
+   * lineWindowAtY, and only then resumes the sweep. */
+  const stepLimitFallback = (y: number): { topY: number; xOffset: number; maxWidth: number } => {
+    let cursor = y;
+    for (;;) {
+      const bottom = lowestMetTightBottom(prepared, cursor, probeH, paraXLeft, paraXRight);
+      if (bottom === null) break;
+      const next = gridAfter(Math.max(bottom, cursor));
+      if (!(next > cursor)) break;
+      cursor = next;
     }
-    return (aligned !== swept.topY ? evaluate(aligned) : null) ?? swept;
+    return evaluate(cursor) ?? sweep(cursor, true);
   };
   if (inTightRegion(topY)) {
     const stepped = stepThroughTight(topY);

@@ -459,6 +459,26 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(20_000 + 16);
   }, 30_000);
 
+  it('tests the first grid step below the tight polygons after the step limit', () => {
+    const rectangle = (y0: number, y1: number) => polygonFloat('tight', [
+      { xPt: 0, yPt: y0 }, { xPt: 100, yPt: y0 }, { xPt: 100, yPt: y1 }, { xPt: 0, yPt: y1 },
+    ]);
+    const unrelated = squareRect(200, 2000, 300, 2100);
+    const alone = computePreparedLineFloatWindow(0, 10, 0.05, 0, 100, prepareFloatWrap([rectangle(0, 1000)]));
+    expect(alone.topY).toBeGreaterThan(1000);
+    expect(alone.topY).toBeLessThan(1000.05 + 1e-6);
+    // An unrelated object below the region must not pull the line past the
+    // first usable step once the step limit is reached.
+    expect(computePreparedLineFloatWindow(
+      0, 10, 0.05, 0, 100, prepareFloatWrap([rectangle(0, 1000), unrelated]),
+    )).toEqual(alone);
+    // Several overlapping tight polygons: the fallback passes all of them.
+    expect(computePreparedLineFloatWindow(
+      0, 10, 0.05, 0, 100,
+      prepareFloatWrap([rectangle(0, 400), rectangle(300, 700), rectangle(650, 1000), unrelated]),
+    )).toEqual(alone);
+  }, 60_000);
+
   it('keeps sweeping to the earliest contour root for through wrap', () => {
     const triangle = polygonFloat('through', [
       { xPt: 20, yPt: 0 }, { xPt: 80, yPt: 0 }, { xPt: 50, yPt: 100 },
