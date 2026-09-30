@@ -406,6 +406,43 @@ describe('script-scoped Arabic visual substitutes', () => {
     }
   });
 
+  it.each([false, true])('keeps a Latin-attached Arabic mark excluded during auto-fit and final measurement (split Leader: %s)', async (splitLeader) => {
+    // §17.3.2.26 selects hAnsi for é and ascii for U+064E. Even when
+    // intrinsic merging joins the ascii suffix to Leader, the mark's Latin
+    // base in the full run must keep it outside the Arabic substitute scope.
+    const run = (text: string) => '<w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
+      + ' w:hAnsi="Sakkal Majalla"/><w:sz w:val="20"/></w:rPr>'
+      + `<w:t xml:space="preserve">${text}</w:t></w:r>`;
+    const paragraph = '<w:p>' + (splitLeader
+      ? run('مرحباé\u064e ') + run('Leader') : run('مرحباé\u064e Leader')) + '</w:p>';
+    const model = parse(docx('<w:tbl><w:tblPr><w:tblLayout w:type="autofit"/></w:tblPr>'
+      + `<w:tr><w:tc>${paragraph}</w:tc></w:tr></w:tbl>`));
+    const { canvas, calls, measurements } = recordingCanvas(new Set(WEB_FACES));
+    await renderDocumentToCanvas(model, canvas, 0, {
+      dpr: 1, width: 612,
+      layoutServices: createLayoutServices(model, {
+        useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+        measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      }),
+    });
+    const measured = measurements.filter(({ text }) => text.includes('\u064e'));
+    const painted = calls.filter(({ text }) => text.includes('\u064e'));
+    expect(measured.length).toBeGreaterThan(0);
+    expect(painted.length).toBeGreaterThan(0);
+    expect(painted.every(({ face }) => face === 'serif')).toBe(true);
+    expect(measured.every(({ face }) => face === 'serif')).toBe(true);
+    // At the authored 10pt size, intrinsic and final shaping must agree on
+    // the emulated serif advance. A same-run merge still shapes the suffix
+    // together; a different-run seam must retain each run's context.
+    expect(measured).toContainEqual({ text: '\u064e ', face: 'serif', width: 10 });
+    if (!splitLeader) {
+      expect(measured).toContainEqual({ text: '\u064e Leader', face: 'serif', width: 40 });
+      expect(measurements).toContainEqual({ text: 'Leader', face: 'serif', width: 30 });
+    }
+    expect(calls.some(({ text, face }) => text.includes('مرحبا')
+      && face === 'Noto Naskh Arabic')).toBe(true);
+  });
+
   it("preserves each run's external Arabic proof during table intrinsic measurement", async () => {
     // U+08A0 proves Arabic through a different slot/face from the digits.
     // Adjacent digit spans in two runs therefore depend on different contexts.

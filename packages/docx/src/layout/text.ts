@@ -402,8 +402,9 @@ export interface GlyphMeasurer {
 }
 
 export interface TextShapeSpan extends GlyphMeasurement {
-  /** True only for a face selected by the shared run-context substitute rule. */
-  readonly substituteScope?: true;
+  /** Run-context substitute decision: true selects the scoped face, false
+   * retains exclusion. Absence means this request has no scoped substitute. */
+  readonly substituteScope?: boolean;
   readonly text: string;
   readonly start: number;
   readonly end: number;
@@ -1091,7 +1092,9 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         });
         return Object.freeze({
           ...group, ...measurement, font, fontRoute: font.route,
-          ...(substituteScript ? { substituteScope: true as const } : {}),
+          // Excluded spans also depend on the full run: a mark attached to a
+          // Latin base must not become Arabic proof when measured in isolation.
+          ...(scopeDescriptor !== undefined ? { substituteScope: substituteScript } : {}),
         });
       });
       const diagnostics = spans.flatMap((span) => span.font.diagnostics);

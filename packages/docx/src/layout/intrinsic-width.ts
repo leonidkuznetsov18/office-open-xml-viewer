@@ -182,10 +182,12 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       && 'text' in previous
       && 'text' in segment
       && compatibleTextKey(previous) === compatibleTextKey(segment)
-      // A scoped face can borrow proof outside this segment. Concatenation
-      // across run contexts would discard that proof and re-resolve digits.
+      // Included and excluded spans depend on the full run. Losing a Latin
+      // base can turn its attached Arabic mark into standalone proof; losing
+      // Arabic proof can exclude following digits. Keep contiguous ranges in
+      // one context, and do not invent a new context across scoped run seams.
       // General text retains the ordinary same-metric run merge.
-      && (!(previous.substituteScope || segment.substituteScope)
+      && ((previous.substituteScope === undefined && segment.substituteScope === undefined)
         || (previous.textShapeRequest?.substituteContext?.text === segment.textShapeRequest?.substituteContext?.text
           && previous.textShapeRequest?.substituteContext !== undefined
           && segment.textShapeRequest?.substituteContext?.offset
@@ -208,7 +210,7 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
           : undefined,
         textShapeRequest: previous.textShapeRequest
           ? { ...previous.textShapeRequest, text,
-              substituteContext: previous.substituteScope
+              substituteContext: previous.substituteScope !== undefined || segment.substituteScope !== undefined
                 ? previous.textShapeRequest.substituteContext : { text, offset: 0 } }
           : undefined,
       };

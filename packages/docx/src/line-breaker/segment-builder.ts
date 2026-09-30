@@ -1324,7 +1324,8 @@ function emitResolvedTextSegment(
     measuredWidth: 0,
     textLayoutService: environment.layoutServices?.text,
     textShapeRequest,
-    ...(resolvedSpan?.substituteScope ? { substituteScope: true as const } : {}),
+    ...(resolvedSpan?.substituteScope !== undefined
+      ? { substituteScope: resolvedSpan.substituteScope } : {}),
     breakBefore: resolvedSpan?.breakBefore ?? authoritativeSpan?.breakBefore ?? true,
     smallCaps: emissionState.reduced,
     joinPrev:
