@@ -276,7 +276,7 @@ export const WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE = defineCompatibilityRule({
     kind: 'microsoft-note',
     reference: '[MS-OI29500] §§2.1.156, 2.1.158, 2.1.167',
   },
-  description: 'Apply the supported first-row table-property exception facts at table scope, including authored preferred-width shadowing.',
+  description: 'Apply the supported first-row table-property exception facts at table scope. An authored first-row tblPrEx/tblW shadows the body width, including auto/nil/zero clearing it; width ceiling selection and column fitting share this effective preference.',
 });
 
 export const WORD_TRAILING_STRUCTURAL_CELL_MARKER = defineCompatibilityRule({

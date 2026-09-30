@@ -49,6 +49,7 @@ import {
 import {
   effectiveTableWidthKind,
   projectTableColumnLayoutInput,
+  projectEffectiveTablePreferredWidthPt,
   tableDxaPtFromLexical,
   tableWidthConstraintFromLexical,
   type CellIntrinsicWidths,
@@ -949,6 +950,14 @@ function bodyLayoutSequenceInput(
     }
     throw new Error(`Unsupported body layout source at ${entryBodyIndex}`);
   }));
+}
+
+/** Resolve the shared whole-table preference without acquiring cell contents. */
+export function effectiveTablePreferredWidthPt(
+  table: TableLayoutSource,
+  availableWidthPt: number,
+): number | null {
+  return projectEffectiveTablePreferredWidthPt(tableSourceAcquisitionInput(table), availableWidthPt);
 }
 
 /** Project normalized parser/model facts into the pure §17.18.87 solver contract. */
@@ -1946,6 +1955,7 @@ export const bodyAcquisitionInputProjections = Object.freeze({
   numberingMarkerShapeInput,
   paragraphMarkShapeInput,
   tableFormatInput,
+  effectiveTablePreferredWidthPt,
   tableColumnLayoutInput,
   tableParticipatesInOrdinaryFlow,
   paragraphAcquisitionInput,

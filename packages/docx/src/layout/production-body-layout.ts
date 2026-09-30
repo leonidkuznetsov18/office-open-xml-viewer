@@ -2292,8 +2292,11 @@ function resolveColumnWidths(
   // center/right grid-matched controls use that same mode-14 fitted width and
   // the whole mode-15 band. Their +5.4pt-indent geometry does not settle other
   // grid/indent combinations or absolute origin policy (see the rule's limits).
-  const hasPreferredTableWidth = (Number.isFinite(table.widthPt) && (table.widthPt ?? 0) > 0)
-    || (Number.isFinite(table.widthPct) && (table.widthPct ?? 0) > 0);
+  // WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE makes first-row tblPrEx/tblW authoritative for
+  // the whole table. Use the solver's resolver, including auto clearing dxa.
+  const hasPreferredTableWidth = state.acquisitionInputs.effectiveTablePreferredWidthPt(
+    table, contentWPt,
+  ) !== null;
   const savedGridWidthPt = table.colWidths.reduce(
     (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
   );

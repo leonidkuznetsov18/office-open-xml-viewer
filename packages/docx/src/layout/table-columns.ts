@@ -466,15 +466,37 @@ function growUnpreferredColumns(
   minimums: readonly number[],
   maximums: readonly number[],
   cells: readonly TableColumnCellConstraint[],
+  rows: readonly TableColumnRowConstraint[],
   availableWidthPt: number,
 ): void {
-  const eligible = widths.map(() => true);
+  // A saved track without a cell has no content maximum. In particular,
+  // §17.4.85/.86 wAfter/wBefore constrain omitted row intervals; treating
+  // their absent content as a zero maximum would discard the specified width.
+  // Only actual unpreferred cells establish eligibility. An omitted interval
+  // stays excluded even when another row has an auto cell in that track.
+  const eligible = widths.map(() => false);
+  for (const cell of cells) {
+    if (cell.preferredWidth === null && cell.columnSpan === 1
+      && cell.columnStart >= 0 && cell.columnStart < widths.length) {
+      eligible[cell.columnStart] = true;
+    }
+  }
   for (const cell of cells) {
     if (cell.preferredWidth === null && cell.columnSpan === 1) continue;
     const start = Math.max(0, cell.columnStart);
     const end = Math.min(widths.length, start + Math.max(1, cell.columnSpan));
     for (let column = start; column < end; column += 1) eligible[column] = false;
   }
+  // All omissions are prefixes/suffixes. Union them before walking tracks,
+  // avoiding a repeated full-grid scan for each row.
+  let beforeSpan = 0;
+  let afterSpan = 0;
+  for (const row of rows) {
+    beforeSpan = Math.max(beforeSpan, row.before?.columnSpan ?? 0);
+    afterSpan = Math.max(afterSpan, row.after?.columnSpan ?? 0);
+  }
+  for (let column = 0; column < Math.min(widths.length, beforeSpan); column += 1) eligible[column] = false;
+  for (let column = Math.max(0, widths.length - afterSpan); column < widths.length; column += 1) eligible[column] = false;
   const twoUnpreferredTracks = widths.length === 2 && eligible.every(Boolean);
   if (twoUnpreferredTracks) {
     widths.forEach((width, column) => {
@@ -642,7 +664,7 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
     enforceContentConstraint(widths, minimums, transferFloors, maximums, cell);
   }
   if (input.growUnpreferredColumns === true && input.tablePreferredWidthPt === null) {
-    growUnpreferredColumns(widths, minimums, maximums, cells, finiteNonNegative(input.availableWidthPt));
+    growUnpreferredColumns(widths, minimums, maximums, cells, input.rows, finiteNonNegative(input.availableWidthPt));
   }
   return Object.freeze(fitToAvailableWidth(
     widths,

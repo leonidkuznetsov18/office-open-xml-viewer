@@ -181,7 +181,10 @@ function publicTableCellConstraint(
   return null;
 }
 
-function tablePreferredWidthPt(
+/** WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE: an authored first-row tblPrEx/tblW governs the
+ * whole table, including auto/nil/zero clearing the body's preference. Both
+ * occurrence ceiling selection and column projection use this resolver. */
+export function projectEffectiveTablePreferredWidthPt(
   input: TableSourceAcquisitionInput,
   availableWidthPt: number,
 ): number | null {
@@ -323,7 +326,7 @@ export function projectTableColumnLayoutInput(
     availableWidthPt: maximumWidthPt === null ? null : Math.max(0, maximumWidthPt),
     gridWidthsPt,
     gridWidthKeys,
-    tablePreferredWidthPt: tablePreferredWidthPt(input, availableWidthPt),
+    tablePreferredWidthPt: projectEffectiveTablePreferredWidthPt(input, availableWidthPt),
     rows: table.rows.map((row, rowIndex) => {
       const rowInput = input.lexical.rows[rowIndex];
       const beforeSpan = normalizedBeforeSpans[rowIndex] ?? 0;

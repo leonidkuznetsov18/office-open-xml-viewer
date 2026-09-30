@@ -24,6 +24,11 @@ export interface BodyAcquisitionInputProjections {
   readonly tableFormatInput: (
     table: TableLayoutSource,
   ) => TableFormatInput;
+  /** Effective whole-table preference, including the first-row exception. */
+  readonly effectiveTablePreferredWidthPt: (
+    table: TableLayoutSource,
+    availableWidthPt: number,
+  ) => number | null;
   readonly tableColumnLayoutInput: (
     table: TableLayoutSource,
     availableWidthPt: number,
