@@ -6751,6 +6751,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -7369,6 +7370,7 @@ mod tests {
             None,
             None,
             None,
+            None, // inherited_font_algn
             None,
             None,
             None,
@@ -7797,7 +7799,8 @@ mod tests {
                 None, // inherited_anchor
                 None, // inherited_body_pr
                 None, // inherited_alignment
-                None, // inherited_ea_ln_brk
+                None,
+                None, // inherited_font_algn // inherited_ea_ln_brk
                 None, // inherited_space_before
                 None, // inherited_space_after
                 None, // inherited_line_spacing
@@ -7883,6 +7886,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -7928,6 +7932,64 @@ mod tests {
         );
     }
 
+    /// Review regression (#1636): an end-of-paragraph or break mark authors a
+    /// face only when its own a:latin resolves; an unresolved theme token
+    /// inherits like an omitted face.
+    #[test]
+    fn test_mark_face_authored_only_when_resolved() {
+        let rels = HashMap::new();
+        let bytes = empty_zip_bytes();
+        let mut zip = PptxZip::new(Cursor::new(bytes)).unwrap();
+        let mut parse = |theme: &HashMap<String, String>, latin: &str| -> Paragraph {
+            let xml = format!(
+                r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><p><r><rPr sz="4000"><latin typeface="Arial"/></rPr><t>H</t></r><br><rPr sz="1600">{latin}</rPr></br><r><rPr sz="4000"><latin typeface="Arial"/></rPr><t>H</t></r><endParaRPr sz="4000">{latin}</endParaRPr></p></txBody>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut tb = parse_text_body(
+                doc.root_element(),
+                theme,
+                &rels,
+                "ppt/slides",
+                None,
+                [None; 9],
+                std::array::from_fn(|_| None),
+                std::array::from_fn(|_| Default::default()),
+                Default::default(),
+                &empty_level_bullets(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut zip,
+            );
+            tb.paragraphs.remove(0)
+        };
+        let break_face = |p: &Paragraph| match &p.runs[1] {
+            TextRun::Break { font_family, .. } => font_family.clone(),
+            _ => panic!("break expected"),
+        };
+        let empty = HashMap::new();
+        let themed = HashMap::from([("+mn-lt".to_owned(), "Meiryo".to_owned())]);
+        let token = r#"<latin typeface="+mn-lt"/>"#;
+        let unresolved = parse(&empty, token);
+        assert!(!unresolved.end_face_authored);
+        assert_eq!(break_face(&unresolved), None);
+        let resolved = parse(&themed, token);
+        assert!(resolved.end_face_authored);
+        assert_eq!(break_face(&resolved).as_deref(), Some("Meiryo"));
+        let literal = parse(&empty, r#"<latin typeface="Meiryo"/>"#);
+        assert!(literal.end_face_authored);
+        assert!(!parse(&empty, "").end_face_authored);
+    }
+
     /// ECMA-376 §21.1.2.2.7 — `<a:pPr eaLnBrk>` (xsd:boolean, default true)
     /// controls whether East Asian words may break at a line wrap. The parser
     /// must surface the paragraph's own value, fall back to the body lstStyle
@@ -7968,6 +8030,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -8057,6 +8120,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 None,
                 None,
                 None,
@@ -8134,6 +8198,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // inherited_font_algn
                 inherited,
                 inherited,
                 None,
