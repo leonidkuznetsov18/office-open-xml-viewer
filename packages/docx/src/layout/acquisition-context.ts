@@ -21,7 +21,7 @@ import type {
   RetainedTableAcquisition,
   RetainedTableAcquisitionDependencies,
 } from './table-acquisition.js';
-import type { LayoutServices } from './types.js';
+import type { LayoutRect, LayoutServices } from './types.js';
 
 /** One acquired body-table occurrence and the point-space placement facts that
  * bind it to the current retained-layout session. */
@@ -70,6 +70,10 @@ export interface FloatRegistrationState extends AnchorGeometryContext {
  * projection and page-start pre-scan ownership. */
 export interface AnchorFloatRegistrationState extends FloatRegistrationState {
   pageAnchorPrescanned?: Set<ParagraphLayoutSource>;
+  /** WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: object frames of paragraph-relative
+   * drawings carried to this page, keyed by anchor occurrence. The anchor
+   * paragraph keeps the carried frame instead of re-resolving it. */
+  frozenAnchorFrames?: Map<string, LayoutRect>;
   verticalCJK?: boolean;
   verticalAllRotated?: boolean;
   verticalPhys?: PhysicalAnchorFrame;

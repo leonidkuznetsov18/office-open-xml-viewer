@@ -54,13 +54,19 @@ export function floatingTableAvoidance(
     : Object.freeze({ kind: 'none' });
 }
 
-export function drawingMLAvoidance(
-  allowOverlap: boolean,
-  paragraphId: number,
-): FloatAvoidance {
+/** ECMA-376 §20.4.2.3: an allowOverlap=true DrawingML object keeps its
+ * resolved position. Word controls from issue #1623 confirm that no
+ * different-paragraph displacement applies to such pictures. */
+export function drawingMLAvoidance(allowOverlap: boolean): FloatAvoidance {
   return allowOverlap
-    ? Object.freeze({ kind: 'word-different-paragraph', paragraphId })
+    ? Object.freeze({ kind: 'none' })
     : Object.freeze({ kind: 'drawingml-normative' });
+}
+
+/** Legacy `w:framePr` frames keep the established different-paragraph
+ * displacement; no Word control has measured frame overlap. */
+export function frameAvoidance(paragraphId: number): FloatAvoidance {
+  return Object.freeze({ kind: 'word-different-paragraph', paragraphId });
 }
 
 export function floatRegistryParticipant(
