@@ -1,5 +1,6 @@
 import type { TabStop, DocSettings } from '../types';
-import { nextTabStopRtl } from '../layout/text.js';
+import { nextTabStop, nextTabStopRtl, type ResolvedTabStop } from '../layout/text.js';
+import { wordFloatTabStopPosition, wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { type LayoutImageSeg, type LayoutMathSeg, type LayoutSeg, type LayoutTabSeg, type LayoutTextSeg } from './model.js';
 
 /** ECMA-376 §17.15.1.25 — the ABSENT default for `<w:defaultTabStop>`: "If this
@@ -25,6 +26,36 @@ export function resolveDefaultTabPt(settings: DocSettings | undefined): number {
 }
 
 
+/** Resolve normative stop eligibility, then project the displaced line frame
+ * through WORD_TAB_DISPLACED_READING_FRAME in layout/line-compatibility.ts. */
+export function nextLineTabStop(
+  pen: number,
+  stops: readonly ResolvedTabStop[],
+  interval: number,
+  leadingShift: number,
+  marginWidth: number,
+  scale: number,
+): ResolvedTabStop | null {
+  const stop = nextTabStop(pen, stops, interval);
+  if (!stop || leadingShift <= 0) return stop;
+  const custom = stops.some((entry) => entry.alignment !== 'bar' && entry.pos === stop.pos);
+  return { ...stop, pos: wordFloatTabStopPosition(stop.pos, custom, pen,
+    leadingShift, marginWidth, interval === DEFAULT_TAB_PT * scale, scale) };
+}
+
+/** §17.3.3.23 / §17.18.71: align a positional tab's following cell within its
+ * reference box, independently of ordinary stops, in reading coordinates. */
+export function positionalTabTarget(
+  alignment: NonNullable<LayoutTabSeg['ptab']>['alignment'],
+  left: number,
+  right: number,
+  followingWidth: number,
+): number {
+  return alignment === 'left' ? left
+    : alignment === 'right' ? right - followingWidth
+      : (left + right - followingWidth) / 2;
+}
+
 /** One entry in a bidi line's LOGICAL-order sequence, for {@link layoutBidiTabStops}. */
 export interface BidiTabItem {
   /** True for a tab segment (its width is (re)computed); false for content. */
@@ -35,6 +66,7 @@ export interface BidiTabItem {
    * point. The bidi resolver converts the complete cell's logical prefix to a
    * physical reading-frame offset. */
   decimalOffset?: number;
+  ptab?: LayoutTabSeg['ptab'];
 }
 
 
@@ -115,6 +147,7 @@ export function layoutBidiTabStops(
   startPenPx: number,
   leftLimitPx: number,
   intervalPx: number,
+  frame?: Readonly<{ leadingShift: number; indentStart: number; indentEnd: number; bandStart: number; bandEnd: number; narrowed: boolean; scale: number }>,
 ): BidiTabResult[] {
   const n = items.length;
   const width = items.map((it) => it.width);
@@ -156,7 +189,20 @@ export function layoutBidiTabStops(
       pen += width[i];
       continue;
     }
-    const stop = nextTabStopRtl(pen, customStopsPx, intervalPx);
+    if (it.ptab && frame) {
+      const following = followAlignmentWidth(i + 1, 'leading').total;
+      const referenceStart = it.ptab.relativeTo === 'indent' ? frame.indentStart : 0;
+      const referenceEnd = it.ptab.relativeTo === 'indent' ? frame.indentEnd : leftLimitPx;
+      const box = wordPositionalTabReferenceBox(referenceStart, referenceEnd,
+        frame.bandStart, frame.bandEnd, frame.narrowed);
+      const target = positionalTabTarget(it.ptab.alignment, box.start, box.end, following);
+      width[i] = Math.max(0, target - pen);
+      pen += width[i];
+      continue;
+    }
+    const stop = frame
+      ? nextLineTabStop(pen, customStopsPx, intervalPx, frame.leadingShift, leftLimitPx, frame.scale)
+      : nextTabStopRtl(pen, customStopsPx, intervalPx);
     if (!stop) {
       // No stop further left: the tab collapses (following content continues).
       width[i] = 0;
@@ -182,7 +228,7 @@ export function layoutBidiTabStops(
     // Pin content that would fall past the left text margin onto the margin: the
     // following cell spans [target, target + fw] in reading-frame margins, so its
     // far (left) edge must stay ≤ leftLimitPx.
-    if (target + fw > leftLimitPx) target = leftLimitPx - fw;
+    if ((!frame || frame.leadingShift <= 0) && target + fw > leftLimitPx) target = leftLimitPx - fw;
     // Never let a tab move the pen backwards (right).
     if (target < pen) target = pen;
     width[i] = target - pen;
@@ -198,6 +244,8 @@ export interface BidiTabPostPassInput {
   readonly baseRtl: boolean;
   readonly currentLine: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[];
   readonly marginRightPx: number;
+  readonly maxWidth: number;
+  readonly scale: number;
   readonly lineXOffset: number;
   readonly lineMaxWidth: number;
   readonly isFirst: boolean;
@@ -223,6 +271,8 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
     baseRtl,
     currentLine,
     marginRightPx,
+    maxWidth,
+    scale,
     lineXOffset,
     lineMaxWidth,
     isFirst,
@@ -247,6 +297,7 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
   const items: BidiTabItem[] = currentLine.map((s) => ({
     isTab: 'isTab' in s,
     width: s.measuredWidth,
+    ptab: 'isTab' in s ? s.ptab : undefined,
   }));
   for (let tabIndex = 0; tabIndex < currentLine.length; tabIndex += 1) {
     if (!('isTab' in currentLine[tabIndex]!)) continue;
@@ -276,7 +327,15 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
   // paragraph box (its trailing indent).
   const startPen = marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? firstIndent : 0);
   const leftLimit = marginRightPx + tabOriginPx;
-  const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx);
+  const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx, {
+    leadingShift: maxWidth - (lineXOffset + lineMaxWidth),
+    indentStart: marginRightPx - maxWidth,
+    indentEnd: marginRightPx,
+    bandStart: marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? Math.min(0, firstIndent) : 0),
+    bandEnd: marginRightPx - lineXOffset,
+    narrowed: lineXOffset !== 0 || lineMaxWidth !== maxWidth,
+    scale,
+  });
   let delta = 0;
   for (let i = 0; i < currentLine.length; i++) {
     const s = currentLine[i];

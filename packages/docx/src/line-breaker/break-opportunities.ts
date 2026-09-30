@@ -7,7 +7,7 @@ import {
   fitSeaWordPrefix,
   graphemeClusterOffsets,
 } from '@silurus/ooxml-core';
-import { EAST_ASIAN_RE, nextTabStop } from '../layout/text.js';
+import { EAST_ASIAN_RE } from '../layout/text.js';
 import {
   wordIsOverflowPunctuation,
   wordIdeographicSpaceLineEndAllowanceCount,
@@ -30,7 +30,8 @@ import {
   slicedTextMetadata,
   snapToCharsClass,
 } from './advance.js';
-import { tabAlignmentRole } from './tabs.js';
+import { nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
+import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
   extendThroughTrailingIdeographicSpaces,
@@ -442,25 +443,23 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     availW,
   } = context;
 
-  // ── ECMA-376 §17.3.1.6 base-RTL ordinary tab ─────────────────────────
+  // ── ECMA-376 §17.3.1.6 base-RTL tab ──────────────────────────────────
   // The LTR pen math below resolves stops in LOGICAL order, which mis-places
   // a bidi paragraph's tab-delimited cells (they reorder visually — see
   // `layoutBidiTabStops`). Add the tab with a PROVISIONAL width of 0 and do
   // NOT wrap on it; the per-line post-pass (`applyBidiTabs`, run in `flush`)
   // recomputes every tab width in the visual frame once the line's content
-  // is known. A `<w:ptab>` (absolute-position tab) keeps the LTR path for
-  // now (no bidi ptab fixture; its own NOTE flags the gap).
-  if (baseRtl && !seg.ptab) {
+  // is known, including the retained `<w:ptab>` descriptor.
+  if (baseRtl) {
     seg.measuredWidth = 0;
     addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
     return;
   }
 
-  // §17.3.1.37 / §17.3.3.23: tab targets retain their paragraph/margin
-  // reference even when a float shifts this line's start. Use the same
-  // paraX-relative origin as planLine; omitting the window offset adds it
-  // again to every target at placement, and aligned cells bypass text fitting.
-  const absFromParaX = breakerState.lineXOffset + breakerState.currentWidth
+  // LTR pen coordinates include the available line window's displacement.
+  // RTL tabs are resolved in reading order by the post-pass above.
+  const lineOrigin = breakerState.lineXOffset;
+  const absFromParaX = lineOrigin + breakerState.currentWidth
     + (breakerState.isFirst ? firstIndent : 0);
 
   // ── ECMA-376 §17.3.3.23 absolute-position tab (<w:ptab>) ──────────────
@@ -470,24 +469,14 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // ALSO governs how the text after the ptab aligns to that position (left /
   // centered / right). All coordinates below are paraX-relative px.
   //
-  // NOTE: the ptab target is resolved in LOGICAL (LTR) coordinates — this
-  // block runs before the per-line bidi reorder pass, so it has no notion
-  // of the paragraph's base direction. Interaction with bidi mirroring in
-  // an RTL paragraph (where "left"/"right" alignment and the box edges
-  // ought to mirror) is unverified; the primary use case (an LTR footer's
-  // centered/right-aligned PAGE field) is correct.
   if (seg.ptab) {
     seg.resolvedAlignment = seg.ptab.alignment;
-    // Reference box: "indent" ⇒ the paragraph content box [0, maxWidth];
-    // "margin" ⇒ the text-margin box [-tabOriginPx, marginRightPx].
-    const boxLeft = seg.ptab.relativeTo === 'indent' ? 0 : -tabOriginPx;
-    const boxRight = seg.ptab.relativeTo === 'indent' ? maxWidth : marginRightPx;
-    const target =
-      seg.ptab.alignment === 'left'
-        ? boxLeft
-        : seg.ptab.alignment === 'center'
-          ? (boxLeft + boxRight) / 2
-          : boxRight;
+    const bandLeft = breakerState.lineXOffset + (breakerState.isFirst ? Math.min(0, firstIndent) : 0);
+    const bandRight = breakerState.lineXOffset + breakerState.lineMaxWidth;
+    const box = wordPositionalTabReferenceBox(
+      seg.ptab.relativeTo === 'indent' ? 0 : -tabOriginPx,
+      seg.ptab.relativeTo === 'indent' ? maxWidth : marginRightPx,
+      bandLeft, bandRight, breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== maxWidth);
     // Width of the content that trails the ptab up to the next tab / line end
     // — needed to right-/center-align it against `target` (the trailing text
     // is what aligns to the stop, §17.18.71).
@@ -496,14 +485,14 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
       if ('isTab' in q || 'lineBreak' in q) break;
       followW += tabFollowWidth(q);
     }
-    const frac = seg.ptab.alignment === 'center' ? 0.5 : seg.ptab.alignment === 'right' ? 1 : 0;
-    let tabW = target - absFromParaX - followW * frac;
+    const target = positionalTabTarget(seg.ptab.alignment, box.start, box.end, followW);
+    let tabW = target - absFromParaX;
     // §17.3.3.23: "If the alignment location … cannot be found on the current
     // line, because the starting location is past that point, then the tab …
     // shall advance to that location on the next available line." So when the
-    // pen already sits at/after the target, wrap the ptab (and its trailing
+    // pen already sits past the target, wrap the ptab (and its trailing
     // content) to a fresh line — unless the line is empty (nowhere to wrap).
-    if (tabW <= 0) {
+    if (tabW < 0) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);
         breakerState.queue.unshift(seg);
@@ -556,7 +545,8 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     alignment: t.alignment,
     leader: t.leader,
   }));
-  const stop = nextTabStop(curMarginPx, customStopsPx, defaultTabPt * scale);
+  const stop = nextLineTabStop(curMarginPx, customStopsPx, defaultTabPt * scale,
+    lineOrigin, marginRightPx + tabOriginPx, scale);
   seg.resolvedAlignment = stop?.alignment ?? 'left';
   // Convert the chosen margin-space stop back to paraX-relative px.
   const stopParaX = stop ? stop.pos - tabOriginPx : absFromParaX;
@@ -567,7 +557,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // Automatic stops returned by nextTabStop are left-aligned, so they fall
   // through to the left-tab path below.
   const alignmentRole = stop ? tabAlignmentRole(stop.alignment) : 'leading';
-  if (stop && alignmentRole !== 'leading') {
+  if (stop && (alignmentRole !== 'leading' || breakerState.lineMaxWidth !== maxWidth || breakerState.lineXOffset !== 0)) {
     const stopX = stopParaX;
     seg.leader = stop.leader;
     const following = tabFollowingMetrics();
@@ -576,7 +566,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
         ? following.totalWidth / 2
         : alignmentRole === 'decimal'
           ? (following.decimalPrefixWidth ?? following.totalWidth)
-          : following.totalWidth;
+          : alignmentRole === 'leading' ? 0 : following.totalWidth;
     let tabW = stopX - absFromParaX - alignmentWidth;
     if (tabW <= 0) tabW = 0;
     seg.measuredWidth = tabW;

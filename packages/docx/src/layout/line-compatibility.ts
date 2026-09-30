@@ -2,6 +2,53 @@ import { defineCompatibilityRule } from './compatibility.js';
 import { OFFICE_FAR_EAST_SINGLE_LINE_FACTOR, officeOpenTypeAutoLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 import type { LineSpacing, TabStop } from '../types.js';
 
+export const WORD_TAB_DISPLACED_READING_FRAME = defineCompatibilityRule({
+  id: 'word-float-tab-reading-frame',
+  evidence: {
+    kind: 'regression-test',
+    reference: 'packages/docx/src/layout/first-line-float-indent.test.ts#keeps the measured overflow tab advance at %s pt font size',
+  },
+  description: 'Issue #1672 controlled Word exports cover ordinary left/right/center/decimal tabs, one/two tabs, both paragraph directions and either float edge, with no-float counterexamples. Eligibility stays margin-relative (ECMA-376 §17.3.1.37), but an authored target moves with a float-displaced leading line edge. A tab cell stays on that line even when it overlaps the exclusion or overflows the margin. After an authored target carries the pen beyond the margin, the next automatic tab advances 14 pt on the default 36 pt grid: all eight 10 pt cases and the discriminating 20 pt run agree, rejecting a font-scaled space or either grid origin. This is an observed Word rule, not a normative overflow distance; other automatic grids are unmeasured and retain their ordinary grid behavior.',
+});
+
+/** Projection of {@link WORD_TAB_DISPLACED_READING_FRAME}. The caller has already
+ * selected the next eligible stop in margin coordinates. */
+export function wordFloatTabStopPosition(
+  stopPosition: number,
+  custom: boolean,
+  pen: number,
+  leadingShift: number,
+  marginWidth: number,
+  defaultGrid: boolean,
+  scale: number,
+): number {
+  if (leadingShift <= 0) return stopPosition;
+  if (custom) return stopPosition + leadingShift;
+  return pen >= marginWidth && defaultGrid ? pen + 14 * scale : stopPosition;
+}
+
+export const WORD_POSITIONAL_TAB_AVAILABLE_BAND = defineCompatibilityRule({
+  id: 'word-positional-tab-available-band',
+  evidence: {
+    kind: 'regression-test',
+    reference: 'packages/docx/src/layout/first-line-float-indent.test.ts#$kind $alignment ($count), rtl=$rtl, float=$float matches Word geometry',
+  },
+  description: 'Issue #1672 Word exports cover all 36 positional-tab combinations of left/center/right alignment, margin/indent reference, LTR/RTL paragraph direction and no/left/right float. Word intersects the normative reference box (ECMA-376 §§17.3.3.23, 17.18.71, 17.18.73) with the available float band and aligns the following cell in reading order; no-float references remain unchanged. A target at the current pen is reachable without a line break; only a target behind it requires the next line. RTL must retain the positional descriptor through the bidi post-pass rather than resolving it as an ordinary tab.',
+});
+
+/** Reference-box projection of {@link WORD_POSITIONAL_TAB_AVAILABLE_BAND}. */
+export function wordPositionalTabReferenceBox(
+  referenceStart: number,
+  referenceEnd: number,
+  bandStart: number,
+  bandEnd: number,
+  narrowed: boolean,
+): Readonly<{ start: number; end: number }> {
+  return narrowed
+    ? { start: Math.max(referenceStart, bandStart), end: Math.min(referenceEnd, bandEnd) }
+    : { start: referenceStart, end: referenceEnd };
+}
+
 export const WORD_OPENTYPE_FEATURES_COMPAT_KERNING = defineCompatibilityRule({
   id: 'word-opentype-features-compat-kerning',
   evidence: {
