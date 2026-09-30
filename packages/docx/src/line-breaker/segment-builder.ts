@@ -865,6 +865,19 @@ function pushSegmentPiece(
     overflowPunctuationEastAsianRun,
   } = emissionState;
 
+  // Locate this piece in the run's display text (pieces are emitted in order).
+  const scopeContext = emissionState.scopeContext;
+  const contextOffset = substituteContext?.offset
+    ?? (scopeContext ? scopeContext.text.indexOf(text, scopeContext.cursor) : -1);
+  // A parent token advances the cursor once. Children receive its exact range;
+  // re-searching after that advance loses proof outside the child span.
+  if (!substituteContext && scopeContext && contextOffset >= 0) {
+    scopeContext.cursor = contextOffset + text.length;
+  }
+  const retainedContext = substituteContext
+    ?? (scopeContext && contextOffset >= 0
+      ? Object.freeze({ text: scopeContext.text, offset: contextOffset }) : undefined);
+
   if (
     environment.balanceSingleByteDoubleByteWidth &&
     !cs &&
@@ -875,6 +888,7 @@ function pushSegmentPiece(
     // other East-Asian glyphs receive the full delta. Split only at that
     // semantic boundary so Canvas can retain one uniform letterSpacing per
     // segment (measure == paint); the space itself has no contextual shape.
+    let partOffset = 0;
     for (const part of text.split(/(\u3000+)/u).filter(Boolean)) {
       pushSegmentPiece(
         emissionState,
@@ -884,7 +898,10 @@ function pushSegmentPiece(
         undefined,
         compressCharacterWhitespace,
         mappedSymbolUnicode,
+        retainedContext
+          ? { text: retainedContext.text, offset: retainedContext.offset + partOffset } : undefined,
       );
+      partOffset += part.length;
     }
     return;
   }
@@ -906,7 +923,9 @@ function pushSegmentPiece(
         characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
       )
     ) {
-      pushSegmentPiece(emissionState, text, cs, fontFamily, undefined, true, mappedSymbolUnicode);
+      pushSegmentPiece(
+        emissionState, text, cs, fontFamily, undefined, true, mappedSymbolUnicode, retainedContext,
+      );
       return;
     }
   }
@@ -914,18 +933,6 @@ function pushSegmentPiece(
   const italic = cs ? csItalic : base.italic;
   const weight = bold ? 700 : 400;
   const style = italic ? ('italic' as const) : ('normal' as const);
-  // Locate this piece in the run's display text (pieces are emitted in order).
-  const scopeContext = emissionState.scopeContext;
-  const contextOffset = substituteContext?.offset
-    ?? (scopeContext ? scopeContext.text.indexOf(text, scopeContext.cursor) : -1);
-  // A parent token advances the cursor once. Children receive its exact range;
-  // re-searching after that advance loses proof outside the child span.
-  if (!substituteContext && scopeContext && contextOffset >= 0) {
-    scopeContext.cursor = contextOffset + text.length;
-  }
-  const retainedContext = substituteContext
-    ?? (scopeContext && contextOffset >= 0
-      ? Object.freeze({ text: scopeContext.text, offset: contextOffset }) : undefined);
   const textShapeRequest: TextShapeRequest = Object.freeze({
     text,
     ...(retainedContext ? { substituteContext: retainedContext } : {}),
@@ -1300,6 +1307,7 @@ function emitResolvedTextSegment(
     measuredWidth: 0,
     textLayoutService: environment.layoutServices?.text,
     textShapeRequest,
+    ...(resolvedSpan?.substituteScope ? { substituteScope: true as const } : {}),
     breakBefore: resolvedSpan?.breakBefore ?? authoritativeSpan?.breakBefore ?? true,
     smallCaps: emissionState.reduced,
     joinPrev:

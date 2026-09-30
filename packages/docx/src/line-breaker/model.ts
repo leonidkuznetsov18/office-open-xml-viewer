@@ -104,6 +104,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
    * metrics are resolved through this same service during line layout. */
   textLayoutService?: TextLayoutService;
   textShapeRequest?: TextShapeRequest;
+  /** Run-context-dependent substitute; intrinsic merging must preserve its proof. */
+  substituteScope?: true;
   /** Contextually shaped grapheme geometry from the authoritative text service. */
   shapedClusters?: readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;

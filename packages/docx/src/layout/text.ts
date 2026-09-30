@@ -364,6 +364,8 @@ export interface GlyphMeasurer {
 }
 
 export interface TextShapeSpan extends GlyphMeasurement {
+  /** True only for a face selected by the shared run-context substitute rule. */
+  readonly substituteScope?: true;
   readonly text: string;
   readonly start: number;
   readonly end: number;
@@ -1010,7 +1012,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         }
       }
 
-      const spans = merged.map(({ substituteScript: _substituteScript, font, ...group }): TextShapeSpan => {
+      const spans = merged.map(({ substituteScript, font, ...group }): TextShapeSpan => {
         const measurement = request.measure === false ? {
           advancePt: 0,
           ascentPt: 0,
@@ -1026,6 +1028,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         });
         return Object.freeze({
           ...group, ...measurement, font, fontRoute: font.route,
+          ...(substituteScript ? { substituteScope: true as const } : {}),
         });
       });
       const diagnostics = spans.flatMap((span) => span.font.diagnostics);

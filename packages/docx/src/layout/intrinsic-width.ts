@@ -21,7 +21,7 @@ import type {
   TextMeasurer,
 } from '../paragraph-measure.js';
 import { paragraphCharacterGrid } from '../paragraph-measure.js';
-import { calcEffectiveFontPx } from './text.js';
+import { calcEffectiveFontPx, sliceTextShapeRequest } from './text.js';
 import { wordSnapToCharsEastAsianCellCount } from './line-compatibility.js';
 import type { ParagraphLayoutSource, TextFontSlots } from './text.js';
 import { projectEffectiveCellPreferredWidth, type TableLayoutSource } from './table-source-acquisition.js';
@@ -182,6 +182,14 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       && 'text' in previous
       && 'text' in segment
       && compatibleTextKey(previous) === compatibleTextKey(segment)
+      // A scoped face can borrow proof outside this segment. Concatenation
+      // across run contexts would discard that proof and re-resolve digits.
+      // General text retains the ordinary same-metric run merge.
+      && (!(previous.substituteScope || segment.substituteScope)
+        || (previous.textShapeRequest?.substituteContext?.text === segment.textShapeRequest?.substituteContext?.text
+          && previous.textShapeRequest?.substituteContext !== undefined
+          && segment.textShapeRequest?.substituteContext?.offset
+            === previous.textShapeRequest.substituteContext.offset + previous.text.length))
     ) {
       const previousTextLength = previous.text.length;
       const text = previous.text + segment.text;
@@ -246,6 +254,8 @@ function measureTextRange(
     const candidate = {
       ...piece.segment,
       text,
+      ...(piece.segment.textShapeRequest
+        ? { textShapeRequest: sliceTextShapeRequest(piece.segment.textShapeRequest, localStart, localEnd) } : {}),
       punctuationCompressions: slicedPunctuationCompressions(
         piece.segment,
         localStart,
@@ -319,6 +329,8 @@ function measureTextRange(
         const cluster = {
           ...candidate,
           text: text.slice(clusterStart, clusterEnd),
+          ...(candidate.textShapeRequest
+            ? { textShapeRequest: sliceTextShapeRequest(candidate.textShapeRequest, clusterStart, clusterEnd) } : {}),
           punctuationCompressions: slicedPunctuationCompressions(
             candidate,
             clusterStart,

@@ -231,15 +231,18 @@ describe('script-scoped Arabic visual substitutes', () => {
   };
 
   it.each([
-    ['ما ١٢a', false, false],
-    ['م\u0301رحبا', true, true],
-    ['ما ١٢', true, false],
-    ['ما ' + '١٢'.repeat(60) + 'a', false, false],
-  ])('retains the same scoped face in measurement and paint: %s', async (text, rtl, hint) => {
-    const body = '<w:p><w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
+    ['ما ١٢a', false, false, false],
+    ['ما ١٢a', false, false, true],
+    ['م\u0301رحبا', true, true, false],
+    ['ما ١٢', true, false, false],
+    ['ما ' + '١٢'.repeat(60) + 'a', false, false, false],
+  ])('retains the same scoped face in measurement and paint: %s', async (text, rtl, hint, table) => {
+    const paragraph = '<w:p><w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
       + ' w:hAnsi="Sakkal Majalla" w:eastAsia="Sakkal Majalla" w:cs="Sakkal Majalla"'
       + `${hint ? ' w:hint="eastAsia"' : ''}/>${rtl ? '<w:rtl/>' : ''}<w:sz w:val="20"/>`
       + `</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+    const body = table ? '<w:tbl><w:tblPr><w:tblLayout w:type="autofit"/></w:tblPr>'
+      + `<w:tr><w:tc>${paragraph}</w:tc></w:tr></w:tbl>` : paragraph;
     const model = parse(docx(body));
     const { canvas, calls, measurements } = recordingCanvas(new Set(WEB_FACES));
     await renderDocumentToCanvas(model, canvas, 0, {
@@ -259,6 +262,30 @@ describe('script-scoped Arabic visual substitutes', () => {
     if (!hint && text.length < 10) {
       expect(measurements).toContainEqual({ text: '١٢', face: 'Noto Naskh Arabic', width: 18 });
     }
+  });
+
+  it("preserves each run's external Arabic proof during table intrinsic measurement", async () => {
+    // U+08A0 proves Arabic through a different slot/face from the digits.
+    // Adjacent digit spans in two runs therefore depend on different contexts.
+    const run = (text: string) => '<w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
+      + ' w:hAnsi="Univers Next Arabic"/><w:sz w:val="20"/></w:rPr>'
+      + `<w:t xml:space="preserve">${text}</w:t></w:r>`;
+    const model = parse(docx('<w:tbl><w:tblPr><w:tblLayout w:type="autofit"/></w:tblPr>'
+      + `<w:tr><w:tc><w:p>${run('\u08A0 ١٢ ')}${run('١٢ \u08A0')}</w:p></w:tc></w:tr></w:tbl>`));
+    const { canvas, calls, measurements } = recordingCanvas(new Set(WEB_FACES));
+    await renderDocumentToCanvas(model, canvas, 0, {
+      dpr: 1, width: 612,
+      layoutServices: createLayoutServices(model, {
+        useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+        measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      }),
+    });
+    const measured = measurements.filter((entry) => entry.text.includes('١'));
+    const painted = calls.filter((entry) => entry.text.includes('١'));
+    expect(measured.length).toBeGreaterThan(0);
+    expect(painted.length).toBeGreaterThan(0);
+    expect(measured.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
+    expect(painted.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
   });
 
   it('shares scoped word shapes across 4,000 offsets and different run contexts', async () => {
