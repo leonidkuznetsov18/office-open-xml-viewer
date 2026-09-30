@@ -37,18 +37,58 @@ function finiteMean(values: readonly number[]): number {
   return (normalized / values.length) * scale;
 }
 
-function finiteFence(value: number, spread: number, direction: -1 | 1): number {
-  if (!Number.isFinite(spread)) {
-    return direction < 0 ? -Number.MAX_VALUE : Number.MAX_VALUE;
-  }
-  const result = value + direction * spread;
+/**
+ * Tukey fence `edge ± 1.5 × IQR`, where `edge` is the quartile the fence
+ * extends from and `other` the opposite quartile. When an intermediate step
+ * overflows, evaluate the same expression, with the same rounding steps, on
+ * quarter-scaled quartiles and multiply by four; saturate only when that
+ * product overflows. Office's own arithmetic at this range is not measured.
+ */
+function tukeyFence(edge: number, other: number): number {
+  const direct = edge + (edge - other) * 1.5;
+  if (Number.isFinite(direct)) return direct;
+  const quarterEdge = edge / 4;
+  const scaled = quarterEdge + (quarterEdge - other / 4) * 1.5;
+  const result = scaled * 4;
   if (Number.isFinite(result)) return result;
-  return direction < 0 ? -Number.MAX_VALUE : Number.MAX_VALUE;
+  return scaled < 0 ? -Number.MAX_VALUE : Number.MAX_VALUE;
 }
 
 /**
- * Compute median-of-halves box statistics from finite observations.
+ * Linear interpolation at a 1-based order-statistic position, clamped to the
+ * sample. Weighting both neighbours (rather than adding a scaled difference)
+ * keeps the result finite for opposite-signed extreme values; the final clamp
+ * keeps rounding (e.g. of subnormal ties) from leaving the neighbour range.
+ */
+function quantileAt(sorted: readonly number[], position: number): number {
+  if (position <= 1) return sorted[0];
+  if (position >= sorted.length) return sorted[sorted.length - 1];
+  const index = Math.floor(position);
+  const fraction = position - index;
+  const below = sorted[index - 1];
+  const above = sorted[index];
+  if (fraction === 0 || below === above) return below;
+  const value = below * (1 - fraction) + above * fraction;
+  return Math.min(above, Math.max(below, value));
+}
+
+/**
+ * Compute box statistics from finite observations.
  * Missing/non-finite observations are discarded and repeats are retained.
+ *
+ * [MS-ODRAWXML] ST_QuartileMethod (2.24.4.17) describes the two methods only
+ * as including or excluding the median; the interpolation is observed
+ * PowerPoint 16.113 behavior (vector PDF, electronic-distribution engine) on
+ * synthetic controls with the same irregular data under both methods,
+ * n = 1–25, 30 and 31 (every n mod 4): every box edge within 0.41pt
+ * (0.23 axis units) of these values, while each other Hyndman–Fan
+ * definition misses at least one measured group by more than 30pt.
+ * - `exclusive`: position (n + 1)p, the QUARTILE.EXC convention, clamped to
+ *   the smallest/largest observation (for n = 2 the box spans the sample).
+ * - `inclusive`: position (n − 1)p + 1, the QUARTILE.INC convention.
+ * The previous split-halves medians matched only 14/26 (exclusive) and
+ * 13/26 (inclusive) of the measurable groups. Excel's own export (print
+ * engine) of a 40-point inclusive box chart is consistent as well.
  */
 export function computeBoxWhiskerStats(
   values: readonly (number | null | undefined)[],
@@ -59,17 +99,15 @@ export function computeBoxWhiskerStats(
     .sort((a, b) => a - b);
   if (sorted.length === 0) return null;
 
-  const middle = Math.floor(sorted.length / 2);
+  const n = sorted.length;
   const center = median(sorted);
-  const includeMedian = method === 'inclusive' && sorted.length % 2 === 1;
-  const lower = sorted.slice(0, middle + (includeMedian ? 1 : 0));
-  const upper = sorted.slice(middle + (sorted.length % 2 === 1 && !includeMedian ? 1 : 0));
-  const q1 = median(lower.length > 0 ? lower : sorted);
-  const q3 = median(upper.length > 0 ? upper : sorted);
-  const iqr = q3 - q1;
-  const spread = iqr * 1.5;
-  const lowerFence = finiteFence(q1, spread, -1);
-  const upperFence = finiteFence(q3, spread, 1);
+  const position = method === 'inclusive'
+    ? (p: number) => (n - 1) * p + 1
+    : (p: number) => (n + 1) * p;
+  const q1 = quantileAt(sorted, position(0.25));
+  const q3 = quantileAt(sorted, position(0.75));
+  const lowerFence = tukeyFence(q1, q3);
+  const upperFence = tukeyFence(q3, q1);
   const inner: number[] = [];
   const outliers: number[] = [];
   for (const value of sorted) {
@@ -107,15 +145,14 @@ export const BOX_WHISKER_DOT_SPACING_PT = 3;
  * Neither ECMA-376 nor [MS-ODRAWXML] defines which observations
  * CT_SeriesElementVisibilities@nonoutliers/@outliers paint. This is observed
  * PowerPoint 16.113 behavior (vector PDF, electronic-distribution engine) on
- * synthetic three-series controls: 171 series/category groups and 869 dots,
- * every dot count and position (within 1pt) reproduced when the inner/outlier
- * split uses PowerPoint's own quartiles. computeBoxWhiskerStats' quartiles
- * still differ from PowerPoint for some sample sizes, and there the split,
- * and so the dots, differ too (2 of the measured groups).
+ * synthetic three-series controls: 225 series/category groups and 995 dots
+ * under both quartile methods, every dot count and position (within 1pt)
+ * reproduced with the quartiles of computeBoxWhiskerStats.
  *
  * - One instance of the lowest and of the highest non-outlier value is the
- *   whisker end and gets no dot. Further copies of an end value, and values
- *   near it, remain candidates; the omitted end blocks nothing.
+ *   whisker end and gets no dot, even when it lies inside the box and so has
+ *   no whisker cap either. Further copies of an end value, and values near
+ *   it, remain candidates; the omitted end blocks nothing.
  * - Shown non-outliers and outliers form one ascending pass. A candidate is
  *   painted only when it lies at least 3pt from the last dot painted, so
  *   duplicates and near-coincident values collapse onto the lower dot. The

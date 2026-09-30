@@ -1136,6 +1136,7 @@ pub(crate) fn parse_shape(
         inherited_reflection,
         inherited_alignment,
         inherited_ea_ln_brk,
+        inherited_font_algn,
         inherited_spacing,
     ) = if placeholder_inherits {
         (
@@ -1145,10 +1146,11 @@ pub(crate) fn parse_shape(
             lph.lookup_reflection(&ph_type, ph_idx),
             lph.lookup_alignment(&ph_type, ph_idx),
             lph.lookup_ea_ln_brk(&ph_type, ph_idx),
+            lph.lookup_font_algn(&ph_type, ph_idx),
             lph.lookup_spacing(&ph_type, ph_idx),
         )
     } else {
-        (None, None, None, None, None, None, Default::default())
+        (None, None, None, None, None, None, None, Default::default())
     };
     // Shape-level bodyPr values are not list-style properties; a placeholder
     // keeps them even when its layout slot has no txBody.
@@ -1270,6 +1272,7 @@ pub(crate) fn parse_shape(
             inherited_body_pr,
             inherited_alignment,
             inherited_ea_ln_brk,
+            inherited_font_algn,
             inherited_spacing,
             // A placeholder paragraph that no list style indents starts at the
             // inset (#1630: title levels 2-5); ordinary text takes its
@@ -2406,6 +2409,7 @@ pub(crate) fn parse_table_cell(
             text_insets,
             None,                                  // inherited_alignment
             None,                                  // inherited_ea_ln_brk
+            None,                                  // inherited_font_algn
             Default::default(),                    // inherited_spacing
             crate::text::DEFAULT_TEXT_STYLE_MAR_L, // implicit_mar_l
             zip,

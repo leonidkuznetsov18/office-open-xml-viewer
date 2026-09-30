@@ -161,6 +161,7 @@ import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js'
 import {
   powerPointCompatOffNaturalLine, powerPointExactLinePoints, powerPointFaceMetrics,
   powerPointNaturalLine, type PowerPointFaceMetrics,
+  POWERPOINT_FONT_ALGN_UNIT_PT, powerPointFontAlgnOffset, powerPointFontAlgnReference,
 } from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
 import {
@@ -719,6 +720,12 @@ type LayoutSegment = {
    * latin face even when an East Asian segment draws none of its glyphs
    * (#1610 powerpoint-line-supplement-3); null when unresolved. */
   lineMetricLatin?: PowerPointFaceMetrics | null;
+  /** The face of an a:br or endParaRPr mark (text ''), kept so the mark can be
+   * re-sized to the run it follows (see `layoutParagraph`). */
+  markFace?: { family: string; bold: boolean; italic: boolean };
+  /** Baseline displacement of this segment under pPr@fontAlgn t / ctr / b,
+   * relative to the line's `metricAscent` (powerPointFontAlgnOffset). */
+  fontAlgnOffsetPx?: number;
   /** Reading-frame gap resolved against a:tabLst immediately before paint. */
   tabWidthPx?: number;
   sizePx: number;
@@ -1468,6 +1475,10 @@ export function layoutParagraph(
             font: buildFont(bold, italic, sizePx, family, rc, ''),
             underline: false, strikethrough: false,
             lineMetric: lineMetricFor(family, bold, italic, rc),
+            // Only a face the break authors itself is measured to size its line
+            // at the preceding run's size (#1636); an inherited face keeps the
+            // break's own size.
+            ...(run.fontFamily != null ? { markFace: { family, bold, italic } } : {}),
           }
         : undefined;
       input.push({ type: 'break', style });
@@ -1626,18 +1637,35 @@ export function layoutParagraph(
         font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
         underline: false, strikethrough: false,
         lineMetric: lineMetricFor(endFamily, endBold, endItalic, rc),
+        ...(para.endFaceAuthored ? { markFace: { family: endFamily, bold: endBold, italic: endItalic } } : {}),
       }
     : undefined;
-  return broken.map((line, lineIndex) => ({
-    // Office L07/L08: an empty line opened by a line feed inside a run keeps
-    // that run's size; a zero-width segment carries it to the line metrics.
-    segments: [
+  // A line-break or end-of-paragraph mark after text that authors its own face
+  // sizes its line with that face at the size of the run it follows, not at
+  // its own size (#1636 PowerPoint controls: a:br and endParaRPr at 16 / 40 /
+  // 80 pt after 24 pt and 60 pt runs, in the same or another face, both line
+  // models). A mark alone on its line keeps its own size (the empty-line rules
+  // above); a mark with an inherited face keeps the earlier behaviour.
+  const followingMark = (mark: LayoutSegment, lineSegments: readonly LayoutSegment[]): LayoutSegment => {
+    const previous = lineSegments[lineSegments.length - 1];
+    if (!previous || !mark.markFace || previous.sizePx === mark.sizePx) return { ...mark, text: '' };
+    const { family, bold, italic } = mark.markFace;
+    return {
+      ...mark, text: '', sizePx: previous.sizePx,
+      font: buildFont(bold, italic, previous.sizePx, family, rc, ''),
+    };
+  };
+  return broken.map((line, lineIndex): LayoutLine => {
+    const isLastLine = lineIndex === broken.length - 1;
+    const content: LayoutSegment[] = [
       // endParaRPr formats only the empty insertion line after the final
       // character/break (§21.1.2.2.2); it never replaces existing run paint.
-      ...(lineIndex === broken.length - 1 && line.segments.length === 0 && endStyle
+      ...(isLastLine && line.segments.length === 0 && endStyle
         ? [endStyle] : []),
+      // Office L07/L08: an empty line opened by a line feed inside a run keeps
+      // that run's size; a zero-width segment carries it to the line metrics.
       ...(line.segments.length === 0 && line.lineFeedRun !== undefined
-      && !(lineIndex === broken.length - 1 && endStyle)
+      && !(isLastLine && endStyle)
       && input[line.lineFeedRun]?.type === 'text'
       ? [{ ...(input[line.lineFeedRun] as { style: LayoutSegment }).style, text: '' }]
       : line.segments.map((part, index): LayoutSegment => {
@@ -1651,13 +1679,20 @@ export function layoutParagraph(
       if (part.type === 'tab') return { ...part.style, text: '', isTab: true, tabWidthPx: part.width };
       return { ...part.style, text: '' };
     })),
-      ...(line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
-        && (input[line.endBreakRun] as { style?: LayoutSegment }).style
-        ? [{ ...(input[line.endBreakRun] as { style: LayoutSegment }).style, text: '' }]
-        : []),
-    ],
-    ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
-  }));
+    ];
+    const breakStyle = line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
+      ? (input[line.endBreakRun] as { style?: LayoutSegment }).style
+      : undefined;
+    const hasText = line.segments.length > 0;
+    return {
+      segments: [
+        ...content,
+        ...(breakStyle ? [hasText ? followingMark(breakStyle, content) : { ...breakStyle, text: '' }] : []),
+        ...(isLastLine && hasText && endStyle?.markFace ? [followingMark(endStyle, content)] : []),
+      ],
+      ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
+    };
+  });
 }
 
 // ===== Element renderers =====
@@ -4549,12 +4584,34 @@ export function renderTextBody(
         && (metricRuns.length === 0 || metricRuns.some((r) => r.face.excel === undefined))) {
         metricOk = false;
       }
+      // pPr@fontAlgn t / ctr / b (powerPointFontAlgnReference): the line box
+      // is split at its alignment reference and each glyph run is offset from
+      // it. A line without runs has nothing to align and keeps the baseline
+      // rule.
+      const fontAlgn = para.fontAlgn;
+      let alignedLine: { ascent: number; descent: number } | undefined;
+      if (metric && metricOk && fontAlgn && metricRuns.length > 0) {
+        const unitPx = POWERPOINT_FONT_ALGN_UNIT_PT * PT_TO_EMU * scale;
+        alignedLine = powerPointFontAlgnReference(fontAlgn, metricRuns, compatOff, unitPx);
+        if (!alignedLine) metricOk = false;
+        for (const seg of line.segments) {
+          if (!alignedLine) break;
+          if (seg.isTab || !seg.text) continue;
+          const offset = seg.lineMetric
+            && powerPointFontAlgnOffset(fontAlgn, { sizePx: seg.sizePx, face: seg.lineMetric }, compatOff, unitPx);
+          if (offset === undefined) {
+            metricOk = false;
+            break;
+          }
+          seg.fontAlgnOffsetPx = offset;
+        }
+      }
       if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
-        const natural = compatOff
+        const natural = alignedLine ?? (compatOff
           ? powerPointCompatOffNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, box: r.face.excel! })))
           : metricRuns.length > 0
             ? powerPointNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, share: r.face.share })))
-            : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 };
+            : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 });
         if (compatOff) pctSpacingUnit = natural.ascent + natural.descent;
         const spacing = para.spaceLine?.type === 'pts'
           ? { type: 'pts' as const, val: powerPointExactLinePoints(para.spaceLine.val) }
@@ -4903,9 +4960,14 @@ export function renderTextBody(
             resolvedFontAscent + Math.max(0, lineHeight - resolvedFontHeight) / 2,
           )
       : Math.max(lineHeight * 0.8, maxAscent);
-    const baseline = metricAscent !== undefined
+    // Under pPr@fontAlgn t / ctr / b, metricAscent is the line's alignment
+    // reference and each run sits at its own offset from it. A list marker
+    // follows the line's first run.
+    const referenceY = metricAscent !== undefined
       ? cursorY + metricAscent
       : cursorY + baselineOffset;
+    const baseline = referenceY
+      + (line.segments.find((seg) => !seg.isTab && !seg.math && !!seg.text)?.fontAlgnOffsetPx ?? 0);
 
     // Reading-frame marker placement under an RTL base (issue #930, same class as
     // the docx #830 / pptx #913 leading-edge mirroring). PowerPoint seats a list
@@ -5100,7 +5162,7 @@ export function renderTextBody(
       const drawSizePx = seg.drawSizePx ?? seg.sizePx;
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
-      const segBaseline = baseline + baselineShift;
+      const segBaseline = referenceY + (seg.fontAlgnOffsetPx ?? 0) + baselineShift;
       const glyphPaint = resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
       ctx.fillStyle = glyphPaint;
       const ls = seg.letterSpacingPx ?? 0;

@@ -1405,6 +1405,8 @@ export interface OpenedModelSource<TArchive> {
 export function openExternalHyperlink(url: string, allowed?: readonly string[], win?: Pick<Window, 'open'> | undefined): boolean;
 export interface Paragraph extends Paragraph__emitterCollision1 {
     eaLnBrk: boolean;
+    fontAlgn?: 't' | 'ctr' | 'b';
+    endFaceAuthored?: boolean;
     defTabSz?: number;
 }
 interface Paragraph__emitterCollision1 {

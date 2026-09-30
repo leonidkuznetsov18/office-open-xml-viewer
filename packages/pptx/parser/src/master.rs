@@ -141,6 +141,13 @@ pub(crate) struct LayoutPlaceholders {
     /// Default East Asian line-break (eaLnBrk) per placeholder type, from the
     /// layout lstStyle > lvl1pPr @eaLnBrk (ECMA-376 §21.1.2.2.7)
     pub(crate) by_type_ea_ln_brk: HashMap<String, bool>,
+    /// Default font alignment per placeholder type, from the layout lstStyle >
+    /// lvl1pPr @fontAlgn (ECMA-376 §21.1.2.2.7). Same tiers as eaLnBrk; the
+    /// master tier lives in `styles` (`MasterStyleTier::placeholder_font_algn`).
+    pub(crate) by_type_font_algn: HashMap<String, String>,
+    /// fontAlgn per bound layout slot (idx): the slot's own lvl1pPr value,
+    /// else the master value for its type, mirroring `by_idx_alignment`.
+    pub(crate) by_idx_font_algn: HashMap<u32, String>,
     /// Per-level paragraph spacing (spcBef / spcAft / lnSpc) per placeholder
     /// idx, from the matching layout placeholder's lstStyle. The idx tier
     /// prevents one of several same-type layout slots from leaking paragraph
@@ -774,6 +781,41 @@ impl LayoutPlaceholders {
             })
     }
 
+    // ECMA-376 §21.1.2.2.7 fontAlgn inheritance, mirroring lookup_ea_ln_brk.
+    // A placeholder bound to a layout slot by idx reads exactly that slot,
+    // then the master placeholder of the slot's class, then txStyles; it never
+    // reads a same-type sibling slot. An idx without a layout slot reads the
+    // class list style only. Only an idx-less placeholder uses the type maps.
+    pub(crate) fn lookup_font_algn(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<String> {
+        if let Some(i) = ph_idx {
+            return match self.by_idx_placeholder_type.get(&i) {
+                None => MasterStyleTier::get(&self.styles.font_algn, ph_type).cloned(),
+                Some(slot_type) => self.by_idx_font_algn.get(&i).cloned().or_else(|| {
+                    MasterStyleTier::get(&self.styles.placeholder_font_algn, slot_type).cloned()
+                }),
+            };
+        }
+        let master = &self.styles.placeholder_font_algn;
+        self.by_type_font_algn
+            .get(ph_type)
+            .cloned()
+            .or_else(|| {
+                if ph_type == "body" {
+                    self.by_type_font_algn.get("").cloned()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| master.get(ph_type).cloned())
+            .or_else(|| {
+                if ph_type == "body" {
+                    master.get("").cloned()
+                } else {
+                    None
+                }
+            })
+    }
+
     /// Per-level paragraph spacing for this placeholder: the layout slot (by
     /// idx when the placeholder has one, else by type), then the master, per
     /// level and property. An idx with no layout slot takes the txStyles-only
@@ -1280,6 +1322,35 @@ pub(crate) fn parse_master_ea_ln_brk_tier(
     map
 }
 
+/// Master default font alignment per placeholder type from each placeholder
+/// shape's lstStyle > lvl1pPr @fontAlgn, then the class list styles
+/// (ECMA-376 §21.1.2.2.7). Mirrors `parse_master_ea_ln_brk_tier`; the raw
+/// token is kept so an explicit `base` still overrides a later tier.
+pub(crate) fn parse_master_font_algn_tier(
+    root: roxmltree::Node<'_, '_>,
+    with_placeholders: bool,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
+        if let Some(v) = child(sp, "txBody")
+            .and_then(|tb| child(tb, "lstStyle"))
+            .and_then(|ls| child(ls, "lvl1pPr"))
+            .and_then(|lp| attr(&lp, "fontAlgn"))
+        {
+            map.entry(ph_type).or_insert(v.to_string());
+        }
+    }
+    inherit_master_placeholder_classes(&mut map);
+    for (style, types) in tx_style_nodes(root) {
+        if let Some(v) = child(style, "lvl1pPr").and_then(|lp| attr(&lp, "fontAlgn")) {
+            for t in types {
+                map.entry((*t).to_string()).or_insert_with(|| v.to_string());
+            }
+        }
+    }
+    map
+}
+
 /// Per-list-level Latin faces from the master, keyed by placeholder type: the
 /// master placeholder lstStyle wins per level over the class list style
 /// (ECMA-376 §19.3.1.52, §21.1.2.3.7). Tokens resolve against this master's
@@ -1754,6 +1825,11 @@ pub(crate) struct MasterStyleTier {
     pub(crate) bullets: HashMap<String, LevelBullets>,
     pub(crate) alignment: HashMap<String, String>,
     pub(crate) ea_ln_brk: HashMap<String, bool>,
+    /// Class-tier fontAlgn (txStyles only), like `ea_ln_brk`.
+    pub(crate) font_algn: HashMap<String, String>,
+    /// fontAlgn from the master placeholders' lstStyle, then txStyles: the
+    /// master fallback for a layout placeholder (like `master_ea_ln_brk`).
+    pub(crate) placeholder_font_algn: HashMap<String, String>,
     pub(crate) spacing: HashMap<String, LevelSpacing>,
     pub(crate) color: HashMap<String, String>,
     pub(crate) bold: HashMap<String, bool>,
@@ -1789,6 +1865,8 @@ impl MasterStyleTier {
             ),
             alignment: parse_master_alignments_tier(root, false),
             ea_ln_brk: parse_master_ea_ln_brk_tier(root, false),
+            font_algn: parse_master_font_algn_tier(root, false),
+            placeholder_font_algn: parse_master_font_algn_tier(root, true),
             spacing: parse_master_txstyle_spacing_tier(root, false),
             color: parse_master_txstyle_color_tier(root, theme, false),
             bold,
@@ -2008,6 +2086,9 @@ pub(crate) fn parse_layout_placeholders(
         let layout_ea_ln_brk: Option<bool> = layout_lvl1_ppr
             .and_then(|lp| attr(&lp, "eaLnBrk"))
             .map(|v| v == "1" || v == "true");
+        let layout_font_algn: Option<String> = layout_lvl1_ppr
+            .and_then(|lp| attr(&lp, "fontAlgn"))
+            .map(|v| v.to_string());
         let layout_spacing = child(sp, "txBody")
             .and_then(|tb| child(tb, "lstStyle"))
             .map(LevelSpacing::read)
@@ -2198,6 +2279,12 @@ pub(crate) fn parse_layout_placeholders(
                 if let Some(a) = idx_algn {
                     lph.by_idx_alignment.entry(idx).or_insert(a);
                 }
+                let idx_font_algn = layout_font_algn.clone().or_else(|| {
+                    MasterStyleTier::get(&master_styles.placeholder_font_algn, &ph_type).cloned()
+                });
+                if let Some(f) = idx_font_algn {
+                    lph.by_idx_font_algn.entry(idx).or_insert(f);
+                }
                 // ECMA-376 §19.3.1.36: idx binds the slide placeholder to this
                 // exact layout slot. Preserve its vertical anchor independently
                 // from same-type siblings; fall back to the master for this type.
@@ -2291,6 +2378,9 @@ pub(crate) fn parse_layout_placeholders(
             }
             if let Some(e) = layout_ea_ln_brk {
                 lph.by_type_ea_ln_brk.entry(ph_type.clone()).or_insert(e);
+            }
+            if let Some(f) = layout_font_algn.clone() {
+                lph.by_type_font_algn.entry(ph_type.clone()).or_insert(f);
             }
             if let Some(v) = layout_spacing {
                 // Per level and property, the first same-type slot that sets it.
@@ -4149,6 +4239,170 @@ mod placeholder_geometry_tests {
     /// under it the value can only come from the layout (idx 13, G3) or the
     /// slide (G2), otherwise it stays unset (G1). A non-placeholder text box
     /// never takes it from the master or layout.
+    /// Review probe (#1636): a bound slot whose own chain has no fontAlgn must
+    /// not read a same-type sibling slot's value.
+    #[test]
+    fn bound_slot_font_algn_ignores_sibling_slots() {
+        let layout = r#"<p:sldLayout
+              xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:cSld><p:spTree>
+                <p:sp><p:nvSpPr><p:cNvPr id="2" name="a"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="3" name="b"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="3"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="t"/></a:lstStyle><a:p/></p:txBody></p:sp>
+              </p:spTree></p:cSld></p:sldLayout>"#;
+        let layout_doc = roxmltree::Document::parse(layout).unwrap();
+        let mut zip = empty_zip();
+        let placeholders = parse_layout_placeholders(
+            layout_doc.root_element(),
+            &HashMap::new(),
+            &DefaultTextLevels::default(),
+            &MasterStyleTier::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &MasterLevelRunProperties::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slideLayouts",
+            &HashMap::new(),
+            &mut zip,
+        );
+        assert_eq!(placeholders.lookup_font_algn("body", Some(1)), None);
+        assert_eq!(
+            placeholders.lookup_font_algn("body", Some(3)),
+            Some("t".to_owned())
+        );
+        assert_eq!(placeholders.lookup_font_algn("body", Some(7)), None);
+    }
+
+    /// ECMA-376 §21.1.2.2.7 pPr@fontAlgn follows the eaLnBrk tiers: the
+    /// paragraph, the body lstStyle, the layout placeholder, the master
+    /// placeholder and then the master txStyles. Only t / ctr / b survive:
+    /// PowerPoint lays out omitted, auto and base identically (#1619), and an
+    /// explicit base on a nearer tier still overrides an inherited t.
+    #[test]
+    fn font_algn_cascades_through_layout_and_master() {
+        let master = r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:cSld><p:spTree>
+                <p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="b"/></a:lstStyle><a:p/></p:txBody></p:sp>
+              </p:spTree></p:cSld>
+              <p:txStyles><p:titleStyle><a:lvl1pPr fontAlgn="t"/></p:titleStyle>
+                <p:bodyStyle><a:lvl1pPr fontAlgn="ctr"/></p:bodyStyle><p:otherStyle><a:lvl1pPr/></p:otherStyle></p:txStyles>
+            </p:sldMaster>"#;
+        let master_doc = roxmltree::Document::parse(master).unwrap();
+        let styles = MasterStyleTier {
+            font_algn: parse_master_font_algn_tier(master_doc.root_element(), false),
+            placeholder_font_algn: parse_master_font_algn_tier(master_doc.root_element(), true),
+            ..Default::default()
+        };
+        let layout = r#"<p:sldLayout
+              xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:cSld><p:spTree>
+                <p:sp><p:nvSpPr><p:cNvPr id="2" name="t"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="3" name="b"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="4" name="c"/><p:cNvSpPr/><p:nvPr><p:ph type="pic" idx="2"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="base"/></a:lstStyle><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="5" name="d"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="3"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="t"/></a:lstStyle><a:p/></p:txBody></p:sp>
+                <p:sp><p:nvSpPr><p:cNvPr id="6" name="e"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="4"/></p:nvPr></p:nvSpPr>
+                  <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr fontAlgn="b"/></a:lstStyle><a:p/></p:txBody></p:sp>
+              </p:spTree></p:cSld></p:sldLayout>"#;
+        let layout_doc = roxmltree::Document::parse(layout).unwrap();
+        let mut zip = empty_zip();
+        let placeholders = parse_layout_placeholders(
+            layout_doc.root_element(),
+            &HashMap::new(),
+            &DefaultTextLevels::default(),
+            &styles,
+            &HashMap::new(),
+            &HashMap::new(),
+            &MasterLevelRunProperties::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "ppt/slideLayouts",
+            &HashMap::new(),
+            &mut zip,
+        );
+        let effective = |nv_pr: &str, lst: &str, p_pr: &str| {
+            parse_slide_shape(
+                &format!(
+                    r#"<p:nvSpPr><p:cNvPr id="5" name="s"/><p:cNvSpPr/>{nv_pr}</p:nvSpPr>
+                    <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm></p:spPr>
+                    <p:txBody><a:bodyPr/><a:lstStyle>{lst}</a:lstStyle><a:p>{p_pr}<a:r><a:t>Hg</a:t></a:r></a:p></p:txBody>"#
+                ),
+                &placeholders,
+            )
+            .text_body
+            .expect("text body")
+            .paragraphs[0]
+                .font_algn
+                .clone()
+        };
+        let title = r#"<p:nvPr><p:ph type="title"/></p:nvPr>"#;
+        let body = r#"<p:nvPr><p:ph type="body" idx="1"/></p:nvPr>"#;
+        let pic = r#"<p:nvPr><p:ph type="pic" idx="2"/></p:nvPr>"#;
+        let some = |v: &str| Some(v.to_owned());
+        // The master title placeholder (b) wins over titleStyle (t).
+        assert_eq!(effective(title, "", ""), some("b"));
+        // bodyStyle reaches a body placeholder with no placeholder value.
+        assert_eq!(effective(body, "", ""), some("ctr"));
+        // A layout base overrides every master tier and is emitted as None.
+        assert_eq!(effective(pic, "", ""), None);
+        // The shape's own lstStyle and the paragraph win, in that order.
+        assert_eq!(
+            effective(body, r#"<a:lvl1pPr fontAlgn="t"/>"#, ""),
+            some("t")
+        );
+        assert_eq!(
+            effective(
+                body,
+                r#"<a:lvl1pPr fontAlgn="t"/>"#,
+                r#"<a:pPr fontAlgn="auto"/>"#
+            ),
+            None
+        );
+        assert_eq!(
+            effective(title, "", r#"<a:pPr fontAlgn="ctr"/>"#),
+            some("ctr")
+        );
+        // An unknown token is ignored like an omitted one.
+        assert_eq!(
+            effective(body, "", r#"<a:pPr fontAlgn="middle"/>"#),
+            some("ctr")
+        );
+        // Same-type body slots keep their own values (idx binding), and an
+        // idx with no layout slot reads the class tier (bodyStyle).
+        let slot = |idx: u32| format!(r#"<p:nvPr><p:ph type="body" idx="{idx}"/></p:nvPr>"#);
+        assert_eq!(effective(&slot(3), "", ""), some("t"));
+        assert_eq!(effective(&slot(4), "", ""), some("b"));
+        assert_eq!(effective(&slot(9), "", ""), some("ctr"));
+        // Probe: the untouched idx 1 slot keeps the master body value even
+        // though its siblings (idx 3, 4) author fontAlgn.
+        assert_eq!(effective(&slot(1), "", ""), some("ctr"));
+        // An ordinary text box takes no placeholder tier.
+        assert_eq!(effective("<p:nvPr/>", "", ""), None);
+    }
+
     #[test]
     fn compat_ln_spc_cascades_through_layout_and_master() {
         let placeholders = |master_attr: &str| {
