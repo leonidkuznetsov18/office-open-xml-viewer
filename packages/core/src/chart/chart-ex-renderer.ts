@@ -53,7 +53,7 @@ import {
 } from './chart-ex-hierarchy-labels.js';
 import { chartImageFillPaintWorkUpperBound, type ChartImageLookup } from './image-fill.js';
 import { chartLabelBoxHasVisiblePaint, effectiveChartLabelBoxFill } from './label-box.js';
-import { rawLinkedChartStyleRole } from './effective-style.js';
+import { chartExDelegateModel, rawLinkedChartStyleRole } from './effective-style.js';
 import {
   chartStyleDirectLineDecision,
   chartStyleDirectNoLineDecision,
@@ -425,13 +425,12 @@ function renderHistogramChart(
     rejectOversizedCanvasChart(ctx, rect, MAX_CANVAS_CHART_POINTS + 1);
     return;
   }
-  renderBarChart(ctx, {
-    ...chart,
+  renderBarChart(ctx, chartExDelegateModel(chart, {
     chartType: 'clusteredBar',
     categories: plan.categories,
     // Counts never inherit the value dimension's bin-edge format.
     series: [{ ...source, categories: undefined, values: plan.counts, valFormatCode: null }],
-  }, rect, ptToPx, { gapPolicy: 'chartex' }, shapeRotationDeg);
+  }), rect, ptToPx, { gapPolicy: 'chartex' }, shapeRotationDeg);
 }
 
 function renderWaterfallChart(
@@ -542,8 +541,7 @@ function renderWaterfallChart(
   const legendPaintPos = chartExDataPointPaint(chart, 0, 3, localStyle, series?.color);
   const legendPaintNeg = chartExDataPointPaint(chart, 1, 3, localStyle);
   const legendPaintSub = chartExDataPointPaint(chart, 2, 3, localStyle);
-  const legendChart: ChartModel = {
-    ...chart,
+  const legendChart: ChartModel = chartExDelegateModel(chart, {
     chartType: 'clusteredBar',
     series: [
       chartExLegendSeries(
@@ -559,7 +557,7 @@ function renderWaterfallChart(
         false, true, true,
       ),
     ],
-  };
+  });
   const leg = measuredLegendReserve(ctx, legendChart, w, h, 0.22, ptToPx);
   const { legRightW, legLeftW, legTopH, legBottomH } = chartLegendBands(
     leg, chart.legendOverlay === true,
@@ -1065,8 +1063,7 @@ function renderParetoLineChart(
     `#${chartExDataPointFill(chart, styleIndex, 1, source.chartexStyle)}`,
     { linkedNoStyleFallback: true },
   );
-  renderLineChart(ctx, {
-    ...chart,
+  renderLineChart(ctx, chartExDelegateModel(chart, {
     chartType: 'line',
     categories: chart.chartexParetoFlatEndpoint
       ? [...layout.categories, ''] : layout.categories,
@@ -1105,7 +1102,7 @@ function renderParetoLineChart(
     valMin: chart.valMin ?? 0,
     valMax: chart.valMax ?? (chart.valAxisFormatCode === '0%' ? 1 : 1.2),
     valAxisMajorUnit: chart.valAxisMajorUnit ?? (chart.valAxisFormatCode === '0%' ? 0.1 : 0.2),
-  }, r, ptToPx, shapeRotationDeg);
+  }), r, ptToPx, shapeRotationDeg);
 }
 
 function chartExPercentageAxis(chart: ChartModel): SecondaryValueAxis {
@@ -1179,8 +1176,7 @@ function renderParetoChart(
   };
   const secondaryAxis = chartExPercentageAxis(chart);
 
-  renderBarChart(ctx, {
-    ...chart,
+  renderBarChart(ctx, chartExDelegateModel(chart, {
     chartType: 'clusteredBar',
     categories: appendFlatEndpoint
       ? [...firstLayout.categories, ''] : firstLayout.categories,
@@ -1196,7 +1192,7 @@ function renderParetoChart(
         : cumulativeLine,
     ],
     secondaryValAxis: secondaryAxis,
-  }, r, ptToPx, {
+  }), r, ptToPx, {
     gapPolicy: 'chartex',
     semanticLineNoStyleFallback: true,
   }, shapeRotationDeg);
@@ -1895,8 +1891,7 @@ function renderSunburstChart(
   const legendPaints = root.children.map((_, index) =>
     chartExDataPointPaint(chart, index, root.children.length, series?.chartexStyle, series?.color)
   );
-  const legendChart: ChartModel = {
-    ...chart,
+  const legendChart: ChartModel = chartExDelegateModel(chart, {
     chartType: 'clusteredBar',
     series: root.children.map(node => {
       const fill = chartExDataPointFill(
@@ -1914,7 +1909,7 @@ function renderSunburstChart(
         false,
       );
     }),
-  };
+  });
   // Reuse the radial frame so an authored top legend reserves space above the
   // rings instead of being painted over the circle.
   const leg = measuredLegendReserve(ctx, legendChart, w, h, 0.22, ptToPx);
@@ -2229,8 +2224,7 @@ function renderTreemapChart(
       chart, node.branchIndex, root.children.length, series?.chartexStyle, series?.color,
     )
   );
-  const legendChart: ChartModel = {
-    ...chart,
+  const legendChart: ChartModel = chartExDelegateModel(chart, {
     chartType: 'clusteredBar',
     series: root.children.map(node => {
       const fill = chartExDataPointFill(
@@ -2246,7 +2240,7 @@ function renderTreemapChart(
         fill,
       );
     }),
-  };
+  });
   const leg = measuredLegendReserve(ctx, legendChart, r.w, r.h, 0.22, ptToPx);
   const frame = computeChartFrame(chart, r.x, r.y, r.w, r.h, ptToPx, {
     titleTopPadFrac: 0.035,
@@ -2523,11 +2517,11 @@ export function renderChartExChart(
         : [];
       renderBarChart(
         ctx,
-        { ...chart, chartType: 'clusteredBar',
+        chartExDelegateModel(chart, { chartType: 'clusteredBar',
           categories: ordered[0]?.categories ?? chart.categories,
           series: [...ordered, ...axisOnlyLine],
           secondaryValAxis: axisOnlyLine.length > 0
-            ? chartExPercentageAxis(chart) : chart.secondaryValAxis },
+            ? chartExPercentageAxis(chart) : chart.secondaryValAxis }),
         rect,
         ptToPx,
         { gapPolicy: 'chartex' },

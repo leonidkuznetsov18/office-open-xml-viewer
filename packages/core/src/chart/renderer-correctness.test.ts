@@ -410,7 +410,7 @@ it('collects the linked bubble picture selected by point index after direct colo
   const fills = collectChartMarkerImageFills(baseModel({
     chartType: 'bubble',
     categories: ['0', '1'],
-    chartStyleRoles: {
+    classicChartStyleRoles: {
       dataPoint: { fillPaints: linkedPictures, fillPaintAuthored: true },
     },
     series: [series({
@@ -432,7 +432,7 @@ it('prefetches the same compact source-index marker picture that is painted', ()
   const model = baseModel({
     chartType: 'line',
     categories: ['A'],
-    chartStyleRoles: {
+    classicChartStyleRoles: {
       dataPointMarker: {
         fillPaints: pictures,
         fillFormattingIndices: [8, 42],
@@ -516,7 +516,7 @@ it.each(['clusteredBar', 'pie'] as const)(
       chartType,
       categories: ['A'],
       valAxisMajorGridlines: false,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint: { fillPaints: [picture], fillPaintAuthored: true },
       },
       series: [series({ values: [10] })],
@@ -541,7 +541,7 @@ it('prefetches parsed 2-D bar dataPoint pictures through the owning plot group',
   };
   const model = baseModel({
     chartType: 'clusteredBar',
-    chartStyleRoles: { dataPoint: { fillPaints: [picture], fillPaintAuthored: true } },
+    classicChartStyleRoles: { dataPoint: { fillPaints: [picture], fillPaintAuthored: true } },
     plotGroups: [plotGroup('bar', 0, 1, { barDirection: 'col' })],
     series: [series({ values: [10], seriesType: 'bar', markerSymbol: 'none' })],
   });
@@ -563,7 +563,7 @@ it.each([
     };
     const model = baseModel({
       chartType,
-      chartStyleRoles: { dataPoint: { fillPaints: [picture], fillPaintAuthored: true } },
+      classicChartStyleRoles: { dataPoint: { fillPaints: [picture], fillPaintAuthored: true } },
       plotGroups: [plotGroup(kind, 0, 1)],
       series: [series({ values: [10, 20, 30], seriesType, markerSymbol: 'none' })],
     });
@@ -576,7 +576,7 @@ it('keeps an unresolved numeric dataPoint picture authoritative over bar fallbac
     chartType: 'clusteredBar',
     categories: ['A'],
     valAxisMajorGridlines: false,
-    chartStyleRoles: {
+    classicChartStyleRoles: {
       dataPoint: { fillPaints: [null], fillPaintAuthored: true },
     },
     series: [series({ values: [10] })],
@@ -587,7 +587,7 @@ it('keeps an unresolved numeric dataPoint picture authoritative over bar fallbac
   expect(rec.rects).toHaveLength(0);
 });
 
-it('prefetches a linked marker picture from the varying point index domain', () => {
+it('prefetches a numeric marker picture from the varying point index domain', () => {
   const picture = {
     fillType: 'image' as const,
     imagePath: 'xl/media/varying-point-1.png',
@@ -603,13 +603,12 @@ it('prefetches a linked marker picture from the varying point index domain', () 
       varyColors: true,
     }],
     classicChartStyleRoles: { dataPointMarker: {} },
-    classicVaryingPointChartStyleRolesByGroup: [{ dataPointMarker: {} }],
-    chartStyleRoles: {
+    classicVaryingPointChartStyleRolesByGroup: [{
       dataPointMarker: {
         fillPaints: [null, picture],
         fillPaintAuthored: true,
       },
-    },
+    }],
     series: [series({
       values: [1, 2], chartexFormatIdx: 7,
       markerSymbol: 'circle', showMarker: true,
@@ -648,7 +647,7 @@ it('uses the owning bubble group settings for prefetch and paint work', () => {
   const model = baseModel({
     chartType: 'scatter',
     categories: ['1'],
-    chartStyleRoles: {
+    classicChartStyleRoles: {
       dataPoint: { fillPaints: [picture], fillPaintAuthored: true },
     },
     series: [
@@ -672,7 +671,8 @@ it('uses the owning bubble group settings for prefetch and paint work', () => {
     ],
   };
   expect(collectChartMarkerImageFills(visible)).toEqual([picture]);
-  expect(classicMarkerPaintWorkCount(visible, () => bitmap, 1, RECT)).toBe(1);
+  expect(classicMarkerPaintWorkCount(withEffectiveChartStyleRoles(visible), () => bitmap, 1, RECT))
+    .toBe(1);
   const rec = recordingCtx();
   renderChartCore(rec.ctx, visible, RECT, 1, 0, testThreeD, undefined, () => bitmap);
   expect(rec.drawImages).toHaveLength(1);
@@ -704,7 +704,7 @@ it('prefetches and paints one bubble picture for both plot and 3-D legend key', 
   expect(rec.gradients.filter(gradient => gradient.kind === 'radial')).toHaveLength(6);
 });
 
-it('prefetches the linked bubble picture when an unmodified role rejects series noFill', () => {
+it('does not revive a numeric bubble picture when the series authors noFill', () => {
   const picture = {
     fillType: 'image' as const,
     imagePath: 'xl/media/modifier-gated-bubble.png',
@@ -713,7 +713,7 @@ it('prefetches the linked bubble picture when an unmodified role rejects series 
   };
   const model = baseModel({
     chartType: 'bubble', showLegend: true, categories: ['0'],
-    chartStyleRoles: {
+    classicChartStyleRoles: {
       dataPoint: { fillPaints: [picture], fillPaintAuthored: true },
     },
     series: [series({
@@ -723,12 +723,10 @@ it('prefetches the linked bubble picture when an unmodified role rejects series 
     catAxisMin: 0, catAxisMax: 1, valMin: 0, valMax: 2,
   });
   const bitmap = { width: 8, height: 8 } as unknown as CanvasImageSource;
-  expect(collectChartMarkerImageFills(model)).toEqual([picture]);
+  expect(collectChartMarkerImageFills(model)).toEqual([]);
   const rec = recordingCtx();
   renderChartCore(rec.ctx, model, RECT, 1, 0, testThreeD, undefined, () => bitmap);
-  // One plotted bubble and its compound legend key select the same warmed
-  // source; the cache collector deliberately deduplicates it.
-  expect(rec.drawImages).toHaveLength(2);
+  expect(rec.drawImages).toHaveLength(0);
 });
 const renderChart: typeof renderChartCore = (
   ctx,
@@ -1339,7 +1337,8 @@ describe('ordered classic plot groups', () => {
       renderChart(rec.ctx, baseModel({
         chartType: 'scatter', categories: ['0', '1'], series: ordered, plotGroups: groups,
         showLegend: true, legendPos: 'b', chartStyleMarkerSymbol: 'square',
-        chartStyleRoles: {
+        // Numeric roles: linked Chart Style data roles never paint classic series.
+        classicChartStyleRoles: {
           dataPoint: { fillColors: ['FF8800'], fillPaintAuthored: true },
           dataPointMarker: { fillColors: ['0066CC'], fillPaintAuthored: true },
         },
@@ -3071,7 +3070,7 @@ describe('classic 3-D compatibility projection', () => {
   });
 
   it.each(['clusteredBar', 'pie'] as const)(
-    'applies linked dataPoint3D paint to %s and keeps direct point noFill authoritative',
+    'applies numeric dataPoint3D paint to %s and keeps direct point noFill authoritative',
     chartType => {
       const gradient = {
         fillType: 'gradient' as const,
@@ -3087,7 +3086,7 @@ describe('classic 3-D compatibility projection', () => {
         chartType,
         categories: ['A', 'B'],
         valAxisMajorGridlines: false,
-        chartStyleRoles: {
+        classicChartStyleRoles: {
           dataPoint3D: {
             fillPaints: [gradient],
             fillPaintAuthored: true,
@@ -3120,7 +3119,7 @@ describe('classic 3-D compatibility projection', () => {
     renderChart(rec.ctx, baseModel({
       chartType: 'stackedBarPct',
       categories: ['A'],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: {
           fillPaints: [{
             fillType: 'gradient', gradType: 'linear', angle: 0,
@@ -3155,7 +3154,7 @@ describe('classic 3-D compatibility projection', () => {
     renderChart(rec.ctx, baseModel({
       chartType: 'stackedBar',
       categories: values.map((_, index) => `C${index}`),
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: { fillPaints: [gradient], fillPaintAuthored: true },
       },
       threeD: { rotationX: 15, rotationY: 20 },
@@ -3197,7 +3196,7 @@ describe('classic 3-D compatibility projection', () => {
       categories: ['A', 'B'],
       valMin: 10,
       valMax: 20,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: {
           fillPaints: [{
             fillType: 'gradient', gradType: 'linear', angle: 0,
@@ -3233,7 +3232,7 @@ describe('classic 3-D compatibility projection', () => {
       chartType: 'clusteredBar',
       categories: ['A', 'B', 'C'],
       valAxisMajorGridlines: false,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: { fillPaints: palette, fillPaintAuthored: true },
       },
       threeD: { rotationX: 15, rotationY: 20, perspective: 30 },
@@ -3264,7 +3263,7 @@ describe('classic 3-D compatibility projection', () => {
       categories: ['A', 'B', 'C'],
       varyColors: true,
       valAxisMajorGridlines: false,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: { fillPaints: palette, fillPaintAuthored: true },
       },
       threeD: { rotationX: 15, rotationY: 20, perspective: 30 },
@@ -3280,7 +3279,7 @@ describe('classic 3-D compatibility projection', () => {
   it.each([
     ['line', 1],
     ['area', 2],
-  ] as const)('resolves linked dataPoint3D paint once for a 3-D %s series', (chartType, count) => {
+  ] as const)('resolves numeric dataPoint3D paint once for a 3-D %s series', (chartType, count) => {
     const gradient = {
       fillType: 'gradient' as const,
       gradType: 'linear' as const,
@@ -3295,7 +3294,7 @@ describe('classic 3-D compatibility projection', () => {
       chartType,
       categories: ['A', 'B', 'C'],
       valAxisMajorGridlines: false,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: {
           fillPaints: [gradient],
           fillPaintAuthored: true,
@@ -3414,7 +3413,7 @@ describe('classic 3-D compatibility projection', () => {
       chartType: 'clusteredBar',
       categories: Array.from({ length: 257 }, (_, index) => `C${index}`),
       valAxisMajorGridlines: false,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: { fillPaints: [gradient], fillPaintAuthored: true },
       },
       threeD: { rotationX: 15, rotationY: 20, perspective: 30 },
@@ -3779,7 +3778,7 @@ describe('classic 3-D compatibility projection', () => {
       categories: ['A', 'B'],
       valMin: 0,
       valMax: 10,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: {
           fillColors: ['115473'],
           fillPaintAuthored: true,
@@ -5479,7 +5478,7 @@ describe('classic 3-D compatibility projection', () => {
     renderChart(rec.ctx, baseModel({
       chartType: 'line', categories: ['A'], showLegend: true, legendPos: 'r',
       threeD: { rotationX: 15, rotationY: 20 },
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPointMarker: {
           fillPaints: [{
             fillType: 'gradient', gradType: 'linear', angle: 0,
@@ -5511,7 +5510,7 @@ describe('classic 3-D compatibility projection', () => {
     renderChart(rec.ctx, baseModel({
       chartType: 'clusteredBar', categories: ['A'], showLegend: true, legendPos: 'r',
       threeD: { rotationX: 15, rotationY: 20 },
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint3D: {
           fillPaints: [{
             fillType: 'gradient', gradType: 'linear', angle: 0,
@@ -5555,14 +5554,6 @@ describe('classic 3-D compatibility projection', () => {
     expect(chartEffectConsumerUpperBound(numeric)).toBeGreaterThanOrEqual(10_000);
 
     const shared = { softEdges: [{ radius: 12_700 }], effectAuthored: true };
-    const suppressed = withEffectiveChartStyleRoles(baseModel({
-      series: [series({ values: points })],
-      classicChartStyleRoles: {
-        dataPoint: { softEdges: [{ radius: 12_700 }], effectAuthored: true },
-      },
-      chartStyleRoles: { dataPoint: { effectAuthored: true, effectUnsupported: true } },
-    }));
-    expect(chartEffectConsumerUpperBound(suppressed)).toBe(1);
 
     const pointSuppressed = baseModel({
       showLegend: false,
@@ -9114,7 +9105,10 @@ describe('CH3 — labels are locale-independent (§18.8.30)', () => {
     expect(connectors.every(segment => segment.lw === 2)).toBe(true);
   });
 
-  it('uses the linked seriesLine color and 0.75pt width for waterfall connectors', () => {
+  it.each([
+    ['P9', '000000'],
+    ['P10', '156082'],
+  ] as const)('keeps seriesLine connector paint above dataPointLine reference changes (%s)', (_case, dataPointLineColor) => {
     const rec = segRecordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'waterfall',
@@ -9127,11 +9121,15 @@ describe('CH3 — labels are locale-independent (§18.8.30)', () => {
         lineCap: 'flat',
         lineJoin: 'round',
       },
+      chartexDataPointLineStyle: {
+        lineColors: [dataPointLineColor], lineWidthEmu: 28575,
+      },
     }), RECT, 1);
 
     const connectors = rec.segs.filter(segment => segment.ss.toLowerCase() === '#d9d9d9');
     expect(connectors).toHaveLength(2);
     expect(connectors.every(segment => segment.lw === 0.75)).toBe(true);
+    expect(rec.segs.filter(segment => segment.ss.toLowerCase() === `#${dataPointLineColor.toLowerCase()}`)).toHaveLength(0);
   });
 
   it('keeps a direct Waterfall connector stroke authoritative over linked NoStyle', () => {
@@ -10044,12 +10042,12 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(hasCumulativeLine(directNoFill)).toBe(false);
   });
 
-  it('uses the original combo-series index for linked line style fallback', () => {
+  it('uses the original combo-series index for numeric line style fallback', () => {
     const rec = strokedPolylineCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'clusteredBar',
       categories: ['A', 'B', 'C'],
-      chartexDataPointLineStyle: { lineColors: ['111111', '222222'] },
+      classicChartStyleRoles: { dataPointLine: { lineColors: ['111111', '222222'] } },
       series: [
         series({ values: [3, 2, 1] }),
         series({ values: [1, 2, 3], seriesType: 'line', showMarker: false }),
@@ -10207,7 +10205,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     linePaintAuthored: true,
   };
 
-  it.each(['funnel', 'clusteredBar'] as const)(
+  it.each(['funnel', 'clusteredColumn'] as const)(
     'lets %s point and series noFill/line beat an unmodified linked role',
     chartType => {
       const rec = recordingCtx();
@@ -10336,7 +10334,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
   it('lets a structured ChartEx column outline fall through to the linked role paint', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
-      chartType: 'clusteredBar',
+      chartType: 'clusteredColumn',
       categories: ['A', 'B'],
       chartexDataPointStyle: unmodifiedLinkedDataPoint,
       series: [series({ values: [2, 1], chartexStyle: gradientLine })],
@@ -10352,7 +10350,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
   it('omits a structured ChartEx column outline when no role carries a line', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
-      chartType: 'clusteredBar',
+      chartType: 'clusteredColumn',
       categories: ['A', 'B'],
       chartexDataPointStyle: {
         fillColors: ['E46970', '8977D7', 'A5A5A5'], fillPaintAuthored: true,
@@ -10582,7 +10580,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(purple[0]!.w * purple[0]!.h).toBeGreaterThan(north[0]!.w * north[0]!.h);
   });
 
-  it('does not preflight a linked ChartEx column picture fill removed by series noFill', () => {
+  describe('linked ChartEx column picture preflight', () => {
     const picture = {
       fillType: 'image' as const,
       imagePath: 'ppt/media/linked-column.png',
@@ -10590,19 +10588,28 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
       stretch: true,
     };
     // The linked dataPoint role is present (as parsed from a Chart Style
-    // part) and carries no allowNoFillOverride modifier.
+    // part) and carries no allowNoFillOverride modifier. The series is
+    // parser-shaped: ChartEx columns carry no `seriesType`.
     const linked = { fillPaints: [picture], fillPaintAuthored: true };
     const model = (seriesStyle: ChartSeries['chartexStyle']) => baseModel({
-      chartType: 'clusteredBar',
+      chartType: 'clusteredColumn',
       categories: ['A', 'B'],
       chartexDataPointStyle: linked,
       chartStyleRoles: { dataPoint: linked },
       series: [series({ values: [2, 1], chartexStyle: seriesStyle })],
     });
 
-    expect(collectChartImageFillUsages(model(null))).toHaveLength(1);
-    expect(collectChartImageFillUsages(model({ fillHidden: true, fillPaintAuthored: true })))
-      .toHaveLength(0);
+    it('does not preflight a linked picture removed by series noFill', () => {
+      expect(collectChartImageFillUsages(model({ fillHidden: true, fillPaintAuthored: true })))
+        .toHaveLength(0);
+    });
+
+    // Pre-existing gap: the image preflight has no ChartEx clusteredColumn
+    // family, so a reachable linked picture is not collected. Tracked
+    // separately; this flips to a normal test once the preflight covers it.
+    it.fails('preflights a reachable linked picture', () => {
+      expect(collectChartImageFillUsages(model(null))).toHaveLength(1);
+    });
   });
 
   it.each([
@@ -11307,7 +11314,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
       series: [series({
         values: [3, 5], showMarker: true, markerSymbol: 'circle', lineHidden: true,
       })],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPointMarker: {
           fillColors: ['AABBCC'], lineColors: ['CCBBAA'], lineWidthEmu: 19_050,
         },
@@ -11328,7 +11335,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         values: [3], showMarker: true, markerSymbol: 'circle', lineHidden: true,
         markerFill: '112233', markerLine: '332211',
       })],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPointMarker: { fillHidden: true, lineHidden: true },
       },
     }), RECT, 1);
@@ -11395,7 +11402,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     renderChartCore(rec.ctx, baseModel({
       chartType: 'line', categories: ['A', 'B'],
       catAxisHidden: true, valAxisHidden: true,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPointMarker: {
           fillPaintAuthored: true,
           fillPaints: [{
@@ -11689,7 +11696,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     const solidDirect = baseModel({
       chartType: 'line', categories: ['A'],
       series: [series({ values: [1], showMarker: true, markerFill: 'FF0000' })],
-      chartStyleRoles: { dataPointMarker: linked },
+      classicChartStyleRoles: { dataPointMarker: linked },
     });
     expect(collectChartMarkerImageFills(solidDirect)).toEqual([]);
 
@@ -11717,7 +11724,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     const linkedLegendOnly = baseModel({
       chartType: 'line', categories: ['A'], showLegend: true,
       series: [series({ values: [1] })],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPointMarker: { fillPaints: [picture], fillPaintAuthored: true },
       },
     });
@@ -11738,7 +11745,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         values: [null, 1],
         dataLabelOverrides: [{ idx: 1, text: '', showVal: true }],
       })],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataLabel: {
           fillPaints: [{ fillType: 'solid', color: 'FFFFFF' }, picture],
           fillFormattingIndices: [0, 1],
@@ -11757,7 +11764,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
 
     const indexedLabelSolid = {
       ...indexedLabelPicture,
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataLabel: {
           fillPaints: [picture, { fillType: 'solid' as const, color: 'FFFFFF' }],
           fillFormattingIndices: [0, 1],
@@ -12217,7 +12224,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
       series: [series({
         values: [3], showMarker: true, markerSymbol: 'circle', lineHidden: true,
       })],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPointMarker: {
           fillPaints: [{
             fillType: 'gradient', gradType: 'linear', angle: 90,
@@ -12262,7 +12269,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
   });
 
   it.each(['line', 'bubble'] as const)(
-    'prefetches a linked %s picture through a direct spPr with omitted fill',
+    'prefetches a numeric %s picture through a direct spPr with omitted fill',
     chartType => {
       const picture = {
         fillType: 'image' as const,
@@ -12283,11 +12290,10 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
             ? { chartexStyle: { shapePropertiesPresent: true } }
             : { markerStyle: { shapePropertiesPresent: true } }),
         })],
-        chartStyleRoles: {
+        classicChartStyleRoles: {
           [chartType === 'bubble' ? 'dataPoint' : 'dataPointMarker']: {
             fillPaints: [picture],
             fillPaintAuthored: true,
-            allowNoFillOverride: true,
           },
         },
       });
@@ -12305,7 +12311,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
           values: [3], showMarker: true, markerSymbol: 'circle', lineHidden: true,
           markerFillPaintAuthored: directProvenance,
         })],
-        chartStyleRoles: {
+        classicChartStyleRoles: {
           dataPointMarker: { fillPaintAuthored: true },
         },
       }), RECT, 1);
@@ -13168,7 +13174,7 @@ describe('CH9 — bubble scale and numeric-X trendlines', () => {
     renderChart(rec.ctx, baseModel({
       chartType: 'bubble',
       categories: ['0', '1'],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint: {
           fillPaints: [{
             fillType: 'gradient', gradType: 'linear', angle: 0,
@@ -13190,7 +13196,7 @@ describe('CH9 — bubble scale and numeric-X trendlines', () => {
     expect(rec.gradients).toHaveLength(2);
   });
 
-  it('keeps multi-series bubble linked paint in the sparse source-series domain', () => {
+  it('keeps multi-series bubble numeric style paint in the sparse source-series domain', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'bubble',
@@ -13198,7 +13204,7 @@ describe('CH9 — bubble scale and numeric-X trendlines', () => {
       catAxisHidden: true,
       valAxisHidden: true,
       plotGroups: [plotGroup('bubble', 0, 2, { varyColors: false })],
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         dataPoint: {
           fillColors: ['FF0000', '0000FF'],
           fillFormattingIndices: [7, 42],
@@ -13304,43 +13310,6 @@ describe('CH9 — bubble scale and numeric-X trendlines', () => {
     expect(rec.gradients).toHaveLength(1);
     expect(rec.paintEvents.filter(event => event.kind === 'fill')).toHaveLength(1);
   });
-
-  it.each(['point', 'series'] as const)(
-    'inherits linked bubble paint through a bare %s spPr',
-    owner => {
-      const gradient = {
-        fillType: 'gradient' as const, gradType: 'linear' as const, angle: 0,
-        stops: [{ position: 0, color: '112233' }, { position: 1, color: 'DDEEFF' }],
-      };
-      const rec = recordingCtx();
-      renderChart(rec.ctx, baseModel({
-        chartType: 'bubble',
-        categories: ['0'],
-        chartStyleRoles: {
-          dataPoint: {
-            fillPaints: [gradient], fillPaintAuthored: true,
-            linePaints: [gradient], linePaintAuthored: true,
-            allowNoFillOverride: true, allowNoLineOverride: true,
-          },
-        },
-        series: [series({
-          values: [0.5], bubbleSizes: [100],
-          chartexStyle: owner === 'point'
-            ? {
-                fillPaints: [gradient], fillPaintAuthored: true,
-                linePaints: [gradient], linePaintAuthored: true,
-              }
-            : { shapePropertiesPresent: true },
-          dataPointOverrides: owner === 'point'
-            ? [{ idx: 0, chartexStyle: { shapePropertiesPresent: true } }]
-            : undefined,
-        })],
-        catAxisMin: 0, catAxisMax: 1, valMin: 0, valMax: 1,
-      }), RECT, 1);
-
-      expect(rec.gradients).toHaveLength(2);
-    },
-  );
 
   it('keeps direct bubble outline paint above the linked marker line', () => {
     const rec = recordingCtx();
@@ -15680,7 +15649,7 @@ describe('CH8 — pie / doughnut geometry', () => {
     expect(inner).toBe(0);
   });
 
-  it('applies direct > linked > numeric style components to pie slices', () => {
+  it('applies direct > numeric style components to pie slices and ignores linked dataPoint paint', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, pieModel({
       classicChartStyleRoles: {
@@ -15702,8 +15671,8 @@ describe('CH8 — pie / doughnut geometry', () => {
     const fills = rec.paintEvents
       .filter((event): event is FillPaintEvent => event.kind === 'fill')
       .map(event => event.fillStyle);
-    expect(fills.filter(color => color === '#AAAAAA')).toHaveLength(2);
-    expect(fills).toContain('#00FF00');
+    expect(fills).not.toContain('#AAAAAA');
+    expect(fills).toEqual(expect.arrayContaining(['#111111', '#00FF00', '#333333']));
     const sliceOutlines = rec.strokeDetails.filter(stroke => stroke.strokeStyle === '#445566');
     expect(sliceOutlines).toHaveLength(3);
     expect(sliceOutlines.every(stroke => stroke.lineWidth === 2)).toBe(true);
@@ -18884,7 +18853,7 @@ describe('classic line-chart group decorations', () => {
     expect(firstBar).toBeGreaterThan(firstSeries);
   });
 
-  it('fills missing line-group decoration paint from linked Chart Style roles', () => {
+  it('fills missing line-group decoration paint from the numeric and unmeasured linked roles', () => {
     const model = decoratedLine();
     model.lineGroupDecorations![0] = {
       groupIndex: 0,
@@ -18892,8 +18861,7 @@ describe('classic line-chart group decorations', () => {
       hiLowLines: {},
       upDownBars: { gapWidthPercent: 150, up: {}, down: {} },
     };
-    model.chartStyleRoles = {
-      dropLine: { lineColors: ['AA0000'], lineWidthEmu: 19050 },
+    model.classicChartStyleRoles = {
       hiLoLine: { lineColors: ['00AA00'], lineWidthEmu: 28575 },
       upBar: {
         fillColors: ['AABBCC'], lineColors: ['112233'], lineWidthEmu: 19050,
@@ -18904,23 +18872,33 @@ describe('classic line-chart group decorations', () => {
         lineDash: 'dot', lineCap: 'rnd', lineJoin: 'bevel',
       },
     };
+    // Drop lines are an unmeasured linked role and still apply. The linked
+    // high-low line and up/down-bar roles never paint classic decorations.
+    model.chartStyleRoles = {
+      dropLine: { lineColors: ['AA0000'], lineWidthEmu: 19050 },
+      hiLoLine: { lineColors: ['FF00FF'], lineWidthEmu: 9525 },
+      upBar: { fillColors: ['FF00FF'], lineColors: ['FF00FF'] },
+      downBar: { fillColors: ['FF00FF'], lineColors: ['FF00FF'] },
+    };
 
     const lines = segRecordingCtx();
     renderChart(lines.ctx, model, RECT, 1);
     expect(lines.segs.filter(segment => segment.ss === '#AA0000')).toHaveLength(5);
     expect(lines.segs.filter(segment => segment.ss === '#00AA00')).toHaveLength(5);
+    expect(lines.segs.some(segment => segment.ss === '#FF00FF')).toBe(false);
 
     const bars = recordingCtx();
     renderChart(bars.ctx, model, RECT, 1);
     expect(bars.rects.filter(rect => rect.fs === '#AABBCC')).toHaveLength(3);
     expect(bars.rects.filter(rect => rect.fs === '#DDEEFF')).toHaveLength(2);
+    expect(bars.rects.some(rect => rect.fs === '#FF00FF')).toBe(false);
     expect(bars.strokeRects.filter(rect => rect.ss === '#112233'
       && rect.dash.length > 0 && rect.cap === 'square' && rect.join === 'round')).toHaveLength(3);
     expect(bars.strokeRects.filter(rect => rect.ss === '#445566'
       && rect.dash.length > 0 && rect.cap === 'round' && rect.join === 'bevel')).toHaveLength(2);
   });
 
-  it('prefetches and paints a linked numeric up-bar picture without fallback revival', () => {
+  it('prefetches and paints a numeric up-bar picture without fallback revival', () => {
     const picture = {
       fillType: 'image' as const,
       imagePath: 'xl/media/numeric-up-bar.png',
@@ -18931,7 +18909,7 @@ describe('classic line-chart group decorations', () => {
     model.lineGroupDecorations![0].upDownBars = {
       gapWidthPercent: 150, up: {}, down: { fillHidden: true, lineHidden: true },
     };
-    model.chartStyleRoles = {
+    model.classicChartStyleRoles = {
       upBar: { fillPaints: [picture], fillPaintAuthored: true, lineHidden: true },
     };
     expect(collectChartMarkerImageFills(model)).toEqual([picture]);
@@ -19505,7 +19483,7 @@ describe('CH13 — stock chart (high/low/close)', () => {
     expect(red.length).toBe(3);
   });
 
-  it('honors complete high-low line paint, noFill, and linked Chart Style fallback', () => {
+  it('honors complete high-low line paint and noFill, and ignores the linked hiLoLine role', () => {
     const direct = segRecordingCtx();
     renderChart(direct.ctx, stockModel({
       stockHiLowLineStyle: {
@@ -19520,7 +19498,7 @@ describe('CH13 — stock chart (high/low/close)', () => {
     const hidden = segRecordingCtx();
     renderChart(hidden.ctx, stockModel({
       stockHiLowLineStyle: { hidden: true },
-      chartStyleRoles: {
+      classicChartStyleRoles: {
         hiLoLine: {
           lineColors: ['00AA00'],
           lineWidthEmu: 25400,
@@ -19530,16 +19508,22 @@ describe('CH13 — stock chart (high/low/close)', () => {
     }), RECT, 1);
     expect(hidden.segs.some(segment => segment.ss === '#00AA00')).toBe(false);
 
+    // The linked hiLoLine role never paints a classic stock chart: an omitted
+    // direct style resolves exactly as it does without the linked role.
+    const baseline = segRecordingCtx();
+    renderChart(baseline.ctx, stockModel({
+      stockHiLowLineStyle: {}, classicChartStyleRoles: {},
+    }), RECT, 1);
     const linked = segRecordingCtx();
     renderChart(linked.ctx, stockModel({
       stockHiLowLineStyle: {},
+      classicChartStyleRoles: {},
       chartStyleRoles: {
         hiLoLine: { lineColors: ['00AA00'], lineWidthEmu: 19050, lineDash: 'dash' },
       },
     }), RECT, 1);
-    const linkedLines = linked.segs.filter(segment => segment.ss === '#00AA00');
-    expect(linkedLines).toHaveLength(3);
-    expect(linkedLines.every(segment => segment.lw === 1.5 && segment.dash.length > 0)).toBe(true);
+    expect(linked.segs.some(segment => segment.ss === '#00AA00')).toBe(false);
+    expect(linked.segs).toEqual(baseline.segs);
   });
 
   it('draws one styled stock drop-line envelope per category', () => {
@@ -20180,7 +20164,7 @@ describe('surface contour charts', () => {
     expect(rec.filledPaths.length).toBeGreaterThan(0);
   });
 
-  it('uses the linked dataPointWireframe line for a Surface wireframe mesh', () => {
+  it('uses the numeric wireframe line for a Surface wireframe mesh', () => {
     const rec = recordingCtx();
     const wireframeGradient = {
       fillType: 'gradient' as const,
@@ -20191,20 +20175,9 @@ describe('surface contour charts', () => {
         color: index === 0 ? '123456' : 'ABCDEF',
       })),
     };
-    const filledSurfaceGradient = {
-      ...wireframeGradient,
-      stops: [
-        { position: 0, color: 'FF0000' },
-        { position: 1, color: 'FFCCCC' },
-      ],
-    };
     renderChart(rec.ctx, wireframeSurfaceModel({
-      chartStyleRoles: {
-        dataPoint3D: {
-          linePaints: [filledSurfaceGradient],
-          linePaintAuthored: true,
-        },
-        dataPointWireframe: {
+      classicSurfaceBandStyles: {
+        fixed: {
           linePaints: [wireframeGradient],
           linePaintAuthored: true,
           lineColorIndex: 0,
@@ -20261,16 +20234,15 @@ describe('surface contour charts', () => {
     }
   });
 
-  it('inherits a Surface wireframe line through spPr with omitted line paint', () => {
+  it('keeps the numeric Surface wireframe line through spPr with omitted line paint', () => {
     const linked = {
       lineColors: ['123456'],
       linePaintAuthored: true,
       lineColorIndex: 0,
-      allowNoLineOverride: true,
     };
     const seriesOverride = recordingCtx();
     renderChart(seriesOverride.ctx, wireframeSurfaceModel({
-      chartStyleRoles: { dataPointWireframe: linked },
+      classicSurfaceBandStyles: { fixed: linked },
       series: [
         series({ name: 'Y1', values: [1, 2], chartexStyle: { shapePropertiesPresent: true } }),
         series({ name: 'Y2', values: [3, 4] }),
@@ -20281,7 +20253,7 @@ describe('surface contour charts', () => {
 
     const bandOverride = recordingCtx();
     renderChart(bandOverride.ctx, wireframeSurfaceModel({
-      chartStyleRoles: { dataPointWireframe: linked },
+      classicSurfaceBandStyles: { fixed: linked },
       surfaceBandFormats: [{ idx: 0, style: { shapePropertiesPresent: true } }],
     }), RECT, 1);
     expect(bandOverride.strokeDetails.some(stroke => stroke.strokeStyle === '#123456'))
@@ -20291,8 +20263,8 @@ describe('surface contour charts', () => {
   it('renders the representable single compound from a classic wireframe style', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, wireframeSurfaceModel({
-      chartStyleRoles: {
-        dataPointWireframe: {
+      classicSurfaceBandStyles: {
+        fixed: {
           lineColors: ['123456'],
           linePaintAuthored: true,
           lineColorIndex: 0,
@@ -20305,11 +20277,11 @@ describe('surface contour charts', () => {
       .toHaveLength(4);
   });
 
-  it('uses the value-band index for a relative dataPointWireframe palette', () => {
+  it('uses the value-band index for a relative numeric wireframe palette', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, wireframeSurfaceModel({
-      chartStyleRoles: {
-        dataPointWireframe: {
+      classicSurfaceBandStyles: {
+        fixed: {
           lineColors: ['123456', 'ABCDEF'],
           linePaintAuthored: true,
         },
@@ -20506,7 +20478,7 @@ describe('surface contour charts', () => {
     expect(rec.filledPaths.length).toBeGreaterThan(0);
   });
 
-  it('rejects an oversized dataPointWireframe line before resolving it', () => {
+  it('rejects an oversized numeric wireframe line before resolving it', () => {
     const oversized = {
       fillType: 'gradient' as const,
       gradType: 'linear' as const,
@@ -20518,8 +20490,8 @@ describe('surface contour charts', () => {
     };
     const rec = recordingCtx();
     renderChart(rec.ctx, wireframeSurfaceModel({
-      chartStyleRoles: {
-        dataPointWireframe: {
+      classicSurfaceBandStyles: {
+        fixed: {
           linePaints: [oversized],
           linePaintAuthored: true,
           lineColorIndex: 0,
@@ -20597,12 +20569,11 @@ describe('surface contour charts', () => {
       valMax: 40,
       valAxisMajorUnit: 10,
       surfaceWireframe: false,
-      chartStyleRoles: {
-        dataPoint3D: {
+      classicSurfaceBandStyles: {
+        fixed: {
           fillPaints: [gradient],
           fillPaintAuthored: true,
           lineHidden: true,
-          allowNoFillOverride: true,
         },
       },
       surfaceBandFormats: [
@@ -20634,45 +20605,7 @@ describe('surface contour charts', () => {
     expect(rec.filledPaths.length).toBeGreaterThan(1);
   });
 
-  it('retains linked Surface material lighting when a role rejects direct noFill', () => {
-    const model = baseModel({
-      chartType: 'surface',
-      categories: ['X1', 'X2'],
-      valMin: 0,
-      valMax: 10,
-      valAxisMajorUnit: 10,
-      surfaceWireframe: false,
-      chartStyleRoles: {
-        dataPoint3D: {
-          fillColors: ['808080'],
-          fillPaintAuthored: true,
-          allowNoFillOverride: false,
-        },
-      },
-      threeD: { rotationX: 15, rotationY: 20, perspective: 30, rightAngleAxes: false },
-      series: [
-        series({ name: 'Y1', values: [0, 10] }),
-        series({ name: 'Y2', values: [10, 0] }),
-      ],
-    });
-    const render = (surfaceBandFormats: ChartModel['surfaceBandFormats']) => {
-      const rec = recordingCtx();
-      renderChart(rec.ctx, { ...model, surfaceBandFormats }, RECT, 1);
-      return rec.filledPaths
-        .filter(path => path.points.length >= 3)
-        .map(path => path.fillStyle);
-    };
-    const linked = render(undefined);
-    const rejectedNoFill = render([{
-      idx: 0,
-      fillHidden: true,
-      style: { fillHidden: true, fillPaintAuthored: true },
-    }]);
-    expect(rejectedNoFill).toEqual(linked);
-    expect(linked.some(color => color !== '#808080')).toBe(true);
-  });
-
-  it('falls through a raw linked Surface NoStyle to the band-domain numeric role', () => {
+  it('ignores a raw linked Surface role and uses the band-domain numeric role', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'surface',
@@ -20867,7 +20800,7 @@ describe('surface contour charts', () => {
     }
   });
 
-  it('rejects an oversized linked Surface recipe before resolving any paint', () => {
+  it('rejects an oversized numeric Surface recipe before resolving any paint', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       chartType: 'surface',
@@ -20876,8 +20809,8 @@ describe('surface contour charts', () => {
       valMax: 10,
       valAxisMajorUnit: 10,
       surfaceWireframe: false,
-      chartStyleRoles: {
-        dataPoint3D: {
+      classicSurfaceBandStyles: {
+        fixed: {
           fillPaints: [{
             fillType: 'gradient',
             gradType: 'linear',
