@@ -1466,7 +1466,15 @@ export function paragraphInputRuns(
   rc: RenderContext,
 ): { input: DrawingMlInputRun<LayoutSegment>[]; sameStyle: (a: LayoutSegment, b: LayoutSegment) => boolean } {
   const input: DrawingMlInputRun<LayoutSegment>[] = [];
+  // Grapheme clusters are segmented over the paragraph's text, not per run:
+  // the previous text run's last emitted segment and its last cluster, so an
+  // extender (combining mark, variation selector, ZWJ, trailing jamo) that
+  // opens the next run joins its base. A cluster is one glyph and can carry
+  // only one format, so the carried extenders take the base run's formatting
+  // (font slot, colour, link, spacing). A line break or equation ends it.
+  let seam: { item: { text: string }; tail: string } | null = null;
   for (const [sourceRunId, run] of para.runs.entries()) {
+    if (run.type !== 'text') seam = null;
     if (run.type === 'break') {
       const sizePx = run.fontSize != null
         ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
@@ -1520,6 +1528,16 @@ export function paragraphInputRuns(
     let rawText = run.fieldType === 'slidenum' && slideNumber !== undefined
       ? String(slideNumber) : run.text;
     if (run.caps === 'all' || run.caps === 'small') rawText = rawText.toUpperCase();
+    if (seam && rawText) {
+      const joined = seam.tail + rawText;
+      const firstEnd = graphemeClusterOffsets(joined)[0] ?? joined.length;
+      if (firstEnd > seam.tail.length) {
+        const carried = rawText.slice(0, firstEnd - seam.tail.length);
+        seam.item.text += carried;
+        seam.tail += carried;
+        rawText = rawText.slice(carried.length);
+      }
+    }
     const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
     const eaFont = familyEa
@@ -1573,12 +1591,14 @@ export function paragraphInputRuns(
     // stacked cell, one shaped horizontal glyph). Which slot a base takes is
     // unchanged.
     let clusterStart = 0;
+    let lastCluster = '';
     const clusterEnds = graphemeClusterOffsets(rawText);
     clusterEnds.push(rawText.length);
     for (const clusterEnd of clusterEnds) {
       const cluster = rawText.slice(clusterStart, clusterEnd);
       clusterStart = clusterEnd;
       if (!cluster) continue;
+      lastCluster = cluster;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
       let glyph = cluster;
       const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
@@ -1603,6 +1623,10 @@ export function paragraphInputRuns(
       groupFamily = face;
     }
     emitGroup();
+    if (lastCluster) {
+      const last = input[input.length - 1];
+      seam = last?.type === 'text' ? { item: last, tail: lastCluster } : null;
+    }
   }
 
   const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
