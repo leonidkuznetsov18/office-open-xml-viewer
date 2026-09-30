@@ -164,6 +164,7 @@ import {
   POWERPOINT_FONT_ALGN_UNIT_PT, powerPointFontAlgnOffset, powerPointFontAlgnReference,
 } from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
+import { renderStackedText, type StackedParagraphInput } from './stacked-text.js';
 import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
@@ -174,6 +175,7 @@ import {
   drawingMlBlockTop,
   drawingMlTextRect,
   type DrawingMlInputRun,
+  type DrawingMlLineSpacing,
 } from '@silurus/ooxml-core/internal/drawingml-text';
 
 /** Theme font context threaded through the render call chain. */
@@ -720,6 +722,13 @@ type LayoutSegment = {
    * latin face even when an East Asian segment draws none of its glyphs
    * (#1610 powerpoint-line-supplement-3); null when unresolved. */
   lineMetricLatin?: PowerPointFaceMetrics | null;
+  /** The authored face that draws this segment's glyphs (latin, ea, cs or
+   * symbol slot after theme resolution). Stacked vertical text looks its
+   * cell and vertical glyphs up by face (`stacked-faces.ts`). */
+  faceFamily?: string;
+  /** The run's latin face: it sizes a stacked column even where an East Asian
+   * segment draws none of its glyphs, as it sizes a horizontal line (#1610). */
+  faceFamilyLatin?: string;
   /** The face of an a:br or endParaRPr mark (text ''), kept so the mark can be
    * re-sized to the run it follows (see `layoutParagraph`). */
   markFace?: { family: string; bold: boolean; italic: boolean };
@@ -1444,31 +1453,62 @@ function measureTextAdvance(
 }
 
 /**
- * PowerPoint adapter for the shared DrawingML text phases. It resolves the
- * presentation theme, run formatting, fields, symbols, and equation rasters;
- * the core owns all soft break decisions. The resulting LayoutLine retains
- * PowerPoint's paint metadata for renderTextBody.
+ * PowerPoint's input phase for the shared DrawingML text phases: resolves the
+ * presentation theme, run formatting, fields, symbols and equation rasters
+ * into core input runs. Horizontal layout (`layoutParagraph`) and stacked
+ * vertical layout (`stacked-text.ts`) break the same runs.
  */
-export function layoutParagraph(
-  ctx: CanvasRenderingContext2D,
+export function paragraphInputRuns(
   para: Paragraph,
-  maxWidthPx: number,
   defaultFontSizePx: number,
   defaultColor: string,
   scale: number,
-  marLPx: number,
-  defaultBold: boolean = false,
-  defaultItalic: boolean = false,
-  fontScale: number = 1.0,
-  slideNumber?: number,
-  rc: RenderContext = { themeMajorFont: null, themeMinorFont: null, dpr: 1 },
-  firstLineIndentPx: number = 0,
-): LayoutLine[] {
+  defaultBold: boolean,
+  defaultItalic: boolean,
+  fontScale: number,
+  slideNumber: number | undefined,
+  rc: RenderContext,
+): {
+  input: DrawingMlInputRun<LayoutSegment>[];
+  sameStyle: (a: LayoutSegment, b: LayoutSegment) => boolean;
+  /** Line-metric mark of each a:br, keyed by its input index. */
+  breakMarks: Map<number, LayoutSegment>;
+} {
   const input: DrawingMlInputRun<LayoutSegment>[] = [];
+  // Grapheme clusters are segmented once over the paragraph's text, not per
+  // run, so an extender (combining mark, variation selector, ZWJ, trailing
+  // jamo) that opens a run joins its base in the previous run's last segment.
+  // A cluster is one glyph and can carry only one format, so the carried
+  // extenders take the base run's formatting (font slot, colour, link,
+  // spacing). A line break or equation (an LF in the joined text) ends a
+  // cluster. The boundary list is walked with one forward pointer, so the
+  // phase stays linear in the paragraph length however the runs are cut.
+  const runTexts = para.runs.map((run) => {
+    if (run.type !== 'text') return null;
+    const text = run.fieldType === 'slidenum' && slideNumber !== undefined ? String(slideNumber) : run.text;
+    return run.caps === 'all' || run.caps === 'small' ? text.toUpperCase() : text;
+  });
+  const runStarts: number[] = [];
+  let joinedText = '';
+  for (const text of runTexts) {
+    runStarts.push(joinedText.length);
+    joinedText += text ?? '\n';
+  }
+  const clusterBounds = graphemeClusterOffsets(joinedText);
+  clusterBounds.push(joinedText.length);
+  let boundIndex = 0;
+  /** The first cluster boundary at or after `pos`; the pointer only moves forward. */
+  const boundaryFrom = (pos: number): number => {
+    while (boundIndex < clusterBounds.length && clusterBounds[boundIndex] < pos) boundIndex++;
+    return boundIndex < clusterBounds.length ? clusterBounds[boundIndex] : joinedText.length;
+  };
+  // The previous text run's last emitted segment, the base of a carried cluster.
+  let seam: { text: string } | null = null;
   // The line-metric mark of every a:br, keyed by its input index (see
-  // `followingMark` below).
+  // `followingMark` in layoutParagraph).
   const breakMarks = new Map<number, LayoutSegment>();
   for (const [sourceRunId, run] of para.runs.entries()) {
+    if (run.type !== 'text') seam = null;
     if (run.type === 'break') {
       const sizePx = run.fontSize != null
         ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
@@ -1522,9 +1562,18 @@ export function layoutParagraph(
     const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
     const bold = run.bold ?? para.defBold ?? defaultBold;
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
-    let rawText = run.fieldType === 'slidenum' && slideNumber !== undefined
-      ? String(slideNumber) : run.text;
-    if (run.caps === 'all' || run.caps === 'small') rawText = rawText.toUpperCase();
+    let rawText = runTexts[sourceRunId] ?? '';
+    // Offset of rawText's first code unit in the joined paragraph text.
+    let runOffset = runStarts[sourceRunId];
+    const runEnd = runOffset + rawText.length;
+    if (seam && rawText) {
+      const firstEnd = Math.min(boundaryFrom(runOffset), runEnd);
+      if (firstEnd > runOffset) {
+        seam.text += rawText.slice(0, firstEnd - runOffset);
+        rawText = rawText.slice(firstEnd - runOffset);
+        runOffset = firstEnd;
+      }
+    }
     const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
     const eaFont = familyEa
@@ -1562,35 +1611,56 @@ export function layoutParagraph(
     let group = '';
     let groupFont = '';
     let groupShare: PowerPointFaceMetrics | undefined;
+    let groupFamily = family;
     const latinShare = lineMetricFor(family, bold, italic, rc) ?? null;
     const emitGroup = () => {
       if (group) {
         input.push({ type: 'text', text: group,
           style: { ...baseStyle, font: groupFont, lineMetric: groupShare,
-            lineMetricLatin: latinShare } });
+            lineMetricLatin: latinShare, faceFamily: groupFamily, faceFamilyLatin: family } });
       }
       group = '';
     };
-    for (const ch of rawText) {
-      let glyph = ch;
+    // Slots are chosen per grapheme cluster from its base character, so a
+    // combining mark, variation selector, ZWJ or other extender stays in its
+    // base's font segment and a cluster never straddles two segments (one
+    // stacked cell, one shaped horizontal glyph). Which slot a base takes is
+    // unchanged.
+    let clusterStart = 0;
+    let emitted = false;
+    while (clusterStart < rawText.length) {
+      const clusterEnd = Math.min(boundaryFrom(runOffset + clusterStart + 1), runEnd) - runOffset;
+      const cluster = rawText.slice(clusterStart, clusterEnd);
+      clusterStart = clusterEnd;
+      emitted = true;
+      const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
+      let glyph = cluster;
       const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
       const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
         || INDIC_CS_GLYPH_RE.test(ch));
       let font = eaGlyph ? eaFont : csGlyph ? csFont : baseFont;
-      let share = lineMetricFor(eaGlyph ? familyEa : csGlyph ? familyCs : family, bold, italic, rc);
+      let face = (eaGlyph ? familyEa : csGlyph ? familyCs : family) ?? family;
+      let share = lineMetricFor(face, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
-        glyph = symbolFontToUnicode(ch, symbolFamily);
+        const mapped = symbolFontToUnicode(ch, symbolFamily);
+        glyph = mapped + cluster.slice(ch.length);
         font = buildFont(bold, italic, drawSizePx,
-          glyph === ch ? symbolFamily : 'sans-serif', rc, glyph);
+          mapped === ch ? symbolFamily : 'sans-serif', rc, glyph);
         share = undefined;
+        face = mapped === ch ? symbolFamily : 'sans-serif';
       }
       if (group && (font !== groupFont || share !== groupShare)) emitGroup();
       group += glyph;
       groupFont = font;
       groupShare = share;
+      groupFamily = face;
     }
     emitGroup();
+    if (emitted) {
+      const last = input[input.length - 1];
+      seam = last?.type === 'text' ? last : null;
+    }
   }
 
   const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
@@ -1614,6 +1684,33 @@ export function layoutParagraph(
     // purely visual difference (colour) would decide the line height.
     && a.lineMetric === b.lineMetric
     && a.lineMetricLatin === b.lineMetricLatin;
+  return { input, sameStyle, breakMarks };
+}
+
+/**
+ * PowerPoint adapter for the shared DrawingML text phases. It resolves the
+ * presentation theme, run formatting, fields, symbols, and equation rasters;
+ * the core owns all soft break decisions. The resulting LayoutLine retains
+ * PowerPoint's paint metadata for renderTextBody.
+ */
+export function layoutParagraph(
+  ctx: CanvasRenderingContext2D,
+  para: Paragraph,
+  maxWidthPx: number,
+  defaultFontSizePx: number,
+  defaultColor: string,
+  scale: number,
+  marLPx: number,
+  defaultBold: boolean = false,
+  defaultItalic: boolean = false,
+  fontScale: number = 1.0,
+  slideNumber?: number,
+  rc: RenderContext = { themeMajorFont: null, themeMinorFont: null, dpr: 1 },
+  firstLineIndentPx: number = 0,
+): LayoutLine[] {
+  const { input, sameStyle, breakMarks } = paragraphInputRuns(
+    para, defaultFontSizePx, defaultColor, scale, defaultBold, defaultItalic, fontScale, slideNumber, rc,
+  );
   const marRPx = emuToPx(para.marR, scale);
   const broken = breakDrawingMlText(input, {
     maxWidth: maxWidthPx,
@@ -3286,6 +3383,18 @@ export function reflectedShapeTextRotation(
   return Object.is(readable, -0) ? 0 : readable;
 }
 
+/**
+ * Text rotation of a shape's unmirrored text frame. Stacked vertical text
+ * (`wordArtVert` / `wordArtVertRtl`) does not take the readable decomposition
+ * of {@link reflectedShapeTextRotation}: in a flipV shape PowerPoint turns it
+ * 180° and flipH leaves it unchanged (#1626 wordartvert slide 13: rotation 0
+ * with flipH and with flipV, both directions).
+ */
+export function shapeTextRotation(vert: string, rotation: number, flipH: boolean, flipV: boolean): number {
+  if (vert === 'wordArtVert' || vert === 'wordArtVertRtl') return rotation + (flipV ? 180 : 0);
+  return reflectedShapeTextRotation(rotation, flipH, flipV);
+}
+
 function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: number, themeDefaultColor = '#000000', slideNumber?: number, rc: RenderContext = { themeMajorFont: null, themeMinorFont: null, dpr: 1 }, onTextRun?: TextRunCallback, fetchImage?: FetchImage) {
   const x = emuToPx(el.x, scale);
   const y = emuToPx(el.y, scale);
@@ -3914,7 +4023,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   // Render text inside the rotation context so text follows shape rotation
   if (el.textBody) {
     const defaultTextColor = shapeDefaultTextColor(el, rc);
-    const textRotation = reflectedShapeTextRotation(el.rotation, el.flipH, el.flipV);
+    const textRotation = shapeTextRotation(el.textBody.vert, el.rotation, el.flipH, el.flipV);
     ctx.save();
     if (el.flipH || el.flipV) {
       const cx = x + w / 2;
@@ -4098,6 +4207,87 @@ export function resolveBulletLabel(
   return '';
 }
 
+/**
+ * PowerPoint input for stacked vertical text. Paragraph defaults, the stored
+ * normAutofit fontScale / lnSpcReduction and paragraph spacing follow the
+ * horizontal path; spAutoFit keeps the stored geometry (PowerPoint does not
+ * refit an unedited shape). Bullets are not drawn for stacked bodies: no
+ * control measured one.
+ */
+function renderStackedTextBody(
+  ctx: CanvasRenderingContext2D,
+  body: TextBody,
+  vert: 'wordArtVert' | 'wordArtVertRtl',
+  bx: number,
+  by: number,
+  bw: number,
+  bh: number,
+  scale: number,
+  bodyDefaultColor: string,
+  shapeRotation: number,
+  slideNumber: number | undefined,
+  rc: RenderContext,
+  onTextRun?: TextRunCallback,
+): void {
+  const fontScale = body.autoFit === 'norm' && body.fontScale != null && body.fontScale > 0 && body.fontScale < 1
+    ? body.fontScale : 1;
+  const pxPerPt = PT_TO_EMU * scale;
+  const inner = drawingMlTextRect(bw, bh, { lIns: body.lIns, rIns: body.rIns, tIns: body.tIns, bIns: body.bIns }, scale);
+  const bodyDefaultFontSizePx = (body.defaultFontSize ?? 18) * pxPerPt * fontScale;
+  const bodyDefaultBold = body.defaultBold ?? false;
+  const bodyDefaultItalic = body.defaultItalic ?? false;
+  let sameStyle: ((a: LayoutSegment, b: LayoutSegment) => boolean) | undefined;
+  const paragraphs: StackedParagraphInput<LayoutSegment>[] = body.paragraphs.map((para) => {
+    const sizePx = para.defFontSize != null ? para.defFontSize * pxPerPt * fontScale : bodyDefaultFontSizePx;
+    const color = para.defColor ? hexToRgba(para.defColor) : bodyDefaultColor;
+    const built = paragraphInputRuns(para, sizePx, color, scale, bodyDefaultBold, bodyDefaultItalic, fontScale,
+      slideNumber, rc);
+    sameStyle ??= built.sameStyle;
+    const firstText = built.input.find((item) => item.type === 'text');
+    const family = normalizeFontFamily(para.defFontFamily ?? null, rc);
+    const bold = para.defBold ?? bodyDefaultBold;
+    const italic = para.defItalic ?? bodyDefaultItalic;
+    const markStyle: LayoutSegment = firstText?.type === 'text' ? firstText.style : {
+      text: '', font: buildFont(bold, italic, sizePx, family, rc, ''), sizePx, color,
+      underline: false, strikethrough: false, lineMetric: lineMetricFor(family, bold, italic, rc), faceFamily: family,
+    };
+    const spacing = (pts: number | null, pct: number | undefined): DrawingMlLineSpacing =>
+      pct != null ? { type: 'pct', val: pct }
+        : pts != null ? { type: 'pts', val: (pts / 100) * fontScale } : undefined;
+    return {
+      runs: built.input,
+      alignment: para.alignment,
+      lineSpacing: para.spaceLine?.type === 'pts'
+        ? { type: 'pts', val: powerPointExactLinePoints(para.spaceLine.val) } : para.spaceLine,
+      spaceBefore: spacing(para.spaceBefore, para.spaceBeforePct),
+      spaceAfter: spacing(para.spaceAfter, para.spaceAfterPct),
+      markStyle,
+      eastAsianLineBreak: para.eaLnBrk !== false,
+    };
+  });
+  const runs = renderStackedText(ctx, {
+    vert,
+    rect: { left: bx + inner.left, top: by + inner.top, width: inner.width, height: inner.height },
+    anchor: body.verticalAnchor,
+    anchorCtr: body.anchorCtr === true,
+    wrap: body.wrap !== 'none',
+    spcFirstLastPara: body.spcFirstLastPara === true,
+    lnSpcReduction: body.autoFit === 'norm' ? body.lnSpcReduction ?? 0 : 0,
+    pxPerPt,
+    paragraphs,
+    sameStyle,
+  });
+  if (!onTextRun) return;
+  for (const run of runs) {
+    onTextRun({
+      text: run.text, inShapeX: run.x - bx, inShapeY: run.y - by, w: run.w, h: run.h,
+      fontSize: run.fontSize, font: run.font, shapeX: bx, shapeY: by, shapeW: bw, shapeH: bh,
+      rotation: shapeRotation,
+      ...(run.hyperlink ? { hyperlink: run.hyperlink } : {}),
+    });
+  }
+}
+
 // Exported (like `layoutParagraph` / `paintHighlight`) so the picture-bullet
 // draw path can be unit-tested against a mock 2D context without standing up a
 // full canvas. Not re-exported from index.ts — module-internal otherwise.
@@ -4133,6 +4323,16 @@ export function renderTextBody(
   // an already-sufficient row.
   measureNaturalLineSpacing = measureOnly,
 ): number | void {
+  // Stacked vertical text (wordArtVert / wordArtVertRtl): upright glyphs one
+  // above another in columns; see stacked-text.ts and core layoutStackedText.
+  if (body.vert === 'wordArtVert' || body.vert === 'wordArtVertRtl') {
+    // Like the rotated modes, a table row measures a vertical body by its box.
+    if (measureOnly) return bw;
+    renderStackedTextBody(ctx, body, body.vert, bx, by, bw, bh, scale, shapeDefaultTextColor ?? themeDefaultColor,
+      shapeRotation, slideNumber, rc, onTextRun);
+    return;
+  }
+
   // Vertical text: rotate rendering context so text flows top-to-bottom.
   // "vert" and "eaVert" both approximate to 90° clockwise rotation.
   // "vert270" rotates 270° (= 90° counterclockwise).
