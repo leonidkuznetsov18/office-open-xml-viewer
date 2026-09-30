@@ -676,6 +676,8 @@ pub(crate) struct InheritedBodyPr {
     pub(crate) spc_col: Option<i64>,
     pub(crate) rtl_col: Option<bool>,
     pub(crate) spc_first_last_para: Option<bool>,
+    /// `anchorCtr` (ECMA-376 §21.1.2.1.1).
+    pub(crate) anchor_ctr: Option<bool>,
     /// `compatLnSpc` (see the cascade note on `TextBody::compat_ln_spc`).
     pub(crate) compat_ln_spc: Option<bool>,
     pub(crate) auto_fit: Option<InheritedAutoFit>,
@@ -700,6 +702,7 @@ impl InheritedBodyPr {
             spc_col: attr_i64(&body_pr, "spcCol"),
             rtl_col: flag("rtlCol"),
             spc_first_last_para: flag("spcFirstLastPara"),
+            anchor_ctr: flag("anchorCtr"),
             compat_ln_spc: flag("compatLnSpc"),
             auto_fit: ooxml_common::text::parse_autofit(body_pr).map(
                 |(mode, font_scale, ln_spc_reduction)| InheritedAutoFit {
@@ -722,6 +725,7 @@ impl InheritedBodyPr {
             spc_col: self.spc_col.or(fallback.spc_col),
             rtl_col: self.rtl_col.or(fallback.rtl_col),
             spc_first_last_para: self.spc_first_last_para.or(fallback.spc_first_last_para),
+            anchor_ctr: self.anchor_ctr.or(fallback.anchor_ctr),
             compat_ln_spc: self.compat_ln_spc.or(fallback.compat_ln_spc),
             auto_fit: self.auto_fit.or_else(|| fallback.auto_fit.clone()),
             text_warp: self.text_warp.or_else(|| fallback.text_warp.clone()),
@@ -736,6 +740,7 @@ impl InheritedBodyPr {
             && self.spc_col.is_none()
             && self.rtl_col.is_none()
             && self.spc_first_last_para.is_none()
+            && self.anchor_ctr.is_none()
             && self.compat_ln_spc.is_none()
             && self.auto_fit.is_none()
             && self.text_warp.is_none()
@@ -1314,6 +1319,10 @@ pub(crate) fn parse_text_body(
         .spc_first_last_para
         .or(inherited.spc_first_last_para)
         .unwrap_or(false);
+    // ECMA-376 §21.1.2.1.1 anchorCtr ("centered within the bounding box"
+    // perpendicular to the anchor), xsd:boolean default false. Cascaded like
+    // the other bodyPr attributes above.
+    let anchor_ctr = own.anchor_ctr.or(inherited.anchor_ctr).unwrap_or(false);
     // ECMA-376 §21.1.2.1.1 compatLnSpc ("line spacing ... decided in a
     // simplistic manner using the font scene", schema default false). Carried
     // through the placeholder cascade like the other bodyPr attributes; a
@@ -1510,6 +1519,7 @@ pub(crate) fn parse_text_body(
         spc_col,
         rtl_col,
         spc_first_last_para,
+        anchor_ctr,
         compat_ln_spc,
         text_warp,
     }

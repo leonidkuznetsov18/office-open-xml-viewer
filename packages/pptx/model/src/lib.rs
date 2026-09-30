@@ -992,6 +992,11 @@ pub struct TextBody {
     #[serde(skip_serializing_if = "is_false")]
     #[serde(default)]
     pub spc_first_last_para: bool,
+    /// `<a:bodyPr anchorCtr>` (ECMA-376 §21.1.2.1.1) — centre the text block
+    /// perpendicular to the anchor. Default false.
+    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default)]
+    pub anchor_ctr: bool,
     /// Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
     /// slide → layout → master placeholder cascade. None when no level
     /// authors it. Only `Some(false)` changes layout (see the renderer's
