@@ -43,6 +43,8 @@ export interface DocumentLayoutSettings {
     readonly balanceSingleByteDoubleByteWidth: boolean;
     readonly lineWrapLikeWord6: boolean;
     readonly enableOpenTypeFeatures: boolean;
+    /** compatSetting compatibilityMode; undefined when the document omits it. */
+    readonly compatibilityMode?: number;
   };
 }
 
@@ -197,6 +199,9 @@ export function resolveDocumentLayoutSettings(
         document.settings?.balanceSingleByteDoubleByteWidth ?? false,
       lineWrapLikeWord6: document.settings?.lineWrapLikeWord6 ?? false,
       enableOpenTypeFeatures: document.settings?.enableOpenTypeFeatures ?? false,
+      ...(document.settings?.compatibilityMode !== undefined
+        ? { compatibilityMode: document.settings.compatibilityMode }
+        : {}),
     },
   };
 }

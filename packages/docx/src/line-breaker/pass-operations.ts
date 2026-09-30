@@ -242,7 +242,11 @@ export function performFitsMeasuredWidth(
 ): boolean {
   const { breakerState, firstIndent, widthPolicy } = operationState;
 
-  if (used <= available) return true;
+  // Intrinsic AutoFit widths can become the exact final line width. The
+  // margin subtraction and point/pixel round trip may differ by an ulp from
+  // the same shaped advance. Use the existing grapheme-fit numerical epsilon
+  // (below), not an Office width allowance, before forcing an emergency split.
+  if (used <= available + 1e-9) return true;
   if (
     widthPolicy === 'intrinsic' ||
     !Number.isFinite(used) ||

@@ -30,6 +30,7 @@ import type {
   StoryLayout,
   TableLayout,
   TableLayoutInput,
+  TablePreferredWidthConstraint,
 } from './types.js';
 import {
   floatingTableRegistryDelta,
@@ -2233,12 +2234,13 @@ function resolveColumnWidths(
       : baseIndentPt;
   });
   // §17.18.87 lets AutoFit override its preferred width up to the page width.
-  // Keep the ordinary text-band ceiling unless §17.4.50 placement moves a
-  // top-level page-owned story table into its semantic leading margin. The
-  // promoted ceiling is the physical page distance left after resolving jc +
-  // tblInd, rather than the page width in isolation: a partial negative indent
-  // does not move the table origin all the way to the page edge. Test the
-  // authored indent before bidiVisual reverses its physical translation;
+  // For a table with a preferred tblW, keep the ordinary text-band ceiling
+  // unless §17.4.50 placement moves a top-level page-owned story table into
+  // its semantic leading margin (auto-width tables use the leading-indent band
+  // below instead). The promoted ceiling is the physical page distance left
+  // after resolving jc + tblInd, rather than the page width in isolation: a
+  // partial negative indent does not move the table origin all the way to the
+  // page edge. Test the authored indent before bidiVisual reverses its physical translation;
   // table justification reverses under bidiVisual as well. Body tables must
   // also remain in a single-column page band; headers and footers are
   // page-owned stories and do not inherit the body's newspaper columns.
@@ -2278,25 +2280,115 @@ function resolveColumnWidths(
       return 2 * Math.min(resolvedCenterPt, state.pageWidth - resolvedCenterPt);
     }),
   );
-  const maximumTableWidthPt = isLeadingMarginPageStoryTable
-    ? Math.max(contentWPt, pageFitCeilingPt)
-    : contentWPt;
   const effectiveLayout = format.firstRowException?.layout === 'fixed'
     ? 'fixed'
     : table.layout;
+  // WORD_AUTOFIT_LEADING_INDENT_BAND (table-compatibility.ts): for an
+  // AutoFit table with no preferred tblW (§17.4.63 auto), a leading §17.4.50
+  // tblInd moves only the leading edge while the trailing edge stays at the
+  // text band. The text band available to the grid is contentW - tblInd for
+  // either sign, and the physical page is not a ceiling. In mode 14 (or with
+  // the mode omitted) outer cell margins hang outside that band, so the table
+  // adds them in full; mode 15 removes that allowance. The additional
+  // center/right grid-matched controls use that same mode-14 fitted width and
+  // the whole mode-15 band. Their +5.4pt-indent geometry does not settle other
+  // grid/indent combinations or absolute origin policy (see the rule's limits).
+  // WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE makes first-row tblPrEx/tblW authoritative for
+  // the whole table. Use the solver's resolver, including auto clearing dxa.
+  const hasPreferredTableWidth = state.acquisitionInputs.effectiveTablePreferredWidthPt(
+    table, contentWPt,
+  ) !== null;
+  const savedGridWidthPt = table.colWidths.reduce(
+    (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
+  );
+  // Nonleading controls only establish the case where saved grid + indent
+  // equals the band. There the two possible mode-14 ceilings coincide; keep
+  // other nonleading geometries on their established width contract rather
+  // than choosing between indistinguishable hypotheses. The epsilon covers
+  // point arithmetic, not a visual fit tolerance.
+  const hasMeasuredAlignmentGeometry = rowPlacements.every(({ justification, indentPt }) => {
+    const nonleading = justification === 'center' || justification === 'right' || justification === 'end';
+    return !nonleading || Math.abs(savedGridWidthPt + indentPt - contentWPt) <= 1e-9;
+  });
+  const compatibilityMode = state.layoutSettings.compat.compatibilityMode;
+  const hasMeasuredCompatibilityMode = compatibilityMode === undefined
+    || compatibilityMode === 14 || compatibilityMode === 15;
+  const usesLeadingIndentBand = effectiveLayout !== 'fixed'
+    && format.ordinaryFlow
+    && isTopLevelPageOwnedStory
+    && !isVerticalTextDirection(state.sectionLayout.textDirection)
+    && !hasPreferredTableWidth
+    && hasMeasuredCompatibilityMode
+    && hasMeasuredAlignmentGeometry;
+  const outerCellMarginsHangOutsideBand = compatibilityMode === undefined || compatibilityMode === 14;
+  const textBandPt = usesLeadingIndentBand
+    ? Math.max(0, Math.min(...rowPlacements.map(({ justification, indentPt }) => {
+        const trailing = justification === 'right' || justification === 'end';
+        const leading = justification !== 'center' && !trailing;
+        // The center/right controls retain the leading band's width in mode
+        // 14, but use the full text band in mode 15. This is a width rule;
+        // signed placement remains governed separately by MS-OI29500 2.1.155.
+        return leading || outerCellMarginsHangOutsideBand ? contentWPt - indentPt : contentWPt;
+      })))
+    : contentWPt;
+  // WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND (table-compatibility.ts): an AutoFit
+  // grid can include outer §17.4.42 cell margins beyond the text band. For a
+  // preferred-width table, only the margin overhang already represented by
+  // §17.4.48 tblGrid is used (that class is not covered by the mode controls).
+  // A row with skipped outer tracks cannot establish that margin ownership.
+  // A nested table's saved overhang belongs to its containing cell; giving it
+  // the page-table allowance enlarges that cell's contents beyond Word's grid.
+  const possibleOuterCellMarginsPt = effectiveLayout === 'fixed'
+    || !format.ordinaryFlow
+    || (isLeadingMarginPageStoryTable && !usesLeadingIndentBand)
+    || isVerticalTextDirection(state.sectionLayout.textDirection)
+    || state.storyContext?.containers.some((container) => container.kind === 'tableCell')
+    || format.rows.length === 0
+    ? 0
+    : format.rows.reduce((minimumPt, row, rowIndex) => {
+        const sourceRow = table.rows[rowIndex];
+        if (!sourceRow || (sourceRow.gridBefore ?? 0) > 0 || (sourceRow.gridAfter ?? 0) > 0) return 0;
+        const first = row.cells[0]?.marginsPt;
+        const last = row.cells.at(-1)?.marginsPt;
+        const leftPt = first?.left;
+        const rightPt = last?.right;
+        const marginPt = typeof leftPt === 'number' && Number.isFinite(leftPt)
+          && typeof rightPt === 'number' && Number.isFinite(rightPt)
+          ? Math.max(0, leftPt) + Math.max(0, rightPt)
+          : 0;
+        return Math.min(minimumPt, marginPt);
+      }, Number.POSITIVE_INFINITY);
+  // compatSetting compatibilityMode: WORD_AUTOFIT_LEADING_INDENT_BAND treats
+  // an omitted setting like an explicit 14.
+  // The two-cell forced-fit distribution always shares the actual outer
+  // margins; only the ceiling differs by compatibility mode.
+  const forcedFitOuterMarginsPt = usesLeadingIndentBand
+    ? possibleOuterCellMarginsPt
+    : Math.min(possibleOuterCellMarginsPt, Math.max(0, savedGridWidthPt - contentWPt));
+  const outerCellMarginsPt = usesLeadingIndentBand
+    ? (outerCellMarginsHangOutsideBand ? possibleOuterCellMarginsPt : 0)
+    : Math.min(possibleOuterCellMarginsPt, Math.max(0, savedGridWidthPt - contentWPt));
+  // A preferred-width table with a negative indent keeps the older physical
+  // page ceiling (its authored width may reach the page edge); the auto-width
+  // band above supersedes it for tables without a preferred width.
+  const maximumTableWidthPt = (isLeadingMarginPageStoryTable && !usesLeadingIndentBand
+    ? Math.max(contentWPt, pageFitCeilingPt)
+    : textBandPt) + outerCellMarginsPt;
   const isFixedNestedTable = effectiveLayout === 'fixed'
     && state.storyContext?.containers.some((container) => container.kind === 'tableCell');
 
   const intrinsicWidthsForTable = (
     owner: TableLayoutSource,
     ownerFormat = state.acquisitionInputs.tableFormatInput(owner),
-  ): ((cell: DeepReadonly<DocTableCell>) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
+  ): ((cell: DeepReadonly<DocTableCell>, preferredWidth: TablePreferredWidthConstraint | null) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
+    const ownerLayout = ownerFormat.firstRowException?.layout === 'fixed'
+      || owner.layout === 'fixed' ? 'fixed' : 'autofit';
     const ownerMargins = new WeakMap<object, Readonly<{ left: number; right: number }>>();
     owner.rows.forEach((row, rowIndex) => row.cells.forEach((cell, cellIndex) => {
       const acquired = ownerFormat.rows[rowIndex]?.cells[cellIndex]?.marginsPt;
       ownerMargins.set(cell, acquired ?? effCellMargins(cell, owner));
     }));
-    return (cell) => measureTableCellIntrinsicWidths(
+    return (cell, preferredWidth) => measureTableCellIntrinsicWidths(
       cell,
       ownerMargins.get(cell as object) ?? effCellMargins(cell, owner),
       {
@@ -2331,15 +2423,39 @@ function resolveColumnWidths(
                   defaultTabPt: state.defaultTabPt,
                 }, state.layoutServices.text, false)
               : undefined);
-          return measureParagraphIntrinsicWidths(
+          const intrinsic = measureParagraphIntrinsicWidths(
             paragraph,
             context,
-            contentWPt,
+            // §17.18.87 defines maximum content width without soft wrapping.
+            // Capping it at the band loses the relative demand of two growing
+            // columns (notably the 5:1 control). Only the measured auto-column
+            // growth path needs this uncapped interval; preferred and nested
+            // paths retain their existing measurement ceiling.
+            usesLeadingIndentBand && owner === table && ownerLayout !== 'fixed'
+              && preferredWidth === null
+              ? Number.MAX_SAFE_INTEGER
+              : contentWPt,
             { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
             paragraphMeasurementEnvironment(state),
             numbering,
             { preserveWhitespaceOnlyContent: true },
           );
+          if (cell.noWrap !== true || preferredWidth?.kind === 'dxa' || ownerLayout === 'fixed') return intrinsic;
+          // The nonbreaking text interval is independent of first-line
+          // positioning. Probe without a line-width ceiling: the ordinary
+          // maxWidthPt is capped at contentWPt, which is too small for an
+          // AutoFit noWrap minimum when tcW is omitted (§17.4.29, §17.4.71).
+          // Ordinary min/max still use the authored indent and width limit.
+          const unpositioned = measureParagraphIntrinsicWidths(
+            paragraph,
+            { ...context, firstIndentPt: 0 },
+            Number.MAX_SAFE_INTEGER,
+            { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
+            paragraphMeasurementEnvironment(state),
+            numbering,
+            { preserveWhitespaceOnlyContent: true },
+          );
+          return { ...intrinsic, noWrapWidthPt: unpositioned.maxWidthPt };
         },
         nestedTable: (nested) => measureTableIntrinsicWidths(
           state.acquisitionInputs.tableColumnLayoutInput(
@@ -2350,9 +2466,11 @@ function resolveColumnWidths(
           ),
         ),
       },
+      ownerLayout,
+      preferredWidth,
     );
   };
-  return [...resolveTableColumnWidths(state.acquisitionInputs.tableColumnLayoutInput(
+  const columnInput = state.acquisitionInputs.tableColumnLayoutInput(
     table,
     contentWPt,
     intrinsicWidthsForTable(table, format),
@@ -2366,7 +2484,12 @@ function resolveColumnWidths(
       : state.acquisitionInputs.tableParticipatesInOrdinaryFlow(table)
       ? maximumTableWidthPt
       : Math.max(contentWPt, state.pageWidth),
-  ))];
+  );
+  return [...resolveTableColumnWidths({
+    ...columnInput,
+    outerMarginAllowancePt: forcedFitOuterMarginsPt,
+    growUnpreferredColumns: usesLeadingIndentBand,
+  })];
 }
 
 // ===== Text frames & drop caps (ECMA-376 §17.3.1.11) =====

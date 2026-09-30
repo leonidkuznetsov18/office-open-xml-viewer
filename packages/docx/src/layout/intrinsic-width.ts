@@ -24,8 +24,8 @@ import { paragraphCharacterGrid } from '../paragraph-measure.js';
 import { calcEffectiveFontPx } from './text.js';
 import { wordSnapToCharsEastAsianCellCount } from './line-compatibility.js';
 import type { ParagraphLayoutSource, TextFontSlots } from './text.js';
-import type { TableLayoutSource } from './table-source-acquisition.js';
-import type { DeepReadonly } from './types.js';
+import { projectEffectiveCellPreferredWidth, type TableLayoutSource } from './table-source-acquisition.js';
+import type { DeepReadonly, TablePreferredWidthConstraint } from './types.js';
 import { stableFingerprint } from './fingerprint.js';
 import {
   numberingMarkerLogicalInterval,
@@ -41,6 +41,8 @@ export interface ParagraphIntrinsicWidths {
 export interface TableCellIntrinsicWidths {
   readonly minWidthPt: number;
   readonly maxWidthPt: number;
+  /** Intrinsic text width without first-line positioning, for w:noWrap. */
+  readonly noWrapWidthPt?: number;
 }
 
 export interface TableCellIntrinsicWidthDependencies {
@@ -54,16 +56,19 @@ export interface ParagraphIntrinsicWidthOptions {
   readonly preserveWhitespaceOnlyContent?: boolean;
 }
 
-/** Fold public cell content into one intrinsic interval. OOXML width/style
- * precedence is deliberately absent: parser/model projection and the column
- * solver own those separate responsibilities. */
+/** Fold public cell content into one intrinsic interval using the effective
+ * tcW acquired before measurement. Public-model-only callers use the same
+ * width interpreter; lexical/style precedence remains in source projection. */
 export function measureTableCellIntrinsicWidths(
   cell: DeepReadonly<DocTableCell>,
   margins: Readonly<{ left: number; right: number }>,
   dependencies: TableCellIntrinsicWidthDependencies,
+  tableLayout: 'autofit' | 'fixed' = 'autofit',
+  preferredWidth: TablePreferredWidthConstraint | null = projectEffectiveCellPreferredWidth(cell),
 ): TableCellIntrinsicWidths {
   let minContentWidthPt = 0;
   let maxContentWidthPt = 0;
+  let noWrapContentWidthPt = 0;
   for (const element of cell.content) {
     // ECMA-376 §17.18.87 defines AutoFit minima from cell contents. The
     // registered Word observation refines the otherwise-unspecified empty-mark
@@ -76,10 +81,23 @@ export function measureTableCellIntrinsicWidths(
       : dependencies.nestedTable(element);
     minContentWidthPt = Math.max(minContentWidthPt, intrinsic.minWidthPt);
     maxContentWidthPt = Math.max(maxContentWidthPt, intrinsic.maxWidthPt);
+    noWrapContentWidthPt = Math.max(
+      noWrapContentWidthPt,
+      intrinsic.noWrapWidthPt ?? intrinsic.maxWidthPt,
+    );
   }
   const horizontalMarginsPt = Math.max(0, margins.left) + Math.max(0, margins.right);
+  // ECMA-376 §17.4.29: for AutoFit auto/pct tcW, measure cell contents as
+  // one unbroken string. This changes column constraints, not line breaking.
+  // The noWrap content width excludes first-line paragraph positioning:
+  // controlled Word documents with 0/432-twip first-line indent give the same
+  // noWrap column width, even though the indented text still wraps in the cell.
+  // Hanging indents and numbering markers have not been measured here.
+  const unbrokenMinimum = tableLayout === 'autofit'
+    && cell.noWrap === true
+    && preferredWidth?.kind !== 'dxa';
   return {
-    minWidthPt: minContentWidthPt + horizontalMarginsPt,
+    minWidthPt: (unbrokenMinimum ? noWrapContentWidthPt : minContentWidthPt) + horizontalMarginsPt,
     maxWidthPt: Math.max(minContentWidthPt, maxContentWidthPt) + horizontalMarginsPt,
   };
 }

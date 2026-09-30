@@ -1154,6 +1154,7 @@ export interface DocSettings {
     useFeLayout?: boolean;
     balanceSingleByteDoubleByteWidth?: boolean;
     adjustLineHeightInTable?: boolean;
+    compatibilityMode?: number;
 }
 export interface DocTable {
     colWidths: number[];
@@ -1181,6 +1182,7 @@ export interface DocTableCell {
     vAlign: 'top' | 'center' | 'bottom';
     widthPt: number | null;
     widthPct?: number;
+    noWrap?: boolean;
     marginTop?: number | null;
     marginBottom?: number | null;
     marginLeft?: number | null;
