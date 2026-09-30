@@ -1166,9 +1166,11 @@ pub(crate) fn tx_style_nodes<'a, 'i>(
 ///
 /// ctrTitle takes the title style and obj / subTitle / typeless the body style
 /// (`class_style_nodes`). These are the values of PowerPoint's default
-/// template; body levels 6-9, which were not measured, carry that template's
-/// continuation (marL + 0.5" per level, 18 pt, 5 pt before). No otherStyle is
-/// synthesized: no control observed one.
+/// template. A supplementary control measured levels 6-9 the same way: body
+/// levels 6-9 continue at marL + 0.5" per level, 18 pt, 90 %, 5 pt before
+/// with the same bullet, and title levels 6-9 stay at the hard defaults; both
+/// laid out identically to a master with the template txStyles spelled out.
+/// No otherStyle is synthesized: no control observed one.
 const BUILT_IN_TX_STYLES: &str = concat!(
     r#"<p:txStyles xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" "#,
     r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
@@ -3443,9 +3445,17 @@ mod placeholder_geometry_tests {
                 other => panic!("expected the built-in body bullet, got {other:?}"),
             }
         }
-        // Body levels 2-5 (#1630): 24 / 20 / 18 / 18 pt, marL + 0.5" per level,
-        // the same hanging Arial bullet, theme minor face.
-        for (level, size) in [(1, 24.0), (2, 20.0), (3, 18.0), (4, 18.0)] {
+        // Body levels 2-9 (#1630 controls, levels 1-5 and 6-9): 24 / 20 / 18 pt
+        // and 18 pt below, marL + 0.5" per level, the same hanging Arial
+        // bullet, theme minor face.
+        for (level, size) in [
+            (1, 24.0),
+            (2, 20.0),
+            (3, 18.0),
+            (4, 18.0),
+            (5, 18.0),
+            (8, 18.0),
+        ] {
             assert_eq!(sizes["body"][level], Some(size));
             assert_eq!(faces["body"][level].as_deref(), Some("Calibri"));
             assert_eq!(
