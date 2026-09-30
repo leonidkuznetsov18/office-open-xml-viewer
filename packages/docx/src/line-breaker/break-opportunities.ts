@@ -30,7 +30,7 @@ import {
   slicedTextMetadata,
   snapToCharsClass,
 } from './advance.js';
-import { applyBidiTabPostPass, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
+import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
 import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
@@ -93,6 +93,7 @@ export type BreakOpportunityIteratorContext = Pick<
 /** Consume one prepared queue in source order, applying all legal break paths. */
 export function iterateBreakOpportunities(context: BreakOpportunityIteratorContext): void {
   const { breakerState, flush } = context;
+  const resolveCompletedTabCells = createBidiTabCellResolver();
   while (breakerState.queue.length > 0) {
     const seg = breakerState.queue.shift()!;
 
@@ -108,7 +109,7 @@ export function iterateBreakOpportunities(context: BreakOpportunityIteratorConte
 
     // ── Tab segment ──────────────────────────────────────
     if ('isTab' in seg) {
-      processTabSegment(context, seg);
+      processTabSegment(context, seg, resolveCompletedTabCells);
       continue;
     }
 
@@ -457,7 +458,11 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
   }
 }
 
-function processTabSegment(context: BreakOpportunityIteratorContext, seg: LayoutTabSeg): void {
+function processTabSegment(
+  context: BreakOpportunityIteratorContext,
+  seg: LayoutTabSeg,
+  resolveCompletedTabCells: ReturnType<typeof createBidiTabCellResolver>,
+): void {
   const {
     breakerState,
     flush,
@@ -482,7 +487,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     let oversizedMarginLeading = false;
     if (seg.ptab) {
       const input = { ...context, ...breakerState };
-      breakerState.currentWidth += applyBidiTabPostPass(input);
+      breakerState.currentWidth += resolveCompletedTabCells(input);
       const { startPen, leftLimit, frame } = bidiTabFrame(input);
       let followingWidth = 0;
       for (const q of breakerState.queue) {
@@ -518,7 +523,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
       // ptab instead has an authored fixed gap.
       // Aligned cells retain post-pass alignment,
       // bounded by the actual band after normal text fitting.
-      breakerState.currentWidth += applyBidiTabPostPass(input);
+      breakerState.currentWidth += resolveCompletedTabCells(input);
       const pen = startPen + breakerState.currentWidth;
       const stop = seg.ptab && !oversizedMarginLeading ? undefined : nextLineTabStop(pen,
         context.bidiCustomStopsPx, context.bidiIntervalPx, frame.leadingShift);
@@ -547,7 +552,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
       // Earlier cells are complete when another ordinary tab is reached. Charge
       // their resolved gaps so the next cell cannot overflow the line, but leave
       // this final gap provisional: the bidi walk may shrink it as text fits.
-      breakerState.currentWidth += applyBidiTabPostPass(input);
+      breakerState.currentWidth += resolveCompletedTabCells(input);
     }
     seg.measuredWidth = 0;
     addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);

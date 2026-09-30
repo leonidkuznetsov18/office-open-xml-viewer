@@ -149,6 +149,17 @@ export function layoutBidiTabStops(
   intervalPx: number,
   frame?: Readonly<{ leadingShift: number; indentStart: number; indentEnd: number; bandStart: number; bandEnd: number; narrowed: boolean }>,
 ): BidiTabResult[] {
+  return resolveBidiTabStops(items, customStopsPx, startPenPx, leftLimitPx, intervalPx, frame).results;
+}
+
+function resolveBidiTabStops(
+  items: BidiTabItem[],
+  customStopsPx: { pos: number; alignment: TabStop['alignment']; leader?: TabStop['leader'] }[],
+  startPenPx: number,
+  leftLimitPx: number,
+  intervalPx: number,
+  frame?: Readonly<{ leadingShift: number; indentStart: number; indentEnd: number; bandStart: number; bandEnd: number; narrowed: boolean }>,
+): { results: BidiTabResult[]; endPen: number } {
   const n = items.length;
   const width = items.map((it) => it.width);
   const leader: (TabStop['leader'] | undefined)[] = new Array(n).fill(undefined);
@@ -254,7 +265,7 @@ export function layoutBidiTabStops(
     pen = target;
   }
 
-  return items.map((_, i) => ({ width: width[i], leader: leader[i] }));
+  return { results: items.map((_, i) => ({ width: width[i], leader: leader[i] })), endPen: pen };
 }
 
 
@@ -305,16 +316,48 @@ export function bidiTabFrame(input: Pick<BidiTabPostPassInput,
 
 /** Resolve bidi tab positions after line content is known, in the visual frame. */
 export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
+  if (!input.baseRtl || !input.currentLine.some((segment) => 'isTab' in segment)) return 0;
+  return resolveBidiTabRange(input, 0, bidiTabFrame(input).startPen).delta;
+}
+
+/** Called only at a tab boundary: all preceding cells are complete. Tabs reset
+ * snap/space fitting blocks, so appending the next cell cannot change that
+ * prefix. Carry its exact reading pen instead of revisiting it at every tab.
+ * The new tab remains provisional; flush still projects the final whole line
+ * after any trailing-cell fitting/retraction. Thus each completed cell is
+ * visited once here and once at flush, including collapsed zero-width tabs.
+ * This is a traversal optimization of §17.3.1.37, not a new tab policy. */
+export function createBidiTabCellResolver(): (input: BidiTabPostPassInput) => number {
+  let line: BidiTabPostPassInput['currentLine'] | undefined;
+  let end = 0;
+  let pen = 0;
+  return (input) => {
+    if (line !== input.currentLine) {
+      line = input.currentLine;
+      end = 0;
+      pen = bidiTabFrame(input).startPen;
+    }
+    const resolved = resolveBidiTabRange(input, end, pen);
+    end = input.currentLine.length;
+    pen = resolved.endPen;
+    return resolved.delta;
+  };
+}
+
+function resolveBidiTabRange(
+  input: BidiTabPostPassInput,
+  from: number,
+  startPen: number,
+): { delta: number; endPen: number } {
   const {
     baseRtl,
-    currentLine,
     bidiCustomStopsPx,
     bidiIntervalPx,
     decimalAlignmentPoint,
     strAdvance,
   } = input;
-  if (!baseRtl) return 0;
-  if (!currentLine.some((s) => 'isTab' in s)) return 0;
+  if (!baseRtl) return { delta: 0, endPen: startPen };
+  const currentLine = input.currentLine.slice(from);
   // LOGICAL order — the reading-frame walk resolves the Nth tab against the
   // Nth-reachable stop in the logical reading frame. Do not feed the visual
   // sequence here: UAX#9 L2 reverses cells AND tabs together, so a
@@ -357,8 +400,8 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
   // (which narrows the leading edge under an RTL base, mirroring the draw
   // loop's `effAvailW`). The left text margin sits tabOriginPx past the
   // paragraph box (its trailing indent).
-  const { startPen, leftLimit, frame } = bidiTabFrame(input);
-  const res = layoutBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx, frame);
+  const { leftLimit, frame } = bidiTabFrame(input);
+  const { results: res, endPen } = resolveBidiTabStops(items, bidiCustomStopsPx, startPen, leftLimit, bidiIntervalPx, frame);
   let delta = 0;
   for (let i = 0; i < currentLine.length; i++) {
     const s = currentLine[i];
@@ -367,5 +410,5 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
     s.measuredWidth = res[i].width;
     (s as LayoutTabSeg).leader = res[i].leader;
   }
-  return delta;
+  return { delta, endPen };
 }
