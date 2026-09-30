@@ -165,6 +165,9 @@ import {
 } from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
 import {
+  COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
+} from './east-asian-default.js';
+import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
   drawingMlLineHeight,
@@ -1113,6 +1116,7 @@ export function buildFont(
   rc: RenderContext,
   text = '',
   hasNamedFamily = true,
+  extraFamilies: readonly string[] = [],
 ): string {
   const style  = italic ? 'italic ' : '';
   const normalized = normalizeFontFamily(family, rc);
@@ -1141,10 +1145,15 @@ export function buildFont(
       : [...NON_CJK_SANS_FALLBACKS, 'Arial', 'Helvetica', 'Liberation Sans'];
     return `${style}${weight}${sizePx}px ${families.length ? `${quoteAll([...latin, ...families])}, ` : ''}${normalized}`;
   }
-  return `${style}${weight}${sizePx}px ${cssFontStack(
+  const stack = cssFontStack(
     officeRoute?.family ?? normalized, authoredFamily, fallback, text,
     rc.googleSubstitutes === true,
-  )}`;
+  );
+  // Application-default faces follow the primary face in their fallback
+  // order (issue #1627), ahead of the generic web fallbacks.
+  const extras = extraFamilies.filter((name) => name !== normalized);
+  return `${style}${weight}${sizePx}px ${extras.length
+    ? stack.replace(/^("[^"]*"), /u, `$1, ${quoteAll(extras)}, `) : stack}`;
 }
 
 /**
@@ -1507,20 +1516,36 @@ export function layoutParagraph(
       ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
     const drawSizePx = baselineDrawSizePx(sizePx, run.baseline ?? undefined);
     const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
-    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : null;
-    const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
     const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
     const bold = run.bold ?? para.defBold ?? defaultBold;
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
     let rawText = run.fieldType === 'slidenum' && slideNumber !== undefined
       ? String(slideNumber) : run.text;
     if (run.caps === 'all' || run.caps === 'small') rawText = rawText.toUpperCase();
+    // The parser resolves the ea/cs faces, theme script fonts included. An
+    // empty slot takes PowerPoint's application default, never the Latin
+    // face (issue #1627).
+    const eaDefaults = run.fontFamilyEa ? [] : eastAsianDefaultFaces(
+      run.fontFamily ?? para.defFontFamily ?? rc.themeMinorFont ?? null,
+      [...rawText].filter((ch) => isCjkBreakChar(ch.codePointAt(0) ?? 0)).join(''),
+    );
+    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : eaDefaults[0];
+    const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
     const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
-    const eaFont = familyEa
-      ? buildFont(bold, italic, drawSizePx, familyEa, rc, rawText) : baseFont;
-    const csFont = familyCs
-      ? buildFont(bold, italic, drawSizePx, familyCs, rc, rawText) : baseFont;
+    const eaFont = buildFont(bold, italic, drawSizePx, familyEa, rc, rawText, true,
+      eaDefaults.slice(1));
+    // An empty cs slot draws each complex-script character in its script's
+    // application default; the defaults also follow an authored cs face.
+    const csFonts = new Map<string, string>();
+    const csFontFor = (face: string) => {
+      let font = csFonts.get(face);
+      if (font === undefined) {
+        font = buildFont(bold, italic, drawSizePx, face, rc, rawText, true, COMPLEX_SCRIPT_DEFAULT_FACES);
+        csFonts.set(face, font);
+      }
+      return font;
+    };
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
     const color = run.color ? hexToRgba(run.color)
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
@@ -1563,11 +1588,12 @@ export function layoutParagraph(
     };
     for (const ch of rawText) {
       let glyph = ch;
-      const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
-      const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
-        || INDIC_CS_GLYPH_RE.test(ch));
-      let font = eaGlyph ? eaFont : csGlyph ? csFont : baseFont;
-      let share = lineMetricFor(eaGlyph ? familyEa : csGlyph ? familyCs : family, bold, italic, rc);
+      const eaGlyph = isCjkBreakChar(ch.codePointAt(0) ?? 0);
+      const csGlyph = isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
+        || INDIC_CS_GLYPH_RE.test(ch);
+      const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
+      let font = eaGlyph ? eaFont : csGlyph ? csFontFor(csFace) : baseFont;
+      let share = lineMetricFor(eaGlyph ? familyEa : csFace, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         glyph = symbolFontToUnicode(ch, symbolFamily);

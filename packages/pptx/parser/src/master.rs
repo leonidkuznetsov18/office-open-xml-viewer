@@ -18,11 +18,11 @@ use crate::text::{
     has_any_level_bullet, has_any_level_color, has_any_level_face, has_any_level_indent,
     has_any_level_run_properties, has_any_level_size, merge_level_bullets, merge_level_colors,
     merge_level_faces, merge_level_indents, merge_level_run_properties, merge_level_sizes,
-    paragraph_spacing, read_level_bullets, read_level_colors, read_level_faces,
-    read_level_font_sizes, read_level_indents, read_level_run_properties_with_rels,
-    resolve_latin_face, text_property_color, BuFont, BuMarker, InheritedBodyPr, LevelBullets,
-    LevelColors, LevelFaces, LevelFontSizes, LevelIndents, LevelRunProperties, ParagraphSpacing,
-    HARD_DEFAULT_FONT_SIZE, HARD_DEFAULT_LATIN_FACE,
+    paragraph_spacing, read_level_bullets, read_level_colors, read_level_defrpr_values,
+    read_level_faces, read_level_font_sizes, read_level_indents,
+    read_level_run_properties_with_rels, resolve_latin_face, text_property_color, BuFont, BuMarker,
+    InheritedBodyPr, LevelBullets, LevelColors, LevelFaces, LevelFontSizes, LevelIndents,
+    LevelRunProperties, ParagraphSpacing, HARD_DEFAULT_FONT_SIZE, HARD_DEFAULT_LATIN_FACE,
 };
 use crate::theme::{
     bake_clr_map, parse_theme_part, PptxSchemeResolver, PptxTheme, PptxThemeSource,
@@ -1991,6 +1991,13 @@ impl MasterStyleTier {
 pub(crate) struct DefaultTextLevels {
     pub(crate) faces: LevelFaces,
     pub(crate) sizes: LevelFontSizes,
+    /// Authored `<a:ea>` / `<a:cs>` typefaces per level (tokens stay tokens;
+    /// they resolve per run language, issue #1627).
+    pub(crate) east_asian: LevelFaces,
+    pub(crate) complex_script: LevelFaces,
+    /// Per-level `lang` / `altLang` of the level defRPr.
+    pub(crate) lang: LevelFaces,
+    pub(crate) alt_lang: LevelFaces,
 }
 
 /// Build [`DefaultTextLevels`]. When the presentation has no defaultTextStyle
@@ -2005,10 +2012,15 @@ pub(crate) fn parse_default_text_levels(
         Some(node) => DefaultTextLevels {
             faces: read_level_faces(node, theme),
             sizes: read_level_font_sizes(node),
+            east_asian: read_level_defrpr_values(node, Some("ea"), "typeface"),
+            complex_script: read_level_defrpr_values(node, Some("cs"), "typeface"),
+            lang: read_level_defrpr_values(node, None, "lang"),
+            alt_lang: read_level_defrpr_values(node, None, "altLang"),
         },
         None => DefaultTextLevels {
             faces: std::array::from_fn(|_| resolve_latin_face("+mn-lt", theme)),
             sizes: [Some(HARD_DEFAULT_FONT_SIZE); 9],
+            ..Default::default()
         },
     }
 }
@@ -3495,12 +3507,13 @@ mod placeholder_geometry_tests {
 
         for title in TITLE_CLASS {
             assert_eq!(sizes[*title][0], Some(44.0));
-            assert_eq!(faces[*title][0].as_deref(), Some("Calibri Light"));
+            // Chain values keep theme tokens (issue #1627).
+            assert_eq!(faces[*title][0].as_deref(), Some("+mj-lt"));
         }
         // Every body-class type, obj included, gets the built-in body style.
         for body in BODY_CLASS {
             assert_eq!(sizes[*body][0], Some(28.0));
-            assert_eq!(faces[*body][0].as_deref(), Some("Calibri"));
+            assert_eq!(faces[*body][0].as_deref(), Some("+mn-lt"));
             assert_eq!(indents[*body][0].mar_l, Some(228_600));
             assert_eq!(indents[*body][0].indent, Some(-228_600));
             match bullets[*body][0].resolve() {
@@ -3827,7 +3840,7 @@ mod placeholder_geometry_tests {
     fn default_text_levels_synthesize_theme_minor_when_absent() {
         let theme = HashMap::from([("+mn-lt".to_owned(), "Verdana".to_owned())]);
         let absent = parse_default_text_levels(None, &theme);
-        assert!(absent.faces.iter().all(|f| f.as_deref() == Some("Verdana")));
+        assert!(absent.faces.iter().all(|f| f.as_deref() == Some("+mn-lt")));
         assert!(absent.sizes.iter().all(|s| *s == Some(18.0)));
 
         let dts = r#"<p:defaultTextStyle

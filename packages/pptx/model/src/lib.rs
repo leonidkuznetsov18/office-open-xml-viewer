@@ -1273,8 +1273,9 @@ pub struct TextRunData {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_fill: bool,
     pub font_family: Option<String>,
-    /// East Asian font family from rPr > ea (resolved through the theme).
-    /// Renderer uses this for CJK runs. None = inherit from latin font.
+    /// East Asian face after the ea cascade and the theme script font of the
+    /// run language (issue #1627). None = the slot has no face: the renderer
+    /// applies PowerPoint's application default, not the Latin face.
     /// ECMA-376 §21.1.2.3.3 (CT_TextFont, ea variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family_ea: Option<String>,
@@ -1286,6 +1287,14 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.10 (CT_TextFont, sym variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family_sym: Option<String>,
+    /// Cascaded run language (`rPr@lang`, ECMA-376 §21.1.2.3.9) after list
+    /// styles, paragraph defaults and the run. It selected the theme script
+    /// fonts already resolved into the three face slots (issue #1627).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// Cascaded alternate language (`rPr@altLang`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt_lang: Option<String>,
     /// Baseline shift in thousandths of a point. Positive = superscript, negative = subscript.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<i32>,

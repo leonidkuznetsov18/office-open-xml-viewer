@@ -40,6 +40,8 @@ mod chart;
 mod chart_compatibility;
 
 mod theme;
+// Theme font tokens resolved per run language (issue #1627).
+mod script_font;
 use theme::*;
 
 mod fill;
@@ -5686,6 +5688,144 @@ mod tests {
         ));
     }
 
+    /// Issue #1627: theme tokens resolve per run language. The theme script
+    /// font of the lang (then altLang) wins inside the token's collection;
+    /// text boxes take the defaultTextStyle ea/cs tokens and a fontRef
+    /// major/minor collection below their own lstStyle; an empty or absent
+    /// slot is left to the renderer's application default.
+    #[test]
+    fn east_asian_and_complex_script_faces_follow_run_language() {
+        let theme = parse_theme_colors(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+              <a:clrScheme name="C"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="111111"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2><a:accent1><a:srgbClr val="111111"/></a:accent1><a:accent2><a:srgbClr val="222222"/></a:accent2><a:accent3><a:srgbClr val="333333"/></a:accent3><a:accent4><a:srgbClr val="444444"/></a:accent4><a:accent5><a:srgbClr val="555555"/></a:accent5><a:accent6><a:srgbClr val="666666"/></a:accent6><a:hlink><a:srgbClr val="0000FF"/></a:hlink><a:folHlink><a:srgbClr val="800080"/></a:folHlink></a:clrScheme>
+              <a:fontScheme name="F">
+                <a:majorFont><a:latin typeface="Garamond"/><a:ea typeface="HGMinchoE"/><a:cs typeface=""/>
+                  <a:font script="Jpan" typeface="HGSoeiKakugothicUB"/><a:font script="Hebr" typeface="Tahoma"/><a:font script="Viet" typeface="Book Antiqua"/></a:majorFont>
+                <a:minorFont><a:latin typeface="Corbel"/><a:ea typeface="Meiryo"/><a:cs typeface="Microsoft Sans Serif"/>
+                  <a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Hebr" typeface="David"/><a:font script="Viet" typeface="Palatino Linotype"/></a:minorFont>
+              </a:fontScheme>
+              <a:fmtScheme name="S"><a:fillStyleLst/><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme>
+            </a:themeElements></a:theme>"#,
+        );
+        let dts_xml = r#"<p:defaultTextStyle xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:defPPr><a:defRPr lang="ja-JP"/></a:defPPr>
+          <a:lvl1pPr><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/></a:defRPr></a:lvl1pPr>
+          <a:lvl2pPr><a:defRPr sz="1800"/></a:lvl2pPr></p:defaultTextStyle>"#;
+        let dts_doc = roxmltree::Document::parse(dts_xml).unwrap();
+        let placeholders = LayoutPlaceholders {
+            default_text: crate::master::parse_default_text_levels(
+                Some(dts_doc.root_element()),
+                &theme,
+            ),
+            ..LayoutPlaceholders::default()
+        };
+        let text_box = |font_ref: &str, lst: &str, paras: &str| {
+            let style = if font_ref.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<p:style><a:lnRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:lnRef><a:fillRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:fillRef><a:effectRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:effectRef><a:fontRef idx="{font_ref}"><a:schemeClr val="tx1"/></a:fontRef></p:style>"#
+                )
+            };
+            let xml = format!(
+                r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+                  <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="500000"/></a:xfrm></p:spPr>{style}
+                  <p:txBody><a:bodyPr/><a:lstStyle>{lst}</a:lstStyle>{paras}</p:txBody></p:sp>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            let shape = parse_shape(
+                doc.root_element(),
+                &placeholders,
+                &theme,
+                &HashMap::new(),
+                "ppt/slides",
+                None,
+                &mut zip,
+            )
+            .expect("text box");
+            shape
+                .text_body
+                .expect("body")
+                .paragraphs
+                .into_iter()
+                .map(|p| match p.runs.into_iter().next() {
+                    Some(TextRun::Text(t)) => (t.font_family, t.font_family_ea, t.font_family_cs),
+                    other => panic!("expected a text run, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let s = |v: &str| Some(v.to_owned());
+        let runs = text_box(
+            "",
+            "",
+            r#"<a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="en-US"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="en-US" altLang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="he-IL"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="vi-VN"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface="Meiryo"/></a:rPr><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface=""/></a:rPr><a:t>a</a:t></a:r></a:p>
+               <a:p><a:pPr lvl="1"/><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr/><a:t>a</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(
+            runs[0],
+            (s("Corbel"), s("Yu Mincho"), s("Microsoft Sans Serif"))
+        );
+        assert_eq!(
+            runs[1],
+            (s("Corbel"), s("Meiryo"), s("Microsoft Sans Serif"))
+        );
+        assert_eq!(
+            runs[2].1,
+            s("Yu Mincho"),
+            "altLang selects the East Asian script"
+        );
+        assert_eq!(runs[3].2, s("David"), "lang selects the complex script");
+        assert_eq!(
+            runs[4].0,
+            s("Palatino Linotype"),
+            "the latin token follows vi-VN"
+        );
+        assert_eq!(runs[5].1, s("Meiryo"), "a literal face is used as authored");
+        assert_eq!(
+            runs[6].1, None,
+            "typeface=\"\" leaves the application default"
+        );
+        assert_eq!(
+            runs[7].1, None,
+            "a level without ea leaves the application default"
+        );
+        // defPPr lang has no effect: no lang selects no script.
+        assert_eq!(runs[8].1, s("Meiryo"));
+
+        let major = text_box(
+            "major",
+            "",
+            r#"<a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:pPr lvl="1"/><a:r><a:rPr lang="he-IL"/><a:t>a</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(major[0], (s("Garamond"), s("HGSoeiKakugothicUB"), None));
+        assert_eq!(
+            major[1].2,
+            s("Tahoma"),
+            "fontRef major supplies +mj-cs at every level"
+        );
+
+        let over = text_box(
+            "major",
+            r#"<a:lvl1pPr><a:defRPr lang="ja-JP"><a:ea typeface="+mn-ea"/></a:defRPr></a:lvl1pPr>"#,
+            r#"<a:p><a:r><a:rPr/><a:t>a</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(
+            over[0].1,
+            s("Yu Mincho"),
+            "the shape lstStyle beats fontRef, and its lang inherits"
+        );
+    }
+
     /// ECMA-376 §19.3.1.52 / §21.1.2.3.7: a title with no local Latin
     /// typeface inherits titleStyle's +mj-lt, resolved through the current
     /// master's major Latin theme font.
@@ -5703,8 +5843,10 @@ mod tests {
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master_xml).unwrap();
         let faces = parse_master_level_faces(master_doc.root_element(), &theme, None);
-        assert_eq!(faces["title"][0].as_deref(), Some("Arial Black"));
-        assert_eq!(faces["ctrTitle"][0].as_deref(), Some("Arial Black"));
+        // The chain keeps the theme token; the face follows the run language
+        // once the cascade is complete (issue #1627).
+        assert_eq!(faces["title"][0].as_deref(), Some("+mj-lt"));
+        assert_eq!(faces["ctrTitle"][0].as_deref(), Some("+mj-lt"));
 
         let placeholders = LayoutPlaceholders {
             by_type_level_faces: faces,
@@ -8277,6 +8419,7 @@ mod tests {
             let dts = crate::master::DefaultTextLevels {
                 faces,
                 sizes: [None; 9],
+                ..Default::default()
             };
             let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
             parse_table(

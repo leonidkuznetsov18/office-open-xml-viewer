@@ -209,6 +209,15 @@ pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
                 map.insert(format!("{prefix}-{axis}"), typeface.clone());
             }
         }
+        // CT_SupplementalFont (§20.1.4.1.16): the per-script faces a theme
+        // token resolves to for a run whose language selects that script
+        // (issue #1627). A script with conflicting duplicates is ambiguous
+        // and names no face.
+        for font in &group.supplemental {
+            if let Some(typeface) = group.typeface_for_script(&font.script) {
+                map.insert(theme_script_key(prefix, &font.script), typeface.to_owned());
+            }
+        }
     }
 
     let root = doc.root_element();
@@ -351,6 +360,12 @@ pub(crate) fn parse_clr_map_ovr(xml: &str) -> Option<HashMap<String, String>> {
     let ovr = child(doc.root_element(), "clrMapOvr")?;
     let override_node = child(ovr, "overrideClrMapping")?;
     Some(parse_clr_map_node(override_node))
+}
+
+/// Theme-map key of a major (`+mj`) or minor (`+mn`) supplemental script
+/// font, e.g. `+mn-script-Jpan`.
+pub(crate) fn theme_script_key(set_prefix: &str, script: &str) -> String {
+    format!("{set_prefix}-script-{script}")
 }
 
 /// Resolve a theme typeface reference (e.g. "+mj-lt") to the actual font family name.

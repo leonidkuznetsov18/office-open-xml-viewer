@@ -12,10 +12,11 @@ use crate::fill::{
     parse_xfrm, EffectLst,
 };
 use crate::master::{DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders};
+use crate::script_font::{resolve_slot_face, theme_token_set, FontSlot};
 use crate::text::{
-    complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
-    resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes, LevelIndents,
-    LevelRunProperties, HARD_DEFAULT_LATIN_FACE,
+    complete_level_faces, complete_level_sizes, empty_level_bullets, finalize_latin_face,
+    parse_text_body, resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes,
+    LevelIndents, LevelRunProperties, RunProperties, HARD_DEFAULT_LATIN_FACE,
 };
 use crate::theme::{PptxRawSchemeResolver, PptxSchemeResolver, PptxThemeSource};
 use crate::types::*;
@@ -1174,6 +1175,16 @@ pub(crate) fn parse_shape(
     //   ordinary shape: p:style fontRef (face only) → defaultTextStyle.
     // The shape's own lstStyle, the paragraph defRPr and the run are applied
     // over these in parse_text_body.
+    // DrawingML §20.1.4.2.10: a shape style's fontRef names the theme
+    // major/minor collection (idx none names none).
+    let style_font_set = style_node
+        .and_then(|s| child(s, "fontRef"))
+        .and_then(|fr| attr(&fr, "idx"))
+        .and_then(|idx| match idx.as_str() {
+            "major" => Some("+mj"),
+            "minor" => Some("+mn"),
+            _ => None,
+        });
     let (chain_faces, chain_sizes): (LevelFaces, LevelFontSizes) = if ph_node.is_some() {
         if placeholder_inherits {
             (
@@ -1189,14 +1200,8 @@ pub(crate) fn parse_shape(
         // text box's defaultTextStyle face yields to fontRef minor/major, and
         // fontRef none leaves the defaultTextStyle face; sizes still come from
         // defaultTextStyle.
-        let style_face = style_node
-            .and_then(|s| child(s, "fontRef"))
-            .and_then(|fr| attr(&fr, "idx"))
-            .and_then(|idx| match idx.as_str() {
-                "major" => resolve_latin_face("+mj-lt", theme),
-                "minor" => resolve_latin_face("+mn-lt", theme),
-                _ => None,
-            });
+        let style_face =
+            style_font_set.and_then(|set| resolve_latin_face(&format!("{set}-lt"), theme));
         let faces = match style_face {
             Some(face) => std::array::from_fn(|_| Some(face.clone())),
             None => lph.default_text.faces.clone(),
@@ -1240,6 +1245,22 @@ pub(crate) fn parse_shape(
         } else {
             levels
         }
+    } else if ph_node.is_none() {
+        // Ordinary text inherits the defaultTextStyle level's ea/cs faces and
+        // language; a fontRef major/minor replaces the ea/cs faces with its
+        // collection's tokens at every level, below the shape's own lstStyle
+        // (issue #1627: N10, N13, N20, I26, P31-P36).
+        let dts = &lph.default_text;
+        std::array::from_fn(|level| {
+            let (ea, cs) = match style_font_set {
+                Some(set) => (Some(format!("{set}-ea")), Some(format!("{set}-cs"))),
+                None => (
+                    dts.east_asian[level].clone(),
+                    dts.complex_script[level].clone(),
+                ),
+            };
+            RunProperties::script_base(ea, cs, dts.lang[level].clone(), dts.alt_lang[level].clone())
+        })
     } else {
         std::array::from_fn(|_| Default::default())
     };
@@ -2121,22 +2142,48 @@ pub(crate) fn resolve_table_cell_style(
 /// style's tcTxStyle face, else the presentation defaultTextStyle level, else
 /// the hard default. Observed (issue #1620): a cell of a built-in table style
 /// rendered in the master theme's minor font even when defaultTextStyle named
-/// another face.
+/// another face. Runs without their own ea/cs face take the tcTxStyle fontRef
+/// collection's ea/cs tokens, else the defaultTextStyle level's, resolved for
+/// the run language like a text box's (issue #1627).
 pub(crate) fn complete_table_cell_faces(
     cell: &mut TableCell,
     style_face: Option<&str>,
     default_text: &DefaultTextLevels,
+    theme: &HashMap<String, String>,
 ) {
     let Some(body) = cell.text_body.as_mut() else {
         return;
     };
+    let style_set = style_face.and_then(theme_token_set);
     for paragraph in &mut body.paragraphs {
+        let level = (paragraph.lvl as usize).min(8);
         if paragraph.def_font_family.is_none() {
-            let level = (paragraph.lvl as usize).min(8);
-            paragraph.def_font_family = style_face
+            let face = style_face
                 .map(str::to_owned)
                 .or_else(|| default_text.faces[level].clone())
                 .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
+            paragraph.def_font_family = finalize_latin_face(face.as_deref(), theme, None);
+        }
+        let (ea, cs) = match style_set {
+            Some(set) => (Some(format!("{set}-ea")), Some(format!("{set}-cs"))),
+            None => (
+                default_text.east_asian[level].clone(),
+                default_text.complex_script[level].clone(),
+            ),
+        };
+        for run in &mut paragraph.runs {
+            let TextRun::Text(run) = run else { continue };
+            let (lang, alt) = (run.lang.as_deref(), run.alt_lang.as_deref());
+            if run.font_family_ea.is_none() {
+                run.font_family_ea = ea
+                    .as_deref()
+                    .and_then(|f| resolve_slot_face(f, FontSlot::EastAsian, theme, lang, alt));
+            }
+            if run.font_family_cs.is_none() {
+                run.font_family_cs = cs
+                    .as_deref()
+                    .and_then(|f| resolve_slot_face(f, FontSlot::ComplexScript, theme, lang, alt));
+            }
         }
     }
 }
@@ -2274,14 +2321,14 @@ pub(crate) fn parse_table(
                     .font
                     .as_deref()
                     .and_then(|face| resolve_latin_face(face, theme));
-                complete_table_cell_faces(cell, style_face.as_deref(), default_text);
+                complete_table_cell_faces(cell, style_face.as_deref(), default_text, theme);
 
                 // Direct `tcPr` formatting is the final tier. The presence flags
                 // preserve an authored noFill/no-line, which is not equivalent to
                 // an omitted property inheriting the table style.
                 apply_resolved_table_cell_style(cell, effective);
             } else {
-                complete_table_cell_faces(cell, None, default_text);
+                complete_table_cell_faces(cell, None, default_text, theme);
                 // ── Fallback for built-in styles not defined in tableStyles.xml ──
                 // Approximate "Medium Style 2": accent1 header fill + thin outer box + row separators.
                 let thin = Stroke {

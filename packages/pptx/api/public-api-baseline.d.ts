@@ -2161,6 +2161,8 @@ export interface TextRunData {
     fontFamilyEa?: string;
     fontFamilyCs?: string;
     fontFamilySym?: string;
+    lang?: string;
+    altLang?: string;
     baseline?: number;
     caps?: 'none' | 'small' | 'all';
     letterSpacing?: number;
