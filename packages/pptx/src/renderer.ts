@@ -814,6 +814,10 @@ interface LayoutLine {
    *  left-aligned, not stretched — like the paragraph's last line (§20.1.10.59).
    *  `dist`/`thaiDist` still fill every line, including these. */
   endsWithBreak?: boolean;
+  /** The a:br / endParaRPr marks that size this line with text (see
+   * `followingMark`). They take part in the line metrics only: they draw
+   * nothing and are not layout pieces. */
+  metricMarks?: LayoutSegment[];
 }
 
 /**
@@ -1470,6 +1474,9 @@ export function layoutParagraph(
   firstLineIndentPx: number = 0,
 ): LayoutLine[] {
   const input: DrawingMlInputRun<LayoutSegment>[] = [];
+  // The line-metric mark of every a:br, keyed by its input index (see
+  // `followingMark` below).
+  const breakMarks = new Map<number, LayoutSegment>();
   for (const [sourceRunId, run] of para.runs.entries()) {
     if (run.type === 'break') {
       const sizePx = run.fontSize != null
@@ -1484,12 +1491,15 @@ export function layoutParagraph(
             font: buildFont(bold, italic, sizePx, family, rc, ''),
             underline: false, strikethrough: false,
             lineMetric: lineMetricFor(family, bold, italic, rc),
-            // Only a face the break authors itself is measured to size its line
-            // at the preceding run's size (#1636); an inherited face keeps the
-            // break's own size.
-            ...(run.fontFamily != null ? { markFace: { family, bold, italic } } : {}),
           }
         : undefined;
+      breakMarks.set(input.length, {
+        text: '', sizePx, color: defaultColor,
+        font: buildFont(bold, italic, sizePx, family, rc, ''),
+        underline: false, strikethrough: false,
+        lineMetric: lineMetricFor(family, bold, italic, rc),
+        markFace: { family, bold, italic },
+      });
       input.push({ type: 'break', style });
       continue;
     }
@@ -1663,15 +1673,26 @@ export function layoutParagraph(
         font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
         underline: false, strikethrough: false,
         lineMetric: lineMetricFor(endFamily, endBold, endItalic, rc),
-        ...(para.endFaceAuthored ? { markFace: { family: endFamily, bold: endBold, italic: endItalic } } : {}),
       }
     : undefined;
-  // A line-break or end-of-paragraph mark after text that authors its own face
-  // sizes its line with that face at the size of the run it follows, not at
-  // its own size (#1636 PowerPoint controls: a:br and endParaRPr at 16 / 40 /
-  // 80 pt after 24 pt and 60 pt runs, in the same or another face, both line
-  // models). A mark alone on its line keeps its own size (the empty-line rules
-  // above); a mark with an inherited face keeps the earlier behaviour.
+  const endMark: LayoutSegment | undefined = end
+    ? {
+        text: '', sizePx: endSizePx, color: defaultColor,
+        font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
+        underline: false, strikethrough: false,
+        lineMetric: lineMetricFor(endFamily, endBold, endItalic, rc),
+        markFace: { family: endFamily, bold: endBold, italic: endItalic },
+      }
+    : undefined;
+  // A line-break or end-of-paragraph mark after text sizes its line with its
+  // face at the size of the run it follows, never at its own size (PowerPoint
+  // reference-export controls, both line models and fontAlgn base / t / b):
+  // - #1636: a:br and endParaRPr authoring a face, at 16 / 40 / 80 pt after
+  //   24 pt and 60 pt runs, in the run's face or another;
+  // - #1663: the same marks without a face of their own (a:br without rPr,
+  //   lang-only or size-only rPr / endParaRPr) contribute the face they
+  //   inherit from the list style. An omitted endParaRPr contributes nothing.
+  // A mark alone on its line keeps its own size (the empty-line rules above).
   const followingMark = (mark: LayoutSegment, lineSegments: readonly LayoutSegment[]): LayoutSegment => {
     const previous = lineSegments[lineSegments.length - 1];
     if (!previous || !mark.markFace || previous.sizePx === mark.sizePx) return { ...mark, text: '' };
@@ -1706,16 +1727,19 @@ export function layoutParagraph(
       return { ...part.style, text: '' };
     })),
     ];
-    const breakStyle = line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
-      ? (input[line.endBreakRun] as { style?: LayoutSegment }).style
-      : undefined;
+    const endsInBreak = line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break';
+    const breakStyle = endsInBreak ? (input[line.endBreakRun!] as { style?: LayoutSegment }).style : undefined;
+    const breakMark = endsInBreak ? breakMarks.get(line.endBreakRun!) : undefined;
     const hasText = line.segments.length > 0;
+    const metricMarks = hasText
+      ? [
+          ...(breakMark ? [followingMark(breakMark, content)] : []),
+          ...(isLastLine && endMark ? [followingMark(endMark, content)] : []),
+        ]
+      : [];
     return {
-      segments: [
-        ...content,
-        ...(breakStyle ? [hasText ? followingMark(breakStyle, content) : { ...breakStyle, text: '' }] : []),
-        ...(isLastLine && hasText && endStyle?.markFace ? [followingMark(endStyle, content)] : []),
-      ],
+      segments: [...content, ...(!hasText && breakStyle ? [{ ...breakStyle, text: '' }] : [])],
+      ...(metricMarks.length > 0 ? { metricMarks } : {}),
       ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
     };
   });
@@ -4520,6 +4544,14 @@ export function renderTextBody(
             if (resolved > resolvedFontLine) resolvedFontLine = resolved;
           }
         }
+      }
+      // Break / end-of-paragraph marks after text: their face at the size of
+      // the run they follow (layoutParagraph `followingMark`). A mark whose
+      // face has no reference metrics (a generic or embedded family) draws
+      // nothing, so it is left out rather than taking the whole body off the
+      // metric model.
+      for (const mark of line.metricMarks ?? []) {
+        if (mark.lineMetric !== undefined) metricRuns.push({ sizePx: mark.sizePx, face: mark.lineMetric });
       }
       if (maxSizePx === 0) maxSizePx = paraDefaultFontSizePx;
       const textMaxSizePx = maxSizePx;

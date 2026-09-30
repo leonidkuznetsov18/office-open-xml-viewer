@@ -8072,11 +8072,10 @@ mod tests {
         );
     }
 
-    /// Review regression (#1636): an end-of-paragraph or break mark authors a
-    /// face only when its own a:latin resolves; an unresolved theme token
-    /// inherits like an omitted face.
+    /// A break carries only its own resolved latin face: an unresolved theme
+    /// token leaves it to inherit the paragraph face (#1636, #1663).
     #[test]
-    fn test_mark_face_authored_only_when_resolved() {
+    fn test_break_face_is_own_resolved_face() {
         let rels = HashMap::new();
         let bytes = empty_zip_bytes();
         let mut zip = PptxZip::new(Cursor::new(bytes)).unwrap();
@@ -8119,15 +8118,16 @@ mod tests {
         let empty = HashMap::new();
         let themed = HashMap::from([("+mn-lt".to_owned(), "Meiryo".to_owned())]);
         let token = r#"<latin typeface="+mn-lt"/>"#;
-        let unresolved = parse(&empty, token);
-        assert!(!unresolved.end_face_authored);
-        assert_eq!(break_face(&unresolved), None);
-        let resolved = parse(&themed, token);
-        assert!(resolved.end_face_authored);
-        assert_eq!(break_face(&resolved).as_deref(), Some("Meiryo"));
-        let literal = parse(&empty, r#"<latin typeface="Meiryo"/>"#);
-        assert!(literal.end_face_authored);
-        assert!(!parse(&empty, "").end_face_authored);
+        assert_eq!(break_face(&parse(&empty, token)), None);
+        assert_eq!(
+            break_face(&parse(&themed, token)).as_deref(),
+            Some("Meiryo")
+        );
+        assert_eq!(
+            break_face(&parse(&empty, r#"<latin typeface="Meiryo"/>"#)).as_deref(),
+            Some("Meiryo")
+        );
+        assert_eq!(break_face(&parse(&empty, "")), None);
     }
 
     /// ECMA-376 §21.1.2.2.7 — `<a:pPr eaLnBrk>` (xsd:boolean, default true)
