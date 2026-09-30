@@ -33,14 +33,11 @@ export function nextLineTabStop(
   stops: readonly ResolvedTabStop[],
   interval: number,
   leadingShift: number,
-  marginWidth: number,
-  scale: number,
 ): ResolvedTabStop | null {
   const stop = nextTabStop(pen, stops, interval);
   if (!stop || leadingShift <= 0) return stop;
   const custom = stops.some((entry) => entry.alignment !== 'bar' && entry.pos === stop.pos);
-  return { ...stop, pos: wordFloatTabStopPosition(stop.pos, custom, pen,
-    leadingShift, marginWidth, interval === DEFAULT_TAB_PT * scale, scale) };
+  return { ...stop, pos: wordFloatTabStopPosition(stop.pos, custom, leadingShift) };
 }
 
 /** §17.3.3.23 / §17.18.71: align a positional tab's following cell within its
@@ -67,6 +64,9 @@ export interface BidiTabItem {
    * physical reading-frame offset. */
   decimalOffset?: number;
   ptab?: LayoutTabSeg['ptab'];
+  readingGap?: number;
+  /** Authored leader retained with a gap already allocated during fitting. */
+  leader?: TabStop['leader'];
 }
 
 
@@ -147,7 +147,7 @@ export function layoutBidiTabStops(
   startPenPx: number,
   leftLimitPx: number,
   intervalPx: number,
-  frame?: Readonly<{ leadingShift: number; indentStart: number; indentEnd: number; bandStart: number; bandEnd: number; narrowed: boolean; scale: number }>,
+  frame?: Readonly<{ leadingShift: number; indentStart: number; indentEnd: number; bandStart: number; bandEnd: number; narrowed: boolean }>,
 ): BidiTabResult[] {
   const n = items.length;
   const width = items.map((it) => it.width);
@@ -189,6 +189,12 @@ export function layoutBidiTabStops(
       pen += width[i];
       continue;
     }
+    if (it.readingGap !== undefined) {
+      width[i] = it.readingGap;
+      leader[i] = it.leader;
+      pen += width[i];
+      continue;
+    }
     if (it.ptab && frame) {
       const following = followAlignmentWidth(i + 1, 'leading').total;
       const referenceStart = it.ptab.relativeTo === 'indent' ? frame.indentStart : 0;
@@ -198,12 +204,15 @@ export function layoutBidiTabStops(
       const target = positionalTabTarget(it.ptab.alignment, box.start, box.end, following);
       // §17.3.3.23 reachability was checked by the queue-owning iterator.
       // An unreachable target on an empty line can only contribute zero gap.
-      width[i] = Math.max(0, target - pen);
+      // The fitted prefix, rather than the full queued cell, owns alignment.
+      // The final projection may reduce a gap but cannot enlarge its allocation
+      // past the fitting band (library policy, not an Office overflow fallback).
+      width[i] = Math.max(0, Math.min(target, frame.bandEnd - following) - pen);
       pen += width[i];
       continue;
     }
     const stop = frame
-      ? nextLineTabStop(pen, customStopsPx, intervalPx, frame.leadingShift, leftLimitPx, frame.scale)
+      ? nextLineTabStop(pen, customStopsPx, intervalPx, frame.leadingShift)
       : nextTabStopRtl(pen, customStopsPx, intervalPx);
     if (!stop) {
       // No stop further left: the tab collapses (following content continues).
@@ -229,8 +238,10 @@ export function layoutBidiTabStops(
     }
     // Pin content that would fall past the left text margin onto the margin: the
     // following cell spans [target, target + fw] in reading-frame margins, so its
-    // far (left) edge must stay ≤ leftLimitPx.
-    if ((!frame || frame.leadingShift <= 0) && target + fw > leftLimitPx) target = leftLimitPx - fw;
+    // far (left) edge must stay within the paragraph/float band. This is
+    // library containment policy, including for margin-reference targets.
+    const trailingLimit = frame?.bandEnd ?? leftLimitPx;
+    if (target + fw > trailingLimit) target = trailingLimit - fw;
     // Never let a tab move the pen backwards (right).
     if (target < pen) target = pen;
     width[i] = target - pen;
@@ -247,7 +258,6 @@ export interface BidiTabPostPassInput {
   readonly currentLine: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[];
   readonly marginRightPx: number;
   readonly maxWidth: number;
-  readonly scale: number;
   readonly lineXOffset: number;
   readonly lineMaxWidth: number;
   readonly isFirst: boolean;
@@ -270,9 +280,9 @@ export interface BidiTabPostPassInput {
 /** One reading-frame projection for positional-tab reachability and the
  * final bidi walk. Both must compare the pen with the same float/indent band. */
 export function bidiTabFrame(input: Pick<BidiTabPostPassInput,
-  'marginRightPx' | 'maxWidth' | 'scale' | 'lineXOffset' | 'lineMaxWidth' |
+  'marginRightPx' | 'maxWidth' | 'lineXOffset' | 'lineMaxWidth' |
   'isFirst' | 'firstIndent' | 'tabOriginPx'>) {
-  const { marginRightPx, maxWidth, scale, lineXOffset, lineMaxWidth, isFirst, firstIndent, tabOriginPx } = input;
+  const { marginRightPx, maxWidth, lineXOffset, lineMaxWidth, isFirst, firstIndent, tabOriginPx } = input;
   const startPen = marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? firstIndent : 0);
   return {
     startPen,
@@ -284,7 +294,6 @@ export function bidiTabFrame(input: Pick<BidiTabPostPassInput,
       bandStart: marginRightPx - (lineXOffset + lineMaxWidth) + (isFirst ? Math.min(0, firstIndent) : 0),
       bandEnd: marginRightPx - lineXOffset,
       narrowed: lineXOffset !== 0 || lineMaxWidth !== maxWidth,
-      scale,
     },
   };
 }
@@ -314,6 +323,8 @@ export function applyBidiTabPostPass(input: BidiTabPostPassInput): number {
     isTab: 'isTab' in s,
     width: s.measuredWidth,
     ptab: 'isTab' in s ? s.ptab : undefined,
+    readingGap: 'isTab' in s ? s.readingGap : undefined,
+    leader: 'isTab' in s ? s.leader : undefined,
   }));
   for (let tabIndex = 0; tabIndex < currentLine.length; tabIndex += 1) {
     if (!('isTab' in currentLine[tabIndex]!)) continue;

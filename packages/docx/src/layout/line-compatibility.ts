@@ -6,9 +6,9 @@ export const WORD_TAB_DISPLACED_READING_FRAME = defineCompatibilityRule({
   id: 'word-float-tab-reading-frame',
   evidence: {
     kind: 'regression-test',
-    reference: 'packages/docx/src/layout/first-line-float-indent.test.ts#keeps the measured overflow tab advance at %s pt font size',
+    reference: 'packages/docx/src/layout/first-line-float-indent.test.ts#$kind $alignment ($count), rtl=$rtl, float=$float matches Word geometry',
   },
-  description: 'Issue #1672 controlled Word exports cover ordinary left/right/center/decimal tabs, one/two tabs, both paragraph directions and either float edge, with no-float counterexamples. Eligibility stays margin-relative (ECMA-376 §17.3.1.37), but an authored target moves with a float-displaced leading line edge. The measured single-token cells stay with the tab even when they overlap the exclusion or overflow the margin. This permits the first atomic token, not an unbounded tab-delimited cell: subsequent legal break opportunities still consume the ordinary line budget. After an authored target carries the pen beyond the margin, the next automatic tab advances 14 pt on the default 36 pt grid: all eight 10 pt cases and the discriminating 20 pt run agree, rejecting a font-scaled space or either grid origin. This is an observed Word rule, not a normative overflow distance; other automatic grids are unmeasured and retain their ordinary grid behavior.',
+  description: 'Issue #1672 controlled Word exports cover ordinary left/right/center/decimal tabs, one/two tabs, both paragraph directions and either float edge, with no-float counterexamples. Eligibility stays margin-relative (ECMA-376 §17.3.1.37), but an authored target moves with a float-displaced leading line edge. Library policy retains this observation only where text fits the available float band. Word also overflows some tab cells into floats or past the margin; that unspecified fallback is intentionally unsupported. Out-of-band targets break the line and following text uses ordinary legal-break and emergency fitting, without an overflow allowance or a fabricated wide reference band.',
 });
 
 /** Projection of {@link WORD_TAB_DISPLACED_READING_FRAME}. The caller has already
@@ -16,15 +16,9 @@ export const WORD_TAB_DISPLACED_READING_FRAME = defineCompatibilityRule({
 export function wordFloatTabStopPosition(
   stopPosition: number,
   custom: boolean,
-  pen: number,
   leadingShift: number,
-  marginWidth: number,
-  defaultGrid: boolean,
-  scale: number,
 ): number {
-  if (leadingShift <= 0) return stopPosition;
-  if (custom) return stopPosition + leadingShift;
-  return pen >= marginWidth && defaultGrid ? pen + 14 * scale : stopPosition;
+  return custom ? stopPosition + Math.max(0, leadingShift) : stopPosition;
 }
 
 export const WORD_POSITIONAL_TAB_AVAILABLE_BAND = defineCompatibilityRule({

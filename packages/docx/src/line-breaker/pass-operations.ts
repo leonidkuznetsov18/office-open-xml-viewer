@@ -287,7 +287,6 @@ export function performFlush(
     currentLine: breakerState.currentLine,
     marginRightPx,
     maxWidth: operationState.maxWidth,
-    scale,
     lineXOffset: breakerState.lineXOffset,
     lineMaxWidth: breakerState.lineMaxWidth,
     isFirst: breakerState.isFirst,

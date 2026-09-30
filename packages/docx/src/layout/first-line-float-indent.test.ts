@@ -83,7 +83,7 @@ describe('first-line indents beside floats through the DOCX parser', () => {
   // so leading/trailing/center positions differ by 4/0/2 pt in RTL (0/4/2 LTR).
   // No-float ordinary tabs retain main's geometry. Five no-float RTL positional
   // cases instead use Word: margin-left, both centers, and both right targets.
-  // Overlap and ink beyond the margin are intentional measured outcomes.
+  // Word overlap is deliberately excluded from the library containment policy.
   const floatStarts = [
     [552, 108, 484, 40], [566, 352, 240, 26],
     [532, 108, 484, 60], [566, 332, 260, 26],
@@ -115,7 +115,7 @@ describe('first-line indents beside floats through the DOCX parser', () => {
     }))));
 
   it.each(matrix)('$kind $alignment ($count), rtl=$rtl, float=$float matches Word geometry', (entry) => {
-    const relativeTo = 'relativeTo' in entry ? entry.relativeTo : undefined;
+    const relativeTo = 'relativeTo' in entry ? entry.relativeTo as 'margin' | 'indent' : undefined;
     const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', entry.rtl,
       entry.float === 'right' ? 268 : 0, {
         alignment: entry.alignment, count: entry.count,
@@ -135,19 +135,34 @@ describe('first-line indents beside floats through the DOCX parser', () => {
       ]);
     } else {
       const index = (entry.rtl ? 2 : 0) + (entry.float === 'right' ? 1 : 0);
-      expect(texts.map((text) => text.bounds)).toEqual([
-        { xPt: floatStarts[entry.tabIndex][index], yPt: 72, widthPt: 20, heightPt: 12 },
-      ]);
+      const expectedX = floatStarts[entry.tabIndex][index];
+      const bandStart = entry.float === 'left' ? 272 : 72;
+      const bandEnd = entry.float === 'right' ? 340 : 540;
+      if (expectedX >= bandStart && expectedX + 20 <= bandEnd) {
+        expect(texts.map((text) => text.bounds)).toEqual([
+          { xPt: expectedX, yPt: 72, widthPt: 20, heightPt: 12 },
+        ]);
+      }
+      for (const text of texts) {
+        expect(text.bounds.xPt).toBeGreaterThanOrEqual(bandStart);
+        expect(text.bounds.xPt + text.bounds.widthPt).toBeLessThanOrEqual(bandEnd);
+      }
     }
   });
 
-  it.each([false, true])('fits a margin-aligned cell independently of the paragraph right indent, positional=%s', (positional) => {
+  it.each([false, true])('wraps a margin-aligned cell wider than the paragraph band, positional=%s', (positional) => {
     const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
       { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional, noFloat: true }));
-    expect(paragraph.lines).toHaveLength(1);
-    const texts = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
-    const last = texts.at(-1);
-    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(positional ? 540 : 352);
+    expect(paragraph.lines.length).toBeGreaterThan(1);
+    for (const line of paragraph.lines) {
+      for (const text of line.placements) {
+        if (text.kind === 'text') {
+          expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+          const trailingSpaceWidth = (text.text.length - text.text.trimEnd().length) * 5;
+          expect(text.bounds.xPt + text.bounds.widthPt - trailingSpaceWidth).toBeLessThanOrEqual(180);
+        }
+      }
+    }
   });
 
   it('wraps content after an automatic tab in a narrowed float window', () => {
@@ -170,38 +185,77 @@ describe('first-line indents beside floats through the DOCX parser', () => {
     else expect(paragraph.lines).toHaveLength(2);
   });
 
-  it.each(matrix)('long $kind $alignment ($count), rtl=$rtl, float=$float retains legal line breaks', (entry) => {
-    const relativeTo = 'relativeTo' in entry ? entry.relativeTo : undefined;
-    const content = (entry.alignment === 'decimal' ? '12.3 ' : 'word ').repeat(100).trim();
+  const followOnContents = [
+    { script: 'Latin words', content: 'word '.repeat(40).trim() },
+    { script: 'CJK', content: '漢'.repeat(100) },
+    { script: 'Thai dictionary', content: 'ภาษาไทย'.repeat(20) },
+    { script: 'unbreakable', content: 'a'.repeat(100) },
+    { script: 'mixed', content: 'word 漢字ภาษาไทย abc-def '.repeat(20).trim() },
+  ];
+  const fittingMatrix = [...matrix, ...[false, true].flatMap((rtl) =>
+    (['none', 'left', 'right'] as const).map((float) => ({
+      alignment: 'left', count: 1, rtl, float, kind: 'automatic', tabIndex: 0,
+    })))].flatMap((entry) => followOnContents.map((content) => ({ ...entry, ...content })));
+
+  it.each(fittingMatrix)('$script after $kind $alignment ($count), rtl=$rtl, float=$float retains normal fitting', (entry) => {
+    const relativeTo = 'relativeTo' in entry ? entry.relativeTo as 'margin' | 'indent' : undefined;
     const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', entry.rtl,
       entry.float === 'right' ? 268 : 0, {
-        alignment: entry.alignment, count: entry.count, text: content,
+        alignment: entry.alignment, count: entry.count, text: entry.content,
         positional: relativeTo !== undefined, relativeTo, noFloat: entry.float === 'none',
+        automatic: entry.kind === 'automatic',
       }));
     expect(paragraph.lines.length).toBeGreaterThan(1);
     const textLines = paragraph.lines.map((line) => line.placements.filter((node) => node.kind === 'text'));
     expect(textLines.flat().map((text) => text.text).join('').replace(/\s/g, ''))
-      .toBe(content.replace(/\s/g, ''));
-    // A displaced tab may itself pass the margin, as the short Word controls
-    // demonstrate. That does not grant its entire following cell infinite room.
+      .toBe(entry.content.replace(/\s/g, ''));
     for (const texts of textLines) {
-      expect(texts.reduce((total, text) => total + text.bounds.widthPt, 0)).toBeLessThanOrEqual(468);
-    }
-    for (const texts of textLines.slice(1)) {
       for (const text of texts) {
-        expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
-        expect(text.bounds.xPt + text.bounds.widthPt).toBeLessThanOrEqual(540);
+        if (text.text.trim().length === 0) continue;
+        // Trailing spaces contribute advance but no ink, and normally hang
+        // outside the fitted band. Check the visible text extent instead.
+        const trailingSpaceWidth = (text.text.length - text.text.trimEnd().length) * 5;
+        const left = text.bounds.xPt;
+        const right = text.bounds.xPt + text.bounds.widthPt - trailingSpaceWidth;
+        expect(left).toBeGreaterThanOrEqual(72);
+        expect(right).toBeLessThanOrEqual(540);
+        if (text.bounds.yPt < 172 && entry.float !== 'none') {
+          if (entry.float === 'left') expect(left).toBeGreaterThanOrEqual(272);
+          else expect(right).toBeLessThanOrEqual(340);
+        }
       }
     }
   });
 
-  it.each([10, 20])('keeps the measured overflow tab advance at %s pt font size', (fontSizePt) => {
+  it.each([
+    { positional: false, relativeTo: 'indent' as const, firstCount: 93, firstX: 72 },
+    { positional: true, relativeTo: 'indent' as const, firstCount: 86, firstX: 74 },
+    { positional: true, relativeTo: 'margin' as const, firstCount: 86, firstX: 74 },
+  ])('preserves in-band no-float RTL CJK fitting, positional=$positional, reference=$relativeTo', ({ positional, relativeTo, firstCount, firstX }) => {
+    const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', true, 0,
+      { alignment: 'left', count: 1, text: '漢'.repeat(100), positional, relativeTo, noFloat: true }));
+    const texts = paragraph.lines.map((line) => line.placements.filter((node) => node.kind === 'text'));
+    expect(texts.map((line) => line.map((text) => text.text).join('')))
+      .toEqual(['漢'.repeat(firstCount), '漢'.repeat(100 - firstCount)]);
+    expect(texts[0][0].bounds.xPt).toBe(firstX);
+  });
+
+  it('splits CJK at legal opportunities after an in-band automatic tab', () => {
+    const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', false, 268,
+      { alignment: 'left', count: 1, text: '漢'.repeat(50), automatic: true }));
+    expect(paragraph.lines).toHaveLength(2);
+    const first = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
+    expect(first.map((text) => text.text).join('')).toBe('漢'.repeat(46));
+    const last = first.at(-1);
+    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(338);
+  });
+
+  it.each([10, 20])('contains an out-of-band tab cell at %s pt font size', (fontSizePt) => {
     const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', false, 0,
       { alignment: 'left', count: 2, text: 'word', fontSizePt }), fontSizePt * 0.6);
     const text = paragraph.lines.flatMap((line) => line.placements).find((node) => node.kind === 'text');
-    expect(paragraph.lines).toHaveLength(1);
-    expect(text?.bounds.xPt).toBe(566);
-    expect(text?.bounds.yPt).toBe(72);
+    expect(text?.bounds.xPt).toBeGreaterThanOrEqual(272);
+    expect((text?.bounds.xPt ?? 0) + (text?.bounds.widthPt ?? 0)).toBeLessThanOrEqual(540);
     expect(text?.bounds.widthPt).toBe(fontSizePt * 2.4);
   });
 

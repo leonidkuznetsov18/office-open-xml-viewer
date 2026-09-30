@@ -258,12 +258,15 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       ? trailingSpaceW
       : undefined;
   s.latinSpaceCompressionPx = undefined;
+  // Library containment policy: an RTL line is anchored at its right edge,
+  // so even an invisible trailing-space advance shifts visible LTR cells left.
+  // Count that advance during fitting instead of admitting glyphs past the band.
   const fitWidthFor = (
     widthPx: number,
     trailingSpacePx: number,
     next: LayoutSeg | undefined,
   ): number =>
-    justifiedCandidateFitWidth(widthPx, trailingSpacePx, next, {
+    justifiedCandidateFitWidth(widthPx, context.baseRtl ? 0 : trailingSpacePx, next, {
       isJustified,
       stretchLastLine,
       lineMaxWidth: breakerState.lineMaxWidth,
@@ -476,6 +479,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // positional tab additionally owns a normative next-line decision, which
   // must happen here, while the queue can still move (§17.3.3.23).
   if (baseRtl) {
+    let oversizedMarginLeading = false;
     if (seg.ptab) {
       const input = { ...context, ...breakerState };
       breakerState.currentWidth += applyBidiTabPostPass(input);
@@ -489,10 +493,54 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
         seg.ptab.relativeTo === 'indent' ? frame.indentStart : 0,
         seg.ptab.relativeTo === 'indent' ? frame.indentEnd : leftLimit,
         frame.bandStart, frame.bandEnd, frame.narrowed);
+      // Library scope policy preserves the established no-float normal-fitting
+      // contract for an oversized leading margin cell. Its complete contents
+      // cannot align within the reference, so retain the ordinary automatic
+      // gap used by that contract, without claiming an additional observed rule.
+      oversizedMarginLeading = !frame.narrowed && seg.ptab.alignment === 'left'
+        && seg.ptab.relativeTo === 'margin' && followingWidth > box.end - box.start;
       const target = positionalTabTarget(seg.ptab.alignment, box.start, box.end, followingWidth);
       if (target < startPen + breakerState.currentWidth && breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);
         breakerState.queue.unshift(seg);
+        return;
+      }
+    }
+    const input = { ...context, ...breakerState };
+    const { startPen, frame } = bidiTabFrame(input);
+    if (frame.narrowed || oversizedMarginLeading || seg.ptab?.relativeTo === 'indent'
+      || breakerState.currentLine.some((item) => 'isTab' in item)) {
+      // Resolve leading gaps before fitting, in the same reading frame as
+      // paint. A provisional zero gap can fit text that the final tab would
+      // push into the exclusion. In an unnarrowed ordinary first cell the
+      // existing post-pass can reduce its gap as text fills the band, so keep
+      // that in-band fitting contract. Before another tab, preceding gaps must
+      // be fixed; an indent-relative leading ptab has an authored fixed gap.
+      // Aligned cells retain post-pass alignment,
+      // bounded by the actual band after normal text fitting.
+      breakerState.currentWidth += applyBidiTabPostPass(input);
+      const pen = startPen + breakerState.currentWidth;
+      const stop = seg.ptab && !oversizedMarginLeading ? undefined : nextLineTabStop(pen,
+        context.bidiCustomStopsPx, context.bidiIntervalPx, frame.leadingShift);
+      const leading = seg.ptab ? seg.ptab.alignment === 'left'
+        : !stop || tabAlignmentRole(stop.alignment) === 'leading';
+      if (leading) {
+        const target = seg.ptab && !oversizedMarginLeading
+          ? wordPositionalTabReferenceBox(
+            seg.ptab.relativeTo === 'indent' ? frame.indentStart : 0,
+            seg.ptab.relativeTo === 'indent' ? frame.indentEnd : input.marginRightPx + tabOriginPx,
+            frame.bandStart, frame.bandEnd, frame.narrowed).start
+          : stop?.pos ?? pen;
+        if (target > frame.bandEnd && breakerState.currentLine.length > 0) {
+          flush(undefined, false, seg.src);
+          breakerState.queue.unshift(seg);
+          return;
+        }
+        const gap = target > frame.bandEnd ? 0 : Math.max(0, target - pen);
+        seg.readingGap = gap;
+        seg.measuredWidth = gap;
+        seg.leader = stop?.leader;
+        addToLine(seg, gap, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
         return;
       }
     }
@@ -547,12 +595,20 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
       // segment so the line-height reflects the ptab's font.
       tabW = 0;
     }
+    if (breakerState.currentWidth + tabW > availW()) {
+      if (breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        return;
+      }
+      tabW = 0;
+    }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    // §17.3.3.23 margin references ignore paragraph indents. A cell fitting
-    // that reference band retains its allocation at the target; a wider
-    // cell uses ordinary line breaking instead of an unlimited atomic commit.
-    if (seg.ptab.alignment !== 'left' && followW <= box.end - box.start) {
+    // §17.3.3.23 selects the reference target independently of paragraph
+    // indents. Library policy limits allocation to the actual paragraph/float
+    // band: a fitting cell stays aligned, and all other cells use normal breaks.
+    if (seg.ptab.alignment !== 'left' && breakerState.currentWidth + followW <= availW()) {
       commitAlignedTabCell(context);
     }
     return;
@@ -570,7 +626,7 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     leader: t.leader,
   }));
   const stop = nextLineTabStop(curMarginPx, customStopsPx, defaultTabPt * scale,
-    lineOrigin, marginRightPx + tabOriginPx, scale);
+    lineOrigin);
   seg.resolvedAlignment = stop?.alignment ?? 'left';
   // Convert the chosen margin-space stop back to paraX-relative px.
   const stopParaX = stop ? stop.pos - tabOriginPx : absFromParaX;
@@ -593,16 +649,21 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
           : following.totalWidth;
     let tabW = stopX - absFromParaX - alignmentWidth;
     if (tabW <= 0) tabW = 0;
+    if (breakerState.currentWidth + tabW > availW()) {
+      if (breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        return;
+      }
+      tabW = 0;
+    }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
     // Keep an aligned cell atomic only when it fits the available band.
     // Oversized cells return to the iterator at their ordinary break sites.
-    // §17.3.1.37 stops use text-margin coordinates, independent of the
-    // paragraph's right indent. Only a float exclusion narrows this reference
-    // band; an indented footer can still align a fitting cell at the margin.
-    const cellBandWidth = breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== maxWidth
-      ? availW() : marginRightPx + tabOriginPx;
-    if (following.totalWidth <= cellBandWidth) {
+    // Stop coordinates do not confer an allocation outside the paragraph's
+    // indents. Library containment applies even when no float narrows the band.
+    if (breakerState.currentWidth + following.totalWidth <= availW()) {
       commitAlignedTabCell(context);
     }
     return;
@@ -613,20 +674,18 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // "after all custom stops" automatic grid, so there is no separate fallback.
   let tabWidth = stopParaX - absFromParaX;
   if (stop) seg.leader = stop.leader;
-  // Clamp to avoid negative widths; if tab would overflow the line, wrap instead
-  if (tabWidth <= 0 && breakerState.lineXOffset === 0 && breakerState.lineMaxWidth === maxWidth) {
-    flush(undefined, false, seg.src);
-    breakerState.queue.unshift(seg);
-    return;
+  // ECMA-376 §§17.3.1.37–38: an unavailable stop breaks the line. Library
+  // containment policy also applies to float-displaced targets. On an empty
+  // line an out-of-band tab contributes no gap, so its cell can use the normal
+  // fitting path rather than retrying an unreachable target forever.
+  if (breakerState.currentWidth + tabWidth > availW()) {
+    if (breakerState.currentLine.length > 0) {
+      flush(undefined, false, seg.src);
+      breakerState.queue.unshift(seg);
+      return;
+    }
+    tabWidth = 0;
   }
-  if (breakerState.currentWidth + tabWidth > availW() && breakerState.currentLine.length > 0
-    && breakerState.lineXOffset === 0 && breakerState.lineMaxWidth === maxWidth) {
-    flush(undefined, false, seg.src);
-    breakerState.queue.unshift(seg);
-    return;
-  }
-  // Word permits the tab advance itself beyond a displaced band. Content
-  // continues through normal fitting; this is not an unbounded cell allowance.
   tabWidth = Math.max(0, tabWidth);
   seg.measuredWidth = tabWidth;
   addToLine(seg, tabWidth, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
@@ -675,21 +734,6 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     fitsMeasuredWidth(breakerState.currentWidth + wForFit, availW())
   ) {
     // Fits on current line as-is
-    s.measuredWidth = w;
-    addToLine(s, w, h, asc, desc);
-    appendQueuedIdeographicSpaceSegment(s);
-  } else if (
-    breakerState.currentLine.some((segment) => 'isTab' in segment &&
-      (segment.ptab?.alignment !== undefined && segment.ptab.alignment !== 'left' ||
-        segment.resolvedAlignment !== undefined && tabAlignmentRole(segment.resolvedAlignment) !== 'leading' ||
-        breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== context.maxWidth)) &&
-    breakerState.currentLine.every((segment) => 'isTab' in segment || ('text' in segment && segment.metricOnly === true)) &&
-    wForFit <= availW()
-  ) {
-    // Aligned margin tabs and the Word float/tab controls retain the first
-    // atomic token even beyond the paragraph band. Keep it with the tab; the
-    // next legal break is still fitted normally, rather than committing the
-    // entire tab-delimited remainder without any width budget.
     s.measuredWidth = w;
     addToLine(s, w, h, asc, desc);
     appendQueuedIdeographicSpaceSegment(s);
