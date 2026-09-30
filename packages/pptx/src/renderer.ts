@@ -1475,13 +1475,35 @@ export function paragraphInputRuns(
   breakMarks: Map<number, LayoutSegment>;
 } {
   const input: DrawingMlInputRun<LayoutSegment>[] = [];
-  // Grapheme clusters are segmented over the paragraph's text, not per run:
-  // the previous text run's last emitted segment and its last cluster, so an
-  // extender (combining mark, variation selector, ZWJ, trailing jamo) that
-  // opens the next run joins its base. A cluster is one glyph and can carry
-  // only one format, so the carried extenders take the base run's formatting
-  // (font slot, colour, link, spacing). A line break or equation ends it.
-  let seam: { item: { text: string }; tail: string } | null = null;
+  // Grapheme clusters are segmented once over the paragraph's text, not per
+  // run, so an extender (combining mark, variation selector, ZWJ, trailing
+  // jamo) that opens a run joins its base in the previous run's last segment.
+  // A cluster is one glyph and can carry only one format, so the carried
+  // extenders take the base run's formatting (font slot, colour, link,
+  // spacing). A line break or equation (an LF in the joined text) ends a
+  // cluster. The boundary list is walked with one forward pointer, so the
+  // phase stays linear in the paragraph length however the runs are cut.
+  const runTexts = para.runs.map((run) => {
+    if (run.type !== 'text') return null;
+    const text = run.fieldType === 'slidenum' && slideNumber !== undefined ? String(slideNumber) : run.text;
+    return run.caps === 'all' || run.caps === 'small' ? text.toUpperCase() : text;
+  });
+  const runStarts: number[] = [];
+  let joinedText = '';
+  for (const text of runTexts) {
+    runStarts.push(joinedText.length);
+    joinedText += text ?? '\n';
+  }
+  const clusterBounds = graphemeClusterOffsets(joinedText);
+  clusterBounds.push(joinedText.length);
+  let boundIndex = 0;
+  /** The first cluster boundary at or after `pos`; the pointer only moves forward. */
+  const boundaryFrom = (pos: number): number => {
+    while (boundIndex < clusterBounds.length && clusterBounds[boundIndex] < pos) boundIndex++;
+    return boundIndex < clusterBounds.length ? clusterBounds[boundIndex] : joinedText.length;
+  };
+  // The previous text run's last emitted segment, the base of a carried cluster.
+  let seam: { text: string } | null = null;
   // The line-metric mark of every a:br, keyed by its input index (see
   // `followingMark` in layoutParagraph).
   const breakMarks = new Map<number, LayoutSegment>();
@@ -1540,17 +1562,16 @@ export function paragraphInputRuns(
     const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
     const bold = run.bold ?? para.defBold ?? defaultBold;
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
-    let rawText = run.fieldType === 'slidenum' && slideNumber !== undefined
-      ? String(slideNumber) : run.text;
-    if (run.caps === 'all' || run.caps === 'small') rawText = rawText.toUpperCase();
+    let rawText = runTexts[sourceRunId] ?? '';
+    // Offset of rawText's first code unit in the joined paragraph text.
+    let runOffset = runStarts[sourceRunId];
+    const runEnd = runOffset + rawText.length;
     if (seam && rawText) {
-      const joined = seam.tail + rawText;
-      const firstEnd = graphemeClusterOffsets(joined)[0] ?? joined.length;
-      if (firstEnd > seam.tail.length) {
-        const carried = rawText.slice(0, firstEnd - seam.tail.length);
-        seam.item.text += carried;
-        seam.tail += carried;
-        rawText = rawText.slice(carried.length);
+      const firstEnd = Math.min(boundaryFrom(runOffset), runEnd);
+      if (firstEnd > runOffset) {
+        seam.text += rawText.slice(0, firstEnd - runOffset);
+        rawText = rawText.slice(firstEnd - runOffset);
+        runOffset = firstEnd;
       }
     }
     const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
@@ -1606,14 +1627,12 @@ export function paragraphInputRuns(
     // stacked cell, one shaped horizontal glyph). Which slot a base takes is
     // unchanged.
     let clusterStart = 0;
-    let lastCluster = '';
-    const clusterEnds = graphemeClusterOffsets(rawText);
-    clusterEnds.push(rawText.length);
-    for (const clusterEnd of clusterEnds) {
+    let emitted = false;
+    while (clusterStart < rawText.length) {
+      const clusterEnd = Math.min(boundaryFrom(runOffset + clusterStart + 1), runEnd) - runOffset;
       const cluster = rawText.slice(clusterStart, clusterEnd);
       clusterStart = clusterEnd;
-      if (!cluster) continue;
-      lastCluster = cluster;
+      emitted = true;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
       let glyph = cluster;
       const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
@@ -1638,9 +1657,9 @@ export function paragraphInputRuns(
       groupFamily = face;
     }
     emitGroup();
-    if (lastCluster) {
+    if (emitted) {
       const last = input[input.length - 1];
-      seam = last?.type === 'text' ? { item: last, tail: lastCluster } : null;
+      seam = last?.type === 'text' ? last : null;
     }
   }
 

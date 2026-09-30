@@ -193,3 +193,25 @@ describe('grapheme clusters across run seams', () => {
     });
   }
 });
+
+// One base followed by 80,000 runs that hold only a combining mark: cluster
+// segmentation must stay linear in the paragraph length (a rescan of the
+// growing cluster per run took about 19 s here; main lays the runs out in
+// about 0.35 s).
+describe('cluster segmentation cost', () => {
+  it('handles 80,000 extender-only runs in linear time, horizontal and stacked', () => {
+    const b = body('a', 'wordArtVert', 'Yu Gothic');
+    const r = b.paragraphs[0].runs[0] as TextRunData;
+    b.paragraphs[0].runs = [{ ...r, text: 'a' }, ...Array.from({ length: 80_000 }, () => ({ ...r, text: '\u0301' })), { ...r, text: 'B' }];
+    const start = performance.now();
+    const lines = layoutParagraph(mockCtx().ctx, b.paragraphs[0], 1e9, 24, '#000', SCALE, 0);
+    expect(lines).toHaveLength(1);
+    const [line] = lines;
+    const segs = line.segments.filter((g) => g.text);
+    expect(segs.map((g) => g.text).join('')).toBe(`a${'\u0301'.repeat(80_000)}B`);
+    const { ctx, calls } = mockCtx();
+    renderTextBody(ctx, b, 0, 0, 100, 470, SCALE);
+    expect(calls.map((c) => c.text.length)).toEqual([80_001, 1]);
+    expect(performance.now() - start).toBeLessThan(5_000);
+  }, 60_000);
+});
