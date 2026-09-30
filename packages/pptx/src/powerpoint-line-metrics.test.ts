@@ -435,5 +435,10 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
         expect(() => runBaselines([p], compat)).not.toThrow();
       }
     }
-  });
+    // Six layouts of a 10^5-character line. The cost is linear and the same
+    // as the baseline (non-fontAlgn) path, ~1.2-1.7 s each locally (10^4: 0.3 s,
+    // 2 x 10^5: 3.5 s), so the default 5 s budget is too tight on CI. The size
+    // stays: ~150 000 metric entries are needed to exceed V8's spread-argument
+    // limit (~125 000 here) that this test guards.
+  }, 60_000);
 });
