@@ -3132,9 +3132,7 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_transforms,
                 &bundle.master_alignments,
                 &bundle.master_ea_ln_brk,
-                &bundle.master_space_before,
-                &bundle.master_space_after,
-                &bundle.master_line_spacing,
+                &bundle.master_spacing,
                 layout_theme,
                 layout_dir,
                 layout_rels,
@@ -5002,14 +5000,13 @@ mod tests {
             "ppt/slides",
             None,
             None,
-            None,
-            None,
-            None,
+            &Default::default(),
             None,
             &[None; 9],
             &levels,
             &Default::default(),
             &empty_level_bullets(),
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L,
             &mut zip,
         );
         let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
@@ -5054,14 +5051,13 @@ mod tests {
             "ppt/slides",
             None,
             None,
-            None,
-            None,
-            None,
+            &Default::default(),
             None,
             &[None; 9],
             &std::array::from_fn(|_| Default::default()),
             &Default::default(),
             &empty_level_bullets(),
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L,
             &mut zip,
         );
         let [TextRun::Text(run), TextRun::Text(field)] = para.runs.as_slice() else {
@@ -5127,14 +5123,13 @@ mod tests {
             "ppt/slides",
             None,
             None,
-            None,
-            None,
-            None,
+            &Default::default(),
             None,
             &[None; 9],
             &levels,
             &Default::default(),
             &empty_level_bullets(),
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L,
             &mut zip,
         );
         let [TextRun::Text(run), TextRun::Text(field), TextRun::Break { font_size, .. }] =
@@ -5271,14 +5266,13 @@ mod tests {
             "ppt/slides",
             None,
             None,
-            None,
-            None,
-            None,
+            &Default::default(),
             None,
             &[None; 9],
             &levels,
             &Default::default(),
             &empty_level_bullets(),
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L,
             &mut zip,
         );
         assert_eq!(para.def_font_size, Some(60.0));
@@ -6752,9 +6746,8 @@ mod tests {
                 None,
                 None,
                 None, // inherited_font_algn
-                None,
-                None,
-                None,
+                Default::default(),
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -6838,8 +6831,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             "",
             &HashMap::new(),
             &mut zip,
@@ -6884,14 +6875,12 @@ mod tests {
         </p:sldLayout>"#;
 
         // Typed-empty master inheritance maps (no master fallbacks in this test).
-        let m_f64: HashMap<String, f64> = HashMap::new();
         let m_lfs: HashMap<String, LevelFontSizes> = HashMap::new();
         let m_li: HashMap<String, LevelIndents> = HashMap::new();
         let m_lb: HashMap<String, LevelBullets> = HashMap::new();
         let m_str: HashMap<String, String> = HashMap::new();
         let m_tf: HashMap<String, Transform> = HashMap::new();
         let m_bool: HashMap<String, bool> = HashMap::new();
-        let m_i64: HashMap<String, crate::text::ParagraphSpacing> = HashMap::new();
         let empty_rels: HashMap<String, String> = HashMap::new();
         let build = |accent1_hex: &str| -> ParsedLayout {
             let mut theme: HashMap<String, String> = HashMap::new();
@@ -6914,9 +6903,7 @@ mod tests {
                 &m_tf,
                 &m_str,
                 &m_bool,
-                &m_i64,
-                &m_i64,
-                &m_f64,
+                &HashMap::new(),
                 &theme,
                 "ppt/slideLayouts",
                 &empty_rels,
@@ -7336,8 +7323,6 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -7371,9 +7356,8 @@ mod tests {
             None,
             None,
             None, // inherited_font_algn
-            None,
-            None,
-            None,
+            Default::default(),
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L,
             &mut zip,
         );
         assert_eq!(body.paragraphs[0].def_color.as_deref(), Some("505050"));
@@ -7799,11 +7783,10 @@ mod tests {
                 None, // inherited_anchor
                 None, // inherited_body_pr
                 None, // inherited_alignment
-                None,
-                None, // inherited_font_algn // inherited_ea_ln_brk
-                None, // inherited_space_before
-                None, // inherited_space_after
-                None, // inherited_line_spacing
+                None, // inherited_ea_ln_brk
+                None, // inherited_font_algn
+                Default::default(),
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
                 &mut zip,
             )
         };
@@ -7887,9 +7870,8 @@ mod tests {
                 None,
                 None,
                 None, // inherited_font_algn
-                None,
-                None,
-                None,
+                Default::default(),
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             )
         };
@@ -7965,9 +7947,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                None,
-                None,
+                Default::default(),
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -8031,9 +8012,8 @@ mod tests {
                 None,
                 None,
                 None, // inherited_font_algn
-                None,
-                None,
-                None,
+                Default::default(),
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -8121,9 +8101,8 @@ mod tests {
                 None,
                 None,
                 None, // inherited_font_algn
-                None,
-                None,
-                None,
+                Default::default(),
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -8158,6 +8137,57 @@ mod tests {
             !json_absent.contains("defTabSz"),
             "absent defTabSz must be omitted from JSON; got {json_absent}"
         );
+    }
+
+    /// #1630: paragraph spacing inherits level by level. A level-2 paragraph
+    /// takes level 2 of the nearest list style that sets it (own lstStyle,
+    /// then the inherited levels), never level 1's value.
+    #[test]
+    fn paragraph_spacing_inherits_per_level() {
+        use crate::text::{LevelSpacing, ParagraphSpacing};
+        use ooxml_common::text::SpaceLine;
+        let theme = HashMap::new();
+        let rels = HashMap::new();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let xml = r#"<txBody xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"><lstStyle>
+            <lvl1pPr><lnSpc><spcPct val="90000"/></lnSpc><spcBef><spcPts val="1000"/></spcBef></lvl1pPr></lstStyle>
+            <p><r><t>a</t></r></p><p><pPr lvl="1"/><r><t>b</t></r></p><p><pPr lvl="2"/><r><t>c</t></r></p></txBody>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut inherited = LevelSpacing::default();
+        inherited.before[2] = Some(ParagraphSpacing::Points(500));
+        inherited.line[2] = Some(SpaceLine::Pts { val: 30.0 });
+        let body = parse_text_body(
+            doc.root_element(),
+            &theme,
+            &rels,
+            "ppt/slides",
+            None,
+            [None; 9],
+            std::array::from_fn(|_| None),
+            std::array::from_fn(|_| Default::default()),
+            Default::default(),
+            &empty_level_bullets(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            inherited,
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L,
+            &mut zip,
+        );
+        let [a, b, c] = body.paragraphs.as_slice() else {
+            panic!("three paragraphs")
+        };
+        assert!(matches!(a.space_line, Some(SpaceLine::Pct { val }) if val == 90000.0));
+        assert_eq!(a.space_before, Some(1000));
+        assert_eq!((b.space_line.is_none(), b.space_before), (true, None));
+        assert_eq!(c.space_line, Some(SpaceLine::Pts { val: 30.0 }));
+        assert_eq!(c.space_before, Some(500));
     }
 
     /// ECMA-376 §21.1.2.2.9-.10: `a:spcBef`/`a:spcAft` hold one CT_TextSpacing
@@ -8199,9 +8229,13 @@ mod tests {
                 None,
                 None,
                 None, // inherited_font_algn
-                inherited,
-                inherited,
-                None,
+                {
+                    let mut spacing = crate::text::LevelSpacing::default();
+                    spacing.before[0] = inherited;
+                    spacing.after[0] = inherited;
+                    spacing
+                },
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             );
             tb.paragraphs.remove(0)
@@ -8277,6 +8311,7 @@ mod tests {
             let dts = crate::master::DefaultTextLevels {
                 faces,
                 sizes: [None; 9],
+                mar_l: [0; 9],
             };
             let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
             parse_table(

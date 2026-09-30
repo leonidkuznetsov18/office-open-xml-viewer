@@ -80,9 +80,17 @@ function chosenProfiles(family: string, bold: boolean, italic: boolean): Profile
   const trimmed = family.trim();
   if (!trimmed) return [];
   const name = OBSERVED_SUBSTITUTES[trimmed.toLocaleLowerCase('en-US')] ?? trimmed;
-  const profiles = findReferenceFontMetrics(name, {
-    weight: bold ? 700 : 400, style: italic ? 'italic' : 'normal',
-  });
+  const style = italic ? 'italic' : 'normal';
+  let profiles = findReferenceFontMetrics(name, { weight: bold ? 700 : 400, style });
+  if (profiles.length === 0) {
+    // A face name that is itself one cut of a family ("Calibri Light" is
+    // weight 300) has no 400 or 700 profile; use that cut when the name
+    // selects a single weight. #1630 controls (reference PDF export): Calibri
+    // Light titles sat at the 1950 / 2500 usWin share, like Calibri. A bold
+    // Calibri Light title embedded Calibri-Light itself (#1435 deck).
+    const named = findReferenceFontMetrics(name, { style });
+    if (named.length > 0 && named.every((p) => p.weight === named[0].weight)) profiles = named;
+  }
   const supplemental = profiles.filter((p) => p.source === 'macos-supplemental');
   return supplemental.length > 0 ? supplemental : profiles.filter((p) => p.source === 'office-mac');
 }
