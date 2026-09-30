@@ -6,6 +6,7 @@
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
 use crate::fill::{parse_color_node, parse_fill, parse_reflection, parse_shadow};
+use crate::script_font::{resolve_slot_face, theme_token_set, FontSlot};
 use crate::theme::resolve_theme_typeface;
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
@@ -194,12 +195,15 @@ pub(crate) type LevelFaces = [Option<String>; 9];
 
 /// Resolve one authored `<a:latin typeface>` value.
 ///
-/// * A theme token (`+mj-lt`, `+mn-lt`, …, ECMA-376 §20.1.4.1.16-.17) resolves
-///   through the slide master's own theme. A token naming an absent or empty
-///   theme slot counts as unspecified (`None`), so the next tier of the chain
-///   applies: with an empty theme minor font a text-box run carrying `+mn-lt`
-///   took the presentation `defaultTextStyle` face, and a placeholder took the
-///   hard default.
+/// * A theme token (`+mj-lt`, `+mn-lt`, …, ECMA-376 §20.1.4.1.16-.17) is
+///   checked against the slide master's own theme. A token naming an absent or
+///   empty theme slot counts as unspecified (`None`), so the next tier of the
+///   chain applies: with an empty theme minor font a text-box run carrying
+///   `+mn-lt` took the presentation `defaultTextStyle` face, and a placeholder
+///   took the hard default. A token naming a face is kept as the token: the
+///   face depends on the run language (a theme script font such as `Viet`,
+///   issue #1627) and is chosen by [`finalize_latin_face`] once the run's
+///   cascade is complete.
 /// * A literal empty `typeface=""` is an authored face that no installed font
 ///   matches. PowerPoint rendered it in Arial in a run, in master txStyles and
 ///   in a shape lstStyle, never falling through to the inherited face.
@@ -211,9 +215,27 @@ pub(crate) fn resolve_latin_face(
         return Some(HARD_DEFAULT_LATIN_FACE.to_owned());
     }
     if typeface.starts_with('+') {
-        return theme.get(typeface).filter(|face| !face.is_empty()).cloned();
+        return theme
+            .get(typeface)
+            .filter(|face| !face.is_empty())
+            .map(|_| typeface.to_owned());
     }
     Some(typeface.to_owned())
+}
+
+/// The face a resolved Latin chain value names for a run language: a kept
+/// theme token picks its collection's script font for the language (Viet),
+/// else the collection's Latin face. Literal faces pass through.
+pub(crate) fn finalize_latin_face(
+    face: Option<&str>,
+    theme: &HashMap<String, String>,
+    lang: Option<&str>,
+) -> Option<String> {
+    let face = face?;
+    if theme_token_set(face).is_none() {
+        return Some(face.to_owned());
+    }
+    resolve_slot_face(face, FontSlot::Latin, theme, lang, None)
 }
 
 /// The resolved Latin face of a `defRPr` / `rPr`, or `None` when unspecified.
@@ -251,6 +273,27 @@ pub(crate) fn extract_level_faces(
     child(tx_body, "lstStyle")
         .map(|ls| read_level_faces(ls, theme))
         .unwrap_or_default()
+}
+
+/// Per-level authored value of `<a:lvlNpPr><a:defRPr>`: the typeface of child
+/// `element` (`ea` / `cs`, kept as authored) or, with `element` None, the
+/// attribute `attribute` (`lang` / `altLang`).
+pub(crate) fn read_level_defrpr_values(
+    list_style: roxmltree::Node<'_, '_>,
+    element: Option<&str>,
+    attribute: &str,
+) -> LevelFaces {
+    std::array::from_fn(|lvl| {
+        let tag = format!("lvl{}pPr", lvl + 1);
+        let def_rpr = list_style
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == tag)
+            .and_then(|lp| child(lp, "defRPr"))?;
+        match element {
+            Some(name) => child(def_rpr, name).and_then(|n| attr(&n, attribute)),
+            None => attr(&def_rpr, attribute),
+        }
+    })
 }
 
 pub(crate) fn has_any_level_face(faces: &LevelFaces) -> bool {
@@ -943,12 +986,10 @@ impl RunProperties {
             font_family: child(node, "latin")
                 .and_then(|n| attr(&n, "typeface"))
                 .and_then(|v| resolve_latin_face(&v, theme)),
-            font_family_ea: child(node, "ea")
-                .and_then(|n| attr(&n, "typeface"))
-                .map(|v| resolve_theme_typeface(&v, theme)),
-            font_family_cs: child(node, "cs")
-                .and_then(|n| attr(&n, "typeface"))
-                .map(|v| resolve_theme_typeface(&v, theme)),
+            // ea/cs keep the authored value (a token, a literal or "") so the
+            // face can follow the run language after the cascade (#1627).
+            font_family_ea: child(node, "ea").and_then(|n| attr(&n, "typeface")),
+            font_family_cs: child(node, "cs").and_then(|n| attr(&n, "typeface")),
             font_family_sym: child(node, "sym")
                 .and_then(|n| attr(&n, "typeface"))
                 .map(|v| resolve_theme_typeface(&v, theme)),
@@ -1036,6 +1077,45 @@ impl RunProperties {
         self.font_family = face;
         self.font_size = size;
         self
+    }
+
+    /// The ea/cs faces and language ordinary text inherits from the
+    /// presentation defaultTextStyle level or its shape style's fontRef.
+    pub(crate) fn script_base(
+        ea: Option<String>,
+        cs: Option<String>,
+        lang: Option<String>,
+        alt_lang: Option<String>,
+    ) -> Self {
+        let mut attributes = PropertyAttributes::new();
+        if let Some(lang) = lang {
+            attributes.insert("lang".to_owned(), lang);
+        }
+        if let Some(alt_lang) = alt_lang {
+            attributes.insert("altLang".to_owned(), alt_lang);
+        }
+        Self {
+            attributes,
+            font_family_ea: ea,
+            font_family_cs: cs,
+            ..Default::default()
+        }
+    }
+
+    /// The cascaded run language (`lang`, ECMA-376 §21.1.2.3.9).
+    pub(crate) fn language(&self) -> Option<&str> {
+        self.attributes
+            .get("lang")
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+    }
+
+    /// The cascaded alternate language (`altLang`).
+    pub(crate) fn alt_language(&self) -> Option<&str> {
+        self.attributes
+            .get("altLang")
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
     }
 
     pub(crate) fn over(&self, lower: &Self) -> Self {
@@ -1861,7 +1941,8 @@ pub(crate) fn parse_paragraph(
     let def_italic = defaults.italic;
     // The list-level face already ends the placeholder / defaultTextStyle
     // chain (shape.rs); levels never borrow the level-1 face (#1620).
-    let def_font_family = defaults.font_family.clone();
+    let def_font_family =
+        finalize_latin_face(defaults.font_family.as_deref(), theme, defaults.language());
 
     let mut runs = Vec::new();
     for node in p_node.children().filter(|n| n.is_element()) {
@@ -1884,7 +1965,11 @@ pub(crate) fn parse_paragraph(
                     // preceding line to the master default size (observed in
                     // PowerPoint-exported Japanese and title controls).
                     font_size: own.font_size,
-                    font_family: own.font_family,
+                    font_family: finalize_latin_face(
+                        own.font_family.as_deref(),
+                        theme,
+                        effective.language(),
+                    ),
                     bold: own.bold,
                     italic: own.italic,
                     character_attributes: br_pr.map(|_| effective.attributes).unwrap_or_default(),
@@ -1924,6 +2009,7 @@ pub(crate) fn parse_paragraph(
             String::new(),
             RunProperties::from_xml(node, theme).with_relationships(rels),
             &defaults,
+            theme,
         ))
     });
     let has_text = runs
@@ -2191,7 +2277,7 @@ fn parse_run_with_defaults(
     let authored = r_pr
         .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
         .unwrap_or_default();
-    Some(resolve_run_properties(text, authored, defaults))
+    Some(resolve_run_properties(text, authored, defaults, theme))
 }
 
 fn inherited_hyperlink_target(
@@ -2225,8 +2311,11 @@ fn resolve_run_properties(
     text: String,
     authored: RunProperties,
     defaults: &RunProperties,
+    theme: &HashMap<String, String>,
 ) -> TextRunData {
     let props = authored.over(defaults);
+    let lang = props.language();
+    let alt_lang = props.alt_language();
     let underline = props.underline.as_deref().is_some_and(|v| v != "none");
     let underline_style = props
         .underline
@@ -2249,9 +2338,20 @@ fn resolve_run_properties(
     };
     let no_fill = matches!(props.fill, Some(Fill::None));
     let color = props.color.clone();
-    let font_family = props.font_family.clone();
-    let font_family_ea = props.font_family_ea.clone().filter(|v| !v.is_empty());
-    let font_family_cs = props.font_family_cs.clone().filter(|v| !v.is_empty());
+    // Theme tokens resolve per run language (issue #1627). An empty ea/cs
+    // slot stays None: the renderer then applies Office's application
+    // default for the script, never the Latin face.
+    let font_family = finalize_latin_face(props.font_family.as_deref(), theme, lang);
+    let font_family_ea = props
+        .font_family_ea
+        .as_deref()
+        .and_then(|face| resolve_slot_face(face, FontSlot::EastAsian, theme, lang, alt_lang));
+    let font_family_cs = props
+        .font_family_cs
+        .as_deref()
+        .and_then(|face| resolve_slot_face(face, FontSlot::ComplexScript, theme, lang, alt_lang));
+    let run_lang = lang.map(str::to_owned);
+    let run_alt_lang = alt_lang.map(str::to_owned);
     let font_family_sym = props.font_family_sym.clone().filter(|v| !v.is_empty());
     let baseline = props.baseline.filter(|v| *v != 0);
 
@@ -2310,6 +2410,8 @@ fn resolve_run_properties(
         font_family_ea,
         font_family_cs,
         font_family_sym,
+        lang: run_lang,
+        alt_lang: run_alt_lang,
         baseline,
         caps,
         letter_spacing,

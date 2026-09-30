@@ -166,6 +166,9 @@ import {
 import { drawEaVertRun } from './vertical-text.js';
 import { renderStackedText, type StackedParagraphInput } from './stacked-text.js';
 import {
+  COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
+} from './east-asian-default.js';
+import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
   drawingMlLineHeight,
@@ -1126,6 +1129,7 @@ export function buildFont(
   rc: RenderContext,
   text = '',
   hasNamedFamily = true,
+  extraFamilies: readonly string[] = [],
 ): string {
   const style  = italic ? 'italic ' : '';
   const normalized = normalizeFontFamily(family, rc);
@@ -1154,10 +1158,15 @@ export function buildFont(
       : [...NON_CJK_SANS_FALLBACKS, 'Arial', 'Helvetica', 'Liberation Sans'];
     return `${style}${weight}${sizePx}px ${families.length ? `${quoteAll([...latin, ...families])}, ` : ''}${normalized}`;
   }
-  return `${style}${weight}${sizePx}px ${cssFontStack(
+  const stack = cssFontStack(
     officeRoute?.family ?? normalized, authoredFamily, fallback, text,
     rc.googleSubstitutes === true,
-  )}`;
+  );
+  // Application-default faces follow the primary face in their fallback
+  // order (issue #1627), ahead of the generic web fallbacks.
+  const extras = extraFamilies.filter((name) => name !== normalized);
+  return `${style}${weight}${sizePx}px ${extras.length
+    ? stack.replace(/^("[^"]*"), /u, `$1, ${quoteAll(extras)}, `) : stack}`;
 }
 
 /**
@@ -1557,12 +1566,20 @@ export function paragraphInputRuns(
       ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
     const drawSizePx = baselineDrawSizePx(sizePx, run.baseline ?? undefined);
     const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
-    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : null;
-    const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
     const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
     const bold = run.bold ?? para.defBold ?? defaultBold;
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
     let rawText = runTexts[sourceRunId] ?? '';
+    // The parser resolves the ea/cs faces, theme script fonts included. An
+    // empty slot takes PowerPoint's application default, never the Latin
+    // face (issue #1627). The default tier is chosen from the run's whole
+    // East Asian text, before any leading cluster joins the previous seam.
+    const eaDefaults = run.fontFamilyEa ? [] : eastAsianDefaultFaces(
+      run.fontFamily ?? para.defFontFamily ?? rc.themeMinorFont ?? null,
+      [...rawText].filter((ch) => isCjkBreakChar(ch.codePointAt(0) ?? 0)).join(''),
+    );
+    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : eaDefaults[0];
+    const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
     // Offset of rawText's first code unit in the joined paragraph text.
     let runOffset = runStarts[sourceRunId];
     const runEnd = runOffset + rawText.length;
@@ -1576,10 +1593,19 @@ export function paragraphInputRuns(
     }
     const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
-    const eaFont = familyEa
-      ? buildFont(bold, italic, drawSizePx, familyEa, rc, rawText) : baseFont;
-    const csFont = familyCs
-      ? buildFont(bold, italic, drawSizePx, familyCs, rc, rawText) : baseFont;
+    const eaFont = buildFont(bold, italic, drawSizePx, familyEa, rc, rawText, true,
+      eaDefaults.slice(1));
+    // An empty cs slot draws each complex-script character in its script's
+    // application default; the defaults also follow an authored cs face.
+    const csFonts = new Map<string, string>();
+    const csFontFor = (face: string) => {
+      let font = csFonts.get(face);
+      if (font === undefined) {
+        font = buildFont(bold, italic, drawSizePx, face, rc, rawText, true, COMPLEX_SCRIPT_DEFAULT_FACES);
+        csFonts.set(face, font);
+      }
+      return font;
+    };
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
     const color = run.color ? hexToRgba(run.color)
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
@@ -1624,8 +1650,8 @@ export function paragraphInputRuns(
     // Slots are chosen per grapheme cluster from its base character, so a
     // combining mark, variation selector, ZWJ or other extender stays in its
     // base's font segment and a cluster never straddles two segments (one
-    // stacked cell, one shaped horizontal glyph). Which slot a base takes is
-    // unchanged.
+    // stacked cell, one shaped horizontal glyph). An empty ea/cs slot draws
+    // in PowerPoint's application default (issue #1627).
     let clusterStart = 0;
     let emitted = false;
     while (clusterStart < rawText.length) {
@@ -1635,11 +1661,12 @@ export function paragraphInputRuns(
       emitted = true;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
       let glyph = cluster;
-      const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
-      const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
-        || INDIC_CS_GLYPH_RE.test(ch));
-      let font = eaGlyph ? eaFont : csGlyph ? csFont : baseFont;
-      let face = (eaGlyph ? familyEa : csGlyph ? familyCs : family) ?? family;
+      const eaGlyph = isCjkBreakChar(ch.codePointAt(0) ?? 0);
+      const csGlyph = isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
+        || INDIC_CS_GLYPH_RE.test(ch);
+      const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
+      let font = eaGlyph ? eaFont : csGlyph ? csFontFor(csFace) : baseFont;
+      let face = eaGlyph ? familyEa : csFace;
       let share = lineMetricFor(face, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
