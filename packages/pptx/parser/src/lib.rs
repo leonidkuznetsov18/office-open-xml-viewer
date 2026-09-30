@@ -7840,6 +7840,17 @@ mod tests {
         }
         assert!(!parse(r#"<bodyPr spcFirstLastPara="0"/>"#).spc_first_last_para);
 
+        // anchorCtr (ECMA-376 §21.1.2.1.1): the same boolean shape; stacked
+        // vertical text centres its column block along the columns with it.
+        assert!(!tb_absent.anchor_ctr);
+        assert!(!json.contains("anchorCtr"), "{json}");
+        let tb_ctr = parse(r#"<bodyPr vert="wordArtVert" anchorCtr="1"/>"#);
+        assert!(tb_ctr.anchor_ctr);
+        assert!(serde_json::to_string(&tb_ctr)
+            .unwrap()
+            .contains("\"anchorCtr\":true"));
+        assert!(!parse(r#"<bodyPr anchorCtr="0"/>"#).anchor_ctr);
+
         // rtlCol="1" appears under the camelCase key "rtlCol".
         let json_true = serde_json::to_string(&tb).unwrap();
         assert!(
