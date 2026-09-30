@@ -38,7 +38,7 @@ import {
 } from '@silurus/ooxml-core/worker';
 import { prepareMathRuns, renderLayoutSourceToCanvas } from './renderer';
 import { createLayoutServices } from './layout-runtime.js';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames, docxOfficeFontFallbackRequests } from './google-fonts';
+import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import type {
   RenderWorkerResponse,
@@ -268,17 +268,18 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         });
       }
       embeddedFontFaces = embeddedFonts.faces;
-      const officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model).filter((request) =>
+      const officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model, { useGoogleFonts: req.useGoogleFonts, cjkFallback: req.cjkFallback }).filter((request) =>
         !embeddedFonts.routes.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
           && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))));
       officeFontFaces = officeFonts.faces;
       let googleFaces: FontFace[] = [];
+      let installedSubstituteFamilies: readonly string[] = [];
       if (req.useGoogleFonts) {
         // Pagination measures text, so each admitted face must be available
         // before canonical layout in both worker and main mode.
-        const names = docxFontPreloadNames(model, req.cjkFallback).filter((name) =>
-          name?.toLowerCase() !== 'calibri' || !officeFonts.routes.calibri);
-        googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        const plan = docxGoogleFontPlan(model, req.cjkFallback, officeFonts);
+        installedSubstituteFamilies = plan.installedSubstituteFamilies;
+        googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
       }
       googleFontFaces = googleFaces;
       const preparedMath = renderers.math && source.mathOccurrences.length > 0
@@ -291,6 +292,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         embeddedRoutes: embeddedFonts.routes,
         officeRoutes: Object.values(officeFonts.routes),
         googleFaces,
+        installedSubstituteFamilies,
         mathResources: preparedMath?.records,
         mathDrawables: preparedMath?.drawables,
       });

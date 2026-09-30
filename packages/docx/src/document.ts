@@ -45,7 +45,7 @@ import type { DocxDocumentModel, RenderPageOptions, WorkerRequest, WorkerRespons
 import { renderLayoutSourceToCanvas, documentHasMath, prepareMathRuns, type DocxTextRunInfo } from './renderer';
 import { createLayoutServices } from './layout-runtime.js';
 import { buildBookmarkPageMap } from './bookmark-nav';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames, docxOfficeFontFallbackRequests } from './google-fonts';
+import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import {
   attachDocumentLayoutRuntime,
@@ -616,7 +616,7 @@ export class DocxDocument {
         embeddedRoutes = loadedEmbedded.routes;
       }
       const officeFonts = doc._mode === 'main' && doc._document
-        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document).filter((request) =>
+        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { useGoogleFonts: opts.useGoogleFonts, cjkFallback: cjkFallback }).filter((request) =>
             !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
@@ -625,12 +625,13 @@ export class DocxDocument {
         throw new PaginationAbortError();
       }
       doc._officeFontFaces = officeFonts.faces;
+      let installedSubstituteFamilies: readonly string[] = [];
       if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
-        // A proven local Calibri face already resolves this authored family;
-        // avoid the optional Google Fonts substitution for the same request.
-        const names = docxFontPreloadNames(doc._document, cjkFallback).filter((name) =>
-          name?.toLowerCase() !== 'calibri' || !('calibri' in officeFonts.routes));
-        const googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        // An installed authored face is never displaced by a different-family
+        // substitute (docxGoogleFontPlan).
+        const plan = docxGoogleFontPlan(doc._document, cjkFallback, officeFonts);
+        installedSubstituteFamilies = plan.installedSubstituteFamilies;
+        const googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
         if (signal?.aborted) {
           unloadGoogleFonts(googleFaces);
           throw new PaginationAbortError();
@@ -656,6 +657,7 @@ export class DocxDocument {
           embeddedRoutes,
           officeRoutes: Object.values(officeFonts.routes),
           googleFaces: doc._googleFontFaces,
+          installedSubstituteFamilies,
           mathResources: preparedMath?.records,
           mathDrawables: preparedMath?.drawables,
         });

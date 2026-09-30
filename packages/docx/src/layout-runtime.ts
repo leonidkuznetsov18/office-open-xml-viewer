@@ -57,6 +57,7 @@ export function createLayoutServices(
     readonly embeddedRoutes?: readonly LoadedEmbeddedFontRoute[];
     readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
     readonly googleFaces?: readonly FontFace[];
+    readonly installedSubstituteFamilies?: readonly string[];
   } = {},
 ): LayoutServices {
   const source = isLayoutSourceStore(input) ? input : layoutSourceStore(input);
