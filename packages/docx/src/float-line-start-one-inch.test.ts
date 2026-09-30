@@ -285,9 +285,133 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       const elapsedMs = performance.now() - started;
       if (count === 10) expect(window).toEqual(perStepReference(floats, 0, 60, 1, 0, 100));
       expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(4 * count + 8);
-      expect(elapsedMs).toBeLessThan(500);
+      // Generous: the evaluation count is the real bound; this only catches a
+      // return of the quartic enumeration (seconds) without flaking under load.
+      expect(elapsedMs).toBeLessThan(5_000);
     }
   });
+
+  /** Square exclusion band (a rectangle), full or partial column width. */
+  const squareRect = (x0: number, y0: number, x1: number, y1: number, side = 'bothSides'): FloatRect => ({
+    kind: 'shape', mode: 'square', imageKey: 'square',
+    imageX: x0, imageY: y0, imageW: x1 - x0, imageH: y1 - y0,
+    xLeft: x0, xRight: x1, yTop: y0, yBottom: y1,
+    side, distLeft: 0, distRight: 0, distTop: 0, distBottom: 0, paraId: 1,
+  } as FloatRect);
+
+  /**
+   * Independent oracle for a stack of square rectangles and tight polygons:
+   * a line tests its own top; while a tight polygon meets its band it retries
+   * on the grid start + k * lineHeight; otherwise it moves to the next square
+   * bottom, or, when the next thing it reaches is a tight polygon, onto the
+   * first grid step inside that polygon's band.
+   */
+  const mixedReference = (
+    floats: FloatRect[],
+    start: number,
+    required: number,
+    lineHeight: number,
+  ) => {
+    const prepared = prepareFloatWrap(floats);
+    const fits = (y: number) => {
+      const window = computePreparedLineFloatWindow(y, required, lineHeight, 0, 100, prepared);
+      return window.topY === y ? window : null;
+    };
+    const inColumn = floats.filter((float) => float.xRight > 0.01 && float.xLeft < 99.99);
+    const tight = inColumn.filter((float) => float.authoredWrap === 'tight');
+    const squares = inColumn.filter((float) => float.authoredWrap !== 'tight');
+    const meetsTight = (y: number) => tight.some((float) => y + lineHeight > float.yTop && y <= float.yBottom);
+    const gridAfter = (y: number) => {
+      let k = Math.floor((y - start) / lineHeight) + 1;
+      while (start + (k - 1) * lineHeight > y) k -= 1;
+      while (start + k * lineHeight <= y) k += 1;
+      return start + k * lineHeight;
+    };
+    let y = start;
+    for (let guard = 0; guard < 100_000; guard += 1) {
+      const window = fits(y);
+      if (window) return window;
+      if (meetsTight(y)) {
+        y = gridAfter(y);
+        continue;
+      }
+      const nextBottom = Math.min(...squares.map((float) => float.yBottom).filter((bottom) => bottom > y));
+      const entries = tight.map((float) => float.yTop - lineHeight).filter((entry) => entry >= y);
+      const entry = entries.length > 0 ? Math.min(...entries) : Number.POSITIVE_INFINITY;
+      if (entry < nextBottom) {
+        y = gridAfter(entry);
+      } else if (Number.isFinite(nextBottom)) {
+        if (entry === nextBottom && !fits(nextBottom)) y = gridAfter(entry);
+        else y = nextBottom;
+      } else {
+        throw new Error('oracle found no candidate');
+      }
+    }
+    throw new Error('oracle did not terminate');
+  };
+
+  it('steps through a tight polygon reached after a square exclusion', () => {
+    const floats = [
+      squareRect(0, 0, 100, 20),
+      polygonFloat('tight', [{ xPt: 0, yPt: 10 }, { xPt: 100, yPt: 10 }, { xPt: 100, yPt: 100 }, { xPt: 0, yPt: 100 }]),
+    ];
+    const prepared = prepareFloatWrap(floats);
+    expect(computePreparedLineFloatWindow(0, 10, 5, 0, 100, prepared).topY).toBe(105);
+    expect(computePreparedLineFloatWindow(20, 10, 5, 0, 100, prepared).topY).toBe(105);
+    expect(computePreparedLineFloatWindow(0, 10, 5, 0, 100, prepared))
+      .toEqual(mixedReference(floats, 0, 10, 5));
+  });
+
+  it('keeps a sloped tight polygon reached after a square exclusion on the line grid', () => {
+    const floats = [
+      squareRect(0, 0, 100, 20),
+      polygonFloat('tight', [{ xPt: 0, yPt: 10 }, { xPt: 100, yPt: 10 }, { xPt: 50, yPt: 110 }]),
+    ];
+    const window = computePreparedLineFloatWindow(0, 40, 5, 0, 100, prepareFloatWrap(floats));
+    expect(window.topY % 5).toBe(0);
+    expect(window).toEqual(mixedReference(floats, 0, 40, 5));
+  });
+
+  it('matches the oracle on random mixed square and tight stacks from varied line tops', () => {
+    let seed = 0x5eed;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const sides = ['bothSides', 'left', 'right', 'largest'] as const;
+    let compared = 0;
+    for (let trial = 0; trial < 300; trial += 1) {
+      const floats: FloatRect[] = [];
+      const count = 1 + Math.floor(random() * 4);
+      for (let index = 0; index < count; index += 1) {
+        const side = sides[Math.floor(random() * sides.length)]!;
+        const x0 = Math.round(-30 + random() * 120);
+        const y0 = Math.round(random() * 120);
+        const x1 = x0 + 10 + Math.round(random() * 100);
+        const y1 = y0 + 5 + Math.round(random() * 60);
+        if (random() < 0.5) {
+          floats.push(squareRect(x0, y0, x1, y1, side));
+        } else if (random() < 0.5) {
+          floats.push(polygonFloat('tight', [
+            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
+          ], { side }));
+        } else {
+          floats.push(polygonFloat('tight', [
+            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 + Math.round(random() * 20) },
+            { xPt: Math.round((x0 + x1) / 2), yPt: y1 },
+          ], { side }));
+        }
+      }
+      const start = Math.round(random() * 60);
+      const required = 5 + Math.round(random() * 60);
+      const lineHeight = [0.7, 1, 2.5, 5, 12][Math.floor(random() * 5)]!;
+      const expected = mixedReference(floats, start, required, lineHeight);
+      const actual = computePreparedLineFloatWindow(start, required, lineHeight, 0, 100, prepareFloatWrap(floats));
+      expect(actual, `trial ${trial}`).toEqual(expected);
+      compared += 1;
+    }
+    expect(compared).toBe(300);
+  }, 120_000);
 
   it('bounds the tight line-step search by geometry, not by the number of steps', () => {
     const tall = polygonFloat('tight', [

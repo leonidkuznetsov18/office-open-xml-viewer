@@ -1416,6 +1416,7 @@ function nextClippedWindowEvent(
  */
 function tightLineStepWindow(
   topY: number,
+  after: number,
   probeH: number,
   paraXLeft: number,
   paraXRight: number,
@@ -1446,12 +1447,15 @@ function tightLineStepWindow(
     if (rect.exemptLineTopPt !== undefined) extraCritical.push(rect.exemptLineTopPt);
     if (rect.topEdgeInclusiveFromYPt !== undefined) extraCritical.push(rect.topEdgeInclusiveFromYPt);
   }
-  // First retry step whose band meets no tight polygon.
-  const stopCandidates = new Set<number>();
+  // First retry step after `after` whose band meets no tight polygon.
+  const firstStep = stepAfter(after);
+  const stopCandidates = new Set<number>([firstStep]);
   for (const { rect, polygon } of prepared.floats) {
-    if (polygon?.kind === 'tight') stopCandidates.add(stepAfter(rect.yBottom));
+    if (polygon?.kind === 'tight') stopCandidates.add(Math.max(firstStep, stepAfter(rect.yBottom)));
   }
-  for (const y of extraCritical) if (isStep(y)) stopCandidates.add(Math.round((y - topY) / probeH));
+  for (const y of extraCritical) {
+    if (isStep(y) && y > after) stopCandidates.add(Math.round((y - topY) / probeH));
+  }
   let stepEnd = Number.POSITIVE_INFINITY;
   for (const k of [...stopCandidates].sort((left, right) => left - right)) {
     if (!bandMeetsTightPolygon(prepared, grid(k), probeH, paraXLeft, paraXRight)) {
@@ -1459,21 +1463,21 @@ function tightLineStepWindow(
       break;
     }
   }
-  if (!Number.isFinite(stepEnd)) {
-    throw new Error('Tight line-step advance found no step below its polygons');
-  }
+  // Every polygon ends, so a step past the last bottom always qualifies;
+  // stay total even for degenerate input rather than failing layout.
+  if (!Number.isFinite(stepEnd)) return Object.freeze({ window: null, stepEndY: grid(firstStep) });
   const stepEndY = grid(stepEnd);
   const slabBounds = [...new Set([...structuralEvents, ...extraCritical])]
-    .filter((y) => y > topY && y < stepEndY)
+    .filter((y) => y > after && y < stepEndY)
     .sort((left, right) => left - right);
   slabBounds.push(stepEndY);
   const evaluated = new Set<number>();
   const tryStep = (y: number) => {
-    if (y <= topY || y > stepEndY || evaluated.has(y)) return null;
+    if (y <= after || y > stepEndY || evaluated.has(y)) return null;
     evaluated.add(y);
     return evaluate(y);
   };
-  let lower = topY;
+  let lower = after;
   for (const upper of slabBounds) {
     let cursor = lower;
     for (;;) {
@@ -1556,17 +1560,31 @@ function computePreparedLineFloatWindowCore(
   let cursor = topY;
   // WORD_TIGHT_WRAP_LINE_STEP_ADVANCE: while a tight polygon meets the band,
   // Word retries one line height lower instead of sweeping to an edge event.
+  // The retry grid is anchored at the original line top, including when the
+  // sweep reaches a tight polygon only after passing other objects.
+  const stepThroughTight = (after: number) => tightLineStepWindow(
+    topY, after, probeH, paraXLeft, paraXRight, prepared, structuralEvents, reference,
+    polygonRequiredWidth, squareRequiredWidth, evaluate,
+  );
   if (probeH > 0 && bandMeetsTightPolygon(prepared, topY, probeH, paraXLeft, paraXRight)) {
-    const stepped = tightLineStepWindow(
-      topY, probeH, paraXLeft, paraXRight, prepared, structuralEvents, reference,
-      polygonRequiredWidth, squareRequiredWidth, evaluate,
-    );
+    const stepped = stepThroughTight(topY);
     if (stepped.window) return stepped.window;
     cursor = stepped.stepEndY;
   }
   let structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
   while (structuralIndex >= 0 && structuralIndex < structuralEvents.length) {
     const upper = structuralEvents[structuralIndex]!;
+    // Whether a band meets a tight polygon changes only at structural events,
+    // so the midpoint decides the whole open slab (cursor, upper).
+    if (probeH > 0 && bandMeetsTightPolygon(
+      prepared, exactBinary64Midpoint(cursor, upper), probeH, paraXLeft, paraXRight,
+    )) {
+      const stepped = stepThroughTight(cursor);
+      if (stepped.window) return stepped.window;
+      cursor = stepped.stepEndY;
+      structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
+      continue;
+    }
     const localEvent = nextLocalSweepEvent(
       cursor, upper, probeH, paraXLeft, paraXRight, prepared,
       columnXLeftPt, columnXRightPt, reference,
@@ -1586,7 +1604,18 @@ function computePreparedLineFloatWindowCore(
     while (structuralIndex < structuralEvents.length
       && structuralEvents[structuralIndex]! <= cursor);
   }
-  throw new Error('Finite float line-window event sweep found no usable terminal Y');
+  // Past the last event no object meets a band that starts strictly below
+  // every object, so the line fits there. Keep layout total rather than
+  // throwing for geometry whose last event itself is blocked (for example a
+  // line resting on a tight polygon's bottom edge).
+  const lowest = Math.max(cursor, ...prepared.floats.map(({ rect }) => rect.yBottom));
+  let fallbackY = probeH > 0
+    ? topY + (Math.floor((lowest - topY) / probeH) + 1) * probeH
+    : lowest;
+  if (!(fallbackY > lowest)) fallbackY = lowest + Math.max(probeH, Number.EPSILON * Math.max(1, Math.abs(lowest)));
+  const fallback = evaluate(fallbackY);
+  if (fallback) return fallback;
+  return { topY: fallbackY, xOffset: 0, maxWidth };
 }
 
 export function computePreparedLineFloatWindow(
