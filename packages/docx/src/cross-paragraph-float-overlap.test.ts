@@ -34,7 +34,8 @@ const PNG = Uint8Array.from([
 
 interface Picture {
   readonly paragraph: number;
-  readonly wrap: 'tight' | 'square';
+  readonly wrap: 'tight' | 'square' | 'none';
+  readonly allowOverlap?: boolean;
   readonly hFrom: 'column' | 'margin';
   readonly xPt: number;
   readonly yPt: number;
@@ -54,14 +55,14 @@ const xml = (body: string) => encoder.encode(`<?xml version="1.0" encoding="UTF-
 function anchor(picture: Picture, index: number): string {
   const w = Math.round(picture.widthPt * EMU);
   const h = Math.round(picture.heightPt * EMU);
-  const wrap = picture.wrap === 'tight'
+  const wrap = picture.wrap === 'none' ? '<wp:wrapNone/>' : picture.wrap === 'tight'
     ? '<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="0"><wp:start x="0" y="0"/>'
       + '<wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/><wp:lineTo x="21600" y="0"/>'
       + '<wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>'
     : '<wp:wrapSquare wrapText="bothSides"/>';
   return `<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="${9 * EMU}" distR="${9 * EMU}" `
     + `simplePos="0" relativeHeight="${251659264 + index * 1024}" behindDoc="0" locked="0" `
-    + 'layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>'
+    + `layoutInCell="1" allowOverlap="${picture.allowOverlap === false ? 0 : 1}"><wp:simplePos x="0" y="0"/>`
     + `<wp:positionH relativeFrom="${picture.hFrom}"><wp:posOffset>${Math.round(picture.xPt * EMU)}</wp:posOffset></wp:positionH>`
     + `<wp:positionV relativeFrom="paragraph"><wp:posOffset>${Math.round(picture.yPt * EMU)}</wp:posOffset></wp:positionV>`
     + `<wp:extent cx="${w}" cy="${h}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>${wrap}`
@@ -137,7 +138,7 @@ function measureContext(): CanvasRenderingContext2D {
 
 interface Placed {
   readonly lines: ReadonlyMap<number, Readonly<{ yPt: number; xPt: number }>>;
-  readonly pictures: readonly Readonly<{ xPt: number; yPt: number }>[];
+  readonly pictures: readonly Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>[];
 }
 
 function layOut(control: Control): Placed {
@@ -156,7 +157,7 @@ function layOut(control: Control): Placed {
     { currentDateMs: 0 },
   );
   const lines = new Map<number, Readonly<{ yPt: number; xPt: number }>>();
-  const pictures: Array<Readonly<{ xPt: number; yPt: number }>> = [];
+  const pictures: Array<Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>> = [];
   const page = layout.pages[0]!;
   for (const node of page.layers.body) {
     if (node.kind !== 'paragraph') continue;
@@ -164,7 +165,7 @@ function layOut(control: Control): Placed {
     const line = node.lines[0];
     if (line && !lines.has(index)) lines.set(index, { yPt: line.bounds.yPt, xPt: line.bounds.xPt });
     for (const drawing of node.drawings) {
-      pictures.push({ xPt: drawing.flowBounds.xPt, yPt: drawing.flowBounds.yPt });
+      pictures.push({ ...drawing.flowBounds });
     }
   }
   return { lines, pictures };
@@ -276,5 +277,25 @@ describe('issue #1623 Word placement of floats from different paragraphs', () =>
     const mode15 = layOut({ mode: 15, pictures: pair('tight', 'margin', -15.2, 238.85) });
     close(mode15.lines.get(8)?.yPt, 264);
     close(mode15.lines.get(9)?.yPt, 480);
+  });
+
+  it('keeps allowOverlap=false separation when a carried picture moves an earlier paragraph', () => {
+    const placed = layOut({
+      mode: 15,
+      pictures: [
+        { paragraph: 8, wrap: 'none', hFrom: 'margin', xPt: 0, yPt: -200, widthPt: 100, heightPt: 100 },
+        {
+          paragraph: 9, wrap: 'tight', hFrom: 'margin', xPt: 0, yPt: -30,
+          widthPt: 468, heightPt: 96, allowOverlap: false,
+        },
+      ],
+    });
+    const [first, second] = placed.pictures;
+    expect(first && second).toBeTruthy();
+    const overlapX = Math.min(first!.xPt + first!.widthPt, second!.xPt + second!.widthPt)
+      - Math.max(first!.xPt, second!.xPt);
+    const overlapY = Math.min(first!.yPt + first!.heightPt, second!.yPt + second!.heightPt)
+      - Math.max(first!.yPt, second!.yPt);
+    expect(overlapX <= 0.001 || overlapY <= 0.001).toBe(true);
   });
 });

@@ -3,6 +3,7 @@ import {
   prepareFloatWrap,
   resolveLineFloatWindow,
   computePreparedLineFloatWindow,
+  computePreparedLineFloatWindowWithDiagnostics,
   skipPastTopAndBottom,
   wordMinLineStartPx,
   WORD_MIN_LINE_START_PT,
@@ -159,6 +160,47 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
 
     expect(result.topY).toBe(67);
     expect(result.maxWidth).toBeGreaterThanOrEqual(40);
+  });
+
+  it('matches a per-line retry on sloped and self-intersecting tight polygons', () => {
+    const star = Array.from({ length: 9 }, (_, index) => {
+      const angle = (index * 4 * Math.PI) / 9;
+      return { xPt: 50 + 45 * Math.cos(angle), yPt: 60 + 55 * Math.sin(angle) };
+    });
+    const shapes = [
+      [{ xPt: 20, yPt: 0 }, { xPt: 80, yPt: 0 }, { xPt: 50, yPt: 100 }],
+      [{ xPt: 0, yPt: 10 }, { xPt: 100, yPt: 10 }, { xPt: 100, yPt: 30 },
+        { xPt: 45, yPt: 60 }, { xPt: 100, yPt: 90 }, { xPt: 0, yPt: 90 }],
+      star,
+    ];
+    for (const points of shapes) {
+      const float = polygonFloat('tight', points);
+      const prepared = prepareFloatWrap([float]);
+      for (const [required, lineHeight] of [[40, 1], [30, 3.3], [55, 7], [10, 0.7]] as const) {
+        const start = 0;
+        const actual = computePreparedLineFloatWindow(start, required, lineHeight, 0, 100, prepared);
+        // Reference: test every line step while the band still meets the polygon.
+        let expected: number | null = null;
+        for (let y = start; ; y += lineHeight) {
+          const window = computePreparedLineFloatWindow(y, required, lineHeight, 0, 100, prepared);
+          if (window.topY === y) { expected = y; break; }
+          if (y > float.yBottom) break;
+        }
+        if (expected !== null) expect(actual.topY).toBeCloseTo(expected, 9);
+      }
+    }
+  });
+
+  it('bounds the tight line-step search by geometry, not by the number of steps', () => {
+    const tall = polygonFloat('tight', [
+      { xPt: 0, yPt: 0 }, { xPt: 100, yPt: 0 }, { xPt: 100, yPt: 10_000 }, { xPt: 0, yPt: 10_000 },
+    ]);
+    const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+      0, 10, 0.05, 0, 100, prepareFloatWrap([tall]),
+    );
+    expect(window.topY).toBeGreaterThan(10_000);
+    expect(window.topY).toBeLessThanOrEqual(10_000 + 0.05 + 1e-6);
+    expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(8);
   });
 
   it('keeps sweeping to the earliest contour root for through wrap', () => {

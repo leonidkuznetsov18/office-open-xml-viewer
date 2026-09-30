@@ -1266,6 +1266,98 @@ function nextLocalSweepEvent(
 }
 
 /**
+ * WORD_TIGHT_WRAP_LINE_STEP_ADVANCE without visiting every line step.
+ *
+ * The retry grid is topY + k * probeH, k >= 1, and it runs while the band meets
+ * a tight polygon. `stepEndY` is the first grid Y whose band meets none: a grid
+ * Y just past a polygon bottom or at an exempt anchor-line top. Between two
+ * consecutive critical Ys (structural events, local contour roots, exempt
+ * line tops, top-touch thresholds) the window is constant, so only the first
+ * grid Y inside each open slab and a grid Y on a critical Y can be the first
+ * usable step. That bounds the work by the critical Ys, not by the number of
+ * line steps, and returns the same Y as testing every step.
+ */
+function tightLineStepWindow(
+  topY: number,
+  probeH: number,
+  paraXLeft: number,
+  paraXRight: number,
+  prepared: PreparedFloatWrap,
+  structuralEvents: readonly number[],
+  columnXLeftPt: number,
+  columnXRightPt: number,
+  reference: LineFloatReference,
+  polygonRequiredWidth: number,
+  squareRequiredWidth: number,
+  diagnostics: MutableLineFloatSweepDiagnostics | null,
+  evaluate: (y: number) => { topY: number; xOffset: number; maxWidth: number } | null,
+): Readonly<{
+  window: { topY: number; xOffset: number; maxWidth: number } | null;
+  stepEndY: number;
+}> {
+  const grid = (k: number) => topY + k * probeH;
+  /** Smallest k >= 1 with grid(k) strictly after y. */
+  const stepAfter = (y: number): number => {
+    let k = Math.max(1, Math.floor((y - topY) / probeH) + 1);
+    while (k > 1 && grid(k - 1) > y) k -= 1;
+    while (grid(k) <= y) k += 1;
+    return k;
+  };
+  const isStep = (y: number): boolean => {
+    const k = Math.round((y - topY) / probeH);
+    return k >= 1 && grid(k) === y;
+  };
+  const extraCritical: number[] = [];
+  for (const { rect } of prepared.floats) {
+    if (rect.exemptLineTopPt !== undefined) extraCritical.push(rect.exemptLineTopPt);
+    if (rect.topEdgeInclusiveFromYPt !== undefined) extraCritical.push(rect.topEdgeInclusiveFromYPt);
+  }
+  // First retry step whose band meets no tight polygon.
+  const stopCandidates = new Set<number>();
+  for (const { rect, polygon } of prepared.floats) {
+    if (polygon?.kind === 'tight') stopCandidates.add(stepAfter(rect.yBottom));
+  }
+  for (const y of extraCritical) if (isStep(y)) stopCandidates.add(Math.round((y - topY) / probeH));
+  let stepEnd = Number.POSITIVE_INFINITY;
+  for (const k of [...stopCandidates].sort((left, right) => left - right)) {
+    if (!bandMeetsTightPolygon(prepared, grid(k), probeH, paraXLeft, paraXRight)) {
+      stepEnd = k;
+      break;
+    }
+  }
+  if (!Number.isFinite(stepEnd)) {
+    throw new Error('Tight line-step advance found no step below its polygons');
+  }
+  const stepEndY = grid(stepEnd);
+  const critical = [...new Set([...structuralEvents, ...extraCritical])]
+    .filter((y) => y > topY && y < stepEndY)
+    .sort((left, right) => left - right);
+  let cursor = topY;
+  let criticalIndex = 0;
+  while (cursor < stepEndY) {
+    const upper = criticalIndex < critical.length ? critical[criticalIndex]! : stepEndY;
+    const local = nextLocalSweepEvent(
+      cursor, upper, probeH, paraXLeft, paraXRight, prepared,
+      columnXLeftPt, columnXRightPt, reference,
+      polygonRequiredWidth, squareRequiredWidth, diagnostics,
+    );
+    const next = local ?? upper;
+    const inside = grid(stepAfter(cursor));
+    if (inside < next) {
+      const window = evaluate(inside);
+      if (window) return Object.freeze({ window, stepEndY });
+    }
+    if (isStep(next)) {
+      const window = evaluate(next);
+      if (window) return Object.freeze({ window, stepEndY });
+    }
+    cursor = next;
+    if (local === null) criticalIndex += 1;
+  }
+  return Object.freeze({ window: null, stepEndY });
+}
+
+/**
  * Hot line query over immutable, acquisition-compiled float geometry.
  *
  * Polygon vertices/intersections and rectangle edges form finite structural
@@ -1322,12 +1414,14 @@ function computePreparedLineFloatWindowCore(
   let cursor = topY;
   // WORD_TIGHT_WRAP_LINE_STEP_ADVANCE: while a tight polygon meets the band,
   // Word retries one line height lower instead of sweeping to an edge event.
-  if (probeH > 0) {
-    while (bandMeetsTightPolygon(prepared, cursor, probeH, paraXLeft, paraXRight)) {
-      cursor += probeH;
-      const stepped = evaluate(cursor);
-      if (stepped) return stepped;
-    }
+  if (probeH > 0 && bandMeetsTightPolygon(prepared, topY, probeH, paraXLeft, paraXRight)) {
+    const stepped = tightLineStepWindow(
+      topY, probeH, paraXLeft, paraXRight, prepared, structuralEvents,
+      columnXLeftPt, columnXRightPt, reference,
+      polygonRequiredWidth, squareRequiredWidth, diagnostics, evaluate,
+    );
+    if (stepped.window) return stepped.window;
+    cursor = stepped.stepEndY;
   }
   let structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
   while (structuralIndex >= 0 && structuralIndex < structuralEvents.length) {

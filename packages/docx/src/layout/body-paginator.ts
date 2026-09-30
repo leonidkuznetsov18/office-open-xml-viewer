@@ -2605,30 +2605,41 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
   return plan;
 }
 
-/** The carried drawings of `applied` that stayed on their page: a carried
- * drawing whose anchor paragraph lands elsewhere is dropped for good. */
+/** The carried drawings of `applied` that stayed on their page with their
+ * carried frame: a carried drawing whose anchor paragraph lands elsewhere, or
+ * that §20.4.2.3 collision avoidance moved off its carried frame, is dropped
+ * for good. */
 function keptHostAnchorCarries(
   applied: ReadonlyMap<string, PageWrapDestination> | null,
   layout: DocumentLayout,
 ): Map<string, PageWrapDestination> {
   const kept = new Map<string, PageWrapDestination>();
   if (!applied) return kept;
-  const landed = new Map<string, string>();
+  const landed = new Map<string, Readonly<{ at: string; bounds: LayoutRect | undefined }>>();
   for (const page of layout.pages) {
     for (const node of page.layers.body) {
       if (node.kind !== 'paragraph') continue;
+      const collisions = new Map((node.anchorCollisions ?? []).map((entry) => [entry.occurrenceId, entry.bounds] as const));
       for (const drawing of node.drawings) {
         if (!drawing.anchorLayer) continue;
         landed.set(
           drawing.anchorLayer.acquisitionOccurrenceId ?? drawing.anchorLayer.occurrenceId,
-          `${page.pageIndex}|${node.flowDomainId}`,
+          Object.freeze({
+            at: `${page.pageIndex}|${node.flowDomainId}`,
+            bounds: collisions.get(drawing.anchorLayer.occurrenceId),
+          }),
         );
       }
     }
   }
+  const sameRect = (left: LayoutRect | undefined, right: LayoutRect) => left !== undefined
+    && left.xPt === right.xPt && left.yPt === right.yPt
+    && left.widthPt === right.widthPt && left.heightPt === right.heightPt;
   for (const [key, destination] of applied) {
     if (destination.kind !== 'host-drawing') continue;
-    if (landed.get(key) === `${destination.pageIndex}|${destination.flowDomainId}`) {
+    const observed = landed.get(key);
+    if (observed?.at === `${destination.pageIndex}|${destination.flowDomainId}`
+      && sameRect(observed.bounds, destination.carry.bounds)) {
       kept.set(key, destination);
     }
   }

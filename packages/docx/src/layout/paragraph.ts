@@ -3208,7 +3208,7 @@ function acquireAnchorOccurrence(
   }
   const effectiveWrapBounds = effectiveResult.geometry.wrapBounds;
   const normativeCollision = !behavior.allowOverlap;
-  if (normativeCollision && !frozenFrame) {
+  if (normativeCollision) {
     // §20.4.2.3 object collision is independent of text wrapping. An
     // allowOverlap=true object keeps its resolved position: Word controls
     // (issue #1623) never move such a picture away from pictures anchored in
