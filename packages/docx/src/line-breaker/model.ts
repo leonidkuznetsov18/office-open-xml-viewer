@@ -301,6 +301,10 @@ export interface LayoutTabSeg extends LayoutSegSource {
   isTab: true;
   fontSize: number;  // pt — for line-height purposes
   measuredWidth: number;
+  /** Queue-resolved reading-frame gap. The bidi post-pass must preserve the
+   * same gap that ordinary text fitting consumed, including a collapsed
+   * unreachable stop on an empty line. */
+  readingGap?: number;
   /** tab leader to fill the gap (e.g. TOC dot leaders); set during layout. */
   leader?: TabStop['leader'];
   /** Alignment selected from the effective stop during layout. */
