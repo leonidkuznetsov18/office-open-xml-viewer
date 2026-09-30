@@ -1591,26 +1591,38 @@ export function paragraphInputRuns(
         runOffset = firstEnd;
       }
     }
-    const baseFont = buildFont(bold, italic, drawSizePx, family, rc, rawText,
-      hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
     const eaFont = buildFont(bold, italic, drawSizePx, familyEa, rc, rawText, true,
       eaDefaults.slice(1));
+    // Font stacks whose visual substitute is script-scoped must be resolved
+    // from the grapheme cluster they paint, not the whole source run. A mixed
+    // Arabic/Latin DrawingML run is still one authored run, but Noto Arabic is
+    // only a substitute for its Arabic glyphs; letting the Arabic half enable
+    // that face for the whole run also paints and measures the Latin half in
+    // Noto Arabic. The cluster loop below is already the font-slot boundary, so
+    // caching by the resulting stack preserves clusters without inventing a
+    // second text segmentation policy.
+    const stackFonts = new Map<string, string>();
+    const stackFontFor = (face: string, text: string, named: boolean, extras: readonly string[] = []) => {
+      // `buildFont` depends on text only through these script predicates. Keep
+      // cache cardinality bounded by face/script class, not grapheme count.
+      const key = `${face}\0${named ? 1 : 0}\0${containsHanScript(text) ? 1 : 0}`
+        + `\0${ARABIC_TEXT_RE.test(text) ? 1 : 0}\0${extras.join('\0')}`;
+      const cached = stackFonts.get(key);
+      if (cached !== undefined) return cached;
+      const built = buildFont(bold, italic, drawSizePx, face, rc, text, named, extras);
+      stackFonts.set(key, built);
+      return built;
+    };
     // An empty cs slot draws each complex-script character in its script's
     // application default; the defaults also follow an authored cs face.
-    const csFonts = new Map<string, string>();
-    const csFontFor = (face: string) => {
-      let font = csFonts.get(face);
-      if (font === undefined) {
-        font = buildFont(bold, italic, drawSizePx, face, rc, rawText, true, COMPLEX_SCRIPT_DEFAULT_FACES);
-        csFonts.set(face, font);
-      }
-      return font;
-    };
+    const csFontFor = (face: string, text: string) =>
+      stackFontFor(face, text, true, COMPLEX_SCRIPT_DEFAULT_FACES);
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
     const color = run.color ? hexToRgba(run.color)
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
     const baseStyle: LayoutSegment = {
-      text: '', font: baseFont, sizePx, drawSizePx, color,
+      // `emitGroup` installs the cluster-scoped resolved font.
+      text: '', font: '', sizePx, drawSizePx, color,
       // PowerPoint's default hyperlink theme colour masks pattFill. Reapplying
       // the text fill writes hlinkClr="tx" and restores the authored pattern.
       patternFill: run.hyperlink && !run.hyperlinkUsesTextFill ? undefined : run.patternFill,
@@ -1665,7 +1677,9 @@ export function paragraphInputRuns(
       const csGlyph = isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
         || INDIC_CS_GLYPH_RE.test(ch);
       const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
-      let font = eaGlyph ? eaFont : csGlyph ? csFontFor(csFace) : baseFont;
+      let font = eaGlyph ? eaFont : csGlyph ? csFontFor(csFace, cluster) : stackFontFor(
+        family, cluster, hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
+      );
       let face = eaGlyph ? familyEa : csFace;
       let share = lineMetricFor(face, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
