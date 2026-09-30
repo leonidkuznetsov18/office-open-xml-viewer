@@ -9,6 +9,7 @@ import type {
   BodyAcquisitionLocation,
   BodyLayoutSession,
   BodyTableContinuationCursor,
+  CarriedHostAnchor,
   PageAnchorPrescanInput,
 } from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
@@ -117,6 +118,7 @@ import type {
   DocumentLayout,
   LayoutDiagnostic,
   LayoutPage,
+  LayoutRect,
   LayoutServices,
   NoteLayout,
   PaintNode,
@@ -905,6 +907,13 @@ type PageWrapDestination = Readonly<{
   bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
   pageIndex: number;
   flowDomainId: string;
+}> | Readonly<{
+  kind: 'host-drawing';
+  occurrenceId: string;
+  paragraphSource: SourceRef;
+  pageIndex: number;
+  flowDomainId: string;
+  carry: CarriedHostAnchor;
 }>;
 
 function* paginateBodyPassSteps(
@@ -2474,19 +2483,166 @@ function plannedPageStartAnchors(
           occurrenceId: destination.occurrenceId,
           paragraphSource: destination.paragraphSource,
         })
-      : Object.freeze({
-          kind: 'floating-table' as const,
-          occurrenceId: destination.occurrenceId,
-          tableSource: destination.tableSource,
-          bounds: destination.bounds,
-        })));
+      : destination.kind === 'host-drawing'
+        ? Object.freeze({
+            kind: 'host-drawing' as const,
+            occurrenceId: destination.occurrenceId,
+            paragraphSource: destination.paragraphSource,
+            carry: destination.carry,
+          })
+        : Object.freeze({
+            kind: 'floating-table' as const,
+            occurrenceId: destination.occurrenceId,
+            tableSource: destination.tableSource,
+            bounds: destination.bounds,
+          })));
 }
 
 function pageStartAnchorsIdentity(anchors: PageStartAnchors): string {
   return anchors.map((anchor) => (anchor.kind === 'drawing'
     ? `drawing|${anchor.occurrenceId}|${sourceKey(anchor.paragraphSource)}`
-    : `table|${anchor.occurrenceId}|${sourceKey(anchor.tableSource)}|${anchor.bounds.xPt}|${
-      anchor.bounds.yPt}|${anchor.bounds.widthPt}|${anchor.bounds.heightPt}`)).join('\n');
+    : anchor.kind === 'host-drawing'
+      ? `host|${anchor.occurrenceId}|${sourceKey(anchor.paragraphSource)}|${JSON.stringify(anchor.carry)}`
+      : `table|${anchor.occurrenceId}|${sourceKey(anchor.tableSource)}|${anchor.bounds.xPt}|${
+        anchor.bounds.yPt}|${anchor.bounds.widthPt}|${anchor.bounds.heightPt}`)).join('\n');
+}
+
+/**
+ * WORD_LATER_ANCHOR_EARLIER_LINE_WRAP / WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH:
+ * the paragraph-relative wrapping drawings of a pass that must also wrap
+ * earlier lines of their page. A drawing qualifies when its exclusion starts
+ * above its anchor paragraph, or, for a compatibility-mode-14 wrapTight
+ * drawing, when it starts exactly at the paragraph top and the paragraph's
+ * first line could not be placed there. Each carries the geometry resolved in
+ * this pass (its first placement).
+ */
+function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestination> {
+  const plan = new Map<string, PageWrapDestination>();
+  for (const page of layout.pages) {
+    // Exclusions of drawings anchored in earlier paragraphs of this page, with
+    // the top of their anchor paragraph.
+    const earlier: Array<Readonly<{ paragraphTopPt: number; bounds: LayoutRect }>> = [];
+    for (const node of page.layers.body) {
+      if (node.kind !== 'paragraph' || node.drawings.length === 0) continue;
+      const owned = new Set((node.anchorCollisions ?? []).map((entry) => entry.occurrenceId));
+      const ownedExclusions = node.exclusions.filter((exclusion) => (
+        exclusion.anchorOccurrenceId !== undefined && owned.has(exclusion.anchorOccurrenceId)
+      ));
+      const pending = () => ownedExclusions.forEach((exclusion) => earlier.push(Object.freeze({
+        paragraphTopPt: node.flowBounds.yPt,
+        bounds: exclusion.bounds,
+      })));
+      if (node.continuation?.continuesFromPrevious) {
+        pending();
+        continue;
+      }
+      const exclusions = new Map(node.exclusions.flatMap((exclusion) => (
+        exclusion.anchorOccurrenceId ? [[exclusion.anchorOccurrenceId, exclusion] as const] : []
+      )));
+      // Retained ids are projected; acquisition and the page registry use the
+      // acquisition occurrence id.
+      const acquisitionIds = new Map(node.drawings.flatMap((drawing) => (
+        drawing.anchorLayer
+          ? [[drawing.anchorLayer.occurrenceId,
+            drawing.anchorLayer.acquisitionOccurrenceId ?? drawing.anchorLayer.occurrenceId] as const]
+          : []
+      )));
+      const frames = new Map((node.anchorFrames ?? []).flatMap((frame) => (
+        frame.status === 'resolved' ? [[frame.occurrenceId, frame] as const] : []
+      )));
+      const paragraphTopPt = node.flowBounds.yPt;
+      const firstLine = node.lines[0];
+      const firstLinePushed = firstLine !== undefined
+        && firstLine.bounds.yPt > paragraphTopPt + node.spacing.beforePt;
+      for (const collision of node.anchorCollisions ?? []) {
+        if (collision.verticalOwnership !== 'host') continue;
+        const frame = frames.get(collision.occurrenceId);
+        const exclusion = exclusions.get(collision.occurrenceId);
+        if (!frame || !exclusion || frame.geometry.wrap.kind === 'none') continue;
+        const topPt = exclusion.bounds.yPt;
+        const contentTopPt = paragraphTopPt + node.spacing.beforePt;
+        // The touch reaches back to the anchor paragraph of the earliest other
+        // drawing that also meets the first-line band where the line started.
+        const touchFromPt = exclusion.wordMode14TightAnchor === true
+          && firstLinePushed
+          && topPt === contentTopPt
+          && firstLine !== undefined
+          ? earlier.find((entry) => (
+            entry.bounds.yPt < contentTopPt + firstLine.bounds.heightPt
+              && entry.bounds.yPt + entry.bounds.heightPt > contentTopPt
+          ))?.paragraphTopPt
+          : undefined;
+        const touch = touchFromPt !== undefined;
+        if (!(topPt < paragraphTopPt) && !touch) continue;
+        const occurrenceId = acquisitionIds.get(collision.occurrenceId);
+        if (occurrenceId === undefined) continue;
+        plan.set(occurrenceId, Object.freeze({
+          kind: 'host-drawing',
+          occurrenceId,
+          paragraphSource: node.source,
+          pageIndex: page.pageIndex,
+          flowDomainId: node.flowDomainId,
+          carry: Object.freeze({
+            bounds: Object.freeze({ ...collision.bounds }),
+            exclusionBounds: Object.freeze({ ...exclusion.bounds }),
+            horizontalOwnership: collision.horizontalOwnership,
+            verticalOwnership: collision.verticalOwnership,
+            wrap: exclusion.wrap,
+            wrapSide: frame.geometry.wrap.side,
+            wrapDistances: Object.freeze({ ...frame.geometry.wrap.distances }),
+            ...(frame.geometry.wrap.polygon
+              ? { wrapPolygon: Object.freeze([...frame.geometry.wrap.polygon.points]) }
+              : {}),
+            ...(touch ? { topEdgeInclusiveFromYPt: touchFromPt } : {}),
+            ...(exclusion.anchorLineExemptTopPt === undefined
+              ? {} : { anchorLineExemptTopPt: exclusion.anchorLineExemptTopPt }),
+          }),
+        }));
+      }
+      pending();
+    }
+  }
+  return plan;
+}
+
+/** The carried drawings of `applied` that stayed on their page: a carried
+ * drawing whose anchor paragraph lands elsewhere is dropped for good. */
+function keptHostAnchorCarries(
+  applied: ReadonlyMap<string, PageWrapDestination> | null,
+  layout: DocumentLayout,
+): Map<string, PageWrapDestination> {
+  const kept = new Map<string, PageWrapDestination>();
+  if (!applied) return kept;
+  const landed = new Map<string, string>();
+  for (const page of layout.pages) {
+    for (const node of page.layers.body) {
+      if (node.kind !== 'paragraph') continue;
+      for (const drawing of node.drawings) {
+        if (!drawing.anchorLayer) continue;
+        landed.set(
+          drawing.anchorLayer.acquisitionOccurrenceId ?? drawing.anchorLayer.occurrenceId,
+          `${page.pageIndex}|${node.flowDomainId}`,
+        );
+      }
+    }
+  }
+  for (const [key, destination] of applied) {
+    if (destination.kind !== 'host-drawing') continue;
+    if (landed.get(key) === `${destination.pageIndex}|${destination.flowDomainId}`) {
+      kept.set(key, destination);
+    }
+  }
+  return kept;
+}
+
+/** Lowest page index holding a carry candidate, bounding what the carry-free
+ * pass may publish. */
+function firstHostCarryPage(layout: DocumentLayout): number {
+  let first = Number.POSITIVE_INFINITY;
+  for (const destination of hostAnchorCarryPlan(layout).values()) {
+    first = Math.min(first, destination.pageIndex);
+  }
+  return first;
 }
 
 /**
@@ -2733,13 +2889,11 @@ function* paginateBodyWithAnchorConvergenceSteps(
   // observe the line, retest it with exactly the anchors confirmed before it,
   // prove the deferral, apply it. Anchor tests on later pages wait for the
   // pages before them, so the budget grows with the anchors, not a constant.
-  const anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * pageOwnedAnchorCount;
-  if (pageOwnedAnchorCount === 0) {
-    return yield* paginateBodyPassSteps(
-      input, services, options, reserves, null, null, balancePlan,
-      publisher ? passPublicationObserver(publisher, livePageIndex) : undefined,
-    );
-  }
+  let anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * pageOwnedAnchorCount;
+  // A carry-free pass may change from the first page that holds a carried
+  // paragraph-relative drawing (WORD_LATER_ANCHOR_EARLIER_LINE_WRAP).
+  const carryBounded = (limit: (pass: BodyPaginationPassResult) => number) =>
+    (pass: BodyPaginationPassResult) => Math.min(limit(pass), firstHostCarryPage(pass.layout));
   // Every anchor pass may publish, but only the leading pages
   // `anchorStablePageLimit` proves every later pass of this run reproduces. A
   // seeded run never publishes: it can be abandoned for an unseeded retry,
@@ -2751,16 +2905,19 @@ function* paginateBodyWithAnchorConvergenceSteps(
     const events: PageAnchorInputEvent[] = [];
     // A prescan disagreement on a closed page is permanent for this pass.
     let ceiling = Number.POSITIVE_INFINITY;
-    return passPublicationObserver(publisher, (pass) => {
+    return passPublicationObserver(publisher, carryBounded((pass) => {
       const stable = anchorStablePageLimit(events, appliedPlan, pass);
       ceiling = Math.min(ceiling, stable.prescanDisagreementPage);
       return stable.limit;
-    }, {
+    }), {
       onPageAnchorInput: (event) => { events.push(event); },
       canExtend: () => ceiling > publisher.publishedPages,
     });
   };
-  const converge = function* (initialPlan?: ReturnType<typeof pageAnchorDestinationPlan>) {
+  const converge = function* (
+    initialPlan?: ReadonlyMap<string, PageWrapDestination>,
+    publish = true,
+  ) {
     type AnchorPassCarry = Readonly<{
       plan: ReadonlyMap<string, PageWrapDestination>;
       minimumTablePageBySource: ReadonlyMap<string, number>;
@@ -2782,10 +2939,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
           appliedPlan,
           previous?.minimumTablePageBySource ?? null,
           balancePlan,
-          anchorPassObserver(appliedPlan),
+          publish ? anchorPassObserver(appliedPlan) : undefined,
           appliedDeferrals.size > 0 ? appliedDeferrals : null,
         );
         const observed = pageAnchorDestinationPlan(pass.layout);
+        for (const [key, destination] of keptHostAnchorCarries(appliedPlan, pass.layout)) {
+          observed.set(key, destination);
+        }
         // The unseeded pass registers source-order estimates, not anchor
         // lines that reached their page, so it proves nothing about them.
         const lineTests = appliedPlan === null
@@ -2834,26 +2994,52 @@ function* paginateBodyWithAnchorConvergenceSteps(
       limit: anchorPassLimit,
     })).value.pass;
   };
-  try {
-    try {
-      return yield* converge(seedPlan);
-    } catch (error) {
-      if (!seedPlan || !(error instanceof ExactConvergenceError)) throw error;
-      // A plan carried from another reserve/balance run is only a starting
-      // estimate. Its former page ownership may be invalid in this run; retry
-      // once from the unseeded source order before reporting non-convergence.
-      return yield* converge();
-    }
-  } catch (error) {
-    if (error instanceof ExactConvergenceError) {
-      throw new LayoutInvariantError(
-        'NON_CONVERGENCE',
-        error.reason === 'cycle'
-          ? 'Page-anchor destination acquisition repeated an exact-state cycle'
-          : `Page-anchor destination acquisition reached the operational pass limit ${anchorPassLimit}`,
+  const carryFree = function* () {
+    if (pageOwnedAnchorCount === 0) {
+      return yield* paginateBodyPassSteps(
+        input, services, options, reserves, null, null, balancePlan,
+        publisher ? passPublicationObserver(publisher, carryBounded(livePageIndex)) : undefined,
       );
     }
-    throw error;
+    try {
+      try {
+        return yield* converge(seedPlan);
+      } catch (error) {
+        if (!seedPlan || !(error instanceof ExactConvergenceError)) throw error;
+        // A plan carried from another reserve/balance run is only a starting
+        // estimate. Its former page ownership may be invalid in this run; retry
+        // once from the unseeded source order before reporting non-convergence.
+        return yield* converge();
+      }
+    } catch (error) {
+      if (error instanceof ExactConvergenceError) {
+        throw new LayoutInvariantError(
+          'NON_CONVERGENCE',
+          error.reason === 'cycle'
+            ? 'Page-anchor destination acquisition repeated an exact-state cycle'
+            : `Page-anchor destination acquisition reached the operational pass limit ${anchorPassLimit}`,
+        );
+      }
+      throw error;
+    }
+  };
+  const settled = yield* carryFree();
+  if (settled.terminalDiagnostic !== null) return settled;
+  // WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: carry each qualifying
+  // paragraph-relative drawing, with the geometry of its first placement, to
+  // the start of its page so earlier lines wrap around it. A carried drawing
+  // whose paragraph then lands elsewhere is dropped, so the carried set only
+  // shrinks and the run terminates.
+  const hostPlan = hostAnchorCarryPlan(settled.layout);
+  if (hostPlan.size === 0) return settled;
+  const carriedPlan = new Map<string, PageWrapDestination>(pageAnchorDestinationPlan(settled.layout));
+  for (const [key, destination] of hostPlan) carriedPlan.set(key, destination);
+  anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * (pageOwnedAnchorCount + hostPlan.size);
+  try {
+    return yield* converge(carriedPlan, false);
+  } catch (error) {
+    if (!(error instanceof ExactConvergenceError)) throw error;
+    return settled;
   }
 }
 

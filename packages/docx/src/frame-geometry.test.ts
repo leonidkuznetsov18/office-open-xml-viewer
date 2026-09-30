@@ -133,11 +133,56 @@ describe('legacy float transport facts', () => {
     })).toThrow('Floating-table transport omitted tblOverlap');
   });
 
-  it('keeps a displaced anchor wrap band within the page-right boundary', () => {
+  it('keeps a displaced frame wrap band within the page-right boundary', () => {
     const st = makeState({
       pageWidth: 100,
       floats: [{
         kind: 'frame',
+        mode: 'square',
+        imageKey: 'blocker',
+        imageX: 0,
+        imageY: 0,
+        imageW: 50,
+        imageH: 50,
+        xLeft: 0,
+        xRight: 50,
+        yTop: 0,
+        yBottom: 50,
+        side: 'bothSides',
+        distLeft: 0,
+        distRight: 0,
+        distTop: 0,
+        distBottom: 0,
+        paraId: 1,
+      }],
+    });
+
+    const placed = pushFloatRect(st as never, {
+      x: 20,
+      y: 10,
+      w: 45,
+      h: 10,
+      dl: 0,
+      dr: 8,
+      dt: 0,
+      db: 0,
+      kind: 'frame',
+      mode: 'square',
+      side: 'bothSides',
+      imageKey: 'moving',
+      paraId: 2,
+      avoidOverlap: true,
+    });
+
+    expect(placed).toMatchObject({ imageX: 20, imageY: 50 });
+    expect(placed.xRight).toBeLessThanOrEqual(100.5);
+  });
+
+  it('keeps an overlap-permitted DrawingML anchor at its resolved position (issue #1623)', () => {
+    const st = makeState({
+      pageWidth: 100,
+      floats: [{
+        kind: 'shape',
         mode: 'square',
         imageKey: 'blocker',
         imageX: 0,
@@ -175,8 +220,7 @@ describe('legacy float transport facts', () => {
       avoidOverlap: true,
     });
 
-    expect(placed).toMatchObject({ imageX: 20, imageY: 50 });
-    expect(placed.xRight).toBeLessThanOrEqual(100.5);
+    expect(placed).toMatchObject({ imageX: 20, imageY: 10 });
   });
 });
 

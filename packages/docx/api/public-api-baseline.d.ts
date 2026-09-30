@@ -1151,6 +1151,7 @@ export interface DocSettings {
     characterSpacingControl?: string;
     lineWrapLikeWord6?: boolean;
     enableOpenTypeFeatures?: boolean;
+    compatibilityMode?: number;
     useFeLayout?: boolean;
     balanceSingleByteDoubleByteWidth?: boolean;
     adjustLineHeightInTable?: boolean;

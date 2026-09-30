@@ -2630,6 +2630,23 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
                     _ => None,
                 })
         });
+    // [MS-DOCX] §2.3.3: the Word version whose layout behaviour applies.
+    let compatibility_mode = compat
+        .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
+        .and_then(|compat| {
+            compat
+                .children()
+                .find(|node| {
+                    node.is_element()
+                        && node.tag_name().name() == "compatSetting"
+                        && node.tag_name().namespace() == root.tag_name().namespace()
+                        && attr_w(*node, "name").as_deref() == Some("compatibilityMode")
+                        && attr_w(*node, "uri").as_deref()
+                            == Some("http://schemas.microsoft.com/office/word")
+                })
+                .and_then(|node| attr_w(node, "val"))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
     let use_fe_layout = compat_bool("useFELayout");
     let balance_single_byte_double_byte_width = compat_bool("balanceSingleByteDoubleByteWidth");
     let adjust_line_height_in_table = compat_bool("adjustLineHeightInTable");
@@ -2655,6 +2672,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && character_spacing_control.is_none()
         && line_wrap_like_word6.is_none()
         && enable_open_type_features.is_none()
+        && compatibility_mode.is_none()
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
         && adjust_line_height_in_table.is_none()
@@ -2670,6 +2688,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         character_spacing_control,
         line_wrap_like_word6,
         enable_open_type_features,
+        compatibility_mode,
         use_fe_layout,
         balance_single_byte_double_byte_width,
         adjust_line_height_in_table,
@@ -17380,6 +17399,41 @@ mod math_jc_tests {
                 parse_document_settings(&xml)
                     .expect("compat setting")
                     .line_wrap_like_word6,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn settings_compatibility_mode_reads_the_word_compat_setting() {
+        for (xml, expected) in [
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="14"/></w:compat></w:settings>"#
+                ),
+                Some(Some(14)),
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>"#
+                ),
+                Some(Some(15)),
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="urn:other" w:val="14"/></w:compat></w:settings>"#
+                ),
+                None,
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:useFELayout/><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="x"/></w:compat></w:settings>"#
+                ),
+                Some(None),
+            ),
+        ] {
+            assert_eq!(
+                parse_document_settings(&xml).map(|settings| settings.compatibility_mode),
                 expected,
             );
         }

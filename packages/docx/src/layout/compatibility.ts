@@ -61,7 +61,7 @@ export const WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT = defineCompatibilityRu
     kind: 'regression-test',
     reference: 'packages/docx/src/layout/floats.test.ts#keeps observed different-paragraph displacement on exclusion bounds',
   },
-  description: 'Preserve the established Word-compatible policy that an overlap-permitted float is displaced by exclusion geometry from floats anchored in other paragraphs, while same-paragraph floats may overlap.',
+  description: 'Preserve the established Word-compatible policy that an overlap-permitted floating table or frame is displaced by exclusion geometry from floats anchored in other paragraphs, while same-paragraph floats may overlap. It does not apply to DrawingML objects: issue #1623 Word controls keep allowOverlap=true pictures from different paragraphs at their resolved positions in compatibility modes 14 and 15.',
 });
 
 export const WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL = defineCompatibilityRule({

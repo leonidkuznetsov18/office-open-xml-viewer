@@ -154,6 +154,20 @@ export interface FollowingBodyBlockMeasurement {
   readonly pageOwnedAnchorKeysByLine?: readonly (readonly string[])[];
 }
 
+/** First-placement geometry of a carried paragraph-relative drawing. */
+export type CarriedHostAnchor = Readonly<{
+  bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  exclusionBounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  horizontalOwnership?: 'page' | 'host';
+  verticalOwnership?: 'page' | 'host';
+  wrap: 'square' | 'tight' | 'through' | 'topAndBottom';
+  wrapSide?: string | null;
+  wrapDistances?: Readonly<{ topPt: number; rightPt: number; bottomPt: number; leftPt: number }>;
+  wrapPolygon?: readonly Readonly<{ xPt: number; yPt: number }>[];
+  topEdgeInclusiveFromYPt?: number;
+  anchorLineExemptTopPt?: number;
+}>;
+
 export interface PageAnchorPrescanInput {
   readonly anchors: readonly (
     | Readonly<{
@@ -166,6 +180,14 @@ export interface PageAnchorPrescanInput {
         occurrenceId: string;
         tableSource: SourceRef;
         bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+      }>
+    | Readonly<{
+        /** WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: a paragraph-relative drawing
+         * carried from a previous pass with its first-placement geometry. */
+        kind: 'host-drawing';
+        occurrenceId: string;
+        paragraphSource: SourceRef;
+        carry: CarriedHostAnchor;
       }>
   )[];
   readonly location: BodyAcquisitionLocation;

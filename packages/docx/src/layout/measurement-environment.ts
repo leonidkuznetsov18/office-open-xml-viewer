@@ -91,6 +91,9 @@ export function paragraphMeasurementEnvironment(
     characterSpacingControl: state.layoutSettings.characterSpacingControl,
     lineWrapLikeWord6: state.layoutSettings.compat.lineWrapLikeWord6,
     enableOpenTypeFeatures: state.layoutSettings.compat.enableOpenTypeFeatures,
+    ...(state.layoutSettings.compat.compatibilityMode === null
+      ? {}
+      : { compatibilityMode: state.layoutSettings.compat.compatibilityMode }),
     resolvedLocalFonts: state.resolvedLocalFonts,
     layoutServices: state.layoutServices,
     verticalGlyphMeasurement: state.verticalGlyphMeasurement,

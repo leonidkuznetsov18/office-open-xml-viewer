@@ -99,6 +99,13 @@ interface FloatRectCore {
   anchorOccurrenceId?: string;
   acquisitionOccurrenceId?: string;
   wrapPolygon?: readonly Readonly<{ xPt: number; yPt: number }>[];
+  /** WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH: a line starting at or below this Y
+   * whose bottom lies exactly on this tight polygon's top also wraps around
+   * the top edge. */
+  topEdgeInclusiveFromYPt?: number;
+  /** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP: the line starting exactly at this
+   * top ignores this float. */
+  exemptLineTopPt?: number;
   /** Hex key of the image bitmap (used to defer drawing until final Y is known). */
   imageKey: string;
   /** Absolute X of the object box in the consuming wrap context's linear unit
@@ -662,6 +669,83 @@ function widestUsableFreeGap(
   return null;
 }
 
+/** Whether the unpadded polygon `points` meets the rectangle
+ * [leftPt, rightPt] x [topY, topY + heightPt). */
+export function polygonMeetsRect(
+  points: readonly Readonly<{ xPt: number; yPt: number }>[],
+  topY: number,
+  heightPt: number,
+  leftPt: number,
+  rightPt: number,
+): boolean {
+  if (points.length < 3 || !(heightPt > 0) || !(rightPt > leftPt)) return false;
+  const xs = points.map((point) => point.xPt);
+  const ys = points.map((point) => point.yPt);
+  const compiled = compilePolygonWrap({
+    kind: 'tight',
+    imageKey: 'anchor-line-rewrap-probe',
+    points,
+    xLeftPt: Math.min(...xs),
+    xRightPt: Math.max(...xs),
+    yTopPt: Math.min(...ys),
+    yBottomPt: Math.max(...ys),
+  });
+  const exactLeft = unreducedExactFromNumber(leftPt);
+  const exactRight = unreducedExactFromNumber(rightPt);
+  return projectPolygonExactLineIntervals(compiled, topY, heightPt).some((interval) =>
+    compareExactRational(interval.l, exactRight) < 0
+      && compareExactRational(interval.r, exactLeft) > 0);
+}
+
+/** Exact binary height of the probe that reads a tight polygon edge. */
+const TIGHT_EDGE_PROBE_PT = 2 ** -10;
+
+/** Line-top Y of the probe band that reads a tight polygon's touched edge, or
+ * null when the line band does not touch one. WORD_TIGHT_WRAP_BOTTOM_EDGE: a
+ * line whose top is exactly the polygon bottom wraps around the bottom edge.
+ * WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH: a line whose bottom is exactly the top
+ * of a polygon flagged `topEdgeInclusiveFromYPt`, starting at or below that
+ * Y, wraps around the top edge. */
+function tightEdgeTouch(
+  float: PreparedFloatRect,
+  exactTop: ExactRational,
+  exactBottom: ExactRational,
+): number | null {
+  if (float.polygon?.kind !== 'tight') return null;
+  const { rect } = float;
+  if (compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) === 0) {
+    return rect.yBottom - TIGHT_EDGE_PROBE_PT;
+  }
+  if (rect.topEdgeInclusiveFromYPt !== undefined
+    && compareExactRational(exactTop, unreducedExactFromNumber(rect.topEdgeInclusiveFromYPt)) >= 0
+    && compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) === 0) {
+    return rect.yTop;
+  }
+  return null;
+}
+
+/** Whether the line band [topY, topY + probeH] meets a tight polygon,
+ * including the touched edges of `tightEdgeTouch`. */
+function bandMeetsTightPolygon(
+  prepared: PreparedFloatWrap,
+  topY: number,
+  probeH: number,
+  paraXLeft: number,
+  paraXRight: number,
+): boolean {
+  const exactTop = unreducedExactFromNumber(topY);
+  const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(probeH));
+  return prepared.floats.some((float) => {
+    const { rect } = float;
+    if (float.polygon?.kind !== 'tight' || rect.mode !== 'square') return false;
+    if (rect.exemptLineTopPt === topY) return false;
+    if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) return false;
+    if (tightEdgeTouch(float, exactTop, exactBottom) !== null) return true;
+    return compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) > 0
+      && compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) < 0;
+  });
+}
+
 function lineWindowAtY(
   topY: number,
   probeH: number,
@@ -689,12 +773,16 @@ function lineWindowAtY(
   for (const float of prepared.floats) {
     const { rect } = float;
     if (rect.mode !== 'square') continue;
-    if (compareExactRational(exactBottom, exactRectY(rect.yTop)) <= 0
-      || compareExactRational(exactTop, exactRectY(rect.yBottom)) >= 0) continue;
+    if (rect.exemptLineTopPt === topY) continue;
+    const edge = tightEdgeTouch(float, exactTop, exactBottom);
+    if (edge === null && (compareExactRational(exactBottom, exactRectY(rect.yTop)) <= 0
+      || compareExactRational(exactTop, exactRectY(rect.yBottom)) >= 0)) continue;
     if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) continue;
-    const intervals = floatBlockedIntervals(
-      float, topY, probeH, paraXLeft, paraXRight, reference,
-    );
+    const intervals = edge === null
+      ? floatBlockedIntervals(float, topY, probeH, paraXLeft, paraXRight, reference)
+      : floatBlockedIntervals(
+          float, edge, TIGHT_EDGE_PROBE_PT, paraXLeft, paraXRight, reference,
+        );
     if (intervals.length === 0) continue;
     blocked.push(...intervals);
   }
@@ -756,6 +844,52 @@ function lineWindowAtY(
     xOffset: xOffsetNumber,
     maxWidth: maxWidthNumber,
   };
+}
+
+/**
+ * Left edge of the first free horizontal gap of the band [topY, topY + probeH]
+ * between `leftPt` and `rightPt`, around the square/tight/through exclusions of
+ * `floats`, or null when the band is fully blocked (including by a
+ * topAndBottom object). Gaps narrower than MIN_LINE_GAP are slivers.
+ *
+ * Used by WORD_MODE14_COLUMN_LINE_START_ORIGIN: in compatibility mode 14 a
+ * column-relative horizontal offset is measured from this edge.
+ */
+export function firstFreeGapLeftPt(
+  floats: readonly FloatRect[],
+  topY: number,
+  probeH: number,
+  leftPt: number,
+  rightPt: number,
+): number | null {
+  const prepared = prepareFloatWrap(floats);
+  const exactTop = unreducedExactFromNumber(topY);
+  const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(probeH));
+  const reference: LineFloatReference = { xLeftPt: leftPt, xRightPt: rightPt, readingDirection: 'ltr' };
+  const blocked: ExactAttributedGap[] = [];
+  for (const float of prepared.floats) {
+    const { rect } = float;
+    if (compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) <= 0
+      || compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) >= 0) continue;
+    if (!floatOverlapsColumnX(rect as FloatRect, leftPt, rightPt)) continue;
+    if (rect.mode === 'topAndBottom') return null;
+    blocked.push(...floatBlockedIntervals(float, topY, probeH, leftPt, rightPt, reference));
+  }
+  let cursor = unreducedExactFromNumber(leftPt);
+  const exactRight = unreducedExactFromNumber(rightPt);
+  const minimum = unreducedExactFromNumber(MIN_LINE_GAP);
+  for (const interval of mergeAttributedIntervals(blocked)) {
+    if (compareExactRational(interval.r, cursor) <= 0) continue;
+    const gapRight = compareExactRational(interval.l, exactRight) < 0 ? interval.l : exactRight;
+    if (compareExactRational(subtractUnreducedExact(gapRight, cursor), minimum) >= 0) {
+      return exactRationalToNumberUp(cursor);
+    }
+    cursor = interval.r;
+    if (compareExactRational(cursor, exactRight) >= 0) return null;
+  }
+  return compareExactRational(subtractUnreducedExact(exactRight, cursor), minimum) >= 0
+    ? exactRationalToNumberUp(cursor)
+    : null;
 }
 
 interface AffineBoundary {
@@ -1186,6 +1320,15 @@ function computePreparedLineFloatWindowCore(
   const current = evaluate(topY);
   if (current) return current;
   let cursor = topY;
+  // WORD_TIGHT_WRAP_LINE_STEP_ADVANCE: while a tight polygon meets the band,
+  // Word retries one line height lower instead of sweeping to an edge event.
+  if (probeH > 0) {
+    while (bandMeetsTightPolygon(prepared, cursor, probeH, paraXLeft, paraXRight)) {
+      cursor += probeH;
+      const stepped = evaluate(cursor);
+      if (stepped) return stepped;
+    }
+  }
   let structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
   while (structuralIndex >= 0 && structuralIndex < structuralEvents.length) {
     const upper = structuralEvents[structuralIndex]!;

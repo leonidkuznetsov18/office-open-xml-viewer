@@ -13,6 +13,8 @@ import {
   type TextMeasurer,
 } from '../paragraph-measure.js';
 import { createFloatWrapOracle } from './float-wrap-oracle.js';
+import { firstFreeGapLeftPt, polygonMeetsRect, type FloatRect } from './float-wrap.js';
+import type { AnchorAcquisitionInput } from './anchor-input.js';
 import type {
   LayoutImageSeg,
   LayoutLine,
@@ -23,6 +25,7 @@ import type {
 } from '../line-layout.js';
 import {
   effectiveCharacterSpacingPt,
+  getDefaultFontSize,
   segLetterSpacingPx,
   widthBalanceSpaceAdjustmentForTextPt,
 } from '../line-layout.js';
@@ -75,7 +78,7 @@ import {
   type RetainedEmphasisMarkInput,
 } from './retained-typography.js';
 import type { RunTypographyAcquisitionInput } from './typography-input.js';
-import { alignedAnchorPlacement, resolveAnchorFrame, type AnchorReferenceFramesInput, type AnchorFrameResult } from './anchor-frame.js';
+import { alignedAnchorPlacement, resolveAnchorFrame, type AnchorFrameRect, type AnchorReferenceFramesInput, type AnchorFrameResult } from './anchor-frame.js';
 import { paragraphGapPt } from './paragraph-spacing.js';
 import {
   translateDrawing,
@@ -1172,6 +1175,12 @@ export interface ParagraphAcquisitionOptions {
     'page' | 'margin' | 'column' | 'pageParity'
   >>;
   readonly acquireCompleteStory?: CompleteTextBoxStoryAcquirer;
+  /** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP decisions, keyed by anchor
+   * occurrence: the host line top whose layout ignores that object. */
+  readonly anchorLineExemptions?: ReadonlyMap<string, number>;
+  /** WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: carried first-placement object
+   * frames keyed by anchor occurrence. */
+  readonly frozenAnchorFrames?: ReadonlyMap<string, LayoutRect>;
 }
 
 function runSource(source: SourceRef, runIndex: number): SourceRef {
@@ -3010,6 +3019,8 @@ function acquireAnchorOccurrence(
   sameParagraphCollisions: readonly DrawingMLCollisionEntryPt[],
   /** Every anchor occurrence of this paragraph, computed once per paragraph. */
   paragraphOccurrenceIds: ReadonlySet<string>,
+  /** First-line content top before any float moves the line down. */
+  contentStartYPt: number,
 ): AcquiredAnchorOccurrence | null {
   let hostLineIndex = -1;
   let host: Extract<ParagraphPlacement, { kind: 'anchor-host' }> | undefined;
@@ -3053,7 +3064,18 @@ function acquireAnchorOccurrence(
       column: baseFrames?.column
         ? layoutInCellFrame
           ? { ...baseFrames.column, ...layoutInCellFrame }
-          : baseFrames.column
+          : wordMode14ColumnOriginApplies(outer.run.anchorAcquisitionInput, options)
+            ? {
+                ...baseFrames.column,
+                xPt: wordMode14ColumnLineStartOrigin(
+                  baseFrames.column,
+                  externalExclusions,
+                  paragraphOccurrenceIds,
+                  contentStartYPt,
+                  lines[0]?.bounds.heightPt ?? 0,
+                ),
+              }
+            : baseFrames.column
         : null,
       paragraph: {
         xPt: options.placement.paragraphXPt,
@@ -3151,6 +3173,31 @@ function acquireAnchorOccurrence(
     }
   }
   let effectiveResult = resizeResolvedAnchorGeometry(result, rect);
+  const translateAnchor = (delta: Readonly<{ xPt: number; yPt: number }>): void => {
+    rect = translateRect(rect, delta);
+    if (uprightTransform) uprightTransform = {
+      ...uprightTransform,
+      e: uprightTransform.e + delta.xPt,
+      f: uprightTransform.f + delta.yPt,
+    };
+    else {
+      const outerTextBox = acquiredShapeTextBoxes.get(outer.runIndex);
+      if (outerTextBox) {
+        acquiredShapeTextBoxes.set(
+          outer.runIndex,
+          translateTextBox(outerTextBox, delta),
+        );
+      }
+    }
+    effectiveResult = resizeResolvedAnchorGeometry(result, rect);
+  };
+  // WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: a drawing carried to this page keeps
+  // the frame resolved when its anchor paragraph was first laid out.
+  const frozenFrame = options.frozenAnchorFrames?.get(occurrenceId);
+  if (frozenFrame) {
+    const delta = { xPt: frozenFrame.xPt - rect.xPt, yPt: frozenFrame.yPt - rect.yPt };
+    if (delta.xPt !== 0 || delta.yPt !== 0) translateAnchor(delta);
+  }
   if (
     behavior.allowOverlapStatus !== 'valid'
     || behavior.allowOverlap === null
@@ -3161,15 +3208,13 @@ function acquireAnchorOccurrence(
   }
   const effectiveWrapBounds = effectiveResult.geometry.wrapBounds;
   const normativeCollision = !behavior.allowOverlap;
-  const compatibilityCollision = behavior.allowOverlap
-    && options.ordinaryFlow
-    && effectiveWrapBounds !== null;
-  if (normativeCollision || compatibilityCollision) {
-    // §20.4.2.3 object collision is independent of text wrapping. The
-    // allowOverlap=true compatibility path deliberately retains the old
-    // wrap-exclusion policy only for ordinary-flow anchors.
-    // ECMA-376 §20.4.2.3 otherwise requires displacement for every existing
-    // object whose allowOverlap behavior makes it a collision participant.
+  if (normativeCollision && !frozenFrame) {
+    // §20.4.2.3 object collision is independent of text wrapping. An
+    // allowOverlap=true object keeps its resolved position: Word controls
+    // (issue #1623) never move such a picture away from pictures anchored in
+    // other paragraphs, in either compatibility mode, wrap kind, or reference.
+    // ECMA-376 §20.4.2.3 requires displacement for every existing object
+    // whose allowOverlap behavior makes it a collision participant.
     // Word has one narrower composition exception: a source-later page-owned
     // member below the already-authored layers in this SAME anchor paragraph
     // retains its authored position. Cross-paragraph entries remain blockers.
@@ -3184,36 +3229,17 @@ function acquireAnchorOccurrence(
         behavior.relativeHeight,
         entry.relativeHeight,
       ));
-    const blockerBounds = normativeCollision
-      ? [...externalCollisions, ...sameParagraphBlockers]
-          .filter((entry) => entry.occurrenceId !== occurrenceId)
-          .map((entry) => ({
-            occurrenceId: entry.occurrenceId,
-            bounds: entry.bounds,
-          }))
-      : externalExclusions
-          // Page-owned prescan registers this paragraph's own anchors on the
-          // page before the paragraph lays out. They are same-paragraph
-          // siblings, not different-paragraph blockers, so the compatibility
-          // policy leaves them to overlap as allowOverlap=true permits.
-          .filter((exclusion) => exclusion.anchorOccurrenceId === undefined
-            || !paragraphOccurrenceIds.has(exclusion.anchorOccurrenceId))
-          .map((exclusion) => ({
-            occurrenceId: exclusion.anchorOccurrenceId ?? exclusion.id,
-            bounds: exclusion.bounds,
-          }));
-    const blockers: FloatPlacementParticipant[] = blockerBounds.map((entry) => ({
-      occurrenceId: entry.occurrenceId,
-      kind: 'drawingml',
-      // `externalExclusions` is the already-established other-paragraph
-      // registry; the current paragraph uses a distinct compatibility id.
-      paragraphId: 0,
-      bounds: entry.bounds,
-      exclusionBounds: entry.bounds,
-    }));
+    const blockers: FloatPlacementParticipant[] = [...externalCollisions, ...sameParagraphBlockers]
+      .filter((entry) => entry.occurrenceId !== occurrenceId)
+      .map((entry) => ({
+        occurrenceId: entry.occurrenceId,
+        kind: 'drawingml',
+        paragraphId: 0,
+        bounds: entry.bounds,
+        exclusionBounds: entry.bounds,
+      }));
     const page = options.anchorFrames?.page;
-    const rightBoundary = normativeCollision
-      && behavior.layoutInCell
+    const rightBoundary = behavior.layoutInCell
       && options.anchorCellBounds
       ? options.anchorCellBounds.xPt + options.anchorCellBounds.widthPt
       : page
@@ -3228,30 +3254,11 @@ function acquireAnchorOccurrence(
         exclusionBounds: effectiveWrapBounds ?? rect,
       },
       blockers,
-      avoidance: normativeCollision
-        ? { kind: 'drawingml-normative' }
-        : { kind: 'word-different-paragraph', paragraphId: 1 },
+      avoidance: { kind: 'drawingml-normative' },
       rightBoundaryPt: rightBoundary,
     });
     const delta = displaced.displacement;
-    if (delta.xPt !== 0 || delta.yPt !== 0) {
-      rect = translateRect(rect, delta);
-      if (uprightTransform) uprightTransform = {
-        ...uprightTransform,
-        e: uprightTransform.e + delta.xPt,
-        f: uprightTransform.f + delta.yPt,
-      };
-      else {
-        const outerTextBox = acquiredShapeTextBoxes.get(outer.runIndex);
-        if (outerTextBox) {
-          acquiredShapeTextBoxes.set(
-            outer.runIndex,
-            translateTextBox(outerTextBox, delta),
-          );
-        }
-      }
-      effectiveResult = resizeResolvedAnchorGeometry(result, rect);
-    }
+    if (delta.xPt !== 0 || delta.yPt !== 0) translateAnchor(delta);
   }
   for (const { run, runIndex } of ordered) {
     const source = runSource(options.source, runIndex);
@@ -3364,6 +3371,14 @@ function acquireAnchorOccurrence(
     bounds: wrapBounds,
     polygon: effectiveResult.geometry.wrap.polygon?.points ?? rectanglePolygon(wrapBounds),
     anchorOccurrenceId: occurrenceId,
+    ...(options.anchorLineExemptions?.has(occurrenceId)
+      ? { anchorLineExemptTopPt: options.anchorLineExemptions.get(occurrenceId)! }
+      : {}),
+    ...(effectiveResult.geometry.wrap.kind === 'tight'
+      && options.environment.compatibilityMode !== undefined
+      && options.environment.compatibilityMode <= 14
+      ? { wordMode14TightAnchor: true }
+      : {}),
     verticalOwnership: anchorAxisOwnership(
       effectiveResult,
       'vertical',
@@ -3976,6 +3991,106 @@ interface AcquiredParagraphResult {
   readonly layout: ParagraphLayout;
 }
 
+/** Project retained wrap exclusions onto the float-wrap geometry authority. */
+function wrapExclusionFloatRects(exclusions: readonly WrapExclusion[]): FloatRect[] {
+  return exclusions.map((exclusion, index) => ({
+    kind: 'shape' as const,
+    mode: exclusion.wrap === 'topAndBottom' ? 'topAndBottom' as const : 'square' as const,
+    authoredWrap: exclusion.wrap,
+    wrapPolygon: exclusion.polygon,
+    imageKey: exclusion.id,
+    imageX: exclusion.bounds.xPt,
+    imageY: exclusion.bounds.yPt,
+    imageW: exclusion.bounds.widthPt,
+    imageH: exclusion.bounds.heightPt,
+    xLeft: exclusion.bounds.xPt,
+    xRight: exclusion.bounds.xPt + exclusion.bounds.widthPt,
+    yTop: exclusion.bounds.yPt,
+    yBottom: exclusion.bounds.yPt + exclusion.bounds.heightPt,
+    side: exclusion.wrapSide ?? 'bothSides',
+    distLeft: 0, distRight: 0, distTop: 0, distBottom: 0,
+    paraId: index,
+    ...(exclusion.anchorLineExemptTopPt === undefined
+      ? {} : { exemptLineTopPt: exclusion.anchorLineExemptTopPt }),
+    ...(exclusion.topEdgeInclusiveFromYPt === undefined
+      ? {} : { topEdgeInclusiveFromYPt: exclusion.topEdgeInclusiveFromYPt }),
+  }));
+}
+
+/** WORD_MODE14_COLUMN_LINE_START_ORIGIN: the left edge of the first free gap
+ * of the anchor paragraph first-line band, around other paragraphs' floats. */
+function wordMode14ColumnLineStartOrigin(
+  column: AnchorFrameRect,
+  externalExclusions: readonly WrapExclusion[],
+  paragraphOccurrenceIds: ReadonlySet<string>,
+  bandTopPt: number,
+  bandHeightPt: number,
+): number {
+  const others = externalExclusions.filter((exclusion) =>
+    exclusion.anchorOccurrenceId === undefined
+      || !paragraphOccurrenceIds.has(exclusion.anchorOccurrenceId));
+  if (others.length === 0) return column.xPt;
+  return firstFreeGapLeftPt(
+    wrapExclusionFloatRects(others),
+    bandTopPt,
+    bandHeightPt,
+    column.xPt,
+    column.xPt + column.widthPt,
+  ) ?? column.xPt;
+}
+
+/** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP: host lines (laid out without their
+ * own objects) whose content the unpadded tight polygon does not meet. */
+function wordMode14AnchorLineExemptions(
+  paragraph: ParagraphAcquisitionInput,
+  options: ParagraphAcquisitionOptions,
+  layout: ParagraphLayout,
+  ownedExclusions: readonly WrapExclusion[],
+): ReadonlyMap<string, number> {
+  const mode = options.environment.compatibilityMode;
+  const exemptions = new Map<string, number>();
+  if (mode === undefined || mode > 14) return exemptions;
+  for (const exclusion of ownedExclusions) {
+    if (exclusion.wrap !== 'tight' || exclusion.anchorOccurrenceId === undefined) continue;
+    const line = layout.lines.find((candidate) => candidate.placements.some((placement) =>
+      placement.kind === 'anchor-host'
+        && placement.anchorOccurrenceId === exclusion.anchorOccurrenceId));
+    if (!line) continue;
+    let left = Number.POSITIVE_INFINITY;
+    let right = Number.NEGATIVE_INFINITY;
+    for (const placement of line.placements) {
+      if (placement.kind !== 'text' && placement.kind !== 'resource' && placement.kind !== 'tab') continue;
+      const bounds = placement.bounds;
+      if (!bounds || !(bounds.widthPt > 0)) continue;
+      left = Math.min(left, bounds.xPt);
+      right = Math.max(right, bounds.xPt + bounds.widthPt);
+    }
+    if (!(right > left)) {
+      // An empty line holds only the paragraph mark, one mark em wide.
+      left = line.bounds.xPt;
+      right = left + getDefaultFontSize(paragraph);
+    }
+    if (!polygonMeetsRect(exclusion.polygon, line.bounds.yPt, line.bounds.heightPt, left, right)) {
+      exemptions.set(exclusion.anchorOccurrenceId, line.bounds.yPt);
+    }
+  }
+  return exemptions;
+}
+
+function wordMode14ColumnOriginApplies(
+  acquisition: AnchorAcquisitionInput,
+  options: ParagraphAcquisitionOptions,
+): boolean {
+  const mode = options.environment.compatibilityMode;
+  return mode !== undefined
+    && mode <= 14
+    && options.ordinaryFlow
+    && acquisition.simplePosition.enabled !== true
+    && acquisition.horizontal.relativeFromStatus === 'valid'
+    && acquisition.horizontal.relativeFrom === 'column'
+    && acquisition.horizontal.choice.kind === 'offset';
+}
+
 function measurementPlacement(
   options: ParagraphAcquisitionOptions,
   exclusions: readonly WrapExclusion[],
@@ -3985,24 +4100,7 @@ function measurementPlacement(
     throw new Error('Conflicting paragraph wrap authorities: placement.wrap and effective exclusions');
   }
   const pageReference = options.anchorFrames?.page;
-  const exclusionOracle = createFloatWrapOracle(exclusions.map((exclusion, index) => ({
-          kind: 'shape' as const,
-          mode: exclusion.wrap === 'topAndBottom' ? 'topAndBottom' as const : 'square' as const,
-          authoredWrap: exclusion.wrap,
-          wrapPolygon: exclusion.polygon,
-          imageKey: exclusion.id,
-          imageX: exclusion.bounds.xPt,
-          imageY: exclusion.bounds.yPt,
-          imageW: exclusion.bounds.widthPt,
-          imageH: exclusion.bounds.heightPt,
-          xLeft: exclusion.bounds.xPt,
-          xRight: exclusion.bounds.xPt + exclusion.bounds.widthPt,
-          yTop: exclusion.bounds.yPt,
-          yBottom: exclusion.bounds.yPt + exclusion.bounds.heightPt,
-          side: exclusion.wrapSide ?? 'bothSides',
-          distLeft: 0, distRight: 0, distTop: 0, distBottom: 0,
-          paraId: index,
-        })), {
+  const exclusionOracle = createFloatWrapOracle(wrapExclusionFloatRects(exclusions), {
           xLeftPt: pageReference?.xPt ?? options.placement.paragraphXPt,
           xRightPt: pageReference
             ? pageReference.xPt + pageReference.widthPt
@@ -4042,6 +4140,11 @@ function exclusionSetState(exclusions: readonly WrapExclusion[]): string {
     polygon: exclusion.polygon,
     ...(exclusion.verticalOwnership === undefined
       ? {} : { verticalOwnership: exclusion.verticalOwnership }),
+    ...(exclusion.anchorLineExemptTopPt === undefined
+      ? {} : { anchorLineExemptTopPt: exclusion.anchorLineExemptTopPt }),
+    ...(exclusion.topEdgeInclusiveFromYPt === undefined
+      ? {} : { topEdgeInclusiveFromYPt: exclusion.topEdgeInclusiveFromYPt }),
+    ...(exclusion.wordMode14TightAnchor === true ? { wordMode14TightAnchor: true } : {}),
   })));
 }
 
@@ -4202,6 +4305,7 @@ function paragraphAcquisitionKey(
       lineOnly ? null : environment.pageWritingMode,
       environment.verticalCJK ?? null,
       lineOnly ? null : environment.verticalPageFrame ?? null,
+      lineOnly ? null : environment.compatibilityMode ?? null,
       environment.documentHasEastAsianText,
       environment.useFeLayout ?? null,
       environment.balanceSingleByteDoubleByteWidth ?? null,
@@ -4225,6 +4329,9 @@ function paragraphAcquisitionKey(
     ],
     lineOnly ? null : JSON.stringify(options.exclusions),
     lineOnly || !hasAnchoredPayload ? null : JSON.stringify(options.anchorCollisions ?? []),
+    lineOnly || !hasAnchoredPayload || !options.frozenAnchorFrames?.size
+      ? null
+      : JSON.stringify([...options.frozenAnchorFrames].sort(([left], [right]) => left.localeCompare(right))),
     continuation ? JSON.stringify(continuation) : null,
     lineOnly ? null : options.paragraphBorderEdges
       ? [options.paragraphBorderEdges.top, options.paragraphBorderEdges.bottom]
@@ -4437,6 +4544,9 @@ export function acquireParagraphResult(
     ownedExclusions: readonly WrapExclusion[];
     state: string;
   }>;
+  // WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP: decided once from the pass that laid
+  // every host line out without its own objects.
+  let anchorLineExemptions: ReadonlyMap<string, number> | undefined;
   try {
     const result = convergeExactState<Pass>({
       seedState: exclusionSetState(initialExclusions),
@@ -4464,8 +4574,22 @@ export function acquireParagraphResult(
           },
           continuation,
           );
-        const layout = paragraphLayoutFromMeasurement(paragraph, acquisitionOptions, measured);
+        const layout = paragraphLayoutFromMeasurement(
+          paragraph,
+          anchorLineExemptions && anchorLineExemptions.size > 0
+            ? { ...acquisitionOptions, anchorLineExemptions }
+            : acquisitionOptions,
+          measured,
+        );
         const ownedExclusions = canonicalOwnedExclusions(layout, occurrenceIds);
+        if (anchorLineExemptions === undefined) {
+          anchorLineExemptions = wordMode14AnchorLineExemptions(
+            paragraph,
+            options,
+            layout,
+            ownedExclusions,
+          );
+        }
         const nextEffectiveExclusions = mergeParagraphExclusions(
           options.exclusions,
           ownedExclusions,
@@ -4852,6 +4976,8 @@ export function paragraphLayoutFromMeasurement(
       options.anchorCollisions ?? [],
       anchorCollisions,
       paragraphOccurrenceIds,
+      options.placement.startYPt
+        + (options.placement.suppressSpaceBefore ? 0 : measured.requestedSpaceBeforePt),
     );
     if (!acquired) continue;
     anchorResults.push(acquired.result);

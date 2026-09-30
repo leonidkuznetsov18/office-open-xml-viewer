@@ -322,6 +322,11 @@ pub struct DocumentSettings {
     /// Absent defaults to disabled; explicit `w:kern` remains authoritative.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_open_type_features: Option<bool>,
+    /// [MS-DOCX] §2.3.3 `compatibilityMode` compatibility setting (the Word
+    /// version whose layout behaviour applies, e.g. 14 or 15). `None` when the
+    /// setting is absent or its value is not a non-negative integer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_mode: Option<u32>,
     /// ECMA-376 Part 4 §14.8.3.50 `w:compat` / `w:useFELayout` — enable Far
     /// East layout compatibility behavior.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -115,6 +115,10 @@ export interface DocSettings {
   lineWrapLikeWord6?: boolean;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for this compatibility flag. */
   enableOpenTypeFeatures?: boolean;
+  /** ECMA-376 §17.15.3.4 `w:compatSetting` named `compatibilityMode`: the
+   * application version whose layout rules apply (for example 14 or 15).
+   * Absent when not authored. */
+  compatibilityMode?: number;
   /** ECMA-376 Part 4 §14.8.3.50 `w:compat/w:useFELayout` — Far East layout
    * compatibility. */
   useFeLayout?: boolean;

@@ -40,6 +40,8 @@ export interface ParagraphMeasurementEnvironment extends LineLayoutEnvironment {
   /** The paragraph is acquired in a section-logical frame that paint rotates
    * into a vertical physical page. This is independent of glyph orientation. */
   readonly verticalPageFrame?: boolean;
+  /** `w:compatSetting` compatibilityMode (§17.15.3.4) of the document; absent when not authored. */
+  readonly compatibilityMode?: number;
 }
 
 export interface TextMeasurer {

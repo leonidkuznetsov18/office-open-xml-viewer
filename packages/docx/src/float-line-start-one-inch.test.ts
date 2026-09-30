@@ -148,8 +148,21 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       .toEqual({ topY: 80, xOffset: 0, maxWidth: 44 });
   });
 
-  it('advances to the earliest contour root instead of the polygon bottom', () => {
+  it('advances a tight line in whole line-height steps (word-tight-wrap-line-step-advance)', () => {
     const triangle = polygonFloat('tight', [
+      { xPt: 20, yPt: 0 }, { xPt: 80, yPt: 0 }, { xPt: 50, yPt: 100 },
+    ]);
+
+    // The free side gap first reaches 40 pt at the contour root 200/3; the
+    // line retries one line height (1 pt) lower each time, so it lands at 67.
+    const result = resolveLineFloatWindow(0, 40, 1, 0, 100, [triangle]);
+
+    expect(result.topY).toBe(67);
+    expect(result.maxWidth).toBeGreaterThanOrEqual(40);
+  });
+
+  it('keeps sweeping to the earliest contour root for through wrap', () => {
+    const triangle = polygonFloat('through', [
       { xPt: 20, yPt: 0 }, { xPt: 80, yPt: 0 }, { xPt: 50, yPt: 100 },
     ]);
 
