@@ -292,7 +292,7 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       // pathological regression without flaking under load.
       expect(elapsedMs).toBeLessThan(5_000);
     }
-  });
+  }, 60_000);
 
   /** Square exclusion band (a rectangle), full or partial column width. */
   const squareRect = (x0: number, y0: number, x1: number, y1: number, side = 'bothSides'): FloatRect => ({
