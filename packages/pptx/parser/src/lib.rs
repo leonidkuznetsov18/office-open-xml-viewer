@@ -1096,9 +1096,25 @@ struct TableTextStyle {
     color: Option<String>,
     bold: Option<bool>,
     italic: Option<bool>,
-    /// Latin typeface from `tcTxStyle` (§20.1.4.2.10 fontRef → `+mj-lt` /
-    /// `+mn-lt`, or `<a:font><a:latin>`), unresolved; resolved per slide theme.
-    font: Option<String>,
+    /// `tcTxStyle` font choice (EG_ThemeableFontStyles), unresolved; resolved
+    /// per slide theme.
+    font: Option<TableStyleFont>,
+}
+
+/// The font choice of a `tcTxStyle` (EG_ThemeableFontStyles, §20.1.4.2.10).
+/// A fontRef names a theme collection; `<a:font>` authors its own faces, and
+/// an authored theme token there is an ordinary token (issue #1627 review:
+/// the two differ when the named collection's Latin face is empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TableStyleFont {
+    /// `fontRef idx="major"` / `"minor"`: `+mj` / `+mn`.
+    Collection(&'static str),
+    /// `<a:font>`: the authored latin / ea / cs typefaces.
+    Faces {
+        latin: Option<String>,
+        ea: Option<String>,
+        cs: Option<String>,
+    },
 }
 
 impl TableTextStyle {

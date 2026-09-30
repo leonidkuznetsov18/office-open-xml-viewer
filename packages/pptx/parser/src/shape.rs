@@ -14,7 +14,6 @@ use crate::fill::{
 use crate::master::{
     DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders, TableTextLevels,
 };
-use crate::script_font::theme_token_set;
 use crate::text::{
     complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
     resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes, LevelIndents,
@@ -25,7 +24,7 @@ use crate::types::*;
 use crate::{
     attr, attr_f64, attr_i64, attr_r, child, read_zip_head, read_zip_str, resolve_path,
     table_style_presets, PptxZip, ResolvedTableCellStyle, TableCellBorderStyle, TableLineStyle,
-    TablePartStyle, TableStyleDef, TableStyleFlags, TableTextStyle,
+    TablePartStyle, TableStyleDef, TableStyleFlags, TableStyleFont, TableTextStyle,
 };
 use ooxml_common::blip::{
     mime_from_ext, parse_blip_duotone, parse_blip_effects, parse_src_rect, svg_blip_rid,
@@ -1853,14 +1852,20 @@ pub(crate) fn parse_table_styles_xml(
             let font = child(text, "fontRef")
                 .and_then(|font_ref| attr(&font_ref, "idx"))
                 .and_then(|idx| match idx.as_str() {
-                    "major" => Some("+mj-lt".to_owned()),
-                    "minor" => Some("+mn-lt".to_owned()),
+                    "major" => Some(TableStyleFont::Collection("+mj")),
+                    "minor" => Some(TableStyleFont::Collection("+mn")),
                     _ => None,
                 })
                 .or_else(|| {
-                    child(text, "font")
-                        .and_then(|font| child(font, "latin"))
-                        .and_then(|latin| attr(&latin, "typeface"))
+                    child(text, "font").map(|font| {
+                        let face =
+                            |name: &str| child(font, name).and_then(|n| attr(&n, "typeface"));
+                        TableStyleFont::Faces {
+                            latin: face("latin"),
+                            ea: face("ea"),
+                            cs: face("cs"),
+                        }
+                    })
                 });
             TableTextStyle {
                 color: parse_color_node(text, theme),
@@ -2157,41 +2162,52 @@ pub(crate) fn resolve_table_cell_style(
 ///   tcTxStyle names no font, also rendered in the theme minor font at every
 ///   level, not in the defaultTextStyle or master otherStyle face (#1628). A
 ///   style fontRef whose collection has an empty Latin face gives Arial.
-/// * ea/cs: the same theme collection as the Latin face. A tcTxStyle
-///   `fontRef` is the CT_FontReference a shape's p:style uses, and the
-///   text-box controls (#1627 N13, N20, I26, P31-P35) show a fontRef naming
-///   the collection for the ea and cs slots as well as Latin; a cell without
-///   a style font takes the minor collection like its Latin face. A token or
-///   literal authored in the cell overrides it, `typeface=""` included.
+/// * ea/cs: a tcTxStyle `fontRef` is the CT_FontReference a shape's p:style
+///   uses; the text-box controls (#1627 N13, N20, I26, P31-P35) and the
+///   table-lang controls show a fontRef naming its collection for the ea and
+///   cs slots as well as Latin. A cell without a style font takes the minor
+///   collection like its Latin face; a tcTxStyle `<a:font>` supplies its own
+///   authored ea/cs. A token or literal authored in the cell overrides it,
+///   `typeface=""` included.
 /// * No list-style language or faces: cells take neither the defaultTextStyle
 ///   nor the otherStyle faces (#1628), and the #1627 table-lang controls show
 ///   no defaultTextStyle lang (ja-JP, ko-KR, he-IL) or literal ea/cs reaching
 ///   a cell, styled or not, while the text-box twins took them. Only the
 ///   cell's own lang / altLang apply.
 pub(crate) fn table_cell_chain(
-    style_font: Option<&str>,
+    style_font: Option<&TableStyleFont>,
     theme: &HashMap<String, String>,
 ) -> LevelRunProperties {
-    // The collection a tcTxStyle fontRef names holds for ea/cs whether or not
-    // its Latin face is usable: take it from the authored value before the
-    // Latin face falls back.
-    let set = match style_font {
-        Some(font) => theme_token_set(font),
-        None => Some("+mn"),
+    let theme_minor = || resolve_latin_face("+mn-lt", theme);
+    let (face, ea, cs) = match style_font {
+        // A fontRef collection holds for ea/cs whatever its Latin face; an
+        // empty Latin face draws in Arial (#1627 table-lang TE*, like a
+        // shape's fontRef, XE*).
+        Some(TableStyleFont::Collection(set)) => (
+            resolve_latin_face(&format!("{set}-lt"), theme),
+            Some(format!("{set}-ea")),
+            Some(format!("{set}-cs")),
+        ),
+        // `<a:font>` faces are authored values: a Latin token naming an empty
+        // slot is unspecified and the cell falls through to the theme minor
+        // face (#1620 / #1628 behaviour); ea/cs are used as authored.
+        Some(TableStyleFont::Faces { latin, ea, cs }) => (
+            latin
+                .as_deref()
+                .and_then(|face| resolve_latin_face(face, theme))
+                .or_else(theme_minor),
+            ea.clone(),
+            cs.clone(),
+        ),
+        None => (
+            theme_minor(),
+            Some("+mn-ea".to_owned()),
+            Some("+mn-cs".to_owned()),
+        ),
     };
-    // A style font naming a collection with an empty Latin face draws in
-    // Arial (#1627 table-lang controls TE*), like a shape's fontRef.
-    let face = match style_font {
-        Some(font) => resolve_latin_face(font, theme),
-        None => resolve_latin_face("+mn-lt", theme),
-    }
-    .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
+    let face = face.or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
     std::array::from_fn(|_| {
-        let (ea, cs) = match set {
-            Some(set) => (Some(format!("{set}-ea")), Some(format!("{set}-cs"))),
-            None => (None, None),
-        };
-        RunProperties::script_base(ea, cs, None, None)
+        RunProperties::script_base(ea.clone(), cs.clone(), None, None)
             // Sizes stay on the level-size tier (`TableTextLevels`), which
             // the renderer applies to runs without their own size.
             .with_chain_face_and_size(face.clone(), None)
@@ -2319,7 +2335,7 @@ pub(crate) fn parse_table(
     let last_row_idx = row_count.saturating_sub(1);
     // The table-style tier of each cell's text is known from its position, so
     // the cell text is parsed over it (see `table_cell_chain`).
-    let cell_font = |ri: usize, ci: usize| -> Option<String> {
+    let cell_font = |ri: usize, ci: usize| -> Option<TableStyleFont> {
         let s = style?;
         resolve_table_cell_style(s, style_flags, ri, ci, row_count, col_count)
             .text
@@ -2336,7 +2352,7 @@ pub(crate) fn parse_table(
                 source_dir,
                 &default_text.table,
                 zip,
-                |ci| table_cell_chain(cell_font(ri, ci).as_deref(), theme),
+                |ci| table_cell_chain(cell_font(ri, ci).as_ref(), theme),
             )
         })
         .collect();
@@ -3680,6 +3696,69 @@ mod style_ref_tests {
     use crate::theme::PptxTheme;
     use std::io::Cursor;
 
+    /// Issue #1627 review round 3: an authored `<a:font><a:latin
+    /// typeface="+mj-lt"/>` is an ordinary token. With an empty major Latin
+    /// face it falls through to the theme minor face (main's behaviour), not
+    /// the Arial of a fontRef whose collection has an empty Latin face.
+    #[test]
+    fn table_style_authored_latin_token_keeps_the_minor_fallback() {
+        let theme: HashMap<String, String> =
+            [("+mn-lt", "Corbel"), ("+mj-script-Jpan", "MajorJpan")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+        let xml = r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:txBody><a:bodyPr/>
+            <a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p></a:txBody></a:tc>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let run = |font: TableStyleFont| {
+            let mut zip = empty_zip();
+            let chain = table_cell_chain(Some(&font), &theme);
+            let cell = parse_table_cell_with_chain(
+                doc.root_element(),
+                &theme,
+                &HashMap::new(),
+                "ppt/slides",
+                &crate::master::TableTextLevels::default(),
+                &chain,
+                &mut zip,
+            );
+            match cell.text_body.unwrap().paragraphs.remove(0).runs.remove(0) {
+                TextRun::Text(t) => t,
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let authored = run(TableStyleFont::Faces {
+            latin: Some("+mj-lt".to_owned()),
+            ea: Some("+mj-ea".to_owned()),
+            cs: None,
+        });
+        assert_eq!(authored.font_family.as_deref(), Some("Corbel"));
+        assert_eq!(authored.font_family_ea.as_deref(), Some("MajorJpan"));
+        // Parsing keeps the two tcTxStyle forms apart.
+        let styles = parse_table_styles_xml(
+            r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{A}">
+              <a:tblStyle styleId="{A}" styleName="authored"><a:wholeTbl><a:tcTxStyle><a:font><a:latin typeface="+mj-lt"/><a:ea typeface="+mj-ea"/><a:cs typeface=""/></a:font></a:tcTxStyle></a:wholeTbl></a:tblStyle>
+              <a:tblStyle styleId="{B}" styleName="ref"><a:wholeTbl><a:tcTxStyle><a:fontRef idx="major"/></a:tcTxStyle></a:wholeTbl></a:tblStyle>
+            </a:tblStyleLst>"#,
+            &theme,
+        );
+        assert_eq!(
+            styles["{A}"].whole_tbl.text.font,
+            Some(TableStyleFont::Faces {
+                latin: Some("+mj-lt".to_owned()),
+                ea: Some("+mj-ea".to_owned()),
+                cs: Some(String::new()),
+            })
+        );
+        assert_eq!(
+            styles["{B}"].whole_tbl.text.font,
+            Some(TableStyleFont::Collection("+mj"))
+        );
+        let font_ref = run(TableStyleFont::Collection("+mj"));
+        assert_eq!(font_ref.font_family.as_deref(), Some("Arial"));
+        assert_eq!(font_ref.font_family_ea.as_deref(), Some("MajorJpan"));
+    }
+
     /// Issue #1627 review: a tcTxStyle fontRef names its theme collection for
     /// ea/cs even when that collection's Latin face is empty, so the Latin
     /// face falls back (Arial) while Japanese and Hebrew keep the MAJOR
@@ -3701,7 +3780,7 @@ mod style_ref_tests {
             <a:p><a:r><a:rPr lang="he-IL"/><a:t>b</a:t></a:r></a:p></a:txBody></a:tc>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
         let mut zip = empty_zip();
-        let chain = table_cell_chain(Some("+mj-lt"), &theme);
+        let chain = table_cell_chain(Some(&TableStyleFont::Collection("+mj")), &theme);
         let cell = parse_table_cell_with_chain(
             doc.root_element(),
             &theme,
