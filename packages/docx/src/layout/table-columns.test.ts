@@ -14,6 +14,51 @@ function input(overrides: Partial<TableColumnLayoutInput> = {}): TableColumnLayo
 }
 
 describe('ECMA-376 §17.18.87 table column solver', () => {
+  it('fits two growing unpreferred tracks between their content minima and maxima', () => {
+    // Word's simultaneous-growth controls distinguish content-interval sharing
+    // from sharing deficits over the saved grid or sharing absolute maxima.
+    const solve = (availableWidthPt: number, gridWidthsPt = [25, 25]) => resolveTableColumnWidths(input({
+      layout: 'autofit', availableWidthPt, gridWidthsPt, growUnpreferredColumns: true,
+      rows: [{ before: null, after: null, cells: [
+        { columnStart: 0, columnSpan: 1, preferredWidth: null,
+          minContentWidthPt: 20, maxContentWidthPt: 300 },
+        { columnStart: 1, columnSpan: 1, preferredWidth: null,
+          minContentWidthPt: 20, maxContentWidthPt: 200 },
+      ] }],
+    }));
+    const binding = solve(300);
+    expect(binding[0]).toBeCloseTo(20 + 260 * 280 / 460, 8);
+    expect(binding[1]).toBeCloseTo(20 + 260 * 180 / 460, 8);
+    expect(solve(600)).toEqual([300, 200]);
+    // An oversized saved short track must release room for the long track.
+    expect(solve(300, [280, 30])[0]).toBeCloseTo(20 + 260 * 280 / 460, 8);
+  });
+
+  it('releases unpreferred saved width beyond the content maximum for a growing neighbor', () => {
+    const result = resolveTableColumnWidths(input({
+      layout: 'autofit', availableWidthPt: 430, gridWidthsPt: [340, 85],
+      growUnpreferredColumns: true,
+      rows: [{ before: null, after: null, cells: [
+        { columnStart: 0, columnSpan: 1, preferredWidth: null,
+          minContentWidthPt: 96, maxContentWidthPt: 96 },
+        { columnStart: 1, columnSpan: 1, preferredWidth: null,
+          minContentWidthPt: 45, maxContentWidthPt: 1400 },
+      ] }],
+    }));
+    expect(result).toEqual([96, 334]);
+  });
+
+  it('retains the established solver result outside the two-track simultaneous-growth evidence', () => {
+    expect(resolveTableColumnWidths(input({
+      layout: 'autofit', availableWidthPt: 300, gridWidthsPt: [25, 25, 25],
+      growUnpreferredColumns: true,
+      rows: [{ before: null, after: null, cells: [300, 200, 100].map((maximum, column) => ({
+        columnStart: column, columnSpan: 1, preferredWidth: null,
+        minContentWidthPt: 20, maxContentWidthPt: maximum,
+      })) }],
+    }))).toEqual([25, 25, 25]);
+  });
+
   it('constructs a zero-width grid when tblGrid is omitted and extends it for gridSpan', () => {
     expect(resolveTableColumnWidths(input({
       gridWidthsPt: [],

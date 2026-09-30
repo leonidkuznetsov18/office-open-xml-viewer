@@ -455,21 +455,19 @@ function noWrapPreferredFloors(
   return floors;
 }
 
-/** WORD_AUTOFIT_CONTENT_COLUMN_GROWTH (table-compatibility.ts): §17.4.49
- * makes tblGrid only the initial grid. A column whose every cell lacks a
- * preferred width (§17.4.71 auto or omitted) and wants more than its saved
- * width grows toward its maximum content width while the table stays within
- * the AutoFit ceiling. §17.18.87 does not prescribe how simultaneous deficits
- * share the room; splitting it by each deficit is a deterministic solver
- * policy, not a compatibility constant. */
+/** WORD_AUTOFIT_CONTENT_COLUMN_GROWTH (table-compatibility.ts): tblGrid is
+ * initial geometry (§17.4.48), not a content maximum. The measured two-track
+ * controls release an unpreferred short track's excess saved width. When both
+ * tracks grow, Word interpolates their content minima toward their maxima,
+ * rather than sharing deficits over the saved grid. Simultaneous growth with
+ * more tracks or spans is unmeasured and keeps the existing solver result. */
 function growUnpreferredColumns(
   widths: number[],
+  minimums: readonly number[],
   maximums: readonly number[],
   cells: readonly TableColumnCellConstraint[],
   availableWidthPt: number,
 ): void {
-  const roomPt = availableWidthPt - widths.reduce((sum, width) => sum + width, 0);
-  if (roomPt <= EPSILON_PT) return;
   const eligible = widths.map(() => true);
   for (const cell of cells) {
     if (cell.preferredWidth === null && cell.columnSpan === 1) continue;
@@ -477,11 +475,32 @@ function growUnpreferredColumns(
     const end = Math.min(widths.length, start + Math.max(1, cell.columnSpan));
     for (let column = start; column < end; column += 1) eligible[column] = false;
   }
+  const twoUnpreferredTracks = widths.length === 2 && eligible.every(Boolean);
+  if (twoUnpreferredTracks) {
+    widths.forEach((width, column) => {
+      widths[column] = Math.min(width, maximums[column] ?? width);
+    });
+  }
   const deficits = widths.map((width, column) => (eligible[column]
     ? Math.max(0, (maximums[column] ?? 0) - width)
     : 0));
   const totalDeficitPt = deficits.reduce((sum, deficit) => sum + deficit, 0);
   if (totalDeficitPt <= EPSILON_PT) return;
+  if (deficits.filter((deficit) => deficit > EPSILON_PT).length > 1) {
+    if (!twoUnpreferredTracks) return;
+    const minimumPt = minimums.reduce((sum, width) => sum + width, 0);
+    if (minimumPt > availableWidthPt) return;
+    const intervals = maximums.map((maximum, column) => Math.max(0, maximum - (minimums[column] ?? 0)));
+    const totalIntervalPt = intervals.reduce((sum, width) => sum + width, 0);
+    if (totalIntervalPt <= EPSILON_PT) return;
+    const fraction = Math.min(1, (availableWidthPt - minimumPt) / totalIntervalPt);
+    widths.forEach((_width, column) => {
+      widths[column] = (minimums[column] ?? 0) + fraction * intervals[column]!;
+    });
+    return;
+  }
+  const roomPt = availableWidthPt - widths.reduce((sum, width) => sum + width, 0);
+  if (roomPt <= EPSILON_PT) return;
   const growPt = Math.min(roomPt, totalDeficitPt);
   deficits.forEach((deficit, column) => {
     widths[column] = (widths[column] ?? 0) + growPt * deficit / totalDeficitPt;
@@ -623,7 +642,7 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
     enforceContentConstraint(widths, minimums, transferFloors, maximums, cell);
   }
   if (input.growUnpreferredColumns === true && input.tablePreferredWidthPt === null) {
-    growUnpreferredColumns(widths, maximums, cells, finiteNonNegative(input.availableWidthPt));
+    growUnpreferredColumns(widths, minimums, maximums, cells, finiteNonNegative(input.availableWidthPt));
   }
   return Object.freeze(fitToAvailableWidth(
     widths,

@@ -226,13 +226,15 @@ describe('§17.4.50 tblInd — table indent from the leading margin', () => {
     gridPt: number;
     compatibilityMode?: number;
     text?: string;
+    preferredCell?: boolean;
+    justification?: 'left' | 'center' | 'right';
   }) => {
     const source = tableDoc(options.gridPt, options.indentPt, false);
     const { widthPt: _preferred, ...sourceTable } = source.body[0] as DocTable;
     const sourceRow = sourceTable.rows[0]!;
     const { widthPt: _cellPreferred, ...sourceCell } = sourceRow.cells[0]!;
     const cell = options.text === undefined
-      ? sourceRow.cells[0]!
+      ? (options.preferredCell ? sourceRow.cells[0]! : sourceCell as DocTableCell)
       : { ...sourceCell, content: [{ type: 'paragraph', ...bodyParagraph(options.text) }] } as DocTableCell;
     const doc = {
       ...source,
@@ -242,6 +244,7 @@ describe('§17.4.50 tblInd — table indent from the leading margin', () => {
       section: { ...source.section, marginLeft: options.sideMarginPt, marginRight: options.sideMarginPt },
       body: [{
         ...sourceTable,
+        jc: options.justification ?? 'left',
         cellMarginLeft: 5.4,
         cellMarginRight: 5.4,
         rows: [{ ...sourceRow, cells: [cell] }],
@@ -277,6 +280,37 @@ describe('§17.4.50 tblInd — table indent from the leading margin', () => {
       // WORD_AUTOFIT_LEADING_INDENT_BAND: no physical page clamp.
       expect(bounds.xPt).toBeCloseTo(expected.xPt, 6);
       expect(bounds.widthPt).toBeCloseTo(expected.widthPt, 6);
+    },
+  );
+
+  it('applies the mode ceiling independently of cell preferences', () => {
+    // Cell preferences affect allocation, not the auto tblW occurrence limit.
+    // Word PDF clipping bounds and matching-font line partitions also confirm
+    // this for an all-dxa multirow table.
+    const bounds = autoWidthTable({
+      sideMarginPt: 10, indentPt: 5, gridPt: 190, compatibilityMode: 15,
+      preferredCell: true,
+    });
+    expect(bounds.widthPt).toBeCloseTo(175, 6);
+  });
+
+  it('preserves the established ceiling for an unmeasured compatibility mode', () => {
+    expect(autoWidthTable({
+      sideMarginPt: 10, indentPt: 5, gridPt: 190, compatibilityMode: 12,
+    }).widthPt).toBeCloseTo(190, 6);
+  });
+
+  it.each(['center', 'right'] as const)(
+    '%s auto-width limit retains the indent in mode 14 and uses the full band in mode 15',
+    (justification) => {
+      const common = { sideMarginPt: 10, indentPt: 5, gridPt: 175, justification, text: 'x'.repeat(100) };
+      expect(autoWidthTable({ ...common, compatibilityMode: 14 }).widthPt).toBeCloseTo(185.8, 6);
+      expect(autoWidthTable({ ...common, compatibilityMode: 15 }).widthPt).toBeCloseTo(180, 6);
+      // A wider grid separates the two mode-14 hypotheses, but no such Word
+      // control exists. Preserve the established result outside their common
+      // geometry instead of inferring a ceiling from these four controls.
+      expect(autoWidthTable({ ...common, gridPt: 190, compatibilityMode: 14 }).widthPt).toBeCloseTo(190, 6);
+      expect(autoWidthTable({ ...common, gridPt: 190, compatibilityMode: 15 }).widthPt).toBeCloseTo(190, 6);
     },
   );
 

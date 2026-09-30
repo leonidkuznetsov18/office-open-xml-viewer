@@ -2286,35 +2286,54 @@ function resolveColumnWidths(
   // AutoFit table with no preferred tblW (§17.4.63 auto), a leading §17.4.50
   // tblInd moves only the leading edge while the trailing edge stays at the
   // text band. The text band available to the grid is contentW - tblInd for
-  // either sign, and the physical page is not a ceiling. Below compatibility
-  // mode 15 the outer cell margins hang outside that text band, so the table
-  // adds them in full; from mode 15 the table edges stay inside it. Centered
-  // and trailing justifications are outside that evidence and keep the whole
-  // text band.
+  // either sign, and the physical page is not a ceiling. In mode 14 (or with
+  // the mode omitted) outer cell margins hang outside that band, so the table
+  // adds them in full; mode 15 removes that allowance. The additional
+  // center/right grid-matched controls use that same mode-14 fitted width and
+  // the whole mode-15 band. Their +5.4pt-indent geometry does not settle other
+  // grid/indent combinations or absolute origin policy (see the rule's limits).
   const hasPreferredTableWidth = (Number.isFinite(table.widthPt) && (table.widthPt ?? 0) > 0)
     || (Number.isFinite(table.widthPct) && (table.widthPct ?? 0) > 0);
+  const savedGridWidthPt = table.colWidths.reduce(
+    (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
+  );
+  // Nonleading controls only establish the case where saved grid + indent
+  // equals the band. There the two possible mode-14 ceilings coincide; keep
+  // other nonleading geometries on their established width contract rather
+  // than choosing between indistinguishable hypotheses. The epsilon covers
+  // point arithmetic, not a visual fit tolerance.
+  const hasMeasuredAlignmentGeometry = rowPlacements.every(({ justification, indentPt }) => {
+    const nonleading = justification === 'center' || justification === 'right' || justification === 'end';
+    return !nonleading || Math.abs(savedGridWidthPt + indentPt - contentWPt) <= 1e-9;
+  });
+  const compatibilityMode = state.layoutSettings.compat.compatibilityMode;
+  const hasMeasuredCompatibilityMode = compatibilityMode === undefined
+    || compatibilityMode === 14 || compatibilityMode === 15;
   const usesLeadingIndentBand = effectiveLayout !== 'fixed'
     && format.ordinaryFlow
     && isTopLevelPageOwnedStory
     && !isVerticalTextDirection(state.sectionLayout.textDirection)
-    && !hasPreferredTableWidth;
+    && !hasPreferredTableWidth
+    && hasMeasuredCompatibilityMode
+    && hasMeasuredAlignmentGeometry;
+  const outerCellMarginsHangOutsideBand = compatibilityMode === undefined || compatibilityMode === 14;
   const textBandPt = usesLeadingIndentBand
     ? Math.max(0, Math.min(...rowPlacements.map(({ justification, indentPt }) => {
         const trailing = justification === 'right' || justification === 'end';
         const leading = justification !== 'center' && !trailing;
-        return leading ? contentWPt - indentPt : contentWPt;
+        // The center/right controls retain the leading band's width in mode
+        // 14, but use the full text band in mode 15. This is a width rule;
+        // signed placement remains governed separately by MS-OI29500 2.1.155.
+        return leading || outerCellMarginsHangOutsideBand ? contentWPt - indentPt : contentWPt;
       })))
     : contentWPt;
   // WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND (table-compatibility.ts): an AutoFit
   // grid can include outer §17.4.42 cell margins beyond the text band. For a
   // preferred-width table, only the margin overhang already represented by
-  // §17.4.49 tblGrid is used (that class is not covered by the mode controls).
+  // §17.4.48 tblGrid is used (that class is not covered by the mode controls).
   // A row with skipped outer tracks cannot establish that margin ownership.
   // A nested table's saved overhang belongs to its containing cell; giving it
   // the page-table allowance enlarges that cell's contents beyond Word's grid.
-  const savedGridWidthPt = table.colWidths.reduce(
-    (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
-  );
   const possibleOuterCellMarginsPt = effectiveLayout === 'fixed'
     || !format.ordinaryFlow
     || (isLeadingMarginPageStoryTable && !usesLeadingIndentBand)
@@ -2337,8 +2356,6 @@ function resolveColumnWidths(
       }, Number.POSITIVE_INFINITY);
   // compatSetting compatibilityMode: WORD_AUTOFIT_LEADING_INDENT_BAND treats
   // an omitted setting like an explicit 14.
-  const compatibilityMode = state.layoutSettings.compat.compatibilityMode;
-  const outerCellMarginsHangOutsideBand = compatibilityMode === undefined || compatibilityMode < 15;
   // The two-cell forced-fit distribution always shares the actual outer
   // margins; only the ceiling differs by compatibility mode.
   const forcedFitOuterMarginsPt = usesLeadingIndentBand
@@ -2405,7 +2422,15 @@ function resolveColumnWidths(
           const intrinsic = measureParagraphIntrinsicWidths(
             paragraph,
             context,
-            contentWPt,
+            // §17.18.87 defines maximum content width without soft wrapping.
+            // Capping it at the band loses the relative demand of two growing
+            // columns (notably the 5:1 control). Only the measured auto-column
+            // growth path needs this uncapped interval; preferred and nested
+            // paths retain their existing measurement ceiling.
+            usesLeadingIndentBand && owner === table && ownerLayout !== 'fixed'
+              && cell.widthPt == null && cell.widthPct == null
+              ? Number.MAX_SAFE_INTEGER
+              : contentWPt,
             { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
             paragraphMeasurementEnvironment(state),
             numbering,
