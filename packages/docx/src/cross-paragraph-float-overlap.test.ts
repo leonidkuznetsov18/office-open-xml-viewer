@@ -298,4 +298,15 @@ describe('issue #1623 Word placement of floats from different paragraphs', () =>
       - Math.max(first!.yPt, second!.yPt);
     expect(overlapX <= 0.001 || overlapY <= 0.001).toBe(true);
   });
+
+  it('carries a later tight picture to an earlier line that starts on its bottom edge', () => {
+    const placed = layOut({
+      mode: 15,
+      // The picture spans 48-72 in the top margin; only P000 (72-96) touches it.
+      pictures: [{ paragraph: 1, wrap: 'tight', hFrom: 'margin', xPt: 0, yPt: -48, widthPt: 200, heightPt: 24 }],
+    });
+    close(placed.pictures[0]?.yPt, 48);
+    close(placed.lines.get(0)?.xPt, 281);
+    close(placed.lines.get(1)?.xPt, 72);
+  });
 });

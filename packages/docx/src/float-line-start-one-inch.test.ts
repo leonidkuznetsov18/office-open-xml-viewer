@@ -230,15 +230,30 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
     };
     const sides = ['bothSides', 'left', 'right', 'largest'] as const;
     let compared = 0;
-    for (let trial = 0; trial < 200; trial += 1) {
-      const floats = Array.from({ length: 1 + Math.floor(random() * 3) }, () => polygonFloat(
-        'tight',
-        Array.from({ length: 3 + Math.floor(random() * 3) }, () => ({
-          xPt: Math.round(-40 + random() * 180),
-          yPt: Math.round(random() * 120),
-        })),
-        { side: sides[Math.floor(random() * sides.length)]! },
-      )).filter((float) => float.yBottom > float.yTop && float.xRight > float.xLeft);
+    for (let trial = 0; trial < 400; trial += 1) {
+      // Half of the trials use only axis-aligned rectangles, whose boundaries
+      // are constant inside a structural slab.
+      const rectangles = random() < 0.5;
+      const floats = Array.from({ length: 1 + Math.floor(random() * 3) }, () => {
+        const side = sides[Math.floor(random() * sides.length)]!;
+        if (rectangles) {
+          const x0 = Math.round(-40 + random() * 150);
+          const y0 = Math.round(random() * 90);
+          const x1 = x0 + 5 + Math.round(random() * 90);
+          const y1 = y0 + 5 + Math.round(random() * 60);
+          return polygonFloat('tight', [
+            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
+          ], { side });
+        }
+        return polygonFloat(
+          'tight',
+          Array.from({ length: 3 + Math.floor(random() * 3) }, () => ({
+            xPt: Math.round(-40 + random() * 180),
+            yPt: Math.round(random() * 120),
+          })),
+          { side },
+        );
+      }).filter((float) => float.yBottom > float.yTop && float.xRight > float.xLeft);
       if (floats.length === 0) continue;
       const start = Math.round(random() * 30);
       const required = 5 + Math.round(random() * 70);
@@ -251,8 +266,28 @@ describe('resolveLineFloatWindow — Word 1-inch line-start gate (issue #676)', 
       expect(actual, `trial ${trial}`).toEqual(expected);
       compared += 1;
     }
-    expect(compared).toBeGreaterThan(100);
+    expect(compared).toBeGreaterThan(200);
   }, 120_000);
+
+  it('keeps the tight line-step search near-linear in the number of overlapping polygons', () => {
+    for (const count of [10, 50, 75]) {
+      const floats = Array.from({ length: count }, (_, index) => polygonFloat('tight', [
+        { xPt: index - 10, yPt: index * 2 },
+        { xPt: index + 50, yPt: index * 2 },
+        { xPt: index + 50, yPt: index * 2 + 300 },
+        { xPt: index - 10, yPt: index * 2 + 300 },
+      ]));
+      const prepared = prepareFloatWrap(floats);
+      const started = performance.now();
+      const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+        0, 60, 1, 0, 100, prepared,
+      );
+      const elapsedMs = performance.now() - started;
+      if (count === 10) expect(window).toEqual(perStepReference(floats, 0, 60, 1, 0, 100));
+      expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(4 * count + 8);
+      expect(elapsedMs).toBeLessThan(500);
+    }
+  });
 
   it('bounds the tight line-step search by geometry, not by the number of steps', () => {
     const tall = polygonFloat('tight', [

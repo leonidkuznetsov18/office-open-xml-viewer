@@ -13,6 +13,7 @@ import type {
   PageAnchorPrescanInput,
 } from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
+import { createFloatLineBandPredicate, type FloatRect } from './float-wrap.js';
 import {
   commitPageFlowTransition,
   createBodyPaginationState,
@@ -2591,12 +2592,25 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
           : undefined;
         const touch = touchFromPt !== undefined;
         if (!(topPt < paragraphTopPt) && !touch) continue;
-        const bottomPt = topPt + exclusion.bounds.heightPt;
-        const meetsEarlierLine = earlierBands.some((band) => (
-          (band.topPt < bottomPt && band.bottomPt > topPt)
-          || (touch && band.bottomPt === topPt && band.topPt >= touchFromPt!)
-        ));
-        if (!meetsEarlierLine) continue;
+        const carry: CarriedHostAnchor = Object.freeze({
+          bounds: Object.freeze({ ...collision.bounds }),
+          exclusionBounds: Object.freeze({ ...exclusion.bounds }),
+          horizontalOwnership: collision.horizontalOwnership,
+          verticalOwnership: collision.verticalOwnership,
+          wrap: exclusion.wrap,
+          wrapSide: frame.geometry.wrap.side,
+          wrapDistances: Object.freeze({ ...frame.geometry.wrap.distances }),
+          ...(frame.geometry.wrap.polygon
+            ? { wrapPolygon: Object.freeze([...frame.geometry.wrap.polygon.points]) }
+            : {}),
+          ...(touch ? { topEdgeInclusiveFromYPt: touchFromPt } : {}),
+          ...(exclusion.anchorLineExemptTopPt === undefined
+            ? {} : { anchorLineExemptTopPt: exclusion.anchorLineExemptTopPt }),
+        });
+        // The line check's own predicate, so a carry is kept exactly when it
+        // can change an earlier line.
+        const meets = createFloatLineBandPredicate(carriedFloatRect(carry));
+        if (!earlierBands.some((band) => meets(band.topPt, band.bottomPt - band.topPt))) continue;
         const occurrenceId = acquisitionIds.get(collision.occurrenceId);
         if (occurrenceId === undefined) continue;
         plan.set(occurrenceId, Object.freeze({
@@ -2605,21 +2619,7 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
           paragraphSource: node.source,
           pageIndex: page.pageIndex,
           flowDomainId: node.flowDomainId,
-          carry: Object.freeze({
-            bounds: Object.freeze({ ...collision.bounds }),
-            exclusionBounds: Object.freeze({ ...exclusion.bounds }),
-            horizontalOwnership: collision.horizontalOwnership,
-            verticalOwnership: collision.verticalOwnership,
-            wrap: exclusion.wrap,
-            wrapSide: frame.geometry.wrap.side,
-            wrapDistances: Object.freeze({ ...frame.geometry.wrap.distances }),
-            ...(frame.geometry.wrap.polygon
-              ? { wrapPolygon: Object.freeze([...frame.geometry.wrap.polygon.points]) }
-              : {}),
-            ...(touch ? { topEdgeInclusiveFromYPt: touchFromPt } : {}),
-            ...(exclusion.anchorLineExemptTopPt === undefined
-              ? {} : { anchorLineExemptTopPt: exclusion.anchorLineExemptTopPt }),
-          }),
+          carry,
         }));
       }
       pending();
@@ -2627,6 +2627,34 @@ function hostAnchorCarryPlan(layout: DocumentLayout): Map<string, PageWrapDestin
     }
   }
   return plan;
+}
+
+/** The wrap geometry the page registry derives from a carried drawing (see
+ * commitBodyFlowRegistryDelta and paragraphWrapExclusions). */
+function carriedFloatRect(carry: CarriedHostAnchor): FloatRect {
+  const bounds = carry.exclusionBounds;
+  return {
+    kind: 'shape',
+    mode: carry.wrap === 'topAndBottom' ? 'topAndBottom' : 'square',
+    authoredWrap: carry.wrap,
+    ...(carry.wrapPolygon ? { wrapPolygon: carry.wrapPolygon } : {}),
+    imageKey: 'carried-anchor',
+    imageX: carry.bounds.xPt,
+    imageY: carry.bounds.yPt,
+    imageW: carry.bounds.widthPt,
+    imageH: carry.bounds.heightPt,
+    xLeft: bounds.xPt,
+    xRight: bounds.xPt + bounds.widthPt,
+    yTop: bounds.yPt,
+    yBottom: bounds.yPt + bounds.heightPt,
+    side: carry.wrapSide ?? 'bothSides',
+    distLeft: 0, distRight: 0, distTop: 0, distBottom: 0,
+    paraId: 0,
+    ...(carry.topEdgeInclusiveFromYPt === undefined
+      ? {} : { topEdgeInclusiveFromYPt: carry.topEdgeInclusiveFromYPt }),
+    ...(carry.anchorLineExemptTopPt === undefined
+      ? {} : { exemptLineTopPt: carry.anchorLineExemptTopPt }),
+  };
 }
 
 /** The carried drawings of `applied` that stayed on their page with their

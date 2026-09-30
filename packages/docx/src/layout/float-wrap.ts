@@ -19,8 +19,6 @@ import {
 import {
   compareExactRational,
   decodeBinary64,
-  exactRationalKey,
-  normalizeExactRational,
   exactRationalToNumberDown,
   exactRationalToNumber,
   exactRationalToNumberUp,
@@ -726,6 +724,29 @@ function tightEdgeTouch(
   return null;
 }
 
+/**
+ * The vertical test `lineWindowAtY` uses to decide whether `float` affects a
+ * line band [topY, topY + heightPt]: a strict overlap, or a touched tight
+ * polygon edge (`tightEdgeTouch`), except on an exempt anchor line.
+ * Pagination uses the same predicate to decide whether a carried drawing
+ * can change an earlier line.
+ */
+export function createFloatLineBandPredicate(
+  float: FloatRect,
+): (topY: number, heightPt: number) => boolean {
+  const prepared = prepareFloatWrap([float]).floats[0]!;
+  const { rect } = prepared;
+  return (topY, heightPt) => {
+    const exactTop = unreducedExactFromNumber(topY);
+    const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(heightPt));
+    const overlaps = compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) > 0
+      && compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) < 0;
+    if (rect.mode === 'topAndBottom') return overlaps;
+    if (rect.exemptLineTopPt === topY) return false;
+    return overlaps || tightEdgeTouch(prepared, exactTop, exactBottom) !== null;
+  };
+}
+
 /** Whether the line band [topY, topY + probeH] meets a tight polygon,
  * including the touched edges of `tightEdgeTouch`. */
 function bandMeetsTightPolygon(
@@ -1267,26 +1288,40 @@ function nextLocalSweepEvent(
   return Math.min(...roots);
 }
 
-type ExactAffine = Readonly<{ slope: ExactRational; intercept: ExactRational }>;
-
-const reducedExact = (value: ExactRational): ExactRational =>
-  normalizeExactRational(value.numerator, value.denominator);
-
 /**
- * Every Y strictly inside (lower, upper) at which the result of
- * `lineWindowAtY` can change within one structural slab.
+ * The first Y in (lower, upper) at which `lineWindowAtY` can change, or null
+ * when it is constant on the whole open interval; lower and upper lie within
+ * one structural slab.
  *
- * Inside a structural slab each blocked-interval boundary is affine in the
- * line top (`objectAffineIntervals`, with its envelope switch points). The
- * window depends only on the order of these boundaries and of the paragraph
- * bounds (which the gaps are clipped to), on which gap is widest, and on
- * whether that gap reaches its required width. So it can change only where two
- * boundaries meet, where a boundary difference equals a required width, or
- * where two boundary differences are equal. Collecting all those roots makes
- * the window constant between consecutive critical Ys, including when a
- * contour crosses the paragraph bounds.
+ * Kinetic counterpart of `nextLocalSweepEvent` for the tight line-step
+ * search. It reads the state just after `lower` and reports the earliest
+ * change of: the blocked-interval order and merge structure (adjacent
+ * boundaries only, plus contour envelope switches), a gap edge crossing a
+ * paragraph bound (gaps are clipped to the paragraph as in `lineWindowAtY`),
+ * a clipped gap opening or closing, a clipped gap width crossing its required
+ * width in either direction, or another gap overtaking the widest one. Each
+ * call is O(B log B) in the blocked-interval boundaries.
  */
-function slabCriticalYs(
+/** Whether every blocked-interval boundary of `prepared` is constant in the
+ * line top: square exclusions and tight/through polygons whose edges are all
+ * horizontal or vertical. Such geometry changes only at structural events. */
+const constantBoundaryCache = new WeakMap<PreparedFloatWrap, boolean>();
+function hasOnlyConstantBoundaries(prepared: PreparedFloatWrap): boolean {
+  const cached = constantBoundaryCache.get(prepared);
+  if (cached !== undefined) return cached;
+  const constant = prepared.floats.every(({ rect, polygon }) => {
+    if (!polygon) return true;
+    const points = rect.wrapPolygon ?? [];
+    return points.every((point, index) => {
+      const next = points[(index + 1) % points.length]!;
+      return point.xPt === next.xPt || point.yPt === next.yPt;
+    });
+  });
+  constantBoundaryCache.set(prepared, constant);
+  return constant;
+}
+
+function nextClippedWindowEvent(
   lower: number,
   upper: number,
   probeH: number,
@@ -1296,70 +1331,75 @@ function slabCriticalYs(
   reference: LineFloatReference,
   polygonRequiredWidth: number,
   squareRequiredWidth: number,
-): number[] {
-  const envelopeRoots: number[] = [];
-  const boundaries: ExactAffine[] = [
-    { slope: { numerator: 0n, denominator: 1n }, intercept: unreducedExactFromNumber(paraXLeft) },
-    { slope: { numerator: 0n, denominator: 1n }, intercept: unreducedExactFromNumber(paraXRight) },
-  ];
+): number | null {
+  // Constant boundaries keep every order, clip, width and widest-gap relation
+  // fixed inside a structural slab.
+  if (hasOnlyConstantBoundaries(prepared)) return null;
+  const roots: number[] = [];
+  const intervals: AffineBlockedInterval[] = [];
   for (const float of prepared.floats) {
-    if (float.rect.mode !== 'square') continue;
-    if (!floatOverlapsColumnX(float.rect as FloatRect, paraXLeft, paraXRight)) continue;
-    for (const interval of objectAffineIntervals(
-      float, probeH, lower, upper, paraXLeft, paraXRight, reference, envelopeRoots, null,
-    )) {
-      boundaries.push(interval.left.exact, interval.right.exact);
-    }
-  }
-  const unique = new Map<string, ExactAffine>();
-  for (const boundary of boundaries) {
-    const slope = reducedExact(boundary.slope);
-    const intercept = reducedExact(boundary.intercept);
-    unique.set(`${exactRationalKey(slope)}|${exactRationalKey(intercept)}`, { slope, intercept });
-  }
-  const affine = [...unique.values()];
-  const differences: ExactAffine[] = [];
-  for (let i = 0; i < affine.length; i += 1) {
-    for (let j = 0; j < affine.length; j += 1) {
-      if (i === j) continue;
-      differences.push({
-        slope: reducedExact(subtractUnreducedExact(affine[j]!.slope, affine[i]!.slope)),
-        intercept: reducedExact(subtractUnreducedExact(affine[j]!.intercept, affine[i]!.intercept)),
-      });
-    }
-  }
-  const requirements = [...new Set([
-    Math.max(MIN_LINE_GAP, polygonRequiredWidth),
-    Math.max(MIN_LINE_GAP, squareRequiredWidth),
-    0,
-  ])].map(unreducedExactFromNumber);
-  const exactLower = unreducedExactFromNumber(lower);
-  const exactUpper = unreducedExactFromNumber(upper);
-  const roots: number[] = [...envelopeRoots.filter((y) => y > lower && y < upper)];
-  const addRoot = (slope: ExactRational, intercept: ExactRational) => {
-    // slope * y + intercept = 0
-    if (slope.numerator === 0n) return;
-    const root = reducedExact(divideUnreducedExact(
-      subtractUnreducedExact({ numerator: 0n, denominator: 1n }, intercept),
-      slope,
+    const { rect } = float;
+    if (rect.mode !== 'square') continue;
+    if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) continue;
+    intervals.push(...objectAffineIntervals(
+      float, probeH, lower, upper, paraXLeft, paraXRight, reference, roots, null,
     ));
-    if (compareExactRational(root, exactLower) <= 0 || compareExactRational(root, exactUpper) >= 0) return;
-    roots.push(exactRationalToNumberDown(root), exactRationalToNumberUp(root));
+  }
+  if (intervals.length === 0) return roots.length === 0 ? null : Math.min(...roots);
+  const merged = mergeAffineIntervalsAtRight(intervals, lower, upper, roots, null);
+  const pageLeft = constantBoundary(paraXLeft);
+  const pageRight = constantBoundary(paraXRight);
+  const crossing = (left: AffineBoundary, right: AffineBoundary, delta: number) => {
+    appendLocalRoot(roots, exactAffineRoot(left.exact, right.exact, delta), lower, upper, null);
   };
-  for (const difference of differences) {
-    for (const requirement of requirements) {
-      addRoot(difference.slope, subtractUnreducedExact(difference.intercept, requirement));
+  const gaps: Array<{ exactWidth: AffineBoundary['exact'] }> = [];
+  const addGap = (left: AffineBoundary, right: AffineBoundary, squareConstrained: boolean) => {
+    // Clip to the paragraph exactly as widestUsableFreeGap does.
+    crossing(left, pageLeft, 0);
+    crossing(right, pageRight, 0);
+    const clippedLeft = compareAtRight(left, pageLeft, lower) >= 0 ? left : pageLeft;
+    const clippedRight = compareAtRight(right, pageRight, lower) <= 0 ? right : pageRight;
+    crossing(clippedRight, clippedLeft, 0);
+    if (compareAtRight(clippedRight, clippedLeft, lower) <= 0) return;
+    const requirement = Math.max(
+      MIN_LINE_GAP,
+      squareConstrained ? squareRequiredWidth : polygonRequiredWidth,
+    );
+    crossing(clippedRight, clippedLeft, requirement);
+    gaps.push({
+      exactWidth: {
+        slope: subtractUnreducedExact(clippedRight.exact.slope, clippedLeft.exact.slope),
+        intercept: subtractUnreducedExact(clippedRight.exact.intercept, clippedLeft.exact.intercept),
+      },
+    });
+  };
+  let gapLeft = pageLeft;
+  for (const interval of merged) {
+    // A gap ending at an interval that starts at or beyond the paragraph right
+    // bound keeps only its left flag (widestUsableFreeGap's final consider).
+    crossing(interval.left, pageRight, 0);
+    const beyond = compareAtRight(interval.left, pageRight, lower) >= 0;
+    addGap(gapLeft, interval.left, beyond ? gapLeft.square : gapLeft.square || interval.left.square);
+    gapLeft = interval.right;
+  }
+  addGap(gapLeft, pageRight, gapLeft.square);
+  const widthAt = (gap: { exactWidth: AffineBoundary['exact'] }) => addUnreducedExact(
+    multiplyUnreducedExact(gap.exactWidth.slope, unreducedExactFromNumber(lower)),
+    gap.exactWidth.intercept,
+  );
+  let widest = gaps[0];
+  for (const gap of gaps.slice(1)) {
+    const comparison = compareExactRational(widthAt(gap), widthAt(widest!))
+      || compareExactRational(gap.exactWidth.slope, widest!.exactWidth.slope);
+    if (comparison > 0) widest = gap;
+  }
+  if (widest) {
+    for (const gap of gaps) {
+      if (gap === widest) continue;
+      appendLocalRoot(roots, exactAffineRoot(gap.exactWidth, widest.exactWidth, 0), lower, upper, null);
     }
   }
-  for (let i = 0; i < differences.length; i += 1) {
-    for (let j = i + 1; j < differences.length; j += 1) {
-      addRoot(
-        subtractUnreducedExact(differences[i]!.slope, differences[j]!.slope),
-        subtractUnreducedExact(differences[i]!.intercept, differences[j]!.intercept),
-      );
-    }
-  }
-  return [...new Set(roots)].filter((y) => y > lower && y < upper).sort((left, right) => left - right);
+  return roots.length === 0 ? null : Math.min(...roots);
 }
 
 /**
@@ -1369,7 +1409,7 @@ function slabCriticalYs(
  * a tight polygon. `stepEndY` is the first grid Y whose band meets none: a grid
  * Y just past a polygon bottom or at an exempt anchor-line top. The window is
  * constant between consecutive critical Ys (structural events, exempt line
- * tops, top-touch thresholds and `slabCriticalYs`), so only the first grid Y
+ * tops, top-touch thresholds and `nextClippedWindowEvent`), so only the first grid Y
  * inside each open interval and a grid Y on a critical Y can be the first
  * usable step. That bounds the work by the critical Ys, not by the number of
  * line steps, and returns the same Y as testing every step.
@@ -1435,25 +1475,24 @@ function tightLineStepWindow(
   };
   let lower = topY;
   for (const upper of slabBounds) {
-    const points = [
-      ...slabCriticalYs(
-        lower, upper, probeH, paraXLeft, paraXRight, prepared, reference,
-        polygonRequiredWidth, squareRequiredWidth,
-      ),
-      upper,
-    ];
     let cursor = lower;
-    for (const point of points) {
+    for (;;) {
+      const event = nextClippedWindowEvent(
+        cursor, upper, probeH, paraXLeft, paraXRight, prepared, reference,
+        polygonRequiredWidth, squareRequiredWidth,
+      );
+      const next = event !== null && event < upper ? event : upper;
       const inside = grid(stepAfter(cursor));
-      if (inside < point) {
+      if (inside < next) {
         const window = tryStep(inside);
         if (window) return Object.freeze({ window, stepEndY });
       }
-      if (isStep(point)) {
-        const window = tryStep(point);
+      if (isStep(next)) {
+        const window = tryStep(next);
         if (window) return Object.freeze({ window, stepEndY });
       }
-      cursor = point;
+      if (next >= upper) break;
+      cursor = next;
     }
     lower = upper;
   }
