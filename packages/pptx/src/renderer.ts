@@ -1567,8 +1567,20 @@ export function paragraphInputRuns(
       }
       group = '';
     };
-    for (const ch of rawText) {
-      let glyph = ch;
+    // Slots are chosen per grapheme cluster from its base character, so a
+    // combining mark, variation selector, ZWJ or other extender stays in its
+    // base's font segment and a cluster never straddles two segments (one
+    // stacked cell, one shaped horizontal glyph). Which slot a base takes is
+    // unchanged.
+    let clusterStart = 0;
+    const clusterEnds = graphemeClusterOffsets(rawText);
+    clusterEnds.push(rawText.length);
+    for (const clusterEnd of clusterEnds) {
+      const cluster = rawText.slice(clusterStart, clusterEnd);
+      clusterStart = clusterEnd;
+      if (!cluster) continue;
+      const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
+      let glyph = cluster;
       const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
       const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
         || INDIC_CS_GLYPH_RE.test(ch));
@@ -1577,11 +1589,12 @@ export function paragraphInputRuns(
       let share = lineMetricFor(face, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
-        glyph = symbolFontToUnicode(ch, symbolFamily);
+        const mapped = symbolFontToUnicode(ch, symbolFamily);
+        glyph = mapped + cluster.slice(ch.length);
         font = buildFont(bold, italic, drawSizePx,
-          glyph === ch ? symbolFamily : 'sans-serif', rc, glyph);
+          mapped === ch ? symbolFamily : 'sans-serif', rc, glyph);
         share = undefined;
-        face = glyph === ch ? symbolFamily : 'sans-serif';
+        face = mapped === ch ? symbolFamily : 'sans-serif';
       }
       if (group && (font !== groupFont || share !== groupShare)) emitGroup();
       group += glyph;

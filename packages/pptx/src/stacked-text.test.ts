@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HyperlinkTarget } from '@silurus/ooxml-core';
-import { renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
+import { layoutParagraph, renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
 import { buildPptxTextLayer } from './text-layer.js';
 import type { Paragraph, TextBody, TextRunData } from './types.js';
 
@@ -133,5 +133,32 @@ describe('pptx stacked vertical text (wordArtVert / wordArtVertRtl)', () => {
     expect(shapeTextRotation('wordArtVert', 0, true, false)).toBe(0);
     expect(shapeTextRotation('wordArtVertRtl', 0, false, true)).toBe(180);
     expect(shapeTextRotation('horz', 0, false, true)).toBe(0);
+  });
+});
+
+// A grapheme extender (variation selector, combining mark) follows its base's
+// font slot, so no cluster straddles two segments. Arial latin, Yu Gothic ea.
+describe('font slots keep grapheme clusters whole', () => {
+  const IVS = '\u{E0100}'; // ideographic variation selector (Latin slot by itself)
+  it('stacked: a CJK base and its selector share one Yu Gothic cell', () => {
+    const { ctx, calls } = mockCtx();
+    renderTextBody(ctx, body(`葛${IVS}B`, 'wordArtVert', 'Yu Gothic'), 0, 0, 60, 470, SCALE);
+    expect(calls.map((c) => c.text)).toEqual([`葛${IVS}`, 'B']);
+  });
+
+  it('stacked: a bracket with a selector keeps its glyphs (no lone-character substitution)', () => {
+    const { ctx, calls } = mockCtx();
+    renderTextBody(ctx, body('「\uFE0F', 'wordArtVert', 'Yu Gothic'), 0, 0, 60, 470, SCALE);
+    expect(calls.map((c) => c.text)).toEqual(['「\uFE0F']);
+  });
+
+  it('horizontal: the cluster stays in the base segment and font', () => {
+    const { ctx } = mockCtx();
+    const para = body(`葛${IVS}B e\u0301`, 'horz', 'Yu Gothic').paragraphs[0];
+    const [line] = layoutParagraph(ctx, para, 10_000, 24, '#000', SCALE, 0);
+    const segs = line.segments.filter((g) => g.text);
+    expect(segs.map((g) => g.text)).toEqual([`葛${IVS}`, 'B e\u0301']);
+    expect(segs[0].font).toContain('Yu Gothic');
+    expect(segs[1].font).not.toContain('Yu Gothic');
   });
 });
