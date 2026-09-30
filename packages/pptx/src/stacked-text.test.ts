@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { renderTextBody, shapeTextRotation } from './renderer.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { HyperlinkTarget } from '@silurus/ooxml-core';
+import { renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
+import { buildPptxTextLayer } from './text-layer.js';
 import type { Paragraph, TextBody, TextRunData } from './types.js';
 
 // ECMA-376 §20.1.10.83 wordArtVert / wordArtVertRtl through the PowerPoint
@@ -41,10 +43,10 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
   return { ctx: ctx as unknown as CanvasRenderingContext2D, calls };
 }
 
-function body(text: string, vert: string, fontFamilyEa?: string): TextBody {
+function body(text: string, vert: string, fontFamilyEa?: string, hyperlink?: string): TextBody {
   const run = {
     type: 'text', text, bold: null, italic: null, underline: false, strikethrough: false,
-    fontSize: 24, color: '000000', fontFamily: 'Arial', fontFamilyEa,
+    fontSize: 24, color: '000000', fontFamily: 'Arial', fontFamilyEa, hyperlink,
   } as TextRunData;
   const para = {
     alignment: 'l', marL: 0, marR: 0, indent: 0, spaceBefore: null, spaceAfter: null, spaceLine: null,
@@ -56,6 +58,23 @@ function body(text: string, vert: string, fontFamilyEa?: string): TextBody {
     lIns: 91440, rIns: 91440, tIns: 45720, bIns: 45720, wrap: 'square', vert, autoFit: 'none',
   };
 }
+
+interface FakeEl {
+  textContent: string; innerHTML: string; title: string; dataset: Record<string, string>;
+  style: Record<string, string>; children: FakeEl[]; listeners: ((e: { preventDefault(): void }) => void)[];
+  appendChild(c: FakeEl): void; setAttribute(): void; addEventListener(t: string, f: (e: { preventDefault(): void }) => void): void; click(): void;
+}
+function fakeEl(): FakeEl {
+  const el: FakeEl = {
+    textContent: '', innerHTML: '', title: '', dataset: {}, style: {}, children: [], listeners: [],
+    appendChild(c) { el.children.push(c); },
+    setAttribute() {},
+    addEventListener(t, f) { if (t === 'click') el.listeners.push(f); },
+    click() { for (const f of el.listeners) f({ preventDefault() {} }); },
+  };
+  return el;
+}
+afterEach(() => vi.unstubAllGlobals());
 
 // Arial 24 pt: cell 7/6 × 1.1172 em × 24 = 31.28, descent 0.2119 em.
 const CELL = (7 / 6) * (2288 / 2048) * 24;
@@ -84,6 +103,30 @@ describe('pptx stacked vertical text (wordArtVert / wordArtVertRtl)', () => {
     const bracket = calls.find((c) => c.text === '﹁');
     expect(bracket?.rot).toBe(0);
     expect(calls.some((c) => c.text === '「')).toBe(false);
+  });
+
+  it('stacks a grapheme cluster in one cell', () => {
+    const { ctx, calls } = mockCtx();
+    renderTextBody(ctx, body('e\u0301B', 'wordArtVert'), 0, 0, 60, 470, SCALE);
+    expect(calls.map((c) => c.text)).toEqual(['e\u0301', 'B']);
+    expect(calls[1].y - calls[0].y).toBeCloseTo(CELL, 6);
+  });
+
+  it('hands each glyph its run hyperlink so the text layer installs link handlers', () => {
+    const { ctx } = mockCtx();
+    const runs: PptxTextRunInfo[] = [];
+    renderTextBody(ctx, body('AB', 'wordArtVert', undefined, 'https://example.com/'), 0, 0, 60, 470, SCALE,
+      null, 0, false, false, '#000000', undefined, undefined, (r) => runs.push(r));
+    const target: HyperlinkTarget = { kind: 'external', url: 'https://example.com/' };
+    expect(runs.map((r) => r.hyperlink)).toEqual([target, target]);
+    vi.stubGlobal('document', { createElement: () => fakeEl() });
+    const layer = fakeEl();
+    const onClick = vi.fn<(t: HyperlinkTarget) => void>();
+    buildPptxTextLayer(layer as unknown as HTMLDivElement, runs, 960, 540, onClick);
+    const spans = layer.children.flatMap((group) => group.children);
+    expect(spans).toHaveLength(2);
+    spans[0].click();
+    expect(onClick).toHaveBeenCalledWith(target);
   });
 
   it('keeps a stacked body upright under flipH and turns it 180° under flipV', () => {

@@ -36,7 +36,8 @@ import {
   type StackedGlyph,
   type StackedParagraph,
 } from '@silurus/ooxml-core/internal/drawingml-text';
-import { verticalBracketFormSubstitute, verticalFormSubstitute } from '@silurus/ooxml-core';
+import { graphemeClusterOffsets, verticalBracketFormSubstitute, verticalFormSubstitute } from '@silurus/ooxml-core';
+import type { HyperlinkTarget } from '@silurus/ooxml-core';
 
 /** The segment fields stacked layout and paint read (renderer's LayoutSegment). */
 export interface StackedSegmentStyle {
@@ -51,6 +52,8 @@ export interface StackedSegmentStyle {
   lineMetric?: { readonly glyph: { ascent: number; descent: number } | undefined };
   /** Face box of the run's latin face. */
   lineMetricLatin?: { readonly glyph: { ascent: number; descent: number } | undefined } | null;
+  /** The run's resolved hyperlink, handed to the selection overlay per glyph. */
+  hyperlink?: HyperlinkTarget;
 }
 
 export interface StackedParagraphInput<T extends StackedSegmentStyle> {
@@ -86,6 +89,7 @@ export interface StackedGlyphRun {
   y: number;
   w: number;
   h: number;
+  hyperlink?: HyperlinkTarget;
 }
 
 type Ctx2D = CanvasRenderingContext2D;
@@ -138,7 +142,19 @@ function makeMeasurer<T extends StackedSegmentStyle>(ctx: Ctx2D) {
     const thickness = Math.max(cell, STACKED_CELL_FACTOR * latinEm * style.sizePx);
     const spc = style.letterSpacingPx ?? 0;
     const out: Measured<T>[] = [];
-    for (const ch of text) {
+    // One stacked cell per grapheme cluster: a base with its combining marks
+    // or variation selectors (é, か + ゙) stands in one cell, measured and
+    // painted together. The cluster takes the class of its base character:
+    // every measured sideways character is a single code point, and a mark
+    // attached to it (for example a variation selector) does not change how
+    // PowerPoint turns the base.
+    let start = 0;
+    const ends = graphemeClusterOffsets(text);
+    ends.push(text.length);
+    for (const end of ends) {
+      const ch = text.slice(start, end);
+      start = end;
+      if (!ch) continue;
       const cp = ch.codePointAt(0) ?? 0;
       let kind: Measured<T>['kind'] = 'upright';
       let advance = cell;
@@ -200,6 +216,7 @@ export function renderStackedText<T extends StackedSegmentStyle>(
     runs.push({
       text: g.text, font: style.font, fontSize: size,
       x: placed.axisX - g.thickness / 2, y: placed.cellTop, w: g.thickness, h: g.advance,
+      ...(style.hyperlink ? { hyperlink: style.hyperlink } : {}),
     });
     if (g.space || style.noFill) continue;
     ctx.font = style.font;
@@ -210,7 +227,10 @@ export function renderStackedText<T extends StackedSegmentStyle>(
       ctx.textBaseline = 'alphabetic';
       ctx.fillText(g.text, placed.axisX, placed.cellTop + g.cell - box.descent * size);
     } else if (g.kind === 'verticalGlyph') {
-      const form = verticalFormSubstitute(cp) ?? verticalBracketFormSubstitute(cp);
+      // A presentation form replaces a lone character only; a cluster with a
+      // mark keeps its own glyphs and takes the turned fallback.
+      const single = String.fromCodePoint(cp) === g.text;
+      const form = single ? verticalFormSubstitute(cp) ?? verticalBracketFormSubstitute(cp) : null;
       const left = placed.axisX - (box.ascent + box.descent) * size / 2;
       if (form !== null) {
         ctx.textAlign = 'left';

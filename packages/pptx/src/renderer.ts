@@ -4198,6 +4198,7 @@ function renderStackedTextBody(
       text: run.text, inShapeX: run.x - bx, inShapeY: run.y - by, w: run.w, h: run.h,
       fontSize: run.fontSize, font: run.font, shapeX: bx, shapeY: by, shapeW: bw, shapeH: bh,
       rotation: shapeRotation,
+      ...(run.hyperlink ? { hyperlink: run.hyperlink } : {}),
     });
   }
 }

@@ -112,6 +112,20 @@ describe('layoutStackedText (wordArtVert / wordArtVertRtl)', () => {
   });
 });
 
+describe('layoutStackedText input size', () => {
+  it('lays out a 150,000-glyph run without spreading it into an argument list', () => {
+    const text = 'A'.repeat(150_000);
+    const one = layoutStackedText([para([text])], options({ wrap: false }));
+    expect(one.glyphs).toHaveLength(150_000);
+    expect(one.columns[0].thickness).toBeCloseTo(CELL, 6);
+    const centred = layoutStackedText([para([text])], options({ wrap: false, anchorCtr: true }));
+    expect(centred.glyphs[0].cellTop).toBeCloseTo((172.8 - 150_000 * CELL) / 2, 3);
+    // Wrapped into columns of five cells: 30,000 columns in one paragraph.
+    const wrapped = layoutStackedText([para(['A '.repeat(75_000)])], options());
+    expect(wrapped.columns.length).toBeGreaterThan(20_000);
+  }, 60_000);
+});
+
 describe('stacked face and character tables', () => {
   it('uses measured boxes for the faces that do not follow their font tables', () => {
     expect(stackedCellBoxOverride('游ゴシック')).toBe(1.5084);

@@ -139,8 +139,10 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
     });
     const paraLines: Line<G>[] = broken.map((line, i) => {
       const glyphs = line.segments.flatMap((seg) => seg.type === 'text' ? options.glyphs(seg.text, seg.style) : []);
-      const thickness = glyphs.length > 0
-        ? Math.max(...glyphs.map((g) => g.thickness)) : para.emptyThickness;
+      // Iterative maxima throughout: a single run can hold far more glyphs
+      // than a call's argument list (no spread into Math.max).
+      let thickness = glyphs.length > 0 ? 0 : para.emptyThickness;
+      for (const g of glyphs) if (g.thickness > thickness) thickness = g.thickness;
       const natural = { ascent: thickness / 2, descent: thickness / 2 };
       const box = drawingMlSpacedLineBox(natural, para.lineSpacing, pxPerPt, reduction);
       return {
@@ -162,12 +164,14 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
       : drawingMlParagraphSpacing(para.spaceBefore, paraLines[0].thickness, pxPerPt);
     const after = last && !edges ? 0
       : drawingMlParagraphSpacing(para.spaceAfter, paraLines[paraLines.length - 1].thickness, pxPerPt);
-    items.push([
-      ...(before ? [{ type: 'gap' as const, size: before }] : []),
-      ...paraLines.map((line) => ({ type: 'line' as const, line })),
-      ...(after ? [{ type: 'gap' as const, size: after }] : []),
-    ]);
-    lines.push(...paraLines);
+    const paraItems: ({ type: 'gap'; size: number } | { type: 'line'; line: Line<G> })[] = [];
+    if (before) paraItems.push({ type: 'gap', size: before });
+    for (const line of paraLines) {
+      paraItems.push({ type: 'line', line });
+      lines.push(line);
+    }
+    if (after) paraItems.push({ type: 'gap', size: after });
+    items.push(paraItems);
   });
 
   // A spaced line shorter than its natural box: the body's last line keeps
@@ -182,7 +186,7 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
   const axisU: number[] = [];
   let u = 0;
   for (const paraItems of items) {
-    const ordered = rtl ? paraItems : [...paraItems].reverse();
+    const ordered = rtl ? paraItems : paraItems.slice().reverse();
     // Lines inside a paragraph keep their order in both directions.
     const lineItems = paraItems.filter((item) => item.type === 'line');
     let lineCursor = 0;
@@ -204,7 +208,8 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
   let regionTop = rect.top;
   let regionLength = rect.height;
   if (options.anchorCtr) {
-    const longest = Math.max(0, ...lines.map((l) => sumAdvance(l.glyphs.slice(0, contentGlyphs(l.glyphs)))));
+    let longest = 0;
+    for (const l of lines) longest = Math.max(longest, sumAdvance(l.glyphs.slice(0, contentGlyphs(l.glyphs))));
     regionTop = rect.top + (rect.height - longest) / 2;
     regionLength = longest;
   }
