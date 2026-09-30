@@ -334,6 +334,9 @@ export function paragraphMarkLineMetrics(
   const authoredFamily = getDefaultFontFamily(para, markUsesEastAsianFace);
   const markWeight = effectiveMarkShapeInput?.weight ?? 400;
   const markStyle = effectiveMarkShapeInput?.style ?? 'normal';
+  // §17.3.1.29 stores the paragraph mark's own run properties in pPr/rPr.
+  // Shape this probe in its own context: the library's scoped Arabic substitute
+  // policy must not borrow script proof from surrounding body runs.
   const markProbe = markUsesEastAsianFace ? 'あ' : 'x';
   // A supplied metric map without the selecting text service cannot prove
   // which face Canvas paints. The compatibility argument above is ignored;

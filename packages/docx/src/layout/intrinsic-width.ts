@@ -21,7 +21,7 @@ import type {
   TextMeasurer,
 } from '../paragraph-measure.js';
 import { paragraphCharacterGrid } from '../paragraph-measure.js';
-import { calcEffectiveFontPx } from './text.js';
+import { calcEffectiveFontPx, sliceTextShapeRequest } from './text.js';
 import { wordSnapToCharsEastAsianCellCount } from './line-compatibility.js';
 import type { ParagraphLayoutSource, TextFontSlots } from './text.js';
 import { projectEffectiveCellPreferredWidth, type TableLayoutSource } from './table-source-acquisition.js';
@@ -182,6 +182,16 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       && 'text' in previous
       && 'text' in segment
       && compatibleTextKey(previous) === compatibleTextKey(segment)
+      // Included and excluded spans depend on the full run. Losing a Latin
+      // base can turn its attached Arabic mark into standalone proof; losing
+      // Arabic proof can exclude following digits. Keep contiguous ranges in
+      // one context, and do not invent a new context across scoped run seams.
+      // General text retains the ordinary same-metric run merge.
+      && ((previous.substituteScope === undefined && segment.substituteScope === undefined)
+        || (previous.textShapeRequest?.substituteContext?.text === segment.textShapeRequest?.substituteContext?.text
+          && previous.textShapeRequest?.substituteContext !== undefined
+          && segment.textShapeRequest?.substituteContext?.offset
+            === previous.textShapeRequest.substituteContext.offset + previous.text.length))
     ) {
       const previousTextLength = previous.text.length;
       const text = previous.text + segment.text;
@@ -199,7 +209,9 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
           ? punctuationCompressions
           : undefined,
         textShapeRequest: previous.textShapeRequest
-          ? { ...previous.textShapeRequest, text }
+          ? { ...previous.textShapeRequest, text,
+              substituteContext: previous.substituteScope !== undefined || segment.substituteScope !== undefined
+                ? previous.textShapeRequest.substituteContext : { text, offset: 0 } }
           : undefined,
       };
       continue;
@@ -246,6 +258,8 @@ function measureTextRange(
     const candidate = {
       ...piece.segment,
       text,
+      ...(piece.segment.textShapeRequest
+        ? { textShapeRequest: sliceTextShapeRequest(piece.segment.textShapeRequest, localStart, localEnd) } : {}),
       punctuationCompressions: slicedPunctuationCompressions(
         piece.segment,
         localStart,
@@ -256,7 +270,6 @@ function measureTextRange(
       if (measured.textLayoutService && measured.textShapeRequest) {
         const shaped = measured.textLayoutService.shape({
           ...measured.textShapeRequest,
-          text: measured.text,
           fontSizePt: calcEffectiveFontPx(measured, 1),
           measure: true,
           clusterGeometry: false,
@@ -284,7 +297,6 @@ function measureTextRange(
       const shapedClusters = candidate.textLayoutService && candidate.textShapeRequest
         ? candidate.textLayoutService.shape({
             ...candidate.textShapeRequest,
-            text,
             fontSizePt: calcEffectiveFontPx(candidate, 1),
             measure: true,
             clusterGeometry: true,
@@ -319,6 +331,8 @@ function measureTextRange(
         const cluster = {
           ...candidate,
           text: text.slice(clusterStart, clusterEnd),
+          ...(candidate.textShapeRequest
+            ? { textShapeRequest: sliceTextShapeRequest(candidate.textShapeRequest, clusterStart, clusterEnd) } : {}),
           punctuationCompressions: slicedPunctuationCompressions(
             candidate,
             clusterStart,

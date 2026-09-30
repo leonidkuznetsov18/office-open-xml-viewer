@@ -18,7 +18,7 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
@@ -121,12 +121,34 @@ export interface SegmentBuildContext {
   ) => number | undefined;
 }
 
+/** ECMA-376 §17.3.2.5/§17.3.2.33 change displayed case, not run ownership.
+ * §17.3.3.30 symbol normalization may also expand a scalar to a surrogate
+ * pair. Scope and offsets use the complete display string after both changes;
+ * small-caps size pieces and tabs cannot create independent Arabic proof.
+ * Hidden runs are omitted by the parser (§17.3.2.41), not merged into this run.
+ */
+function transformedRunText(
+  text: string,
+  run: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
+  environment: LineLayoutEnvironment,
+): string {
+  const r: ParagraphTextBearingRun = run;
+  const display = run.allCaps || run.smallCaps ? text.toUpperCase() : text;
+  const map = (text: string, family: string | null | undefined) => isSymbolFontFamily(family)
+    ? symbolTextToUnicodeSegments(text, family).map((part) => part.text).join('') : text;
+  if (r.rtl || r.cs) return map(display, r.fontFamilyCs ?? run.fontFamily);
+  if (environment.layoutServices?.text) return map(display, run.fontFamily);
+  return splitByEastAsia(display).map((part) => map(part.text,
+    part.ea ? r.fontFamilyEastAsia ?? run.fontFamily : run.fontFamily)).join('');
+}
+
 export function appendTextPiece(
   state: SegmentBuildContext,
   text: string,
   base: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
   vertAlign: 'super' | 'sub' | null,
   sourceRunIndex: number,
+  fullRunContext: Readonly<{ text: string; offset: number }>,
   sourceFragmentIndex?: number,
   joinPreviousRun = false,
 ): void {
@@ -282,6 +304,10 @@ export function appendTextPiece(
     reduced: false,
     firstSeg: true,
     gluePending: false,
+    scopeContext: {
+      text: fullRunContext.text,
+      cursor: fullRunContext.offset,
+    },
   };
   // True while the next emitted segment should be GLUED to the previous one
   // (a small-caps case-piece that continues the same word). Consumed by the
@@ -514,15 +540,13 @@ export function finalizeBuiltSegments(
       const cached = metricCache.get(key);
       if (cached !== undefined) return cached;
       const naturalSpace = service.shape({
-        ...request,
-        text: ' ',
+        ...independentTextShapeRequest(request, ' '),
         fontSizePt: effectiveFontSizePt,
         measure: true,
         clusterGeometry: false,
       }).advancePt;
       const ideographicCell = service.shape({
-        ...request,
-        text: '\u4e00',
+        ...independentTextShapeRequest(request, '\u4e00'),
         fontSizePt: effectiveFontSizePt,
         fontHint: 'eastAsia',
         measure: true,
@@ -814,6 +838,10 @@ interface SegmentEmissionState {
   reduced: boolean;
   firstSeg: boolean;
   gluePending: boolean;
+  /** The run's display text around the emitted pieces, with a cursor. The
+   * text service decides a script-scoped substitute's scope over this whole
+   * contiguous context, not over one word (core fontSubstituteScriptScope). */
+  readonly scopeContext: { readonly text: string; cursor: number };
 }
 
 function pushSegmentPiece(
@@ -824,6 +852,7 @@ function pushSegmentPiece(
   authoritativeSpan?: TextShapeSpan,
   compressCharacterWhitespace = false,
   mappedSymbolUnicode = false,
+  substituteContext?: TextShapeRequest['substituteContext'],
 ): void {
   const {
     base,
@@ -858,6 +887,15 @@ function pushSegmentPiece(
     overflowPunctuationEastAsianRun,
   } = emissionState;
 
+  // Consume an exact range of the immutable full display run. A parent
+  // advances once; child spans inherit its range. Never search ahead or drop
+  // context when a transform fails to project: that could invent Arabic proof.
+  const scopeContext = emissionState.scopeContext;
+  const retainedContext = substituteContext
+    ?? Object.freeze({ text: scopeContext.text, offset: scopeContext.cursor });
+  assertTextShapeRunContext({ text, substituteContext: retainedContext }, scopeContext.text);
+  if (!substituteContext) scopeContext.cursor += text.length;
+
   if (
     environment.balanceSingleByteDoubleByteWidth &&
     !cs &&
@@ -868,6 +906,7 @@ function pushSegmentPiece(
     // other East-Asian glyphs receive the full delta. Split only at that
     // semantic boundary so Canvas can retain one uniform letterSpacing per
     // segment (measure == paint); the space itself has no contextual shape.
+    let partOffset = 0;
     for (const part of text.split(/(\u3000+)/u).filter(Boolean)) {
       pushSegmentPiece(
         emissionState,
@@ -877,7 +916,10 @@ function pushSegmentPiece(
         undefined,
         compressCharacterWhitespace,
         mappedSymbolUnicode,
+        retainedContext
+          ? { text: retainedContext.text, offset: retainedContext.offset + partOffset } : undefined,
       );
+      partOffset += part.length;
     }
     return;
   }
@@ -899,7 +941,9 @@ function pushSegmentPiece(
         characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
       )
     ) {
-      pushSegmentPiece(emissionState, text, cs, fontFamily, undefined, true, mappedSymbolUnicode);
+      pushSegmentPiece(
+        emissionState, text, cs, fontFamily, undefined, true, mappedSymbolUnicode, retainedContext,
+      );
       return;
     }
   }
@@ -909,6 +953,7 @@ function pushSegmentPiece(
   const style = italic ? ('italic' as const) : ('normal' as const);
   const textShapeRequest: TextShapeRequest = Object.freeze({
     text,
+    ...(retainedContext ? { substituteContext: retainedContext } : {}),
     fontSizePt: cs ? csFontSize : base.fontSize,
     // A successfully decoded Symbol/Wingdings code point is Unicode text,
     // not a request for the legacy font encoding. Clear every authored
@@ -955,8 +1000,7 @@ function pushSegmentPiece(
             )
               continue;
             const measured = environment.layoutServices?.text.shape({
-              ...textShapeRequest,
-              text: compressedGrapheme,
+              ...sliceTextShapeRequest(textShapeRequest, start, end),
               measure: true,
               clusterGeometry: false,
             });
@@ -978,13 +1022,12 @@ function pushSegmentPiece(
                     }
                     const punctuationRoute = measured.spans[0]?.fontRoute.fingerprint;
                     const ideographicCell = environment.layoutServices?.text.shape({
-                      ...textShapeRequest,
+                      ...independentTextShapeRequest(textShapeRequest, '\u4e00'),
                       // U+3000 is semantically an ideographic space, but several
                       // proportional East Asian faces expose it to Canvas with
                       // the same narrow advance as their punctuation. The grid's
                       // full-width character cell is represented by an
                       // ideograph, not by that platform-specific space metric.
-                      text: '\u4e00',
                       fontHint: 'eastAsia',
                       measure: true,
                       clusterGeometry: false,
@@ -1126,7 +1169,10 @@ function emitResolvedTextSegment(
         [...span.text].some((grapheme) =>
           characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
         );
-      pushSegmentPiece(emissionState, span.text, spanCs, spanFamily, span, compressedSpan);
+      pushSegmentPiece(
+        emissionState, span.text, spanCs, spanFamily, span, compressedSpan, mappedSymbolUnicode,
+        sliceTextShapeRequest(textShapeRequest, span.start, span.end).substituteContext,
+      );
     }
     return;
   }
@@ -1278,6 +1324,8 @@ function emitResolvedTextSegment(
     measuredWidth: 0,
     textLayoutService: environment.layoutServices?.text,
     textShapeRequest,
+    ...(resolvedSpan?.substituteScope !== undefined
+      ? { substituteScope: resolvedSpan.substituteScope } : {}),
     breakBefore: resolvedSpan?.breakBefore ?? authoritativeSpan?.breakBefore ?? true,
     smallCaps: emissionState.reduced,
     joinPrev:
@@ -1414,6 +1462,7 @@ function appendRunsToSegments(
             t,
             t.vertAlign ?? 'super',
             runIndex,
+            { text: transformedRunText(label, t, environment), offset: 0 },
             0,
             joinFromPreviousNoBreakHyphen,
           );
@@ -1425,6 +1474,8 @@ function appendRunsToSegments(
       }
       // Split on tab chars so tab alignment can be resolved during layout.
       const parts = t.text.split('\t');
+      const fullDisplayText = transformedRunText(t.text, t, environment);
+      let displayOffset = 0;
       for (let i = 0; i < parts.length; i++) {
         if (parts[i].length > 0) {
           appendTextPiece(
@@ -1433,10 +1484,12 @@ function appendRunsToSegments(
             t,
             t.vertAlign,
             runIndex,
+            { text: fullDisplayText, offset: displayOffset },
             i,
             i === 0 && joinFromPreviousNoBreakHyphen,
           );
         }
+        displayOffset += transformedRunText(parts[i], t, environment).length + 1;
         if (i < parts.length - 1) {
           segs.push({
             isTab: true,
@@ -1548,6 +1601,7 @@ function appendRunsToSegments(
           f,
           f.vertAlign,
           runIndex,
+          { text: transformedRunText(text, f, environment), offset: 0 },
           undefined,
           joinFromPreviousNoBreakHyphen,
         );

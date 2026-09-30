@@ -190,9 +190,14 @@ describe('DOCX_GOOGLE_FONTS — theme typeface coverage', () => {
 });
 
 describe('DOCX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
-  it('preserves every pre-consolidation entry byte-for-byte', () => {
+  it('preserves complete loading entries with explicit Arabic scope metadata', () => {
     for (const [key, entry] of Object.entries(DOCX_GOOGLE_FONTS_OLD)) {
-      expect(DOCX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading entries remain the frozen oracle; only these five authored
+      // visual alternatives carry the explicitly expected Arabic scope tag.
+      const scoped = new Set(['sakkal majalla', 'traditional arabic', 'simplified arabic',
+        'arabic typesetting', 'univers next arabic']);
+      expect(DOCX_GOOGLE_FONTS[key], `entry "${key}"`)
+        .toEqual(scoped.has(key) ? { ...entry, script: 'arabic' } : entry);
     }
   });
 
@@ -241,20 +246,6 @@ it('preloads the explicit Chinese region even when the same run contains kana', 
   expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans SC');
   expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans JP');
 });
-
-it('keeps Arabic visual substitutes at legacy theme-only collection', () => {
-  const families = ['Sakkal Majalla', 'Traditional Arabic', 'Simplified Arabic',
-    'Arabic Typesetting', 'Univers Next Arabic'];
-  for (const family of families) {
-    const doc = docWith('مرحبا', 'Aptos', 'Aptos');
-    (doc.body[0] as { runs: object[] }).runs = [{ type: 'text', text: 'مرحبا',
-      fontFamily: family, fontFamilyHighAnsi: family, fontFamilyEastAsia: family, fontFamilyCs: family }];
-    expect(docxFontPreloadNames(doc)).not.toContain(family);
-    doc.majorFont = family;
-    expect(docxFontPreloadNames(doc).filter((name) => name === family)).toEqual([family]);
-  }
-});
-
 
 it('keeps default native preflight at its existing slot projection', () => {
   const doc = docWith('body');

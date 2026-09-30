@@ -29,7 +29,10 @@ import {
   segLetterSpacingPx,
   widthBalanceSpaceAdjustmentForTextPt,
 } from '../line-layout.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE, shapeRunToDocRun } from './text.js';
+import {
+  calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest,
+  replaceTextShapeRequest, sliceTextShapeRequest, shapeRunToDocRun,
+} from './text.js';
 import { eastAsianUprightPaintOps } from './vertical-glyph-orientation.js';
 import { wordTrackChangeDecoration } from './paint-compatibility.js';
 import type { DocParagraph, DocRun, ShapeRun } from '../types.js';
@@ -374,8 +377,7 @@ function contextualAdvance(segment: MeasuredTextPlanSegment, text: string): numb
     throw new Error('Kashida acquisition requires the retained TextLayoutService authority');
   }
   const shaped = segment.textLayoutService.shape({
-    ...segment.textShapeRequest,
-    text,
+    ...replaceTextShapeRequest(segment.textShapeRequest, text),
     measure: true,
   });
   const scaleX = segment.basePaintOps[0]?.scaleX ?? 1;
@@ -1243,7 +1245,6 @@ function selectedFaceSourceMetrics(
   if (!segment.textLayoutService || !segment.textShapeRequest) return undefined;
   const shape = segment.textLayoutService.shape({
     ...segment.textShapeRequest,
-    text: segment.text,
     measure: true,
   });
   return { ascentPt: shape.ascentPt, descentPt: shape.descentPt };
@@ -1309,14 +1310,12 @@ function textPlacement(
   const baseShape = segment.ruby && segment.textLayoutService && segment.textShapeRequest
     ? segment.textLayoutService.shape({
         ...segment.textShapeRequest,
-        text: segment.text,
         measure: true,
       })
     : undefined;
   const rubyShape = segment.ruby && segment.textLayoutService && segment.textShapeRequest
     ? segment.textLayoutService.shape({
-        ...segment.textShapeRequest,
-        text: segment.ruby.text,
+        ...independentTextShapeRequest(segment.textShapeRequest, segment.ruby.text),
         fontSizePt: segment.ruby.fontSizePt,
         measure: true,
       })
@@ -1721,9 +1720,9 @@ function retainedGeometryPlan(
   if (!service || !request) {
     throw new Error('Retained typography geometry requires TextLayoutService');
   }
-  const shape = (text: string) => service.shape({ ...request, text, measure: true });
+  const shapeProbe = (text: string) => service.shape({ ...independentTextShapeRequest(request, text), measure: true });
   const glyphProbe = (text: string): RetainedInkMetric => {
-    const measured = shape(text);
+    const measured = shapeProbe(text);
     const span = measured.spans[0];
     if (!span || measured.spans.length !== 1 || span.start !== 0 || span.end !== text.length) {
       throw new Error('Retained decoration probe requires one selected-face span');
@@ -1764,9 +1763,11 @@ function retainedGeometryPlan(
   } : undefined;
   const emphasis = segment.emphasisMark ? (() => {
     const glyph = emphasisGlyph(segment.emphasisMark);
-    const markShape = shape(glyph);
+    const markShape = shapeProbe(glyph);
     const markSpan = markShape.spans[0];
     if (!markSpan) throw new Error('Emphasis shaping produced no selected-face span');
+    // §17.3.2.12 positions w:em against each base cluster's ink. Its font
+    // selection must retain the same run range as the body placement.
     const clusterInk = (segment.shapedClusters ?? []).map((cluster): RetainedEmphasisClusterInk => {
       const text = segment.text.slice(cluster.range.start, cluster.range.end);
       return {
@@ -1775,7 +1776,9 @@ function retainedGeometryPlan(
           start: sourceOffset + cluster.range.start,
           end: sourceOffset + cluster.range.end,
         },
-        ink: completeInkBounds(shape(text)),
+        ink: completeInkBounds(service.shape({
+          ...sliceTextShapeRequest(request, cluster.range.start, cluster.range.end), measure: true,
+        })),
       };
     });
     return {
@@ -1966,7 +1969,6 @@ function textPlanSegment(
         }
         const shape = segment.textLayoutService.shape({
           ...segment.textShapeRequest,
-          text: segment.text,
           fontSizePt: projected.fontSizePt,
           measure: true,
           clusterGeometry: false,

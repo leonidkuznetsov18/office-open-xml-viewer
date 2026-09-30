@@ -64,9 +64,11 @@ export class LineMeasurementAdapter {
 
   measureSegment(segment: LayoutTextSeg, clusterGeometry = false): TextMetrics {
     if (segment.textLayoutService && segment.textShapeRequest) {
+      if (segment.textShapeRequest.text !== segment.text) {
+        throw new Error('Segment measurement does not match its retained text range context');
+      }
       const shaped = segment.textLayoutService.shape({
         ...segment.textShapeRequest,
-        text: segment.text,
         fontSizePt: calcEffectiveFontPx(segment, this.scale),
         measure: true,
         clusterGeometry,

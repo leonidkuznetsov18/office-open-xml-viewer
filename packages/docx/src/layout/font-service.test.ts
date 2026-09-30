@@ -53,6 +53,23 @@ describe('font layout services', () => {
       .not.toBe(first.advancePt);
   }, 30_000);
 
+  it('activates scoped substitution only for the selected family/weight/style tuple', () => {
+    const resolver = createFontResolver([
+      { requestedFamily: 'Sakkal Majalla', resolvedFamily: 'Embedded Sakkal', source: 'embedded' },
+      { requestedFamily: 'Sakkal Majalla', resolvedFamily: 'Noto Naskh Arabic',
+        source: 'substitute', script: 'arabic' },
+      { requestedFamily: 'Sakkal Majalla', resolvedFamily: 'Noto Naskh Arabic',
+        source: 'substitute', script: 'arabic', weight: 700 },
+    ], { scriptScopedFamilies: { 'sakkal majalla': {
+      script: 'arabic', substituteFamilies: ['Noto Naskh Arabic'],
+    } } });
+    expect(resolver.scopedSubstituteScript?.('Sakkal Majalla', 400, 'normal')).toBeUndefined();
+    expect(resolver.scopedSubstituteScript?.('Sakkal Majalla', 700, 'normal')).toBe('arabic');
+    expect(resolver.scopedSubstituteScript?.('Sakkal Majalla', 700, 'italic')).toBeUndefined();
+    expect(resolver.resolve({ requestedFamily: 'Sakkal Majalla', weight: 700, script: 'arabic' }).source)
+      .toBe('substitute');
+  });
+
   it('snapshots regional routes and includes their contents in the font fingerprint', () => {
     const routes = { sc: { Calibri: 'Carlito, "Noto Sans SC", sans-serif' } };
     const resolver = createFontResolver(faces, { regionalFamilyLists: routes });

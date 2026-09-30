@@ -5,7 +5,7 @@ import {
   fontFaceWeightCovers,
 } from '@silurus/ooxml-core';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
-import type { OfficeFontFallbackRoute } from '@silurus/ooxml-core';
+import type { FontSubstituteScript, OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { DOCX_GOOGLE_FONTS } from '../google-font-registry.js';
 import type { LoadedEmbeddedFontRoute } from '../embedded-fonts.js';
 import { normalizeFontFamilyUncached } from '../line-layout.js';
@@ -60,6 +60,26 @@ export interface ProductionLayoutServiceOptions {
   /** Normalized families whose authored face is installed; they are never
    * routed to a different-family Google substitute (`docxGoogleFontPlan`). */
   readonly installedSubstituteFamilies?: readonly string[];
+}
+
+/** Registry families with a script-scoped visual substitute (core
+ * substitute-script.ts), mapped to every substitute family of that script. An
+ * installed authored face is never substituted, so it is not scoped either.
+ * This registry delimits proof, not slot overrides: the resolver permits an
+ * override only when a loaded scoped substitute wins the exact resource tuple,
+ * after embedded, local and authored CSS inventory precedence. */
+function docxScriptScopedFamilies(
+  installed: readonly string[],
+): Record<string, { script: FontSubstituteScript; substituteFamilies: string[] }> {
+  const scoped = Object.entries(DOCX_GOOGLE_FONTS).filter(([, entry]) => entry.script !== undefined);
+  return Object.fromEntries(scoped
+    .filter(([key]) => !installed.includes(key))
+    .map(([key, entry]) => [key, {
+      script: entry.script!,
+      substituteFamilies: [...new Set(scoped
+        .filter(([, other]) => other.script === entry.script && other.loadFamily)
+        .map(([, other]) => other.loadFamily!))],
+    }]));
 }
 
 export function createProductionLayoutServices(
@@ -180,6 +200,7 @@ export function createProductionLayoutServices(
           resolvedFamily: loaded.displayFamily,
           source: normalizedFaceFamily(resolvedFamily) === normalizedFaceFamily(name)
             ? 'google' : 'substitute',
+          ...(entry.script === undefined ? {} : { script: entry.script }),
           weight: loaded.weight,
           style: loaded.style,
         });
@@ -224,6 +245,9 @@ export function createProductionLayoutServices(
             family, source.fonts.familyClasses, source.fonts.familyPitches, region,
           )])),
       ])),
+      scriptScopedFamilies: options.useGoogleFonts
+        ? docxScriptScopedFamilies(options.installedSubstituteFamilies ?? [])
+        : undefined,
       nativeFamilyLists: Object.fromEntries(routedFontFamilies.map((family) => [
         family,
         normalizeFontFamilyUncached(

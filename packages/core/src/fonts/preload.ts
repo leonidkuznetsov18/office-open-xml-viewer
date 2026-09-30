@@ -23,6 +23,7 @@
  * the canvas after the font landed.
  */
 import { retainFace, releaseFaces } from './font-registry.js';
+import type { FontSubstituteScript } from './substitute-script.js';
 
 export interface FontPreloadEntry {
   /** Google Fonts CSS URL — `display=swap` recommended. */
@@ -33,6 +34,11 @@ export interface FontPreloadEntry {
    * the requested name when omitted.
    */
   loadFamily?: string;
+  /**
+   * Script scope of a visual substitute. Such a substitute may paint and
+   * measure only characters of this script. See `substitute-script.ts`.
+   */
+  script?: FontSubstituteScript;
 }
 
 /**

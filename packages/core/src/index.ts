@@ -176,6 +176,14 @@ export {
 // SCRIPT_GOOGLE_FONTS below.
 export { GOOGLE_FONT_SUBSTITUTES, loadedGoogleRegularAliases } from './fonts/google-fonts';
 export {
+  fontSubstituteScriptClusterClass,
+  fontSubstituteScriptCoversText,
+  fontSubstituteScriptScope,
+  type FontSubstituteScopeCluster,
+  substituteEntryCoversText,
+  type FontSubstituteScript,
+} from './fonts/substitute-script';
+export {
   fontFaceWeightCovers,
   loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,

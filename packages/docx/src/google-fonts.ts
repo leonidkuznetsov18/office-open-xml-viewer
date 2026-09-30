@@ -4,6 +4,7 @@ import {
   classifyCjkFont,
   cjkLangFromLanguage,
   scriptPreloadNamesForText,
+  substituteEntryCoversText,
 } from '@silurus/ooxml-core';
 import type {
   DocxDocumentModel,
@@ -14,14 +15,6 @@ import { DOCX_GOOGLE_FONTS } from './google-font-registry.js';
 // Kept in a parser-model-free module: layout font routing reads the registry,
 // while this module traverses parser-owned facts to collect rendered families.
 export { DOCX_GOOGLE_FONTS } from './google-font-registry.js';
-
-// Collection policy, not script inference or a font-slot override. These
-// existing visual alternatives remain available through theme names exactly
-// as before this expanded preload; their rendering policy is a separate change.
-const THEME_ONLY_VISUAL_SUBSTITUTES = new Set([
-  'sakkal majalla', 'traditional arabic', 'simplified arabic',
-  'arabic typesetting', 'univers next arabic',
-]);
 
 function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
   for (const usage of docxRenderedTextUsages(doc)) yield usage.text;
@@ -39,10 +32,9 @@ function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
  * stories and numbering markers. The loader requests only names that have a
  * {@link DOCX_GOOGLE_FONTS} entry, and the layout font inventory routes only
  * preloaded names to their loaded substitute, so a rendered Cambria run needs
- * Cambria here for Caladea to be both fetched and selected. The five Arabic
- * visual substitutes retain legacy theme-only collection: broadening their
- * preload would also broaden their unscoped visual substitution. That separate
- * policy must be implemented before collecting their rendered families. Names
+ * Cambria here for Caladea to be both fetched and selected. A script-scoped
+ * visual substitute (Arabic faces → Noto Arabic) is collected only from usage
+ * whose text contains that script. Rendered names
  * without an entry are omitted (they would be inert). The document font table
  * alone never adds a name.
  *
@@ -73,9 +65,10 @@ export function docxFontPreloadNames(
       const name = family?.trim();
       const key = name?.toLocaleLowerCase('en-US');
       const entry = key ? DOCX_GOOGLE_FONTS[key] : undefined;
-      // Preserve the legacy collection boundary for Arabic visual substitutes.
+      // A script-scoped visual substitute is fetched only when text in its
+      // script actually requests the family (core substitute-script.ts).
       if (name && key && entry && !themeKeys.has(key) && !renderedFamilies.has(key)
-        && !THEME_ONLY_VISUAL_SUBSTITUTES.has(key)) {
+        && substituteEntryCoversText(entry, usage.text, 'any')) {
         renderedFamilies.set(key, name);
       }
     }
@@ -98,8 +91,8 @@ export interface DocxGoogleFontPlan {
   readonly installedSubstituteFamilies: readonly string[];
 }
 
-/** Different-family substitutes (Calibri → Carlito, Cambria →
- * Caladea) among the preload names, keyed by normalized family. */
+/** Different-family substitutes (Calibri → Carlito, Sakkal Majalla → Noto
+ * Naskh Arabic) among the preload names, keyed by normalized family. */
 function differentFamilySubstitutes(
   names: readonly (string | null | undefined)[],
 ): Map<string, string> {
