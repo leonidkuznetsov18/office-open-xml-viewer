@@ -562,7 +562,7 @@ describe('table-cell parser-owned anchor reflow', () => {
     expect(secondExclusion!.bounds.yPt).toBe(second!.flowBounds.yPt);
   });
 
-  it('preserves prior-paragraph collision avoidance when allowOverlap permits overlap', () => {
+  it('keeps an allowOverlap picture at its resolved position over a prior-paragraph picture (issue #1623)', () => {
     const [first, second] = cellParagraphs(model([
       paragraph([
         ...anchoredImageRuns({
@@ -593,9 +593,9 @@ describe('table-cell parser-owned anchor reflow', () => {
 
     expect(firstExclusion).toBeDefined();
     expect(secondExclusion).toBeDefined();
-    expect(secondExclusion!.bounds.xPt).toBe(
-      firstExclusion!.bounds.xPt + firstExclusion!.bounds.widthPt,
-    );
+    // ECMA-376 §20.4.2.3 allowOverlap=true: no displacement; Word keeps such
+    // pictures from different paragraphs at their resolved positions.
+    expect(secondExclusion!.bounds.xPt).toBe(firstExclusion!.bounds.xPt);
   });
 
   it('applies allowOverlap=false between anchors hosted by the same paragraph', () => {

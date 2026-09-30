@@ -1339,7 +1339,11 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         }
         if let Some(v) = attr_w(sp, "line") {
             let rule = attr_w(sp, "lineRule").unwrap_or_else(|| "auto".to_string());
-            let raw: f64 = v.parse().unwrap_or(240.0);
+            // §17.3.1.33: w:line is ST_SignedTwipsMeasure. A value outside
+            // its lexical union (e.g. an exponent or NaN) keeps the historical
+            // single-spacing fallback instead of reaching layout. Converting
+            // from the authored unit keeps every valid lexeme finite.
+            let measure = signed_twips_measure(&v).unwrap_or(SignedTwipsMeasure::Twips(240.0));
             // OOXML encodes line spacing as:
             //   auto      → raw / 240   = multiplier (1.0 = single, 1.5 = 1½, 2.0 = double)
             //   atLeast   → raw / 20    = pt (minimum line height)
@@ -1351,9 +1355,9 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
             // the section enables a line grid, which is where those oversized
             // values are actually authored.
             let (val, effective_rule) = match rule.as_str() {
-                "exact" => (raw / 20.0, "exact".to_string()),
-                "atLeast" => (raw / 20.0, "atLeast".to_string()),
-                _ => (raw / 240.0, "auto".to_string()),
+                "exact" => (measure.to_pt(), "exact".to_string()),
+                "atLeast" => (measure.to_pt(), "atLeast".to_string()),
+                _ => (measure.to_240ths(), "auto".to_string()),
             };
             fmt.line_spacing_val = Some(val);
             fmt.line_spacing_rule = Some(effective_rule);
@@ -3552,6 +3556,38 @@ mod tests {
     }
 
     // ── WD4: run-level character metrics (§17.3.2.35 / .43 / .24 / .19) ──────
+
+    #[test]
+    fn spacing_line_accepts_only_signed_twips_measure_lexemes() {
+        // §17.3.1.33: w:line is ST_SignedTwipsMeasure (§17.18.81).
+        let f = para_fmt_from(r#"<w:spacing w:line="20" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(1.0));
+        let f = para_fmt_from(r#"<w:spacing w:line="12pt" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(12.0));
+        // Exponents, decimals and non-finite values are outside the union and
+        // keep the single-spacing fallback rather than a sub-ulp line pitch.
+        for invalid in ["2e-13", "0.5", "NaN", "inf"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="{invalid}" w:lineRule="exact"/>"#
+            ));
+            assert_eq!(f.line_spacing_val, Some(12.0), "{invalid:?}");
+        }
+        // A valid, representable universal measure stays finite.
+        let f = para_fmt_from(&format!(
+            r#"<w:spacing w:line="1{}pt" w:lineRule="exact"/>"#,
+            "0".repeat(307)
+        ));
+        assert_eq!(f.line_spacing_val, Some(1e307));
+        // A valid unit-bearing lexeme beyond binary64 saturates, as bare
+        // integers do, instead of falling back to single spacing.
+        for unit in ["pt", "in", "mm", "cm", "pc", "pi"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="1{}{unit}" w:lineRule="exact"/>"#,
+                "0".repeat(400)
+            ));
+            assert_eq!(f.line_spacing_val, Some(f64::MAX), "{unit}");
+        }
+    }
 
     #[test]
     fn char_spacing_parses_signed_twips_to_pt() {

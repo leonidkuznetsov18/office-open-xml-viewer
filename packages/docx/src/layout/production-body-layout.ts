@@ -522,6 +522,9 @@ function acquireBodyParagraphAtLocation(
           }),
       anchorFrames: bodyAnchorReferenceFrames(state),
       acquireCompleteStory: state.acquireCompleteTextBoxStory,
+      ...(state.frozenAnchorFrames && state.frozenAnchorFrames.size > 0
+        ? { frozenAnchorFrames: state.frozenAnchorFrames }
+        : {}),
     },
     continuation.boundary === null
       ? undefined
@@ -1385,6 +1388,33 @@ function prescanBodyPageAnchors(
     return paragraphIds.get(key)!;
   };
   const entries = request.anchors.flatMap((anchor): readonly FloatRegistryEntryPt[] => {
+    if (anchor.kind === 'host-drawing') {
+      // WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: register the first-placement
+      // geometry at page start; the anchor paragraph keeps the same frame.
+      const { carry } = anchor;
+      if (!state.frozenAnchorFrames) state.frozenAnchorFrames = new Map();
+      state.frozenAnchorFrames.set(anchor.occurrenceId, Object.freeze({ ...carry.bounds }));
+      return [
+        Object.freeze({
+          kind: 'shape' as const,
+          occurrenceId: anchor.occurrenceId,
+          exclusionId: anchor.occurrenceId,
+          paragraphId: paragraphIdFor(anchor.paragraphSource),
+          bounds: carry.bounds,
+          exclusionBounds: carry.exclusionBounds,
+          ...(carry.horizontalOwnership ? { horizontalOwnership: carry.horizontalOwnership } : {}),
+          ...(carry.verticalOwnership ? { verticalOwnership: carry.verticalOwnership } : {}),
+          wrap: carry.wrap,
+          wrapSide: carry.wrapSide ?? null,
+          ...(carry.wrapDistances ? { wrapDistances: carry.wrapDistances } : {}),
+          ...(carry.wrapPolygon ? { wrapPolygon: carry.wrapPolygon } : {}),
+          ...(carry.topEdgeInclusiveFromYPt === undefined
+            ? {} : { topEdgeInclusiveFromYPt: carry.topEdgeInclusiveFromYPt }),
+          ...(carry.anchorLineExemptTopPt === undefined
+            ? {} : { anchorLineExemptTopPt: carry.anchorLineExemptTopPt }),
+        }),
+      ];
+    }
     if (anchor.kind === 'floating-table') {
       // §17.4.57 topFromText is the minimum gap above a positioned
       // table. In controlled Word output, a page-positioned table
@@ -1636,6 +1666,7 @@ function resetBodyPageAcquisition(
   state.floats = [];
   state.floatParaSeq = 0;
   state.pageAnchorPrescanned = new Set();
+  state.frozenAnchorFrames = new Map();
   sessionState.floatRegistry = Object.freeze({
     coordinateSpace: 'logical-page-points' as const,
     flowDomainId: pageRegistryFlowDomainId(next.pageIndex),
@@ -1758,6 +1789,10 @@ function commitBodyFlowRegistryDelta(
       distTop: top,
       distBottom: bottom,
       paraId: entry.paragraphId,
+      ...(entry.topEdgeInclusiveFromYPt === undefined
+        ? {} : { topEdgeInclusiveFromYPt: entry.topEdgeInclusiveFromYPt }),
+      ...(entry.anchorLineExemptTopPt === undefined
+        ? {} : { exemptLineTopPt: entry.anchorLineExemptTopPt }),
     };
     return entry.kind === 'table'
       ? {
@@ -1871,6 +1906,9 @@ function retainedBodyParagraphFloatEntries(
     }),
   );
   if (hostFrames.size === 0) return Object.freeze([]);
+  // A drawing carried to this page (WORD_LATER_ANCHOR_EARLIER_LINE_WRAP) is
+  // already registered with the same geometry.
+  const registered = new Set(sessionState.floatRegistry.entries.map((entry) => entry.occurrenceId));
   const exclusions = new Map(
     layout.exclusions.flatMap((exclusion) =>
       exclusion.anchorOccurrenceId ? [[exclusion.anchorOccurrenceId, exclusion] as const] : [],
@@ -1879,7 +1917,7 @@ function retainedBodyParagraphFloatEntries(
   return Object.freeze(
     (layout.anchorCollisions ?? []).flatMap((collision): FloatRegistryEntryPt[] => {
       const frame = hostFrames.get(collision.occurrenceId);
-      if (!frame) return [];
+      if (!frame || registered.has(collision.occurrenceId)) return [];
       if (frame.geometry.wrap.kind === 'none') return [];
       const exclusion = exclusions.get(collision.occurrenceId);
       if (!exclusion) {

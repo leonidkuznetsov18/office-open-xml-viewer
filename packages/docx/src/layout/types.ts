@@ -572,6 +572,17 @@ export interface WrapExclusion {
   readonly polygon: readonly PointPt[];
   readonly anchorOccurrenceId?: string;
   readonly verticalOwnership?: 'page' | 'host';
+  /** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP: the anchor line starting at this
+   * top does not wrap around its own object. Paragraph-local; the registry
+   * entry seen by other paragraphs carries the full exclusion. */
+  readonly anchorLineExemptTopPt?: number;
+  /** WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH: a line starting at or below this Y
+   * whose bottom lies exactly on this polygon's top wraps around it. Set only
+   * on carried later anchors. */
+  readonly topEdgeInclusiveFromYPt?: number;
+  /** The drawing is wrapTight in a compatibility-mode-14 document; read by
+   * WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH when pagination carries it. */
+  readonly wordMode14TightAnchor?: boolean;
 }
 
 /** @internal Occurrence-keyed DrawingML object bounds for §20.4.2.3.
@@ -780,6 +791,10 @@ interface FloatRegistryEntryCorePt {
     leftPt: number;
   }>;
   readonly wrapPolygon?: readonly PointPt[];
+  /** See WrapExclusion.topEdgeInclusiveFromYPt. */
+  readonly topEdgeInclusiveFromYPt?: number;
+  /** See WrapExclusion.anchorLineExemptTopPt. */
+  readonly anchorLineExemptTopPt?: number;
 }
 
 /** Point-space snapshot used while final table-fragment float placement is
