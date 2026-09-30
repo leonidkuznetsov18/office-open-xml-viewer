@@ -9,7 +9,8 @@ import { renderDocumentToCanvas } from './renderer.js';
 import { docxFontPreloadNames } from './google-fonts.js';
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 import type { LayoutTextSeg } from './line-breaker/model.js';
-import { sliceTextShapeRequest } from './layout/text.js';
+import { createLayoutServicesRuntimeView } from './layout/runtime-state.js';
+import { assertTextShapeRunContext, sliceTextShapeRequest, textScopeScanStats } from './layout/text.js';
 import type { DocxDocumentModel } from './types.js';
 
 // useGoogleFonts substitutes (Calibri → Carlito, Cambria → Caladea) are fetched
@@ -351,6 +352,10 @@ describe('script-scoped Arabic visual substitutes', () => {
     expect(() => services.text.shape({ ...word, text: word.text.slice(1), measure: true }))
       .toThrow(/context/iu);
     expect(services.text.shape({ ...sliceTextShapeRequest(word, 1, 2), measure: true }).advancePt).toBe(9);
+    // A fragment can agree with its own truncated context and still lose the
+    // owning run. Acquisition's guard must also reject that false identity.
+    expect(() => assertTextShapeRunContext({ text: word.text,
+      substituteContext: { text: word.text, offset: 0 } }, 'ما ١٢a')).toThrow(/full run context/iu);
     const adapter = new LineMeasurementAdapter(canvas.getContext('2d') as CanvasRenderingContext2D,
       1, () => '10px serif');
     expect(() => adapter.measureSegment({ text: '٢', textShapeRequest: word,
@@ -415,6 +420,91 @@ describe('script-scoped Arabic visual substitutes', () => {
     expect(painted.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
   });
 
+  it('scans each alternating parent/child scope configuration once per run', async () => {
+    const text = 'ما a\u0301 '.repeat(1000);
+    const model = parse(docx('<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"'
+      + ' w:eastAsia="Arial" w:cs="Sakkal Majalla" w:hint="eastAsia"/><w:rtl/>'
+      + `</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`));
+    const { canvas, calls } = recordingCanvas(new Set([...WEB_FACES, 'Arial']));
+    const services = createLayoutServices(model, {
+      useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+    });
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 612, layoutServices: services });
+    expect(calls.some((call) => call.text.includes('ما') && call.face === 'Noto Naskh Arabic')).toBe(true);
+    expect(calls.some((call) => call.text.includes('\u0301') && call.face === 'Arial')).toBe(true);
+    // Parent tokens force cs; resolved Latin children do not. Repeated words
+    // must reuse both full-run descriptors, rather than evicting each other.
+    expect(textScopeScanStats(services.text)).toEqual({ scans: 2, utf16Units: 2 * text.length });
+  }, 30_000);
+
+  it.each(['', '<w:caps/>', '<w:smallCaps/>'])(
+    'retains the full case-transformed run around a Latin base and Arabic mark: %s', async (transform) => {
+      const original = 'مرحباé\u064e';
+      const fullText = transform ? original.toUpperCase() : original;
+      const model = parse(docx('<w:p><w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
+        + ` w:hAnsi="Sakkal Majalla"/>${transform}</w:rPr><w:t>${original}</w:t></w:r></w:p>`));
+      const { canvas, calls, measurements } = recordingCanvas(new Set(WEB_FACES));
+      const services = createLayoutServices(model, {
+        useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+        measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+      });
+      const seen: string[] = [];
+      const view = createLayoutServicesRuntimeView(services, { text: {
+        ...services.text,
+        shape(request) {
+          if (request.substituteContext) {
+            // Checking only substring == context.slice(offset) would accept
+            // a fresh, truncated context. Compare with the independent full run.
+            expect(request.substituteContext.text).toBe(fullText);
+            seen.push(request.text);
+          }
+          return services.text.shape(request);
+        },
+      } });
+      await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 612, layoutServices: view });
+      expect(seen.some((text) => text.includes('\u064e'))).toBe(true);
+      expect(calls.filter((call) => call.text.includes('\u064e')).map((call) => call.face)).toEqual(['serif']);
+      expect(measurements.filter((entry) => entry.text.includes('\u064e'))
+        .every((entry) => entry.face === 'serif')).toBe(true);
+    },
+  );
+
+  it.each([
+    ['Sakkal Majalla', '<w:smallCaps/>', 'مرحباßé\u064e\t١٢', 'مرحباSSÉ\u064e\t١٢'],
+    ['Wingdings', '', '\uf024\t\uf04a', '👓\t☺'],
+  ])('projects expanded display scalars and tab pieces into one full %s run', async (family, transform, original, fullText) => {
+    const model = parse(docx('<w:p><w:r><w:rPr>'
+      + `<w:rFonts w:ascii="${family}" w:hAnsi="${family}"/>${transform}`
+      + `</w:rPr><w:t>${original}</w:t></w:r></w:p>`));
+    const { canvas, calls } = recordingCanvas(new Set(WEB_FACES));
+    const services = createLayoutServices(model, { useGoogleFonts: true, googleFaces: WEB_FACES.map(loaded),
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D });
+    const ranges: string[] = [];
+    const view = createLayoutServicesRuntimeView(services, { text: { ...services.text, shape(request) {
+      if (request.substituteContext) {
+        assertTextShapeRunContext(request, fullText);
+        ranges.push(request.text);
+      }
+      return services.text.shape(request);
+    } } });
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 612, layoutServices: view });
+    expect(ranges.some((text) => text.includes(family === 'Wingdings' ? '☺' : '١٢'))).toBe(true);
+    expect(calls.some((call) => call.text.includes(family === 'Wingdings' ? '☺' : 'É'))).toBe(true);
+    if (family === 'Sakkal Majalla') {
+      expect(calls.filter((call) => call.text.includes('١٢') || call.text.includes('\u064e'))
+        .every((call) => call.face === 'serif')).toBe(true);
+    }
+  });
+
+  it('does not merge hidden Arabic proof into the next visible run', async () => {
+    const model = parse(docx('<w:p><w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla"'
+      + ' w:hAnsi="Sakkal Majalla"/><w:vanish/></w:rPr><w:t>ما</w:t></w:r>'
+      + '<w:r><w:rPr><w:rFonts w:ascii="Sakkal Majalla" w:hAnsi="Sakkal Majalla"/>'
+      + '</w:rPr><w:t>١٢</w:t></w:r></w:p>'));
+    expect(await paintedFamilies(model, ['١٢'])).toEqual(['serif']);
+  });
+
   it('shares scoped word shapes across 4,000 offsets and different run contexts', async () => {
     const context = 'ما ' + '١٢ '.repeat(4000);
     const model = parse(docx(sakkal(context)));
@@ -437,13 +527,17 @@ describe('script-scoped Arabic visual substitutes', () => {
     const unproven = shape('١٢', 'Leader ١٢', 7);
     expect(unproven).not.toBe(first);
     expect(unproven.spans[0]?.font.resolvedFamily).not.toBe('Noto Naskh Arabic');
+    expect(textScopeScanStats(services.text)).toEqual({ scans: 3,
+      utf16Units: context.length + 'مرحبا ١٢'.length + 'Leader ١٢'.length });
     await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 612, layoutServices: services });
     expect(calls.some((entry) => entry.text.includes('١٢'))).toBe(true);
     expect(calls.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
     const digitMeasurements = measurements.filter((entry) => entry.text.includes('١٢'));
     expect(digitMeasurements.length).toBeGreaterThan(0);
     expect(digitMeasurements.every((entry) => entry.face === 'Noto Naskh Arabic')).toBe(true);
-  }, 20_000);
+  // Scope work and shape sharing above are deterministic resource bounds;
+  // allow the full paint fixture to finish on hosts running parallel sessions.
+  }, 60_000);
 
   it('merges joined Arabic across slots when both resolve to the same substitute face', async () => {
     // U+08A0 is a highAnsi scalar; the two requested families both resolve to

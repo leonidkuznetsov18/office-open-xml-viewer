@@ -294,6 +294,21 @@ export interface TextShapeRequest {
   readonly substituteContext?: Readonly<{ text: string; offset: number }>;
 }
 
+/** Validate against the owning transformed run, not merely a self-consistent
+ * fragment. Acquisition knows the full run; partial measurements inherit it. */
+export function assertTextShapeRunContext(
+  request: Readonly<Pick<TextShapeRequest, 'text' | 'substituteContext'>>,
+  fullRunText: string,
+): void {
+  const context = request.substituteContext;
+  if (!context || context.text !== fullRunText
+    || !Number.isInteger(context.offset) || context.offset < 0
+    || context.offset + request.text.length > fullRunText.length
+    || fullRunText.slice(context.offset, context.offset + request.text.length) !== request.text) {
+    throw new Error('Text shape request does not match its full run context; project the range explicitly');
+  }
+}
+
 /** Slice retained shaping input without re-judging a fragment's script proof.
  * UTF-16 offsets match both Canvas text and the shared run-scope descriptor. */
 export function sliceTextShapeRequest(
@@ -569,6 +584,7 @@ const LATIN1_CHINESE_EAST_ASIA = new Set([
 const SCOPE_NEUTRAL_SCALAR = /^[\s\p{Cf}\p{M}]$/u;
 /** Recent run contexts whose substitute scope is retained (one per run). */
 const SCOPE_CACHE_LIMIT = 64;
+const SCOPE_CONFIGURATIONS_PER_RUN = 8;
 const SCOPE_SLOTS = ['ascii', 'highAnsi', 'eastAsia', 'complexScript'] as const;
 
 /** Two resolutions select the same registered face: the same resource,
@@ -674,6 +690,12 @@ export function requestedFamily(
  * reaching it retires the ordinals together with the measurement cache. */
 export const TEXT_ROUTE_ORDINAL_LIMIT = 4096;
 const routeOrdinalTableSizes = new WeakMap<object, () => number>();
+const scopeScanStats = new WeakMap<object, () => Readonly<{ scans: number; utf16Units: number }>>();
+
+/** Internal resource diagnostic: whole-run work, independent of wall-clock noise. */
+export function textScopeScanStats(service: TextLayoutService): Readonly<{ scans: number; utf16Units: number }> | undefined {
+  return scopeScanStats.get(service)?.();
+}
 
 /** Internal diagnostic: live route-ordinal entries held by a text service. */
 export function textRouteOrdinalTableSize(service: TextLayoutService): number | undefined {
@@ -830,7 +852,9 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     request: Readonly<GlyphMeasureRequest>,
   ): number => input.measurer.measure(request).advancePt;
   const shapeCache = new Map<string, TextShapeResult>();
-  const scopeCache = new Map<string, Readonly<{ key: string; slots: Uint8Array }>>();
+  const scopeCache = new Map<string, Map<string, Uint8Array>>();
+  let scopeScans = 0;
+  let scopeUtf16Units = 0;
   const service: TextLayoutService = Object.freeze({
     fingerprint,
     fontMetrics,
@@ -844,11 +868,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // closed prevents a stale offset from silently selecting a different face
       // than paint. Independent and transformed text have explicit helpers.
       const context = request.substituteContext ?? { text: request.text, offset: 0 };
-      if (!Number.isInteger(context.offset) || context.offset < 0
-        || context.offset + request.text.length > context.text.length
-        || context.text.slice(context.offset, context.offset + request.text.length) !== request.text) {
-        throw new Error('Text shape request does not match its run context; project the range explicitly');
-      }
+      if (request.substituteContext) assertTextShapeRunContext(request, context.text);
       const configuredBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
       const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
       for (const slot of SCOPE_SLOTS) {
@@ -899,11 +919,21 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           request.eastAsiaLanguage ?? null, eastAsiaCharset ?? null,
         ]);
         // The raw run string is a Map key only once, never JSON-serialized or
-        // embedded in each word key. At most 64 runs retain one linear slot
-        // array each; formatting changes replace that run's cached descriptor.
-        const retained = cached(scopeCache, context.text);
-        let slots = retained?.key === key ? retained.slots : undefined;
+        // embedded in each word key. Parent tokens and their resolved children
+        // can alternate cs and scalar-slot classification on every word. Keep
+        // both configurations: replacing one descriptor would rescan the whole
+        // run per child, making layout quadratic. Both LRU levels are bounded
+        // resource policy (64 runs, 8 configurations per run); retained arrays
+        // remain linear in the retained run lengths, independent of word count.
+        let configurations = cached(scopeCache, context.text);
+        if (!configurations) {
+          configurations = new Map();
+          retain(scopeCache, context.text, configurations, SCOPE_CACHE_LIMIT);
+        }
+        let slots = cached(configurations, key);
         if (!slots) {
+          scopeScans += 1;
+          scopeUtf16Units += context.text.length;
           const contextScalars = scalarsOf(context.text);
           const indexAt = new Map(contextScalars.map((scalar, index) => [scalar.start, index]));
           slots = new Uint8Array(context.text.length);
@@ -934,7 +964,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
               if (host !== undefined && scopedBySlot.get(host) === script) slots.fill(SCOPE_SLOTS.indexOf(host) + 1, cluster.start, cluster.end);
             }
           }
-          retain(scopeCache, context.text, { key, slots }, SCOPE_CACHE_LIMIT);
+          retain(configurations, key, slots, SCOPE_CONFIGURATIONS_PER_RUN);
         }
         // Exact, collision-free range descriptor: zero means normal scalar
         // classification; 1–4 carry the in-scope host slot. Key size is O(word),
@@ -1146,5 +1176,6 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     },
   });
   routeOrdinalTableSizes.set(service, () => routeOrdinals.size);
+  scopeScanStats.set(service, () => Object.freeze({ scans: scopeScans, utf16Units: scopeUtf16Units }));
   return service;
 }

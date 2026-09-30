@@ -18,7 +18,7 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
@@ -121,12 +121,34 @@ export interface SegmentBuildContext {
   ) => number | undefined;
 }
 
+/** ECMA-376 §17.3.2.5/§17.3.2.33 change displayed case, not run ownership.
+ * §17.3.3.30 symbol normalization may also expand a scalar to a surrogate
+ * pair. Scope and offsets use the complete display string after both changes;
+ * small-caps size pieces and tabs cannot create independent Arabic proof.
+ * Hidden runs are omitted by the parser (§17.3.2.41), not merged into this run.
+ */
+function transformedRunText(
+  text: string,
+  run: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
+  environment: LineLayoutEnvironment,
+): string {
+  const r: ParagraphTextBearingRun = run;
+  const display = run.allCaps || run.smallCaps ? text.toUpperCase() : text;
+  const map = (text: string, family: string | null | undefined) => isSymbolFontFamily(family)
+    ? symbolTextToUnicodeSegments(text, family).map((part) => part.text).join('') : text;
+  if (r.rtl || r.cs) return map(display, r.fontFamilyCs ?? run.fontFamily);
+  if (environment.layoutServices?.text) return map(display, run.fontFamily);
+  return splitByEastAsia(display).map((part) => map(part.text,
+    part.ea ? r.fontFamilyEastAsia ?? run.fontFamily : run.fontFamily)).join('');
+}
+
 export function appendTextPiece(
   state: SegmentBuildContext,
   text: string,
   base: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
   vertAlign: 'super' | 'sub' | null,
   sourceRunIndex: number,
+  fullRunContext: Readonly<{ text: string; offset: number }>,
   sourceFragmentIndex?: number,
   joinPreviousRun = false,
 ): void {
@@ -282,7 +304,10 @@ export function appendTextPiece(
     reduced: false,
     firstSeg: true,
     gluePending: false,
-    scopeContext: undefined,
+    scopeContext: {
+      text: fullRunContext.text,
+      cursor: fullRunContext.offset,
+    },
   };
   // True while the next emitted segment should be GLUED to the previous one
   // (a small-caps case-piece that continues the same word). Consumed by the
@@ -370,7 +395,6 @@ export function appendTextPiece(
     emissionState.gluePending = prevPieceText.length > 0 && !/\s$/.test(prevPieceText);
     prevPieceText = piece.text;
     const displayText = base.allCaps || base.smallCaps ? piece.text.toUpperCase() : piece.text;
-    emissionState.scopeContext = { text: displayText, cursor: 0 };
     for (const word of splitTextForLayout(displayText)) {
       if (forceCs) {
         // When the run's digits are AN-classified, split a token into maximal
@@ -817,7 +841,7 @@ interface SegmentEmissionState {
   /** The run's display text around the emitted pieces, with a cursor. The
    * text service decides a script-scoped substitute's scope over this whole
    * contiguous context, not over one word (core fontSubstituteScriptScope). */
-  scopeContext: { text: string; cursor: number } | undefined;
+  readonly scopeContext: { readonly text: string; cursor: number };
 }
 
 function pushSegmentPiece(
@@ -863,18 +887,14 @@ function pushSegmentPiece(
     overflowPunctuationEastAsianRun,
   } = emissionState;
 
-  // Locate this piece in the run's display text (pieces are emitted in order).
+  // Consume an exact range of the immutable full display run. A parent
+  // advances once; child spans inherit its range. Never search ahead or drop
+  // context when a transform fails to project: that could invent Arabic proof.
   const scopeContext = emissionState.scopeContext;
-  const contextOffset = substituteContext?.offset
-    ?? (scopeContext ? scopeContext.text.indexOf(text, scopeContext.cursor) : -1);
-  // A parent token advances the cursor once. Children receive its exact range;
-  // re-searching after that advance loses proof outside the child span.
-  if (!substituteContext && scopeContext && contextOffset >= 0) {
-    scopeContext.cursor = contextOffset + text.length;
-  }
   const retainedContext = substituteContext
-    ?? (scopeContext && contextOffset >= 0
-      ? Object.freeze({ text: scopeContext.text, offset: contextOffset }) : undefined);
+    ?? Object.freeze({ text: scopeContext.text, offset: scopeContext.cursor });
+  assertTextShapeRunContext({ text, substituteContext: retainedContext }, scopeContext.text);
+  if (!substituteContext) scopeContext.cursor += text.length;
 
   if (
     environment.balanceSingleByteDoubleByteWidth &&
@@ -1441,6 +1461,7 @@ function appendRunsToSegments(
             t,
             t.vertAlign ?? 'super',
             runIndex,
+            { text: transformedRunText(label, t, environment), offset: 0 },
             0,
             joinFromPreviousNoBreakHyphen,
           );
@@ -1452,6 +1473,8 @@ function appendRunsToSegments(
       }
       // Split on tab chars so tab alignment can be resolved during layout.
       const parts = t.text.split('\t');
+      const fullDisplayText = transformedRunText(t.text, t, environment);
+      let displayOffset = 0;
       for (let i = 0; i < parts.length; i++) {
         if (parts[i].length > 0) {
           appendTextPiece(
@@ -1460,10 +1483,12 @@ function appendRunsToSegments(
             t,
             t.vertAlign,
             runIndex,
+            { text: fullDisplayText, offset: displayOffset },
             i,
             i === 0 && joinFromPreviousNoBreakHyphen,
           );
         }
+        displayOffset += transformedRunText(parts[i], t, environment).length + 1;
         if (i < parts.length - 1) {
           segs.push({
             isTab: true,
@@ -1575,6 +1600,7 @@ function appendRunsToSegments(
           f,
           f.vertAlign,
           runIndex,
+          { text: transformedRunText(text, f, environment), offset: 0 },
           undefined,
           joinFromPreviousNoBreakHyphen,
         );
