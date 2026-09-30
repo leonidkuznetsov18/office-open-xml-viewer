@@ -82,6 +82,18 @@ export interface Paragraph extends CoreParagraph {
    */
   eaLnBrk: boolean;
   /**
+   * Effective `<a:pPr fontAlgn>` (ECMA-376 §21.1.2.2.7) after the paragraph →
+   * list-style → layout/master cascade. Only `t`, `ctr` and `b` are emitted:
+   * PowerPoint lays out an omitted value, `auto` and `base` identically, so an
+   * absent field means baseline alignment.
+   */
+  fontAlgn?: 't' | 'ctr' | 'b';
+  /**
+   * True when `<a:endParaRPr>` authors its own latin face. Only that face
+   * sizes the paragraph's last line with text (at the last run's size).
+   */
+  endFaceAuthored?: boolean;
+  /**
    * `<a:pPr defTabSz>` (ECMA-376 §21.1.2.2.7) — the default tab-stop interval in
    * EMU. When a `\t` has no reachable explicit `a:tabLst` stop, it advances to
    * the next multiple of this grid (issue #1006). Absent ⇒ the renderer uses the

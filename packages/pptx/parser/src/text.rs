@@ -74,6 +74,64 @@ impl ParagraphSpacing {
     }
 }
 
+/// Per-list-level paragraph spacing from `<a:lvlNpPr>`: `spcBef`, `spcAft`
+/// and `lnSpc`, each a percentage or points (CT_TextSpacing). Index 0..=8 → lvl1pPr..
+/// lvl9pPr. Each level and property inherits independently (ECMA-376
+/// §21.1.2.4): a paragraph at level N takes level N of the nearest list style
+/// that sets it, never another level's value. Observed (#1630): a title whose
+/// titleStyle set 90 % line spacing on level 1 only laid level-2 paragraphs
+/// out at single spacing, and body levels 2-5 took their own 5 pt space before
+/// rather than level 1's 10 pt.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub(crate) struct LevelSpacing {
+    pub(crate) before: [Option<ParagraphSpacing>; 9],
+    pub(crate) after: [Option<ParagraphSpacing>; 9],
+    pub(crate) line: [Option<SpaceLine>; 9],
+}
+
+impl LevelSpacing {
+    /// Read levels 1..9 from a node holding `<a:lvlNpPr>` children: a txBody's
+    /// `<a:lstStyle>` or a master `<p:txStyles>` style node.
+    pub(crate) fn read(list_style: roxmltree::Node<'_, '_>) -> Self {
+        let mut out = Self::default();
+        for lvl in 0..9 {
+            let tag = format!("lvl{}pPr", lvl + 1);
+            let Some(lp) = list_style
+                .children()
+                .find(|n| n.is_element() && n.tag_name().name() == tag)
+            else {
+                continue;
+            };
+            out.before[lvl] = paragraph_spacing(lp, "spcBef");
+            out.after[lvl] = paragraph_spacing(lp, "spcAft");
+            out.line[lvl] = child(lp, "lnSpc").and_then(parse_lnspc);
+        }
+        out
+    }
+
+    /// Per level and property, `self` where set, else `fallback`.
+    pub(crate) fn or(&self, fallback: &Self) -> Self {
+        let mut out = self.clone();
+        for lvl in 0..9 {
+            out.before[lvl] = out.before[lvl].or(fallback.before[lvl]);
+            out.after[lvl] = out.after[lvl].or(fallback.after[lvl]);
+            out.line[lvl] = out.line[lvl].take().or_else(|| fallback.line[lvl].clone());
+        }
+        out
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// marL (EMU) of each level of PowerPoint's default presentation
+/// `defaultTextStyle`: 0.5" per level. Observed (#1620 controls): in a deck
+/// without a defaultTextStyle a level-2 text box paragraph started 36 pt in.
+pub(crate) const DEFAULT_TEXT_STYLE_MAR_L: [i64; 9] = [
+    0, 457_200, 914_400, 1_371_600, 1_828_800, 2_286_000, 2_743_200, 3_200_400, 3_657_600,
+];
+
 /// Per-list-level default font sizes (pt). Index 0..=8 → lvl1pPr..lvl9pPr
 /// (ECMA-376 §21.1.2.4). `None` where the level isn't specified.
 pub(crate) type LevelFontSizes = [Option<f64>; 9];
@@ -1228,9 +1286,9 @@ pub(crate) fn parse_text_body(
     inherited_alignment: Option<String>,
     inherited_level_alignments: &LevelAlignments,
     inherited_ea_ln_brk: Option<bool>,
-    inherited_space_before: Option<ParagraphSpacing>,
-    inherited_space_after: Option<ParagraphSpacing>,
-    inherited_line_spacing: Option<f64>,
+    inherited_font_algn: Option<String>,
+    inherited_spacing: LevelSpacing,
+    implicit_mar_l: [i64; 9],
     zip: &mut PptxZip,
 ) -> TextBody {
     let body_pr = child(tx_body, "bodyPr");
@@ -1436,18 +1494,19 @@ pub(crate) fn parse_text_body(
         .map(|v| v == "1" || v == "true")
         .or(inherited_ea_ln_brk);
 
-    // Own lstStyle > lvl1pPr spacing overrides inherited
-    let own_lvl1_spcbef = own_lvl1_ppr.and_then(|lp| paragraph_spacing(lp, "spcBef"));
-    let own_lvl1_spcaft = own_lvl1_ppr.and_then(|lp| paragraph_spacing(lp, "spcAft"));
-    let body_default_space_before = own_lvl1_spcbef.or(inherited_space_before);
-    let body_default_space_after = own_lvl1_spcaft.or(inherited_space_after);
+    // Own lstStyle > lvl1pPr > fontAlgn overrides inherited (ECMA-376
+    // §21.1.2.2.7), mirroring eaLnBrk. A paragraph's own pPr@fontAlgn wins
+    // (resolved below, after parse_paragraph read it).
+    let body_default_font_algn = own_lvl1_ppr
+        .and_then(|lp| attr(&lp, "fontAlgn"))
+        .map(|v| v.to_string())
+        .or(inherited_font_algn);
 
-    // Own lstStyle > lvl1pPr > lnSpc overrides inherited line spacing
-    let own_lvl1_line_spacing: Option<f64> = own_lvl1_ppr
-        .and_then(|lp| child(lp, "lnSpc"))
-        .and_then(|ls| child(ls, "spcPct"))
-        .and_then(|s| attr_f64(&s, "val"));
-    let body_default_line_spacing = own_lvl1_line_spacing.or(inherited_line_spacing);
+    // Own lstStyle levels over the inherited levels, per level and property.
+    let own_spacing = child(tx_body, "lstStyle")
+        .map(LevelSpacing::read)
+        .unwrap_or_default();
+    let effective_spacing = own_spacing.or(&inherited_spacing);
 
     let mut paragraphs: Vec<Paragraph> = children_vec(tx_body, "p")
         .into_iter()
@@ -1460,18 +1519,21 @@ pub(crate) fn parse_text_body(
                 body_default_alignment.as_deref(),
                 &effective_level_alignments,
                 body_default_ea_ln_brk,
-                body_default_space_before,
-                body_default_space_after,
-                body_default_line_spacing,
+                &effective_spacing,
                 default_reflection.as_ref(),
                 &effective_level_sizes,
                 &effective_level_run_properties,
                 &effective_level_indents,
                 &effective_level_bullets,
+                implicit_mar_l,
                 zip,
             )
         })
         .collect();
+    for para in &mut paragraphs {
+        para.font_algn =
+            effective_font_algn(para.font_algn.take(), body_default_font_algn.as_deref());
+    }
 
     // A paragraph's own pPr > defRPr remains the most specific colour. When
     // absent, inherit the defRPr fill from the matching list level rather than
@@ -1622,14 +1684,13 @@ pub(crate) fn parse_paragraph(
     body_default_alignment: Option<&str>,
     level_alignments: &LevelAlignments,
     body_default_ea_ln_brk: Option<bool>,
-    body_default_space_before: Option<ParagraphSpacing>,
-    body_default_space_after: Option<ParagraphSpacing>,
-    body_default_line_spacing: Option<f64>,
+    level_spacing: &LevelSpacing,
     body_default_reflection: Option<&Reflection>,
     level_font_sizes: &LevelFontSizes,
     level_run_properties: &LevelRunProperties,
     level_indents: &LevelIndents,
     level_bullets: &LevelBullets,
+    implicit_mar_l: [i64; 9],
     zip: &mut PptxZip,
 ) -> Paragraph {
     let p_pr = child(p_node, "pPr");
@@ -1651,6 +1712,12 @@ pub(crate) fn parse_paragraph(
         .map(|v| v == "1" || v == "true")
         .or(body_default_ea_ln_brk)
         .unwrap_or(true);
+
+    // `<a:pPr fontAlgn>` as authored on this paragraph; parse_text_body
+    // completes the cascade with `effective_font_algn`.
+    let font_algn = p_pr
+        .and_then(|n| attr(&n, "fontAlgn"))
+        .map(|v| v.to_string());
 
     // Paragraph's own algn → body/layout/master default → "r" if rtl, else "l"
     let lvl: u32 = p_pr
@@ -1698,10 +1765,12 @@ pub(crate) fn parse_paragraph(
 
     // marL / marR / indent resolve per axis: direct `<a:pPr>` attribute wins,
     // else the authored list-style level cascade (`level_indents`, from the
-    // shape/layout/master lstStyle per ECMA-376 §21.1.2.4.13), else PowerPoint's
-    // hardcoded implicit list defaults:
+    // shape/layout/master lstStyle per ECMA-376 §21.1.2.4.13), else the
+    // implicit defaults:
     //   Bullet paragraphs:  marL = (lvl+1)*342900, indent = -342900 (hanging)
-    //   Plain paragraphs:   marL = lvl*457200 (matches presentation.xml defaultTextStyle)
+    //   Plain paragraphs:   the caller's `implicit_mar_l` for the level. A
+    //                       placeholder passes 0, a text box its
+    //                       defaultTextStyle level (see `DefaultTextLevels`).
     let level_indent = level_indents.get(lvl as usize).copied().unwrap_or_default();
     let mar_l = p_pr
         .and_then(|n| attr_i64(&n, "marL"))
@@ -1710,7 +1779,7 @@ pub(crate) fn parse_paragraph(
             if has_bullet {
                 (lvl as i64 + 1) * 342900
             } else {
-                lvl as i64 * 457200
+                implicit_mar_l[(lvl as usize).min(8)]
             }
         });
     let mar_r = p_pr
@@ -1726,17 +1795,17 @@ pub(crate) fn parse_paragraph(
     // replaces an inherited point value and vice versa (xsd:choice).
     let (space_before, space_before_pct) = ParagraphSpacing::split(
         p_pr.and_then(|n| paragraph_spacing(n, "spcBef"))
-            .or(body_default_space_before),
+            .or(level_spacing.before[lvl.min(8) as usize]),
     );
     let (space_after, space_after_pct) = ParagraphSpacing::split(
         p_pr.and_then(|n| paragraph_spacing(n, "spcAft"))
-            .or(body_default_space_after),
+            .or(level_spacing.after[lvl.min(8) as usize]),
     );
 
     let space_line = p_pr
         .and_then(|n| child(n, "lnSpc"))
         .and_then(parse_lnspc)
-        .or_else(|| body_default_line_spacing.map(|v| SpaceLine::Pct { val: v }));
+        .or_else(|| level_spacing.line[lvl.min(8) as usize].clone());
 
     // Tab stops from pPr > tabLst
     let tab_stops: Vec<TabStop> = p_pr
@@ -1840,6 +1909,11 @@ pub(crate) fn parse_paragraph(
     // For paragraphs with no visible text content, use endParaRPr sz to set line height.
     // This ensures empty spacer paragraphs have the correct height (e.g. between sections).
     let end_rpr = child(p_node, "endParaRPr");
+    // The mark authors a face only when its own a:latin resolves (a theme
+    // token against this master's theme); an unresolved token inherits.
+    let end_face_authored = end_rpr
+        .and_then(|n| run_properties_latin_face(n, theme))
+        .is_some_and(|f| !f.is_empty());
     let end_run_properties = end_rpr.map(|node| {
         Box::new(resolve_run_properties(
             String::new(),
@@ -1888,9 +1962,24 @@ pub(crate) fn parse_paragraph(
         def_tab_sz,
         rtl,
         ea_ln_brk,
+        font_algn,
         runs,
         end_run_properties,
+        end_face_authored,
     }
+}
+
+/// The effective `fontAlgn` (ST_TextFontAlignType, ECMA-376 §20.1.10.62):
+/// the paragraph's own value, else the body/layout/master default. Only the
+/// values that change PowerPoint's layout are kept: an omitted value, `auto`
+/// and `base` render identically (#1619 controls in both line models), and an
+/// unknown token is ignored like an omitted one.
+pub(crate) fn effective_font_algn(own: Option<String>, inherited: Option<&str>) -> Option<String> {
+    let valid = |v: &str| matches!(v, "auto" | "t" | "ctr" | "base" | "b");
+    let resolved = own
+        .filter(|v| valid(v))
+        .or_else(|| inherited.filter(|v| valid(v)).map(str::to_string))?;
+    matches!(resolved.as_str(), "t" | "ctr" | "b").then_some(resolved)
 }
 
 /// Parse the marker choice group (ECMA-376 §21.1.2.4 EG_TextBullet) from a pPr /

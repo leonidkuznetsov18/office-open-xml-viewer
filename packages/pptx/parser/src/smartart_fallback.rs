@@ -322,9 +322,9 @@ fn append_point_paragraphs(
         None,
         &Default::default(),
         None,
-        None,
-        None,
-        None,
+        None, // inherited_font_algn
+        Default::default(),
+        crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
         zip,
     );
     if default_font_size.is_none() {
@@ -467,8 +467,10 @@ fn default_paragraph() -> Paragraph {
         def_tab_sz: None,
         rtl: false,
         ea_ln_brk: true,
+        font_algn: None,
         runs: Vec::new(),
         end_run_properties: None,
+        end_face_authored: false,
     }
 }
 
