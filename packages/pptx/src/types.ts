@@ -128,6 +128,13 @@ export interface TextBody extends CoreTextBody {
    */
   spcFirstLastPara?: boolean;
   /**
+   * `<a:bodyPr anchorCtr>` (ECMA-376 §21.1.2.1.1) — centre the text block
+   * within the bounding box perpendicular to the anchor. Defaults to false;
+   * omitted from JSON when false. Only stacked vertical text
+   * (`wordArtVert` / `wordArtVertRtl`) applies it so far.
+   */
+  anchorCtr?: boolean;
+  /**
    * Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
    * slide → layout → master placeholder cascade; omitted when no level
    * authors it. Only `false` changes layout: PowerPoint renders an omitted
