@@ -1570,8 +1570,10 @@ export interface ChartModel {
   classicChartStyleRoles?: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null;
   /** Surface-specific numeric style materialized in the value-band domain. */
   classicSurfaceBandStyles?: ChartClassicSurfaceBandStyles | null;
-  /** Raw linked style table retained after renderer-facing effective roles are
-   * composed, so Surface can resolve direct > linked > numeric per band. */
+  /** Linked style table retained after renderer-facing effective roles are
+   * composed. For a classic chart the linked series data roles
+   * (`dataPoint*`, `upBar`, `downBar`, `hiLoLine`) are dropped entirely: Office paints
+   * those atoms from direct formatting over the numeric style alone. */
   linkedChartStyleRoles?: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null;
   /** Numeric dataPoint/dataPoint3D roles for the most common bounded point
    * domain among varyColors groups. Group slots with the same domain inherit

@@ -298,6 +298,133 @@ mod tests {
     }
 
     #[test]
+    fn chartex_colorless_references_and_local_shape_fill_follow_office_controls() {
+        let chart_xml = format!(
+            r#"<cx:chartSpace xmlns:cx="{CX_NS}"><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="waterfall"/></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        );
+        let chart_doc = chart_space_of(&chart_xml);
+        let cases = [
+            (
+                "P2",
+                1,
+                "",
+                r#"<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>"#,
+                Some("000000"),
+                None,
+            ),
+            (
+                "P3",
+                0,
+                "",
+                r#"<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>"#,
+                Some("000000"),
+                None,
+            ),
+            (
+                "P4",
+                0,
+                "",
+                r#"<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>"#,
+                None,
+                Some("000000"),
+            ),
+            (
+                "P5",
+                0,
+                "",
+                r#"<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>"#,
+                None,
+                Some("000000"),
+            ),
+            (
+                "P6",
+                0,
+                r#"<cs:styleClr val="auto"/>"#,
+                r#"<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>"#,
+                None,
+                Some("5B9BD5"),
+            ),
+            (
+                "P7",
+                0,
+                r#"<a:srgbClr val="00B050"/>"#,
+                r#"<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>"#,
+                None,
+                Some("00B050"),
+            ),
+            (
+                "P8",
+                0,
+                "",
+                r#"<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"><a:lumMod val="50000"/><a:lumOff val="50000"/></a:schemeClr></a:solidFill></a:ln>"#,
+                None,
+                // Office paints #7F7F7F here: its fixed-point HSL arithmetic
+                // lands 1/255 below the general nearest-byte result (an exact
+                // .5 tie that Office resolves either way elsewhere). The
+                // accepted residual is the general rounding.
+                Some("808080"),
+            ),
+        ];
+        for (name, fill_idx, line_color, shape, expected_fill, expected_line) in cases {
+            let line_idx = if name == "P5" { 1 } else { 0 };
+            let style_xml = format!(
+                r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}"><cs:dataPoint><cs:lnRef idx="{line_idx}">{line_color}</cs:lnRef><cs:fillRef idx="{fill_idx}"/><cs:spPr>{shape}</cs:spPr></cs:dataPoint></cs:chartStyle>"#
+            );
+            let model = parse_chartex_part(
+                chart_doc.root_element(),
+                &ChartParseContext {
+                    color_resolver: Some(&FixtureResolver),
+                    style_xml: Some(&style_xml),
+                    ..Default::default()
+                },
+            )
+            .expect("ChartEx style parses");
+            let role = model.chartex_data_point_style.expect("dataPoint role");
+            assert_eq!(
+                role.fill_colors
+                    .as_ref()
+                    .and_then(|colors| colors.first())
+                    .and_then(Option::as_deref),
+                expected_fill,
+                "{name} fill"
+            );
+            assert_eq!(
+                role.line_colors
+                    .as_ref()
+                    .and_then(|colors| colors.first())
+                    .and_then(Option::as_deref),
+                expected_line,
+                "{name} line"
+            );
+            assert_eq!(
+                role.fill_hidden,
+                expected_fill.is_none().then_some(true),
+                "{name} visibility"
+            );
+            assert_eq!(
+                role.fill_no_style, None,
+                "{name} fillRef must not undo spPr"
+            );
+            if expected_line.is_some() {
+                assert_eq!(role.line_width_emu, Some(19050), "{name} outline width");
+            }
+            if name == "P6" {
+                assert_ne!(
+                    role.line_colors.as_ref().unwrap()[0],
+                    role.line_colors.as_ref().unwrap()[1]
+                );
+            } else if name == "P7" {
+                assert!(role
+                    .line_colors
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|color| color.as_deref() == Some("00B050")));
+            }
+        }
+    }
+
+    #[test]
     fn parse_chartex_style_distinguishes_no_style_from_explicit_no_fill() {
         let xml = format!(
             r#"<cx:chartSpace xmlns:cx="{CX_NS}"><cx:chart><cx:plotArea><cx:plotAreaRegion>

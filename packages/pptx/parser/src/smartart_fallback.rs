@@ -320,6 +320,7 @@ fn append_point_paragraphs(
         None,
         None,
         None,
+        &Default::default(),
         None,
         None, // inherited_font_algn
         Default::default(),
