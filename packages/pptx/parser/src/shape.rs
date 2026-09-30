@@ -11,7 +11,9 @@ use crate::fill::{
     parse_style_matrix_effects, parse_style_matrix_fill_from_source, parse_table_style_fill,
     parse_xfrm, EffectLst,
 };
-use crate::master::{DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders};
+use crate::master::{
+    DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders, TableTextLevels,
+};
 use crate::script_font::theme_token_set;
 use crate::text::{
     complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
@@ -1292,6 +1294,7 @@ pub(crate) fn parse_shape(
             inherited_anchor,
             inherited_body_pr,
             inherited_alignment,
+            &Default::default(),
             inherited_ea_ln_brk,
             inherited_font_algn,
             inherited_spacing,
@@ -2143,42 +2146,44 @@ pub(crate) fn resolve_table_cell_style(
 /// own text is parsed so its lstStyle, paragraph defRPr and runs apply over it
 /// and every theme token resolves with the completed cascade (issue #1627).
 ///
-/// * Latin: the table style's tcTxStyle face, else the presentation
-///   defaultTextStyle level, else the hard default. Observed (issue #1620): a
-///   cell of a built-in table style rendered in the master theme's minor font
-///   even when defaultTextStyle named another face.
-/// * ea/cs: a tcTxStyle `fontRef` (CT_FontReference, the element a shape's
-///   p:style uses) names a whole theme collection; the text-box controls
-///   (#1627 N13, N20, I26, P31-P35) show PowerPoint applies a fontRef's
-///   collection to the ea and cs slots as well as Latin, and #1620 S20 shows
-///   the table style's fontRef collection replacing defaultTextStyle for the
-///   cell's Latin face. Without a style fontRef, the defaultTextStyle level's
-///   ea/cs.
-/// * lang / altLang: the defaultTextStyle level's, as for text boxes.
+/// * Latin: the table style's tcTxStyle face, else the theme minor font, else
+///   the hard default. Observed: a cell of a built-in table style rendered in
+///   the master theme's minor font even when defaultTextStyle named another
+///   face (issue #1620); a cell of no table style, or of a custom style whose
+///   tcTxStyle names no font, also rendered in the theme minor font at every
+///   level, not in the defaultTextStyle or master otherStyle face (#1628).
+/// * ea/cs: the same theme collection as the Latin face. A tcTxStyle
+///   `fontRef` is the CT_FontReference a shape's p:style uses, and the
+///   text-box controls (#1627 N13, N20, I26, P31-P35) show a fontRef naming
+///   the collection for the ea and cs slots as well as Latin; a cell without
+///   a style font takes the minor collection like its Latin face. A token or
+///   literal authored in the cell overrides it, `typeface=""` included.
+/// * No list-style language: cells take neither the defaultTextStyle nor the
+///   otherStyle faces (#1628), so only the cell's own lang / altLang apply.
 pub(crate) fn table_cell_chain(
     style_face: Option<&str>,
-    default_text: &DefaultTextLevels,
+    theme: &HashMap<String, String>,
 ) -> LevelRunProperties {
-    let style_set = style_face.and_then(theme_token_set);
-    std::array::from_fn(|level| {
-        let (ea, cs) = match style_set {
+    let set = style_face
+        .and_then(theme_token_set)
+        .or(if style_face.is_none() {
+            Some("+mn")
+        } else {
+            None
+        });
+    let face = style_face
+        .map(str::to_owned)
+        .or_else(|| resolve_latin_face("+mn-lt", theme))
+        .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
+    std::array::from_fn(|_| {
+        let (ea, cs) = match set {
             Some(set) => (Some(format!("{set}-ea")), Some(format!("{set}-cs"))),
-            None => (
-                default_text.east_asian[level].clone(),
-                default_text.complex_script[level].clone(),
-            ),
+            None => (None, None),
         };
-        let face = style_face
-            .map(str::to_owned)
-            .or_else(|| default_text.faces[level].clone())
-            .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
-        RunProperties::script_base(
-            ea,
-            cs,
-            default_text.lang[level].clone(),
-            default_text.alt_lang[level].clone(),
-        )
-        .with_chain_face_and_size(face, None)
+        RunProperties::script_base(ea, cs, None, None)
+            // Sizes stay on the level-size tier (`TableTextLevels`), which
+            // the renderer applies to runs without their own size.
+            .with_chain_face_and_size(face.clone(), None)
     })
 }
 
@@ -2315,9 +2320,15 @@ pub(crate) fn parse_table(
         .iter()
         .enumerate()
         .map(|(ri, tr)| {
-            parse_table_row_with(*tr, theme, rels, source_dir, zip, |ci| {
-                table_cell_chain(cell_face(ri, ci).as_deref(), default_text)
-            })
+            parse_table_row_with(
+                *tr,
+                theme,
+                rels,
+                source_dir,
+                &default_text.table,
+                zip,
+                |ci| table_cell_chain(cell_face(ri, ci).as_deref(), theme),
+            )
         })
         .collect();
 
@@ -2400,6 +2411,7 @@ fn parse_table_row_with(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
+    table_text: &TableTextLevels,
     zip: &mut PptxZip,
     chain_for: impl Fn(usize) -> LevelRunProperties,
 ) -> TableRow {
@@ -2409,7 +2421,15 @@ fn parse_table_row_with(
         .filter(|n| n.is_element() && n.tag_name().name() == "tc")
         .enumerate()
         .map(|(ci, tc)| {
-            parse_table_cell_with_chain(tc, theme, rels, source_dir, &chain_for(ci), zip)
+            parse_table_cell_with_chain(
+                tc,
+                theme,
+                rels,
+                source_dir,
+                table_text,
+                &chain_for(ci),
+                zip,
+            )
         })
         .collect();
     TableRow { height, cells }
@@ -2422,10 +2442,11 @@ pub(crate) fn parse_table_cell(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
+    table_text: &TableTextLevels,
     zip: &mut PptxZip,
 ) -> TableCell {
-    let chain = table_cell_chain(None, &DefaultTextLevels::default());
-    parse_table_cell_with_chain(tc, theme, rels, source_dir, &chain, zip)
+    let chain = table_cell_chain(None, theme);
+    parse_table_cell_with_chain(tc, theme, rels, source_dir, table_text, &chain, zip)
 }
 
 fn parse_table_cell_with_chain(
@@ -2433,6 +2454,7 @@ fn parse_table_cell_with_chain(
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
     source_dir: &str,
+    table_text: &TableTextLevels,
     chain: &LevelRunProperties,
     zip: &mut PptxZip,
 ) -> TableCell {
@@ -2460,12 +2482,12 @@ fn parse_table_cell_with_chain(
             rels,
             source_dir,
             None,
-            [None; 9],
+            // Master otherStyle sizes (`TableTextLevels`); the table-style
+            // face tier is in `chain` (`table_cell_chain`).
+            table_text.sizes,
             std::array::from_fn(|_| None),
-            // Table style / defaultTextStyle tier (`table_cell_chain`); the
-            // cell's own formatting applies over it.
             chain.clone(),
-            Default::default(), // inherited_level_indents
+            table_text.indents,
             &empty_level_bullets(),
             None,
             None,
@@ -2473,11 +2495,13 @@ fn parse_table_cell_with_chain(
             None, // inherited_reflection
             anchor,
             text_insets,
-            None,                                  // inherited_alignment
-            None,                                  // inherited_ea_ln_brk
-            None,                                  // inherited_font_algn
-            Default::default(),                    // inherited_spacing
-            crate::text::DEFAULT_TEXT_STYLE_MAR_L, // implicit_mar_l
+            None, // inherited_alignment
+            &table_text.alignments,
+            None,               // inherited_ea_ln_brk
+            None,               // inherited_font_algn
+            Default::default(), // inherited_spacing
+            // Every level carries an explicit marL (`TableTextLevels`).
+            [0; 9],
             zip,
         );
         // Table-cell text direction is authored on tcPr rather than txBody's
@@ -3949,6 +3973,7 @@ mod style_ref_tests {
             &HashMap::new(),
             &HashMap::new(),
             "ppt/slides",
+            &crate::master::TableTextLevels::default(),
             &mut zip,
         );
         let body = cell.text_body.expect("table cell text body");
@@ -4052,6 +4077,7 @@ mod style_ref_tests {
             &theme,
             &HashMap::new(),
             "ppt/slides",
+            &crate::master::TableTextLevels::default(),
             &mut zip,
         );
         let tb = cell.text_body.expect("table cell text body");

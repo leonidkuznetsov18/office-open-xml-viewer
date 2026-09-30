@@ -321,6 +321,22 @@ pub(crate) fn complete_level_sizes(sizes: &LevelFontSizes) -> LevelFontSizes {
     std::array::from_fn(|lvl| Some(sizes[lvl].unwrap_or(HARD_DEFAULT_FONT_SIZE)))
 }
 
+/// Per-list-level paragraph alignment (`<a:lvlNpPr@algn>`). Index 0..=8 →
+/// lvl1pPr..lvl9pPr; `None` where the level does not set it.
+pub(crate) type LevelAlignments = [Option<String>; 9];
+
+/// Read `<a:lvlNpPr@algn>` for levels 1..9 from a node holding `<a:lvlNpPr>`
+/// children (a txBody's `<a:lstStyle>` or a master `<p:txStyles>` style).
+pub(crate) fn read_level_alignments(list_style: roxmltree::Node<'_, '_>) -> LevelAlignments {
+    std::array::from_fn(|lvl| {
+        let tag = format!("lvl{}pPr", lvl + 1);
+        list_style
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == tag)
+            .and_then(|lp| attr(&lp, "algn"))
+    })
+}
+
 /// Per-list-level default text colours. Index 0..=8 maps to
 /// `lvl1pPr`..`lvl9pPr` (ECMA-376 §21.1.2.4). Keeping these per level is
 /// essential: applying a layout's lvl1 colour as a body-wide fallback makes a
@@ -366,7 +382,7 @@ pub(crate) fn merge_level_colors(primary: &LevelColors, fallback: &LevelColors) 
 /// itself, exactly like a paragraph's own `<a:pPr>`). Each axis is `Option` so it
 /// inherits independently: a level that sets only `marL` leaves `marR`/`indent`
 /// `None` and a lower-priority tier supplies them.
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct LevelIndent {
     pub(crate) mar_l: Option<i64>,
     pub(crate) mar_r: Option<i64>,
@@ -1348,6 +1364,7 @@ pub(crate) fn parse_text_body(
     inherited_anchor: Option<String>,
     inherited_body_pr: Option<InheritedBodyPr>,
     inherited_alignment: Option<String>,
+    inherited_level_alignments: &LevelAlignments,
     inherited_ea_ln_brk: Option<bool>,
     inherited_font_algn: Option<String>,
     inherited_spacing: LevelSpacing,
@@ -1535,6 +1552,16 @@ pub(crate) fn parse_text_body(
         .and_then(|rp| attr(&rp, "i"))
         .map(|v| v == "1" || v == "true")
         .or(inherited_italic);
+    // Per-level alignment: the own lstStyle level, else the inherited level.
+    // A level neither sets falls back to the body default below.
+    let own_level_alignments = child(tx_body, "lstStyle")
+        .map(read_level_alignments)
+        .unwrap_or_default();
+    let effective_level_alignments: LevelAlignments = std::array::from_fn(|lvl| {
+        own_level_alignments[lvl]
+            .clone()
+            .or_else(|| inherited_level_alignments[lvl].clone())
+    });
     // Own lstStyle > lvl1pPr > algn overrides inherited alignment
     let body_default_alignment = own_lvl1_ppr
         .and_then(|lp| attr(&lp, "algn"))
@@ -1570,6 +1597,7 @@ pub(crate) fn parse_text_body(
                 rels,
                 source_dir,
                 body_default_alignment.as_deref(),
+                &effective_level_alignments,
                 body_default_ea_ln_brk,
                 &effective_spacing,
                 default_reflection.as_ref(),
@@ -1734,6 +1762,7 @@ pub(crate) fn parse_paragraph(
     rels: &HashMap<String, String>,
     source_dir: &str,
     body_default_alignment: Option<&str>,
+    level_alignments: &LevelAlignments,
     body_default_ea_ln_brk: Option<bool>,
     level_spacing: &LevelSpacing,
     body_default_reflection: Option<&Reflection>,
@@ -1771,15 +1800,15 @@ pub(crate) fn parse_paragraph(
         .map(|v| v.to_string());
 
     // Paragraph's own algn → body/layout/master default → "r" if rtl, else "l"
-    let alignment = p_pr
-        .and_then(|n| attr(&n, "algn"))
-        .map(|a| a.to_string())
-        .or_else(|| body_default_alignment.map(|a| a.to_string()))
-        .unwrap_or_else(|| if rtl { "r".into() } else { "l".into() });
     let lvl: u32 = p_pr
         .and_then(|n| attr(&n, "lvl"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let alignment = p_pr
+        .and_then(|n| attr(&n, "algn"))
+        .or_else(|| level_alignments[(lvl as usize).min(8)].clone())
+        .or_else(|| body_default_alignment.map(|a| a.to_string()))
+        .unwrap_or_else(|| if rtl { "r".into() } else { "l".into() });
 
     // Effective bullet: the paragraph's own bullet groups
     // (`<a:buClr>`/`<a:buSz…>`/`<a:buFont>` + `<a:buChar>`/`<a:buAutoNum>`/

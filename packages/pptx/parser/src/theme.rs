@@ -462,37 +462,45 @@ impl ooxml_common::color::ThemeResolver for PptxSchemeResolver<'_> {
 mod tests {
     #[test]
     fn supplemental_script_fonts_are_aggregated_once_and_conflicts_name_no_face() {
-        let mut fonts = String::new();
-        for i in 0..48_000 {
-            fonts.push_str(&format!(r#"<a:font script="S{i}" typeface="F{i}"/>"#));
-        }
-        fonts.push_str(r#"<a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Jpan" typeface="Yu Mincho"/>"#);
-        fonts.push_str(
-            r#"<a:font script="Hebr" typeface="David"/><a:font script="Hebr" typeface="Arial"/>"#,
-        );
-        let xml = format!(
-            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="F"><a:majorFont><a:latin typeface="A"/></a:majorFont><a:minorFont><a:latin typeface="B"/>{fonts}</a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
-        );
+        use ooxml_common::theme::ThemeSupplementalFont;
+        let font = |script: &str, typeface: &str| ThemeSupplementalFont {
+            script: script.to_owned(),
+            typeface: typeface.to_owned(),
+        };
+        let mut fonts: Vec<_> = (0..48_000)
+            .map(|i| font(&format!("S{i}"), &format!("F{i}")))
+            .collect();
+        fonts.extend([
+            font("Jpan", "Yu Mincho"),
+            font("Jpan", "Yu Mincho"),
+            font("Hebr", "David"),
+            font("Hebr", "Arial"),
+        ]);
+        // One pass: the former per-entry rescan was quadratic in the entry
+        // count (48,000 entries took seconds).
         let started = std::time::Instant::now();
-        let map = parse_theme_colors(&xml);
+        let faces: HashMap<_, _> = unique_script_faces(&fonts).into_iter().collect();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed() < std::time::Duration::from_millis(500),
             "took {:?}",
             started.elapsed()
         );
+        assert_eq!(faces.get("S47999"), Some(&"F47999"));
+        assert_eq!(faces.get("Jpan"), Some(&"Yu Mincho"));
         assert_eq!(
-            map.get("+mn-script-S47999").map(String::as_str),
-            Some("F47999")
+            faces.get("Hebr"),
+            None,
+            "conflicting duplicates name no face"
+        );
+
+        let map = parse_theme_colors(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="F"><a:majorFont><a:latin typeface="A"/></a:majorFont><a:minorFont><a:latin typeface="B"/><a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Hebr" typeface="David"/><a:font script="Hebr" typeface="Arial"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
         );
         assert_eq!(
             map.get("+mn-script-Jpan").map(String::as_str),
             Some("Yu Mincho")
         );
-        assert_eq!(
-            map.get("+mn-script-Hebr"),
-            None,
-            "conflicting duplicates name no face"
-        );
+        assert_eq!(map.get("+mn-script-Hebr"), None);
     }
 
     use super::*;
