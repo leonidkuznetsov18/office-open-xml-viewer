@@ -18,18 +18,18 @@ use crate::text::{
     has_any_level_bullet, has_any_level_color, has_any_level_face, has_any_level_indent,
     has_any_level_run_properties, has_any_level_size, merge_level_bullets, merge_level_colors,
     merge_level_faces, merge_level_indents, merge_level_run_properties, merge_level_sizes,
-    paragraph_spacing, read_level_bullets, read_level_colors, read_level_faces,
-    read_level_font_sizes, read_level_indents, read_level_run_properties_with_rels,
-    resolve_latin_face, text_property_color, BuFont, BuMarker, InheritedBodyPr, LevelBullets,
-    LevelColors, LevelFaces, LevelFontSizes, LevelIndents, LevelRunProperties, ParagraphSpacing,
-    HARD_DEFAULT_FONT_SIZE, HARD_DEFAULT_LATIN_FACE,
+    read_level_bullets, read_level_colors, read_level_faces, read_level_font_sizes,
+    read_level_indents, read_level_run_properties_with_rels, resolve_latin_face,
+    text_property_color, InheritedBodyPr, LevelBullets, LevelColors, LevelFaces, LevelFontSizes,
+    LevelIndents, LevelRunProperties, LevelSpacing, DEFAULT_TEXT_STYLE_MAR_L,
+    HARD_DEFAULT_FONT_SIZE,
 };
 use crate::theme::{
     bake_clr_map, parse_theme_part, PptxSchemeResolver, PptxTheme, PptxThemeSource,
 };
 use crate::types::*;
 use crate::{
-    attr, attr_f64, attr_r, build_smartart_drawings, child, find_rel_target_by_type,
+    attr, attr_r, build_smartart_drawings, child, find_rel_target_by_type,
     note_layout_master_parse, parse_preflighted_pptx_xml, parse_rels, read_zip_str, resolve_path,
     PptxZip,
 };
@@ -148,20 +148,16 @@ pub(crate) struct LayoutPlaceholders {
     /// fontAlgn per bound layout slot (idx): the slot's own lvl1pPr value,
     /// else the master value for its type, mirroring `by_idx_alignment`.
     pub(crate) by_idx_font_algn: HashMap<u32, String>,
-    /// Default space-before/after (hundredths of pt) per placeholder idx, from
-    /// the matching layout placeholder's lstStyle. The idx tier prevents one of
-    /// several same-type layout slots from leaking paragraph spacing into its
-    /// siblings (ECMA-376 §19.3.1.36 placeholder matching).
-    pub(crate) by_idx_space_before: HashMap<u32, ParagraphSpacing>,
-    pub(crate) by_idx_space_after: HashMap<u32, ParagraphSpacing>,
-    /// Default space-before (hundredths of pt) per placeholder type, from layout lstStyle
-    pub(crate) by_type_space_before: HashMap<String, ParagraphSpacing>,
-    /// Default space-after (hundredths of pt) per placeholder type, from layout lstStyle
-    pub(crate) by_type_space_after: HashMap<String, ParagraphSpacing>,
-    /// Default space-before from master txStyles (fallback when layout has none)
-    pub(crate) by_type_master_space_before: HashMap<String, ParagraphSpacing>,
-    /// Default space-after from master txStyles (fallback when layout has none)
-    pub(crate) by_type_master_space_after: HashMap<String, ParagraphSpacing>,
+    /// Per-level paragraph spacing (spcBef / spcAft / lnSpc) per placeholder
+    /// idx, from the matching layout placeholder's lstStyle. The idx tier
+    /// prevents one of several same-type layout slots from leaking paragraph
+    /// spacing into its siblings (ECMA-376 §19.3.1.36 placeholder matching).
+    pub(crate) by_idx_spacing: HashMap<u32, LevelSpacing>,
+    /// Per-level paragraph spacing per placeholder type, from layout lstStyle
+    pub(crate) by_type_spacing: HashMap<String, LevelSpacing>,
+    /// Per-level paragraph spacing from the master placeholders and txStyles
+    /// (fallback per level when the layout has none)
+    pub(crate) by_type_master_spacing: HashMap<String, LevelSpacing>,
     /// Stroke per placeholder type from layout spPr > ln
     pub(crate) by_type_stroke: HashMap<String, Stroke>,
     /// Stroke per placeholder idx from layout spPr > ln
@@ -172,17 +168,11 @@ pub(crate) struct LayoutPlaceholders {
     /// components as an ordinary `p:pic`.
     pub(crate) by_type_picture_properties: HashMap<String, PictureShapeProperties>,
     pub(crate) by_idx_picture_properties: HashMap<u32, PictureShapeProperties>,
-    /// Default line spacing (spcPct val, e.g. 90000 = 90%) per placeholder idx, from layout lstStyle
-    pub(crate) by_idx_line_spacing: HashMap<u32, f64>,
-    /// Default line spacing (spcPct val) per placeholder type, from layout lstStyle
-    pub(crate) by_type_line_spacing: HashMap<String, f64>,
     /// Paragraph alignment per placeholder type from master lstStyle > lvl1pPr algn (fallback)
     pub(crate) by_type_master_alignment: HashMap<String, String>,
     /// East Asian line-break per placeholder type from master lstStyle > lvl1pPr
     /// @eaLnBrk (fallback when the layout has none) — ECMA-376 §21.1.2.2.7
     pub(crate) by_type_master_ea_ln_brk: HashMap<String, bool>,
-    /// Default line spacing from master txStyles (fallback when layout has none)
-    pub(crate) by_type_master_line_spacing: HashMap<String, f64>,
     /// Inherited blipFill (data URL + src rect) per placeholder idx from layout spPr
     pub(crate) by_idx_blip_fill: HashMap<u32, InheritedBlipFill>,
     /// Inherited blipFill per placeholder type from layout spPr
@@ -826,68 +816,33 @@ impl LayoutPlaceholders {
             })
     }
 
-    pub(crate) fn lookup_space_before(
-        &self,
-        ph_type: &str,
-        ph_idx: Option<u32>,
-    ) -> Option<ParagraphSpacing> {
+    /// Per-level paragraph spacing for this placeholder: the layout slot (by
+    /// idx when the placeholder has one, else by type), then the master, per
+    /// level and property. An idx with no layout slot takes the txStyles-only
+    /// tier. The layout placeholder itself inherits the master text style for
+    /// its type (ECMA-376 §19.3.1.36 / §19.3.1.51), so an idx-matched slot
+    /// without spacing still yields the master values.
+    pub(crate) fn lookup_spacing(&self, ph_type: &str, ph_idx: Option<u32>) -> LevelSpacing {
         if let Some(i) = ph_idx {
             if !self.by_idx_placeholder_type.contains_key(&i) {
-                return MasterStyleTier::get(&self.styles.space_before, ph_type).cloned();
+                return MasterStyleTier::get(&self.styles.spacing, ph_type)
+                    .cloned()
+                    .unwrap_or_default();
             }
         }
-        let layout = if let Some(idx) = ph_idx {
-            self.by_idx_space_before.get(&idx).copied()
-        } else {
-            self.by_type_space_before.get(ph_type).copied().or_else(|| {
-                if ph_type == "body" {
-                    self.by_type_space_before.get("").copied()
-                } else {
-                    None
-                }
-            })
-        };
-        layout
-            .or_else(|| self.by_type_master_space_before.get(ph_type).copied())
-            .or_else(|| {
-                if ph_type == "body" {
-                    self.by_type_master_space_before.get("").copied()
-                } else {
-                    None
-                }
-            })
-    }
-
-    pub(crate) fn lookup_space_after(
-        &self,
-        ph_type: &str,
-        ph_idx: Option<u32>,
-    ) -> Option<ParagraphSpacing> {
-        if let Some(i) = ph_idx {
-            if !self.by_idx_placeholder_type.contains_key(&i) {
-                return MasterStyleTier::get(&self.styles.space_after, ph_type).cloned();
+        let by_type = |map: &HashMap<String, LevelSpacing>| -> LevelSpacing {
+            let own = map.get(ph_type).cloned().unwrap_or_default();
+            if ph_type == "body" {
+                own.or(&map.get("").cloned().unwrap_or_default())
+            } else {
+                own
             }
-        }
-        let layout = if let Some(idx) = ph_idx {
-            self.by_idx_space_after.get(&idx).copied()
-        } else {
-            self.by_type_space_after.get(ph_type).copied().or_else(|| {
-                if ph_type == "body" {
-                    self.by_type_space_after.get("").copied()
-                } else {
-                    None
-                }
-            })
         };
-        layout
-            .or_else(|| self.by_type_master_space_after.get(ph_type).copied())
-            .or_else(|| {
-                if ph_type == "body" {
-                    self.by_type_master_space_after.get("").copied()
-                } else {
-                    None
-                }
-            })
+        let layout = match ph_idx {
+            Some(idx) => self.by_idx_spacing.get(&idx).cloned().unwrap_or_default(),
+            None => by_type(&self.by_type_spacing),
+        };
+        layout.or(&by_type(&self.by_type_master_spacing))
     }
 
     /// Look up inherited blipFill from the layout placeholder spPr. Used when a slide
@@ -1062,45 +1017,6 @@ impl LayoutPlaceholders {
             }
         })
     }
-
-    /// Look up inherited line spacing (spcPct val, e.g. 90000 = 90%) for this placeholder.
-    /// Idx-strict per ECMA-376 §19.3.1.36 (see `lookup_fill`'s rationale).
-    pub(crate) fn lookup_line_spacing(&self, ph_type: &str, ph_idx: Option<u32>) -> Option<f64> {
-        if let Some(i) = ph_idx {
-            if !self.by_idx_placeholder_type.contains_key(&i) {
-                return MasterStyleTier::get(&self.styles.line_spacing, ph_type).cloned();
-            }
-        }
-        // The layout placeholder itself inherits the master text style for its
-        // type (ECMA-376 §19.3.1.36 / §19.3.1.51), so an idx-matched layout
-        // placeholder without lnSpc still yields the master level-1 value.
-        let master = || {
-            self.by_type_master_line_spacing
-                .get(ph_type)
-                .copied()
-                .or_else(|| {
-                    if ph_type == "body" {
-                        self.by_type_master_line_spacing.get("").copied()
-                    } else {
-                        None
-                    }
-                })
-        };
-        if let Some(i) = ph_idx {
-            return self.by_idx_line_spacing.get(&i).copied().or_else(master);
-        }
-        self.by_type_line_spacing
-            .get(ph_type)
-            .copied()
-            .or_else(|| {
-                if ph_type == "body" {
-                    self.by_type_line_spacing.get("").copied()
-                } else {
-                    None
-                }
-            })
-            .or_else(master)
-    }
 }
 
 /// Parse bodyPr anchor ("t"/"ctr"/"b") from master placeholder shapes.
@@ -1191,15 +1107,14 @@ pub(crate) const BODY_CLASS: &[&str] = &["body", "subTitle", "obj", ""];
 pub(crate) const OTHER_CLASS: &[&str] = &["dt", "ftr", "sldNum"];
 
 /// The class list styles that supply the Latin face and size: `titleStyle` /
-/// `bodyStyle` from the master txStyles and the presentation
-/// `defaultTextStyle` for the other class. A missing element yields no entry;
-/// see the synthesized defaults.
+/// `bodyStyle` from the master's effective txStyles (`effective_tx_styles`)
+/// and the presentation `defaultTextStyle` for the other class.
 pub(crate) fn class_style_nodes<'a, 'i>(
     root: roxmltree::Node<'a, 'i>,
     default_text_style: Option<roxmltree::Node<'a, 'i>>,
 ) -> Vec<(roxmltree::Node<'a, 'i>, &'static [&'static str])> {
     let mut out = Vec::new();
-    if let Some(tx_styles) = child(root, "txStyles") {
+    if let Some(tx_styles) = effective_tx_styles(root) {
         if let Some(n) = child(tx_styles, "titleStyle") {
             out.push((n, TITLE_CLASS));
         }
@@ -1221,7 +1136,7 @@ pub(crate) fn class_style_nodes<'a, 'i>(
 pub(crate) fn tx_style_nodes<'a, 'i>(
     root: roxmltree::Node<'a, 'i>,
 ) -> Vec<(roxmltree::Node<'a, 'i>, &'static [&'static str])> {
-    let Some(tx_styles) = child(root, "txStyles") else {
+    let Some(tx_styles) = effective_tx_styles(root) else {
         return Vec::new();
     };
     [
@@ -1234,16 +1149,62 @@ pub(crate) fn tx_style_nodes<'a, 'i>(
     .collect()
 }
 
-/// CT_SlideMaster makes txStyles optional. For a master without it PowerPoint
-/// applies built-in title and body styles (observed, issue #1435 and #1620):
-/// level-1 title text in the theme major Latin font at 44 pt; level-1 body,
-/// subTitle and obj text in the theme minor Latin font at 28 pt with an Arial
-/// round bullet and an 18 pt hanging gutter. The obj rows were confirmed with
-/// a layout slot that has a txBody (a slot without one is cut off, see
-/// `LayoutPlaceholders::is_list_style_cut`). Deeper levels were not observed
-/// and are not synthesized.
-fn master_without_tx_styles(root: roxmltree::Node<'_, '_>) -> bool {
-    child(root, "txStyles").is_none()
+/// The title and body styles PowerPoint applies to a master without
+/// `p:txStyles`, which CT_SlideMaster makes optional (ECMA-376 §19.3.1.42).
+///
+/// Observed (issues #1435, #1620, #1630; PowerPoint's reference PDF export):
+/// on masters without txStyles - with and without master placeholders, under
+/// two themes - every measured title and body paragraph at levels 1-5 was laid
+/// out exactly like the same text on a master whose txStyles spelled out:
+/// * title level 1: theme major Latin, 44 pt, line spacing 90 %, no space
+///   before, no bullet. Deeper title levels have no entry: they rendered in
+///   Arial 18 pt with single spacing and no indent, the hard defaults;
+/// * body levels 1-5: theme minor Latin at 28 / 24 / 20 / 18 / 18 pt, line
+///   spacing 90 %, space before 10 pt at level 1 and 5 pt below, an Arial
+///   U+2022 bullet, marL 0.25" plus 0.5" per level with a 0.25" hanging
+///   indent.
+///
+/// ctrTitle takes the title style and obj / subTitle / typeless the body style
+/// (`class_style_nodes`). These are the values of PowerPoint's default
+/// template. A supplementary control measured levels 6-9 the same way: body
+/// levels 6-9 continue at marL + 0.5" per level, 18 pt, 90 %, 5 pt before
+/// with the same bullet, and title levels 6-9 stay at the hard defaults; both
+/// laid out identically to a master with the template txStyles spelled out.
+/// No otherStyle is synthesized: no control observed one.
+const BUILT_IN_TX_STYLES: &str = concat!(
+    r#"<p:txStyles xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" "#,
+    r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
+    r#"<p:titleStyle><a:lvl1pPr><a:lnSpc><a:spcPct val="90000"/></a:lnSpc>"#,
+    r#"<a:spcBef><a:spcPct val="0"/></a:spcBef><a:buNone/>"#,
+    r#"<a:defRPr sz="4400"><a:latin typeface="+mj-lt"/></a:defRPr></a:lvl1pPr></p:titleStyle>"#,
+    r#"<p:bodyStyle>"#,
+    r#"<a:lvl1pPr marL="228600" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="1000"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="2800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl1pPr>"#,
+    r#"<a:lvl2pPr marL="685800" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="2400"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl2pPr>"#,
+    r#"<a:lvl3pPr marL="1143000" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="2000"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl3pPr>"#,
+    r#"<a:lvl4pPr marL="1600200" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl4pPr>"#,
+    r#"<a:lvl5pPr marL="2057400" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl5pPr>"#,
+    r#"<a:lvl6pPr marL="2514600" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl6pPr>"#,
+    r#"<a:lvl7pPr marL="2971800" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl7pPr>"#,
+    r#"<a:lvl8pPr marL="3429000" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl8pPr>"#,
+    r#"<a:lvl9pPr marL="3886200" indent="-228600"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl9pPr>"#,
+    r#"</p:bodyStyle></p:txStyles>"#,
+);
+
+static BUILT_IN_TX_STYLES_DOC: std::sync::LazyLock<roxmltree::Document<'static>> =
+    std::sync::LazyLock::new(|| {
+        roxmltree::Document::parse(BUILT_IN_TX_STYLES).expect("built-in txStyles is well-formed")
+    });
+
+/// The master's `p:txStyles`, or `BUILT_IN_TX_STYLES` when it has none.
+pub(crate) fn effective_tx_styles<'a, 'i>(
+    root: roxmltree::Node<'a, 'i>,
+) -> Option<roxmltree::Node<'a, 'i>> {
+    child(root, "txStyles").or_else(|| Some(BUILT_IN_TX_STYLES_DOC.root_element()))
+}
+
+/// A master placeholder's `txBody/lstStyle`.
+fn placeholder_list_style<'a, 'i>(sp: roxmltree::Node<'a, 'i>) -> Option<roxmltree::Node<'a, 'i>> {
+    child(sp, "txBody").and_then(|tb| child(tb, "lstStyle"))
 }
 
 /// A master placeholder's `txBody/lstStyle/lvl1pPr`.
@@ -1421,17 +1382,10 @@ pub(crate) fn parse_master_level_faces_tier(
         }
     }
     inherit_master_placeholder_classes(&mut map);
-    let mut generic: Vec<(LevelFaces, &[&str])> = class_style_nodes(root, default_text_style)
+    let generic: Vec<(LevelFaces, &[&str])> = class_style_nodes(root, default_text_style)
         .into_iter()
         .map(|(style, types)| (read_level_faces(style, theme), types))
         .collect();
-    if master_without_tx_styles(root) {
-        for (token, types) in [("+mj-lt", TITLE_CLASS), ("+mn-lt", BODY_CLASS)] {
-            let mut faces = LevelFaces::default();
-            faces[0] = resolve_latin_face(token, theme);
-            generic.push((faces, types));
-        }
-    }
     for (faces, types) in generic {
         for t in types {
             let merged = merge_level_faces(map.get(*t).unwrap_or(&LevelFaces::default()), &faces);
@@ -1470,17 +1424,10 @@ pub(crate) fn parse_master_level_font_sizes_tier(
         }
     }
     inherit_master_placeholder_classes(&mut map);
-    let mut generic: Vec<(LevelFontSizes, &[&str])> = class_style_nodes(root, default_text_style)
+    let generic: Vec<(LevelFontSizes, &[&str])> = class_style_nodes(root, default_text_style)
         .into_iter()
         .map(|(style, types)| (read_level_font_sizes(style), types))
         .collect();
-    if master_without_tx_styles(root) {
-        for (size, types) in [(44.0, TITLE_CLASS), (28.0, BODY_CLASS)] {
-            let mut sizes: LevelFontSizes = [None; 9];
-            sizes[0] = Some(size);
-            generic.push((sizes, types));
-        }
-    }
     for (sizes, types) in generic {
         for t in types {
             let merged = merge_level_sizes(map.get(*t).unwrap_or(&[None; 9]), &sizes);
@@ -1631,18 +1578,13 @@ pub(crate) fn parse_master_level_indents_tier(
     for (style_node, ph_types) in tx_style_nodes(root) {
         let indents = read_level_indents(style_node);
         if has_any_level_indent(&indents) {
+            // Per level and axis: a master placeholder that indents only
+            // some levels keeps the class style's other levels (§21.1.2.4).
             for ph_type in ph_types {
-                map.entry(ph_type.to_string()).or_insert(indents);
+                map.entry(ph_type.to_string())
+                    .and_modify(|existing| *existing = merge_level_indents(existing, &indents))
+                    .or_insert(indents);
             }
-        }
-    }
-    if master_without_tx_styles(root) {
-        // Built-in body style (see `master_without_tx_styles`).
-        let mut level_one: LevelIndents = Default::default();
-        level_one[0].mar_l = Some(228_600);
-        level_one[0].indent = Some(-228_600);
-        for ph_type in BODY_CLASS {
-            map.entry((*ph_type).to_owned()).or_insert(level_one);
         }
     }
     map
@@ -1705,18 +1647,6 @@ pub(crate) fn parse_master_level_bullets_tier(
                     .and_modify(|existing| *existing = merge_level_bullets(existing, &bullets))
                     .or_insert_with(|| bullets.clone());
             }
-        }
-    }
-    if master_without_tx_styles(root) {
-        // Built-in body style (see `master_without_tx_styles`): a round bullet
-        // drawn in Arial whatever the text face (PowerPoint embedded ArialMT for
-        // the marker beside Calibri text).
-        let mut level_one = empty_level_bullets();
-        level_one[0].marker = Some(BuMarker::Char("•".to_owned()));
-        level_one[0].font = Some(BuFont::Font(HARD_DEFAULT_LATIN_FACE.to_owned()));
-        for ph_type in BODY_CLASS {
-            map.entry((*ph_type).to_owned())
-                .or_insert_with(|| level_one.clone());
         }
     }
     map
@@ -1836,65 +1766,44 @@ pub(crate) fn parse_master_txstyle_color_tier(
     map
 }
 
-/// Parse default paragraph spacing from the class list styles.
-/// Returns (space_before_map, space_after_map, line_spacing_map) keyed by ph_type string.
-/// space_before/after values are in hundredths of a point (same as Paragraph.space_before/after).
-/// line_spacing values are the level-1 `lnSpc/spcPct` val (e.g. 90000 = 90%).
+/// Per-level paragraph spacing (spcBef / spcAft / lnSpc) from the master,
+/// keyed by ph_type: a master placeholder's lstStyle (with the class mapping
+/// of `MASTER_PLACEHOLDER_CLASSES`) wins per level and property over the
+/// txStyles class style.
 pub(crate) fn parse_master_txstyle_spacing(
     root: roxmltree::Node<'_, '_>,
-) -> (
-    HashMap<String, ParagraphSpacing>,
-    HashMap<String, ParagraphSpacing>,
-    HashMap<String, f64>,
-) {
+) -> HashMap<String, LevelSpacing> {
     parse_master_txstyle_spacing_tier(root, true)
 }
 
 pub(crate) fn parse_master_txstyle_spacing_tier(
     root: roxmltree::Node<'_, '_>,
     with_placeholders: bool,
-) -> (
-    HashMap<String, ParagraphSpacing>,
-    HashMap<String, ParagraphSpacing>,
-    HashMap<String, f64>,
-) {
-    let mut before_map: HashMap<String, ParagraphSpacing> = HashMap::new();
-    let mut after_map: HashMap<String, ParagraphSpacing> = HashMap::new();
-    let mut line_map: HashMap<String, f64> = HashMap::new();
-    let mut read = |lvl1: Option<roxmltree::Node<'_, '_>>, types: &[&str]| {
-        let spc_before = lvl1.and_then(|lp| paragraph_spacing(lp, "spcBef"));
-        let spc_after = lvl1.and_then(|lp| paragraph_spacing(lp, "spcAft"));
-        let line = lvl1
-            .and_then(|lp| child(lp, "lnSpc"))
-            .and_then(|ls| child(ls, "spcPct"))
-            .and_then(|s| attr_f64(&s, "val"));
+) -> HashMap<String, LevelSpacing> {
+    let mut map: HashMap<String, LevelSpacing> = HashMap::new();
+    let mut read = |list_style: Option<roxmltree::Node<'_, '_>>, types: &[&str]| {
+        let Some(spacing) = list_style.map(LevelSpacing::read).filter(|s| !s.is_empty()) else {
+            return;
+        };
         for ph_type in types {
-            if let Some(v) = line {
-                line_map.entry(ph_type.to_string()).or_insert(v);
-            }
-            if let Some(v) = spc_before {
-                before_map.entry(ph_type.to_string()).or_insert(v);
-            }
-            if let Some(v) = spc_after {
-                after_map.entry(ph_type.to_string()).or_insert(v);
-            }
+            let entry = map.entry((*ph_type).to_owned()).or_default();
+            *entry = entry.or(&spacing);
         }
     };
     // Master placeholder lstStyle first (with the class mapping), then txStyles.
     let placeholders = master_placeholder_shapes(root, with_placeholders);
-    let lvl1 = master_placeholder_lvl1;
     for (ph_type, sp) in &placeholders {
-        read(lvl1(*sp), &[ph_type.as_str()]);
+        read(placeholder_list_style(*sp), &[ph_type.as_str()]);
     }
     for (source, targets) in MASTER_PLACEHOLDER_CLASSES {
         if let Some((_, sp)) = placeholders.iter().find(|(t, _)| t == source) {
-            read(lvl1(*sp), targets);
+            read(placeholder_list_style(*sp), targets);
         }
     }
     for (style_node, ph_types) in tx_style_nodes(root) {
-        read(child(style_node, "lvl1pPr"), ph_types);
+        read(Some(style_node), ph_types);
     }
-    (before_map, after_map, line_map)
+    map
 }
 
 /// The txStyles-only tier of every list-style map, for a slide placeholder
@@ -1923,9 +1832,7 @@ pub(crate) struct MasterStyleTier {
     /// fontAlgn from the master placeholders' lstStyle, then txStyles: the
     /// master fallback for a layout placeholder (like `master_ea_ln_brk`).
     pub(crate) placeholder_font_algn: HashMap<String, String>,
-    pub(crate) space_before: HashMap<String, ParagraphSpacing>,
-    pub(crate) space_after: HashMap<String, ParagraphSpacing>,
-    pub(crate) line_spacing: HashMap<String, f64>,
+    pub(crate) spacing: HashMap<String, LevelSpacing>,
     pub(crate) color: HashMap<String, String>,
     pub(crate) bold: HashMap<String, bool>,
     pub(crate) italic: HashMap<String, bool>,
@@ -1943,8 +1850,6 @@ impl MasterStyleTier {
         default_text_style: Option<roxmltree::Node<'_, '_>>,
         zip: &mut PptxZip,
     ) -> Self {
-        let (space_before, space_after, line_spacing) =
-            parse_master_txstyle_spacing_tier(root, false);
         let (bold, italic, caps, reflection) =
             parse_master_txstyle_run_properties_tier(root, false);
         MasterStyleTier {
@@ -1964,9 +1869,7 @@ impl MasterStyleTier {
             ea_ln_brk: parse_master_ea_ln_brk_tier(root, false),
             font_algn: parse_master_font_algn_tier(root, false),
             placeholder_font_algn: parse_master_font_algn_tier(root, true),
-            space_before,
-            space_after,
-            line_spacing,
+            spacing: parse_master_txstyle_spacing_tier(root, false),
             color: parse_master_txstyle_color_tier(root, theme, false),
             bold,
             italic,
@@ -1991,24 +1894,34 @@ impl MasterStyleTier {
 pub(crate) struct DefaultTextLevels {
     pub(crate) faces: LevelFaces,
     pub(crate) sizes: LevelFontSizes,
+    /// The marL a plain paragraph takes when nothing in its own cascade sets
+    /// one: the level's marL, else 0 (issue #1628 controls: text boxes whose
+    /// defaultTextStyle level set no marL started at the inset at levels 2
+    /// and 3).
+    pub(crate) mar_l: [i64; 9],
 }
 
 /// Build [`DefaultTextLevels`]. When the presentation has no defaultTextStyle
 /// at all PowerPoint behaves as if every level named the theme minor Latin
-/// font at 18 pt: text boxes at lvl1 and lvl2 rendered in the master's minor
+/// font at 18 pt with marL 0.5" per level: text boxes at lvl1 and lvl2 rendered in the master's minor
 /// font at 18 pt (issue #1620), unlike a present level that omits the face.
 pub(crate) fn parse_default_text_levels(
     default_text_style: Option<roxmltree::Node<'_, '_>>,
     theme: &HashMap<String, String>,
 ) -> DefaultTextLevels {
     match default_text_style {
-        Some(node) => DefaultTextLevels {
-            faces: read_level_faces(node, theme),
-            sizes: read_level_font_sizes(node),
-        },
+        Some(node) => {
+            let indents = read_level_indents(node);
+            DefaultTextLevels {
+                faces: read_level_faces(node, theme),
+                sizes: read_level_font_sizes(node),
+                mar_l: std::array::from_fn(|level| indents[level].mar_l.unwrap_or(0)),
+            }
+        }
         None => DefaultTextLevels {
             faces: std::array::from_fn(|_| resolve_latin_face("+mn-lt", theme)),
             sizes: [Some(HARD_DEFAULT_FONT_SIZE); 9],
+            mar_l: DEFAULT_TEXT_STYLE_MAR_L,
         },
     }
 }
@@ -2057,9 +1970,7 @@ pub(crate) fn parse_layout_placeholders(
     master_transforms: &HashMap<String, Transform>,
     master_alignments: &HashMap<String, String>,
     master_ea_ln_brk: &HashMap<String, bool>,
-    master_space_before: &HashMap<String, ParagraphSpacing>,
-    master_space_after: &HashMap<String, ParagraphSpacing>,
-    master_line_spacing: &HashMap<String, f64>,
+    master_spacing: &HashMap<String, LevelSpacing>,
     theme_source: &(impl PptxThemeSource + ?Sized),
     layout_dir: &str,
     layout_rels: &HashMap<String, String>,
@@ -2080,9 +1991,7 @@ pub(crate) fn parse_layout_placeholders(
         by_type_master_body_pr: master_body_pr.clone(),
         by_type_master_alignment: master_alignments.clone(),
         by_type_master_ea_ln_brk: master_ea_ln_brk.clone(),
-        by_type_master_space_before: master_space_before.clone(),
-        by_type_master_space_after: master_space_after.clone(),
-        by_type_master_line_spacing: master_line_spacing.clone(),
+        by_type_master_spacing: master_spacing.clone(),
         ..Default::default()
     };
 
@@ -2182,13 +2091,10 @@ pub(crate) fn parse_layout_placeholders(
         let layout_font_algn: Option<String> = layout_lvl1_ppr
             .and_then(|lp| attr(&lp, "fontAlgn"))
             .map(|v| v.to_string());
-        let layout_space_before = layout_lvl1_ppr.and_then(|lp| paragraph_spacing(lp, "spcBef"));
-        let layout_space_after = layout_lvl1_ppr.and_then(|lp| paragraph_spacing(lp, "spcAft"));
-        // lnSpc > spcPct val (e.g. 90000 = 90%)
-        let layout_line_spacing: Option<f64> = layout_lvl1_ppr
-            .and_then(|lp| child(lp, "lnSpc"))
-            .and_then(|ls| child(ls, "spcPct"))
-            .and_then(|s| attr_f64(&s, "val"));
+        let layout_spacing = child(sp, "txBody")
+            .and_then(|tb| child(tb, "lstStyle"))
+            .map(LevelSpacing::read)
+            .filter(|spacing| !spacing.is_empty());
 
         let layout_body_pr = child(sp, "txBody").and_then(|tb| child(tb, "bodyPr"));
         // Layout bodyPr anchor; fall back to master anchor map.
@@ -2345,14 +2251,8 @@ pub(crate) fn parse_layout_placeholders(
                         .entry(idx)
                         .or_insert_with(|| layout_picture_properties.clone());
                 }
-                if let Some(ls) = layout_line_spacing {
-                    lph.by_idx_line_spacing.entry(idx).or_insert(ls);
-                }
-                if let Some(v) = layout_space_before {
-                    lph.by_idx_space_before.entry(idx).or_insert(v);
-                }
-                if let Some(v) = layout_space_after {
-                    lph.by_idx_space_after.entry(idx).or_insert(v);
+                if let Some(v) = layout_spacing.clone() {
+                    lph.by_idx_spacing.entry(idx).or_insert(v);
                 }
                 if !effective_body_pr.is_empty() {
                     lph.by_idx_body_pr
@@ -2484,16 +2384,10 @@ pub(crate) fn parse_layout_placeholders(
             if let Some(f) = layout_font_algn.clone() {
                 lph.by_type_font_algn.entry(ph_type.clone()).or_insert(f);
             }
-            if let Some(v) = layout_space_before {
-                lph.by_type_space_before.entry(ph_type.clone()).or_insert(v);
-            }
-            if let Some(v) = layout_space_after {
-                lph.by_type_space_after.entry(ph_type.clone()).or_insert(v);
-            }
-            if let Some(ls) = layout_line_spacing {
-                lph.by_type_line_spacing
-                    .entry(ph_type.clone())
-                    .or_insert(ls);
+            if let Some(v) = layout_spacing {
+                // Per level and property, the first same-type slot that sets it.
+                let entry = lph.by_type_spacing.entry(ph_type.clone()).or_default();
+                *entry = entry.or(&v);
             }
             if !effective_body_pr.is_empty() {
                 // Per field, the first same-type layout placeholder that sets it.
@@ -2667,9 +2561,7 @@ pub(crate) fn parse_layout(
     master_transforms: &HashMap<String, Transform>,
     master_alignments: &HashMap<String, String>,
     master_ea_ln_brk: &HashMap<String, bool>,
-    master_space_before: &HashMap<String, ParagraphSpacing>,
-    master_space_after: &HashMap<String, ParagraphSpacing>,
-    master_line_spacing: &HashMap<String, f64>,
+    master_spacing: &HashMap<String, LevelSpacing>,
     theme_source: &(impl PptxThemeSource + ?Sized),
     layout_dir: &str,
     layout_rels: &HashMap<String, String>,
@@ -2699,9 +2591,7 @@ pub(crate) fn parse_layout(
         master_transforms,
         master_alignments,
         master_ea_ln_brk,
-        master_space_before,
-        master_space_after,
-        master_line_spacing,
+        master_spacing,
         theme_source,
         layout_dir,
         layout_rels,
@@ -2771,9 +2661,7 @@ pub(crate) struct ParsedMaster {
     pub(crate) master_transforms: HashMap<String, Transform>,
     pub(crate) master_alignments: HashMap<String, String>,
     pub(crate) master_ea_ln_brk: HashMap<String, bool>,
-    pub(crate) master_space_before: HashMap<String, ParagraphSpacing>,
-    pub(crate) master_space_after: HashMap<String, ParagraphSpacing>,
-    pub(crate) master_line_spacing: HashMap<String, f64>,
+    pub(crate) master_spacing: HashMap<String, LevelSpacing>,
     pub(crate) master_bold: HashMap<String, bool>,
     pub(crate) master_italic: HashMap<String, bool>,
     pub(crate) master_caps: HashMap<String, String>,
@@ -2925,7 +2813,7 @@ pub(crate) fn build_master_bundle(
         .map(|root| parse_master_alignments(root))
         .unwrap_or_default();
     let master_ea_ln_brk = master_root.map(parse_master_ea_ln_brk).unwrap_or_default();
-    let (master_space_before, master_space_after, master_line_spacing) = master_root
+    let master_spacing = master_root
         .map(|root| parse_master_txstyle_spacing(root))
         .unwrap_or_default();
     let (master_bold, master_italic, master_caps, master_reflection) = master_root
@@ -2975,9 +2863,7 @@ pub(crate) fn build_master_bundle(
         master_transforms,
         master_alignments,
         master_ea_ln_brk,
-        master_space_before,
-        master_space_after,
-        master_line_spacing,
+        master_spacing,
         master_bold,
         master_italic,
         master_caps,
@@ -2990,7 +2876,7 @@ pub(crate) fn build_master_bundle(
 mod placeholder_geometry_tests {
     use super::*;
     use crate::shape::parse_shape;
-    use crate::text::{BuMarker, BulletProps};
+    use crate::text::{BuMarker, BulletProps, ParagraphSpacing};
     use std::io::Cursor;
 
     fn empty_zip() -> PptxZip {
@@ -3048,8 +2934,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -3094,9 +2978,7 @@ mod placeholder_geometry_tests {
             &HashMap::<String, Transform>::new(),
             &HashMap::<String, String>::new(),
             &HashMap::<String, bool>::new(),
-            &HashMap::<String, ParagraphSpacing>::new(),
-            &HashMap::<String, ParagraphSpacing>::new(),
-            &HashMap::<String, f64>::new(),
+            &HashMap::<String, LevelSpacing>::new(),
             &HashMap::new(),
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -3136,8 +3018,9 @@ mod placeholder_geometry_tests {
     /// distinguishes title, body/subtitle, and object placeholders. These are
     /// application defaults, not fabricated defaults for ordinary text boxes.
     /// ECMA-376 §19.3.1.51 txStyles: a placeholder without its own or a layout
-    /// lnSpc inherits the master level-1 lnSpc for its type. An idx-matched
-    /// layout placeholder without lnSpc also falls through to the master.
+    /// lnSpc inherits the master lnSpc of its type, level by level. An
+    /// idx-matched layout placeholder without lnSpc also falls through to the
+    /// master, and a level the layout does not set keeps the master's value.
     #[test]
     fn master_tx_styles_line_spacing_is_inherited() {
         let xml = r#"<p:sldMaster
@@ -3146,48 +3029,99 @@ mod placeholder_geometry_tests {
           <p:cSld><p:spTree/></p:cSld>
           <p:txStyles>
             <p:titleStyle><a:lvl1pPr><a:lnSpc><a:spcPct val="85000"/></a:lnSpc></a:lvl1pPr></p:titleStyle>
-            <p:bodyStyle><a:lvl1pPr><a:lnSpc><a:spcPct val="90000"/></a:lnSpc></a:lvl1pPr></p:bodyStyle>
+            <p:bodyStyle><a:lvl1pPr><a:lnSpc><a:spcPct val="90000"/></a:lnSpc></a:lvl1pPr>
+              <a:lvl2pPr><a:lnSpc><a:spcPct val="80000"/></a:lnSpc><a:spcBef><a:spcPts val="500"/></a:spcBef></a:lvl2pPr></p:bodyStyle>
           </p:txStyles>
         </p:sldMaster>"#;
+        let pct = |val: f64| Some(ooxml_common::text::SpaceLine::Pct { val });
         let doc = roxmltree::Document::parse(xml).unwrap();
-        let (_, _, lines) = parse_master_txstyle_spacing(doc.root_element());
-        assert_eq!(lines.get("title"), Some(&85000.0));
-        assert_eq!(lines.get("body"), Some(&90000.0));
-        assert_eq!(lines.get("obj"), Some(&90000.0));
-        assert_eq!(lines.get("dt"), None);
+        let spacing = parse_master_txstyle_spacing(doc.root_element());
+        assert_eq!(spacing["title"].line[0], pct(85000.0));
+        // The title style sets level 1 only; level 2 is not borrowed from it.
+        assert_eq!(spacing["title"].line[1], None);
+        assert_eq!(spacing["body"].line[..2], [pct(90000.0), pct(80000.0)]);
+        assert_eq!(
+            spacing["body"].before[1],
+            Some(ParagraphSpacing::Points(500))
+        );
+        assert_eq!(spacing["obj"].line[0], pct(90000.0));
+        assert!(!spacing.contains_key("dt"));
 
         // idx 11 and 12 are bound layout slots; an unmatched idx reads the
         // txStyles-only tier.
+        let mut layout_12 = LevelSpacing::default();
+        layout_12.line[0] = pct(120000.0);
         let placeholders = LayoutPlaceholders {
             by_idx_placeholder_type: HashMap::from([
                 (11, "body".to_owned()),
                 (12, "body".to_owned()),
             ]),
-            by_idx_line_spacing: HashMap::from([(12, 120000.0)]),
-            by_type_master_line_spacing: lines.clone(),
+            by_idx_spacing: HashMap::from([(12, layout_12)]),
+            by_type_master_spacing: spacing.clone(),
             styles: MasterStyleTier {
-                line_spacing: lines,
+                spacing,
                 ..Default::default()
             },
             ..LayoutPlaceholders::default()
         };
         assert_eq!(
-            placeholders.lookup_line_spacing("body", Some(40)),
-            Some(90000.0)
+            placeholders.lookup_spacing("body", Some(40)).line[0],
+            pct(90000.0)
         );
         assert_eq!(
-            placeholders.lookup_line_spacing("body", Some(11)),
-            Some(90000.0)
+            placeholders.lookup_spacing("body", Some(11)).line[0],
+            pct(90000.0)
         );
+        let slot_12 = placeholders.lookup_spacing("body", Some(12));
+        assert_eq!(slot_12.line[..2], [pct(120000.0), pct(80000.0)]);
         assert_eq!(
-            placeholders.lookup_line_spacing("body", Some(12)),
-            Some(120000.0)
+            placeholders.lookup_spacing("title", None).line[0],
+            pct(85000.0)
         );
+        assert!(placeholders.lookup_spacing("dt", Some(3)).is_empty());
+    }
+
+    /// Review regression (#1630): list-level indents and spacing merge per
+    /// level and per axis. A master placeholder that indents only level 1 keeps
+    /// the built-in body style's other levels, and an authored point value
+    /// (`spcPts`) of lnSpc / spcBef / spcAft survives the cascade.
+    #[test]
+    fn partial_master_list_levels_merge_per_level_and_axis() {
+        use ooxml_common::text::SpaceLine;
+        let xml = r#"<p:sldMaster
+          xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:cSld><p:spTree>
+            <p:sp><p:nvSpPr><p:cNvPr id="3" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+              <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle>
+                <a:lvl1pPr marL="342900"><a:spcAft><a:spcPct val="20000"/></a:spcAft></a:lvl1pPr>
+                <a:lvl3pPr><a:lnSpc><a:spcPts val="3000"/></a:lnSpc><a:spcBef><a:spcPts val="700"/></a:spcBef></a:lvl3pPr>
+              </a:lstStyle><a:p/></p:txBody></p:sp>
+          </p:spTree></p:cSld>
+        </p:sldMaster>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let indents = parse_master_level_indents(doc.root_element());
+        let body = indents["body"];
+        // Level 1: marL from the placeholder, indent from the built-in style.
         assert_eq!(
-            placeholders.lookup_line_spacing("title", None),
-            Some(85000.0)
+            (body[0].mar_l, body[0].indent),
+            (Some(342_900), Some(-228_600))
         );
-        assert_eq!(placeholders.lookup_line_spacing("dt", Some(3)), None);
+        // Level 3 untouched by the placeholder: the built-in (90 pt, -18 pt).
+        assert_eq!(
+            (body[2].mar_l, body[2].indent),
+            (Some(1_143_000), Some(-228_600))
+        );
+
+        let spacing = parse_master_txstyle_spacing(doc.root_element());
+        let body = &spacing["body"];
+        assert_eq!(body.line[2], Some(SpaceLine::Pts { val: 30.0 }));
+        assert_eq!(body.before[2], Some(ParagraphSpacing::Points(700)));
+        assert_eq!(body.after[0], Some(ParagraphSpacing::Percent(20000.0)));
+        // Unset properties keep the built-in values per level.
+        assert_eq!(body.line[0], Some(SpaceLine::Pct { val: 90000.0 }));
+        assert_eq!(body.before[0], Some(ParagraphSpacing::Points(1000)));
+        assert_eq!(body.line[1], Some(SpaceLine::Pct { val: 90000.0 }));
     }
 
     const PML_A: &str = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
@@ -3283,8 +3217,6 @@ mod placeholder_geometry_tests {
                 "ppt/slideMasters",
                 &mut zip,
             ),
-            &HashMap::new(),
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -3513,9 +3445,36 @@ mod placeholder_geometry_tests {
                 other => panic!("expected the built-in body bullet, got {other:?}"),
             }
         }
-        // Deeper levels were not observed and stay unstyled.
-        assert_eq!(sizes["body"][1], None);
-        assert_eq!(faces["body"][1], None);
+        // Body levels 2-9 (#1630 controls, levels 1-5 and 6-9): 24 / 20 / 18 pt
+        // and 18 pt below, marL + 0.5" per level, the same hanging Arial
+        // bullet, theme minor face.
+        for (level, size) in [
+            (1, 24.0),
+            (2, 20.0),
+            (3, 18.0),
+            (4, 18.0),
+            (5, 18.0),
+            (8, 18.0),
+        ] {
+            assert_eq!(sizes["body"][level], Some(size));
+            assert_eq!(faces["body"][level].as_deref(), Some("Calibri"));
+            assert_eq!(
+                indents["body"][level].mar_l,
+                Some(228_600 + 457_200 * level as i64)
+            );
+            assert_eq!(indents["body"][level].indent, Some(-228_600));
+            assert!(matches!(
+                bullets["body"][level].resolve(),
+                Bullet::Char { .. }
+            ));
+        }
+        // The title style has level 1 only; deeper title levels end at the
+        // hard defaults (Arial 18 pt, no indent).
+        assert_eq!(sizes["title"][1], None);
+        assert_eq!(faces["title"][1], None);
+        assert!(indents
+            .get("title")
+            .is_none_or(|levels| levels[1].mar_l.is_none()));
         assert!(!sizes.contains_key("dt"));
     }
 
@@ -3607,8 +3566,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -3690,8 +3647,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &parse_master_ea_ln_brk(root),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             &theme,
             "ppt/slideLayouts",
             &HashMap::new(),
@@ -3752,8 +3707,6 @@ mod placeholder_geometry_tests {
             &parse_master_level_font_sizes(root, dts),
             &HashMap::new(),
             &parse_master_level_run_properties(root, &theme, &HashMap::new(), "ppt/slideMasters"),
-            &HashMap::new(),
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -3842,6 +3795,33 @@ mod placeholder_geometry_tests {
             "a present level without latin is not the theme minor"
         );
         assert_eq!(present.sizes[1], Some(20.0));
+
+        // #1620 (no defaultTextStyle): a level-2 text box paragraph started
+        // 0.5" in. #1628: a present level that sets no marL starts at 0.
+        assert_eq!(absent.mar_l, DEFAULT_TEXT_STYLE_MAR_L);
+        assert_eq!(present.mar_l, [0; 9]);
+    }
+
+    /// #1630 / #1628: a plain paragraph whose cascade sets no marL starts at
+    /// the inset in a placeholder (title levels 2-5) and at its
+    /// defaultTextStyle level's marL in ordinary text.
+    #[test]
+    fn plain_paragraph_implicit_indent_follows_its_default_list_style() {
+        let paragraph = |shape: &str, placeholders: &LayoutPlaceholders| {
+            let shape = parse_slide_shape(shape, placeholders);
+            shape.text_body.unwrap().paragraphs[0].mar_l
+        };
+        let title = r#"<p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+            <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:pPr lvl="1"/><a:r><a:t>x</a:t></a:r></a:p></p:txBody>"#;
+        let text_box = r#"<p:nvSpPr><p:cNvPr id="3" name="TextBox"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+            <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm></p:spPr>
+            <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:pPr lvl="2"/><a:r><a:t>x</a:t></a:r></a:p></p:txBody>"#;
+        let mut placeholders = LayoutPlaceholders::default();
+        placeholders.default_text.mar_l = DEFAULT_TEXT_STYLE_MAR_L;
+        assert_eq!(paragraph(title, &placeholders), 0);
+        assert_eq!(paragraph(text_box, &placeholders), 914_400);
+        placeholders.default_text.mar_l = [0; 9];
+        assert_eq!(paragraph(text_box, &placeholders), 0);
     }
 
     #[test]
@@ -3998,8 +3978,6 @@ mod placeholder_geometry_tests {
             &MasterLevelRunProperties::default(),
             &HashMap::new(),
             &master_bullets,
-            &HashMap::new(),
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -4177,8 +4155,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             "ppt/slideLayouts",
             &HashMap::new(),
             &mut zip,
@@ -4305,8 +4281,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
             "ppt/slideLayouts",
             &HashMap::new(),
             &mut zip,
@@ -4366,8 +4340,6 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &MasterLevelRunProperties::default(),
-            &HashMap::new(),
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -4479,8 +4451,6 @@ mod placeholder_geometry_tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &master_body_pr,
-                &HashMap::new(),
-                &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),

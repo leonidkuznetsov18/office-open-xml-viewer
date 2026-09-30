@@ -323,9 +323,8 @@ fn append_point_paragraphs(
         None,
         None,
         None, // inherited_font_algn
-        None,
-        None,
-        None,
+        Default::default(),
+        crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
         zip,
     );
     if default_font_size.is_none() {
