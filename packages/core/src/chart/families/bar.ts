@@ -47,6 +47,7 @@ import {
 import { resolveChartExLabel } from '../chart-ex-label.js';
 import {
   chartDataPointStyleRole,
+  chartModelIsChartEx,
   chartSeriesVariesByPoint,
   rawLinkedChartStyleRole,
 } from '../effective-style.js';
@@ -286,10 +287,10 @@ export function renderBarChart(
   );
   // The shared classic-style adapter intentionally exposes effective roles in
   // the historical `chartex*Style` fields. Do not use those aliases as a file-
-  // format discriminator: only a true ChartEx model lacks the classic numeric
-  // role table. Otherwise a classic bar+line combo would drop every non-bar
-  // legend entry by entering the ChartEx synthetic-series path.
-  const isChartExColumn = chart.classicChartStyleRoles == null
+  // format discriminator: the ChartEx chart type (or a ChartEx delegate) is.
+  // Otherwise a classic bar+line combo would drop every non-bar legend entry
+  // by entering the ChartEx synthetic-series path.
+  const isChartExColumn = chartModelIsChartEx(chart)
     && (chart.chartexDataPointStyle != null || chart.chartexColorPalette != null);
   const styledBarLegendSeries = new Map<ChartSeries, ChartSeries>();
   if (isChartExColumn) {
