@@ -26,7 +26,7 @@ import { layoutFingerprint } from './invariants.js';
 import { normalizeLayoutOptions } from './options.js';
 import { PaginationAbortError } from './pagination-scheduler.js';
 import { layoutDocumentProgressively, type ProgressiveLayoutPreview } from './progressive.js';
-import type { DocumentLayout, LayoutPage } from './types.js';
+import type { DocumentLayout, LayoutPage, LayoutRect } from './types.js';
 
 // Page-owned anchors (§20.4.3.5 positionV relativeFrom="margin") and
 // page-positioned floating tables (§17.4.57 tblpPr vertAnchor="page") are
@@ -205,6 +205,26 @@ function expectPublishedPagesFinal(
   }
 }
 
+/** No body text line overlaps a body table, and no two body tables overlap. */
+function expectNoTableOverlap(layout: DocumentLayout): void {
+  const overlaps = (a: LayoutRect, b: LayoutRect) => (
+    a.xPt < b.xPt + b.widthPt - 0.01 && b.xPt < a.xPt + a.widthPt - 0.01
+    && a.yPt < b.yPt + b.heightPt - 0.01 && b.yPt < a.yPt + a.heightPt - 0.01
+  );
+  for (const page of layout.pages) {
+    const tables = page.layers.body.filter((node) => node.kind === 'table');
+    const lines = page.layers.body.flatMap((node) => node.kind === 'paragraph' ? node.lines : []);
+    tables.forEach((table, index) => {
+      for (const other of tables.slice(index + 1)) {
+        expect(overlaps(table.flowBounds, other.flowBounds), `page ${page.pageIndex} tables`).toBe(false);
+      }
+      for (const text of lines) {
+        expect(overlaps(table.flowBounds, text.bounds), `page ${page.pageIndex} text`).toBe(false);
+      }
+    });
+  }
+}
+
 // Line 60 sits on page 2 in source order. The first pass prescans its image
 // on pages 0-2, the second applies it on the page it reached, and the third
 // confirms the moved destination.
@@ -330,6 +350,62 @@ describe('progressive layout with page-owned anchors', () => {
       previous = layout;
     }
   }, 300_000);
+
+  it('admits coupled page-anchored tables in source order (review repro)', async () => {
+    // Exact 24 pt lines; every table fits the text area. Re-registering every
+    // observed destination at once alternated (T1, T2, T3) = (0, 1, 2) and
+    // (absent, 4, 5): T1's own exclusion pushed its source to page 1, where
+    // T2's stale registration collided with it.
+    const model = documentModel(33, [
+      [13, pageFloatingTable(468, 72, 1, 360, 0)],
+      [15, pageFloatingTable(468, 72, 1, 600, 0)],
+      [33, pageFloatingTable(300, 72, 1, 600, 0)],
+    ]);
+    const { layout, passes: count } = blockingLayout(model);
+    // T1 is tried on page 0, displaces its own source and moves to page 1
+    // (Word source-boundary control C06); T2 and T3 then follow on fresh pages.
+    expect([13, 15, 33].map((index) => tablePages(layout, index).placedPage)).toEqual([1, 2, 3]);
+    expect(count).toBeLessThanOrEqual(1 + 5 * 3);
+    expectNoTableOverlap(layout);
+    const { previews, final } = await progressiveRun(model);
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(layout));
+    expectPublishedPagesFinal(previews, final);
+  }, 300_000);
+
+  it('terminates within its bound for random page/margin table sequences', () => {
+    // Property: random interleavings of paragraphs and page- or
+    // margin-anchored floating tables (heights up to the page body, varied
+    // tblpY and wrap distances) settle within 1 + 5T passes for T tables,
+    // never overlap text or each other, and are deterministic.
+    let seed = 0x1659;
+    const pick = <T>(values: readonly T[]): T => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return values[(seed >>> 8) % values.length]!;
+    };
+    for (let sample = 0; sample < 40; sample += 1) {
+      const body: BodyElement[] = [];
+      const tables = pick([1, 2, 3, 4, 5]);
+      for (let table = 0; table < tables; table += 1) {
+        body.push(...Array.from({ length: pick([0, 3, 12, 20, 25, 26, 27, 30]) }, () => line()));
+        const distance = pick([0, 9, 18]);
+        const floating = pageFloatingTable(
+          pick([150, 300, 468, 524]), pick([0, 36, 72, 144, 400]), 1,
+          pick([24, 120, 360, 600, 647, 648]), distance,
+        ) as BodyElement & { tblpPr: Record<string, unknown> };
+        Object.assign(floating.tblpPr, {
+          vertAnchor: pick(['page', 'margin']),
+          leftFromText: distance, rightFromText: distance, bottomFromText: distance,
+        });
+        body.push(floating);
+      }
+      body.push(line(), line());
+      const model = { ...documentModel(0, []), body };
+      const first = blockingLayout(model);
+      expect(first.passes).toBeLessThanOrEqual(1 + 5 * tables);
+      expectNoTableOverlap(first.layout);
+      expect(layoutFingerprint(blockingLayout(model).layout)).toBe(layoutFingerprint(first.layout));
+    }
+  }, 600_000);
 
   it('emits no stale page when cancelled during convergence', async () => {
     const model = anchoredImageModel();

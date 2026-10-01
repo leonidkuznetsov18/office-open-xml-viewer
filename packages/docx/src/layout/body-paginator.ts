@@ -927,6 +927,10 @@ function* paginateBodyPassSteps(
   balancePlan: BodyBalancePlan,
   observer?: BodyPaginationPassObserver,
   anchorLineDeferrals: AnchorLineDeferrals | null = null,
+  /** Defensive fallback only (see `paginateBodyWithAnchorConvergenceSteps`):
+   * from this page on, a page-owned table starts a page holding no earlier
+   * content, so no unverified registration is needed for it. */
+  freshPageTablesFrom: number | null = null,
 ): PaginationSteps<BodyPaginationPassResult> {
   const kernel = bodyLayoutKernelOf(services);
   if (!kernel) throw new Error('Body layout kernel is not attached to the supplied services');
@@ -1717,6 +1721,14 @@ function* paginateBodyPassSteps(
               entryIndex,
             );
           }
+        }
+        if (freshPageTablesFrom !== null && block.pageOwnedFloatingTable === true
+          && state.flow.pageIndex >= freshPageTablesFrom
+          && (state.pages.at(-1)?.accumulator.readingOrder.length ?? 0) > 0) {
+          commitTransition(
+            advanceToPage(state.flow, state.flow.section, 'overflow'),
+            entryIndex,
+          );
         }
       }
       let cursor: import('./body-layout-kernel.js').BodyTableContinuationCursor | undefined;
@@ -2733,15 +2745,18 @@ function firstHostCarryPage(layout: DocumentLayout): number {
  * may prove new deferrals for page N, only where a drawing registered on N
  * did not land on N. Pass k's prescan of N then already disagrees with the
  * observed plan (the drawing is observed later, or not yet placed), so both
- * only affect pages at or after a disagreement. Each read can be predicted
+ * only affect pages at or after a disagreement. Likewise
+ * `resolvePageOwnedTables` changes table registrations only on the earliest
+ * page whose prescanned tables disagree with the observed ones, and later. Each read can be predicted
  * from closed pages of pass k:
  *
  * - A prescan of page p reads the plan's destinations on (p, flow domain). Once
  *   p is closed, pass k's observed destinations there are final, and the read
  *   agrees iff they equal what pass k prescanned.
  * - A page-owned table floor read at page r changes the flow only when the
- *   floor exceeds r. The next floor is absent, carried, or proven from a table
- *   whose destination changed. The read agrees in every later pass iff the
+ *   floor exceeds r. Floors are carried unchanged except that the table
+ *   frontier (`resolvePageOwnedTables`) may raise its candidate's floor, and
+ *   the candidate's registration already disagrees there. The read agrees in every later pass iff the
  *   current floor does not exceed r, the table's destination is unchanged,
  *   and that destination lies on a page that itself stays final. A table
  *   reached before the bound but placed at or after it could still move, and
@@ -2821,9 +2836,10 @@ function anchorCarryIdentity(
   plan: ReadonlyMap<string, unknown>,
   deferrals: AnchorLineDeferrals,
   minimumTablePageBySource: ReadonlyMap<string, number>,
+  tableFrontier: TableFrontier | null,
 ): string {
   return `${anchorPlanIdentity(plan)}\u0004${anchorLineDeferralsIdentity(deferrals)}\u0004${
-    anchorPlanIdentity(minimumTablePageBySource)}`;
+    anchorPlanIdentity(minimumTablePageBySource)}\u0004${JSON.stringify(tableFrontier)}`;
 }
 
 /**
@@ -2919,95 +2935,220 @@ function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
   return JSON.stringify([...plan].sort(([left], [right]) => left.localeCompare(right)));
 }
 
-/** Earliest changed registration, excluding one table's own registration.
- * A plan entry is read on both its old and its new page (including geometry
- * changes on the same page). Two minima suffice; do not rescan the whole plan
- * per table. Missing entries count as changes too. */
-function changedAnchorReadPages(
-  applied: ReadonlyMap<string, PageWrapDestination>,
-  next: ReadonlyMap<string, PageWrapDestination>,
-): (except: string) => number {
-  let firstKey: string | undefined;
-  let first = Number.POSITIVE_INFINITY;
-  let second = Number.POSITIVE_INFINITY;
-  const keys = new Set([...applied.keys(), ...next.keys()]);
-  for (const key of keys) {
-    const before = applied.get(key);
-    const after = next.get(key);
-    if (JSON.stringify(before) === JSON.stringify(after)) continue;
-    const page = Math.min(before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
-    if (page < first) {
-      second = first;
-      first = page;
-      firstKey = key;
-    } else {
-      second = Math.min(second, page);
-    }
+/**
+ * Sequential admission state of the earliest page whose page-owned table
+ * registrations disagree with the tables that landed there (the frontier).
+ * `accepted` were admitted on that page in source order; `candidate` is the one
+ * table the applied plan trials after them.
+ */
+type TableFrontier = Readonly<{
+  pageIndex: number;
+  accepted: readonly string[];
+  candidate: string | null;
+  geometryRetries: number;
+}>;
+
+/** Body-level page-owned floating tables in source order (static: the order
+ * never depends on layout). */
+function pageOwnedTableOrder(input: BodyLayoutInput): ReadonlyMap<string, number> {
+  const order = new Map<string, number>();
+  for (const entry of input.sequence) {
+    if (entry.kind !== 'body-block' || entry.block.kind !== 'table'
+      || entry.block.pageOwnedFloatingTable !== true) continue;
+    order.set(`table:${sourceKey(entry.block.source)}`, order.size);
   }
-  return (except) => except === firstKey ? second : first;
+  return order;
 }
 
-/**
- * Preserve/prove table floors against the next pass's complete earlier reads,
- * rather than requiring every destination in the document to stay unchanged.
- * ECMA-376 §17.4.57 supplies the page-owned exclusion; the existing candidate
- * rule retries p+1 when registering a table on p sends its source beyond p.
- * This changes acquisition convergence, not the table's authored placement.
- *
- * Termination invariant for these table tests: a rejected candidate p stays
- * rejected while all other carry reads through p stay identical. Later source
- * content cannot enter that prefix, because the floor sends the table and all
- * following flow beyond p. With a settled earlier prefix a table's floor only
- * increases; once the table is admitted, later independent destinations cannot
- * revoke it. Induct on the earliest disagreeing registration, not on whole-
- * document equality. Earlier changes invalidate suffix proofs before reuse.
- * The operational pass guard still fails closed for unresolved anchor coupling;
- * it is a resource bound, not an alternate placement or a convergence proof.
- */
-function nextTablePageFloors(
-  events: readonly PageAnchorInputEvent[],
+function floatingTableEntries(
+  plan: ReadonlyMap<string, PageWrapDestination> | null,
+): Map<string, Extract<PageWrapDestination, { kind: 'floating-table' }>> {
+  const tables = new Map<string, Extract<PageWrapDestination, { kind: 'floating-table' }>>();
+  for (const [key, destination] of plan ?? []) {
+    if (destination.kind === 'floating-table') tables.set(key, destination);
+  }
+  return tables;
+}
+
+function tablesOnPage(
+  tables: ReadonlyMap<string, Extract<PageWrapDestination, { kind: 'floating-table' }>>,
+  pageIndex: number,
+): Map<string, Extract<PageWrapDestination, { kind: 'floating-table' }>> {
+  return new Map([...tables].filter(([, destination]) => destination.pageIndex === pageIndex));
+}
+
+/** Earliest page on which a drawing (or host carry) registration or an
+ * anchor-line deferral differs between the applied and the next carry. */
+function drawingReadChangePage(
   applied: ReadonlyMap<string, PageWrapDestination> | null,
   next: ReadonlyMap<string, PageWrapDestination>,
   previousDeferrals: AnchorLineDeferrals,
   nextDeferrals: AnchorLineDeferrals,
-): ReadonlyMap<string, number> {
-  const floors = new Map<string, number>();
-  if (applied === null) return floors;
-  const otherRegistrationChangedAt = changedAnchorReadPages(applied, next);
-  let deferralChangedAt = Number.POSITIVE_INFINITY;
+): number {
+  let changedAt = Number.POSITIVE_INFINITY;
+  for (const key of new Set([...applied?.keys() ?? [], ...next.keys()])) {
+    const before = applied?.get(key);
+    const after = next.get(key);
+    if (before?.kind === 'floating-table' || after?.kind === 'floating-table') continue;
+    if (JSON.stringify(before) === JSON.stringify(after)) continue;
+    changedAt = Math.min(changedAt, before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
+  }
   for (const key of new Set([...previousDeferrals.keys(), ...nextDeferrals.keys()])) {
     const before = previousDeferrals.get(key);
     const after = nextDeferrals.get(key);
     if (before?.identity !== after?.identity) {
-      deferralChangedAt = Math.min(deferralChangedAt,
-        before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
+      changedAt = Math.min(changedAt, before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
     }
   }
-  let earlierFloorChangedAt = Number.POSITIVE_INFINITY;
-  // Events are in acquisition order. A later table cannot read its floor before
-  // this table: any effective floor advances the flow before that later read.
-  for (const event of events) {
-    if (event.kind !== 'page-owned-table') continue;
-    const prior = applied.get(event.key);
-    const destination = next.get(event.key);
-    const changedAt = Math.min(otherRegistrationChangedAt(event.key),
-      deferralChangedAt, earlierFloorChangedAt);
-    let floor: number | undefined;
-    if (prior?.kind === 'floating-table' && destination?.kind === 'floating-table') {
-      // A floor f proves only pages below f; changes on f need not revoke it.
-      if (event.floor !== undefined && changedAt >= event.floor) floor = event.floor;
-      // Only this table's registration may differ through candidate page p.
-      // Later-page changes cannot undo this failed-candidate observation.
-      if (destination.pageIndex > prior.pageIndex && changedAt > prior.pageIndex) {
-        floor = Math.max(floor ?? 0, prior.pageIndex + 1);
-      }
-    }
-    if (floor !== undefined) floors.set(event.key, floor);
-    if (floor !== event.floor) {
-      earlierFloorChangedAt = Math.min(earlierFloorChangedAt, event.pageIndex);
-    }
+  return changedAt;
+}
+
+/** Raised when a pass contradicts the admission invariant below. It is a
+ * defensive assertion: the convergence run then publishes its fresh-page
+ * fallback instead of a layout that could overlap. */
+class TableAdmissionInvariantError extends Error {
+  constructor(readonly pageIndex: number) {
+    super(`Page-owned table admission on page ${pageIndex} lost source order`);
   }
-  return floors;
+}
+
+/**
+ * Page-owned floating table admission (§17.4.57 tblpPr vertAnchor="page" or
+ * "margin"; the issue #1659 fixed point).
+ *
+ * A pass registers each planned table on its planned page before laying that
+ * page out, so text that precedes the table's source on the page wraps around
+ * it. The table itself is acquired where its source lands. A consistent pass
+ * is one in which, on every page, the registered tables are exactly the
+ * tables that landed there with the registered geometry. Re-registering every
+ * observed table at once (the previous construction) is not monotone: a
+ * table's own registration can push its source off its page and later tables'
+ * stale registrations can collide with it, so destination plans can alternate.
+ *
+ * Instead the tables are admitted like Word lays out pages: in page order and,
+ * on one page, in source order. Let N be the earliest page whose registrations
+ * disagree with its landed tables (the frontier). Pages before N agree, and a
+ * pass is a deterministic function of its carry reads, so the next pass
+ * reproduces them exactly as long as no read before N changes; this function
+ * changes table reads only on N and later. On N it keeps the tables `accepted`
+ * so far and trials exactly one more, the earliest unaccepted table registered
+ * or landed on N:
+ *
+ * - every accepted table and the candidate land on N with the registered
+ *   geometry: accept the candidate;
+ * - the candidate lands on N with other geometry: re-register it once;
+ * - otherwise the candidate's registration displaced its own source or an
+ *   accepted table: reject it on N. Word controls (source-boundary C06) show
+ *   it is then tried on N+1, so its page floor becomes N+1 and the flow from
+ *   its source starts the next page. The accepted tables precede it and are
+ *   unaffected.
+ *
+ * Termination: floors only grow and are set only on the frontier, and the
+ * frontier never moves back, because nothing before it changes. Each pass
+ * that does not converge makes exactly one frontier transition and strictly
+ * increases (frontier page, tables accepted or rejected there, trial phase),
+ * where a pending candidate is replaced only by an earlier source table. A
+ * rejected table starts a fresh page with nothing before it, so it is
+ * rejected at most once. Per table that is at most one selection, one
+ * rejection, one selection on the next page and one geometry retry on each,
+ * so T page-owned tables settle within 1 + 5T passes (an acceptance selects
+ * the next table in the same pass; pages registered without conflict settle
+ * in the pass that observes them). When a drawing read changes on or before
+ * the frontier, table registrations through the frontier stay as applied
+ * for that pass and the anchor-line rule makes the progress instead.
+ */
+function resolvePageOwnedTables(
+  order: ReadonlyMap<string, number>,
+  applied: ReadonlyMap<string, PageWrapDestination> | null,
+  next: ReadonlyMap<string, PageWrapDestination>,
+  previous: TableFrontier | null,
+  floors: ReadonlyMap<string, number>,
+  drawingChangedAt: number,
+): Readonly<{
+  plan: ReadonlyMap<string, PageWrapDestination>;
+  floors: ReadonlyMap<string, number>;
+  frontier: TableFrontier | null;
+  frontierPage: number;
+}> {
+  const appliedTables = floatingTableEntries(applied);
+  const observedTables = floatingTableEntries(next);
+  let frontierPage = Number.POSITIVE_INFINITY;
+  for (const destination of [...appliedTables.values(), ...observedTables.values()]) {
+    const page = destination.pageIndex;
+    if (page >= frontierPage) continue;
+    if (anchorPlanIdentity(tablesOnPage(appliedTables, page))
+      !== anchorPlanIdentity(tablesOnPage(observedTables, page))) frontierPage = page;
+  }
+  if (frontierPage === Number.POSITIVE_INFINITY) {
+    return Object.freeze({ plan: next, floors, frontier: previous, frontierPage });
+  }
+  const N = frontierPage;
+  const plan = new Map(next);
+  // Pages before N agree; pages after N take the observed tables as a
+  // speculative registration that later frontiers verify.
+  const setPage = (
+    tables: ReadonlyMap<string, Extract<PageWrapDestination, { kind: 'floating-table' }>>,
+  ) => {
+    for (const [key, destination] of observedTables) {
+      if (destination.pageIndex === N) plan.delete(key);
+    }
+    for (const [key, destination] of tables) plan.set(key, destination);
+  };
+  if (drawingChangedAt <= N) {
+    setPage(tablesOnPage(appliedTables, N));
+    return Object.freeze({ plan, floors, frontier: previous, frontierPage: N });
+  }
+  const registered = tablesOnPage(appliedTables, N);
+  const landed = tablesOnPage(observedTables, N);
+  // A frontier that returned to N after an earlier drawing change restarts.
+  const accepted = previous?.pageIndex === N
+    && previous.accepted.every((key) => registered.has(key)) ? previous.accepted : [];
+  const acceptedSet = new Set(accepted);
+  const rank = (key: string) => order.get(key) ?? Number.POSITIVE_INFINITY;
+  const pending = [...new Set([...registered.keys(), ...landed.keys()])]
+    .filter((key) => !acceptedSet.has(key))
+    .sort((left, right) => rank(left) - rank(right));
+  const first = pending[0];
+  const lastAccepted = Math.max(-1, ...accepted.map(rank));
+  if (first === undefined || rank(first) < lastAccepted) {
+    throw new TableAdmissionInvariantError(N);
+  }
+  const trialed = [...registered.keys()].filter((key) => !acceptedSet.has(key));
+  const same = (key: string) => JSON.stringify(registered.get(key)) === JSON.stringify(landed.get(key));
+  const keep = new Map(accepted.map((key) => [key, registered.get(key)!] as const));
+  const nextFloors = new Map(floors);
+  let frontier: TableFrontier;
+  if (trialed.length === 1 && trialed[0] === first) {
+    const priorRetries = previous?.pageIndex === N && previous.candidate === first
+      ? previous.geometryRetries : 0;
+    const acceptedHold = accepted.every(same);
+    if (acceptedHold && same(first)) {
+      const admitted = [...accepted, first];
+      keep.set(first, registered.get(first)!);
+      const following = [...landed.keys()].filter((key) => !keep.has(key))
+        .sort((left, right) => rank(left) - rank(right))[0];
+      if (following !== undefined) keep.set(following, landed.get(following)!);
+      frontier = Object.freeze({
+        pageIndex: N, accepted: Object.freeze(admitted), candidate: following ?? null, geometryRetries: 0,
+      });
+    } else if (acceptedHold && landed.has(first) && priorRetries < 1) {
+      keep.set(first, landed.get(first)!);
+      frontier = Object.freeze({
+        pageIndex: N, accepted, candidate: first, geometryRetries: priorRetries + 1,
+      });
+    } else {
+      nextFloors.set(first, Math.max(nextFloors.get(first) ?? 0, N + 1));
+      frontier = Object.freeze({ pageIndex: N, accepted, candidate: null, geometryRetries: 0 });
+    }
+  } else {
+    // An observation (nothing trialed), a speculative registration reaching
+    // the frontier, or an earlier table that now lands on N: trial the
+    // earliest pending table alone after the accepted ones.
+    keep.set(first, landed.get(first) ?? registered.get(first)!);
+    frontier = Object.freeze({ pageIndex: N, accepted, candidate: first, geometryRetries: 0 });
+  }
+  setPage(keep);
+  return Object.freeze({ plan, floors: nextFloors, frontier, frontierPage: N });
 }
 
 /** What a header/footer reserve repagination reads of the previous pass. */
@@ -3028,6 +3169,8 @@ function* paginateBodyWithAnchorConvergenceSteps(
   seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
   let pageOwnedAnchorCount = 0;
+  const tableOrder = pageOwnedTableOrder(input);
+  const pageOwnedTableCount = tableOrder.size;
   for (const entry of input.sequence) {
     if (entry.kind !== 'body-block') continue;
     pageOwnedAnchorCount += entry.block.kind === 'paragraph'
@@ -3040,7 +3183,11 @@ function* paginateBodyWithAnchorConvergenceSteps(
   // observe the line, retest it with exactly the anchors confirmed before it,
   // prove the deferral, apply it. Anchor tests on later pages wait for the
   // pages before them, so the budget grows with the anchors, not a constant.
-  let anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * pageOwnedAnchorCount;
+  // Page-owned tables settle within 1 + 5T passes (`resolvePageOwnedTables`);
+  // reaching this guard is a defensive assertion that publishes the
+  // fresh-page fallback, never a failure.
+  let anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * pageOwnedAnchorCount
+    + 2 * pageOwnedTableCount;
   // A carry-free pass may change from the first page that holds a carried
   // paragraph-relative drawing (WORD_LATER_ANCHOR_EARLIER_LINE_WRAP).
   const carryBounded = (limit: (pass: BodyPaginationPassResult) => number) =>
@@ -3065,30 +3212,41 @@ function* paginateBodyWithAnchorConvergenceSteps(
       canExtend: () => ceiling > publisher.publishedPages,
     });
   };
+  type AnchorPassCarry = Readonly<{
+    plan: ReadonlyMap<string, PageWrapDestination>;
+    minimumTablePageBySource: ReadonlyMap<string, number>;
+    deferrals: AnchorLineDeferrals;
+    tableFrontier: TableFrontier | null;
+  }>;
+  const noDeferrals: AnchorLineDeferrals = new Map();
+  /** The carry of the latest pass and the earliest page its reads changed. */
+  let latest: Readonly<{
+    applied: AnchorPassCarry | null;
+    seed: ReadonlyMap<string, PageWrapDestination> | null;
+    changedAt: number;
+  }> | null = null;
   const converge = function* (
     initialPlan?: ReadonlyMap<string, PageWrapDestination>,
     publish = true,
   ) {
-    type AnchorPassCarry = Readonly<{
-      plan: ReadonlyMap<string, PageWrapDestination>;
-      minimumTablePageBySource: ReadonlyMap<string, number>;
-      deferrals: AnchorLineDeferrals;
-    }>;
-    const noDeferrals: AnchorLineDeferrals = new Map();
+    latest = null;
     return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
       pass: BodyPaginationPassResult;
     }>, number, AnchorPassCarry>({
-      ...(initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals, new Map()) } : {}),
+      ...(initialPlan
+        ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals, new Map(), null) }
+        : {}),
       step: function* anchorPass(previous) {
         const appliedPlan = previous?.plan ?? initialPlan ?? null;
         const appliedDeferrals = previous?.deferrals ?? noDeferrals;
+        const appliedFloors = previous?.minimumTablePageBySource ?? new Map<string, number>();
         const pass = yield* paginateBodyPassSteps(
           input,
           services,
           options,
           reserves,
           appliedPlan,
-          previous?.minimumTablePageBySource ?? null,
+          appliedFloors.size > 0 ? appliedFloors : null,
           balancePlan,
           publish ? anchorPassObserver(appliedPlan) : undefined,
           appliedDeferrals.size > 0 ? appliedDeferrals : null,
@@ -3102,34 +3260,92 @@ function* paginateBodyWithAnchorConvergenceSteps(
         const lineTests = appliedPlan === null
           ? Object.freeze({ plan: observed, deferrals: appliedDeferrals })
           : resolveAnchorLineTests(pass, observed, appliedDeferrals);
-        // A reserve/balance seed is only an estimate: its table bounds were
-        // acquired in another run. Observe this run's geometry before proving
-        // a failed candidate with it, just as in the unseeded first pass.
-        const minimumTablePageBySource = nextTablePageFloors(
-          pass.anchorInputs, previous ? appliedPlan : null, lineTests.plan,
-          appliedDeferrals, lineTests.deferrals,
+        const drawingChangedAt = drawingReadChangePage(
+          appliedPlan, lineTests.plan, appliedDeferrals, lineTests.deferrals,
         );
+        const record = (changedAt: number) => {
+          latest = Object.freeze({
+            applied: previous,
+            seed: previous ? null : initialPlan ?? null,
+            changedAt,
+          });
+        };
+        let tables: ReturnType<typeof resolvePageOwnedTables>;
+        try {
+          tables = resolvePageOwnedTables(
+            tableOrder,
+            appliedPlan,
+            lineTests.plan,
+            previous?.tableFrontier ?? null,
+            appliedFloors,
+            drawingChangedAt,
+          );
+        } catch (error) {
+          if (error instanceof TableAdmissionInvariantError) {
+            record(Math.min(drawingChangedAt, error.pageIndex));
+          }
+          throw error;
+        }
+        record(Math.min(drawingChangedAt, tables.frontierPage));
         return Object.freeze({
           pass,
-          plan: lineTests.plan,
-          minimumTablePageBySource,
+          plan: tables.plan,
+          minimumTablePageBySource: tables.floors,
           deferrals: lineTests.deferrals,
+          tableFrontier: tables.frontier,
         });
       },
       stateOf: (value) => anchorCarryIdentity(
-        value.plan, value.deferrals, value.minimumTablePageBySource,
+        value.plan, value.deferrals, value.minimumTablePageBySource, value.tableFrontier,
       ),
-      // The next anchor pass reads only the plan, the proven table pages and
-      // the proven anchor-line deferrals; the superseded pass (its whole
-      // layout) is not carried into it.
+      // The next anchor pass reads only the plan, the table page floors and
+      // the proven anchor-line deferrals; the table frontier only interprets
+      // its result. The superseded pass (its whole layout) is not carried.
       carry: (value) => Object.freeze({
         plan: value.plan,
         minimumTablePageBySource: value.minimumTablePageBySource,
         deferrals: value.deferrals,
+        tableFrontier: value.tableFrontier,
       }),
       limit: anchorPassLimit,
     })).value.pass;
   };
+  /**
+   * Defensive assertion path only: `resolvePageOwnedTables` terminates within
+   * its bound for valid input. Should a run still cycle or exceed the guard,
+   * keep every read before the earliest page whose reads were changing, so
+   * published pages stay final, and give each page-owned table reached from
+   * that page a fresh page: no text precedes it on its page, so no unverified
+   * registration is needed and the output is complete and non-overlapping.
+   */
+  const fallback = function* () {
+    const last = latest;
+    const fromPage = last === null || !Number.isFinite(last.changedAt) ? 0 : last.changedAt;
+    const appliedPlan = last?.applied?.plan ?? last?.seed ?? null;
+    const plan = new Map<string, PageWrapDestination>();
+    for (const [key, destination] of appliedPlan ?? []) {
+      if (destination.kind !== 'floating-table' || destination.pageIndex < fromPage) {
+        plan.set(key, destination);
+      }
+    }
+    const floors = last?.applied?.minimumTablePageBySource ?? new Map<string, number>();
+    const deferrals = last?.applied?.deferrals ?? noDeferrals;
+    return yield* paginateBodyPassSteps(
+      input,
+      services,
+      options,
+      reserves,
+      appliedPlan === null ? null : plan,
+      floors.size > 0 ? floors : null,
+      balancePlan,
+      undefined,
+      deferrals.size > 0 ? deferrals : null,
+      fromPage,
+    );
+  };
+  const isConvergenceFailure = (error: unknown) => (
+    error instanceof ExactConvergenceError || error instanceof TableAdmissionInvariantError
+  );
   const carryFree = function* () {
     if (pageOwnedAnchorCount === 0) {
       return yield* paginateBodyPassSteps(
@@ -3141,22 +3357,15 @@ function* paginateBodyWithAnchorConvergenceSteps(
       try {
         return yield* converge(seedPlan);
       } catch (error) {
-        if (!seedPlan || !(error instanceof ExactConvergenceError)) throw error;
+        if (!seedPlan || !isConvergenceFailure(error)) throw error;
         // A plan carried from another reserve/balance run is only a starting
         // estimate. Its former page ownership may be invalid in this run; retry
-        // once from the unseeded source order before reporting non-convergence.
+        // once from the unseeded source order.
         return yield* converge();
       }
     } catch (error) {
-      if (error instanceof ExactConvergenceError) {
-        throw new LayoutInvariantError(
-          'NON_CONVERGENCE',
-          error.reason === 'cycle'
-            ? 'Page-anchor destination acquisition repeated an exact-state cycle'
-            : `Page-anchor destination acquisition reached the operational pass limit ${anchorPassLimit}`,
-        );
-      }
-      throw error;
+      if (!isConvergenceFailure(error)) throw error;
+      return yield* fallback();
     }
   };
   const settled = yield* carryFree();
@@ -3170,11 +3379,12 @@ function* paginateBodyWithAnchorConvergenceSteps(
   if (hostPlan.size === 0) return settled;
   const carriedPlan = new Map<string, PageWrapDestination>(pageAnchorDestinationPlan(settled.layout));
   for (const [key, destination] of hostPlan) carriedPlan.set(key, destination);
-  anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * (pageOwnedAnchorCount + hostPlan.size);
+  anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * (pageOwnedAnchorCount + hostPlan.size)
+    + 2 * pageOwnedTableCount;
   try {
     return yield* converge(carriedPlan, false);
   } catch (error) {
-    if (!(error instanceof ExactConvergenceError)) throw error;
+    if (!isConvergenceFailure(error)) throw error;
     return settled;
   }
 }
