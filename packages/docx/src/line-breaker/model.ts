@@ -30,6 +30,14 @@ export interface LayoutSegSource {
 
 export interface LayoutTextSeg extends LayoutSegSource {
   text: string;
+  /** Authored family and selected source survive local FontFace aliases.
+   * Compatibility metadata may distinguish an installed authored face from a
+   * substitute without inspecting the CSS alias or changing its paint route. */
+  authoredFontFamily?: string | null;
+  fontSource?: import('../layout/font-service.js').FontResolutionSource;
+  /** Existing selected-face reference policy; application-provided SFNT
+   * resources are local inventory entries but are not installed Office faces. */
+  authoredReferenceMetricAllowed?: boolean;
   /** §17.3.2.26 script slot selected by the authoritative shaping service. */
   script?: FontScriptSlot;
   /** Internal §17.6.5 snapToChars allocation retained from measure to paint. */
