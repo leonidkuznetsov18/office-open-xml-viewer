@@ -2075,6 +2075,7 @@ export interface TableCell {
     vMerge: boolean;
 }
 export interface TableElement {
+    background?: Fill;
     type: 'table';
     id?: string;
     x: number;

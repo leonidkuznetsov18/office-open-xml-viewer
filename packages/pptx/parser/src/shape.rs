@@ -1950,6 +1950,20 @@ pub(crate) fn parse_table_styles_xml(
             }
         };
 
+        // ECMA-376 §20.1.4.2.25: tblBg is a table-sized paint below the
+        // thirteen cell roles. Keeping it separate preserves gradients and
+        // the alpha composition of band1H/band1V over that background.
+        // Background effects (effect/effectRef) are not supported here.
+        def.background = child(style_node, "tblBg").and_then(|background| {
+            child(background, "fill")
+                .and_then(|fill| parse_table_style_fill(fill, theme))
+                .or_else(|| {
+                    child(background, "fillRef").and_then(|reference| {
+                        parse_style_matrix_fill_from_source(reference, theme_source)
+                    })
+                })
+        });
+
         macro_rules! parse_role {
             ($xml_name:literal, $field:ident) => {
                 if let Some(role) = child(style_node, $xml_name) {
@@ -1958,6 +1972,24 @@ pub(crate) fn parse_table_styles_xml(
             };
         }
         parse_role!("wholeTbl", whole_tbl);
+        // The cell's default grid survives an unspecified whole-table
+        // border; an explicit noFill line removes it. Tagged PDF controls
+        // distinguish a custom wholeTbl with empty tcBdr (1pt black grid)
+        // from the documented No Style, No Grid definition (all NoLine).
+        let grid = TableLineStyle::from_stroke(Some(table_style_presets::stroke("000000")));
+        for side in [
+            &mut def.whole_tbl.borders.left,
+            &mut def.whole_tbl.borders.right,
+            &mut def.whole_tbl.borders.top,
+            &mut def.whole_tbl.borders.bottom,
+            &mut def.whole_tbl.borders.inside_h,
+            &mut def.whole_tbl.borders.inside_v,
+        ] {
+            if matches!(side, TableLineStyle::Unspecified) {
+                *side = grid.clone();
+            }
+        }
+
         parse_role!("band1H", band1_h);
         parse_role!("band2H", band2_h);
         parse_role!("band1V", band1_v);
@@ -2111,7 +2143,13 @@ pub(crate) fn resolve_table_cell_style(
             TablePartRegion::Row,
         );
     }
-    if flags.band_col {
+    // ECMA-376 §20.1.4.2.2/.4 define vertical band roles. PowerPoint
+    // applies them to the interior
+    // columns after enabled first/last-column regions are reserved. Tagged
+    // PDF combined-flag controls distinguish this from overwriting a row
+    // band: an edge column retains its horizontal band but gets no vertical
+    // band fill (both-bands and all-flags counterexamples).
+    if flags.band_col && !(flags.first_col && col == 0 || flags.last_col && col == last_col) {
         let band_col = col.saturating_sub(usize::from(flags.first_col));
         overlay(
             &mut resolved,
@@ -2293,12 +2331,24 @@ pub(crate) fn parse_table(
         .as_deref()
         .map(|xml| parse_table_styles_xml(xml, theme_source))
         .unwrap_or_default();
-    let style_owned: Option<TableStyleDef> = style_id.as_deref().and_then(|id| {
-        table_styles
-            .get(id)
-            .cloned()
-            .or_else(|| table_style_presets::lookup_builtin_table_style(id, theme))
-    });
+    let style_owned: Option<TableStyleDef> = style_id
+        .as_deref()
+        .and_then(|id| {
+            table_styles
+                .get(id)
+                .cloned()
+                .or_else(|| table_style_presets::lookup_builtin_table_style(id, theme_source))
+        })
+        .or_else(|| {
+            // [MS-OE376] §2.1.1343(a): an unresolved ID applies no table style.
+            // Tagged PowerPoint controls for omitted tblPr/ID, unknown and zero
+            // IDs (flags absent/all enabled) retain a plain 1pt black grid, even
+            // with a contrasting tblStyleLst default. Direct cell formatting wins.
+            table_style_presets::lookup_builtin_table_style(
+                "{5940675A-B579-460E-94D1-54222C63F5DA}",
+                theme_source,
+            )
+        });
     let style = style_owned.as_ref();
 
     let cols: Vec<i64> = tbl
@@ -2317,7 +2367,6 @@ pub(crate) fn parse_table(
     }
 
     let col_count = cols.len();
-    let last_col_idx = col_count.saturating_sub(1);
 
     let style_flags = TableStyleFlags {
         first_row,
@@ -2332,7 +2381,6 @@ pub(crate) fn parse_table(
         .filter(|n| n.is_element() && n.tag_name().name() == "tr")
         .collect();
     let row_count = row_nodes.len();
-    let last_row_idx = row_count.saturating_sub(1);
     // The table-style tier of each cell's text is known from its position, so
     // the cell text is parsed over it (see `table_cell_chain`).
     let cell_font = |ri: usize, ci: usize| -> Option<TableStyleFont> {
@@ -2368,55 +2416,12 @@ pub(crate) fn parse_table(
                 // preserve an authored noFill/no-line, which is not equivalent to
                 // an omitted property inheriting the table style.
                 apply_resolved_table_cell_style(cell, effective);
-            } else {
-                // ── Fallback for built-in styles not defined in tableStyles.xml ──
-                // Approximate "Medium Style 2": accent1 header fill + thin outer box + row separators.
-                let thin = Stroke {
-                    color: "A0A096".to_string(),
-                    width: 9525,
-                    fill: None,
-                    dash_style: None,
-                    custom_dash: Vec::new(),
-                    line_cap: None,
-                    line_join: None,
-                    miter_limit: None,
-                    alignment: None,
-                    head_end: None,
-                    tail_end: None,
-                    cmpd: None,
-                };
-                if !cell.has_direct_fill && cell.fill.is_none() && first_row && ri == 0 {
-                    if let Some(color) = theme.get("accent1") {
-                        cell.fill = Some(Fill::Solid {
-                            color: color.clone(),
-                        });
-                    }
-                }
-                // Outer top
-                if !cell.has_direct_border_t && cell.border_t.is_none() && ri == 0 {
-                    cell.border_t = Some(thin.clone());
-                }
-                // Inner horizontal separators
-                if !cell.has_direct_border_t && cell.border_t.is_none() && ri > 0 {
-                    cell.border_t = Some(thin.clone());
-                }
-                // Outer bottom
-                if !cell.has_direct_border_b && cell.border_b.is_none() && ri == last_row_idx {
-                    cell.border_b = Some(thin.clone());
-                }
-                // Outer left edge
-                if !cell.has_direct_border_l && cell.border_l.is_none() && ci == 0 {
-                    cell.border_l = Some(thin.clone());
-                }
-                // Outer right edge
-                if !cell.has_direct_border_r && cell.border_r.is_none() && ci == last_col_idx {
-                    cell.border_r = Some(thin.clone());
-                }
             }
         }
     }
 
     Some(TableElement {
+        background: style.and_then(|s| s.background.clone()),
         id: None,
         x: t.x,
         y: t.y,
@@ -2529,6 +2534,15 @@ fn parse_table_cell_with_chain(
             [0; 9],
             zip,
         );
+        // ECMA-376 §21.1.3.17: cell margins belong to tcPr (defaults
+        // 0.1in horizontally and 0.05in vertically). Tagged PowerPoint PDF
+        // controls with bodyPr 9pt and tcPr 1pt retain the 1pt cell margins;
+        // bodyPr insets do not override these cell-owned properties.
+        let margin = |name, default| tc_pr.and_then(|n| attr_i64(&n, name)).unwrap_or(default);
+        body.l_ins = margin("marL", 91_440);
+        body.r_ins = margin("marR", 91_440);
+        body.t_ins = margin("marT", 45_720);
+        body.b_ins = margin("marB", 45_720);
         // Table-cell text direction is authored on tcPr rather than txBody's
         // bodyPr (ECMA-376 §21.1.3.17 CT_TableCellProperties@vert).
         if let Some(direction) = text_direction.as_deref() {
@@ -4097,7 +4111,7 @@ mod style_ref_tests {
     fn table_cell_projects_tcpr_vertical_text_and_margins_into_the_text_body() {
         let doc = roxmltree::Document::parse(
             r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-              <a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Vertical label</a:t></a:r></a:p></a:txBody>
+              <a:txBody><a:bodyPr lIns="9999" tIns="9999" rIns="9999" bIns="9999"/><a:lstStyle/><a:p><a:r><a:t>Vertical label</a:t></a:r></a:p></a:txBody>
               <a:tcPr vert="vert270" anchor="ctr" marL="100" marT="200" marR="300" marB="400"/>
             </a:tc>"#,
         )

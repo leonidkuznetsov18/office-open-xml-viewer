@@ -1191,6 +1191,7 @@ struct TablePartStyle {
 
 #[derive(Debug, Clone, Default)]
 struct TableStyleDef {
+    background: Option<Fill>,
     whole_tbl: TablePartStyle,
     band1_h: TablePartStyle,
     band2_h: TablePartStyle,
@@ -7696,10 +7697,13 @@ mod tests {
             </a:theme>"#,
         );
         let styles = parse_table_styles_xml(
-            r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblStyle styleId="{REF}"><a:wholeTbl><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:srgbClr val="445566"/></a:lnRef></a:left></a:tcBdr><a:fillRef idx="1"><a:srgbClr val="778899"/></a:fillRef></a:tcStyle></a:wholeTbl><a:firstRow><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="2"/></a:left></a:tcBdr></a:tcStyle></a:firstRow></a:tblStyle></a:tblStyleLst>"#,
+            r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblStyle styleId="{REF}"><a:tblBg><a:fillRef idx="1"><a:srgbClr val="223344"/></a:fillRef></a:tblBg><a:wholeTbl><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:srgbClr val="445566"/></a:lnRef></a:left></a:tcBdr><a:fillRef idx="1"><a:srgbClr val="778899"/></a:fillRef></a:tcStyle></a:wholeTbl><a:firstRow><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="2"/></a:left></a:tcBdr></a:tcStyle></a:firstRow></a:tblStyle></a:tblStyleLst>"#,
             &theme,
         );
         let style = styles.get("{REF}").expect("table style");
+        assert!(
+            matches!(style.background, Some(Fill::Gradient { ref stops, angle, .. }) if stops[0].color == "223344" && angle == 90.0)
+        );
         assert!(
             matches!(style.whole_tbl.fill, Some(Fill::Gradient { ref stops, angle, .. }) if stops[0].color == "778899" && angle == 90.0)
         );
@@ -7722,6 +7726,60 @@ mod tests {
             2,
         );
         assert!(matches!(resolved.border_l, TableLineStyle::NoLine));
+    }
+
+    #[test]
+    fn unresolved_table_style_keeps_plain_grid_and_direct_formatting() {
+        let theme = HashMap::from([
+            ("tx1".to_owned(), "000000".to_owned()),
+            ("accent1".to_owned(), "4472C4".to_owned()),
+        ]);
+        for id in [
+            None,
+            Some("{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}"),
+            Some("{00000000-0000-0000-0000-000000000000}"),
+        ] {
+            let style_id = id
+                .map(|id| format!("<a:tableStyleId>{id}</a:tableStyleId>"))
+                .unwrap_or_default();
+            let xml = format!(
+                r#"<a:tbl xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                <a:tblPr firstRow="1" bandRow="1" firstCol="1">{style_id}</a:tblPr>
+                <a:tblGrid><a:gridCol w="100"/><a:gridCol w="100"/></a:tblGrid>
+                <a:tr h="100"><a:tc><a:tcPr/></a:tc><a:tc><a:tcPr>
+                <a:lnL><a:noFill/></a:lnL><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                </a:tcPr></a:tc></a:tr></a:tbl>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            let table = parse_table(
+                doc.root_element(),
+                &Transform::default(),
+                &theme,
+                &HashMap::new(),
+                "ppt/slides",
+                &crate::master::DefaultTextLevels::default(),
+                &mut zip,
+            )
+            .unwrap();
+            let plain = &table.rows[0].cells[0];
+            assert!(
+                matches!(plain.fill, None | Some(Fill::None)),
+                "{id:?}: no accent fill"
+            );
+            for border in [
+                &plain.border_l,
+                &plain.border_r,
+                &plain.border_t,
+                &plain.border_b,
+            ] {
+                let border = border.as_ref().expect("plain grid");
+                assert_eq!((&*border.color, border.width), ("000000", 12700));
+            }
+            let direct = &table.rows[0].cells[1];
+            assert!(direct.border_l.is_none());
+            assert!(matches!(&direct.fill, Some(Fill::Solid { color }) if color == "FF0000"));
+        }
     }
 
     #[test]
@@ -7828,6 +7886,26 @@ mod tests {
             Some("WHOLE"),
             "an unspecified band2V inherits wholeTbl"
         );
+
+        // Light-style edge roles can supply bold text without a fill. Enabled
+        // edge columns retain horizontal bands instead of inheriting band1V.
+        style.first_col.fill = None;
+        let flags = TableStyleFlags {
+            first_col: true,
+            last_col: true,
+            band_row: true,
+            band_col: true,
+            ..Default::default()
+        };
+        for (row, col, expected) in [
+            (0, 0, "BAND-ROW"),
+            (0, 1, "BAND-COL"),
+            (0, 2, "BAND-ROW"),
+            (1, 0, "WHOLE"),
+        ] {
+            let cell = resolve_table_cell_style(&style, flags, row, col, 3, 3);
+            assert_eq!(solid_color(&cell.fill).as_deref(), Some(expected));
+        }
     }
 
     /// ECMA-376 §21.1.3.17 (`CT_TableCellProperties`) — direct cell fill and

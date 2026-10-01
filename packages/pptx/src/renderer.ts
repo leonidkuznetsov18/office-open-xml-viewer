@@ -4364,12 +4364,6 @@ export function renderTextBody(
   // `vert`/`vert270` (whose spec meaning IS to rotate every glyph), keeping those
   // paths byte-identical.
   eaVertUpright = false,
-  // A zero-height table row asks PowerPoint to derive its height from the
-  // natural line box. Office treats a positive a:tr@h as an authored minimum
-  // ([MS-OE376] §2.1.1347): use the glyph-size box when checking whether content
-  // actually exceeds that minimum, so implicit leading alone does not enlarge
-  // an already-sufficient row.
-  measureNaturalLineSpacing = measureOnly,
 ): number | void {
   // Stacked vertical text (wordArtVert / wordArtVertRtl): upright glyphs one
   // above another in columns; see stacked-text.ts and core layoutStackedText.
@@ -4798,34 +4792,21 @@ export function renderTextBody(
       // shapes all keep the same omitted-lnSpc pitch at a given point size.
       // Percentage spacing scales this renderer's PowerPoint-compatible natural
       // line box (ECMA-376 §21.1.2.2.5/.11 defines the authored percentage;
-      // Office output supplies the line-box compatibility behaviour). A positive
-      // a:tr@h remains a minimum. A PowerPoint table control with 16pt text,
-      // 120% lnSpc and 8.5pt vertical cell margins grows a 36.85pt row;
-      // changing only lnSpc to 100% or the margins to zero does not. Explicit
-      // percentage spacing therefore consumes the painted natural line box
-      // even for one final line. Omitted lnSpc keeps its glyph-box exception
-      // in a positive row. Neither path uses a substituted font's design box.
+      // Office output supplies the line-box compatibility behaviour). Paint
+      // and table measurement use the same natural line; the row's final
+      // extent uses the last baseline plus its natural descent below.
       const naturalSingle = maxSizePx * 1.2;
       const useResolvedFontMetrics = isSpAutoFit && resolvedFontLine > naturalSingle;
       // A live resolved font box describes containment, not baseline advance.
       // Keeping the two values separate prevents a tall Meiryo design box from
       // being repeated between every pair of lines under spAutoFit (#1473).
       const implicitSingle = naturalSingle;
-      // Paint and table measurement must agree for explicitly authored
-      // percentage spacing. Positive rows with omitted lnSpc retain the
-      // existing glyph-box containment rule: the implicit leading is not by
-      // itself evidence that PowerPoint grows the authored minimum. An explicit
-      // percentage, however, is part of the authored content extent, and every
-      // line in a multi-line body consumes the painted line box.
+      // Earlier lines consume each full authored advance. There is no
+      // separate glyph-size-only measurement path for positive table rows.
       const paintedLineHeight = drawingMlLineHeight(
         implicitSingle, para.spaceLine, PT_TO_EMU * scale,
       );
       let lineHeight = paintedLineHeight;
-      if (measureOnly && !isSpAutoFit && !measureNaturalLineSpacing) {
-        if (!para.spaceLine) {
-          lineHeight = maxSizePx;
-        }
-      }
       // PowerPoint retains its established percentage-line advance, but seats
       // glyphs from a tall resolved fallback inside the authored percentage
       // box. Keeping that box separate from `lineHeight` fixes the first-line
@@ -4886,7 +4867,7 @@ export function renderTextBody(
           seg.fontAlgnOffsetPx = offset;
         }
       }
-      if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
+      if (metric && metricOk) {
         const natural = alignedLine ?? (compatOff
           ? powerPointCompatOffNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, box: r.face.excel! })))
           : metricRuns.length > 0
@@ -5005,13 +4986,6 @@ export function renderTextBody(
     }
   }
 
-  // ── measure-only: return the content height the text body needs ─────────
-  // Used by renderTable to grow rows to fit their tallest cell (ECMA-376
-  // §21.1.3.18: a:tr@h is a minimum). Returns padding + laid-out text height.
-  if (measureOnly) {
-    return tPad + requiredHeight + bPad;
-  }
-
   // ── anchor="b" with bh=0: auto-height growing upward from by ────────────
   // When cy=0 and anchor="b", off_y is the bottom anchor; shape grows upward.
   const anchor = body.verticalAnchor ?? 't';
@@ -5043,6 +5017,11 @@ export function renderTextBody(
     && lastMetric.metricNaturalDescent !== undefined
     ? requiredHeight - (lastMetric.lineHeight - lastMetric.metricAscent) + lastMetric.metricNaturalDescent
     : requiredHeight;
+  // A table row must hold the final baseline plus its natural descent,
+  // rather than terminal lnSpc leading. Tagged PDF row controls at 16pt
+  // with 1pt insets: omitted/100% = 21.2pt, 120% = 22.92pt, 24pt =
+  // 23.64pt. Earlier full line advances and interior paragraph gaps remain.
+  if (measureOnly) return tPad + anchorHeight + bPad;
   let cursorY: number;
   const contentH = Math.max(0, effectiveBh - tPad - bPad);
   if (anchor === 'ctr') {
@@ -7047,14 +7026,13 @@ export function renderTable(
   // first row.
   const authoredRowHeights = el.rows.map(r => emuToPx(r.height, scale));
   const rowHeights = [...authoredRowHeights];
-  const authoredRowsTotalEmu = el.rows.reduce((sum, row) => sum + row.height, 0);
-  // The graphic-frame extent is the table's authored outer height. PowerPoint
-  // can leave slack between that extent and the sum of positive a:tr@h minima;
-  // that discrepancy signals that text-driven row growth was present when the
-  // table was authored. When the positive minima already fill the frame, do not
-  // invent growth merely because browser font metrics wrap differently.
-  const hasAuthoredRowGrowthSignal = el.height > authoredRowsTotalEmu;
-
+  // Tagged PowerPoint PDF controls: positive and zero minima grow alike,
+  // regardless of frame extent below/equal/above the row sum. The tallest
+  // cell controls each row (Arial/Calibri/Times, bold/plain, mixed sizes,
+  // empty cells, breaks/wraps/paragraphs, and default/explicit margins).
+  // Fit the renderer's actual lines. Font-width/wrapping differences from
+  // Office can therefore yield different row heights; the saved frame extent
+  // is not evidence that an overflowing cell should ignore its content.
   // First pass: single-row (rowSpan ≤ 1) cells set their own row's minimum.
   for (let ri = 0; ri < el.rows.length; ri++) {
     const row = el.rows[ri];
@@ -7063,11 +7041,10 @@ export function renderTable(
       if (cell.hMerge || cell.vMerge) continue;
       if ((cell.rowSpan || 1) > 1) continue;
       if (!cell.textBody) continue;
-      if (row.height > 0 && !hasAuthoredRowGrowthSignal) continue;
       const cellW = spannedWidth(ci, cell.gridSpan || 1);
       const needed = (renderTextBody(
         ctx, tableTextBody(cell.textBody), 0, 0, cellW, 0, scale, null, 0, false, false,
-        '#000000', slideNumber, rc, undefined, true, undefined, false, row.height === 0,
+        '#000000', slideNumber, rc, undefined, true, undefined, false,
       ) as number) || 0;
       if (needed > rowHeights[ri]) rowHeights[ri] = needed;
     }
@@ -7084,13 +7061,9 @@ export function renderTable(
       const span = cell.rowSpan || 1;
       if (span <= 1 || !cell.textBody) continue;
       const cellW = spannedWidth(ci, cell.gridSpan || 1);
-      const hasAutoHeightRow = el.rows
-        .slice(ri, Math.min(el.rows.length, ri + span))
-        .some((spannedRow) => spannedRow.height === 0);
-      if (!hasAutoHeightRow && !hasAuthoredRowGrowthSignal) continue;
       const needed = (renderTextBody(
         ctx, tableTextBody(cell.textBody), 0, 0, cellW, 0, scale, null, 0, false, false,
-        '#000000', slideNumber, rc, undefined, true, undefined, false, hasAutoHeightRow,
+        '#000000', slideNumber, rc, undefined, true, undefined, false,
       ) as number) || 0;
       let have = 0;
       for (let s = 0; s < span && ri + s < rowHeights.length; s++) have += rowHeights[ri + s];
@@ -7216,6 +7189,20 @@ export function renderTable(
         }
       }
     }
+  }
+
+  // tblBg uses the full grown table rectangle, once, before alpha cell
+  // fills. A per-cell background would restart theme gradients at every row.
+  const tableHeight = rowHeights.reduce((sum, height) => sum + height, 0);
+  // Keep the theme paint and band alpha intact. Solid/gradient matrix
+  // controls agree with Office PDF vectors and Poppler rasterization; MuPDF
+  // can differ by 1–2 RGB levels on non-white alpha composites. That PDF
+  // rasterizer difference is not a colour compensation rule for Canvas.
+  const backgroundPaint = resolveShapeFill(el.background ?? null, ctx, x0, y0,
+    tableW, tableHeight, el.rotation, scale * PT_TO_EMU);
+  if (backgroundPaint) {
+    ctx.fillStyle = backgroundPaint;
+    ctx.fillRect(x0, y0, tableW, tableHeight);
   }
 
   // Pass 1: fills + text bodies.
