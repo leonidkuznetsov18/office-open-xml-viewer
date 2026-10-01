@@ -112,15 +112,31 @@ describe('first-line indents beside floats through the DOCX parser', () => {
 
   // ECMA-376 §17.3.1.37 stops are independent of the paragraph's right indent;
   // without a float, a fitting ordinary aligned cell keeps that allocation on
-  // its line (sample-1 footer regression). A margin ptab cell instead ends at
-  // the indent (WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP).
-  it.each([false, true])('places a fitting right cell beside a 360 pt right indent, positional=%s', (positional) => {
+  // its line (sample-1 footer regression).
+  it('aligns a fitting ordinary cell at its stop past the right indent', () => {
     const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
-      { alignment: 'right', count: 1, text: positional ? 'word' : 'word '.repeat(10).trim(), positional, noFloat: true }));
+      { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), noFloat: true }));
     expect(paragraph.lines).toHaveLength(1);
     const texts = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
     const last = texts.at(-1);
-    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(positional ? 180 : 352);
+    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(352);
+  });
+
+  // Positional tabs keep the #1675 containment policy; their Word placement
+  // past a right indent is an open follow-up (see margin-tab-allocation.test).
+  it('wraps a margin ptab cell wider than the paragraph band', () => {
+    const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
+      { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional: true, noFloat: true }));
+    expect(paragraph.lines.length).toBeGreaterThan(1);
+    for (const line of paragraph.lines) {
+      for (const text of line.placements) {
+        if (text.kind === 'text') {
+          expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+          const trailingSpaceWidth = (text.text.length - text.text.trimEnd().length) * 5;
+          expect(text.bounds.xPt + text.bounds.widthPt - trailingSpaceWidth).toBeLessThanOrEqual(180);
+        }
+      }
+    }
   });
 
   it.each([false, true])('wraps a no-float aligned cell wider than its text margin, positional=%s', (positional) => {
@@ -165,17 +181,16 @@ describe('first-line indents beside floats through the DOCX parser', () => {
         expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
         expect(text.bounds.xPt + text.bounds.widthPt).toBeLessThanOrEqual(540);
       }
-      if (!rtl) {
+      if (!rtl && !positional) {
         // An ordinary right stop at 352pt extends the band to the margin,
-        // leaving 188pt that center/right alignment distribute as usual. A
-        // margin ptab cell ends at the indent band edge, which it fills.
+        // leaving 188pt that center/right alignment distribute as usual.
         expect(paragraph.lines).toHaveLength(1);
         const prefix = texts.find((text) => text.text === 'prefix');
         const word = texts.find((text) => text.text === 'word');
-        const shift = positional ? 0 : jc === 'center' ? 94 : jc === 'right' ? 188 : 0;
+        const shift = jc === 'center' ? 94 : jc === 'right' ? 188 : 0;
         if (jc !== 'distribute') {
           expect(prefix?.bounds.xPt).toBe(72 + shift);
-          expect((word?.bounds.xPt ?? 0) + (word?.bounds.widthPt ?? 0)).toBe((positional ? 180 : 352) + shift);
+          expect((word?.bounds.xPt ?? 0) + (word?.bounds.widthPt ?? 0)).toBe(352 + shift);
         }
       }
     });

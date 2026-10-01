@@ -43,28 +43,6 @@ export function wordPositionalTabReferenceBox(
     : { start: referenceStart, end: referenceEnd };
 }
 
-export const WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP = defineCompatibilityRule({
-  id: 'word-positional-margin-tab-indent-clamp',
-  evidence: {
-    kind: 'regression-test',
-    reference: 'packages/docx/src/margin-tab-allocation.test.ts#ends a margin $alignment ptab at the right indent, decorated=$decorated',
-  },
-  description: 'A Word 16 export (body paragraph, 360 pt right indent, no float, with and without paragraph borders/shading) places the cell after a right or center <w:ptab w:relativeTo="margin"> so it ends at the paragraph right indent, although ECMA-376 §17.3.3.23 selects the margin target independently of indents; ordinary right/center/decimal stops in the same control extend past the indent. On an unnarrowed line, a fitting margin-relative right/center positional cell whose target passes the indent band therefore ends at that band edge. Left alignment, indent references and float-narrowed lines are unchanged.',
-});
-
-/** Gap projection of {@link WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP}. All
- * widths share the line-relative frame; a cell that cannot fit keeps its gap. */
-export function wordPositionalMarginTabGap(
-  gap: number,
-  pen: number,
-  followWidth: number,
-  bandWidth: number,
-): number {
-  return pen + gap + followWidth > bandWidth && pen + followWidth <= bandWidth
-    ? bandWidth - pen - followWidth
-    : gap;
-}
-
 export const WORD_OPENTYPE_FEATURES_COMPAT_KERNING = defineCompatibilityRule({
   id: 'word-opentype-features-compat-kerning',
   evidence: {

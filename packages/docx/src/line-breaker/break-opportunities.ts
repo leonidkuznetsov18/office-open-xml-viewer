@@ -31,7 +31,7 @@ import {
   snapToCharsClass,
 } from './advance.js';
 import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
-import { wordPositionalMarginTabGap, wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
+import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
   extendThroughTrailingIdeographicSpaces,
@@ -708,17 +708,7 @@ function processTabSegment(
       // segment so the line-height reflects the ptab's font.
       tabW = 0;
     }
-    // §17.3.3.23 selects the reference target independently of paragraph
-    // indents, but the positional cell's allocation stays within the actual
-    // paragraph/float band (unlike ordinary stops, see alignedTabCellAvailW).
-    // WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP projects a fitting margin cell
-    // whose target passes the unnarrowed indent band.
-    if (seg.ptab.alignment !== 'left' && seg.ptab.relativeTo === 'margin'
-      && breakerState.lineXOffset === 0 && breakerState.lineMaxWidth === maxWidth) {
-      tabW = wordPositionalMarginTabGap(tabW, breakerState.currentWidth, followW, availW());
-    }
-    const cellLimit = availW();
-    if (breakerState.currentWidth + tabW > cellLimit) {
+    if (breakerState.currentWidth + tabW > availW()) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);
         breakerState.queue.unshift(seg);
@@ -728,7 +718,10 @@ function processTabSegment(
     }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    if (seg.ptab.alignment !== 'left' && breakerState.currentWidth + followW <= cellLimit) {
+    // §17.3.3.23 selects the reference target independently of paragraph
+    // indents. Library policy limits allocation to the actual paragraph/float
+    // band: a fitting cell stays aligned, and all other cells use normal breaks.
+    if (seg.ptab.alignment !== 'left' && breakerState.currentWidth + followW <= availW()) {
       commitAlignedTabCell(context);
     }
     return;
