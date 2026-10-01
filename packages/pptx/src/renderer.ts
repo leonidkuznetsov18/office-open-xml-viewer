@@ -4324,6 +4324,15 @@ function renderStackedTextBody(
     pxPerPt,
     paragraphs,
     sameStyle,
+    drawObject: (style, x, y) => {
+      const equation = style.math!;
+      const render = mathRenders.get(equation.nodes);
+      if (!render) throw new Error('Stacked equations must be prepared before drawing');
+      const height = equation.ascent + equation.descent;
+      if (equation.width > 0 && height > 0) {
+        ctx.drawImage(tintedMathImage(render, style.color), x, y, equation.width, height);
+      }
+    },
   });
   if (!onTextRun) return;
   for (const run of runs) {

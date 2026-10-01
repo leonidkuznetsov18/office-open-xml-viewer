@@ -147,3 +147,20 @@ describe('stacked face and character tables', () => {
     expect(stackedVerticalGlyph('Arial', cp('（'))).toBe(false);
   });
 });
+
+it.each(['wordArtVert', 'wordArtVertRtl'] as const)('%s wraps an upright inline object atomically using its column extent', (direction) => {
+  const object = { type: 'object' as const, width: 48, style: S, payload: 'equation' };
+  const result = layoutStackedText([para([], { runs: [
+    { type: 'text', text: 'A', style: S }, object,
+    { type: 'text', text: 'B', style: S },
+  ] })], options({ direction, rect: { ...RECT, height: CELL + 48 },
+    objectGlyph: (segment) => ({ text: String(segment.payload), style: segment.style,
+      kind: 'upright', advance: segment.width, thickness: 72, space: false }),
+  }));
+  expect(result.glyphs.map((g) => [g.text, g.column, g.cellTop])).toEqual([
+    ['A', 0, 0], ['equation', 0, CELL], ['B', 1, 0],
+  ]);
+  expect(result.columns[0].thickness).toBe(72);
+  expect(Math.sign(result.columns[1].axisX - result.columns[0].axisX))
+    .toBe(direction === 'wordArtVert' ? 1 : -1);
+});

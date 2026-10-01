@@ -1,8 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HyperlinkTarget } from '@silurus/ooxml-core';
-import { layoutParagraph, renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
+import { layoutParagraph, prepareSlideMath, renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
 import { buildPptxTextLayer } from './text-layer.js';
 import type { Paragraph, TextBody, TextRunData } from './types.js';
+
+vi.mock('@silurus/ooxml-core', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core')>(),
+  rasterizeMathSvg: async () => ({ source: {} }),
+  tintMathRaster: () => ({}),
+}));
 
 // ECMA-376 §20.1.10.83 wordArtVert / wordArtVertRtl through the PowerPoint
 // renderer: segments become stacked glyphs (core layoutStackedText) and each
@@ -11,7 +17,7 @@ const SCALE = 1 / 12700; // 1 pt → 1 px
 
 interface Call { text: string; x: number; y: number; rot: number; tx: number; ty: number; align: string }
 
-function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
+function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[]; images: { x: number; y: number; w: number; h: number; rot: number }[] } {
   let font = '24px serif';
   let textAlign: CanvasTextAlign = 'left';
   let textBaseline: CanvasTextBaseline = 'alphabetic';
@@ -21,9 +27,11 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
   const stack: [number, number, number][] = [];
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '24');
   const calls: Call[] = [];
+  const images: { x: number; y: number; w: number; h: number; rot: number }[] = [];
   const ctx = {
     canvas: { style: {} },
     get font() { return font; }, set font(v: string) { font = v; },
+    drawImage(_image: unknown, x: number, y: number, w: number, h: number) { images.push({ x, y, w, h, rot }); },
     fillStyle: '#000', strokeStyle: '#000', lineWidth: 1, letterSpacing: '0px', direction: 'ltr',
     get textAlign() { return textAlign; }, set textAlign(v: CanvasTextAlign) { textAlign = v; },
     get textBaseline() { return textBaseline; }, set textBaseline(v: CanvasTextBaseline) { textBaseline = v; },
@@ -40,7 +48,7 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
     scale: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, stroke: () => {},
     fill: () => {}, clip: () => {}, rect: () => {}, fillRect: () => {}, setLineDash: () => {},
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, calls };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, calls, images };
 }
 
 function body(text: string, vert: string, fontFamilyEa?: string, hyperlink?: string): TextBody {
@@ -214,4 +222,24 @@ describe('cluster segmentation cost', () => {
     expect(calls.map((c) => c.text.length)).toEqual([80_001, 1]);
     expect(performance.now() - start).toBeLessThan(5_000);
   }, 60_000);
+});
+
+it.each(['wordArtVert', 'wordArtVertRtl'])('%s paints an atomic upright equation through core stacked layout', async (vert) => {
+  const b = body('A', vert);
+  const text = b.paragraphs[0].runs[0] as TextRunData;
+  b.paragraphs[0].runs = [text,
+    { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'italic' }], display: false, fontSize: 24 },
+    { ...text, text: 'B' }];
+  await prepareSlideMath({ elements: [{ type: 'shape', textBody: b }] } as unknown as import('./types.js').Slide, {
+    loadMathJax: async () => {},
+    mathMLToSvg: async () => ({ svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 }),
+  });
+  const { ctx, calls, images } = mockCtx();
+  renderTextBody(ctx, b, 0, 0, 200, 300, SCALE);
+  expect(calls.map((c) => c.text)).toEqual(['A', 'B']);
+  expect(images).toHaveLength(1);
+  expect(images[0]).toMatchObject({ w: 72, h: 48, rot: 0 });
+  expect(images[0].x + 36).toBeCloseTo(calls[0].x);
+  expect(images[0].y).toBeCloseTo(3.6 + CELL);
+  expect(calls[1].y - calls[0].y).toBeCloseTo(CELL + 48);
 });

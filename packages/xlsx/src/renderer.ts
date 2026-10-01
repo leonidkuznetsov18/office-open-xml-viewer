@@ -4841,6 +4841,15 @@ export function drawShapeText(
       const face = isCjkBreakChar(text.codePointAt(0) ?? 0)
         ? run.fontFaceEa ?? run.fontFace : run.fontFace;
       return { ...textFont({ ...run, text, fontFace: face }, fontScale), face };
+    }, (run, precedingSizePt) => {
+      const render = mathRenders.get(run.nodes);
+      if (!render) throw new Error('Stacked equations must be prepared before drawing');
+      const pxSize = (run.fontSize ?? precedingSizePt) * PT_TO_PX * cs * fontScale;
+      const width = render.widthEm * pxSize;
+      const height = (render.ascentEm + render.descentEm) * pxSize;
+      return { width, height, draw: (x, y) => {
+        if (width > 0 && height > 0) ctx.drawImage(tintedMathImage(render, run.color ?? '#000000'), x, y, width, height);
+      } };
     });
     return;
   }

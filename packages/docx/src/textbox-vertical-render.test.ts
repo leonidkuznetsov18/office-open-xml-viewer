@@ -1,3 +1,7 @@
+import { layoutDocument } from './document-layout.js';
+import { normalizeInternalDocumentModel } from './parser-model.js';
+import { createLayoutServices } from './layout-runtime.js';
+import { paintTextBoxLayout } from './paint/canvas-text.js';
 import { describe, it, expect } from 'vitest';
 import {
   acquireAndPaintShapeTextBox,
@@ -699,4 +703,42 @@ describe('§20.1.10.83 textbox <wps:bodyPr vert> — vertical text-box rendering
     // bIns must NOT move the physical-left first column.
     expect(firstColX(7, 20), 'bIns does not own the physical-left origin').toBeCloseTo(firstColX(7, 3), 5);
   });
+});
+
+it.each(['wordArtVert', 'wordArtVertRtl'])('%s retains a complete upright OMML object in the Word column', (textVert) => {
+  const { ctx, glyphs, images } = makeMatrixCtx();
+  const text = (value: string) => ({ type: 'text', text: value, fontSize: 10, fontFamily: 'NotInMetrics',
+    bold: false, italic: false, underline: false, strikethrough: false });
+  const paraProps = { alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+    spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [] };
+  const shape = { ...richTextbox([], textVert), widthPt: 200, heightPt: 100,
+    textBoxContent: [{ type: 'paragraph', ...paraProps, runs: [text('A'),
+      { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'italic' }], display: false, fontSize: 10 }, text('B')] }] };
+  const normalized = normalizeInternalDocumentModel({
+    section: { pageWidth: 300, pageHeight: 200, marginTop: 0, marginRight: 0, marginBottom: 0,
+      marginLeft: 0, headerDistance: 0, footerDistance: 0, titlePage: false, evenAndOddHeaders: false },
+    body: [{ type: 'paragraph', ...paraProps, runs: [shape] }],
+    headers: { default: null, first: null, even: null }, footers: { default: null, first: null, even: null },
+    fontFamilyClasses: {},
+  } as unknown as import('./types.js').DocxDocumentModel);
+  const services = createLayoutServices(normalized.document, { measureContext: ctx,
+    mathDrawables: new Map(normalized.mathOccurrences.map((m) => [m.resourceKey, {} as CanvasImageSource])),
+    mathResources: normalized.mathOccurrences.map((m) => ({ resourceKey: m.resourceKey,
+      widthEm: 3, ascentEm: 1.5, descentEm: .5, diagnostics: [] })) });
+  const layout = layoutDocument(normalized.document, services, { currentDateMs: 0 });
+  const paragraph = layout.pages[0].layers.body.find((node) => node.kind === 'paragraph');
+  if (!paragraph || paragraph.kind !== 'paragraph') throw new Error('expected body paragraph');
+  expect(paragraph.textBoxes).toHaveLength(1);
+  paintTextBoxLayout(paragraph.textBoxes[0]!, { ctx, scale: 1, dpr: 1, resources: {
+    paint(_key, kind, bounds, target) {
+      expect(kind).toBe('math');
+      target.drawImage({} as CanvasImageSource, bounds.xPt, bounds.yPt, bounds.widthPt, bounds.heightPt);
+    },
+  } });
+  expect(glyphs.map((g) => g.text).join('')).toBe('AB');
+  expect(images).toHaveLength(1);
+  expect(images[0]).toMatchObject({ w: 30, h: 20 });
+  expect(norm(images[0].angleDeg)).toBeCloseTo(0);
+  expect(images[0].devY - glyphs[0].devY).toBeCloseTo(10);
+  expect(glyphs[1].devY - glyphs[0].devY).toBeCloseTo(30);
 });

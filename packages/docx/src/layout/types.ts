@@ -1415,6 +1415,8 @@ export interface FlowContainer {
   readonly capacity?: 'bounded' | 'unbounded';
   /** Authored DrawingML inline wrapping policy for text-box paragraphs. */
   readonly noWrap?: boolean;
+  /** Upright inline math in a quarter-turn DrawingML WordArt frame. */
+  readonly quarterTurnMath?: boolean;
 }
 
 export interface FlowCursor extends PointPt {}

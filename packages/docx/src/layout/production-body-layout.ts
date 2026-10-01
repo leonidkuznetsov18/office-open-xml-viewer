@@ -1,3 +1,4 @@
+import { quarterTurnMathMetadataService } from './resources.js';
 import { pageOwnedAnchorKeysByLine } from './anchor-line-deferral.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import type {
@@ -618,7 +619,8 @@ function acquireBodyStoryLayout(
     },
   };
   preRegisterPageFloats(root, 0, candidate);
-  const storyServices = createLayoutServicesRuntimeView(services);
+  const storyServices = createLayoutServicesRuntimeView(services, request.container.quarterTurnMath
+    ? { math: quarterTurnMathMetadataService(services.math) } : {});
   candidate.layoutServices = storyServices;
   const blockInputs: StoryBlockInput[] = root.flatMap((element, index): StoryBlockInput[] => {
     const source: SourceRef = {

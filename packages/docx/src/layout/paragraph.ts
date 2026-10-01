@@ -3798,6 +3798,7 @@ export function acquireShapeTextBoxLayout(
         id: `${options.id}:story`,
         kind: 'textbox',
         bounds: innerBounds,
+        ...(stackedWordArt ? { quarterTurnMath: true } : {}),
         capacity: 'unbounded',
         ...(stackedWordArt && shape.textWrap === 'none' ? { noWrap: true } : {}),
       },

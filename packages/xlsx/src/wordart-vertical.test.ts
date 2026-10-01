@@ -1,10 +1,17 @@
-import { describe, expect, it } from 'vitest';
-import { drawShapeText, renderViewport } from './renderer.js';
+import { describe, expect, it, vi } from 'vitest';
+import { drawShapeText, renderViewport, prepareWorksheetMath } from './renderer.js';
 import type { ShapeText, Styles, Worksheet } from './types.js';
+
+vi.mock('@silurus/ooxml-core', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core')>(),
+  rasterizeMathSvg: async () => ({ source: {} }),
+  tintMathRaster: () => ({}),
+}));
 
 function record() {
   const calls: { text: string; x: number; y: number; angle: number }[] = [];
   const clips: number[][] = [];
+  const images: { x: number; y: number; w: number; h: number; angle: number }[] = [];
   let font = '24px Arial';
   let angle = 0;
   let sx = 1, sy = 1;
@@ -14,6 +21,7 @@ function record() {
     measureText: (text: string) => ({ width: text.length * 10,
       fontBoundingBoxAscent: 24, fontBoundingBoxDescent: 6 }),
     fillText: (text: string, x: number, y: number) => calls.push({ text, x, y, angle: angle + (sx < 0 ? Math.PI : 0) }),
+    drawImage(_image: unknown, x: number, y: number, w: number, h: number) { images.push({ x, y, w, h, angle }); },
     save() { frames.push([angle, sx, sy]); },
     restore() { [angle, sx, sy] = frames.pop()!; },
     rotate(value: number) { angle += sx * sy * value; },
@@ -24,7 +32,7 @@ function record() {
     textAlign: 'left', textBaseline: 'alphabetic', fillStyle: '#000',
   };
   const ctx = new Proxy(state, { get: (target, key) => target[key as keyof typeof target] ?? (() => {}) }) as unknown as CanvasRenderingContext2D;
-  return { ctx, calls, clips };
+  return { ctx, calls, clips, images };
 }
 
 const body = (vert: string, extra: Partial<ShapeText> = {}): ShapeText => ({
@@ -87,4 +95,24 @@ describe('Excel DrawingML stacked WordArt', () => {
     },
   );
 
+});
+
+// Non-square extents detect use of horizontal width as the column advance.
+it.each(['wordArtVert', 'wordArtVertRtl'])('%s retains an upright equation between text runs', async (vert) => {
+  const txt = body(vert);
+  const text = txt.paragraphs[0].runs[0] as Extract<import('./types.js').ShapeTextRun, { type: 'text' }>;
+  txt.paragraphs[0].runs = [{ ...text, text: 'A' },
+    { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'italic' }], display: false, fontSize: 18 },
+    { ...text, text: 'B' }];
+  await prepareWorksheetMath({ shapeGroups: [{ shapes: [{ text: txt }] }] } as unknown as Worksheet, {
+    loadMathJax: async () => {},
+    mathMLToSvg: async () => ({ svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 }),
+  });
+  const { ctx, calls, images } = record();
+  drawShapeText(ctx, txt, 300, 300, 1);
+  expect(calls.map((c) => c.text)).toEqual(['A', 'B']);
+  expect(images).toHaveLength(1);
+  expect(images[0]).toMatchObject({ w: 72, h: 48, angle: 0 });
+  expect(images[0].x + 36).toBeCloseTo(calls[0].x);
+  expect(calls[1].y - calls[0].y).toBeCloseTo(images[0].y + 48);
 });

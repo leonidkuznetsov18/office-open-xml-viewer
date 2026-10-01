@@ -8,7 +8,13 @@ import { excelShapeSpacing } from './shape-office-line.js';
 import type { ShapeText, ShapeTextRun } from './types.js';
 
 type TextRun = Extract<ShapeTextRun, { type: 'text' }>;
-type Style = { font: string; px: number; face?: string; color: string; spacing: number; bold: boolean; italic: boolean };
+export interface StackedEquation {
+  width: number;
+  height: number;
+  draw(x: number, y: number): void;
+}
+
+type Style = { equation?: StackedEquation; font: string; px: number; face?: string; color: string; spacing: number; bold: boolean; italic: boolean };
 type Glyph = StackedGlyph<Style> & { cell: number; ascent: number; descent: number };
 
 /**
@@ -21,7 +27,9 @@ type Glyph = StackedGlyph<Style> & { cell: number; ascent: number; descent: numb
  * claim. Glyph metrics, vertical forms and shaping follow the available font.
  * Excel's PDF clips at the worksheet print region, not at each shape: keep
  * overflow for the caller's worksheet/viewport clip (no added body clip).
- * Stacked OMML equations are unsupported; no Office control covers them.
+ * OMML uses an atomic upright box from the existing equation renderer; its
+ * height advances along the column and its width sizes the column (library
+ * policy, not a claim about Office equation positioning).
  */
 export function drawShapeStackedText(
   ctx: CanvasRenderingContext2D,
@@ -30,6 +38,7 @@ export function drawShapeStackedText(
   rect: DrawingMlTextRect,
   pxPerPt: number,
   resolveFont: (run: TextRun, text: string) => { font: string; px: number; face?: string },
+  equation: (run: Extract<ShapeTextRun, { type: 'math' }>, precedingSizePt: number) => StackedEquation,
 ): void {
   const measure = (text: string, style: Style): Glyph[] => {
     ctx.font = style.font;
@@ -57,14 +66,23 @@ export function drawShapeStackedText(
     }
     return glyphs;
   };
-  const sameStyle = (a: Style, b: Style) => a.font === b.font && a.color === b.color && a.spacing === b.spacing;
+  const sameStyle = (a: Style, b: Style) => !a.equation && !b.equation && a.font === b.font && a.color === b.color && a.spacing === b.spacing;
   const paragraphs: StackedParagraph<Style>[] = body.paragraphs.map((para) => {
     const runs: DrawingMlInputRun<Style>[] = [];
     let mark: Style | undefined;
     let previousFaceText = '';
+    let precedingSizePt = 11;
     for (const run of para.runs) {
       if (run.type === 'break') { runs.push({ type: 'break' }); continue; }
-      if (run.type !== 'text') continue;
+      if (run.type === 'math') {
+        const object = equation(run, precedingSizePt);
+        const style: Style = { font: '', px: 0, color: run.color ?? '#000000',
+          spacing: 0, bold: false, italic: false, equation: object };
+        runs.push({ type: 'object', width: object.height, style, display: run.display });
+        previousFaceText = '';
+        continue;
+      }
+      precedingSizePt = run.size > 0 ? run.size : 11;
       // Split only at face changes. Equivalent adjacent run styles can still
       // join in the shared breaker, preserving combining/ZWJ clusters.
       let piece = '';
@@ -98,9 +116,18 @@ export function drawShapeStackedText(
     wrap: body.wrap !== 'none', spcFirstLastPara: body.spcFirstLastPara,
     lnSpcReduction: body.autoFit === 'norm' ? body.lnSpcReduction ?? 0 : 0,
     pxPerPt, glyphs: measure, sameStyle,
+    objectGlyph: ({ style }) => {
+      const object = style.equation!;
+      return { text: '', style, kind: 'upright', advance: object.height,
+        thickness: object.width, space: false, cell: object.height, ascent: 0, descent: 0 };
+    },
   });
   ctx.save();
   for (const glyph of layout.glyphs) {
+    if (glyph.style.equation) {
+      glyph.style.equation.draw(glyph.axisX - glyph.thickness / 2, glyph.cellTop);
+      continue;
+    }
     if (glyph.space) continue;
     ctx.font = glyph.style.font;
     ctx.fillStyle = glyph.style.color;
