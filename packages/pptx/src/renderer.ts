@@ -4324,6 +4324,17 @@ function renderStackedTextBody(
     pxPerPt,
     paragraphs,
     sameStyle,
+    drawObject: (style, x, y) => {
+      const equation = style.math!;
+      const render = mathRenders.get(equation.nodes);
+      // Match horizontal paint: optional/failed math has no ink or warning.
+      // Core stacked layout preserves the display boundary's blank column.
+      if (!render) return;
+      const height = equation.ascent + equation.descent;
+      if (equation.width > 0 && height > 0) {
+        ctx.drawImage(tintedMathImage(render, style.color), x, y, equation.width, height);
+      }
+    },
   });
   if (!onTextRun) return;
   for (const run of runs) {

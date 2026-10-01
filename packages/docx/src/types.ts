@@ -950,10 +950,12 @@ export interface ShapeRun {
   textAnchor?: string | null;
   /** ECMA-376 §21.1.2.1.1 auto-fit mode from `<wps:bodyPr>`, normalized to the
    *  shared core `autoFit` vocabulary (core `src/types/common.ts`): "none"
-   *  (`<a:noAutofit/>`, fixed box — overflowing text is CLIPPED to the box),
+   *  (`<a:noAutofit/>`, fixed box; stacked WordArt retains Word's visible overflow),
    *  "sp" (`<a:spAutoFit/>`, box grows to text), or "norm" (`<a:normAutofit/>`,
    *  text shrinks). Absent ⇒ overflow visible. */
   textAutofit?: string | null;
+  /** ECMA-376 §21.1.2.1.1 bodyPr@wrap (square default, none permits overflow). */
+  textWrap?: string | null;
   textInsetL?: number;  // pt
   textInsetT?: number;  // pt
   textInsetR?: number;  // pt
@@ -963,8 +965,9 @@ export interface ShapeRun {
    *  "vert" (all glyphs 90° CW, chars T→B, lines R→L), "vert270" (all glyphs 270°
    *  CW = 90° CCW, chars B→T, lines L→R), and "eaVert" (East-Asian upright: CJK
    *  stands upright, non-EA rotated 90°, chars T→B, lines R→L). "horz"/absent ⇒
-   *  horizontal (unchanged). Unrecognised values ("mongolianVert", "wordArtVert",
-   *  …) fall back to horizontal until implemented. */
+   *  horizontal (unchanged). WordArt modes use Word's mixed-orientation,
+   *  left-to-right column layout (both wordArtVert and wordArtVertRtl).
+   *  Other unrecognised values fall back to horizontal. */
   textVert?: string | null;
   /** ECMA-376 Part 4 §19.1.2.23 `<v:textpath>` — WordArt text laid on the
    *  shape path (a text watermark). When set the renderer draws this string,

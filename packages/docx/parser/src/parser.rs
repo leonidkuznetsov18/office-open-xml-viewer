@@ -9937,6 +9937,7 @@ fn parse_wsp_shape(
         anchor: text_anchor,
         autofit: text_autofit,
         vert: text_vert,
+        wrap: text_wrap,
         inset_l: text_inset_l,
         inset_t: text_inset_t,
         inset_r: text_inset_r,
@@ -9981,6 +9982,7 @@ fn parse_wsp_shape(
         default_text_color,
         text_anchor,
         text_autofit,
+        text_wrap,
         text_vert,
         text_inset_l,
         text_inset_t,
@@ -10073,6 +10075,7 @@ struct ShapeTextBody {
     anchor: Option<String>,
     autofit: Option<String>,
     vert: Option<String>,
+    wrap: Option<String>,
     inset_l: f64,
     inset_t: f64,
     inset_r: f64,
@@ -10281,16 +10284,20 @@ fn parse_shape_text_body(
     let anchor = body_pr
         .and_then(|b| b.attribute("anchor"))
         .map(|s| s.to_string());
-    // ECMA-376 §20.1.10.83 `<wps:bodyPr vert>` (ST_TextVerticalType) — the text
-    // body's flow direction. Carried verbatim; the renderer maps the recognised
-    // values (vert / vert270 / eaVert) and falls unknown ones back to horizontal.
+    // ECMA-376 §21.1.2.1.1: wrap="none" permits inline overflow rather than
+    // starting another line/column. An absent attribute uses square wrapping.
+    let wrap = body_pr
+        .and_then(|b| b.attribute("wrap"))
+        .map(str::to_string);
+    // ECMA-376 §20.1.10.83 `<wps:bodyPr vert>` (ST_TextVerticalType): carry
+    // the direction verbatim into the host-specific retained text-box layout.
     let vert = body_pr
         .and_then(|b| b.attribute("vert"))
         .map(|s| s.to_string());
     // ECMA-376 §21.1.2.1.1 auto-fit: the bodyPr's autofit is a CHILD element,
     // one of <a:noAutofit/> / <a:spAutoFit/> / <a:normAutofit/>. Normalize it to
     // the shared core vocabulary (packages/core src/types/common.ts `autoFit`):
-    // `noAutofit → "none"` (fixed box → the renderer clips overflow),
+    // `noAutofit → "none"` (fixed box; retained layout owns the overflow policy),
     // `spAutoFit → "sp"` (box grows to fit), `normAutofit → "norm"` (text
     // shrinks to fit). This matches the pptx path so all three formats emit the
     // same enum; an absent auto-fit ⇒ None (overflow visible).
@@ -10339,6 +10346,7 @@ fn parse_shape_text_body(
         anchor,
         autofit,
         vert,
+        wrap,
         inset_l: l,
         inset_t: t,
         inset_r: r,
@@ -23898,6 +23906,25 @@ mod txbx_inline_image_tests {
         // Absent vert ⇒ None (horizontal); absent bodyPr ⇒ None.
         assert_eq!(vert_of(wsp(r#"<wps:bodyPr/>"#)), None);
         assert_eq!(vert_of(wsp("")), None);
+    }
+
+    #[test]
+    fn parse_shape_text_body_preserves_nonwrapping_wordart() {
+        let xml = r#"<wps:wsp
+          xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+          xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <wps:txbx><w:txbxContent><w:p><w:r><w:t>ABCDE</w:t></w:r></w:p></w:txbxContent></wps:txbx>
+          <wps:bodyPr vert="wordArtVert" wrap="none"/>
+        </wps:wsp>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let body = parse_shape_text_body(
+            &StyleMap::default(),
+            doc.root_element(),
+            &ThemeColors::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(body.wrap.as_deref(), Some("none"));
+        assert_eq!(body.vert.as_deref(), Some("wordArtVert"));
     }
 
     /// An image-only paragraph (empty text) must NOT be dropped — the prior

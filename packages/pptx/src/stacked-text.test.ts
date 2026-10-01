@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { rasterizeMathSvg } from '@silurus/ooxml-core';
 import type { HyperlinkTarget } from '@silurus/ooxml-core';
-import { layoutParagraph, renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
+import { layoutParagraph, prepareSlideMath, renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
 import { buildPptxTextLayer } from './text-layer.js';
 import type { Paragraph, TextBody, TextRunData } from './types.js';
+
+vi.mock('@silurus/ooxml-core', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core')>(),
+  rasterizeMathSvg: vi.fn(async () => ({ source: {} })),
+  tintMathRaster: () => ({}),
+}));
 
 // ECMA-376 §20.1.10.83 wordArtVert / wordArtVertRtl through the PowerPoint
 // renderer: segments become stacked glyphs (core layoutStackedText) and each
@@ -11,7 +18,7 @@ const SCALE = 1 / 12700; // 1 pt → 1 px
 
 interface Call { text: string; x: number; y: number; rot: number; tx: number; ty: number; align: string }
 
-function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
+function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[]; images: { x: number; y: number; w: number; h: number; rot: number }[] } {
   let font = '24px serif';
   let textAlign: CanvasTextAlign = 'left';
   let textBaseline: CanvasTextBaseline = 'alphabetic';
@@ -21,9 +28,11 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
   const stack: [number, number, number][] = [];
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '24');
   const calls: Call[] = [];
+  const images: { x: number; y: number; w: number; h: number; rot: number }[] = [];
   const ctx = {
     canvas: { style: {} },
     get font() { return font; }, set font(v: string) { font = v; },
+    drawImage(_image: unknown, x: number, y: number, w: number, h: number) { images.push({ x, y, w, h, rot }); },
     fillStyle: '#000', strokeStyle: '#000', lineWidth: 1, letterSpacing: '0px', direction: 'ltr',
     get textAlign() { return textAlign; }, set textAlign(v: CanvasTextAlign) { textAlign = v; },
     get textBaseline() { return textBaseline; }, set textBaseline(v: CanvasTextBaseline) { textBaseline = v; },
@@ -40,7 +49,7 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[] } {
     scale: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, stroke: () => {},
     fill: () => {}, clip: () => {}, rect: () => {}, fillRect: () => {}, setLineDash: () => {},
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, calls };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, calls, images };
 }
 
 function body(text: string, vert: string, fontFamilyEa?: string, hyperlink?: string): TextBody {
@@ -74,7 +83,7 @@ function fakeEl(): FakeEl {
   };
   return el;
 }
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 // Arial 24 pt: cell 7/6 × 1.1172 em × 24 = 31.28, descent 0.2119 em.
 const CELL = (7 / 6) * (2288 / 2048) * 24;
@@ -214,4 +223,87 @@ describe('cluster segmentation cost', () => {
     expect(calls.map((c) => c.text.length)).toEqual([80_001, 1]);
     expect(performance.now() - start).toBeLessThan(5_000);
   }, 60_000);
+});
+
+// Compare cached and unavailable OMML geometry with the horizontal host rule.
+it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation geometry in both stacked modes', async (failure) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
+  try {
+    for (const display of [false, true]) {
+      const outcomes = [];
+      let horizontalImage: { w: number; h: number } | undefined;
+      for (const vert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
+        warn.mockClear(); error.mockClear();
+        const equation = { type: 'math' as const, nodes: [{ kind: 'run' as const, text: 'x', style: 'italic' as const }], display, fontSize: 18 };
+        const engine = {
+          loadMathJax: async () => {},
+          mathMLToSvg: async () => {
+            if (failure === 'conversion') throw new Error('conversion failed');
+            return { svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 };
+          },
+        };
+        const b = body('A', vert);
+        const text = b.paragraphs[0].runs[0] as TextRunData;
+        b.paragraphs[0].runs = [text, equation, { ...text, text: 'B' }];
+        if (failure !== 'no engine') {
+          await prepareSlideMath({ elements: [{ type: 'shape', textBody: b }] } as unknown as import('./types.js').Slide, engine);
+        }
+        const { ctx, calls, images } = mockCtx();
+        renderTextBody(ctx, b, 0, 0, 300, 300, SCALE);
+        if (failure === 'cached') {
+          expect(images).toHaveLength(1);
+          const image = images[0];
+          expect(image).toMatchObject({ w: 54, h: 36, rot: 0 });
+          if (vert === 'horz') {
+            horizontalImage = image;
+            if (!display) {
+              expect(image.x - calls[0].x).toBeCloseTo(14.4);
+              expect(calls[1].x - image.x).toBeCloseTo(image.w);
+              expect(calls[1].y).toBeCloseTo(calls[0].y);
+            } else {
+              expect(image.y).toBeGreaterThan(calls[0].y);
+              expect(calls[1].y).toBeGreaterThan(image.y + image.h);
+            }
+          } else {
+            expect(image.w).toBe(horizontalImage!.w);
+            expect(image.h).toBe(horizontalImage!.h);
+            const sign = vert === 'wordArtVert' ? 1 : -1;
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display ? sign * (CELL + image.w) : 0);
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 0 : CELL + image.h);
+            expect(image.x + image.w / 2 - calls[0].x).toBeCloseTo(display ? sign * (CELL + image.w) / 2 : 0);
+            expect(image.y).toBeCloseTo(3.6 + (display ? 0 : CELL));
+          }
+        } else {
+          // Horizontal reserves a blank display line, but no inline advance.
+          // Its stacked counterpart uses the mark cell for that blank column.
+          const control = mockCtx();
+          const blank = { ...b, paragraphs: [{ ...b.paragraphs[0], runs: [text,
+            ...(display ? [{ type: 'break' as const }, { type: 'break' as const }] : []),
+            { ...text, text: 'B' }] }] };
+          renderTextBody(control.ctx, blank, 0, 0, 300, 300, SCALE);
+          if (vert !== 'horz') {
+            expect(calls).toEqual(control.calls);
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display
+              ? (vert === 'wordArtVert' ? 2 * CELL : -2 * CELL) : 0);
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 0 : CELL);
+          } else {
+            const lines = layoutParagraph(ctx, b.paragraphs[0], 300, 24, '#000', SCALE, 0);
+            expect(lines).toHaveLength(display ? 3 : 1);
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display ? 0 : 14.4);
+            // Mock font box = 1.1 em; horizontal default line leading = -1.2 px.
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 2 * (24 * 1.1 - 1.2) : 0);
+          }
+        }
+        const outcome = { text: calls.map((c) => c.text).join(''), images: images.length,
+          warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
+        expect(outcome).toEqual({ text: 'AB', images: failure === 'cached' ? 1 : 0, warnings: [], errors: [] });
+        outcomes.push(outcome);
+      }
+      expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);
+    }
+  } finally {
+    vi.mocked(rasterizeMathSvg).mockResolvedValue({ source: {} as CanvasImageSource, widthPx: 3, heightPx: 2 });
+  }
 });
