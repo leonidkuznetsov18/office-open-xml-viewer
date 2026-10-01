@@ -96,6 +96,7 @@ import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { normalizeLayoutOptions, type LayoutOptions } from './layout/options.js';
 import type { LayoutVariantStore } from './layout/variant-store.js';
 import { publishDocxLayout } from './document-layout-events.js';
+import { unchangedLeadingPageCount } from './layout/unchanged-pages.js';
 import {
   docxLayoutViewRequester,
   publishDocxLayoutView,
@@ -712,6 +713,7 @@ export class DocxDocument {
               onPreview: (preview) => {
                 if (!ownsPublication) return;
                 const first = publishedLayout === null;
+                const unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, preview.layout.pages);
                 const retainedPreview = progressiveDocument._replaceMainLayoutPublication(
                   store,
                   layoutOptions,
@@ -737,6 +739,7 @@ export class DocxDocument {
                     pageCount: preview.layout.pages.length,
                     exact: preview.exact,
                     complete: false,
+                    unchangedPages,
                   });
                   progressiveDocument._layoutObservers.notify('onLayoutPartial', opts.onLayoutPartial, {
                     availableUnits: preview.layout.pages.length,
@@ -756,7 +759,9 @@ export class DocxDocument {
           ).then((layout) => {
             // Replace only the exact prefix this drain last published. A newer
             // synchronous rebuild of the same variant owns the key otherwise.
+            let unchangedPages: number | undefined;
             if (ownsPublication) {
+              unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, layout.pages);
               const authoritative = progressiveDocument._replaceMainLayoutPublication(
                 store,
                 layoutOptions,
@@ -773,6 +778,9 @@ export class DocxDocument {
               pageCount: progressiveDocument.pageCount,
               exact: true,
               complete: true,
+              // Only this session's own publications were on screen.
+              ...(ownsPublication && progressiveDocument._isLayoutViewActive(layoutOptions)
+                && unchangedPages !== undefined ? { unchangedPages } : {}),
             });
             // The terminal success callback fires exactly once per load,
             // whether or not any partial was published — consumers must not
@@ -997,6 +1005,7 @@ export class DocxDocument {
         pageCount: res.partial.pageCount,
         exact: res.partial.exact,
         complete: false,
+        ...(res.partial.unchangedPages === undefined ? {} : { unchangedPages: res.partial.unchangedPages }),
       });
       this._layoutObservers.notify('onLayoutPartial', progressive.onPartial, {
         availableUnits: res.partial.pageCount,
@@ -1047,10 +1056,14 @@ export class DocxDocument {
   }
 
   /** Install the authoritative metadata and close the progressive window. */
-  private _onAuthoritativeMeta(meta: DocumentMeta): void {
+  private _onAuthoritativeMeta(meta: DocumentMeta, unchangedPages?: number): void {
     this._clearParseWatchdog();
     const progressive = this._progressive;
     if (progressive?.settled) return;
+    // The worker compares against its own last publication, which is what
+    // the host shows only while the load's view is still the active one.
+    const viewedPublication = progressive !== null && this._meta !== null
+      && this._isLayoutViewActive(progressive.layoutOptions);
     if (!progressive || this._isLayoutViewActive(progressive.layoutOptions) || !this._meta) {
       this._meta = meta;
     } else {
@@ -1076,6 +1089,7 @@ export class DocxDocument {
       pageCount: this.pageCount,
       exact: true,
       complete: true,
+      ...(viewedPublication && unchangedPages !== undefined ? { unchangedPages } : {}),
     });
     // A load whose worker published nothing resolves here instead — there was
     // never anything to show early, so `load()` waited for the real document.
@@ -1266,9 +1280,8 @@ export class DocxDocument {
           progressive.firstPublication.resolve();
           return;
         }
-        this._onAuthoritativeMeta(
-          (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta,
-        );
+        const parsed = res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>;
+        this._onAuthoritativeMeta(parsed.meta, parsed.unchangedPages);
       },
       (error: unknown) => {
         this._parseRequestId = null;

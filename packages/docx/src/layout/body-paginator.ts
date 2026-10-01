@@ -783,6 +783,13 @@ interface BodyPaginationPassObserver {
   /** Receives, in pass order, every value the pass reads from the page-anchor
    * convergence carry (see `anchorStablePageLimit`). */
   onPageAnchorInput?(event: PageAnchorInputEvent): void;
+  /** Whether the applied anchor plan is still being discovered through this
+   * page. The pass suspends (yields) before reading the plan there until it
+   * is not, so whoever drives it can make progress elsewhere meanwhile. */
+  pageAnchorPlanPending?(pageIndex: number): boolean;
+  /** Receives the committed page drafts at each suspension point; all but
+   * the last (live) one are closed. */
+  onPageDrafts?(pages: readonly CanonicalPageDraft[]): void;
 }
 
 type PageStartAnchors = PageAnchorPrescanInput['anchors'];
@@ -1012,7 +1019,14 @@ function* paginateBodyPassSteps(
   // Anchor-line deferrals applied on the current physical page.
   let deferralPage = -1;
   const appliedDeferralKeys = new Set<string>();
-  const prescanPageAnchors = (target: BodyPaginationState, startIndex: number) => {
+  const prescanPageAnchors = function* (
+    target: BodyPaginationState,
+    startIndex: number,
+  ): Generator<number, void, void> {
+    if (anchorDestinations !== null && observer?.pageAnchorPlanPending) {
+      const pageIndex = acquisitionLocation(target).pageIndex;
+      while (observer.pageAnchorPlanPending(pageIndex)) yield target.pages.length;
+    }
     const anchors = pageStartAnchors(target, startIndex);
     const at = acquisitionLocation(target);
     // Recorded even when empty: a later pass that prescans anchors here
@@ -1080,13 +1094,13 @@ function* paginateBodyPassSteps(
     }
     return undefined;
   };
-  prescanPageAnchors(state, 0);
-  const commitTransition = (
+  yield* prescanPageAnchors(state, 0);
+  const commitTransition = function* (
     transition: ReturnType<typeof applyAuthoredBreak>,
     nextEntryIndex: number,
     suppressFirstParagraphSpaceBefore = false,
     skipPageAnchorPrescan = false,
-  ) => {
+  ): Generator<number, void, void> {
     if (transition.state.pageIndex >= MAX_BODY_LAYOUT_PAGES) {
       throw new Error(`Document page budget exceeded (${MAX_BODY_LAYOUT_PAGES} pages)`);
     }
@@ -1107,7 +1121,7 @@ function* paginateBodyPassSteps(
         : null;
       const nextLocation = acquisitionLocation(state);
       session.resetPageAcquisition(nextLocation);
-      if (!skipPageAnchorPrescan) prescanPageAnchors(state, nextEntryIndex);
+      if (!skipPageAnchorPrescan) yield* prescanPageAnchors(state, nextEntryIndex);
     } else {
       const nextLocation = acquisitionLocation(state);
       session.moveAcquisitionCursor(nextLocation);
@@ -1115,7 +1129,7 @@ function* paginateBodyPassSteps(
       // The outgoing source scan intentionally stopped at the section mark, so
       // acquire incoming page-owned wrap authority before its first paragraph.
       if (opensSamePageColumnRegion) {
-        prescanPageAnchors(state, nextEntryIndex);
+        yield* prescanPageAnchors(state, nextEntryIndex);
       }
     }
   };
@@ -1218,6 +1232,7 @@ function* paginateBodyPassSteps(
   bodyEntries: for (let entryIndex = 0; entryIndex < input.sequence.length; entryIndex += 1) {
     // Suspension point. `state.pages.length` is the committed page count, which
     // is what a progressive driver reports; a synchronous driver discards it.
+    observer?.onPageDrafts?.(state.pages);
     yield state.pages.length;
     // Resume after the scheduler has had the chance to yield to the host. A
     // first publication must never run in the same uninterrupted task as the
@@ -1243,7 +1258,7 @@ function* paginateBodyPassSteps(
         continue;
       }
       const pageIndexBeforeBreak = state.flow.pageIndex;
-      commitTransition(
+      yield* commitTransition(
         applyAuthoredBreak(state.flow, entry.break, entry.parity),
         entryIndex + 1,
       );
@@ -1285,7 +1300,7 @@ function* paginateBodyPassSteps(
         reserves[state.flow.pageIndex] ?? { top: 0, bottom: 0 },
       );
       try {
-        commitTransition(
+        yield* commitTransition(
           beginSection(
             state.flow,
             flowSection(entry.section, state.flow.pageIndex),
@@ -1332,7 +1347,7 @@ function* paginateBodyPassSteps(
         continue;
       }
       if (block.pageBreakBefore) {
-        commitTransition(
+        yield* commitTransition(
           applyAuthoredBreak(state.flow, 'pageBreakBefore'),
           entryIndex,
         );
@@ -1425,7 +1440,7 @@ function* paginateBodyPassSteps(
             && admissionChargePt <= freshExtentPt
             && state.flow.pageHasContent
           ) {
-            commitTransition(
+            yield* commitTransition(
               reserveInvadesCommittedPageContent
                 ? advanceToPage(state.flow, state.flow.section, 'overflow')
                 : advanceColumnOrPage(state.flow, 'overflow'),
@@ -1518,7 +1533,7 @@ function* paginateBodyPassSteps(
             && (keepSetAdmissionPt > location.availableBounds.heightPt || keepSetBlockedByDeferral)
             && keepSetAdmissionPt <= freshPageExtent(state)
           ) {
-            commitTransition(
+            yield* commitTransition(
               advanceColumnOrPage(state.flow, 'overflow'),
               entryIndex,
               true,
@@ -1562,7 +1577,7 @@ function* paginateBodyPassSteps(
               groupExtentPt > location.availableBounds.heightPt
               && groupExtentPt <= freshPageExtent(state)
             ) {
-              commitTransition(
+              yield* commitTransition(
                 advanceColumnOrPage(state.flow, 'overflow'),
                 entryIndex,
               );
@@ -1645,7 +1660,7 @@ function* paginateBodyPassSteps(
           (reservePt) => !footnoteReserveInvadesCommittedPageContent(reservePt),
         );
         if (selected.requiresFreshFlowRegion) {
-          commitTransition(
+          yield* commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
             true,
@@ -1682,7 +1697,7 @@ function* paginateBodyPassSteps(
         }
         cursor = selected.nextCursor;
         if (cursor) {
-          commitTransition(
+          yield* commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
           );
@@ -1712,7 +1727,7 @@ function* paginateBodyPassSteps(
           // intermediate pages may still admit the table. This floor belongs
           // only to this exact convergence run.
           while (state.flow.pageIndex < minimumPage) {
-            commitTransition(
+            yield* commitTransition(
               advanceToPage(state.flow, state.flow.section, 'overflow'),
               entryIndex,
             );
@@ -1838,7 +1853,7 @@ function* paginateBodyPassSteps(
             cursor = acquired.nextCursor;
           }
           if (rebasesFloatingTableOnFreshFrame) continue;
-          commitTransition(
+          yield* commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
           );
@@ -1851,7 +1866,7 @@ function* paginateBodyPassSteps(
           // The acquired table is already a coherent row fragment. A fresh
           // physical page preserves it; another same-page column cannot create
           // more room for the page-wide note band.
-          commitTransition(
+          yield* commitTransition(
             advanceToPage(state.flow, state.flow.section, 'overflow'),
             entryIndex,
           );
@@ -1908,7 +1923,7 @@ function* paginateBodyPassSteps(
               throw new Error('Table overflow requires a finite positive page extent');
             }
             const hasMoreHiddenPages = hiddenOverflowPt > pageExtentPt;
-            commitTransition(
+            yield* commitTransition(
               advanceToPage(state.flow, state.flow.section, 'overflow'),
               entryIndex,
               false,
@@ -1917,7 +1932,7 @@ function* paginateBodyPassSteps(
             hiddenOverflowPt -= pageExtentPt;
           }
         } else if (cursor) {
-          commitTransition(
+          yield* commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
           );
@@ -2750,6 +2765,12 @@ function firstHostCarryPage(layout: DocumentLayout): number {
  * page, whose content is still open. The first pass, which prescans source
  * order rather than a plan, is covered by the same comparison.
  *
+ * A second pass that runs while the first is still discovering
+ * (`LeadingSecondPass`) applies a plan that so far holds only the pages the
+ * first pass has closed. A table missing from that partial plan may still be
+ * placed by the first pass, so its prior destination is unknown rather than
+ * absent, and the bound stops at its reach page (`appliedPlanComplete`).
+ *
  * Scope: this proves stability across anchor convergence only. Later
  * continuous-section balancing and header/footer reserve or pagination-field
  * convergence can still replace a provisional publication (`exact:false`).
@@ -2758,6 +2779,7 @@ function anchorStablePageLimit(
   events: readonly PageAnchorInputEvent[],
   appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
   snapshot: BodyPaginationPassResult,
+  appliedPlanComplete = true,
 ): Readonly<{ limit: number; prescanDisagreementPage: number }> {
   const observed = pageAnchorDestinationPlan(snapshot.layout);
   let limit = livePageIndex(snapshot);
@@ -2785,7 +2807,8 @@ function anchorStablePageLimit(
     }
     const placed = observed.get(event.key);
     const prior = appliedPlan?.get(event.key);
-    if ((event.floor !== undefined && event.floor > event.pageIndex)
+    if ((appliedPlan !== null && prior === undefined && !appliedPlanComplete)
+      || (event.floor !== undefined && event.floor > event.pageIndex)
       || placed?.kind !== 'floating-table'
       || (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(placed))) {
       limit = event.pageIndex;
@@ -2928,7 +2951,29 @@ type ReserveRepaginationCarry = Readonly<{
   anchorPlan: ReturnType<typeof pageAnchorDestinationPlan>;
 }>;
 
+/** An unseeded run's second anchor pass, already advanced while the first
+ * pass ran (see `paginateOpeningPassWithLeadingSecond`). */
+type LeadingSecondPass = Readonly<{
+  /** Whether the carry the solver hands its second step is exactly the one
+   * this pass has been applying. */
+  appliesCarry(
+    plan: ReadonlyMap<string, PageWrapDestination>,
+    minimumTablePageBySource: ReadonlyMap<string, number>,
+    deferrals: AnchorLineDeferrals,
+  ): boolean;
+  /** Completes the pass from where it stands. */
+  finish(): PaginationSteps<BodyPaginationPassResult>;
+}>;
+
 const ANCHOR_PASS_BASE_LIMIT = 16;
+
+/** Page numbering is not an input of `pageAnchorDestinationPlan`; a closed page
+ * is finalized with this placeholder only to read its destinations. */
+const CLOSED_PAGE_NUMBER = Object.freeze({
+  displayNumber: 0,
+  format: 'decimal',
+  sectionOccurrenceId: '',
+});
 
 function* paginateBodyWithAnchorConvergenceSteps(
   input: BodyLayoutInput,
@@ -2963,13 +3008,14 @@ function* paginateBodyWithAnchorConvergenceSteps(
   // whose passes form a different chain.
   const anchorPassObserver = (
     appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
+    appliedPlanComplete: () => boolean = () => true,
   ): BodyPaginationPassObserver | undefined => {
     if (!publisher || seedPlan) return undefined;
     const events: PageAnchorInputEvent[] = [];
     // A prescan disagreement on a closed page is permanent for this pass.
     let ceiling = Number.POSITIVE_INFINITY;
     return passPublicationObserver(publisher, carryBounded((pass) => {
-      const stable = anchorStablePageLimit(events, appliedPlan, pass);
+      const stable = anchorStablePageLimit(events, appliedPlan, pass, appliedPlanComplete());
       ceiling = Math.min(ceiling, stable.prescanDisagreementPage);
       return stable.limit;
     }), {
@@ -2977,9 +3023,152 @@ function* paginateBodyWithAnchorConvergenceSteps(
       canExtend: () => ceiling > publisher.publishedPages,
     });
   };
+  /**
+   * The unseeded run's first pass, with its second pass advanced behind it.
+   *
+   * The second pass applies the plan the first one observes. It reads that
+   * plan only where it opens a page or flow domain (`pageStartAnchors`), and
+   * only that page's destinations. A page the first pass has closed keeps its
+   * destinations: tables are placed at or after the page that reaches them and
+   * drawings on their anchor paragraph's page, so neither lands on a closed
+   * page. The second pass may therefore lay out every page whose opening reads
+   * fall on pages the first pass has closed, with the result identical to the
+   * same pass started after the first one finishes. Its proven-stable prefix
+   * (`anchorStablePageLimit`) can then be published while the first pass is
+   * still discovering destinations, instead of only after it, which for a
+   * document that opens with a page-positioned table is the whole first pass.
+   *
+   * The plan view grows in page order, as `pageAnchorDestinationPlan` builds
+   * the full plan, from each page draft the first pass closes (no snapshot of
+   * the pass is composed, so discovery stays linear in the page count). A
+   * second-pass read of a page not yet closed suspends that pass; the driver
+   * then steps the first pass, every step a scheduler suspension point, until
+   * the page closes. When the first pass finishes, the next solver step must
+   * apply exactly the view's plan, entry for entry; otherwise the overlapped
+   * pass is discarded and the ordinary second pass runs instead. Final
+   * output never depends on whether the overlap was used, only publication
+   * timing does.
+   */
+  function* paginateOpeningPassWithLeadingSecond(): Generator<number, Readonly<{
+    first: BodyPaginationPassResult;
+    second: LeadingSecondPass | null;
+  }>, void> {
+    const view = new Map<string, PageWrapDestination>();
+    // Pages below this index are closed in the first pass.
+    let closedBefore = 0;
+    let abandoned = false;
+    const addDestinations = (pages: readonly LayoutPage[]) => {
+      for (const [key, destination] of pageAnchorDestinationPlan({ pages, diagnostics: [] })) {
+        // A destination on a closed page cannot reappear on a later one; if
+        // it ever did, the view would not be the plan, so stop overlapping.
+        if (view.has(key)) {
+          abandoned = true;
+          return;
+        }
+        view.set(key, destination);
+      }
+    };
+    let firstResult: BodyPaginationPassResult | null = null;
+    let secondResult: BodyPaginationPassResult | null = null;
+    let secondLive = -1;
+    // The page whose plan the suspended second pass is waiting for.
+    let secondWaitsFor: number | null = null;
+    const firstPublisher = anchorPassObserver(null)!;
+    const firstObserver: BodyPaginationPassObserver = {
+      shouldPublish: (committedPages) => firstPublisher.shouldPublish(committedPages),
+      publish: (pass, processedEntries) => firstPublisher.publish(pass, processedEntries),
+      onPageAnchorInput: (event) => firstPublisher.onPageAnchorInput?.(event),
+      // Destinations come from each newly closed page alone: they depend
+      // only on that page's body nodes and section regions, not on page
+      // numbering or later pages, so no snapshot of the pass is composed.
+      onPageDrafts: (pages) => {
+        if (abandoned) return;
+        const closed = pages.length - 1;
+        if (closed <= closedBefore) return;
+        const finalized: LayoutPage[] = [];
+        for (let index = closedBefore; index < closed; index += 1) {
+          const draft = pages[index]!;
+          if (draft.kind === 'parity-blank') continue;
+          finalized.push(finalizeLayoutPage(draft.accumulator, CLOSED_PAGE_NUMBER));
+        }
+        addDestinations(finalized);
+        closedBefore = closed;
+      },
+    };
+    const first = paginateBodyPassSteps(
+      input, services, options, reserves, null, null, balancePlan, firstObserver, null,
+    );
+    const secondPublisher = anchorPassObserver(view, () => firstResult !== null)!;
+    const secondObserver: BodyPaginationPassObserver = {
+      shouldPublish: (committedPages) => !abandoned && secondPublisher.shouldPublish(committedPages),
+      publish: (pass, processedEntries) => secondPublisher.publish(pass, processedEntries),
+      // One body entry can open several pages. The second pass suspends
+      // until the first has closed the page this read needs.
+      pageAnchorPlanPending: (pageIndex) => {
+        secondWaitsFor = !abandoned && firstResult === null && closedBefore <= pageIndex
+          ? pageIndex
+          : null;
+        return secondWaitsFor !== null;
+      },
+      onPageAnchorInput: (event) => secondPublisher.onPageAnchorInput?.(event),
+    };
+    const second = paginateBodyPassSteps(
+      input, services, options, reserves, view, new Map(), balancePlan, secondObserver, null,
+    );
+    // Both passes advance one suspension at a time, each forwarded to the
+    // scheduler, so host turns and cancellation are never starved.
+    const secondMayStep = () => !abandoned && secondResult === null && (
+      secondWaitsFor !== null
+        ? closedBefore > secondWaitsFor
+        // Keep the second pass at most one page behind the closed prefix.
+        : closedBefore > secondLive + 1);
+    while (firstResult === null) {
+      if (secondMayStep()) {
+        const next = second.next();
+        if (next.done) secondResult = next.value;
+        else {
+          if (secondWaitsFor === null) secondLive = next.value - 1;
+          yield next.value;
+        }
+        continue;
+      }
+      const step = first.next();
+      if (step.done) {
+        firstResult = step.value;
+        if (!abandoned) {
+          addDestinations(step.value.layout.pages.filter((page) => page.pageIndex >= closedBefore));
+        }
+        break;
+      }
+      yield step.value;
+    }
+    const firstPass = firstResult as BodyPaginationPassResult | null;
+    if (firstPass === null) throw new Error('The opening anchor pass did not complete');
+    if (abandoned) return Object.freeze({ first: firstPass, second: null });
+    const appliedPlan = JSON.stringify([...view]);
+    return Object.freeze({
+      first: firstPass,
+      second: Object.freeze({
+        appliesCarry: (
+          plan: ReadonlyMap<string, PageWrapDestination>,
+          minimumTablePageBySource: ReadonlyMap<string, number>,
+          deferrals: AnchorLineDeferrals,
+        ) => (
+          minimumTablePageBySource.size === 0 && deferrals.size === 0
+          && JSON.stringify([...plan]) === appliedPlan
+        ),
+        finish: function* () {
+          if (abandoned) throw new Error('An abandoned overlapped anchor pass cannot finish');
+          return secondResult ?? (yield* second);
+        },
+      }),
+    });
+  }
   const converge = function* (
-    initialPlan?: ReadonlyMap<string, PageWrapDestination>,
-    publish = true,
+    // `null` throughout, matching the solver's first-pass `previous`: an
+    // unseeded run has no applied plan, which is not an omitted argument.
+    initialPlan: ReadonlyMap<string, PageWrapDestination> | null,
+    publish: boolean,
   ) {
     type AnchorPassCarry = Readonly<{
       plan: ReadonlyMap<string, PageWrapDestination>;
@@ -2991,6 +3180,9 @@ function* paginateBodyWithAnchorConvergenceSteps(
     let restart: AnchorPassCarry | null = null;
     const latest: { carry: AnchorPassCarry | null } = { carry: null };
     let remainingPasses = anchorPassLimit;
+    // Only the unseeded publishing run publishes, so only it overlaps its
+    // second pass with its first (see `LeadingSecondPass`).
+    let leadingSecond: LeadingSecondPass | null = null;
     const identity = (value: AnchorPassCarry) => anchorCarryIdentity(value.plan, value.deferrals)
       // Preserve main's detector until recovery. Once floors are pinned, they
       // are persistent solver input and must participate in exact equality.
@@ -3002,22 +3194,35 @@ function* paginateBodyWithAnchorConvergenceSteps(
         }>, number, AnchorPassCarry>({
           ...(restart
             ? { seedState: identity(restart) }
-            : initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
-          step: function* anchorPass(previous) {
-            previous ??= restart;
-            const appliedPlan = previous?.plan ?? initialPlan ?? null;
+            : initialPlan !== null ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
+          step: function* anchorPass(carried) {
+            const previous = carried ?? restart;
+            const appliedPlan = previous !== null ? previous.plan : initialPlan;
             const appliedDeferrals = previous?.deferrals ?? noDeferrals;
-            const pass = yield* paginateBodyPassSteps(
-              input,
-              services,
-              options,
-              reserves,
-              appliedPlan,
-              previous?.minimumTablePageBySource ?? null,
-              balancePlan,
-              publish ? anchorPassObserver(appliedPlan) : undefined,
-              appliedDeferrals.size > 0 ? appliedDeferrals : null,
-            );
+            const overlapsSecond = publish && publisher !== undefined && seedPlan === undefined
+              && previous === null && appliedPlan === null;
+            const leading = leadingSecond;
+            leadingSecond = null;
+            const pass = overlapsSecond
+              ? yield* (function* () {
+                const opening = yield* paginateOpeningPassWithLeadingSecond();
+                leadingSecond = opening.second;
+                return opening.first;
+              })()
+              : leading !== null && previous !== null
+                && leading.appliesCarry(previous.plan, previous.minimumTablePageBySource, appliedDeferrals)
+                ? yield* leading.finish()
+                : yield* paginateBodyPassSteps(
+                  input,
+                  services,
+                  options,
+                  reserves,
+                  appliedPlan,
+                  previous?.minimumTablePageBySource ?? null,
+                  balancePlan,
+                  publish ? anchorPassObserver(appliedPlan) : undefined,
+                  appliedDeferrals.size > 0 ? appliedDeferrals : null,
+                );
             const observed = pageAnchorDestinationPlan(pass.layout);
             for (const [key, destination] of keptHostAnchorCarries(appliedPlan, pass.layout)) {
               observed.set(key, destination);
@@ -3085,7 +3290,8 @@ function* paginateBodyWithAnchorConvergenceSteps(
         // Keep the existing unseeded retry for a carried plan and the existing
         // host-drawing fallback. Only an otherwise-fatal source-order cycle
         // enters recovery, so successful retry paths retain their output.
-        if (initialPlan || !publish || !(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
+        leadingSecond = null;
+        if (initialPlan !== null || !publish || !(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
           || latest.carry === null) throw error;
         // Library termination policy, not a claim about Word placement:
         // §17.4.57 defines page-relative geometry but not this solver's cycle
@@ -3135,13 +3341,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
     }
     try {
       try {
-        return yield* converge(seedPlan);
+        return yield* converge(seedPlan ?? null, true);
       } catch (error) {
         if (!seedPlan || !(error instanceof ExactConvergenceError)) throw error;
         // A plan carried from another reserve/balance run is only a starting
         // estimate. Its former page ownership may be invalid in this run; retry
         // once from the unseeded source order before reporting non-convergence.
-        return yield* converge();
+        return yield* converge(null, true);
       }
     } catch (error) {
       if (error instanceof ExactConvergenceError) {
