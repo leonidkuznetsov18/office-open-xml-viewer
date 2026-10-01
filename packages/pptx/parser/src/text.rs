@@ -23,7 +23,7 @@ struct InheritedRelationship {
     target: String,
     /// Set for master/layout levels. Slide-local targets retain the existing
     /// slide-relative representation used by the viewer.
-    source_dir: Option<String>,
+    source_part: Option<String>,
 }
 
 fn merge_attributes(higher: &PropertyAttributes, lower: &PropertyAttributes) -> PropertyAttributes {
@@ -1032,7 +1032,7 @@ impl RunProperties {
             .map(|id| {
                 rels.get(id).map(|target| InheritedRelationship {
                     target: target.clone(),
-                    source_dir: None,
+                    source_part: None,
                 })
             });
         self.hlink_mouse_over_target = self
@@ -1042,7 +1042,7 @@ impl RunProperties {
             .map(|id| {
                 rels.get(id).map(|target| InheritedRelationship {
                     target: target.clone(),
-                    source_dir: None,
+                    source_part: None,
                 })
             });
         self
@@ -1051,13 +1051,13 @@ impl RunProperties {
     /// Retain the relationship owner until after the attribute-wise cascade.
     /// A nearer level may author @action without a new r:id, so resolving the
     /// target here would miss a later hlinksldjump action.
-    pub(crate) fn with_part_targets(mut self, part_dir: &str) -> Self {
+    pub(crate) fn with_part_targets(mut self, source_part: &str) -> Self {
         for link in [
             &mut self.hlink_click_target,
             &mut self.hlink_mouse_over_target,
         ] {
             if let Some(Some(relationship)) = link {
-                relationship.source_dir = Some(part_dir.to_owned());
+                relationship.source_part = Some(source_part.to_owned());
             }
         }
         self
@@ -1355,7 +1355,7 @@ pub(crate) fn parse_text_body(
     tx_body: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     inherited_font_size: Option<f64>,
     inherited_level_font_sizes: LevelFontSizes,
     inherited_level_colors: LevelColors,
@@ -1542,7 +1542,7 @@ pub(crate) fn parse_text_body(
     // §6.5.2.3), the same base as the containing shape's picture fills.
     let mut resolve_slide_blip = |rid: &str| -> Option<String> {
         let target = rels.get(rid)?;
-        let path = resolve_path(source_dir, target);
+        let path = resolve_path(source_part, target);
         // Verify the part exists so a listed-but-missing rId yields None and the
         // bullet falls through to Bullet::Inherit (matches the variant's doc
         // comment), mirroring the slide picture-fill resolvers. `index_for_name`
@@ -1604,7 +1604,7 @@ pub(crate) fn parse_text_body(
                 p,
                 theme,
                 rels,
-                source_dir,
+                source_part,
                 body_default_alignment.as_deref(),
                 &effective_level_alignments,
                 body_default_ea_ln_brk,
@@ -1770,7 +1770,7 @@ pub(crate) fn parse_paragraph(
     p_node: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     body_default_alignment: Option<&str>,
     level_alignments: &LevelAlignments,
     body_default_ea_ln_brk: Option<bool>,
@@ -1831,7 +1831,7 @@ pub(crate) fn parse_paragraph(
     // §6.5.2.3).
     let mut resolve_para_blip = |rid: &str| -> Option<String> {
         let target = rels.get(rid)?;
-        let path = resolve_path(source_dir, target);
+        let path = resolve_path(source_part, target);
         // Verify the part exists so a listed-but-missing rId yields None and the
         // buBlip marker falls through (inherit), mirroring the slide picture-fill
         // resolvers. `index_for_name` reads the central directory only (no
@@ -2297,8 +2297,8 @@ fn inherited_hyperlink_target(
         && rel.target.ends_with(".xml")
         && !rel.target.contains("://")
     {
-        if let Some(source_dir) = &rel.source_dir {
-            return Some(resolve_path(source_dir, &rel.target));
+        if let Some(source_part) = &rel.source_part {
+            return Some(resolve_path(source_part, &rel.target));
         }
     }
     Some(rel.target.clone())
@@ -2470,7 +2470,7 @@ mod relationship_owner_tests {
             master.root_element(),
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
         );
         let master_default = &master_levels.placeholders["body"][0];
         let layout_levels =
@@ -2494,7 +2494,7 @@ mod relationship_owner_tests {
     }
 
     #[test]
-    fn inherited_slide_jump_is_resolved_from_master_and_layout_directories() {
+    fn inherited_slide_jump_is_resolved_from_master_and_layout_parts() {
         let doc = roxmltree::Document::parse(
             r#"<rPr
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -2503,10 +2503,13 @@ mod relationship_owner_tests {
         )
         .unwrap();
         let rels = HashMap::from([("rId7".into(), "../slides/slide3.xml".into())]);
-        for part_dir in ["ppt/slideMasters", "ppt/slideLayouts"] {
+        for source_part in [
+            "ppt/slideMasters/slideMaster1.xml",
+            "ppt/slideLayouts/slideLayout1.xml",
+        ] {
             let props = RunProperties::from_xml(doc.root_element(), &HashMap::new())
                 .with_relationships(&rels)
-                .with_part_targets(part_dir);
+                .with_part_targets(source_part);
             assert_eq!(
                 inherited_hyperlink_target(
                     &props.hlink_click_target,
@@ -2523,7 +2526,7 @@ mod relationship_owner_tests {
         .unwrap();
         let props = RunProperties::from_xml(external.root_element(), &HashMap::new())
             .with_relationships(&rels)
-            .with_part_targets("ppt/slideMasters");
+            .with_part_targets("ppt/slideMasters/slideMaster1.xml");
         assert_eq!(
             inherited_hyperlink_target(
                 &props.hlink_click_target,

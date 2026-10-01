@@ -2932,18 +2932,6 @@ fn load_hyperlinks(
 /// normalizing the result as an OPC part name. An invalid target becomes the
 /// empty lookup key, so callers follow their existing missing-part path.
 pub(crate) fn resolve_zip_path(source_part: &str, target: &str) -> String {
-    #[cfg(test)]
-    let test_source_part = if source_part
-        .rsplit('/')
-        .next()
-        .is_some_and(|name| name.contains('.'))
-    {
-        source_part.to_owned()
-    } else {
-        format!("{source_part}/__test_source__.xml")
-    };
-    #[cfg(test)]
-    let source_part = test_source_part.as_str();
     ooxml_common::rels::resolve_part_name(source_part, target).unwrap_or_default()
 }
 
