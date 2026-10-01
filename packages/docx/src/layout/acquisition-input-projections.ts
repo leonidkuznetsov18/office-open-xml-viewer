@@ -1,7 +1,7 @@
 import type { NumberingInfo } from '../types.js';
 import type { ParagraphAcquisitionInput } from './text.js';
 import type { ParagraphLayoutSource } from './text.js';
-import type { TableLayoutSource } from './table-source-acquisition.js';
+import type { TableSourceAcquisitionInput, TableLayoutSource } from './table-source-acquisition.js';
 import type {
   DeepReadonly,
   NumberingMarkerShapeInput,
@@ -25,6 +25,7 @@ export interface BodyAcquisitionInputProjections {
   readonly tableFormatInput: (
     table: TableLayoutSource,
   ) => TableFormatInput;
+  readonly tableSourceAcquisitionInput: (table: TableLayoutSource) => TableSourceAcquisitionInput;
   /** Effective whole-table preference, including the first-row exception. */
   readonly effectiveTablePreferredWidthPt: (
     table: TableLayoutSource,

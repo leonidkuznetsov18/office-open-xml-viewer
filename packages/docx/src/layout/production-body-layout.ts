@@ -31,6 +31,7 @@ import type {
   StoryLayout,
   TableLayout,
   TableLayoutInput,
+  TableColumnLayoutInput,
   TablePreferredWidthConstraint,
 } from './types.js';
 import {
@@ -59,7 +60,9 @@ import { gridForParagraphContext, paragraphMeasurementEnvironment } from './meas
 import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
 import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numbering-marker.js';
+import { projectTableColumnLayoutInput, type TableSourceAcquisitionInput } from './table-source-acquisition.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
+import { decideLogicalTable, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
 import { measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
@@ -70,6 +73,7 @@ import type { DocGridCtx } from '../line-layout.js';
 import { measureParagraph } from '../paragraph-measure.js';
 import {
   acquireRetainedTable,
+  type RetainedTableAcquisition,
   retainedTableAcquisitionIsReusableAcrossPages,
 } from './table-acquisition.js';
 import { combineAdjacentTableLayoutInputs } from './adjacent-table-layout-input.js';
@@ -209,6 +213,7 @@ function buildMeasureState(
     retainedTableAcquisition: {
       layoutServices: (state) => state.layoutServices,
       tableFormat: bodyAcquisitionInputProjections.tableFormatInput,
+      tableDecision: singleTableDecision,
       resolveColumns: resolveColumnWidths,
       createCellState: (state, contentWidthPt, cell) => ({
         ...withTableCellStory(state),
@@ -643,7 +648,8 @@ function acquireBodyStoryLayout(
     }
     const dependencies = candidate.retainedTableAcquisition;
     const table: LayoutTableBlock = element;
-    const columns = resolveColumnWidths(table, request.container.bounds.widthPt, candidate);
+    const decision = singleTableDecision(table, request.container.bounds.widthPt, candidate);
+    const columns = resolveColumnWidths(table, request.container.bounds.widthPt, candidate, decision);
     return [
       acquireRetainedTable(
         table,
@@ -652,6 +658,7 @@ function acquireBodyStoryLayout(
         candidate,
         source,
         dependencies,
+        decision.logical,
       ).input,
     ];
   });
@@ -1257,13 +1264,11 @@ function measureFollowingBodyBlock(
   };
   applyBodyAcquisitionLocationTo(services, candidate, request.location);
   if (request.input.kind === 'adjacent-table-group') {
-    const records = request.input.tables.map((tableInput) => {
+    const records = computeAdjacentTablePtLayouts(candidate, request.input.tables.map((tableInput) => {
       const table = sourceElement(dependencies.source, tableInput.source);
       if (table.type !== 'table') throw new Error('Following table source kind mismatch');
-      const sourceIndex = tableInput.source.path[0]!;
-      computeTablePtLayout(candidate, table, request.availableInlineExtentPt, sourceIndex);
-      return retainedTableRecord(candidate, sourceIndex).acquisition;
-    });
+      return { table, sourceIndex: tableInput.source.path[0]! };
+    }), request.availableInlineExtentPt);
     const combinedInput = ordinaryAcquisitionInputForAdjacentGroup(
       combineAdjacentTableLayoutInputs(
         request.input.logicalSequenceId,
@@ -2136,7 +2141,7 @@ function openConcreteBodyLayoutSession(
       request: Parameters<NonNullable<BodyLayoutSession['measureTable']>>[0],
     ): ReturnType<NonNullable<BodyLayoutSession['measureTable']>> {
       return measureBodyTableEntry(sessionDependencies, request, {
-        setBodyAcquisitionLocation, sourceElement, computeTablePtLayout,
+        setBodyAcquisitionLocation, sourceElement, computeTablePtLayout, computeAdjacentTablePtLayouts,
         ordinaryAcquisitionInputForAdjacentGroup, reacquireBodyTableBlock,
       });
     },
@@ -2212,6 +2217,7 @@ function computeTablePtLayout(
   table: TableLayoutSource,
   contentWPt: number,
   sourceIndex: number,
+  prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>,
 ): { colWidthsPt: number[]; rowContentHeightsPt: number[]; rowHeightsPt: number[] } {
   const prior = state.retainedTablesBySourceIndex.get(sourceIndex);
   if (prior?.contentWidthPt === contentWPt && prior.reusableAcrossPages) {
@@ -2222,7 +2228,9 @@ function computeTablePtLayout(
       rowHeightsPt: priorRowHeightsPt,
     };
   }
-  const colWidthsPt = resolveColumnWidths(table, contentWPt, state);
+  const decision = prepared?.decision ?? singleTableDecision(table, contentWPt, state);
+  const member = prepared?.member ?? decision.logical;
+  const colWidthsPt = prepared ? [...prepared.columns] : resolveColumnWidths(table, contentWPt, state, decision, member);
   const dependencies = state.retainedTableAcquisition;
   const acquired = acquireRetainedTable(
     table,
@@ -2231,6 +2239,7 @@ function computeTablePtLayout(
     state,
     [sourceIndex],
     dependencies,
+    member,
   );
   // Split rows are page-local acquisitions, but an unchanged inline extent
   // retains one authoritative track vector for the table's full occurrence.
@@ -2254,6 +2263,55 @@ function computeTablePtLayout(
   return { colWidthsPt, rowContentHeightsPt: rowHeightsPt, rowHeightsPt };
 }
 
+/** Acquire columns after parser-owned §17.4.37 grouping. Both pagination and
+ * keep-next lookahead use this path, so no authored member can independently
+ * discard a leading track or restart the logical first-row margin anchor. */
+function computeAdjacentTablePtLayouts(
+  state: BodyAcquisitionState,
+  members: readonly Readonly<{ table: TableLayoutSource; sourceIndex: number }>[],
+  contentWPt: number,
+): readonly RetainedTableAcquisition[] {
+  const prior = members.map(({ sourceIndex }) => state.retainedTablesBySourceIndex.get(sourceIndex));
+  if (prior.every((record) => record?.contentWidthPt === contentWPt && record.reusableAcrossPages)) {
+    return prior.map((record) => record!.acquisition);
+  }
+  const first = members[0]!.table;
+  const commonFrame = members.every(({ table }) => table.bidiVisual === first.bidiVisual
+    && table.jc === first.jc && table.tblInd === first.tblInd);
+  const commonGrid = members.every(({ table }) => table.colWidths.length === first.colWidths.length
+    && table.colWidths.every((width, i) => width === first.colWidths[i]));
+  // §17.4.37: resolve measured table-wide properties only after concatenating
+  // logical rows. Keep each row's resolved margins/lexical constraints, but
+  // WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE selects width/layout/indent from
+  // the first logical row, which also owns the leading cell-margin anchor.
+  // Differing authored frames/grids retain the established union policy.
+  const sources = members.map(({ table }) => state.acquisitionInputs.tableSourceAcquisitionInput(table));
+  const logicalTable = Object.freeze({
+    ...first, rows: Object.freeze(members.flatMap(({ table }) => table.rows)),
+  });
+  const logicalRows = Object.freeze(sources.flatMap((source) => source.format.rows));
+  const logicalSource: TableSourceAcquisitionInput = Object.freeze({
+    semantic: Object.freeze({ ...sources[0]!.semantic, rows: Object.freeze(sources.flatMap((source) => source.semantic.rows)) }),
+    lexical: Object.freeze({ ...sources[0]!.lexical, rows: Object.freeze(sources.flatMap((source) => source.lexical.rows)) }),
+    format: Object.freeze({
+      ...sources[0]!.format, rows: logicalRows, firstRowException: logicalRows[0]?.exception ?? null,
+    }),
+  });
+  const decision = decideLogicalTable(logicalTable, logicalSource,
+    members.map(({ table }, i) => ({ table, source: sources[i]! })), contentWPt,
+    tableDecisionEnvironment(state), commonFrame, commonGrid);
+  const logicalColumns = decision.usesLogicalProperties
+    ? resolveColumnWidths(logicalTable, contentWPt, state, decision, decision.logical) : null;
+  return members.map(({ table, sourceIndex }, i) => {
+    const member = decision.members[i]!;
+    computeTablePtLayout(state, table, contentWPt, sourceIndex, {
+      columns: logicalColumns ?? resolveColumnWidths(table, contentWPt, state, decision, member),
+      decision, member,
+    });
+    return retainedTableRecord(state, sourceIndex).acquisition;
+  });
+}
+
 /**
  * Acquire the parser/style facts and intrinsic content constraints required by
  * ECMA-376 §17.18.87, then resolve the shared table grid. `tblGrid` is the
@@ -2261,169 +2319,56 @@ function computeTablePtLayout(
  * authored `tblW`, `tcW`, `wBefore`, and `wAfter` remain active constraints.
  * Exported for the table-layout integration tests.
  */
+function tableDecisionEnvironment(state: BodyMeasurementContext) {
+  return {
+    mode: state.layoutSettings.compat.compatibilityMode,
+    story: state.storyContext?.story,
+    topLevel: state.storyContext?.containers.length === 0,
+    singleColumn: state.sectionLayout?.columns.length === 1,
+    textDirection: state.sectionLayout.textDirection,
+    inTableCell: state.storyContext?.containers.some((container) => container.kind === 'tableCell') ?? false,
+    contentX: state.contentX,
+    pageWidth: state.pageWidth,
+  };
+}
+
+function singleTableDecision(table: TableLayoutSource, contentWPt: number, state: BodyMeasurementContext): LogicalTableDecision {
+  const source = state.acquisitionInputs.tableSourceAcquisitionInput(table);
+  return decideLogicalTable(table, source, [{ table, source }], contentWPt, tableDecisionEnvironment(state));
+}
+
 function resolveColumnWidths(
   table: TableLayoutSource,
   contentWPt: number,
   state: BodyMeasurementContext,
+  decision = singleTableDecision(table, contentWPt, state),
+  member = decision.logical,
 ): number[] {
-  const format = state.acquisitionInputs.tableFormatInput(table);
-  const baseIndentPt = Number.isFinite(table.tblInd) ? (table.tblInd ?? 0) : 0;
-  const rowIndentPts = format.rows.map((row) => {
-    const exception = row.exception;
-    return exception?.indentAuthored
-      ? (exception.indentPt ?? 0)
-      : baseIndentPt;
-  });
-  // §17.18.87 lets AutoFit override its preferred width up to the page width.
-  // For a table with a preferred tblW, keep the ordinary text-band ceiling
-  // unless §17.4.50 placement moves a top-level page-owned story table into
-  // its semantic leading margin (auto-width tables use the leading-indent band
-  // below instead). The promoted ceiling is the physical page distance left
-  // after resolving jc + tblInd, rather than the page width in isolation: a
-  // partial negative indent does not move the table origin all the way to the
-  // page edge. Test the authored indent before bidiVisual reverses its physical translation;
-  // table justification reverses under bidiVisual as well. Body tables must
-  // also remain in a single-column page band; headers and footers are
-  // page-owned stories and do not inherit the body's newspaper columns.
-  const story = state.storyContext?.story;
-  const isTopLevelPageOwnedStory = state.storyContext?.containers.length === 0
-    && (story === 'header'
-      || story === 'footer'
-      || (story === 'body' && state.sectionLayout?.columns.length === 1));
-  const isLeadingMarginPageStoryTable = format.ordinaryFlow
-    && isTopLevelPageOwnedStory
-    && !isVerticalTextDirection(state.sectionLayout.textDirection)
-    && [baseIndentPt, ...rowIndentPts].some((indentPt) => indentPt < 0);
-  const rowPlacements = format.rows.length === 0
-    ? [{ justification: table.jc, indentPt: baseIndentPt }]
-    : format.rows.map((row, rowIndex) => ({
-        justification: row.justification ?? table.jc,
-        indentPt: rowIndentPts[rowIndex] ?? baseIndentPt,
-      }));
-  const bidiVisual = table.bidiVisual === true;
-  const pageFitCeilingPt = Math.min(
-    state.pageWidth,
-    ...rowPlacements.map(({ justification, indentPt }) => {
-      const trailing = justification === 'right' || justification === 'end';
-      const alignment = justification === 'center'
-        ? 'center'
-        : (bidiVisual ? !trailing : trailing) ? 'right' : 'left';
-      const signedIndentPt = bidiVisual ? -indentPt : indentPt;
-      if (alignment === 'left') {
-        const resolvedOriginPt = state.contentX + signedIndentPt;
-        return state.pageWidth - resolvedOriginPt;
-      }
-      if (alignment === 'right') {
-        const resolvedTrailingEdgePt = state.contentX + contentWPt + signedIndentPt;
-        return resolvedTrailingEdgePt;
-      }
-      const resolvedCenterPt = state.contentX + contentWPt / 2 + signedIndentPt;
-      return 2 * Math.min(resolvedCenterPt, state.pageWidth - resolvedCenterPt);
-    }),
-  );
-  const effectiveLayout = format.firstRowException?.layout === 'fixed'
-    ? 'fixed'
-    : table.layout;
-  // WORD_AUTOFIT_LEADING_INDENT_BAND (table-compatibility.ts): for an
-  // AutoFit table with no preferred tblW (§17.4.63 auto), a leading §17.4.50
-  // tblInd moves only the leading edge while the trailing edge stays at the
-  // text band. The text band available to the grid is contentW - tblInd for
-  // either sign, and the physical page is not a ceiling. In mode 14 (or with
-  // the mode omitted) outer cell margins hang outside that band, so the table
-  // adds them in full; mode 15 removes that allowance. The additional
-  // center/right grid-matched controls use that same mode-14 fitted width and
-  // the whole mode-15 band. Their +5.4pt-indent geometry does not settle other
-  // grid/indent combinations or absolute origin policy (see the rule's limits).
-  // WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE makes first-row tblPrEx/tblW authoritative for
-  // the whole table. Use the solver's resolver, including auto clearing dxa.
-  const hasPreferredTableWidth = state.acquisitionInputs.effectiveTablePreferredWidthPt(
-    table, contentWPt,
-  ) !== null;
-  const savedGridWidthPt = table.colWidths.reduce(
-    (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
-  );
-  // Nonleading controls only establish the case where saved grid + indent
-  // equals the band. There the two possible mode-14 ceilings coincide; keep
-  // other nonleading geometries on their established width contract rather
-  // than choosing between indistinguishable hypotheses. The epsilon covers
-  // point arithmetic, not a visual fit tolerance.
-  const hasMeasuredAlignmentGeometry = rowPlacements.every(({ justification, indentPt }) => {
-    const nonleading = justification === 'center' || justification === 'right' || justification === 'end';
-    return !nonleading || Math.abs(savedGridWidthPt + indentPt - contentWPt) <= 1e-9;
-  });
-  const compatibilityMode = state.layoutSettings.compat.compatibilityMode;
-  const hasMeasuredCompatibilityMode = compatibilityMode === undefined
-    || compatibilityMode === 14 || compatibilityMode === 15;
-  const usesLeadingIndentBand = effectiveLayout !== 'fixed'
-    && format.ordinaryFlow
-    && isTopLevelPageOwnedStory
-    && !isVerticalTextDirection(state.sectionLayout.textDirection)
-    && !hasPreferredTableWidth
-    && hasMeasuredCompatibilityMode
-    && hasMeasuredAlignmentGeometry;
-  const outerCellMarginsHangOutsideBand = compatibilityMode === undefined || compatibilityMode === 14;
-  const textBandPt = usesLeadingIndentBand
-    ? Math.max(0, Math.min(...rowPlacements.map(({ justification, indentPt }) => {
-        const trailing = justification === 'right' || justification === 'end';
-        const leading = justification !== 'center' && !trailing;
-        // The center/right controls retain the leading band's width in mode
-        // 14, but use the full text band in mode 15. This is a width rule;
-        // signed placement remains governed separately by MS-OI29500 2.1.155.
-        return leading || outerCellMarginsHangOutsideBand ? contentWPt - indentPt : contentWPt;
-      })))
-    : contentWPt;
-  // WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND (table-compatibility.ts): an AutoFit
-  // grid can include outer §17.4.42 cell margins beyond the text band. For a
-  // preferred-width table, only the margin overhang already represented by
-  // §17.4.48 tblGrid is used (that class is not covered by the mode controls).
-  // A row with skipped outer tracks cannot establish that margin ownership.
-  // A nested table's saved overhang belongs to its containing cell; giving it
-  // the page-table allowance enlarges that cell's contents beyond Word's grid.
-  const possibleOuterCellMarginsPt = effectiveLayout === 'fixed'
-    || !format.ordinaryFlow
-    || (isLeadingMarginPageStoryTable && !usesLeadingIndentBand)
-    || isVerticalTextDirection(state.sectionLayout.textDirection)
-    || state.storyContext?.containers.some((container) => container.kind === 'tableCell')
-    || format.rows.length === 0
-    ? 0
-    : format.rows.reduce((minimumPt, row, rowIndex) => {
-        const sourceRow = table.rows[rowIndex];
-        if (!sourceRow || (sourceRow.gridBefore ?? 0) > 0 || (sourceRow.gridAfter ?? 0) > 0) return 0;
-        const first = row.cells[0]?.marginsPt;
-        const last = row.cells.at(-1)?.marginsPt;
-        const leftPt = first?.left;
-        const rightPt = last?.right;
-        const marginPt = typeof leftPt === 'number' && Number.isFinite(leftPt)
-          && typeof rightPt === 'number' && Number.isFinite(rightPt)
-          ? Math.max(0, leftPt) + Math.max(0, rightPt)
-          : 0;
-        return Math.min(minimumPt, marginPt);
-      }, Number.POSITIVE_INFINITY);
-  // compatSetting compatibilityMode: WORD_AUTOFIT_LEADING_INDENT_BAND treats
-  // an omitted setting like an explicit 14.
-  // The two-cell forced-fit distribution always shares the actual outer
-  // margins; only the ceiling differs by compatibility mode.
-  const forcedFitOuterMarginsPt = usesLeadingIndentBand
-    ? possibleOuterCellMarginsPt
-    : Math.min(possibleOuterCellMarginsPt, Math.max(0, savedGridWidthPt - contentWPt));
-  const outerCellMarginsPt = usesLeadingIndentBand
-    ? (outerCellMarginsHangOutsideBand ? possibleOuterCellMarginsPt : 0)
-    : Math.min(possibleOuterCellMarginsPt, Math.max(0, savedGridWidthPt - contentWPt));
-  // A preferred-width table with a negative indent keeps the older physical
-  // page ceiling (its authored width may reach the page edge); the auto-width
-  // band above supersedes it for tables without a preferred width.
-  const maximumTableWidthPt = (isLeadingMarginPageStoryTable && !usesLeadingIndentBand
-    ? Math.max(contentWPt, pageFitCeilingPt)
-    : textBandPt) + outerCellMarginsPt;
-  const isFixedNestedTable = effectiveLayout === 'fixed'
-    && state.storyContext?.containers.some((container) => container.kind === 'tableCell');
+  const input = acquireTableColumnInput(table, contentWPt, state, member);
+  const normalized = decision.dropsUnusedLeadingGrid ? {
+    ...input,
+    gridWidthsPt: input.gridWidthsPt.map((width, i) => i === 0 ? 0 : width),
+    gridWidthKeys: input.gridWidthKeys?.map((key, i) => i === 0 ? null : key),
+    rows: input.rows.map((row) => ({ ...row, before: null })),
+  } : input;
+  return [...resolveTableColumnWidths(normalized)];
+}
 
+function acquireTableColumnInput(
+  table: TableLayoutSource,
+  contentWPt: number,
+  state: BodyMeasurementContext,
+  decision: TableMemberDecision,
+): TableColumnLayoutInput {
+  const format = decision.source.format;
+  const { maximumTableWidthPt, isFixedNestedTable,
+    usesLeadingIndentBand, forcedFitOuterMarginsPt } = decision;
   const intrinsicWidthsForTable = (
     owner: TableLayoutSource,
-    ownerFormat = state.acquisitionInputs.tableFormatInput(owner),
+    ownerDecision = decision,
   ): ((cell: DeepReadonly<DocTableCell>, preferredWidth: TablePreferredWidthConstraint | null) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
-    const ownerLayout = ownerFormat.firstRowException?.layout === 'fixed'
-      || owner.layout === 'fixed' ? 'fixed' : 'autofit';
+    const ownerFormat = ownerDecision.source.format;
+    const ownerLayout = ownerDecision.effectiveLayout;
     const ownerMargins = new WeakMap<object, Readonly<{ left: number; right: number }>>();
     owner.rows.forEach((row, rowIndex) => row.cells.forEach((cell, cellIndex) => {
       const acquired = ownerFormat.rows[rowIndex]?.cells[cellIndex]?.marginsPt;
@@ -2498,39 +2443,32 @@ function resolveColumnWidths(
           );
           return { ...intrinsic, noWrapWidthPt: unpositioned.maxWidthPt };
         },
-        nestedTable: (nested) => measureTableIntrinsicWidths(
-          state.acquisitionInputs.tableColumnLayoutInput(
-            nested,
-            contentWPt,
-            intrinsicWidthsForTable(nested),
-            contentWPt,
-          ),
-        ),
+        nestedTable: (nested) => {
+          const source = state.acquisitionInputs.tableSourceAcquisitionInput(nested);
+          const nestedDecision = decideLogicalTable(nested, source, [{ table: nested, source }], contentWPt,
+            { ...tableDecisionEnvironment(state), topLevel: false, inTableCell: true });
+          const intrinsic = intrinsicWidthsForTable(nested, nestedDecision.logical);
+          return measureTableIntrinsicWidths(projectTableColumnLayoutInput(source, contentWPt,
+            (row, cellIndex, preferred) => intrinsic(nested.rows[row]!.cells[cellIndex]!, preferred), contentWPt));
+        },
       },
       ownerLayout,
       preferredWidth,
     );
   };
-  const columnInput = state.acquisitionInputs.tableColumnLayoutInput(
-    table,
-    contentWPt,
-    intrinsicWidthsForTable(table, format),
-    isFixedNestedTable
-      // ECMA-376 §17.18.87 resolves a fixed table from its authored tblGrid,
-      // tblW, and tcW constraints. A containing cell is not an implicit tblW:
-      // Word permits such a table to overflow its cell instead of scaling it.
-      // `null` explicitly removes the unrelated physical cell ceiling; it is
-      // not a numeric width and therefore cannot alter authored geometry.
-      ? null
-      : state.acquisitionInputs.tableParticipatesInOrdinaryFlow(table)
-      ? maximumTableWidthPt
-      : Math.max(contentWPt, state.pageWidth),
-  );
-  return [...resolveTableColumnWidths({
+  const maximumWidthPt = isFixedNestedTable
+    // ECMA-376 §17.18.87: the containing cell is not an implicit tblW.
+    ? null
+    : format.ordinaryFlow ? maximumTableWidthPt : Math.max(contentWPt, state.pageWidth);
+  const intrinsicWidths = intrinsicWidthsForTable(table);
+  const columnInput = projectTableColumnLayoutInput(decision.source, contentWPt,
+    (rowIndex, cellIndex, preferred) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferred),
+    maximumWidthPt);
+  return {
     ...columnInput,
     outerMarginAllowancePt: forcedFitOuterMarginsPt,
     growUnpreferredColumns: usesLeadingIndentBand,
-  })];
+  };
 }
 
 // ===== Text frames & drop caps (ECMA-376 §17.3.1.11) =====

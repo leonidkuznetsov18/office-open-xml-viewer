@@ -401,6 +401,11 @@ function sealLayoutSourceStoreWithBody(
     paragraphMarkShapeInput(paragraph) {
       return paragraph.paragraphMarkShapeInput;
     },
+    tableSourceAcquisitionInput(table) {
+      const fact = tableByIdentity.get(table);
+      if (!fact) throw new Error('Unknown table acquisition input');
+      return fact.input;
+    },
     tableFormatInput(table) {
       const fact = tableByIdentity.get(table);
       if (!fact) throw new Error('Unknown table acquisition input');
