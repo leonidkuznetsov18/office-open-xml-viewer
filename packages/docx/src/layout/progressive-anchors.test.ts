@@ -127,6 +127,13 @@ function pageFloatingTable(
   } as unknown as BodyElement;
 }
 
+/** An ordinary (in-flow) table of empty exact-height rows across the column. */
+function ordinaryTable(rows: number, rowHeightPt: number): BodyElement {
+  const { tblpPr: _tblpPr, ...table } = pageFloatingTable(468, 0, rows, rowHeightPt, 0) as unknown as
+    Record<string, unknown>;
+  return table as unknown as BodyElement;
+}
+
 /** `lines` single-line paragraphs; each insert lands at its body index, in order. */
 function documentModel(
   lines: number,
@@ -273,6 +280,45 @@ describe('progressive layout with page-owned anchors', () => {
     expect(counts).toContain(reachedPage);
     expect(counts).not.toContain(placedPage);
     expect(counts.at(-1)!).toBeGreaterThan(placedPage);
+  }, 300_000);
+
+  it('publishes the opening pages of a document that opens with a page table during discovery', async () => {
+    // A page-positioned table on the first page: the source-order first pass
+    // cannot have registered it at the page start, so none of its pages is
+    // final. The second pass, applying the plan of the pages the first has
+    // closed, runs behind it and publishes before discovery finishes. A
+    // three-page ordinary table makes one body entry of the second pass open
+    // pages whose plan the first pass has not closed yet.
+    const lines = 300;
+    const model = documentModel(lines, [
+      [2, pageFloatingTable(468, 300, 2, 100, 0)],
+      [40, ordinaryTable(3 * 27, 24)],
+    ]);
+    const blocking = blockingLayout(model);
+    expect(blocking.passes).toBe(2);
+    expect(tablePages(blocking.layout, 2).placedPage).toBe(0);
+
+    let steps = 0;
+    let stepsAtFirstPreview: number | null = null;
+    const previews: ProgressiveLayoutPreview[] = [];
+    const run = open(model);
+    const before = passes.opened;
+    const final = await layoutDocumentProgressively(run.input, run.services, run.options, {
+      scheduler: { onProgress: () => { steps += 1; } },
+      onPreview: (preview) => {
+        stepsAtFirstPreview ??= steps;
+        previews.push(preview);
+      },
+    });
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blocking.layout));
+    // The overlapped second pass is the solver's second pass, not extra work.
+    expect(passes.opened - before).toBe(blocking.passes);
+    expectPublishedPagesFinal(previews, final);
+    // The first pass alone suspends once per body entry; the opening preview
+    // arrives well before it could have finished.
+    expect(stepsAtFirstPreview).not.toBeNull();
+    expect(stepsAtFirstPreview!).toBeLessThan(run.input.sequence.length / 4);
+    expect(previews.at(-1)!.layout.pages.length).toBeGreaterThan(5);
   }, 300_000);
 
   it('emits no stale page when cancelled during convergence', async () => {

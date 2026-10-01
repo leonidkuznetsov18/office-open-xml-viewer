@@ -783,6 +783,9 @@ interface BodyPaginationPassObserver {
   /** Receives, in pass order, every value the pass reads from the page-anchor
    * convergence carry (see `anchorStablePageLimit`). */
   onPageAnchorInput?(event: PageAnchorInputEvent): void;
+  /** Called before the pass reads the applied anchor plan for a page, so a
+   * plan still being discovered can first be completed through that page. */
+  beforePageAnchorPlanRead?(pageIndex: number): void;
 }
 
 type PageStartAnchors = PageAnchorPrescanInput['anchors'];
@@ -979,6 +982,7 @@ function* paginateBodyPassSteps(
   const pageStartAnchors = (target: BodyPaginationState, startIndex: number): PageStartAnchors => {
     if (anchorDestinations !== null) {
       const location = acquisitionLocation(target);
+      observer?.beforePageAnchorPlanRead?.(location.pageIndex);
       return plannedPageStartAnchors(anchorDestinations, location.pageIndex, location.flowDomainId);
     }
     const anchors: Array<Readonly<{
@@ -2750,6 +2754,12 @@ function firstHostCarryPage(layout: DocumentLayout): number {
  * page, whose content is still open. The first pass, which prescans source
  * order rather than a plan, is covered by the same comparison.
  *
+ * A second pass that runs while the first is still discovering
+ * (`LeadingSecondPass`) applies a plan that so far holds only the pages the
+ * first pass has closed. A table missing from that partial plan may still be
+ * placed by the first pass, so its prior destination is unknown rather than
+ * absent, and the bound stops at its reach page (`appliedPlanComplete`).
+ *
  * Scope: this proves stability across anchor convergence only. Later
  * continuous-section balancing and header/footer reserve or pagination-field
  * convergence can still replace a provisional publication (`exact:false`).
@@ -2758,6 +2768,7 @@ function anchorStablePageLimit(
   events: readonly PageAnchorInputEvent[],
   appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
   snapshot: BodyPaginationPassResult,
+  appliedPlanComplete = true,
 ): Readonly<{ limit: number; prescanDisagreementPage: number }> {
   const observed = pageAnchorDestinationPlan(snapshot.layout);
   let limit = livePageIndex(snapshot);
@@ -2785,7 +2796,8 @@ function anchorStablePageLimit(
     }
     const placed = observed.get(event.key);
     const prior = appliedPlan?.get(event.key);
-    if ((event.floor !== undefined && event.floor > event.pageIndex)
+    if ((appliedPlan !== null && prior === undefined && !appliedPlanComplete)
+      || (event.floor !== undefined && event.floor > event.pageIndex)
       || placed?.kind !== 'floating-table'
       || (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(placed))) {
       limit = event.pageIndex;
@@ -2928,6 +2940,20 @@ type ReserveRepaginationCarry = Readonly<{
   anchorPlan: ReturnType<typeof pageAnchorDestinationPlan>;
 }>;
 
+/** An unseeded run's second anchor pass, already advanced while the first
+ * pass ran (see `paginateOpeningPassWithLeadingSecond`). */
+type LeadingSecondPass = Readonly<{
+  /** Whether the carry the solver hands its second step is exactly the one
+   * this pass has been applying. */
+  appliesCarry(
+    plan: ReadonlyMap<string, PageWrapDestination>,
+    minimumTablePageBySource: ReadonlyMap<string, number>,
+    deferrals: AnchorLineDeferrals,
+  ): boolean;
+  /** Completes the pass from where it stands. */
+  finish(): PaginationSteps<BodyPaginationPassResult>;
+}>;
+
 const ANCHOR_PASS_BASE_LIMIT = 16;
 
 function* paginateBodyWithAnchorConvergenceSteps(
@@ -2963,13 +2989,14 @@ function* paginateBodyWithAnchorConvergenceSteps(
   // whose passes form a different chain.
   const anchorPassObserver = (
     appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
+    appliedPlanComplete: () => boolean = () => true,
   ): BodyPaginationPassObserver | undefined => {
     if (!publisher || seedPlan) return undefined;
     const events: PageAnchorInputEvent[] = [];
     // A prescan disagreement on a closed page is permanent for this pass.
     let ceiling = Number.POSITIVE_INFINITY;
     return passPublicationObserver(publisher, carryBounded((pass) => {
-      const stable = anchorStablePageLimit(events, appliedPlan, pass);
+      const stable = anchorStablePageLimit(events, appliedPlan, pass, appliedPlanComplete());
       ceiling = Math.min(ceiling, stable.prescanDisagreementPage);
       return stable.limit;
     }), {
@@ -2977,9 +3004,150 @@ function* paginateBodyWithAnchorConvergenceSteps(
       canExtend: () => ceiling > publisher.publishedPages,
     });
   };
+  /**
+   * The unseeded run's first pass, with its second pass advanced behind it.
+   *
+   * The second pass applies the plan the first one observes. It reads that
+   * plan only where it opens a page or flow domain (`pageStartAnchors`), and
+   * only that page's destinations. A page the first pass has closed keeps its
+   * destinations: tables are placed at or after the page that reaches them and
+   * drawings on their anchor paragraph's page, so neither lands on a closed
+   * page. The second pass may therefore lay out every page whose opening reads
+   * fall on pages the first pass has closed, with the result identical to the
+   * same pass started after the first one finishes. Its proven-stable prefix
+   * (`anchorStablePageLimit`) can then be published while the first pass is
+   * still discovering destinations, instead of only after it, which for a
+   * document that opens with a page-positioned table is the whole first pass.
+   *
+   * The plan view grows in page order, as `pageAnchorDestinationPlan` builds
+   * the full plan. When the first pass finishes, the view must equal its plan
+   * entry for entry, and the next step must apply exactly that carry; any read
+   * of a page not yet closed, or any mismatch, abandons the overlapped pass and
+   * the ordinary second pass runs instead. Final output never depends on
+   * whether the overlap was used, only the publication timing does.
+   */
+  function* paginateOpeningPassWithLeadingSecond(): Generator<number, Readonly<{
+    first: BodyPaginationPassResult;
+    second: LeadingSecondPass | null;
+  }>, void> {
+    const view = new Map<string, PageWrapDestination>();
+    // Pages below this index are closed in the first pass.
+    let closedBefore = 0;
+    let abandoned = false;
+    const extendView = (layout: DocumentLayout, before: number) => {
+      for (const [key, destination] of pageAnchorDestinationPlan(layout)) {
+        if (destination.pageIndex < closedBefore || destination.pageIndex >= before) continue;
+        // A destination on a closed page cannot reappear on a later one; if
+        // it ever did, the view would not be the plan, so stop overlapping.
+        if (view.has(key)) {
+          abandoned = true;
+          return;
+        }
+        view.set(key, destination);
+      }
+      closedBefore = before;
+    };
+    let firstResult: BodyPaginationPassResult | null = null;
+    let secondResult: BodyPaginationPassResult | null = null;
+    let secondLive = -1;
+    // While the second pass waits inside a plan read, the first pass runs in
+    // that same task; it must not publish there (see the loop below).
+    let draining = false;
+    const firstPublisher = anchorPassObserver(null)!;
+    let forward = false;
+    let refresh = false;
+    const firstObserver: BodyPaginationPassObserver = {
+      shouldPublish: (committedPages) => {
+        forward = !draining && firstPublisher.shouldPublish(committedPages);
+        // A snapshot composes the pass so far, so take one only when the
+        // second pass is waiting for the page the first has just closed.
+        refresh = !abandoned && secondResult === null
+          && (draining || closedBefore <= secondLive + 1)
+          && committedPages - 1 > closedBefore;
+        return forward || refresh;
+      },
+      publish: (pass, processedEntries) => {
+        if (forward) firstPublisher.publish(pass, processedEntries);
+        if (refresh) extendView(pass.layout, livePageIndex(pass));
+      },
+      onPageAnchorInput: (event) => firstPublisher.onPageAnchorInput?.(event),
+    };
+    const first = paginateBodyPassSteps(
+      input, services, options, reserves, null, null, balancePlan, firstObserver, null,
+    );
+    const completeFirst = (result: BodyPaginationPassResult) => {
+      firstResult = result;
+      if (!abandoned) extendView(result.layout, Number.POSITIVE_INFINITY);
+    };
+    const secondPublisher = anchorPassObserver(view, () => firstResult !== null)!;
+    const secondObserver: BodyPaginationPassObserver = {
+      shouldPublish: (committedPages) => !abandoned && secondPublisher.shouldPublish(committedPages),
+      publish: (pass, processedEntries) => secondPublisher.publish(pass, processedEntries),
+      beforePageAnchorPlanRead: (pageIndex) => {
+        // One body entry can open several pages. Run the first pass on until
+        // the page this read needs has closed there.
+        draining = true;
+        try {
+          while (!abandoned && firstResult === null && closedBefore <= pageIndex) {
+            const step = first.next();
+            if (step.done) completeFirst(step.value);
+          }
+        } finally {
+          draining = false;
+        }
+      },
+      onPageAnchorInput: (event) => secondPublisher.onPageAnchorInput?.(event),
+    };
+    const second = paginateBodyPassSteps(
+      input, services, options, reserves, view, new Map(), balancePlan, secondObserver, null,
+    );
+    while (firstResult === null) {
+      const step = first.next();
+      if (step.done) {
+        completeFirst(step.value);
+        break;
+      }
+      yield step.value;
+      // Keep the second pass at most one page behind the closed prefix, so
+      // its reads rarely have to wait.
+      while (!abandoned && firstResult === null && secondResult === null
+        && closedBefore > secondLive + 1) {
+        const next = second.next();
+        if (next.done) {
+          secondResult = next.value;
+          break;
+        }
+        secondLive = next.value - 1;
+        yield next.value;
+      }
+    }
+    const firstPass = firstResult as BodyPaginationPassResult | null;
+    if (firstPass === null) throw new Error('The opening anchor pass did not complete');
+    if (abandoned) return Object.freeze({ first: firstPass, second: null });
+    const appliedPlan = JSON.stringify([...view]);
+    return Object.freeze({
+      first: firstPass,
+      second: Object.freeze({
+        appliesCarry: (
+          plan: ReadonlyMap<string, PageWrapDestination>,
+          minimumTablePageBySource: ReadonlyMap<string, number>,
+          deferrals: AnchorLineDeferrals,
+        ) => (
+          minimumTablePageBySource.size === 0 && deferrals.size === 0
+          && JSON.stringify([...plan]) === appliedPlan
+        ),
+        finish: function* () {
+          if (abandoned) throw new Error('An abandoned overlapped anchor pass cannot finish');
+          return secondResult ?? (yield* second);
+        },
+      }),
+    });
+  }
   const converge = function* (
-    initialPlan?: ReadonlyMap<string, PageWrapDestination>,
-    publish = true,
+    // `null` throughout, matching the solver's first-pass `previous`: an
+    // unseeded run has no applied plan, which is not an omitted argument.
+    initialPlan: ReadonlyMap<string, PageWrapDestination> | null,
+    publish: boolean,
   ) {
     type AnchorPassCarry = Readonly<{
       plan: ReadonlyMap<string, PageWrapDestination>;
@@ -2991,6 +3159,9 @@ function* paginateBodyWithAnchorConvergenceSteps(
     let restart: AnchorPassCarry | null = null;
     const latest: { carry: AnchorPassCarry | null } = { carry: null };
     let remainingPasses = anchorPassLimit;
+    // Only the unseeded publishing run publishes, so only it overlaps its
+    // second pass with its first (see `LeadingSecondPass`).
+    let leadingSecond: LeadingSecondPass | null = null;
     const identity = (value: AnchorPassCarry) => anchorCarryIdentity(value.plan, value.deferrals)
       // Preserve main's detector until recovery. Once floors are pinned, they
       // are persistent solver input and must participate in exact equality.
@@ -3002,22 +3173,35 @@ function* paginateBodyWithAnchorConvergenceSteps(
         }>, number, AnchorPassCarry>({
           ...(restart
             ? { seedState: identity(restart) }
-            : initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
-          step: function* anchorPass(previous) {
-            previous ??= restart;
-            const appliedPlan = previous?.plan ?? initialPlan ?? null;
+            : initialPlan !== null ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
+          step: function* anchorPass(carried) {
+            const previous = carried ?? restart;
+            const appliedPlan = previous !== null ? previous.plan : initialPlan;
             const appliedDeferrals = previous?.deferrals ?? noDeferrals;
-            const pass = yield* paginateBodyPassSteps(
-              input,
-              services,
-              options,
-              reserves,
-              appliedPlan,
-              previous?.minimumTablePageBySource ?? null,
-              balancePlan,
-              publish ? anchorPassObserver(appliedPlan) : undefined,
-              appliedDeferrals.size > 0 ? appliedDeferrals : null,
-            );
+            const overlapsSecond = publish && publisher !== undefined && seedPlan === undefined
+              && previous === null && appliedPlan === null;
+            const leading = leadingSecond;
+            leadingSecond = null;
+            const pass = overlapsSecond
+              ? yield* (function* () {
+                const opening = yield* paginateOpeningPassWithLeadingSecond();
+                leadingSecond = opening.second;
+                return opening.first;
+              })()
+              : leading !== null && previous !== null
+                && leading.appliesCarry(previous.plan, previous.minimumTablePageBySource, appliedDeferrals)
+                ? yield* leading.finish()
+                : yield* paginateBodyPassSteps(
+                  input,
+                  services,
+                  options,
+                  reserves,
+                  appliedPlan,
+                  previous?.minimumTablePageBySource ?? null,
+                  balancePlan,
+                  publish ? anchorPassObserver(appliedPlan) : undefined,
+                  appliedDeferrals.size > 0 ? appliedDeferrals : null,
+                );
             const observed = pageAnchorDestinationPlan(pass.layout);
             for (const [key, destination] of keptHostAnchorCarries(appliedPlan, pass.layout)) {
               observed.set(key, destination);
@@ -3085,7 +3269,8 @@ function* paginateBodyWithAnchorConvergenceSteps(
         // Keep the existing unseeded retry for a carried plan and the existing
         // host-drawing fallback. Only an otherwise-fatal source-order cycle
         // enters recovery, so successful retry paths retain their output.
-        if (initialPlan || !publish || !(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
+        leadingSecond = null;
+        if (initialPlan !== null || !publish || !(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
           || latest.carry === null) throw error;
         // Library termination policy, not a claim about Word placement:
         // §17.4.57 defines page-relative geometry but not this solver's cycle
@@ -3135,13 +3320,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
     }
     try {
       try {
-        return yield* converge(seedPlan);
+        return yield* converge(seedPlan ?? null, true);
       } catch (error) {
         if (!seedPlan || !(error instanceof ExactConvergenceError)) throw error;
         // A plan carried from another reserve/balance run is only a starting
         // estimate. Its former page ownership may be invalid in this run; retry
         // once from the unseeded source order before reporting non-convergence.
-        return yield* converge();
+        return yield* converge(null, true);
       }
     } catch (error) {
       if (error instanceof ExactConvergenceError) {
