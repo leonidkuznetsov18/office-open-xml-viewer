@@ -1818,17 +1818,20 @@ pub struct ShapeRun {
     /// Text auto-fit mode from the `<wps:bodyPr>` child (ECMA-376 §21.1.2.1.1),
     /// normalized to the shared core vocabulary (core `src/types/common.ts`
     /// `autoFit`): "none" (`<a:noAutofit/>`, fixed box — overflowing text is
-    /// CLIPPED to the box), "sp" (`<a:spAutoFit/>`, box grows to text), or
+    /// clipped except Word's stacked WordArt overflow), "sp" (`<a:spAutoFit/>`, box grows to text), or
     /// "norm" (`<a:normAutofit/>`, text shrinks to fit). Absent ⇒ None (renderer
     /// treats as the spec default: overflow visible / no clip).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_autofit: Option<String>,
+    /// ECMA-376 §21.1.2.1.1 bodyPr@wrap: preserve the authored wrapping policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_wrap: Option<String>,
     /// Text-body flow direction from `<wps:bodyPr vert>` (ECMA-376 §20.1.10.83
     /// ST_TextVerticalType): "vert" (all glyphs 90° CW, chars T→B, lines R→L),
     /// "vert270" (all glyphs 270° CW = 90° CCW, chars B→T, lines L→R), "eaVert"
     /// (East-Asian upright: CJK stands upright, non-EA rotated 90°). "horz"/absent
     /// ⇒ None (horizontal). Other values ("mongolianVert", "wordArtVert", …) are
-    /// carried verbatim; the renderer falls them back to horizontal until handled.
+    /// carried verbatim for the host-specific retained text-box layout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_vert: Option<String>,
     /// Body-pr text insets in pt (left/top/right/bottom). Default 0 each.

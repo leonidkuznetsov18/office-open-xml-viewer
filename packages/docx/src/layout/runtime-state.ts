@@ -366,7 +366,7 @@ const fieldAcquisitionContexts = new WeakMap<object, FieldAcquisitionContext>();
 
 export function createLayoutServicesRuntimeView(
   services: LayoutServices,
-  overrides: Readonly<{ text?: LayoutServices['text'] }> = {},
+  overrides: Readonly<{ text?: LayoutServices['text']; math?: LayoutServices['math'] }> = {},
 ): LayoutServices {
   const view = Object.freeze({ ...services, ...overrides });
   const kernel = bodyLayoutKernelOf(services);

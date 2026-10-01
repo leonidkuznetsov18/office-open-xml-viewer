@@ -1,4 +1,4 @@
-import { breakDrawingMlText, type DrawingMlInputRun } from './break.js';
+import { breakDrawingMlText, type DrawingMlLineSegment, type DrawingMlInputRun } from './break.js';
 import {
   drawingMlParagraphSpacing,
   drawingMlSpacedLineBox,
@@ -80,6 +80,11 @@ export interface StackedLayoutOptions<T, G extends StackedGlyph<T> = StackedGlyp
   pxPerPt: number;
   /** Split a text segment into measured glyphs (one grapheme each). */
   glyphs(text: string, style: T): G[];
+  /** Atomic inline object in column coordinates. Its advance is its upright
+   * rendered height and its thickness is its rendered width. OMML remains one
+   * math zone (§22.1.2.77); this is library layout policy, not an Office pitch
+   * inference from the letter-stacking rule in §20.1.10.83. */
+  objectGlyph?(segment: Extract<DrawingMlLineSegment<T>, { type: 'object' }>): G;
   sameStyle?(a: T, b: T): boolean;
 }
 
@@ -138,7 +143,19 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
       eastAsianLineBreak: para.eastAsianLineBreak,
     });
     const paraLines: Line<G>[] = broken.map((line, i) => {
-      const glyphs = line.segments.flatMap((seg) => seg.type === 'text' ? options.glyphs(seg.text, seg.style) : []);
+      const glyphs = line.segments.flatMap((seg) => {
+        if (seg.type === 'text') return options.glyphs(seg.text, seg.style);
+        if (seg.type === 'object') {
+          if (!options.objectGlyph) throw new Error('Stacked inline objects require a host object adapter');
+          const glyph = options.objectGlyph(seg);
+          // Library fallback policy: a zero-size object (unavailable OMML in
+          // PPTX) contributes no inline glyph. Keep the breaker's display
+          // boundaries so an otherwise empty column uses the paragraph mark,
+          // just as the host's empty horizontal line does (§22.1.2.77–78).
+          return glyph.advance === 0 && glyph.thickness === 0 ? [] : [glyph];
+        }
+        return [];
+      });
       // Iterative maxima throughout: a single run can hold far more glyphs
       // than a call's argument list (no spread into Math.max).
       let thickness = glyphs.length > 0 ? 0 : para.emptyThickness;

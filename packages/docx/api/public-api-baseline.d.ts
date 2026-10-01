@@ -2345,6 +2345,7 @@ export interface ShapeRun {
     defaultTextColor?: string | null;
     textAnchor?: string | null;
     textAutofit?: string | null;
+    textWrap?: string | null;
     textInsetL?: number;
     textInsetT?: number;
     textInsetR?: number;

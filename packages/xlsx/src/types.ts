@@ -590,6 +590,12 @@ export interface ShapeInfo {
 }
 
 export interface ShapeText {
+  /** DrawingML vertical text mode (ECMA-376 §20.1.10.83). */
+  vert?: string;
+  /** Center the longest column along its axis (§21.1.2.1.1). */
+  anchorCtr?: boolean;
+  /** Include spacing at the first/last paragraph edges (§21.1.2.1.1). */
+  spcFirstLastPara?: boolean;
   /** `<a:bodyPr@anchor>` — vertical alignment of the text block within the
    *  shape rect. `t` (top, default), `ctr` (middle), `b` (bottom). */
   anchor: string;
@@ -664,6 +670,8 @@ export type ShapeTextRun =
       /** Font size in points (already converted from `<a:rPr@sz>` 100ths-of-a-pt).
        *  0 = inherit (renderer falls back to its default). */
       size: number;
+      /** `<a:rPr@spc>` in points (§20.1.10.74). */
+      spacing?: number;
       color?: string;
       fontFace?: string;
       /** East-Asian typeface (`<a:ea@typeface>`, ECMA-376 §21.1.2.3.1).

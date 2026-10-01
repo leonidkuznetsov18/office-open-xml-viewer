@@ -446,19 +446,14 @@ export function paintTextBoxLayout(node: TextBoxLayout, context: CanvasPaintCont
     || node.transform.f !== 0;
   const transformFrame = canvasPaintFrame(context.ctx, () => {
     if (hasTransform) {
-      if (node.verticalMode) {
-        context.ctx.translate(node.transform.e, node.transform.f);
-        context.ctx.rotate(node.verticalMode === 'vert270' ? -Math.PI / 2 : Math.PI / 2);
-      } else {
-        context.ctx.transform(
-          node.transform.a,
-          node.transform.b,
-          node.transform.c,
-          node.transform.d,
-          node.transform.e,
-          node.transform.f,
-        );
-      }
+      context.ctx.transform(
+        node.transform.a,
+        node.transform.b,
+        node.transform.c,
+        node.transform.d,
+        node.transform.e,
+        node.transform.f,
+      );
     }
   });
   const clipFrame = node.clipBounds ? canvasPaintFrame(context.ctx, () => {

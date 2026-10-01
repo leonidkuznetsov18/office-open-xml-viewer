@@ -100,3 +100,20 @@ export function wordEmptyMarkMinimumStartWidthPx(
 ): number {
   return paragraphMarkEmPt * scale;
 }
+
+/** Word for Mac issue #1668 controls (527 cases including horizontal twins):
+ * both stacked WordArt values use continuous clockwise sideways Latin with
+ * ordinary horizontal advances, upright East Asian/emoji clusters, and left-to-right
+ * columns. Sizes 12–48 pt, face/style and character sweeps, wrapping, spacing,
+ * anchors, transforms and split graphemes showed no direction-mode exception.
+ * This is host compatibility, not ECMA-376 §20.1.10.83's stacked-letter rule.
+ * Reuse the existing mixed-orientation vertical pipeline; native glyph metrics
+ * and vertical glyph designs remain the text service's responsibility.
+ */
+export function wordTextBoxVerticalMode(
+  value: string | null | undefined,
+): 'vert' | 'vert270' | 'eaVert' | 'mongolianVert' | undefined {
+  if (value === 'wordArtVert' || value === 'wordArtVertRtl') return 'mongolianVert';
+  return value === 'vert' || value === 'vert270' || value === 'eaVert' || value === 'mongolianVert'
+    ? value : undefined;
+}
