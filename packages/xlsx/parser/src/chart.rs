@@ -395,7 +395,6 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
         chart_path,
         &relationships,
     );
-    let base_dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let internal_target = |suffix: &str| {
         relationships.values().find(|relationship| {
             relationship.mode == ooxml_common::rels::TargetMode::Internal
@@ -413,7 +412,9 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
                 .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
     });
     if let Some(style_relationship) = style_relationship {
-        let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
+        let style_path = style_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.style_xml =
             Some(read_zip_string(archive, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
@@ -429,7 +430,9 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
     if let Some(color_relationship) =
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
-        let color_path = ooxml_common::rels::resolve_target(base_dir, &color_relationship.target);
+        let color_path = color_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.color_style_xml =
             Some(read_zip_string(archive, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
@@ -452,11 +455,10 @@ fn load_chart_user_shapes_xml(
         .find(|attribute| attribute.name() == "id" && is_r_ns(attribute.namespace()))?
         .value()
         .to_string();
-    let dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let rels_path = ooxml_common::rels::relationship_part_path(chart_path);
     let rels_xml = read_zip_string(archive, &rels_path).ok()?;
     let target = parse_rels_map(&rels_xml).remove(&rid)?;
-    let user_shapes_path = resolve_zip_path(dir, &target);
+    let user_shapes_path = resolve_zip_path(chart_path, &target);
     read_zip_string(archive, &user_shapes_path).ok()
 }
 
@@ -524,7 +526,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
 
     for target in drawing_targets {
         // Resolve drawing path relative to the sheet directory
-        let drawing_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let drawing_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
             continue;
         };
@@ -698,7 +700,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                 let Some(chart_target) = drawing_rels.get(&rid) else {
                     continue;
                 };
-                let chart_path = resolve_zip_path(drawing_dir, chart_target);
+                let chart_path = resolve_zip_path(&drawing_path, chart_target);
                 let Ok(chart_xml) = read_zip_string(archive, &chart_path) else {
                     continue;
                 };
@@ -2273,6 +2275,27 @@ mod chartex_tests {
             .count();
         assert_eq!(columns, 1);
         assert_eq!(chart.chartex_show_unpaired_percentage_axis, None);
+    }
+
+    #[test]
+    fn excel_adapter_rejects_unsupported_chartex_layouts() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="pie"><cx:dataId val="0"/></cx:series>
+          </cx:plotAreaRegion></cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        let charts = load_sheet_charts_with_theme_images(
+            &mut archive,
+            "worksheets/sheet1.xml",
+            None,
+            &theme(),
+            (None, None),
+            None,
+            &ooxml_common::chart::ChartImageRelationships::default(),
+        );
+        assert!(charts.is_empty());
     }
 
     #[test]

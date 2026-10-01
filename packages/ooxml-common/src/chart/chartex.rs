@@ -651,10 +651,10 @@ pub(super) fn parse_chartex_impl(
             (host == ChartHost::Excel && visible_line_owners.contains(node)) || !is_hidden(node)
         })
         .collect();
-    // MS-ODRAWXML §2.24.4.19 defines this closed set.  Preserve a future
-    // identifier verbatim, but let it own the chart-wide fail-closed result:
-    // otherwise a preceding known series or a trailing `paretoLine` could
-    // silently normalize the chart to a visually similar implemented layout.
+    // MS-ODRAWXML §2.24.4.19 defines this closed set. Reject a future or
+    // unsupported identifier for the whole chart: otherwise a preceding known
+    // series or trailing `paretoLine` could silently normalize the plot, or a
+    // classic renderer could paint a misleading chart with the same name.
     const KNOWN_SERIES_LAYOUTS: [&str; 8] = [
         "boxWhisker",
         "clusteredColumn",
@@ -669,19 +669,24 @@ pub(super) fn parse_chartex_impl(
         !attr(node, "layoutId")
             .is_some_and(|layout| KNOWN_SERIES_LAYOUTS.contains(&layout.as_str()))
     });
+    if unknown_series.is_some() {
+        // A ChartEx layout identifier is not interchangeable with the classic
+        // chart families that happen to use the same spelling. Returning a
+        // model here would let the TypeScript renderer dispatch an unsupported
+        // ChartEx layout (for example `pie`) as an ordinary classic chart.
+        // Fail the complete plot closed in every host; package adapters may
+        // then omit it, while DOCX can select an authored MCE picture fallback.
+        return None;
+    }
     // [MS-ODRAWXML] CT_Series@ownerIdx names a document-order series, not
     // formatIdx. The owner can follow its auxiliary line. A line without a
     // valid clustered-column owner never borrows the first column's data. An
     // unknown future layout owns the chart-wide fail-closed result, so no
     // Pareto pairing (and none of its derived flags) may apply then.
-    let pareto_pair = if unknown_series.is_none() {
-        series_nodes
-            .iter()
-            .copied()
-            .find_map(|pareto| pareto_line_owner(&pareto).map(|owner| (owner, pareto)))
-    } else {
-        None
-    };
+    let pareto_pair = series_nodes
+        .iter()
+        .copied()
+        .find_map(|pareto| pareto_line_owner(&pareto).map(|owner| (owner, pareto)));
     let first_column = series_nodes
         .iter()
         .copied()
@@ -721,9 +726,7 @@ pub(super) fn parse_chartex_impl(
             })
             .unwrap_or(0)
     };
-    let (series_node, pareto_series_node) = if let Some(unknown) = unknown_series {
-        (unknown, None)
-    } else if let Some((_, pareto)) = pareto_pair {
+    let (series_node, pareto_series_node) = if let Some((_, pareto)) = pareto_pair {
         (
             first_column.or_else(|| pareto_pair.map(|pair| pair.0))?,
             Some(pareto),
