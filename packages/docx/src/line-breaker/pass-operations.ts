@@ -209,17 +209,21 @@ export function performLineHeadRequirement(
 ): number {
   const { wrapCtx, segs, breakerState, scale } = operationState;
   if (!wrapCtx) return 0;
-  const candidates = boundary ? segs : breakerState.queue;
   const start = boundary?.segIndex ?? 0;
+  // Source boundaries must start directly at their index: walking the already
+  // consumed prefix at every fragment would make long paragraphs quadratic.
+  function* sourceCandidates(): IterableIterator<LayoutSeg> {
+    for (let index = start; index < segs.length; index += 1) yield segs[index];
+  }
+  const candidates = boundary ? sourceCandidates() : breakerState.queue;
   let mark: LayoutTextSeg | undefined;
-  for (let index = start; index < candidates.length; index += 1) {
-    const candidate = candidates[index];
+  for (const candidate of candidates) {
     if (('text' in candidate && !candidate.metricOnly && candidate.text.length > 0)
       || ('imagePath' in candidate && !candidate.anchor) || 'math' in candidate
       || 'isTab' in candidate || 'lineBreak' in candidate) return 0;
     if ('text' in candidate && candidate.metricOnly) mark ??= candidate;
   }
-  if (start >= candidates.length) return 0;
+  if (boundary ? start >= segs.length : breakerState.queue.length === 0) return 0;
   return wrapCtx.paragraphMarkLineStartWidth ?? (mark ? mark.fontSize * scale : 0);
 }
 
@@ -465,7 +469,7 @@ export function performCaptureGapSnapshot(
     scalars: { ...scalars },
     snapBlock: snapBlock ? { ...snapBlock } : null,
     linesLength: lines.length,
-    queue: includeInHand && inHand ? [inHand, ...queue] : queue.slice(),
+    queue: queue.snapshot(includeInHand ? inHand : undefined),
   };
 }
 
@@ -482,7 +486,13 @@ export function performForcedPlacement(
   if (!transaction?.narrowed || !transaction.snapshot) return;
   // Inkless items before the unit (anchor characters, mark metrics) travel
   // with it; only inked content can end the fragment before the unit.
-  const committed = breakerState.currentLine.slice(0, unitStart).some((item) => !isInklessLineItem(item));
+  let committed = false;
+  for (let index = 0; index < unitStart && index < breakerState.currentLine.length; index += 1) {
+    if (!isInklessLineItem(breakerState.currentLine[index])) {
+      committed = true;
+      break;
+    }
+  }
   const lead = committed ? breakerState.currentLine[unitStart] : undefined;
   throw new LineGapRejection(requiredWidth, lead?.src ? { ...lead.src } : undefined);
 }
@@ -514,7 +524,7 @@ export function performRejectGap(
     ? { ...(snapshot.snapBlock as NonNullable<typeof breakerState.snapBlock>) }
     : null;
   breakerState.lines.length = snapshot.linesLength;
-  breakerState.queue = snapshot.queue.slice();
+  breakerState.queue.restore(snapshot.queue);
   breakerState.currentLine = [];
   breakerState.latinLineGaps = [];
   breakerState.inHand = undefined;
@@ -720,7 +730,7 @@ export function performFlush(
     hasRuby: breakerState.lineHasRuby,
     eastAsian: breakerState.lineEastAsian,
     endsWithBreak: brTerminated,
-    consumedEnd: nextStart ?? breakerState.queue[0]?.src ?? endBoundary,
+    consumedEnd: nextStart ?? breakerState.queue.peek()?.src ?? endBoundary,
   });
   if (wrapCtx) {
     if (!brTerminated && nextStart !== undefined) {
@@ -1295,7 +1305,7 @@ export function performAppendQueuedIdeographicSpaceSegment(
     source.fitTextRegionIndex !== undefined
   )
     return;
-  const follower = breakerState.queue[0];
+  const follower = breakerState.queue.peek();
   if (
     !follower ||
     !('text' in follower) ||

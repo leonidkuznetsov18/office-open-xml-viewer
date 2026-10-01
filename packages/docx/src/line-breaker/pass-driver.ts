@@ -20,6 +20,7 @@ import {
   type WrapLayoutCtx,
 } from './model.js';
 import { createLineBreakerState, prepareBreakQueue } from './break-queue.js';
+import { SegmentQueue } from './segment-queue.js';
 import { buildFont } from './font-routes.js';
 import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
@@ -211,7 +212,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const setMeasureFont = (font: string): void => measurement.setFont(font);
 
   const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
-  breakerState.queue = prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement);
+  breakerState.queue = new SegmentQueue(prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement));
 
   // The segment's laid-out ADVANCE (= its measuredWidth): natural width plus the
   // character-grid delta, the §17.3.2.43 horizontal glyph scale (w:w) and the

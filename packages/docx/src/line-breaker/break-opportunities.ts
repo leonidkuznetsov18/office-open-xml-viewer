@@ -149,7 +149,7 @@ export function iterateBreakOpportunities(
   while (breakerState.queue.length > 0) {
     const transaction = breakerState.gapTransaction;
     if (transaction?.narrowed) {
-      const head = breakerState.queue[0]!;
+      const head = breakerState.queue.peek()!;
       if (transaction.stopBefore && breakerState.currentLine.length > 0
         && sameBoundary(head.src, transaction.stopBefore)) {
         // Replay of a rejected fragment ends before its forced unit.
@@ -352,7 +352,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       lineXOffset: breakerState.lineXOffset,
       maxWidth,
     });
-  const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW, breakerState.queue[0]);
+  const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW, breakerState.queue.peek());
   // ECMA-376 §17.3.1.33 does not prescribe a line-breaking tolerance.
   // Word-for-Mac controls with Calibri and Arial, left/center/right aligned
   // 10pt table cells, wrap a trailing Latin word below its natural advance
@@ -519,7 +519,7 @@ function processImageSegment(context: BreakOpportunityIteratorContext, seg: Layo
 function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
   const { breakerState, scale, addToLine, measureText, verticalInkExtra, characterGrid } = context;
   while (breakerState.queue.length > 0) {
-    const q = breakerState.queue[0];
+    const q = breakerState.queue.peek()!;
     if ('isTab' in q || 'lineBreak' in q) break;
     breakerState.queue.shift();
     if ('imagePath' in q) {
@@ -969,12 +969,12 @@ function prepareAtomicTextFit(
   if (
     !s.joinPrev &&
     breakerState.currentLine.length > 0 &&
-    (breakerState.queue[0] as LayoutTextSeg | undefined)?.joinPrev &&
-    ((breakerState.queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
+    (breakerState.queue.peek() as LayoutTextSeg | undefined)?.joinPrev &&
+    ((breakerState.queue.peek() as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
       !hasCJKBreakOpportunity(s.text)) &&
     // A SEA (Thai/Lao/Khmer) lead with usable word breaks is NOT atomic — the
     // run splits at a dictionary boundary (issue #797), mirroring the CJK gate.
-    ((breakerState.queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
+    ((breakerState.queue.peek() as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
       !(s.seaBreaks && s.seaBreaks.length > 0))
   ) {
     const group = measureJoinedTextUnit(s, breakerState.queue, context, w, trailingSpaceW);
@@ -1009,10 +1009,12 @@ function prepareAtomicTextFit(
   ) {
     let chunkW = w;
     let chunkTrail = trailingSpaceW;
-    let chunkEnd = 0;
+    let next = breakerState.queue.peek();
     if (!s.text.endsWith(' ')) {
-      for (; chunkEnd < breakerState.queue.length; chunkEnd++) {
-        const f = breakerState.queue[chunkEnd];
+      const following = breakerState.queue[Symbol.iterator]();
+      for (let step = following.next(); !step.done; step = following.next()) {
+        const f = step.value;
+        next = f;
         if (!('text' in f) || (f as LayoutTextSeg).seaBreaks === undefined) break;
         if (!isDictionarySeaText((f as LayoutTextSeg).text)) break;
         const ft = f as LayoutTextSeg;
@@ -1021,12 +1023,13 @@ function prepareAtomicTextFit(
         chunkW += fw;
         chunkTrail = ft.text.endsWith(' ') ? fw - strAdvance(ft, fTrim) : 0;
         if (ft.text.endsWith(' ')) {
-          chunkEnd++;
+          next = following.next().value;
           break;
         } // a space ends the chunk
+        next = undefined;
       }
     }
-    const chunkWForFit = fitWidthFor(chunkW, chunkTrail, breakerState.queue[chunkEnd]);
+    const chunkWForFit = fitWidthFor(chunkW, chunkTrail, next);
     if (
       breakerState.currentWidth + chunkWForFit > availW() &&
       chunkWForFit <= breakerState.lineMaxWidth

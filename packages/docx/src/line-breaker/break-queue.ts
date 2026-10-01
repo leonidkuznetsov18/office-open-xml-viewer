@@ -5,6 +5,7 @@ import { type LayoutImageSeg, type LayoutLine, type LayoutMathSeg, type LayoutSe
 import { protectedNoBreakOffsets, slicedTextMetadata } from './advance.js';
 import { rebaseSeaBreaks } from './text-runs.js';
 import { resolveFitTextSegments } from './segment-builder.js';
+import { SegmentQueue, type SegmentQueueCursor } from './segment-queue.js';
 
 /** Prepare source-anchored break opportunities and the resumable queue.
  * SEA dictionary boundaries, protected ranges, paragraph-final hanging spaces,
@@ -191,7 +192,7 @@ export interface GapTransaction {
     scalars: Readonly<Record<string, unknown>>;
     snapBlock: unknown;
     linesLength: number;
-    queue: readonly LayoutSeg[];
+    queue: SegmentQueueCursor;
   }> | null;
   /** Complete units precede a forced unit: end the fragment before this source. */
   stopBefore: LineBoundary | null;
@@ -236,7 +237,7 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     currentLineTopY: wrapCtx?.startPageY ?? 0,
     lineHasRuby: false,
     lineEastAsian: false,
-    queue: [] as LayoutSeg[],
+    queue: new SegmentQueue(),
     trailingBreakFontSize: null as number | null,
   };
 }
