@@ -272,6 +272,65 @@ describe('progressive layout with page-owned anchors', () => {
     expect(counts.at(-1)!).toBeGreaterThan(placedPage);
   }, 300_000);
 
+  it('settles independent table destinations that change in the same pass', async () => {
+    const indexes = [26, 58, 90];
+    const model = documentModel(130, indexes.map((index) => (
+      [index, pageFloatingTable(524, 72, 1, 667, 0)] as const
+    )));
+    const blocking = blockingLayout(model);
+    for (const index of indexes) {
+      expect(tablePages(blocking.layout, index).placedPage).toBeGreaterThanOrEqual(
+        tablePages(blocking.layout, index).reachedPage,
+      );
+    }
+    const { previews, final } = await progressiveRun(model);
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blocking.layout));
+    expectPublishedPagesFinal(previews, final);
+  }, 300_000);
+
+  it('retests colliding tables before reusing a failed candidate page', () => {
+    const model = documentModel(55, [
+      [26, pageFloatingTable(524, 72, 1, 667, 0)],
+      [27, pageFloatingTable(524, 72, 1, 667, 0)],
+    ]);
+    const { layout } = blockingLayout(model);
+    const first = tablePages(layout, 26).placedPage;
+    const second = tablePages(layout, 27).placedPage;
+    expect(second).toBe(first + 1);
+  });
+
+  it('preserves settled pages when independent later table tests are appended', () => {
+    // Deterministic property generator: source boundaries and exclusion extents
+    // vary independently. Each suffix starts a fresh page, so an isolated
+    // prefix supplies an independent oracle for every previously settled page.
+    let seed = 1659;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed;
+    };
+    const body: BodyElement[] = [];
+    let previous: DocumentLayout | undefined;
+    for (let sample = 0; sample < 8; sample += 1) {
+      const preceding = 24 + (random() >>> 8) % 5;
+      const height = [120, 600, 647, 667, 697][(random() >>> 8) % 5]!;
+      const first = { ...line(), pageBreakBefore: sample > 0 } as BodyElement;
+      body.push(first, ...Array.from({ length: preceding - 1 }, () => line()),
+        pageFloatingTable(524, 72, 1, height, 0), line(), line());
+      const { layout } = blockingLayout({ ...documentModel(0, []), body: [...body] });
+      if (previous) {
+        expect(layout.pages.length).toBeGreaterThan(previous.pages.length);
+        previous.pages.forEach((page, index) => {
+          expect(pageFingerprint(layout.pages[index]!)).toBe(pageFingerprint(page));
+        });
+      }
+      const tables = layout.pages.flatMap((page) => page.layers.body)
+        .filter((node) => node.kind === 'table');
+      expect(tables).toHaveLength(sample + 1);
+      expect(new Set(tables.map((table) => table.source.path[0])).size).toBe(sample + 1);
+      previous = layout;
+    }
+  }, 300_000);
+
   it('emits no stale page when cancelled during convergence', async () => {
     const model = anchoredImageModel();
     const { layout: final } = blockingLayout(model);

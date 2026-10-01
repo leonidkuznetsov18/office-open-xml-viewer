@@ -2429,6 +2429,13 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
         // fragment extent; the next pass reserves exactly that page-local box.
         // Continuations switch to text-owned flow, so only the first root
         // fragment has page ownership and cursor (row 0, fragment 0).
+        // Keep acquisition's bounds authoritative. Thirty Word-exported boundary
+        // controls (row extents, source boundaries, wrap widths, omitted/zero/
+        // signed and one-twip tblpY) do not yet establish one placement rule:
+        // raw zero can follow the source cursor or start at the fresh margin,
+        // while encoded offsets and oversized rows exercise different paths.
+        // Those implicit-placement differences remain unsupported here; table
+        // floors resolve ownership without normalizing or guessing coordinates.
         // Scope: this resolves an accepted page/margin root's collision with
         // preceding visible lines. It does not yet reinterpret §17.4.57's
         // logical anchor at the following regular paragraph when that owner
@@ -2808,11 +2815,15 @@ function anchorStablePageLimit(
   return Object.freeze({ limit, prescanDisagreementPage });
 }
 
+// Every next-pass read belongs to the identity, even when changing a floor
+// leaves the table box unchanged: it can still change preceding/following flow.
 function anchorCarryIdentity(
   plan: ReadonlyMap<string, unknown>,
   deferrals: AnchorLineDeferrals,
+  minimumTablePageBySource: ReadonlyMap<string, number>,
 ): string {
-  return `${anchorPlanIdentity(plan)}\u0004${anchorLineDeferralsIdentity(deferrals)}`;
+  return `${anchorPlanIdentity(plan)}\u0004${anchorLineDeferralsIdentity(deferrals)}\u0004${
+    anchorPlanIdentity(minimumTablePageBySource)}`;
 }
 
 /**
@@ -2908,18 +2919,95 @@ function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
   return JSON.stringify([...plan].sort(([left], [right]) => left.localeCompare(right)));
 }
 
-function changedAnchorKeys(
+/** Earliest changed registration, excluding one table's own registration.
+ * A plan entry is read on both its old and its new page (including geometry
+ * changes on the same page). Two minima suffice; do not rescan the whole plan
+ * per table. Missing entries count as changes too. */
+function changedAnchorReadPages(
   applied: ReadonlyMap<string, PageWrapDestination>,
-  observed: ReadonlyMap<string, PageWrapDestination>,
-): ReadonlySet<string> {
-  const changed = new Set<string>();
-  for (const [key, destination] of applied) {
-    if (JSON.stringify(destination) !== JSON.stringify(observed.get(key))) changed.add(key);
+  next: ReadonlyMap<string, PageWrapDestination>,
+): (except: string) => number {
+  let firstKey: string | undefined;
+  let first = Number.POSITIVE_INFINITY;
+  let second = Number.POSITIVE_INFINITY;
+  const keys = new Set([...applied.keys(), ...next.keys()]);
+  for (const key of keys) {
+    const before = applied.get(key);
+    const after = next.get(key);
+    if (JSON.stringify(before) === JSON.stringify(after)) continue;
+    const page = Math.min(before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
+    if (page < first) {
+      second = first;
+      first = page;
+      firstKey = key;
+    } else {
+      second = Math.min(second, page);
+    }
   }
-  for (const key of observed.keys()) {
-    if (!applied.has(key)) changed.add(key);
+  return (except) => except === firstKey ? second : first;
+}
+
+/**
+ * Preserve/prove table floors against the next pass's complete earlier reads,
+ * rather than requiring every destination in the document to stay unchanged.
+ * ECMA-376 §17.4.57 supplies the page-owned exclusion; the existing candidate
+ * rule retries p+1 when registering a table on p sends its source beyond p.
+ * This changes acquisition convergence, not the table's authored placement.
+ *
+ * Termination invariant for these table tests: a rejected candidate p stays
+ * rejected while all other carry reads through p stay identical. Later source
+ * content cannot enter that prefix, because the floor sends the table and all
+ * following flow beyond p. With a settled earlier prefix a table's floor only
+ * increases; once the table is admitted, later independent destinations cannot
+ * revoke it. Induct on the earliest disagreeing registration, not on whole-
+ * document equality. Earlier changes invalidate suffix proofs before reuse.
+ * The operational pass guard still fails closed for unresolved anchor coupling;
+ * it is a resource bound, not an alternate placement or a convergence proof.
+ */
+function nextTablePageFloors(
+  events: readonly PageAnchorInputEvent[],
+  applied: ReadonlyMap<string, PageWrapDestination> | null,
+  next: ReadonlyMap<string, PageWrapDestination>,
+  previousDeferrals: AnchorLineDeferrals,
+  nextDeferrals: AnchorLineDeferrals,
+): ReadonlyMap<string, number> {
+  const floors = new Map<string, number>();
+  if (applied === null) return floors;
+  const otherRegistrationChangedAt = changedAnchorReadPages(applied, next);
+  let deferralChangedAt = Number.POSITIVE_INFINITY;
+  for (const key of new Set([...previousDeferrals.keys(), ...nextDeferrals.keys()])) {
+    const before = previousDeferrals.get(key);
+    const after = nextDeferrals.get(key);
+    if (before?.identity !== after?.identity) {
+      deferralChangedAt = Math.min(deferralChangedAt,
+        before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
+    }
   }
-  return changed;
+  let earlierFloorChangedAt = Number.POSITIVE_INFINITY;
+  // Events are in acquisition order. A later table cannot read its floor before
+  // this table: any effective floor advances the flow before that later read.
+  for (const event of events) {
+    if (event.kind !== 'page-owned-table') continue;
+    const prior = applied.get(event.key);
+    const destination = next.get(event.key);
+    const changedAt = Math.min(otherRegistrationChangedAt(event.key),
+      deferralChangedAt, earlierFloorChangedAt);
+    let floor: number | undefined;
+    if (prior?.kind === 'floating-table' && destination?.kind === 'floating-table') {
+      // A floor f proves only pages below f; changes on f need not revoke it.
+      if (event.floor !== undefined && changedAt >= event.floor) floor = event.floor;
+      // Only this table's registration may differ through candidate page p.
+      // Later-page changes cannot undo this failed-candidate observation.
+      if (destination.pageIndex > prior.pageIndex && changedAt > prior.pageIndex) {
+        floor = Math.max(floor ?? 0, prior.pageIndex + 1);
+      }
+    }
+    if (floor !== undefined) floors.set(event.key, floor);
+    if (floor !== event.floor) {
+      earlierFloorChangedAt = Math.min(earlierFloorChangedAt, event.pageIndex);
+    }
+  }
+  return floors;
 }
 
 /** What a header/footer reserve repagination reads of the previous pass. */
@@ -2990,7 +3078,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
     return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
       pass: BodyPaginationPassResult;
     }>, number, AnchorPassCarry>({
-      ...(initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
+      ...(initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals, new Map()) } : {}),
       step: function* anchorPass(previous) {
         const appliedPlan = previous?.plan ?? initialPlan ?? null;
         const appliedDeferrals = previous?.deferrals ?? noDeferrals;
@@ -3014,30 +3102,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
         const lineTests = appliedPlan === null
           ? Object.freeze({ plan: observed, deferrals: appliedDeferrals })
           : resolveAnchorLineTests(pass, observed, appliedDeferrals);
-        const minimumTablePageBySource = new Map<string, number>();
-        // Compare all destinations once. Testing every table against a fresh
-        // copy of the full plan would make table-heavy documents quadratic.
-        // A table floor needs the next pass to differ from this one only in
-        // that table's registration, so no drawing retest or new deferral.
-        const changedKeys = previous && appliedPlan
-          && lineTests.plan === observed && lineTests.deferrals === appliedDeferrals
-          ? changedAnchorKeys(appliedPlan, observed)
-          : null;
-        for (const [key, destination] of observed) {
-          if (destination.kind !== 'floating-table') continue;
-          const prior = appliedPlan?.get(key);
-          if (prior?.kind !== 'floating-table' || !changedKeys
-            || (changedKeys.size > 1 || (changedKeys.size === 1 && !changedKeys.has(key)))) {
-            continue;
-          }
-          // Only this table's changed exclusion can have moved its source in
-          // this run: input, reserves, and every other page anchor are fixed.
-          // Recheck the next candidate page, not the observed source page.
-          const provenPage = destination.pageIndex > prior.pageIndex
-            ? prior.pageIndex + 1
-            : previous?.minimumTablePageBySource.get(key);
-          if (provenPage !== undefined) minimumTablePageBySource.set(key, provenPage);
-        }
+        // A reserve/balance seed is only an estimate: its table bounds were
+        // acquired in another run. Observe this run's geometry before proving
+        // a failed candidate with it, just as in the unseeded first pass.
+        const minimumTablePageBySource = nextTablePageFloors(
+          pass.anchorInputs, previous ? appliedPlan : null, lineTests.plan,
+          appliedDeferrals, lineTests.deferrals,
+        );
         return Object.freeze({
           pass,
           plan: lineTests.plan,
@@ -3045,7 +3116,9 @@ function* paginateBodyWithAnchorConvergenceSteps(
           deferrals: lineTests.deferrals,
         });
       },
-      stateOf: (value) => anchorCarryIdentity(value.plan, value.deferrals),
+      stateOf: (value) => anchorCarryIdentity(
+        value.plan, value.deferrals, value.minimumTablePageBySource,
+      ),
       // The next anchor pass reads only the plan, the proven table pages and
       // the proven anchor-line deferrals; the superseded pass (its whole
       // layout) is not carried into it.
