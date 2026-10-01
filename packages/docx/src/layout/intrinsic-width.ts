@@ -26,7 +26,6 @@ import { wordSnapToCharsEastAsianCellCount } from './line-compatibility.js';
 import type { ParagraphLayoutSource, TextFontSlots } from './text.js';
 import { projectEffectiveCellPreferredWidth, type TableLayoutSource } from './table-source-acquisition.js';
 import type { DeepReadonly, TablePreferredWidthConstraint } from './types.js';
-import { stableFingerprint } from './fingerprint.js';
 import {
   numberingMarkerLogicalInterval,
   type NumberingMarkerGeometry,
@@ -102,6 +101,16 @@ export function measureTableCellIntrinsicWidths(
   };
 }
 
+/**
+ * The shaping inputs of a text segment other than its text service.
+ *
+ * Every component is a primitive or an array of them, so `JSON.stringify` is
+ * already an injective canonical encoding; no key sorting is needed. The text
+ * service is compared separately by its fingerprint (`compatibleText`): that
+ * identity embeds the service's whole font and metric snapshot, and
+ * canonicalizing and percent-encoding it again for every neighbouring segment
+ * pair dominated table intrinsic-width measurement.
+ */
 function compatibleTextKey(segment: LayoutTextSeg): string {
   const request = segment.textShapeRequest;
   const slots = (value: TextFontSlots | undefined) => value
@@ -112,8 +121,7 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
         value.complexScript ?? null,
       ]
     : null;
-  return stableFingerprint('paragraph-intrinsic-text', [
-    segment.textLayoutService?.fingerprint ?? null,
+  return JSON.stringify([
     request ? [
       slots(request.fonts),
       slots(request.themeFonts),
@@ -138,7 +146,7 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
     segment.italic,
     calcEffectiveFontPx(segment, 1),
     segment.fontFamily,
-    segment.fontRoute ?? null,
+    segment.fontRoute ? [segment.fontRoute.familyList, segment.fontRoute.scope] : null,
     segment.charScale ?? 1,
     segment.charSpacing ?? 0,
     segment.fitTextPerGapPx ?? null,
@@ -171,6 +179,11 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
   ]);
 }
 
+function compatibleText(left: LayoutTextSeg, right: LayoutTextSeg): boolean {
+  return (left.textLayoutService?.fingerprint ?? null) === (right.textLayoutService?.fingerprint ?? null)
+    && compatibleTextKey(left) === compatibleTextKey(right);
+}
+
 /** Run boundaries with identical effective metrics are not shaping boundaries.
  * Merge only for the intrinsic probe; retained source/run ownership stays intact. */
 function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[] {
@@ -181,7 +194,7 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       previous
       && 'text' in previous
       && 'text' in segment
-      && compatibleTextKey(previous) === compatibleTextKey(segment)
+      && compatibleText(previous, segment)
       // Included and excluded spans depend on the full run. Losing a Latin
       // base can turn its attached Arabic mark into standalone proof; losing
       // Arabic proof can exclude following digits. Keep contiguous ranges in
