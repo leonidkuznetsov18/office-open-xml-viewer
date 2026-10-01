@@ -241,44 +241,45 @@ export async function preloadGoogleFonts(
 
   // 2) Retain a shared, refcounted FontFace per parsed rule. The FIRST holder of
   //    a rule (across all open documents) creates the FontFace, adds it to the
-  //    set, and must force-`load()` it; a later holder reuses the shared face
-  //    (already loaded) and only bumps its refcount. `held` is what THIS call
+  //    set; a later holder reuses the shared face and bumps its refcount. A
+  //    reused face may still be loading or have failed. `held` is what THIS call
   //    references — returned so the caller can release it in `destroy()`, the
   //    fix for the SPA leak where every opened document left its Google FontFace
   //    objects in `document.fonts` forever.
   const held: FontFace[] = [];
-  const toLoad: FontFace[] = [];
   for (const group of Array.isArray(parsedGroups) ? parsedGroups : []) {
     for (const rule of group.rules) {
       const sig = googleFaceSignature(group.url, rule);
-      const { face, isNew } = retainFace(sig, fonts, () => {
+      const { face } = retainFace(sig, fonts, () => {
         const created = new FontFace(rule.family, rule.src, rule.descriptors);
         fonts.add(created);
         return created;
       });
       held.push(face);
-      if (isNew) toLoad.push(face);
     }
   }
 
-  // 3) Force-load only the FontFaces this call newly created and AWAIT them —
-  //    no timeout race that could resolve mid-download. `face.load()` is required
-  //    because unicode-range gating would otherwise leave the faces `unloaded`
-  //    and the first canvas paint would use a system fallback, shifting once a
-  //    later interaction re-rasterized. We load the FontFace objects WE created
+  // 3) Force-load and await EVERY retained face, within the safety ceiling.
+  //    CSS Font Loading Level 3 §2.2 returns the same font-status promise for
+  //    loading, loaded, and failed faces: idempotent load() joins another holder's
+  //    pending load without restarting it and preserves failure diagnostics for
+  //    this caller. Awaiting only new faces would let concurrent documents paint
+  //    and paginate with fallback metrics while their shared faces still load.
+  //    Explicit load() also bypasses unicode-range gating that would otherwise
+  //    leave canvas-only faces unloaded. We load the retained FontFace objects
   //    rather than re-selecting them from the set by family name: `FontFace.family`
   //    serializes a multi-word name back WITH quotes (e.g. `"Nunito Sans"`), so a
   //    `family`-string filter silently matches nothing and the fonts never load —
-  //    the bug this avoids. (Reused faces were already loaded by their first holder.)
+  //    the bug this avoids.
   // CSS Font Loading Level 3 §2.2: successful individual loads are sufficient
   // for canvas use. FontFaceSet.ready (§3.4) also synchronizes unrelated fonts
   // and layout, so it must not be an additional startup barrier here.
-  if (toLoad.length > 0) {
+  if (held.length > 0) {
     await withFontCeiling(
-      Promise.allSettled(toLoad.map((f) => f.load())).then((results) => {
+      Promise.allSettled(held.map((f) => f.load())).then((results) => {
         results.forEach((res, i) => {
           if (res.status === 'rejected') {
-            failedFamilies.add(toLoad[i].family.replace(/['"]/g, '').toLowerCase());
+            failedFamilies.add(held[i].family.replace(/['"]/g, '').toLowerCase());
           }
         });
       }),
