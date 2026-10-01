@@ -549,14 +549,16 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
  * and §17.3.3.23/§17.18.73 distinguish a `margin` positional reference from
  * an `indent` one: neither makes the paragraph's trailing indent a bound on
  * the stop. So on a line that no float narrows, an aligned cell may extend
- * to the text margin, or the indent edge when a negative indent lies beyond it. A float-narrowed window keeps the actual
- * band: the #1672 Word controls overlap floats, and that overlap is not
+ * to the text margin (or the indent edge when a negative indent lies beyond
+ * it) wherever no exclusion intersects that extension on the line; the pass
+ * records it as `lineMarginExtension`. A line that uses it carries the
+ * extension as part of its band, so alignment and justification slack are
+ * measured against the same allocation. A float-narrowed window keeps the
+ * actual band: the #1672 Word controls overlap floats, and that overlap is not
  * emulated. Ordinary text and left tabs keep the indent band.
  */
 function alignedTabCellAvailW(context: BreakOpportunityIteratorContext): number {
-  const { breakerState, availW, maxWidth, marginRightPx } = context;
-  const narrowed = breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== maxWidth;
-  return narrowed ? availW() : availW() + Math.max(0, marginRightPx - maxWidth);
+  return context.availW() + context.breakerState.lineMarginExtension;
 }
 
 function processTabSegment(
@@ -580,6 +582,7 @@ function processTabSegment(
     tabFollowingMetrics,
     availW,
   } = context;
+  seg.marginAllocation = false;
 
   // Ordinary RTL stops still require the complete cell's visual order. A
   // positional tab additionally owns a normative next-line decision, which
@@ -713,6 +716,7 @@ function processTabSegment(
     const cellAvail = alignedTabCellAvailW(context);
     const cellLimit = seg.ptab.alignment !== 'left'
       && breakerState.currentWidth + tabW + followW <= cellAvail ? cellAvail : availW();
+    seg.marginAllocation = cellLimit > availW() && breakerState.currentWidth + tabW + followW > availW();
     if (breakerState.currentWidth + tabW > cellLimit) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);
@@ -770,6 +774,8 @@ function processTabSegment(
     const cellAvail = alignedTabCellAvailW(context);
     const cellLimit = breakerState.currentWidth + tabW + following.totalWidth <= cellAvail
       ? cellAvail : availW();
+    seg.marginAllocation = cellLimit > availW()
+      && breakerState.currentWidth + tabW + following.totalWidth > availW();
     if (breakerState.currentWidth + tabW > cellLimit) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);

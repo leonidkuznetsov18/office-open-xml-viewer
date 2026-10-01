@@ -137,6 +137,48 @@ describe('first-line indents beside floats through the DOCX parser', () => {
     }
   });
 
+  // The margin extension is a line band only where no exclusion intersects
+  // it: a float inside the right indent keeps #1675's indent-band fitting.
+  it.each([false, true].flatMap((rtl) => [false, true].map((positional) => ({ rtl, positional }))))(
+    'keeps aligned cells out of a float inside the right indent, rtl=$rtl, positional=$positional', ({ rtl, positional }) => {
+      const paragraph = layoutParagraph(documentBytes('w:right="7200"', rtl, 268,
+        { alignment: 'right', count: 1, text: 'word', positional }));
+      const texts = paragraph.lines.flatMap((line) => line.placements).filter((node) => node.kind === 'text');
+      expect(texts.map((text) => text.text).join('')).toBe('word');
+      for (const text of texts) {
+        // Float occupies x=340–540pt, y=72–172pt.
+        const overlapsFloat = text.bounds.xPt + text.bounds.widthPt > 340 && text.bounds.yPt < 172;
+        expect(overlapsFloat).toBe(false);
+        expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+      }
+    });
+
+  it.each(['left', 'center', 'right', 'both', 'distribute'].flatMap((jc) => [false, true].flatMap((rtl) =>
+    [false, true].map((positional) => ({ jc, rtl, positional })))))(
+    'keeps a margin-allocated line inside its band under jc=$jc, rtl=$rtl, positional=$positional', ({ jc, rtl, positional }) => {
+      const paragraph = layoutParagraph(documentBytes(`w:right="7200"/><w:jc w:val="${jc}"`, rtl, 0,
+        { alignment: 'right', count: 1, text: 'word', positional, noFloat: true, prefix: 'prefix' }));
+      const texts = paragraph.lines.flatMap((line) => line.placements).filter((node) => node.kind === 'text');
+      expect(texts.map((text) => text.text).sort()).toEqual(['prefix', 'word']);
+      for (const text of texts) {
+        expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+        expect(text.bounds.xPt + text.bounds.widthPt).toBeLessThanOrEqual(540);
+      }
+      if (!rtl) {
+        // The extended band is the whole margin: a margin-right cell fills
+        // it, so no alignment slack remains; an ordinary right stop at 352pt
+        // leaves 188pt that center/right alignment distribute as usual.
+        expect(paragraph.lines).toHaveLength(1);
+        const prefix = texts.find((text) => text.text === 'prefix');
+        const word = texts.find((text) => text.text === 'word');
+        const shift = positional ? 0 : jc === 'center' ? 94 : jc === 'right' ? 188 : 0;
+        if (jc !== 'distribute') {
+          expect(prefix?.bounds.xPt).toBe(72 + shift);
+          expect((word?.bounds.xPt ?? 0) + (word?.bounds.widthPt ?? 0)).toBe((positional ? 540 : 352) + shift);
+        }
+      }
+    });
+
   it('wraps content after an automatic tab in a narrowed float window', () => {
     const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', false, 268,
       { alignment: 'left', count: 1, text: 'word '.repeat(100).trim(), automatic: true }), 6);

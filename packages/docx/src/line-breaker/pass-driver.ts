@@ -419,7 +419,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     // physical union, including object leading and position ownership, to all
     // fragments; each segment is visited once, independent of gap count.
     const { segments: _segments, xOffset: _x, availWidth: _width,
-      consumedEnd: _end, endsWithBreak: _break, ...metrics } = last;
+      marginExtension: _extension, consumedEnd: _end, endsWithBreak: _break, ...metrics } = last;
     let positionReference: number | undefined;
     for (let index = start; index < end; index += 1) {
       for (const segment of breakerState.lines[index].segments) {
