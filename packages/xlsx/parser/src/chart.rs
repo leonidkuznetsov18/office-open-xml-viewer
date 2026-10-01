@@ -771,6 +771,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                     }),
                 );
                 chart_context.limit_reporter = Some(&reporter);
+                chart_context.allocation_part = Some(&chart_path);
                 chart_context.host = ooxml_common::chart::ChartHost::Excel;
                 let chart_opt = if is_chartex {
                     ooxml_common::chart::parse_chartex_part(
@@ -2216,7 +2217,35 @@ mod chartex_tests {
             "chartex-allocation"
         );
         assert_eq!(json["details"]["violation"]["format"], "xlsx");
-        assert_eq!(json["details"]["violation"]["observed"], 524289);
+        assert_eq!(json["details"]["violation"]["metric"], "bytes");
+        assert_eq!(
+            json["details"]["violation"]["limit"],
+            ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+        );
+        assert_eq!(json["details"]["violation"]["observed"], 12_582_913);
+    }
+
+    #[test]
+    fn chartex_allocation_accounting_is_idempotent_for_reparsed_chart_part() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="524288"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        for operation_name in ["cursor-preview", "cursor-final"] {
+            let charts = archive
+                .run_operation(operation_name, |archive| {
+                    Ok(load_sheet_charts_with_theme_images(
+                        archive,
+                        "worksheets/sheet1.xml",
+                        None,
+                        &theme(),
+                        (None, None),
+                        None,
+                        &ooxml_common::chart::ChartImageRelationships::default(),
+                    ))
+                })
+                .expect("the same ChartEx part is charged once per package");
+            assert_eq!(charts.len(), 1);
+        }
+        archive.assert_healthy().expect("package remains usable");
     }
 
     #[test]

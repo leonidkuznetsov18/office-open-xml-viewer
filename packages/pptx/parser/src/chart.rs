@@ -79,6 +79,7 @@ fn parse_chart_with_images(
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     is_chartex: bool,
     limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    allocation_part: Option<&str>,
 ) -> Option<ChartElement> {
     let doc = parse_preflighted_pptx_xml(xml).ok()?;
     let root = doc.root_element();
@@ -89,6 +90,7 @@ fn parse_chart_with_images(
     let context = ooxml_common::chart::ChartParseContext {
         host: ooxml_common::chart::ChartHost::PowerPoint,
         limit_reporter,
+        allocation_part,
         color_resolver: Some(&resolver),
         style_xml,
         color_style_xml,
@@ -195,6 +197,7 @@ pub(crate) fn parse_legacy_chart_with_style_parts_and_images(
         image_resolver,
         false,
         None,
+        None,
     )
 }
 
@@ -223,6 +226,7 @@ pub(crate) fn parse_chartex(
         theme_format_scheme,
         &images,
         None,
+        None,
     )
 }
 
@@ -235,6 +239,7 @@ pub(crate) fn parse_chartex_with_images(
     theme_format_scheme: Option<&ooxml_common::theme::ThemeFormatScheme>,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    allocation_part: Option<&str>,
 ) -> Option<ChartElement> {
     // The shared chart grammar reparses optional style XML after this entry.
     parse_chart_with_images(
@@ -247,6 +252,7 @@ pub(crate) fn parse_chartex_with_images(
         image_resolver,
         true,
         limit_reporter,
+        allocation_part,
     )
 }
 
@@ -312,7 +318,12 @@ mod tests {
             "chartex-allocation"
         );
         assert_eq!(json["details"]["violation"]["format"], "pptx");
-        assert_eq!(json["details"]["violation"]["observed"], 524289);
+        assert_eq!(json["details"]["violation"]["metric"], "bytes");
+        assert_eq!(
+            json["details"]["violation"]["limit"],
+            ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+        );
+        assert_eq!(json["details"]["violation"]["observed"], 12_582_913);
     }
 
     #[test]

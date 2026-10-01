@@ -906,6 +906,11 @@ fn chartex_allocation_limit_poisoning_matches_native_and_streaming() {
             "chartex-allocation"
         );
         assert_eq!(json["details"]["violation"]["format"], "docx");
-        assert_eq!(json["details"]["violation"]["observed"], 524289);
+        assert_eq!(json["details"]["violation"]["metric"], "bytes");
+        assert_eq!(
+            json["details"]["violation"]["limit"],
+            ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+        );
+        assert_eq!(json["details"]["violation"]["observed"], 12_582_913);
     }
 }

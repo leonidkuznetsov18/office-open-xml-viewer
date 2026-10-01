@@ -147,6 +147,9 @@ pub struct ChartParseContext<'a> {
     pub host: ChartHost,
     /// Package-operation capability: hard failures survive Option-based adapters.
     pub limit_reporter: Option<&'a crate::package_session::PackageLimitReporter>,
+    /// Stable OPC part name used to make document-level ChartEx allocation
+    /// accounting idempotent when a host parses the same part more than once.
+    pub allocation_part: Option<&'a str>,
     pub color_resolver: Option<&'a dyn ColorResolver>,
     pub style_xml: Option<&'a str>,
     pub color_style_xml: Option<&'a str>,
@@ -167,6 +170,7 @@ impl<'a> ChartParseContext<'a> {
         Self {
             host: ChartHost::Unspecified,
             limit_reporter: None,
+            allocation_part: None,
             color_resolver: Some(color_resolver),
             style_xml,
             color_style_xml,
@@ -183,8 +187,8 @@ pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<C
 
 /// Parse a Microsoft chartEx part into the shared wire model.
 pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
-    let budget = ChartexAllocationBudget::new(context.limit_reporter);
-    parse_part(
+    let budget = ChartexAllocationBudget::new(context.limit_reporter, context.allocation_part);
+    let model = parse_part(
         root,
         context,
         |root, resolver, style, colors, refs, images| {
@@ -199,7 +203,8 @@ pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option
                 &budget,
             )
         },
-    )
+    );
+    budget.finish(model)
 }
 
 fn parse_part(

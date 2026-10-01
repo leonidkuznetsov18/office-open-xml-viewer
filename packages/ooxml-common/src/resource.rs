@@ -41,6 +41,7 @@ struct GovernorState {
     next_operation_id: u64,
     operations: HashMap<u64, LogicalOperationState>,
     hard_limit_totals: HashMap<HardResourceLimitKind, u64>,
+    hard_limit_part_totals: HashMap<(HardResourceLimitKind, String), u64>,
     first_error: Option<String>,
 }
 
@@ -82,6 +83,7 @@ pub enum HardResourceLimitKind {
     PptxSharedDependencyXmlBytes,
     XmlDomComplexity,
     ChartexAllocationElements,
+    ChartexAllocationBytes,
     PptxSharedDependencyProjectionBytes,
     PptxSharedCacheEntries,
     PptxSharedCacheProjectionBytes,
@@ -119,6 +121,7 @@ impl HardResourceLimitKind {
                 ("parsing", "pptx-shared-dependency-xml", "bytes")
             }
             Self::ChartexAllocationElements => ("parsing", "chartex-allocation", "elements"),
+            Self::ChartexAllocationBytes => ("parsing", "chartex-allocation", "bytes"),
             Self::XmlDomComplexity => ("parsing", "xml-dom", "complexity-units"),
             Self::PptxSharedDependencyProjectionBytes => {
                 ("parsing", "pptx-shared-dependency", "projected-bytes")
@@ -281,6 +284,7 @@ impl ResourceGovernor {
             next_operation_id: 1,
             operations: HashMap::new(),
             hard_limit_totals: HashMap::new(),
+            hard_limit_part_totals: HashMap::new(),
             first_error: None,
         })))
     }
@@ -578,6 +582,53 @@ pub fn charge_hard_limit(
         part,
         limit,
         observed: next,
+        configurable: false,
+    }))
+}
+
+/// Observe one part's cumulative allocation-like work and charge only growth.
+///
+/// A package may parse the same OPC part more than once (for example an XLSX
+/// cursor preview followed by final materialization). Keeping the maximum seen
+/// for each `(kind, part)` makes those parses idempotent while still summing
+/// distinct parts and charging any later parse that genuinely allocates more.
+pub fn observe_part_hard_limit(
+    kind: HardResourceLimitKind,
+    part: &str,
+    limit: u64,
+    cumulative_for_part: u64,
+) -> Result<(), String> {
+    let Some(governor) = active_governor() else {
+        return Ok(());
+    };
+    let mut state = governor.0.borrow_mut();
+    state.assert_healthy()?;
+    // The raw package-session key stays internal and must distinguish every
+    // entry even when two unsafe names would share the same public redaction.
+    let key = (kind, part.to_owned());
+    let old = state.hard_limit_part_totals.get(&key).copied().unwrap_or(0);
+    let next_part = old.max(cumulative_for_part);
+    let total = state
+        .hard_limit_totals
+        .get(&kind)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(next_part.saturating_sub(old));
+    state.hard_limit_part_totals.insert(key, next_part);
+    state.hard_limit_totals.insert(kind, total);
+    if total <= limit {
+        return Ok(());
+    }
+    let (stage, resource, metric) = kind.wire_fields();
+    Err(state.fail(LimitCrossing {
+        stage,
+        resource,
+        metric,
+        // ChartEx allocation violations intentionally omit package paths from
+        // the public wire error; `part` is only the internal idempotence key.
+        part: None,
+        limit,
+        observed: total,
         configurable: false,
     }))
 }

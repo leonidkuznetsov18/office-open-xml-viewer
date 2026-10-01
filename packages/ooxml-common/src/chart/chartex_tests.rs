@@ -2,6 +2,47 @@
 mod tests {
     use super::super::*;
 
+    #[test]
+    fn chartex_heap_allocations_use_the_budget_gateway() {
+        let source = include_str!("chartex.rs");
+        let (_, after_begin) = source
+            .split_once("CHARTEX_ALLOCATION_GATEWAY_BEGIN")
+            .expect("allocation gateway begin marker");
+        let (_, after_gateway) = after_begin
+            .split_once("CHARTEX_ALLOCATION_GATEWAY_END")
+            .expect("allocation gateway end marker");
+        let before_gateway = source
+            .split_once("CHARTEX_ALLOCATION_GATEWAY_BEGIN")
+            .map(|(before, _)| before)
+            .expect("allocation gateway");
+        let parser_source = format!("{before_gateway}{after_gateway}");
+        for forbidden in [
+            "Vec::new(",
+            "Vec::with_capacity(",
+            "vec![",
+            "String::new(",
+            "Box::new(",
+            ".collect()",
+            ".collect::<Vec",
+            ".extend(",
+            ".reserve(",
+            ".reserve_exact(",
+            ".resize(",
+            "series[0].clone()",
+        ] {
+            assert!(
+                !parser_source.contains(forbidden),
+                "ChartEx heap allocation bypasses ChartexAllocationBudget: {forbidden}"
+            );
+        }
+        for line in parser_source.lines().filter(|line| line.contains(".push(")) {
+            assert!(
+                line.contains("budget.push("),
+                "ChartEx Vec growth bypasses ChartexAllocationBudget: {line}"
+            );
+        }
+    }
+
     fn allocation_chart(counts: &[usize], shared: bool) -> String {
         let mut data = String::new();
         let mut series = String::new();
@@ -23,6 +64,7 @@ mod tests {
     fn chartex_allocation_bound_is_inclusive_and_host_independent() {
         use crate::resource::{OoxmlFormat, ResourceGovernor};
         for (host, format) in [
+            (ChartHost::Unspecified, OoxmlFormat::Pptx),
             (ChartHost::Word, OoxmlFormat::Docx),
             (ChartHost::Excel, OoxmlFormat::Xlsx),
             (ChartHost::PowerPoint, OoxmlFormat::Pptx),
@@ -73,9 +115,21 @@ mod tests {
                     assert_eq!(json["details"]["stage"], "parsing");
                     let violation = &json["details"]["violation"];
                     assert_eq!(violation["resource"], "chartex-allocation");
-                    assert_eq!(violation["metric"], "elements");
-                    assert_eq!(violation["limit"], 524288);
-                    assert_eq!(violation["observed"], 524289);
+                    if counts == vec![524289] {
+                        assert_eq!(violation["metric"], "elements");
+                        assert_eq!(
+                            violation["limit"],
+                            crate::resource::HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS
+                        );
+                        assert_eq!(violation["observed"], 524289);
+                    } else {
+                        assert_eq!(violation["metric"], "bytes");
+                        assert_eq!(
+                            violation["limit"],
+                            crate::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+                        );
+                        assert_eq!(violation["observed"], 12_582_913);
+                    }
                     assert_eq!(violation["configurable"], false);
                 }
             }
@@ -98,6 +152,7 @@ mod tests {
                 .replace(r#"idx="0""#, r#"idx="4294967295""#),
         ];
         for (host, format) in [
+            (ChartHost::Unspecified, OoxmlFormat::Pptx),
             (ChartHost::Word, OoxmlFormat::Docx),
             (ChartHost::Excel, OoxmlFormat::Xlsx),
             (ChartHost::PowerPoint, OoxmlFormat::Pptx),
@@ -118,13 +173,112 @@ mod tests {
     }
 
     #[test]
-    fn chartex_allocation_budget_is_shared_across_document_operations() {
+    fn standalone_chartex_width_failures_are_monotonic_without_a_reporter() {
+        for count in [524_289_u64, 1_048_577, u64::from(u32::MAX)] {
+            let xml = allocation_chart(&[1], true)
+                .replace(r#"ptCount="1""#, &format!(r#"ptCount="{count}""#));
+            for host in [
+                ChartHost::Unspecified,
+                ChartHost::Word,
+                ChartHost::Excel,
+                ChartHost::PowerPoint,
+            ] {
+                let document = root_of(&xml);
+                let context = ChartParseContext {
+                    host,
+                    ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                };
+                assert!(
+                    parse_chartex_part(document.root_element(), &context).is_none(),
+                    "{host:?} accepted ptCount={count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chartex_verdict_does_not_depend_on_pareto_host_filtering() {
+        let later_owner = allocation_chart(&[1, 1, 1_048_577], false).replace(
+            r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="2"/>"#,
+            r#"<cx:series layoutId="paretoLine" ownerIdx="1"><cx:dataId val="2"/>"#,
+        );
+        let hidden_owner = allocation_chart(&[1_048_577, 1, 1], false)
+            .replace(
+                r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/>"#,
+                r#"<cx:series layoutId="clusteredColumn" hidden="1"><cx:dataId val="0"/>"#,
+            )
+            .replace(
+                r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="2"/>"#,
+                r#"<cx:series layoutId="paretoLine" ownerIdx="0"><cx:dataId val="2"/>"#,
+            );
+        let formula_only = allocation_chart(&[1; 16], true).replace(
+            r#"<cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl>"#,
+            r#"<cx:f>Sheet1!$A$1:$A$65536</cx:f>"#,
+        );
+        for xml in [later_owner, hidden_owner, formula_only] {
+            for host in [
+                ChartHost::Unspecified,
+                ChartHost::Word,
+                ChartHost::Excel,
+                ChartHost::PowerPoint,
+            ] {
+                let document = root_of(&xml);
+                let context = ChartParseContext {
+                    host,
+                    ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                };
+                assert!(parse_chartex_part(document.root_element(), &context).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn chartex_budget_covers_empty_series_and_nested_rich_run_clones() {
+        let empty_series = allocation_chart(&vec![0; 10_000], true);
+        let runs = r#"<a:r><a:t>X</a:t></a:r>"#.repeat(1024);
+        // 128 clones of a 1,024-run label exceed the byte ceiling while
+        // keeping the unit test small; the independent reproducer exercises
+        // the original 1,025-series payload.
+        let nested = allocation_chart(&vec![1; 128], true)
+            .replacen(
+                "xmlns:cx=",
+                r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:cx="#,
+                1,
+            )
+            .replacen(
+                r#"<cx:dataId val="0"/></cx:series>"#,
+                &format!(r#"<cx:dataId val="0"/><cx:dataLabels><cx:dataLabel idx="0"><cx:txPr><a:bodyPr/><a:lstStyle/><a:p>{runs}</a:p></cx:txPr></cx:dataLabel></cx:dataLabels></cx:series>"#),
+                1,
+            );
+        for xml in [empty_series, nested] {
+            for host in [
+                ChartHost::Unspecified,
+                ChartHost::Word,
+                ChartHost::Excel,
+                ChartHost::PowerPoint,
+            ] {
+                let document = root_of(&xml);
+                let context = ChartParseContext {
+                    host,
+                    ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                };
+                assert!(
+                    parse_chartex_part(document.root_element(), &context).is_none(),
+                    "{host:?} accepted an allocation amplification"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chartex_allocation_budget_is_document_scoped_and_part_idempotent() {
         use crate::package_session::PackageSessionHandle;
         use crate::resource::OoxmlFormat;
         use std::io::{Cursor, Write};
 
         let xml = allocation_chart(&[524288], true);
         for (host, format) in [
+            (ChartHost::Unspecified, OoxmlFormat::Pptx),
             (ChartHost::Word, OoxmlFormat::Docx),
             (ChartHost::Excel, OoxmlFormat::Xlsx),
             (ChartHost::PowerPoint, OoxmlFormat::Pptx),
@@ -150,6 +304,7 @@ mod tests {
                     let context = ChartParseContext {
                         host,
                         limit_reporter: Some(&reporter),
+                        allocation_part: Some("charts/chart1.xml"),
                         ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
                     };
                     parse_chartex_part(doc.root_element(), &context)
@@ -158,19 +313,35 @@ mod tests {
                 })
                 .expect("first chart consumes the exact document budget");
 
-            let error = package
+            package
                 .run_operation("second-chart", |operation| {
                     let reporter = operation.limit_reporter()?;
                     let doc = root_of(&xml);
                     let context = ChartParseContext {
                         host,
                         limit_reporter: Some(&reporter),
+                        allocation_part: Some("charts/chart1.xml"),
                         ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
                     };
                     let _ = parse_chartex_part(doc.root_element(), &context);
                     Ok(())
                 })
-                .expect_err("second chart must share the document ceiling");
+                .expect("reparsing the same part must be idempotent");
+
+            let error = package
+                .run_operation("distinct-chart", |operation| {
+                    let reporter = operation.limit_reporter()?;
+                    let doc = root_of(&xml);
+                    let context = ChartParseContext {
+                        host,
+                        limit_reporter: Some(&reporter),
+                        allocation_part: Some("charts/chart2.xml"),
+                        ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                    };
+                    let _ = parse_chartex_part(doc.root_element(), &context);
+                    Ok(())
+                })
+                .expect_err("distinct parts must share the document ceiling");
             assert!(error.contains("chartex-allocation"), "{host:?}: {error}");
         }
     }
@@ -1209,7 +1380,7 @@ mod tests {
         );
         let count_doc = chart_space_of(&huge_count);
         let mut references = EmptyChartReferenceResolver;
-        let budget = ChartexAllocationBudget::new(None);
+        let budget = ChartexAllocationBudget::new(None, None);
         assert!(
             chartex_string_levels(count_doc.root_element(), &mut references, &budget).is_none()
         );
@@ -1230,7 +1401,7 @@ mod tests {
             </cx:chartSpace>"#,
         );
         let index_doc = chart_space_of(&huge_index);
-        let budget = ChartexAllocationBudget::new(None);
+        let budget = ChartexAllocationBudget::new(None, None);
         assert!(
             chartex_string_levels(index_doc.root_element(), &mut references, &budget).is_none()
         );
@@ -1250,7 +1421,7 @@ mod tests {
             </cx:chartSpace>"#,
         );
         let aggregate_doc = chart_space_of(&aggregate);
-        let budget = ChartexAllocationBudget::new(None);
+        let budget = ChartexAllocationBudget::new(None, None);
         assert!(
             chartex_string_levels(aggregate_doc.root_element(), &mut references, &budget).is_none()
         );
@@ -1595,7 +1766,7 @@ mod tests {
         // series: authored provenance remains, but no structured recipe is
         // expanded for an arbitrary prefix of the chart.
         for series in series {
-            let budget = ChartexAllocationBudget::new(None);
+            let budget = ChartexAllocationBudget::new(None, None);
             let (_, _, defaults) =
                 parse_chartex_series_labels(series, 1, &FixtureResolver, false, &budget)
                     .expect("labels fit allocation budget");
@@ -2071,6 +2242,14 @@ mod tests {
         ];
         for (index, data) in cases.iter().enumerate() {
             for host in [ChartHost::PowerPoint, ChartHost::Excel] {
+                if index == 3 {
+                    assert!(
+                        parse_chartex_xml(data, &format!("{AGG_OWNER}{OWNED_LINE}"), host)
+                            .is_none(),
+                        "oversized fallback cache must fail closed on {host:?}"
+                    );
+                    continue;
+                }
                 let model = parse_chartex_xml(data, &format!("{AGG_OWNER}{OWNED_LINE}"), host)
                     .unwrap_or_else(|| panic!("case {index} must still parse on {host:?}"));
                 assert_eq!(model.chart_type, "pareto", "case {index}");

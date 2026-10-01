@@ -4560,6 +4560,7 @@ fn load_chart_map(
             &image_resolver,
             &mut exact_chartex_root,
             Some(&reporter),
+            Some(&path),
         ) {
             if let (Some(user_shapes_xml), Ok(chart_doc)) =
                 (user_shapes_xml.as_deref(), parse_guarded(&xml))
@@ -12900,9 +12901,11 @@ fn parse_docx_chart_with_style_parts_and_images(
         image_resolver,
         &mut false,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_docx_chart_with_provenance(
     chart_xml: &str,
     style_xml: Option<&str>,
@@ -12911,6 +12914,7 @@ fn parse_docx_chart_with_provenance(
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     exact_chartex_root: &mut bool,
     limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    allocation_part: Option<&str>,
 ) -> Option<ooxml_common::chart::ChartModel> {
     let doc = parse_guarded(chart_xml).ok()?;
     let root = doc.root_element();
@@ -12928,6 +12932,7 @@ fn parse_docx_chart_with_provenance(
             &ooxml_common::chart::ChartParseContext {
                 host: ooxml_common::chart::ChartHost::Word,
                 limit_reporter,
+                allocation_part,
                 ..ooxml_common::chart::ChartParseContext::new(
                     &resolver,
                     style_xml,

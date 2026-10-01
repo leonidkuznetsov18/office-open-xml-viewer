@@ -3309,6 +3309,7 @@ fn parse_graphic_frame(
                                     theme_source.format_scheme(),
                                     &image_resolver,
                                     Some(&reporter),
+                                    Some(&chart_path),
                                 )
                             })
                     } else {

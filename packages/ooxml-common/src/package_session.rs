@@ -753,6 +753,25 @@ impl PackageSession {
         result
     }
 
+    fn observe_part_hard_limit(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        part: &str,
+        limit: u64,
+        cumulative_for_part: u64,
+    ) -> Result<(), String> {
+        self.ensure_healthy()?;
+        self.assert_operation_active(operation_id)?;
+        let scope = self.governor.scope_operation(operation_id)?;
+        let result = resource::observe_part_hard_limit(kind, part, limit, cumulative_for_part);
+        drop(scope);
+        if result.is_err() {
+            self.converge_poison();
+        }
+        result
+    }
+
     #[cfg(test)]
     fn operation_inflated_bytes(&self, operation_id: ResourceOperation) -> Option<u64> {
         self.usage_for_operation(operation_id)
@@ -1240,6 +1259,24 @@ impl PackageLimitReporter {
             part,
             limit,
             increment,
+        )
+    }
+
+    /// Observe cumulative work for one OPC part without double-charging a
+    /// later parse of that same part.
+    pub fn observe_part_hard_limit(
+        &self,
+        kind: HardResourceLimitKind,
+        part: &str,
+        limit: u64,
+        cumulative_for_part: u64,
+    ) -> Result<(), String> {
+        self.handle.inner.borrow_mut().observe_part_hard_limit(
+            self.operation_id,
+            kind,
+            part,
+            limit,
+            cumulative_for_part,
         )
     }
 }
