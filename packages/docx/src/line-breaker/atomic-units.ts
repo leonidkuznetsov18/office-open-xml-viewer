@@ -13,11 +13,12 @@ export interface AtomicTextMeasurement {
  * Internal separators and formatting seams cannot shorten that allocation.
  * Admission and placement consume this same complete resolved region. */
 export function measureFitTextUnit(
-  first: LayoutTextSeg, following: readonly LayoutSeg[], measurement: AtomicTextMeasurement, startIndex = 0,
+  first: LayoutTextSeg, following: Iterable<LayoutSeg>, measurement: AtomicTextMeasurement, startIndex = 0,
 ): number {
   let width = measurement.segAdvance(first);
-  for (let index = startIndex; index < following.length; index += 1) {
-    const member = following[index];
+  let index = 0;
+  for (const member of following) {
+    if (index++ < startIndex) continue;
     if (!('text' in member) || member.fitTextRegionIndex !== first.fitTextRegionIndex) break;
     width += measurement.segAdvance(member);
   }
@@ -33,15 +34,17 @@ export function measureFitTextUnit(
  * as its own cell. Mid-line lookahead still avoids splitting joined words.
  * No field/link/run direction grants extra atomic ownership by itself. */
 export function measureJoinedTextUnit(
-  s: LayoutTextSeg, following: readonly LayoutSeg[], measurement: AtomicTextMeasurement,
+  s: LayoutTextSeg, following: Iterable<LayoutSeg>, measurement: AtomicTextMeasurement,
   w = measurement.segAdvance(s), trailingSpaceW = 0, startIndex = 0, atLineStart = false,
 ): Readonly<{ width: number; trailingSpace: number; next: LayoutSeg | undefined }> {
   const { segAdvance, strAdvance } = measurement;
   let groupW = w;
   let groupTrail = s.fitTextRegionIndex === undefined ? trailingSpaceW : 0;
-  let groupEnd = startIndex;
-  for (; groupEnd < following.length; groupEnd += 1) {
-    const f = following[groupEnd];
+  let index = 0;
+  let next: LayoutSeg | undefined;
+  for (const f of following) {
+    if (index++ < startIndex) continue;
+    next = f;
     if (!('text' in f)) break;
     if (!f.joinPrev || atLineStart && f.fitTextRegionStart) break;
     const fixedCell = f.ruby !== undefined || f.tateChuYoko === true;
@@ -65,6 +68,7 @@ export function measureJoinedTextUnit(
       ? fw - strAdvance(f, trimmed) : 0;
     groupTrail = trimmed.length === 0 && groupTrail > 0 ? groupTrail + trailing : trailing;
     if (end < f.text.length || !fixedCell && externalEnd !== undefined && hardEnd === undefined) break;
+    next = undefined;
   }
-  return { width: groupW, trailingSpace: groupTrail, next: following[groupEnd] };
+  return { width: groupW, trailingSpace: groupTrail, next };
 }
