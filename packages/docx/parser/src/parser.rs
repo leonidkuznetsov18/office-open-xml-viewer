@@ -16,10 +16,12 @@ use ooxml_common::resource::ResourceUsage;
 // Production parses go through `ooxml_common::depth::parse_guarded` (depth-guarded
 // before roxmltree's recursive tree builder). The `XmlDoc` alias survives only for
 // the in-module unit tests, which parse trusted, hand-written fixtures directly.
+use crate::chartex_choice::{self, Verdict, CHARTEX_NS, CHARTEX_REL};
 #[cfg(test)]
 use roxmltree::Document as XmlDoc;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
+use std::rc::Rc;
 
 use crate::chart_compatibility::apply_word_classic_chart_space_frame;
 use crate::document_projector::{DocumentBodyPlan, DocumentBodyProjector};
@@ -118,6 +120,7 @@ fn read_zip_string(zip: &mut Zip, path: &str) -> Result<String, String> {
 
 fn open_document_body_projector(
     zip: &mut Zip,
+    rids: Rc<HashSet<String>>,
 ) -> Result<DocumentBodyProjector<BufReader<PackageEntryStream>>, String> {
     let operation = zip.operation()?;
     let reporter = operation.limit_reporter()?;
@@ -125,6 +128,7 @@ fn open_document_body_projector(
     Ok(DocumentBodyProjector::new(
         BufReader::new(stream),
         Some(reporter),
+        rids,
     ))
 }
 
@@ -160,7 +164,7 @@ mod private_typography_wire_tests {
             styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &relationships,
             &theme,
             None,
@@ -794,6 +798,25 @@ pub(crate) fn parse_from_bytes_streamed_with_limits(
     zip.run_operation(operation, parse_streamed_compatible)
 }
 
+/// Story-local chart models and resource capability facts. Keeping these
+/// together prevents header/footer rIds from borrowing body relationships.
+#[derive(Default)]
+struct ChartMap {
+    models: HashMap<String, ooxml_common::chart::ChartModel>,
+    renderable_chartex_rids: Rc<HashSet<String>>,
+}
+impl std::ops::Deref for ChartMap {
+    type Target = HashMap<String, ooxml_common::chart::ChartModel>;
+    fn deref(&self) -> &Self::Target {
+        &self.models
+    }
+}
+impl std::ops::DerefMut for ChartMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.models
+    }
+}
+
 struct DocumentParseEnvironment {
     rels_xml: String,
     rel_map: HashMap<String, String>,
@@ -804,7 +827,8 @@ struct DocumentParseEnvironment {
     num_map: NumberingMap,
     theme: ThemeColors,
     media_map: HashMap<String, String>,
-    chart_map: HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: ChartMap,
+    renderable_chartex_rids: Rc<HashSet<String>>,
     document_settings: Option<crate::types::DocumentSettings>,
     page_layout_settings: Option<crate::types::PageLayoutSettingsWire>,
     note_layout_settings: Option<crate::types::NoteLayoutSettingsWire>,
@@ -997,6 +1021,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         num_map,
         theme,
         media_map,
+        renderable_chartex_rids: Rc::clone(&chart_map.renderable_chartex_rids),
         chart_map,
         document_settings,
         page_layout_settings,
@@ -1029,7 +1054,8 @@ fn preflight_document_body(
     zip: &mut Zip,
     environment: &DocumentParseEnvironment,
 ) -> Result<DocumentBodyPreflight, String> {
-    let mut projector = open_document_body_projector(zip)?;
+    let mut projector =
+        open_document_body_projector(zip, Rc::clone(&environment.renderable_chartex_rids))?;
     let mut sequence_facts = Vec::new();
     let mut sections = Vec::new();
     let mut running_refs = SectionRefs::default();
@@ -1121,7 +1147,8 @@ fn preflight_document_body(
     let mut ref_leading_breaks = HashMap::new();
     if !ref_instructions.targets.is_empty() {
         drop(projector);
-        let mut projector = open_document_body_projector(zip)?;
+        let mut projector =
+            open_document_body_projector(zip, Rc::clone(&environment.renderable_chartex_rids))?;
         let mut collector = LeadingBreakCollector::new(&ref_instructions.targets);
         while let Some(block) = projector.next_block()? {
             if block.local_name != "p" {
@@ -1409,10 +1436,11 @@ impl DocxBodyCursor {
         }
 
         let projector =
-            open_document_body_projector(zip).map_err(|error| DocumentCursorFailure {
-                error,
-                theme: Box::new(degraded_theme.clone()),
-            })?;
+            open_document_body_projector(zip, Rc::clone(&environment.renderable_chartex_rids))
+                .map_err(|error| DocumentCursorFailure {
+                    error,
+                    theme: Box::new(degraded_theme.clone()),
+                })?;
         Ok(Self {
             environment: Some(environment),
             plan: preflight.plan,
@@ -3192,7 +3220,7 @@ fn parse_body_elements(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -3217,7 +3245,7 @@ fn parse_body_elements_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -3424,7 +3452,7 @@ impl BodyParseCursor {
         style_map: &StyleMap,
         num_map: &mut NumberingMap,
         media_map: &HashMap<String, String>,
-        chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+        chart_map: &ChartMap,
         rel_map: &HashMap<String, String>,
         theme: &ThemeColors,
         section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -3572,7 +3600,7 @@ fn parse_body_elements_in_story(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -4482,14 +4510,14 @@ fn load_chart_map(
     relationships: &BTreeMap<String, RelTarget>,
     source_part: &str,
     theme: &ThemeColors,
-) -> HashMap<String, ooxml_common::chart::ChartModel> {
+) -> ChartMap {
     // Resolve the rId's Type via the raw rels: `rel_map` only carries Targets,
     // but a chart Target is distinguishable by the part it lands on. Match on the
     // resolved zip path living under `word/charts/` and ending in `.xml` — the
     // canonical location for a DrawingML chart part. `parse_chart_part` returns
     // `None` for a colors/style sidecar, so a stray non-chart `.xml` there is
     // harmless.
-    let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+    let mut chart_map: ChartMap = ChartMap::default();
     for (rid, relationship) in relationships {
         // Use the stored ZIP item name (§6.2.2.3 equivalence); an absent part
         // is dropped exactly like an unreadable one.
@@ -4517,12 +4545,14 @@ fn load_chart_map(
             &theme.chart_images,
         );
         let user_shapes_xml = load_chart_user_shapes_xml(zip, &path, &xml);
-        if let Some(mut chart) = parse_docx_chart_with_style_parts_and_images(
+        let mut exact_chartex_root = false;
+        if let Some(mut chart) = parse_docx_chart_with_provenance(
             &xml,
             related_parts.style_xml.as_deref(),
             related_parts.color_style_xml.as_deref(),
             theme,
             &image_resolver,
+            &mut exact_chartex_root,
         ) {
             if let (Some(user_shapes_xml), Ok(chart_doc)) =
                 (user_shapes_xml.as_deref(), parse_guarded(&xml))
@@ -4538,6 +4568,15 @@ fn load_chart_map(
                         chart.chart_text_boxes = Some(text_boxes);
                     }
                 }
+            }
+            // [MS-ODRAWXML] §2.1.5: ChartEx is a separate part/relationship family.
+            // Reuse the already inflated XML and successful ChartEx parse; no
+            // prescan, extra ZIP read, or part-name guess enters the verdict.
+            if relationship.relationship_type.as_deref() == Some(CHARTEX_REL)
+                && relationship.mode == TargetMode::Internal
+                && exact_chartex_root
+            {
+                Rc::make_mut(&mut chart_map.renderable_chartex_rids).insert(rid.clone());
             }
             chart_map.insert(rid.clone(), chart);
         }
@@ -4951,7 +4990,7 @@ fn parse_paragraph(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -4978,7 +5017,7 @@ fn parse_paragraph_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -5010,7 +5049,7 @@ fn parse_paragraph_cond_at_depth(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -5196,7 +5235,7 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -5585,7 +5624,7 @@ fn parse_para_content(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     runs: &mut Vec<DocRun>,
@@ -5990,7 +6029,7 @@ fn handle_run_in_para(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     runs: &mut Vec<DocRun>,
@@ -6694,7 +6733,7 @@ fn parse_run_inner(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     runs: &mut Vec<DocRun>,
@@ -7471,19 +7510,44 @@ fn parse_run_inner(
                 })));
             }
             "AlternateContent" => {
-                // ECMA-376 Part 3 §9.3 (MCE Step 2) — select the active branch:
-                // the first `<mc:Choice>` whose `Requires` namespaces are all
-                // understood, else the `<mc:Fallback>`. The old code always took
-                // the first Choice and never the Fallback, so a picture living
-                // only behind an un-understood Choice was silently dropped
-                // (issue #747). For sample-24 the Choice `Requires="cx"` IS
-                // understood, so the live chartex chart wins and its rendered-PNG
-                // Fallback is correctly NOT re-emitted (no double draw).
-                if let Some(selected) =
-                    ooxml_common::mce::select_alternate_content(child, &docx_understands_drawing_ns)
-                {
-                    for inner in selected.children().filter(|n| n.is_element()) {
-                        if inner.tag_name().name() == "drawing" {
+                if let Some(selected) = chartex_choice::select_native_alternate_content(
+                    child,
+                    &chart_map.renderable_chartex_rids,
+                    &docx_understands_drawing_ns,
+                    &crate::document_projector::docx_understands_namespace,
+                ) {
+                    let fallback = child.children().find(|node| {
+                        node.is_element()
+                            && node.tag_name().namespace()
+                                == Some(ooxml_common::bounded_xml::MCE_NS)
+                            && node.tag_name().name() == "Fallback"
+                    });
+                    let use_fallback = selected.tag_name().namespace()
+                        == Some(ooxml_common::bounded_xml::MCE_NS)
+                        && selected.tag_name().name() == "Choice"
+                        && fallback.is_some_and(|fallback| {
+                            chartex_choice::native_branch_must_understand(
+                                fallback,
+                                &crate::document_projector::docx_understands_namespace,
+                            )
+                        })
+                        && chartex_choice::native_verdict(
+                            selected,
+                            &chart_map.renderable_chartex_rids,
+                        ) == Verdict::Unrenderable;
+                    // Resource compatibility is intentionally confined to the
+                    // single-drawing ChartEx seam (see chartex_choice.rs). Later
+                    // Choices never replace the selected Choice; only the authored
+                    // drawing/pict fallback is eligible. General MCE stays intact.
+                    let branch = if use_fallback {
+                        fallback.unwrap()
+                    } else {
+                        selected
+                    };
+                    for inner in branch.children().filter(|n| n.is_element()) {
+                        if inner.tag_name().name() == "drawing"
+                            && (!use_fallback || is_w_ns(inner.tag_name().namespace()))
+                        {
                             let mut drawing_runs = parse_inline_drawing(
                                 style_map,
                                 num_map,
@@ -7497,6 +7561,26 @@ fn parse_run_inner(
                             );
                             attach_anchor_host_metrics(&mut drawing_runs);
                             runs.extend(drawing_runs);
+                        } else if use_fallback
+                            && is_w_ns(inner.tag_name().namespace())
+                            && inner.tag_name().name() == "pict"
+                        {
+                            // Same VML dispatch and host metrics as the pict arm.
+                            if let Some(img) = parse_vml_pict_image(inner, media_map) {
+                                let mut pict_runs = vec![DocRun::Image(Box::new(img))];
+                                attach_anchor_host_metrics(&mut pict_runs);
+                                runs.extend(pict_runs);
+                            } else if let Some(shp) = parse_vml_pict(
+                                style_map, num_map, inner, theme, media_map, chart_map, rel_map,
+                                depth,
+                            ) {
+                                let anchored = shp.anchor_acquisition.is_some();
+                                let mut pict_runs = vec![DocRun::Shape(Box::new(shp))];
+                                if anchored {
+                                    attach_anchor_host_metrics(&mut pict_runs);
+                                }
+                                runs.extend(pict_runs);
+                            }
                         }
                     }
                 }
@@ -7717,8 +7801,9 @@ fn group_member_hidden(node: roxmltree::Node) -> bool {
 ///
 /// These are the DrawingML / WordprocessingML drawing-extension namespaces whose
 /// `<w:drawing>` payload `parse_inline_drawing` can turn into renderable runs:
-/// the 2014 chartex chart extension, and the 2010 wordprocessing drawing / shape
-/// / group extensions (shapes + groups are parsed by local name in the
+/// the 2014 ChartEx payload namespace and the 2010 wordprocessing drawing /
+/// shape / group extensions
+/// (shapes + groups are parsed by local name in the
 /// anchor/inline paths; the positioning extension is honored by
 /// `find_position_node`). A `Requires` naming anything outside this set (a future
 /// or app-specific extension we cannot draw) is NOT understood, so its Choice is
@@ -7736,8 +7821,7 @@ fn group_member_hidden(node: roxmltree::Node) -> bool {
 pub(crate) fn docx_understands_drawing_ns(ns: &str) -> bool {
     matches!(
         ns,
-        // Microsoft 2014 chartEx (waterfall / boxWhisker / treemap / sunburst …).
-        "http://schemas.microsoft.com/office/drawing/2014/chartex"
+        CHARTEX_NS
         // Microsoft 2010 WordprocessingML drawing extensions.
         | "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"
         | "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
@@ -7751,7 +7835,7 @@ fn parse_inline_drawing(
     num_map: &mut NumberingMap,
     node: roxmltree::Node,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -7819,7 +7903,7 @@ fn parse_inline_drawing_impl(
     num_map: &mut NumberingMap,
     node: roxmltree::Node,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -8298,7 +8382,7 @@ fn parse_inline_drawing_impl(
 fn collect_drawing_extent_diagnostic(
     drawing: roxmltree::Node,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     runs: &[DocRun],
     diagnostics: &mut Vec<PendingParseDiagnostic>,
 ) {
@@ -9442,7 +9526,7 @@ fn parse_wgp_shapes(
     anchor_z_order: u32,
 ) -> Vec<ShapeRun> {
     let group_metadata = anchor_group_metadata_index(wgp);
-    let chart_map = HashMap::new();
+    let chart_map = ChartMap::default();
     let rel_map = HashMap::new();
     parse_wgp_shapes_with_metadata(
         style_map,
@@ -9470,7 +9554,7 @@ fn parse_wgp_shapes_with_metadata(
     wgp: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
     anchor_pos_x: f64,
@@ -9551,7 +9635,7 @@ fn walk_group_children(
     xform: GroupTransform,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
     anchor_pos_x: f64,
@@ -9647,7 +9731,7 @@ fn parse_wsp_shape(
     wsp: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
     anchor_pos_x: f64,
@@ -10042,7 +10126,7 @@ fn parse_text_box_content(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -10135,7 +10219,7 @@ fn parse_text_box_content_at_depth(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -10183,7 +10267,7 @@ fn parse_shape_text_body(
     wsp: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
 ) -> ShapeTextBody {
@@ -10843,7 +10927,7 @@ fn parse_vml_pict(
     pict: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
 ) -> Option<ShapeRun> {
@@ -12785,6 +12869,7 @@ fn parse_docx_chart_with_style_parts(
     )
 }
 
+#[cfg(test)]
 fn parse_docx_chart_with_style_parts_and_images(
     chart_xml: &str,
     style_xml: Option<&str>,
@@ -12792,8 +12877,27 @@ fn parse_docx_chart_with_style_parts_and_images(
     theme: &ThemeColors,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
 ) -> Option<ooxml_common::chart::ChartModel> {
+    parse_docx_chart_with_provenance(
+        chart_xml,
+        style_xml,
+        color_style_xml,
+        theme,
+        image_resolver,
+        &mut false,
+    )
+}
+
+fn parse_docx_chart_with_provenance(
+    chart_xml: &str,
+    style_xml: Option<&str>,
+    color_style_xml: Option<&str>,
+    theme: &ThemeColors,
+    image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
+    exact_chartex_root: &mut bool,
+) -> Option<ooxml_common::chart::ChartModel> {
     let doc = parse_guarded(chart_xml).ok()?;
     let root = doc.root_element();
+    *exact_chartex_root = root.tag_name().namespace() == Some(CHARTEX_NS);
     let resolver = DocxColorResolver { theme };
     let is_chartex = root
         .tag_name()
@@ -12976,7 +13080,7 @@ fn parse_table(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -13005,7 +13109,7 @@ fn parse_table_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -13638,7 +13742,7 @@ fn parse_table_row(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -13745,7 +13849,7 @@ fn parse_table_cell(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -14370,7 +14474,7 @@ mod tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -14391,7 +14495,7 @@ mod tests {
             style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -15479,7 +15583,7 @@ mod tests {
             styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             &mut runs,
@@ -15737,7 +15841,7 @@ mod tests {
             &styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             &HashMap::new(),
@@ -15782,7 +15886,7 @@ mod tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -17188,7 +17292,7 @@ mod paragraph_identity_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             None,
@@ -17233,7 +17337,7 @@ mod math_jc_tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             None,
@@ -17565,7 +17669,7 @@ mod sym_run_tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             None,
@@ -17679,7 +17783,7 @@ mod para_mark_rpr_tests {
             sm,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             None,
@@ -17811,7 +17915,7 @@ mod cs_toggle_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -18082,7 +18186,7 @@ mod cs_toggle_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -18378,7 +18482,7 @@ mod rtl_tests {
             &style_map,
             &mut num_map,
             &media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rel_map,
             &theme,
             &HashMap::new(),
@@ -18939,7 +19043,7 @@ mod footnote_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -18977,7 +19081,7 @@ mod footnote_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             Some(table_style_id),
@@ -19018,7 +19122,7 @@ mod footnote_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -20542,7 +20646,7 @@ mod anchor_image_relative_from_tests {
         style_map: &StyleMap,
         node: roxmltree::Node,
         media_map: &HashMap<String, String>,
-        chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+        chart_map: &ChartMap,
         theme: &ThemeColors,
     ) -> Vec<DocRun> {
         let mut num_map = NumberingMap::default();
@@ -21427,7 +21531,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChart".to_string(), model);
 
         let runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21449,7 +21553,7 @@ mod anchor_image_relative_from_tests {
 
         // Unresolvable rId (empty map) retains layout without inventing a chart
         // model or image fallback.
-        let empty: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let empty: ChartMap = ChartMap::default();
         let unavailable = parse_inline_drawing(&style_map, drawing, &media, &empty, &theme);
         assert_eq!(unavailable.len(), 1);
         match &unavailable[0] {
@@ -21824,7 +21928,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("chartex model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChartEx".to_string(), model);
 
         let runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21901,7 +22005,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChart".to_string(), model);
 
         let mut runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21944,7 +22048,7 @@ mod anchor_image_relative_from_tests {
 
         // Unresolvable rId keeps one host and the authored anchor geometry
         // without inventing a chart model or image fallback.
-        let empty: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let empty: ChartMap = ChartMap::default();
         let mut unavailable = parse_inline_drawing(&style_map, drawing, &media, &empty, &theme);
         prepend_anchor_host_metrics(
             &mut unavailable,
@@ -22019,7 +22123,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChart".to_string(), model);
 
         let runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -22062,10 +22166,7 @@ mod anchor_image_relative_from_tests {
     /// so an MCE `<mc:AlternateContent>` test can bind arbitrary `Requires`
     /// prefixes and register a chart model for a chartex Choice. Returns the
     /// paragraph's runs.
-    fn parse_p_with_charts(
-        inner: &str,
-        chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
-    ) -> Vec<DocRun> {
+    fn parse_p_with_charts(inner: &str, chart_map: &ChartMap) -> Vec<DocRun> {
         let xml = format!(
             r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -22101,7 +22202,7 @@ mod anchor_image_relative_from_tests {
         p.runs
     }
 
-    fn chartex_model_map() -> HashMap<String, ooxml_common::chart::ChartModel> {
+    fn chartex_model_map() -> ChartMap {
         let theme = ThemeColors::default();
         let model = parse_docx_chart(
             r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
@@ -22116,8 +22217,9 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("chartex model");
-        let mut m: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut m: ChartMap = ChartMap::default();
         m.insert("rId8".to_string(), model);
+        Rc::make_mut(&mut m.renderable_chartex_rids).insert("rId8".to_string());
         m
     }
 
@@ -22172,7 +22274,7 @@ mod anchor_image_relative_from_tests {
     /// must now surface as an image run.
     #[test]
     fn mce_unknown_choice_falls_back_to_picture() {
-        let chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let chart_map: ChartMap = ChartMap::default();
         let runs = parse_p_with_charts(
             r#"<w:r><mc:AlternateContent>
                  <mc:Choice Requires="unknownns"><w:drawing>
@@ -22210,7 +22312,7 @@ mod anchor_image_relative_from_tests {
     /// Fallback picture.
     #[test]
     fn mce_wpc_canvas_choice_falls_back_to_picture() {
-        let chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let chart_map: ChartMap = ChartMap::default();
         let runs = parse_p_with_charts(
             r#"<w:r><mc:AlternateContent>
                  <mc:Choice Requires="wpc"><w:drawing>
@@ -22295,7 +22397,7 @@ mod anchor_image_relative_from_tests {
     /// malformed Choice would be the old always-first-Choice behavior.)
     #[test]
     fn mce_missing_or_blank_requires_falls_back() {
-        let chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let chart_map: ChartMap = ChartMap::default();
         // Case 1: Requires attribute entirely absent.
         let runs_missing = parse_p_with_charts(
             r#"<w:r><mc:AlternateContent>
@@ -22440,7 +22542,7 @@ mod column_tests {
             &style_map,
             &mut num_map,
             &media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rel_map,
             &theme,
             &HashMap::new(),
@@ -23624,7 +23726,7 @@ mod txbx_inline_image_tests {
             wsp,
             theme,
             media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25008,7 +25110,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             rel_map,
             depth,
         )
@@ -25092,7 +25194,7 @@ mod txbx_block_wire_tests {
             doc.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
             0.0,
@@ -25130,7 +25232,7 @@ mod txbx_block_wire_tests {
             doc.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25158,7 +25260,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25187,7 +25289,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25283,7 +25385,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::with_limit(0),
         )
@@ -25395,7 +25497,7 @@ mod txbx_block_wire_tests {
             wsp_document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         );
@@ -25405,7 +25507,7 @@ mod txbx_block_wire_tests {
             &StyleMap::default(),
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             None,
@@ -25489,7 +25591,7 @@ mod txbx_block_wire_tests {
             pict_document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25500,7 +25602,7 @@ mod txbx_block_wire_tests {
             &StyleMap::default(),
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             None,
@@ -25674,7 +25776,7 @@ mod shape_preset_geometry_tests {
             doc.root_element(),
             theme,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
             0.0,
@@ -26009,7 +26111,7 @@ mod inline_wps_shape_tests {
             &mut NumberingMap::default(),
             doc.root_element(),
             media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             DepthGuard::root(),
@@ -26124,7 +26226,7 @@ mod inline_wps_shape_tests {
             &mut NumberingMap::default(),
             doc.root_element(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             DepthGuard::root(),
@@ -26183,7 +26285,7 @@ mod shape_fontref_color_tests {
             doc.root_element(),
             &theme(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
             0.0,
@@ -26320,7 +26422,7 @@ mod numbering_marker_font_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26373,7 +26475,7 @@ mod numbering_marker_font_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26574,7 +26676,7 @@ mod numbering_marker_font_tests {
             &styles,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26635,7 +26737,7 @@ mod numbering_marker_font_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26753,7 +26855,7 @@ mod numbering_marker_font_tests {
             styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -26814,7 +26916,7 @@ mod numbering_marker_font_tests {
             styles,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -27938,7 +28040,7 @@ mod numbering_marker_color_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -28018,7 +28120,7 @@ mod numbering_marker_color_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -28115,7 +28217,7 @@ mod ole_object_tests {
             &StyleMap::default(),
             &mut num_map,
             media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -28407,7 +28509,7 @@ mod vml_pict_tests {
             &StyleMap::default(),
             &mut num_map,
             media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -29346,7 +29448,7 @@ mod strict_namespace_tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             rels,
             &theme,
             None,
@@ -30078,7 +30180,7 @@ mod tracked_change_move_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         );
