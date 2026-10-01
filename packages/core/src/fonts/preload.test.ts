@@ -20,6 +20,7 @@ afterEach(() => {
   _resetCssCacheForTests();
   _resetFontRegistryForTests(); // the FontFace refcount registry is module-global
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const CSS = `
@@ -82,7 +83,11 @@ interface FakeFace {
   load: () => Promise<FakeFace>;
 }
 
-function installFakes(opts: { failLoad?: boolean; quoteFamily?: boolean } = {}) {
+function installFakes(opts: {
+  failLoad?: boolean;
+  quoteFamily?: boolean;
+  load?: (face: FakeFace) => Promise<FakeFace>;
+} = {}) {
   const added: FakeFace[] = [];
   class FakeFontFace implements FakeFace {
     family: string; source: string; loadCalls = 0;
@@ -95,7 +100,7 @@ function installFakes(opts: { failLoad?: boolean; quoteFamily?: boolean } = {}) 
     }
     load(): Promise<FakeFace> {
       this.loadCalls++;
-      return opts.failLoad ? Promise.reject(new Error('net')) : Promise.resolve(this);
+      return opts.failLoad ? Promise.reject(new Error('net')) : (opts.load?.(this) ?? Promise.resolve(this));
     }
   }
   const set = {
@@ -115,6 +120,33 @@ const MAP: Record<string, FontPreloadEntry> = {
 };
 
 describe('preloadGoogleFonts', () => {
+  it.each(['main', 'worker'])('finishes individual loads without waiting on global ready (%s)', async (mode) => {
+    vi.useFakeTimers();
+    let finishLoads!: () => void;
+    const loadGate = new Promise<void>((resolve) => { finishLoads = resolve; });
+    const { set, added } = installFakes({ load: (face) => loadGate.then(() => face) });
+    set.ready = new Promise<void>(() => {});
+    if (mode === 'main') {
+      G.document = { fonts: set };
+      delete G.self;
+    } else {
+      delete G.document;
+      G.self = { fonts: set };
+    }
+    let loaded: FontFace[] | undefined;
+    const loading = preloadGoogleFonts(['Calibri'], MAP).then((faces) => { loaded = faces; });
+
+    // Neither the unresolved set.ready nor the safety ceiling decides readiness.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loaded).toBeUndefined();
+    finishLoads();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loaded).toHaveLength(2);
+    expect(loaded).toEqual(added);
+    expect(added.every((face) => face.loadCalls === 1)).toBe(true);
+    await loading;
+  });
+
   it('preserves a caller-supplied non-Google stylesheet map', async () => {
     const { set } = installFakes();
     G.document = { fonts: set };

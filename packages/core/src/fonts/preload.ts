@@ -270,6 +270,9 @@ export async function preloadGoogleFonts(
   //    serializes a multi-word name back WITH quotes (e.g. `"Nunito Sans"`), so a
   //    `family`-string filter silently matches nothing and the fonts never load —
   //    the bug this avoids. (Reused faces were already loaded by their first holder.)
+  // CSS Font Loading Level 3 §2.2: successful individual loads are sufficient
+  // for canvas use. FontFaceSet.ready (§3.4) also synchronizes unrelated fonts
+  // and layout, so it must not be an additional startup barrier here.
   if (toLoad.length > 0) {
     await withFontCeiling(
       Promise.allSettled(toLoad.map((f) => f.load())).then((results) => {
@@ -278,7 +281,6 @@ export async function preloadGoogleFonts(
             failedFamilies.add(toLoad[i].family.replace(/['"]/g, '').toLowerCase());
           }
         });
-        return fonts.ready;
       }),
     );
   }
