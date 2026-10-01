@@ -77,7 +77,6 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
         chart_path,
         &relationships,
     );
-    let base_dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let internal_target = |suffix: &str| {
         relationships.values().find(|relationship| {
             relationship.mode == ooxml_common::rels::TargetMode::Internal
@@ -95,7 +94,9 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
                 .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
     });
     if let Some(style_relationship) = style_relationship {
-        let style_path = resolve_path(base_dir, &style_relationship.target);
+        let style_path = style_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.style_xml = Some(read_zip_str(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_str(zip, &style_rels_path) {
@@ -110,7 +111,9 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
     if let Some(color_relationship) =
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
-        let color_path = resolve_path(base_dir, &color_relationship.target);
+        let color_path = color_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.color_style_xml =
             Some(read_zip_str(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
@@ -342,14 +345,13 @@ fn load_chart_user_shapes_xml(
                     .is_some_and(|namespace| namespace.ends_with("/relationships"))
         })?
         .value();
-    let dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let rels_path = relationship_part_path(chart_path);
     let rels_xml = read_zip_str(zip, &rels_path).ok()?;
     let target = ooxml_common::rels::parse_rels(&rels_xml)
         .get(rid)?
         .target
         .clone();
-    let user_shapes_path = resolve_path(dir, &target);
+    let user_shapes_path = resolve_path(chart_path, &target);
     read_zip_str(zip, &user_shapes_path).ok()
 }
 

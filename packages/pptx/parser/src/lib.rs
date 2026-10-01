@@ -506,7 +506,7 @@ fn serialize_presentation_bootstrap(
             .relationship_id
             .as_ref()
             .and_then(|id| shared.pres_rels.get(id))
-            .map(|target| resolve_path("ppt", target));
+            .map(|target| resolve_path("ppt/presentation.xml", target));
         let candidate = BootstrapSlideProjection {
             index: descriptor.index,
             part_name: part_name.as_deref(),
@@ -1522,7 +1522,7 @@ fn parse_embedded_font_refs(
             {
                 continue;
             }
-            let part_path = resolve_path("ppt", &relationship.target);
+            let part_path = resolve_path("ppt/presentation.xml", &relationship.target);
             let Some(content_type) = content_types.for_part(&part_path) else {
                 continue;
             };
@@ -1542,20 +1542,25 @@ fn parse_embedded_font_refs(
     refs
 }
 
-/// Resolve a relative path against a base directory inside the ZIP.
+/// Resolve an internal relationship target against its source part.
 ///
-/// Thin alias for the shared [`ooxml_common::rels::resolve_target`], which
-/// handles both root-absolute (`/ppt/charts/chart5.xml`) and relative
-/// (`../charts/chart1.xml`) Targets with `..` normalization (ECMA-376 Part 2
-/// §9.3). Kept as a local name so the many call sites read unchanged.
-pub(crate) fn resolve_path(base_dir: &str, target: &str) -> String {
-    ooxml_common::rels::resolve_target(base_dir, target)
-}
-
-/// Directory containing an OPC source part. Relationship Targets are resolved
-/// relative to this directory (ECMA-376 Part 2 §6.5.2.3).
-fn part_directory(part_path: &str) -> &str {
-    part_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+/// ECMA-376 Part 2 §6.4.1 applies RFC 3986 resolution before validating and
+/// normalizing the result as an OPC part name. An invalid target becomes the
+/// empty lookup key, so callers follow their existing missing-part path.
+pub(crate) fn resolve_path(source_part: &str, target: &str) -> String {
+    #[cfg(test)]
+    let test_source_part = if source_part
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.contains('.'))
+    {
+        source_part.to_owned()
+    } else {
+        format!("{source_part}/__test_source__.xml")
+    };
+    #[cfg(test)]
+    let source_part = test_source_part.as_str();
+    ooxml_common::rels::resolve_part_name(source_part, target).unwrap_or_default()
 }
 
 // ===========================
@@ -2623,7 +2628,7 @@ fn bootstrap_presentation(
     // major/minor fonts, hyperlink colors) and as the fallback theme for any
     // master that declares no /theme relationship of its own.
     let theme_path = find_rel_target_by_type(&pres_rels_xml, "/theme")
-        .map(|target| resolve_path("ppt", &target));
+        .map(|target| resolve_path("ppt/presentation.xml", &target));
     let theme = theme_path
         .as_deref()
         .map(|path| parse_theme_part(path, zip))
@@ -2633,16 +2638,16 @@ fn bootstrap_presentation(
     // The first slide master referenced by the presentation. Used for slides
     // whose layout→master→theme chain can't be resolved (simple/old decks), so
     // their behavior is unchanged from before per-slide resolution existed.
-    let pres_master_path: Option<String> =
-        find_rel_target_by_type(&pres_rels_xml, "/slideMaster").map(|t| resolve_path("ppt", &t));
+    let pres_master_path: Option<String> = find_rel_target_by_type(&pres_rels_xml, "/slideMaster")
+        .map(|t| resolve_path("ppt/presentation.xml", &t));
     let comment_authors_path = find_internal_rel_target_by_types(
         &pres_rels_xml,
         CLASSIC_COMMENT_AUTHOR_RELATIONSHIP_TYPES,
     )
-    .map(|target| resolve_path("ppt", &target));
+    .map(|target| resolve_path("ppt/presentation.xml", &target));
     let modern_comment_authors_path =
         find_internal_rel_target_by_types(&pres_rels_xml, MODERN_COMMENT_AUTHOR_RELATIONSHIP_TYPES)
-            .map(|target| resolve_path("ppt", &target));
+            .map(|target| resolve_path("ppt/presentation.xml", &target));
     let default_text_style = default_text_style_fragment(&pres_xml, pres_root);
 
     // This is a serialization-shaped projection of retained bootstrap state,
@@ -2827,8 +2832,8 @@ fn produce_slide_unit_with_journal<T>(
         // instead of producing `ppt//ppt/slides/slide1.xml`. Relative targets
         // (the common `slides/slide1.xml`) are unaffected. Same fix class as
         // the chart-rel resolution above.
-        let slide_path = resolve_path("ppt", &rel_target);
-        let slide_dir = part_directory(&slide_path).to_owned();
+        let slide_path = resolve_path("ppt/presentation.xml", &rel_target);
+        let slide_dir = slide_path.clone();
         let rels_path = relationship_part_path(&slide_path);
 
         // RB7: a slide part that can't be read no longer aborts the whole deck.
@@ -2853,22 +2858,19 @@ fn produce_slide_unit_with_journal<T>(
 
         // Layout XML
         let layout_path = find_rel_target_by_type(&slide_rels_xml, "/slideLayout")
-            .map(|target| resolve_path(&slide_dir, &target));
+            .map(|target| resolve_path(&slide_path, &target));
 
         if let Some(path) = layout_path.as_deref() {
             if !layout_source_cache.contains_key(path) {
                 let xml = read_zip_str(zip, path).ok();
-                let dir = path
-                    .rsplit_once('/')
-                    .map(|(dir, _)| dir.to_owned())
-                    .unwrap_or_else(|| "ppt/slideLayouts".to_owned());
+                let dir = path.to_owned();
                 // Needed both for images inside the layout and for the
                 // layout→slideMaster chain (ECMA-376 §19.3.1.43).
                 let rels_path = relationship_part_path(path);
                 let rels_xml = read_zip_str(zip, &rels_path).unwrap_or_default();
                 let rels = parse_rels(&rels_xml);
                 let master_path = find_rel_target_by_type(&rels_xml, "/slideMaster")
-                    .map(|target| resolve_path(&dir, &target));
+                    .map(|target| resolve_path(path, &target));
                 let source = LayoutSource {
                     xml,
                     rels,
@@ -2914,7 +2916,12 @@ fn produce_slide_unit_with_journal<T>(
                 source.dir.as_str(),
                 source.master_path.as_deref(),
             ),
-            None => (None, &empty_layout_rels, "ppt/slideLayouts", None),
+            None => (
+                None,
+                &empty_layout_rels,
+                "ppt/slideLayouts/slideLayout.xml",
+                None,
+            ),
         };
 
         // RB7: a slide part that couldn't be READ (recorded above) degrades to a
@@ -3666,16 +3673,19 @@ mod tests {
         // load (read_zip_str on `ppt/slides/ppt/charts/chart5.xml`) and the
         // slide rendered the chart as a blank area.
         assert_eq!(
-            resolve_path("ppt/slides", "/ppt/charts/chart5.xml"),
+            resolve_path("ppt/slides/slide1.xml", "/ppt/charts/chart5.xml"),
             "ppt/charts/chart5.xml"
         );
         // Relative references are unaffected by the absolute-target handling.
         assert_eq!(
-            resolve_path("ppt/slides", "../charts/chart1.xml"),
+            resolve_path("ppt/slides/slide1.xml", "../charts/chart1.xml"),
             "ppt/charts/chart1.xml"
         );
         assert_eq!(
-            resolve_path("ppt/slideLayouts", "../slideMasters/slideMaster1.xml"),
+            resolve_path(
+                "ppt/slideLayouts/slideLayout1.xml",
+                "../slideMasters/slideMaster1.xml",
+            ),
             "ppt/slideMasters/slideMaster1.xml"
         );
     }
@@ -3688,13 +3698,31 @@ mod tests {
         // which must NOT become `ppt//ppt/slides/slide1.xml`. Guards the
         // `resolve_path("ppt", rel_target)` slide-loading path.
         assert_eq!(
-            resolve_path("ppt", "slides/slide1.xml"),
+            resolve_path("ppt/presentation.xml", "slides/slide1.xml"),
             "ppt/slides/slide1.xml"
         );
         assert_eq!(
-            resolve_path("ppt", "/ppt/slides/slide1.xml"),
+            resolve_path("ppt/presentation.xml", "/ppt/slides/slide1.xml"),
             "ppt/slides/slide1.xml"
         );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "./media/image.png"),
+            "ppt/slides/media/image.png"
+        );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "../media/%69mage.png"),
+            "ppt/media/image.png"
+        );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "../media/%ZZ.png"),
+            ""
+        );
+        let external = ooxml_common::rels::RelTarget {
+            target: "https://example.invalid/image.png".to_owned(),
+            relationship_type: None,
+            mode: ooxml_common::rels::TargetMode::External,
+        };
+        assert_eq!(external.resolve_part("ppt/slides/slide1.xml"), None);
     }
 
     #[test]

@@ -2794,10 +2794,11 @@ pub(crate) fn build_master_bundle(
         read_zip_str(zip, master_path).ok()
     };
 
-    let master_dir: String = master_path
-        .rsplit_once('/')
-        .map(|(dir, _)| dir.to_owned())
-        .unwrap_or_else(|| "ppt/slideMasters".to_owned());
+    let master_dir = if master_path.is_empty() {
+        "ppt/slideMasters/slideMaster.xml".to_owned()
+    } else {
+        master_path.to_owned()
+    };
 
     // Master rels: `<master_dir>/_rels/<file>.rels`.
     let master_rels_xml: String = if master_path.is_empty() {

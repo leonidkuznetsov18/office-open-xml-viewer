@@ -115,7 +115,6 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     let theme_xml = read_zip_str(zip, theme_path).unwrap_or_default();
     let mut theme = PptxTheme::from_xml(&theme_xml);
     let rels_xml = read_zip_str(zip, &relationship_part_path(theme_path)).unwrap_or_default();
-    let theme_dir = theme_path.rsplit_once('/').map_or("", |(dir, _)| dir);
 
     theme.chart_images.insert_part_relationships(
         ooxml_common::chart::ChartImageSource::Theme,
@@ -124,7 +123,7 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     );
 
     for (relationship_id, target) in parse_rels(&rels_xml) {
-        let path = resolve_path(theme_dir, &target);
+        let path = resolve_path(theme_path, &target);
         if zip.index_for_name(&path).is_some() {
             theme.insert(format!("{THEME_REL_PREFIX}{relationship_id}"), path);
         }
