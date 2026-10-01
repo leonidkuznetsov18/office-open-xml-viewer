@@ -47,6 +47,24 @@ const paragraph = (id: string, src: SourceRef, heightPt: number): ParagraphLayou
   lines: [], borders: [], resources: [], drawings: [], textBoxes: [], events: [], exclusions: [],
 });
 
+/** `layout` anchoring one page-owned drawing (§20.4.3.4-5): the first
+ * convergence pass observes where it lands, and later passes prescan it. */
+const withPageAnchor = (layout: ParagraphLayout, occurrenceId: string): ParagraphLayout => ({
+  ...layout,
+  drawings: [{
+    kind: 'drawing', id: `drawing:${occurrenceId}`, source: layout.source,
+    flowDomainId: layout.flowDomainId,
+    flowBounds: { xPt: 100, yPt: 10, widthPt: 20, heightPt: 20 },
+    inkBounds: { xPt: 100, yPt: 10, widthPt: 20, heightPt: 20 },
+    advancePt: 0, ordinaryFlow: false, commands: [],
+    anchorLayer: {
+      occurrenceId, acquisitionOccurrenceId: occurrenceId, behindDoc: false,
+      relativeHeight: 0, sourceOrder: 0,
+      horizontalOwnership: 'page', verticalOwnership: 'page',
+    },
+  }],
+} as unknown as ParagraphLayout);
+
 const paragraphWithFootnote = (
   id: string,
   src: SourceRef,
@@ -221,7 +239,7 @@ describe('canonical body producer', () => {
         measureParagraph: ({ input, location }) => {
           measuredPages.push(location.pageIndex);
           return {
-            layout: paragraph('successor', input.source, 10),
+            layout: withPageAnchor(paragraph('successor', input.source, 10), 'anchor:successor'),
             blockExtentPt: 10,
             fragmentation: { kind: 'indivisible' },
           };
@@ -260,7 +278,9 @@ describe('canonical body producer', () => {
     } as unknown as BodyLayoutInput;
     const layout = paginateBody(input, services, { currentDateMs: 0 });
     expect(layout.pages).toHaveLength(22);
-    expect(new Set(prescannedPages)).toEqual(new Set([0, 21]));
+    // The first pass registers nothing; later passes prescan the anchor only
+    // on the page its paragraph reaches, never on the hidden-overflow pages.
+    expect(new Set(prescannedPages)).toEqual(new Set([21]));
     expect(measuredPages).toContain(21);
   });
 
@@ -3281,8 +3301,9 @@ describe('canonical body producer', () => {
         hasPaginationFields: false,
         measureParagraph: ({ input }) => {
           events.push(`measure:${input.source.path[0]}`);
+          const measured = paragraph(`p${input.source.path[0]}`, input.source, 20);
           return {
-            layout: paragraph(`p${input.source.path[0]}`, input.source, 20),
+            layout: input.source.path[0] === 1 ? withPageAnchor(measured, 'anchor:1') : measured,
             blockExtentPt: 20, fragmentation: { kind: 'indivisible' },
           };
         },
@@ -3341,7 +3362,11 @@ describe('canonical body producer', () => {
       sequence: [block(0), block(1, ['anchor:1'])],
     }, services, { currentDateMs: 0 });
 
-    expect(events.slice(0, 3)).toEqual(['prescan:1', 'commit', 'measure:0']);
+    // The first pass observes the anchor; the next one registers it on its
+    // page before measuring the content that precedes it there.
+    const registered = events.indexOf('prescan:1');
+    expect(registered).toBeGreaterThan(0);
+    expect(events.slice(registered, registered + 3)).toEqual(['prescan:1', 'commit', 'measure:0']);
   });
 
   it('prescans incoming nextColumn anchors before measuring earlier content in that flow domain', () => {
@@ -3497,10 +3522,13 @@ describe('canonical body producer', () => {
     }, services, { currentDateMs: 0 });
     const incomingLead = layout.pages[0]!.layers.body.find((node) => node.source.path[0] === 1);
 
-    expect(measuredWithIncomingAuthority.length).toBeGreaterThan(0);
-    expect(measuredWithIncomingAuthority.every(Boolean)).toBe(true);
+    // The first pass observes the anchor without registering it; the final
+    // pass registers it once where its region opens and measures with it.
+    expect(measuredWithIncomingAuthority.length).toBeGreaterThan(1);
+    expect(measuredWithIncomingAuthority.at(-1)).toBe(true);
     expect(incomingLead?.kind === 'paragraph' ? incomingLead.exclusions : []).toHaveLength(1);
-    expect(commitCounts.length).toBeGreaterThan(0);
-    expect(commitCounts.every((count) => count === 1)).toBe(true);
+    expect(commitCounts[0]).toBe(0);
+    expect(commitCounts.at(-1)).toBe(1);
+    expect(commitCounts.every((count) => count <= 1)).toBe(true);
   });
 });
