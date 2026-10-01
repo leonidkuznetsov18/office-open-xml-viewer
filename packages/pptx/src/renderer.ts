@@ -80,7 +80,6 @@ import {
   NON_CJK_SERIF_FALLBACKS,
   DEFAULT_KINSOKU_RULES,
   isCjkBreakChar,
-  isComplexScriptCodePoint,
   isUax14NoBreakPair,
   lineBreakClass,
   containsSeaScript,
@@ -170,6 +169,7 @@ import { renderStackedText, type StackedParagraphInput } from './stacked-text.js
 import {
   COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
 } from './east-asian-default.js';
+import { powerPointDisplayCluster, powerPointEastAsianText, powerPointFontSlot } from './font-slot-compatibility.js';
 import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
@@ -1262,9 +1262,6 @@ function firstLineIndentPxFor(hasBullet: boolean, indentPx: number): number {
  * hyphen; it does not erase a break opportunity supplied by an authored hyphen.
  */
 const LATIN_SCALAR_RE = /^\p{Script_Extensions=Latin}$/u;
-// The core predicate covers the RTL cs axis. DrawingML also routes Indic and
-// Southeast Asian shaping scripts through a:cs when that font slot is present.
-const INDIC_CS_GLYPH_RE = /[\p{Script=Devanagari}\p{Script=Thai}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Malayalam}\p{Script=Gujarati}\p{Script=Gurmukhi}\p{Script=Oriya}\p{Script=Sinhala}\p{Script=Khmer}\p{Script=Lao}\p{Script=Myanmar}\p{Script=Tibetan}]/u;
 const LETTER_SCALAR_RE = /^\p{L}$/u;
 const ASCII_SCALARS_RE = /^[\u0000-\u007f]*$/u;
 
@@ -1360,27 +1357,22 @@ export function naturalWidthExceedsBbox(
     const firstLineIndent = firstLineIndentPxFor(paragraphHasBullet(para), indentPx);
     const textMaxW = bw - lPad - rPad - marLPx - marRPx - firstLineIndent;
     let lineW = 0;
-    for (const run of para.runs) {
-      if (run.type !== 'text') continue;
-      const sizePx = run.fontSize != null
-        ? run.fontSize * PT_TO_EMU * scale
-        : (para.defFontSize != null
-            ? para.defFontSize * PT_TO_EMU * scale
-            : bodyDefaultFontPx);
-      const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
-      const isBold = run.bold ?? para.defBold ?? body.defaultBold ?? false;
-      const isItalic = run.italic ?? para.defItalic ?? body.defaultItalic ?? false;
-      ctx.font = buildFont(
-        isBold,
-        isItalic,
-        baselineDrawSizePx(sizePx, run.baseline ?? undefined),
-        family,
-        rc,
-        run.text,
-        hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
-      );
-      const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
-      lineW += measureTextAdvance(ctx, run.text, letterSpacingPx);
+    // Use the same slot/glyph adapter as wrap and paint. Measuring the authored
+    // run in its Latin face misses wide ea/cs characters and ja-JP's yen glyph.
+    const { input } = paragraphInputRuns(para,
+      para.defFontSize != null ? para.defFontSize * PT_TO_EMU * scale : bodyDefaultFontPx,
+      '#000000', scale, body.defaultBold ?? false, body.defaultItalic ?? false, 1, undefined, rc);
+    let previous: LayoutSegment | undefined;
+    for (const item of input) {
+      if (item.type !== 'text') { previous = undefined; continue; }
+      ctx.font = item.style.font;
+      lineW += measureTextAdvance(ctx, item.text, item.style.letterSpacingPx ?? 0);
+      // A font-slot seam inside an authored run still carries its inter-
+      // cluster tracking. Separate authored runs have no seam advance.
+      if (previous && previous.sourceRunId === item.style.sourceRunId) {
+        lineW += item.style.letterSpacingPx ?? 0;
+      }
+      previous = item.style;
       if (lineW > textMaxW) return true;
     }
   }
@@ -1583,7 +1575,7 @@ export function paragraphInputRuns(
     // East Asian text, before any leading cluster joins the previous seam.
     const eaDefaults = run.fontFamilyEa ? [] : eastAsianDefaultFaces(
       run.fontFamily ?? para.defFontFamily ?? rc.themeMinorFont ?? null,
-      [...rawText].filter((ch) => isCjkBreakChar(ch.codePointAt(0) ?? 0)).join(''),
+      powerPointEastAsianText(rawText, run.lang),
     );
     const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : eaDefaults[0];
     const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
@@ -1598,8 +1590,6 @@ export function paragraphInputRuns(
         runOffset = firstEnd;
       }
     }
-    const eaFont = buildFont(bold, italic, drawSizePx, familyEa, rc, rawText, true,
-      eaDefaults.slice(1));
     // Font stacks whose visual substitute is script-scoped must be resolved
     // from the grapheme cluster they paint, not the whole source run. A mixed
     // Arabic/Latin DrawingML run is still one authored run, but Noto Arabic is
@@ -1679,17 +1669,20 @@ export function paragraphInputRuns(
       clusterStart = clusterEnd;
       emitted = true;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
-      let glyph = cluster;
-      const eaGlyph = isCjkBreakChar(ch.codePointAt(0) ?? 0);
-      const csGlyph = isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
-        || INDIC_CS_GLYPH_RE.test(ch);
+      // Slot choice precedes measurement, wrapping and every paint flow. It
+      // is independent of core's CJK line-break predicate (issue #1653).
+      let glyph = powerPointDisplayCluster(cluster, run.lang);
+      const slot = powerPointFontSlot(ch.codePointAt(0) ?? 0, run.lang);
+      const eaGlyph = slot === 'ea';
+      const csGlyph = slot === 'cs';
       const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
-      let font = eaGlyph ? eaFont : csGlyph ? csFontFor(csFace, cluster) : stackFontFor(
-        family, cluster, hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
+      let font = eaGlyph ? stackFontFor(familyEa, glyph, true, eaDefaults.slice(1))
+        : csGlyph ? csFontFor(csFace, glyph) : stackFontFor(
+        family, glyph, hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
       );
       let face = eaGlyph ? familyEa : csFace;
       let share = lineMetricFor(face, bold, italic, rc);
-      if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
+      if (slot === 'sym' && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         const mapped = symbolFontToUnicode(ch, symbolFamily);
         glyph = mapped + cluster.slice(ch.length);

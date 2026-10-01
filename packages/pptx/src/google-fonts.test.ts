@@ -54,6 +54,18 @@ describe('PPTX exact Office face requests', () => {
       { family: 'Calibri', weight: 700, style: 'italic' },
     ]));
   });
+
+  it('requests a complex-script slot even when its language-selected digits have no Arabic letters', () => {
+    const slide = { elements: [{ type: 'table', rows: [{ cells: [{ textBody: {
+      defaultBold: true, defaultItalic: true, paragraphs: [{
+        bullet: { type: 'none' }, runs: [{ type: 'text', text: '123', lang: 'he-IL',
+          fontFamily: 'Arial', fontFamilyCs: 'Calibri', bold: null, italic: null }],
+      }],
+    } }] }] }] } as unknown as Slide;
+    expect(pptxSlideOfficeFontRequests(slide, null, null)).toEqual([
+      { family: 'Calibri', weight: 700, style: 'italic' },
+    ]);
+  });
 });
 
 // Verbatim snapshot of the PPTX Office-font substitute map BEFORE the shared
@@ -134,6 +146,7 @@ describe('PPTX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
               text: 'Title',
               fontFamily: null,
               fontFamilyEa: 'Yu Gothic',
+              fontFamilyCs: 'Mangal',
               fontFamilySym: null,
             }],
           }],
@@ -148,11 +161,22 @@ describe('PPTX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
       'Aptos',
       'Franklin Gothic Medium',
       'Yu Gothic',
+      'Mangal',
     ]));
   });
 });
 
 describe('PptxFontPreloadAccumulator', () => {
+  it('loads the selected East Asian fallback for punctuation-only runs', () => {
+    const slide = { elements: [{ type: 'shape', textBody: { paragraphs: [{ runs: [
+      { type: 'text', text: '“”', lang: 'ja-JP', fontFamily: 'Corbel', fontFamilyEa: 'Meiryo UI' },
+      { type: 'text', text: '§°', lang: 'en-US', fontFamily: 'Perpetua' },
+    ] }] } }] } as unknown as Slide;
+    const accumulator = new PptxFontPreloadAccumulator(null, null);
+    accumulator.addSlide(slide);
+    expect(accumulator.names()).toEqual(expect.arrayContaining(['Noto Sans JP', 'Noto Serif JP']));
+  });
+
   it('preserves full-presentation shape, table, and chart text semantics incrementally', () => {
     const slide = {
       index: 0,
@@ -204,10 +228,11 @@ it('keeps the union of stable per-slide preferences during progressive preflight
   const fonts = new PptxFontPreloadAccumulator('Calibri', 'Calibri', undefined, undefined, 'sc');
   fonts.addSlide(han);
   expect(fonts.names()).toContain('Noto Sans SC');
+  const before = fonts.names();
   const next = fonts.withSlide(kana);
   expect(next.names()).toContain('Noto Sans SC');
   expect(next.names()).toContain('Noto Sans JP');
-  expect(fonts.names()).not.toContain('Noto Sans JP');
+  expect(fonts.names()).toEqual(before);
   expect(pptxSlideCjkFallback(han, 'Calibri', 'Calibri', 'sc')).toBe('sc');
   expect(pptxSlideCjkFallback(kana, 'Calibri', 'Calibri', 'sc')).toBe('jp');
   expect(pptxSlideCjkFallback(korean, 'Calibri', 'Calibri', 'sc')).toBe('kr');

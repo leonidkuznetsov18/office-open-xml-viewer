@@ -1,0 +1,178 @@
+// PPTX-only font-slot compatibility. ECMA-376 Part 1 §21.1.2.3 supplies
+// the normative Unicode table (the otherwise slot is ea); §21.1.2.3.9 supplies
+// lang. [MS-OI29500] §2.1.1397 discusses font substitution, not these measured
+// slot deviations. Do not infer a slot from font fallback or a line-break class.
+// DOCX uses WordprocessingML §17.3.2.26; Excel's DrawingML adapter has its own
+// Office behaviour. The measured PowerPoint overrides must not affect either.
+//
+// Observed Office deviations take precedence for the tested pairs. They apply
+// only to the code points and language identifiers tested, not a whole block or
+// every regional variant. Swept characters without a distinguishable PDF font
+// use the normative table. Unmeasured scripts retain the pre-1653 routing until
+// distinct-face controls settle Office's behaviour; no new script override is
+// inferred from a fallback font. This is intentionally incomplete Office coverage.
+import { isCjkBreakChar, isComplexScriptCodePoint } from '@silurus/ooxml-core';
+export { POWERPOINT_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
+
+export type PowerPointFontSlot = 'latin' | 'ea' | 'cs' | 'sym';
+type SlotRange = readonly [start: number, end: number, slot: PowerPointFontSlot];
+
+/** Sorted, disjoint ECMA-376 §21.1.2.3 exceptions to the otherwise ea slot. */
+const NORMATIVE_SLOT_RANGES: readonly SlotRange[] = [
+  [0x0000, 0x00A6, 'latin'],
+  [0x00A9, 0x00AF, 'latin'],
+  [0x00B2, 0x00B3, 'latin'],
+  [0x00B5, 0x00D6, 'latin'],
+  [0x00D8, 0x00F6, 'latin'],
+  [0x00F8, 0x058F, 'latin'],
+  [0x0590, 0x074F, 'cs'],
+  [0x0780, 0x07BF, 'cs'],
+  [0x0900, 0x109F, 'cs'],
+  [0x10A0, 0x10FF, 'latin'],
+  [0x1200, 0x137F, 'latin'],
+  [0x13A0, 0x177F, 'latin'],
+  [0x1780, 0x18AF, 'cs'],
+  [0x1D00, 0x1D7F, 'latin'],
+  [0x1E00, 0x1FFF, 'latin'],
+  [0x2000, 0x200B, 'latin'],
+  [0x200C, 0x200F, 'cs'],
+  [0x2010, 0x2029, 'latin'],
+  [0x202A, 0x202F, 'cs'],
+  [0x2030, 0x2046, 'latin'],
+  [0x204A, 0x245F, 'latin'],
+  [0x2670, 0x2671, 'cs'],
+  [0x27C0, 0x2BFF, 'latin'],
+  [0xF000, 0xF0FF, 'sym'],
+  [0xFB00, 0xFB17, 'latin'],
+  [0xFB1D, 0xFB4F, 'cs'],
+  [0xFE50, 0xFE6F, 'latin'],
+  [0x1D400, 0x1D7FF, 'latin'],
+];
+
+const EN_US: readonly SlotRange[] = [
+  [0x24FF, 0x259F, 'latin'],
+  [0x2619, 0x2619, 'latin'],
+  [0x2670, 0x2671, 'latin'],
+  [0x2680, 0x2691, 'latin'],
+  [0x2698, 0x2698, 'latin'],
+  [0x269A, 0x269A, 'latin'],
+  [0x269D, 0x269F, 'latin'],
+  [0x26A2, 0x26A6, 'latin'],
+  [0x26A8, 0x26A9, 'latin'],
+  [0x26AC, 0x26AF, 'latin'],
+  [0x26B2, 0x26BC, 'latin'],
+  [0x26BF, 0x26C3, 'latin'],
+  [0x26C6, 0x26C7, 'latin'],
+  [0x26C9, 0x26CD, 'latin'],
+  [0x26D0, 0x26D0, 'latin'],
+  [0x26D2, 0x26D2, 'latin'],
+  [0x26D5, 0x26E8, 'latin'],
+  [0x26EB, 0x26EF, 'latin'],
+  [0x26F6, 0x26F6, 'latin'],
+  [0x26FB, 0x26FC, 'latin'],
+  [0x26FE, 0x2700, 'latin'],
+  [0x275F, 0x2760, 'latin'],
+  [0x2768, 0x2775, 'latin'],
+];
+
+const JA_JP: readonly SlotRange[] = [[0x201F, 0x201F, 'latin'], ...EN_US];
+
+const KO_KR: readonly SlotRange[] = [
+  [0x201F, 0x201F, 'latin'],
+];
+
+const ZH_CN = KO_KR;
+
+const ZH_TW = KO_KR;
+
+const HE_IL: readonly SlotRange[] = [
+  [0x0030, 0x0039, 'cs'],
+  [0x00BB, 0x00BB, 'cs'],
+  [0x00D7, 0x00D7, 'latin'],
+  [0x00F7, 0x00F7, 'latin'],
+  [0x2047, 0x2048, 'latin'],
+];
+
+const AR_SA = HE_IL;
+
+const TH_TH: readonly SlotRange[] = [
+  [0x0030, 0x0039, 'cs'],
+  [0x00D7, 0x00D7, 'latin'],
+  [0x00F7, 0x00F7, 'latin'],
+  [0x2047, 0x2048, 'latin'],
+];
+
+const HI_IN = TH_TH;
+
+// These extra controls identify only 1–3, unlike the full 0–9 he/ar/th/hi
+// sweep. Do not broaden them before the extra deck checks 0 and 4–9.
+// altLang is deliberately absent: en-US/altLang=he-IL retained Latin digits.
+const PARTIAL_CS_DIGITS: readonly SlotRange[] = [[0x0031, 0x0033, 'cs']];
+
+const OBSERVED_OVERRIDES = new Map<string, readonly SlotRange[]>([
+  ['en-us', EN_US], ['ja-jp', JA_JP], ['ko-kr', KO_KR],
+  ['zh-cn', ZH_CN], ['zh-tw', ZH_TW], ['he-il', HE_IL],
+  ['ar-sa', AR_SA], ['th-th', TH_TH], ['hi-in', HI_IN],
+  ['fa-ir', PARTIAL_CS_DIGITS], ['ur-pk', PARTIAL_CS_DIGITS],
+  ['yi-001', PARTIAL_CS_DIGITS], ['syr-sy', PARTIAL_CS_DIGITS], ['ug-cn', PARTIAL_CS_DIGITS],
+]);
+
+// The full sweep's block boundaries, including excluded/unextractable scalars.
+// A glyph-fallback observation does not select a slot: specification defaults
+// apply within these blocks. Outside them the existing script policy is kept.
+const SWEPT_BLOCKS: readonly (readonly [number, number])[] = [
+  [0x0021, 0x007E], [0x00A1, 0x017F], [0x02B0, 0x02FF], [0x0370, 0x04FF],
+  [0x2000, 0x209F], [0x20A0, 0x20CF], [0x2100, 0x23FF], [0x2460, 0x27BF],
+  [0x3000, 0x303F], [0x3200, 0x33FF], [0xFE30, 0xFE4F], [0xFF01, 0xFF9F], [0xFFE0, 0xFFEE],
+];
+const EXISTING_INDIC_CS_RE = /[\p{Script=Devanagari}\p{Script=Thai}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Malayalam}\p{Script=Gujarati}\p{Script=Gurmukhi}\p{Script=Oriya}\p{Script=Sinhala}\p{Script=Khmer}\p{Script=Lao}\p{Script=Myanmar}\p{Script=Tibetan}]/u;
+
+const NORMATIVE_EA_QUOTE_LANGUAGES = new Set([
+  'ii-cn', 'ja-jp', 'ko-kr', 'zh-cn', 'zh-hk', 'zh-mo', 'zh-sg', 'zh-tw',
+]);
+
+function slotInRanges(cp: number, ranges: readonly SlotRange[]): PowerPointFontSlot | undefined {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const [start, end, slot] = ranges[mid];
+    if (cp < start) hi = mid - 1;
+    else if (cp > end) lo = mid + 1;
+    else return slot;
+  }
+  return undefined;
+}
+
+/** Select the base scalar's slot. Grapheme extenders inherit this slot in the adapter. */
+export function powerPointFontSlot(cp: number, lang?: string): PowerPointFontSlot {
+  const language = lang?.toLowerCase() ?? '';
+  if (cp >= 0xf000 && cp <= 0xf0ff) return 'sym';
+  const overrides = OBSERVED_OVERRIDES.get(language);
+  const observed = overrides && slotInRanges(cp, overrides);
+  if (observed !== undefined) return observed;
+  if (cp >= 0x2018 && cp <= 0x201f && NORMATIVE_EA_QUOTE_LANGUAGES.has(language)) return 'ea';
+  if (SWEPT_BLOCKS.some(([start, end]) => cp >= start && cp <= end)) {
+    return slotInRanges(cp, NORMATIVE_SLOT_RANGES) ?? 'ea';
+  }
+  // The role-permutation controls distinguish Jamo's ea slot (unlike the
+  // unresolved scripts). Do not confuse conjoining Jamo with break units.
+  if (cp >= 0x1100 && cp <= 0x11ff) return 'ea';
+  if (isComplexScriptCodePoint(cp) || EXISTING_INDIC_CS_RE.test(String.fromCodePoint(cp))) return 'cs';
+  return isCjkBreakChar(cp) ? 'ea' : 'latin';
+}
+
+/** Measured ja-JP display mapping; still uses U+005C's latin slot. */
+export function powerPointDisplayCluster(cluster: string, lang?: string): string {
+  return lang?.toLowerCase() === 'ja-jp' && cluster.startsWith('\\')
+    ? `¥${cluster.slice(1)}` : cluster;
+}
+
+/** East Asian-slot text used by the default-face resolver and font preloader. */
+export function powerPointEastAsianText(text: string, lang?: string): string {
+  let result = '';
+  for (const ch of text) {
+    if (powerPointFontSlot(ch.codePointAt(0) ?? 0, lang) === 'ea') result += ch;
+  }
+  return result;
+}
