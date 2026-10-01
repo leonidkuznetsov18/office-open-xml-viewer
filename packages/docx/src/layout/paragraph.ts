@@ -113,6 +113,7 @@ import {
   wordLayoutInCellOwnsRowContainment,
   wordPreservesLowerLayerSameParagraphComposition,
   wordTextBoxVisibleAnchorExtentPt,
+  wordGridPictureLineOriginPt,
 } from './anchor-compatibility.js';
 import {
   wordRunVerticalAlignRaisePt,
@@ -804,7 +805,22 @@ export function planLine(input: PlanLineInput): LineLayout {
   }
 
   const drawnWidthPt = naturalWidthPt + distributedWidthPt;
-  const alignmentSlackPt = lineSlackPt - distributedWidthPt;
+  // WORD_FLOAT_GAP_FLOW aligns the visible word edge, while
+  // the trailing separator remains source-owned. Its advance must not shift
+  // centred/right-aligned gap text. Preserve ordinary lines' existing policy.
+  let trailingSeparatorPt = 0;
+  if (line.availableWidthPt < input.availableWidthPt && !bidi) {
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      const segment = segments[index];
+      if (segment?.kind !== 'text') break;
+      const visibleLength = segment.text.trimEnd().length;
+      trailingSeparatorPt += segment.clusters.filter(cluster =>
+        cluster.range.start >= segment.range.start + visibleLength)
+        .reduce((sum, cluster) => sum + cluster.advancePt, 0);
+      if (visibleLength > 0) break;
+    }
+  }
+  const alignmentSlackPt = lineSlackPt - distributedWidthPt + trailingSeparatorPt;
   const naturalAlignmentOffsetPt = edge === 'right'
     ? alignmentSlackPt
     : edge === 'center'
@@ -1062,6 +1078,35 @@ export function planLine(input: PlanLineInput): LineLayout {
     advancePt: line.advancePt,
     placements,
   });
+}
+
+/** Gap placement is complete before retention. All downstream consumers see
+ * one physical line (§17.3.1.33 spacing, §17.6.8 numbering, §17.3.1.44 widows).
+ * Retain disjoint allocations solely for horizontal shading; source ranges,
+ * placements and vertical allocation belong to their common physical line.
+ * The union visits each fragment/placement once, with no measurement. */
+function retainPhysicalLines(fragments: readonly LineLayout[], physicalIds: readonly number[]): LineLayout[] {
+  const lines: LineLayout[] = [];
+  for (let start = 0; start < fragments.length;) {
+    const first = fragments[start]!;
+    let end = start + 1;
+    while (end < fragments.length && physicalIds[end] === physicalIds[start]) end += 1;
+    if (end === start + 1) lines.push(first);
+    else {
+      const group = fragments.slice(start, end);
+      const { wrapBounds: _wrapBounds, ...physical } = first;
+      lines.push({
+        ...physical,
+        range: { start: first.range.start, end: group.at(-1)!.range.end },
+        bounds: unionLayoutRects(group.map(fragment => fragment.bounds))!,
+        placements: group.flatMap(fragment => fragment.placements),
+        wrapFragments: group.flatMap(fragment => fragment.wrapFragments
+          ?? [fragment.wrapBounds ?? fragment.bounds]),
+      });
+    }
+    start = end;
+  }
+  return lines;
 }
 
 function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
@@ -2243,7 +2288,7 @@ function planMeasuredLines(
     && /^[+\-(]?[\d., ]+\)?%?$/u.test(visibleText)
       ? earliestTab.pos - context.physicalIndentLeftPt
       : undefined;
-  return measured.lines.map((measuredLine, lineIndex) => {
+  return retainPhysicalLines(measured.lines.map((measuredLine, lineIndex) => {
     const raw = measuredLine.layout;
     const baselinePt = plannedBaselinePt(measuredLine, context);
     let lineStartOffset = Number.POSITIVE_INFINITY;
@@ -2414,11 +2459,12 @@ function planMeasuredLines(
     const onlyMath = raw.segments.length === 1 && 'math' in (raw.segments[0] ?? {} as object)
       ? raw.segments[0] as LayoutMathSeg
       : undefined;
-    return planLine({
+    const planned = planLine({
       paragraphXPt, availableWidthPt, alignment: paragraph.alignment,
       baseRtl: context.baseRtl,
       isFirstLine: lineIndex === 0,
-      isLastLine: lineIndex === measured.lines.length - 1,
+      isLastLine: (raw.physicalLineIndex ?? lineIndex)
+        === (measured.lines.at(-1)!.layout.physicalLineIndex ?? measured.lines.length - 1),
       stretchLastLine: context.stretchLastLine,
       exactLineSpacing: context.lineSpacing?.rule === 'exact',
       firstLineIndentPt: context.firstIndentPt,
@@ -2443,7 +2489,15 @@ function planMeasuredLines(
         segments,
       },
     });
-  });
+    return raw.availWidth !== undefined && (raw.availWidth < availableWidthPt || (raw.xOffset ?? 0) !== 0)
+      ? { ...planned, wrapBounds: {
+          xPt: paragraphXPt + (raw.xOffset ?? 0) + (lineIndex === 0 ? Math.min(0, context.firstIndentPt) : 0),
+          yPt: measuredLine.topYPt,
+          widthPt: raw.availWidth - (lineIndex === 0 ? Math.min(0, context.firstIndentPt) : 0),
+          heightPt: measuredLine.advancePt,
+        } }
+      : planned;
+  }), measured.lines.map((line, index) => line.layout.physicalLineIndex ?? index));
 }
 
 /** Retain §17.18.84 bar-tab rules for every laid-out line. A bar is measured
@@ -3086,7 +3140,15 @@ function acquireAnchorOccurrence(
         widthPt: options.placement.availableWidthPt,
         heightPt: Math.max(0, paragraphHeightPt),
       },
-      line: line.bounds,
+      // WORD_GRID_PICTURE_LINE_ORIGIN keeps text leading separate from the
+      // reference frame; paragraph ownership already precedes before-spacing.
+      // The retained host index owns first-line policy. Distinct physical
+      // lines can share a numeric top; equal coordinates do not transfer it.
+      line: hostLineIndex === 0 && options.context.lineGrid.active && outer.run.type === 'image'
+        ? { ...line.bounds, yPt: wordGridPictureLineOriginPt(
+            line.bounds.yPt, options.placement.startYPt, contentStartYPt,
+          ) }
+        : line.bounds,
       character: host.bounds,
       pageParity: baseFrames?.pageParity ?? null,
     },
@@ -5288,6 +5350,7 @@ export function paragraphLayoutFromMeasurement(
     ),
     ...(anchorResults.length ? { anchorFrames: anchorResults } : {}),
     paragraphMark: measured.markOnly ? {
+      ...(measured.markWrapBounds ? { wrapBounds: measured.markWrapBounds } : {}),
       hidden: paragraph.markVanish === true,
       bounds: { xPt: paragraphXPt, yPt: measured.contentStartYPt, widthPt: 0, heightPt: contentHeightPt },
     } : undefined,
@@ -5531,6 +5594,7 @@ export function sliceParagraphLayout(
         ? { paragraphMark: {
             ...acquired.paragraphMark,
             bounds: translateRectY(acquired.paragraphMark.bounds, deltaYPt),
+            ...(acquired.paragraphMark.wrapBounds ? { wrapBounds: translateRectY(acquired.paragraphMark.wrapBounds, deltaYPt) } : {}),
           } }
         : {}),
     continuation,

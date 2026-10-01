@@ -166,6 +166,8 @@ export function translateLine(
   return {
     ...line,
     bounds: translateRect(line.bounds, delta),
+    ...(line.wrapBounds ? { wrapBounds: translateRect(line.wrapBounds, delta) } : {}),
+    ...(line.wrapFragments ? { wrapFragments: line.wrapFragments.map(bounds => translateRect(bounds, delta)) } : {}),
     baselinePt: line.baselinePt + delta.yPt,
     placements: line.placements.map((placement) => translatePlacement(placement, delta, drawingTranslations)),
     ...(line.barTabRules ? { barTabRules: line.barTabRules.map((rule) => ({
@@ -293,6 +295,7 @@ function translateParagraphWithContext(
       translateAnchorFrame(frame, delta)) } : {}),
     ...(paragraph.paragraphMark ? { paragraphMark: {
       ...paragraph.paragraphMark, bounds: translateRect(paragraph.paragraphMark.bounds, delta),
+      ...(paragraph.paragraphMark.wrapBounds ? { wrapBounds: translateRect(paragraph.paragraphMark.wrapBounds, delta) } : {}),
     } } : {}),
     ...(paragraph.lineNumbers ? { lineNumbers: paragraph.lineNumbers.map((lineNumber) => ({
       ...lineNumber, bounds: translateRect(lineNumber.bounds, delta),

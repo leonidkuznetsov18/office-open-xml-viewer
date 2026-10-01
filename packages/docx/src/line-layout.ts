@@ -90,6 +90,7 @@ export function layoutLines(
   overflowPunct = false,
   passContext?: Readonly<{
     probeHeights: readonly number[] | null;
+    probeFloors?: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
   }>,
 ): LayoutLine[] {
@@ -101,6 +102,7 @@ export function layoutLines(
     const runPass = (
       probeHeights: readonly number[] | null,
       preparedFloatWrap?: PreparedFloatWrap,
+      probeFloors: readonly number[] | null = null,
     ): LayoutLine[] => (layoutLines as unknown as (
       ...args: unknown[]
     ) => LayoutLine[])(
@@ -124,14 +126,14 @@ export function layoutLines(
       widthPolicy,
       verticalGlyphMeasurement,
       overflowPunct,
-      { probeHeights, preparedFloatWrap },
+      { probeHeights, probeFloors, preparedFloatWrap },
     );
     if (!wrapCtx || widthPolicy !== 'bounded') return runPass(null);
     const preparedFloatWrap = wrapCtx.lineWindow
       ? undefined
       : prepareFloatWrap(wrapCtx.floats);
-    return convergeLineWrap(
-      (probeHeights) => runPass(probeHeights, preparedFloatWrap),
+    const lines = convergeLineWrap(
+      (probeHeights, probeFloors) => runPass(probeHeights, preparedFloatWrap, probeFloors),
       (line) => wrapCtx.lineBoxH(
         line.ascent,
         line.descent,
@@ -141,8 +143,25 @@ export function layoutLines(
         line.gridCountSingle,
         line.uniformPositionAuto,
         line.inlinePictureTextSingle,
+        line.latinGridCountSingle,
       ),
+      wrapCtx.resolveLineAdvances,
     );
+    const advances = wrapCtx.resolveLineAdvances?.(lines);
+    return lines.map((line, index) => ({
+      ...line,
+      // Publish provenance only after exact-state convergence confirms the
+      // same physical partition, probes and tops, never on an exploratory pass.
+      wrapAllocation: Object.freeze({
+        physicalLineIndex: line.physicalLineIndex!,
+        topYPt: line.topY!,
+        advancePt: advances?.[index] ?? wrapCtx.lineBoxH(
+          line.ascent, line.descent, line.hasRuby, line.intendedSingle,
+          line.eastAsian, line.gridCountSingle, line.uniformPositionAuto,
+          line.inlinePictureTextSingle, line.latinGridCountSingle,
+        ),
+      }),
+    }));
   }
   return runLineBreakerPass({
     ctx, segs, maxWidth, firstIndent, scale, tabStops, wrapCtx,

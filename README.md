@@ -945,6 +945,7 @@ file without uploading it.
 | | Multi-column text body (`numCol` / `spcCol` — balanced flow) | ✅ |
 | | Theme object defaults (`<a:objectDefaults>`) treated as new-object templates only, as PowerPoint does | ✅ |
 | **Tables** | Cells, rows, columns | ✅ |
+| | Table background (`a:tblBg`, beneath cell fills; optional `TableElement.background: Fill` in parsed models) | ✅ |
 | | Cell merges (horizontal / vertical) | ✅ |
 | | Cell borders | ✅ |
 | | Cell fills (solid / gradient) | ✅ |

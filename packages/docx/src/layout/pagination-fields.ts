@@ -115,6 +115,8 @@ export function paginationFieldFlowGeometry(fragment: FlowFragment): unknown {
       lines: fragment.lines.map((line) => ({
         range: line.range,
         bounds: line.bounds,
+        wrapBounds: line.wrapBounds,
+        wrapFragments: line.wrapFragments,
         baselinePt: line.baselinePt,
         advancePt: line.advancePt,
         placements: line.placements.map((placement) => ({

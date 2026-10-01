@@ -553,7 +553,7 @@ function acceptNode(
       flowDomainId,
       translation: {
         // Ordinary table acquisition owns the complete inline placement:
-        // physical jc alignment followed by signed tblInd translation. Move
+        // physical jc alignment followed by the acquired leading-axis translation. Move
         // that acquisition-local frame into the page column without
         // normalizing its retained X origin away. Explicit out-of-flow
         // placements and paragraphs continue to own an exact destination.
@@ -2987,75 +2987,144 @@ function* paginateBodyWithAnchorConvergenceSteps(
       deferrals: AnchorLineDeferrals;
     }>;
     const noDeferrals: AnchorLineDeferrals = new Map();
-    return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
-      pass: BodyPaginationPassResult;
-    }>, number, AnchorPassCarry>({
-      ...(initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
-      step: function* anchorPass(previous) {
-        const appliedPlan = previous?.plan ?? initialPlan ?? null;
-        const appliedDeferrals = previous?.deferrals ?? noDeferrals;
-        const pass = yield* paginateBodyPassSteps(
-          input,
-          services,
-          options,
-          reserves,
-          appliedPlan,
-          previous?.minimumTablePageBySource ?? null,
-          balancePlan,
-          publish ? anchorPassObserver(appliedPlan) : undefined,
-          appliedDeferrals.size > 0 ? appliedDeferrals : null,
-        );
-        const observed = pageAnchorDestinationPlan(pass.layout);
-        for (const [key, destination] of keptHostAnchorCarries(appliedPlan, pass.layout)) {
-          observed.set(key, destination);
-        }
-        // The unseeded pass registers source-order estimates, not anchor
-        // lines that reached their page, so it proves nothing about them.
-        const lineTests = appliedPlan === null
-          ? Object.freeze({ plan: observed, deferrals: appliedDeferrals })
-          : resolveAnchorLineTests(pass, observed, appliedDeferrals);
-        const minimumTablePageBySource = new Map<string, number>();
-        // Compare all destinations once. Testing every table against a fresh
-        // copy of the full plan would make table-heavy documents quadratic.
-        // A table floor needs the next pass to differ from this one only in
-        // that table's registration, so no drawing retest or new deferral.
-        const changedKeys = previous && appliedPlan
-          && lineTests.plan === observed && lineTests.deferrals === appliedDeferrals
-          ? changedAnchorKeys(appliedPlan, observed)
-          : null;
-        for (const [key, destination] of observed) {
-          if (destination.kind !== 'floating-table') continue;
-          const prior = appliedPlan?.get(key);
-          if (prior?.kind !== 'floating-table' || !changedKeys
-            || (changedKeys.size > 1 || (changedKeys.size === 1 && !changedKeys.has(key)))) {
-            continue;
+    const settledFloors = new Map<string, number>();
+    let restart: AnchorPassCarry | null = null;
+    const latest: { carry: AnchorPassCarry | null } = { carry: null };
+    let remainingPasses = anchorPassLimit;
+    const identity = (value: AnchorPassCarry) => anchorCarryIdentity(value.plan, value.deferrals)
+      // Preserve main's detector until recovery. Once floors are pinned, they
+      // are persistent solver input and must participate in exact equality.
+      + (settledFloors.size > 0 ? `\u0005${anchorPlanIdentity(value.minimumTablePageBySource)}` : '');
+    for (;;) {
+      try {
+        return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
+          pass: BodyPaginationPassResult;
+        }>, number, AnchorPassCarry>({
+          ...(restart
+            ? { seedState: identity(restart) }
+            : initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
+          step: function* anchorPass(previous) {
+            previous ??= restart;
+            const appliedPlan = previous?.plan ?? initialPlan ?? null;
+            const appliedDeferrals = previous?.deferrals ?? noDeferrals;
+            const pass = yield* paginateBodyPassSteps(
+              input,
+              services,
+              options,
+              reserves,
+              appliedPlan,
+              previous?.minimumTablePageBySource ?? null,
+              balancePlan,
+              publish ? anchorPassObserver(appliedPlan) : undefined,
+              appliedDeferrals.size > 0 ? appliedDeferrals : null,
+            );
+            const observed = pageAnchorDestinationPlan(pass.layout);
+            for (const [key, destination] of keptHostAnchorCarries(appliedPlan, pass.layout)) {
+              observed.set(key, destination);
+            }
+            // The unseeded pass registers source-order estimates, not anchor
+            // lines that reached their page, so it proves nothing about them.
+            const lineTests = appliedPlan === null
+              ? Object.freeze({ plan: observed, deferrals: appliedDeferrals })
+              : resolveAnchorLineTests(pass, observed, appliedDeferrals);
+            const minimumTablePageBySource = new Map<string, number>();
+            // Compare all destinations once. Testing every table against a fresh
+            // copy of the full plan would make table-heavy documents quadratic.
+            // A table floor needs the next pass to differ from this one only in
+            // that table's registration, so no drawing retest or new deferral.
+            const changedKeys = previous && appliedPlan
+              && lineTests.plan === observed && lineTests.deferrals === appliedDeferrals
+              ? changedAnchorKeys(appliedPlan, observed)
+              : null;
+            for (const [key, destination] of observed) {
+              if (destination.kind !== 'floating-table') continue;
+              const prior = appliedPlan?.get(key);
+              if (prior?.kind !== 'floating-table' || !changedKeys
+                || (changedKeys.size > 1 || (changedKeys.size === 1 && !changedKeys.has(key)))) {
+                continue;
+              }
+              // Only this table's changed exclusion can have moved its source in
+              // this run: input, reserves, and every other page anchor are fixed.
+              // Recheck the next candidate page, not the observed source page.
+              const provenPage = destination.pageIndex > prior.pageIndex
+                ? prior.pageIndex + 1
+                : previous?.minimumTablePageBySource.get(key);
+              if (provenPage !== undefined) minimumTablePageBySource.set(key, provenPage);
+            }
+            // Only cycle recovery retains floors across passes. Ordinary runs
+            // keep the original single-table proof and its exact output unchanged.
+            for (const [key, pageIndex] of settledFloors) {
+              const floor = Math.max(pageIndex, minimumTablePageBySource.get(key) ?? pageIndex);
+              settledFloors.set(key, floor);
+              minimumTablePageBySource.set(key, floor);
+            }
+            latest.carry = Object.freeze({
+              plan: lineTests.plan,
+              minimumTablePageBySource,
+              deferrals: lineTests.deferrals,
+            });
+            return Object.freeze({
+              pass,
+              plan: lineTests.plan,
+              minimumTablePageBySource,
+              deferrals: lineTests.deferrals,
+            });
+          },
+          stateOf: identity,
+          // The next anchor pass reads only the plan, the proven table pages and
+          // the proven anchor-line deferrals; the superseded pass (its whole
+          // layout) is not carried into it.
+          carry: (value) => Object.freeze({
+            plan: value.plan,
+            minimumTablePageBySource: value.minimumTablePageBySource,
+            deferrals: value.deferrals,
+          }),
+          limit: remainingPasses,
+        })).value.pass;
+      } catch (error) {
+        // Keep the existing unseeded retry for a carried plan and the existing
+        // host-drawing fallback. Only an otherwise-fatal source-order cycle
+        // enters recovery, so successful retry paths retain their output.
+        if (initialPlan || !publish || !(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
+          || latest.carry === null) throw error;
+        // Library termination policy, not a claim about Word placement:
+        // §17.4.57 defines page-relative geometry but not this solver's cycle
+        // recovery. Pin only oscillating tables to the latest page in the
+        // repeated cycle; never return a pass with stale exclusions. Normal
+        // acquisition then rebuilds text and table placement with these floors.
+        const repeated = error.states.at(-1)!;
+        const cycle = error.states.slice(error.states.indexOf(repeated), -1)
+          .map((state) => new Map(JSON.parse(state.split('\u0004')[0]!) as Array<[string, PageWrapDestination]>));
+        const changed = new Set<string>();
+        const later = new Map<string, number>();
+        for (const plan of cycle) {
+          for (const key of changedAnchorKeys(cycle[0]!, plan)) changed.add(key);
+          for (const [key, destination] of plan) {
+            if (destination.kind !== 'floating-table') continue;
+            later.set(key, Math.max(later.get(key) ?? -1, destination.pageIndex));
           }
-          // Only this table's changed exclusion can have moved its source in
-          // this run: input, reserves, and every other page anchor are fixed.
-          // Recheck the next candidate page, not the observed source page.
-          const provenPage = destination.pageIndex > prior.pageIndex
-            ? prior.pageIndex + 1
-            : previous?.minimumTablePageBySource.get(key);
-          if (provenPage !== undefined) minimumTablePageBySource.set(key, provenPage);
         }
-        return Object.freeze({
-          pass,
-          plan: lineTests.plan,
-          minimumTablePageBySource,
-          deferrals: lineTests.deferrals,
-        });
-      },
-      stateOf: (value) => anchorCarryIdentity(value.plan, value.deferrals),
-      // The next anchor pass reads only the plan, the proven table pages and
-      // the proven anchor-line deferrals; the superseded pass (its whole
-      // layout) is not carried into it.
-      carry: (value) => Object.freeze({
-        plan: value.plan,
-        minimumTablePageBySource: value.minimumTablePageBySource,
-        deferrals: value.deferrals,
-      }),
-      limit: anchorPassLimit,
-    })).value.pass;
+        let raised = false;
+        for (const [key, pageIndex] of later) {
+          if (!changed.has(key) || pageIndex <= (settledFloors.get(key) ?? -1)) continue;
+          settledFloors.set(key, pageIndex);
+          raised = true;
+        }
+        if (!raised) throw error;
+        // Every settlement strictly raises a table floor: at most one raise
+        // per table per page. Restarts share the original operational pass
+        // budget as well, so even a growing page count cannot run unbounded.
+        remainingPasses -= error.passes;
+        if (remainingPasses < 2) {
+          throw new ExactConvergenceError('limit', error.states, anchorPassLimit);
+        }
+        const floors = new Map(latest.carry.minimumTablePageBySource);
+        for (const [key, pageIndex] of settledFloors) {
+          floors.set(key, Math.max(pageIndex, floors.get(key) ?? pageIndex));
+        }
+        restart = Object.freeze({ ...latest.carry, minimumTablePageBySource: floors });
+      }
+    }
   };
   const carryFree = function* () {
     if (pageOwnedAnchorCount === 0) {

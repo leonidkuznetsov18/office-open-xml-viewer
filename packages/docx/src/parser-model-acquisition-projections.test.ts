@@ -8,6 +8,7 @@ import {
   tableColumnLayoutInput,
   tableFormatInput,
   tableParticipatesInOrdinaryFlow,
+  tableSourceAcquisitionInput,
 } from './parser-model.js';
 import type { DocParagraph, DocxDocumentModel } from './types.js';
 import type { SourceRef } from './layout/types.js';
@@ -64,15 +65,8 @@ const bodySource = (path: number[] = [0]): SourceRef => ({
 describe('parser-to-body-acquisition projection capability', () => {
   it('is one frozen identity-preserving record without compatibility wrappers', () => {
     expect(Object.isFrozen(bodyAcquisitionInputProjections)).toBe(true);
-    expect(Object.keys(bodyAcquisitionInputProjections).sort()).toEqual([
-      'effectiveTablePreferredWidthPt',
-      'numberingMarkerShapeInput',
-      'paragraphAcquisitionInput',
-      'paragraphMarkShapeInput',
-      'tableColumnLayoutInput',
-      'tableFormatInput',
-      'tableParticipatesInOrdinaryFlow',
-    ]);
+    // The boundary gate pins capability names; this test checks runtime
+    // immutability and direct projection identities rather than its key list.
     expect(bodyAcquisitionInputProjections.numberingMarkerShapeInput)
       .toBe(numberingMarkerShapeInput);
     expect(bodyAcquisitionInputProjections.paragraphAcquisitionInput)
@@ -82,6 +76,7 @@ describe('parser-to-body-acquisition projection capability', () => {
     expect(bodyAcquisitionInputProjections.tableColumnLayoutInput)
       .toBe(tableColumnLayoutInput);
     expect(bodyAcquisitionInputProjections.tableFormatInput).toBe(tableFormatInput);
+    expect(bodyAcquisitionInputProjections.tableSourceAcquisitionInput).toBe(tableSourceAcquisitionInput);
     expect(bodyAcquisitionInputProjections.tableParticipatesInOrdinaryFlow)
       .toBe(tableParticipatesInOrdinaryFlow);
   });

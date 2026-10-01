@@ -171,11 +171,20 @@ export function selectParagraphFragment(
       requiresFreshFlowRegion: true, additionalReservePt: 0, admittedBlockExtentPt: 0,
     };
   }
-  let end = selectLargestFittingEnd(
+  // Acquisition retains one entry per physical line; the same index owns
+  // its full source boundary, including all horizontal gap placements.
+  const allGroupEnds = acquired.lines.map((_, index) => index + 1);
+  const groupEnds = allGroupEnds.filter(end => end <= (lineEndLimit ?? total));
+  if (groupEnds.length === 0) return {
+    fragment: null, nextCursor: cursor, requiresFreshFlowRegion: true,
+    additionalReservePt: 0, admittedBlockExtentPt: 0,
+  };
+  let groupEnd = selectLargestFittingEnd(
     0,
-    lineEndLimit ?? total,
+    groupEnds.length,
     availableBlockExtentPt,
-    (lineEnd) => (() => {
+    (groupIndex) => (() => {
+      const lineEnd = groupEnds[groupIndex - 1]!;
       const candidate = slice(lineEnd);
       const reserve = reserveFor(candidate);
       return reserveFits(reserve)
@@ -183,19 +192,19 @@ export function selectParagraphFragment(
         : availableBlockExtentPt + 1;
     })(),
   ).end;
-  if (end === 0) {
+  if (groupEnd === 0) {
     if (canRelocate) return {
       fragment: null, nextCursor: cursor,
       requiresFreshFlowRegion: true, additionalReservePt: 0, admittedBlockExtentPt: 0,
     };
-    end = 1;
+    groupEnd = 1;
   }
   for (;;) {
     const widow = adjustForWidowOrphan({
       widowControl: policy.widowControl,
       start: 0,
-      end,
-      totalLines: total,
+      end: groupEnd,
+      totalLines: allGroupEnds.length,
       canRelocate,
     });
     if (widow.kind === 'relocate') {
@@ -205,8 +214,9 @@ export function selectParagraphFragment(
       };
     }
     if (widow.kind !== 'dropLastLine') break;
-    end -= 1;
+    groupEnd -= 1;
   }
+  const end = groupEnds[groupEnd - 1]!;
   const fragment = slice(end);
   const nextBoundary = end < total ? fragmentation.lineEndBoundaries[end - 1]! : null;
   if (

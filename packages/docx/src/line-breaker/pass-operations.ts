@@ -1,7 +1,6 @@
 import { LineMeasurementAdapter } from './measurement-adapter.js';
-import { graphemeClusterOffsets } from '@silurus/ooxml-core';
+import { graphemeClusterOffsets, kinsokuAdjustedSplit } from '@silurus/ooxml-core';
 import {
-  MIN_LINE_GAP,
   prepareFloatWrap,
   computePreparedLineFloatWindow,
   type PreparedFloatWrap,
@@ -10,7 +9,6 @@ import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceT
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
-  wordUniformRunPositionPaintPt,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -20,7 +18,7 @@ import {
   type LayoutTextSeg,
   type LineBoundary,
 } from './model.js';
-import { createLineBreakerState } from './break-queue.js';
+import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -32,6 +30,8 @@ import {
   charScaleFactor,
   charSpacingDeltaPx,
   protectedNoBreakOffsets,
+  hardJoinPrefixEnd,
+  legalTextSplitAtOrBefore,
   segAdvanceWidth,
   segmentCharacterGridDeltaPx,
   slicedPunctuationCompressions,
@@ -46,7 +46,7 @@ import {
 } from './font-routes.js';
 import { rubyAscentReservePx } from './ruby-metrics.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import { rebaseSeaBreaks } from './text-runs.js';
+import { rebaseSeaBreaks, hasCJKBreakOpportunity } from './text-runs.js';
 import {
   keepLeadingKinsoku,
   retractLeadingKinsoku,
@@ -60,9 +60,13 @@ export interface PassOperationState extends LineBreakerPassInput {
   readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
   readonly materializeLatinSpaceCompression: () => void;
   readonly snapPitchPx: number | null;
-  readonly minLineStartWidth: () => number;
-  readonly isParagraphMarkOnlyFlow: boolean;
-  readonly startLine: (minWidth?: number) => void;
+  readonly lineHeadRequirement: (boundary?: LineBoundary) => number;
+  readonly startLine: (requirement?: number) => void;
+  /** Report a forced placement of the unit starting at `unitStart` in the
+   * current line; throws LineGapRejection inside a narrowed float gap. */
+  readonly forcedPlacement: (requiredWidth: number, unitStart?: number) => void;
+  /** Smallest legal line-head advance of a text segment under placement rules. */
+  readonly minimalLegalTextWidth: (segment: LayoutTextSeg) => number;
   readonly availW: () => number;
   readonly fitsMeasuredWidth: (used: number, available: number) => boolean;
   readonly bidiCustomStopsPx: {
@@ -126,6 +130,7 @@ export interface PassOperationState extends LineBreakerPassInput {
     desc: number,
   ) => boolean;
   readonly probeHeights: readonly number[] | null;
+  readonly probeFloors: readonly number[] | null;
   readonly preparedFloatWrap?: PreparedFloatWrap;
 }
 
@@ -166,19 +171,177 @@ export function performMaterializeLatinSpaceCompression(operationState: PassOper
   breakerState.latinAppliedPerGap = 0;
 }
 
-export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
-  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
-    operationState;
+/**
+ * WORD_FLOAT_GAP_FLOW (#1670): one physical line may be split into fragments,
+ * one per free gap, filled in reading order. ECMA-376 §20.4.2.17–.19 permits
+ * text on both sides of a square/tight/through object but does not say how a
+ * line is partitioned. The registered rule selects the first gap in reading
+ * order whose width admits the content placed there, then continues into
+ * later gaps on the same baseline.
+ *
+ * Admission is a placement transaction, not a separate width predictor. A
+ * fragment narrowed by an exclusion is filled by ordinary placement. If any
+ * placement path would force content into it (an emergency split, an illegal
+ * kinsoku split, or an advance past the fragment edge), the fragment rolls
+ * back to its first placement and the search continues with a requirement
+ * strictly larger than the rejected gap. A full paragraph band (no exclusion
+ * narrows it) keeps the established forced-placement behavior, so progress is
+ * guaranteed once a unit fits no narrowed gap.
+ */
+export class LineGapRejection extends Error {
+  constructor(
+    /** Lower bound of the forced unit's advance, from placement's own measurement. */
+    readonly requiredWidth: number,
+    /** Complete units precede the forced unit: end the fragment before it. */
+    readonly stopBefore?: LineBoundary,
+  ) {
+    super('A narrowed float gap cannot admit the line-head unit');
+    this.name = 'LineGapRejection';
+  }
+}
+
+/** Seed requirement for a line head. Content needs no more than the solver's
+ * numeric floor: placement decides admission. A mark-only head (no inline
+ * content remains) keeps `word-empty-mark-float-side-gap`. */
+export function performLineHeadRequirement(
+  operationState: PassOperationState,
+  boundary?: LineBoundary,
+): number {
+  const { wrapCtx, segs, breakerState, scale } = operationState;
+  if (!wrapCtx) return 0;
+  const candidates = boundary ? segs : breakerState.queue;
+  const start = boundary?.segIndex ?? 0;
+  let mark: LayoutTextSeg | undefined;
+  for (let index = start; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (('text' in candidate && !candidate.metricOnly && candidate.text.length > 0)
+      || ('imagePath' in candidate && !candidate.anchor) || 'math' in candidate
+      || 'isTab' in candidate || 'lineBreak' in candidate) return 0;
+    if ('text' in candidate && candidate.metricOnly) mark ??= candidate;
+  }
+  if (start >= candidates.length) return 0;
+  return wrapCtx.paragraphMarkLineStartWidth ?? (mark ? mark.fontSize * scale : 0);
+}
+
+/** Smallest prefix placement may legally put at a line head: the first SEA
+ * boundary, the first CJK split legal under kinsoku and protected ranges, the
+ * first URL syntax opportunity, a hard seam's protected prefix, else the whole
+ * segment (segments are already delimited at ordinary opportunities). Used
+ * only as the lower bound reported when a narrowed gap rejects its head. */
+export function performMinimalLegalTextWidth(
+  operationState: PassOperationState,
+  segment: LayoutTextSeg,
+): number {
+  const { kinsoku, strAdvance, baseRtl } = operationState;
+  const text = segment.text;
+  let end = text.length;
+  if (segment.fitTextRegionIndex === undefined && !segment.ruby && !segment.tateChuYoko) {
+    const protectedOffsets = protectedNoBreakOffsets(segment);
+    if (segment.hardJoinPrev === true) {
+      end = hardJoinPrefixEnd(segment) ?? text.length;
+    } else if (segment.seaBreaks !== undefined) {
+      end = segment.seaBreaks.find((offset) => offset > 0 && offset < text.length) ?? text.length;
+    } else if (hasCJKBreakOpportunity(text)) {
+      const characters = [...text];
+      for (let count = 1; count < characters.length; count += 1) {
+        if (kinsokuAdjustedSplit(characters, count, kinsoku, 0) !== count) continue;
+        const utf16 = characters.slice(0, count).join('').length;
+        if (legalTextSplitAtOrBefore(segment, utf16, 1) === utf16) {
+          end = utf16;
+          break;
+        }
+      }
+    } else {
+      end = segment.externalLinkBreakOffsets?.find((offset) =>
+        offset > 0 && offset < text.length && !protectedOffsets.has(offset)) ?? text.length;
+    }
+  }
+  const prefix = text.slice(0, end);
+  // The fit tests exclude a collapsible U+0020 suffix except in an RTL line.
+  return strAdvance(segment, baseRtl ? prefix : prefix.replace(/ +$/u, ''));
+}
+
+/** Vertical allocation belongs to the physical line; only a failed gap
+ * continuation opens a new line. Horizontal queue/fit state resets per gap. */
+function resetPhysicalLineMetrics({ breakerState }: PassOperationState): void {
+  breakerState.lineHeight = 0;
+  breakerState.lineAscent = 0;
+  breakerState.lineDescent = 0;
+  breakerState.lineIntendedSingle = 0;
+  breakerState.lineHasInlinePicture = false;
+  breakerState.linePictureMarkSingle = 0;
+  breakerState.lineGridCountSingle = 0;
+  breakerState.lineLatinGridCountSingle = 0;
+  breakerState.lineVisibleAscent = 0;
+  breakerState.lineVisibleDescent = 0;
+  breakerState.lineVisibleIntendedSingle = 0;
+  breakerState.lineHasVisibleMetrics = false;
+  breakerState.lineHasRuby = false;
+  breakerState.lineEastAsian = false;
+  breakerState.positionReferencePt = undefined;
+  breakerState.firstPositioned = undefined;
+  breakerState.uniformPositionEligible = true;
+}
+
+/** Exclusion probe band of a physical line. The initial pass measures without
+ * exclusions. Afterwards every physical line is probed in the pass that
+ * reaches it: a line the previous pass did not produce uses the last resolved
+ * physical allocation, and the next pass replaces it with its own. With fixed
+ * metrics, the result converges in three passes (measure, resolve, confirm)
+ * regardless of how many physical lines or gaps exclusions create; varying
+ * metrics retain the fail-closed pass guard. */
+function physicalProbeHeight(probeHeights: readonly number[] | null, index: number): number | undefined {
+  if (!probeHeights || probeHeights.length === 0) return undefined;
+  return probeHeights[index] ?? probeHeights[probeHeights.length - 1];
+}
+
+function openPhysicalLine(operationState: PassOperationState): void {
+  const { breakerState } = operationState;
+  resetPhysicalLineMetrics(operationState);
+  if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+}
+
+export function performStartLine(operationState: PassOperationState, requirement: number = 0): void {
+  const { breakerState, maxWidth, wrapCtx, firstIndent, probeFloors } = operationState;
 
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
   breakerState.lineMaxWidth = maxWidth;
+  breakerState.gapTransaction = null;
+  const cursor = breakerState.fragmentCursor;
+  breakerState.fragmentCursor = null;
+  // Every gap of this physical line uses the same observed band. New gaps
+  // are horizontal placements, so they need no additional convergence pass.
+  // Without an observed band (first pass), the line is measured unconstrained.
+  if (!wrapCtx || physicalProbeHeight(probeFloors, breakerState.physicalLineIndex) === undefined) {
+    openPhysicalLine(operationState);
+    return;
+  }
+  const transaction: GapTransaction = {
+    cursor,
+    requestTopY: breakerState.currentLineTopY,
+    requirement: requirement + (breakerState.isFirst ? Math.max(0, firstIndent) : 0),
+    window: null,
+    narrowed: false,
+    endsAtExclusion: false,
+    snapshot: null,
+    stopBefore: null,
+  };
+  breakerState.gapTransaction = transaction;
+  if (!cursor) openPhysicalLine(operationState);
+  placeLineWindow(operationState, transaction, null);
+}
+
+/** Search the first admissible window for the transaction's requirement:
+ * a later gap on the continuation baseline, else a new physical line. */
+function placeLineWindow(
+  operationState: PassOperationState,
+  transaction: GapTransaction,
+  rejected: GapWindow | null,
+): void {
+  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeFloors, preparedFloatWrap } =
+    operationState;
   if (!wrapCtx) return;
-  const probeH = probeHeights?.[breakerState.lines.length];
-  // The first pass measures this line without a float window. A later pass
-  // resolves it only once that exact line index has an observed line-box
-  // height; newly-created lines are likewise measured before they are probed.
-  if (probeH === undefined) return;
   // §17.3.1.12 removes a hanging indent from the paragraph's first-line
   // indentation, not from an object's exclusion (§20.4.2.17–.19). Query the
   // expanded first-line band before subtracting floats; applying the hanging
@@ -195,37 +358,184 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
-  if (wrapCtx.lineWindow) {
-    const win = wrapCtx.lineWindow({
-      topYPt: breakerState.currentLineTopY,
-      minimumStartWidthPt: MIN_LINE_GAP,
-      squareMinimumStartWidthPt: minWidth,
-      probeHeightPt: probeH,
-      paragraphXPt: lineBandX,
-      maximumWidthPt: lineBandWidth,
-      columnXPt: wrapCtx.columnXPt,
-      columnWidthPt: wrapCtx.columnWidthPt,
-    });
-    breakerState.currentLineTopY = win.topYPt;
-    breakerState.lineXOffset = win.xOffsetPt;
-    breakerState.lineMaxWidth = win.maximumWidthPt + hangingOffset;
-  } else {
-    const win = computePreparedLineFloatWindow(
-      breakerState.currentLineTopY,
-      MIN_LINE_GAP,
-      probeH,
-      lineBandX,
-      lineBandWidth,
+  const query = (topY: number, x: number, width: number, height: number) => {
+    const requiredWidth = transaction.requirement;
+    if (wrapCtx.lineWindow) {
+      const win = wrapCtx.lineWindow({
+        topYPt: topY, minimumStartWidthPt: requiredWidth,
+        squareMinimumStartWidthPt: requiredWidth, probeHeightPt: height,
+        paragraphXPt: x, maximumWidthPt: width,
+        columnXPt: wrapCtx.columnXPt, columnWidthPt: wrapCtx.columnWidthPt,
+      });
+      return { topY: win.topYPt, xOffset: win.xOffsetPt, maxWidth: win.maximumWidthPt };
+    }
+    return computePreparedLineFloatWindow(
+      topY, requiredWidth, height, x, width,
       preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
-      wrapCtx.columnXPt,
-      wrapCtx.columnXPt + wrapCtx.columnWidthPt,
-      reference,
-      minWidth,
+      wrapCtx.columnXPt, wrapCtx.columnXPt + wrapCtx.columnWidthPt,
+      reference, requiredWidth,
     );
-    breakerState.currentLineTopY = win.topY;
-    breakerState.lineXOffset = win.xOffset;
-    breakerState.lineMaxWidth = win.maxWidth + hangingOffset;
+  };
+  let accepted: GapWindow & { narrowed: boolean } | null = null;
+  const cursor = transaction.cursor;
+  if (cursor) {
+    const probeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+    const left = baseRtl ? lineBandX : cursor.right;
+    const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
+    if (probeH !== undefined && right > left) {
+      const next = query(cursor.topY, left, right - left, probeH);
+      if (next.topY === cursor.topY && next.maxWidth >= transaction.requirement) {
+        // A strictly smaller unvisited band gives monotonic horizontal
+        // progress; the column and largest-side reference never shrink.
+        accepted = {
+          topY: next.topY,
+          xOffset: left - wrapCtx.paraX + next.xOffset,
+          maxWidth: next.maxWidth,
+          solverWidth: next.maxWidth,
+          narrowed: true,
+        };
+      }
+    }
+    if (!accepted) {
+      // No later gap on this baseline admits the head: the physical line ends.
+      transaction.cursor = null;
+      openPhysicalLine(operationState);
+      breakerState.currentLineTopY = transaction.requestTopY;
+    }
   }
+  if (!accepted) {
+    const probeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+    if (probeH === undefined) {
+      breakerState.lineXOffset = 0;
+      breakerState.lineMaxWidth = maxWidth;
+      transaction.window = null;
+      transaction.narrowed = false;
+      transaction.endsAtExclusion = false;
+      transaction.snapshot = null;
+      return;
+    }
+    const win = query(transaction.requestTopY, lineBandX, lineBandWidth, probeH);
+    accepted = {
+      topY: win.topY,
+      xOffset: win.xOffset,
+      maxWidth: win.maxWidth + hangingOffset,
+      solverWidth: win.maxWidth,
+      narrowed: win.xOffset !== 0 || win.maxWidth !== lineBandWidth,
+    };
+  }
+  // After a rejection the requirement exceeds the rejected width. A window
+  // still narrower than it is not admitted by the solver's exact comparison
+  // (it differs only by representable rounding) or comes from a boundary
+  // that does not honor the requirement. Accept it without a transaction:
+  // forced placement is then the established behavior, and the search ends.
+  if (rejected && accepted.narrowed && accepted.solverWidth < transaction.requirement) {
+    accepted = { ...accepted, narrowed: false };
+  }
+  breakerState.currentLineTopY = accepted.topY;
+  breakerState.lineXOffset = accepted.xOffset;
+  breakerState.lineMaxWidth = accepted.maxWidth;
+  transaction.window = accepted;
+  transaction.narrowed = accepted.narrowed;
+  // Absolute line-end edge versus the paragraph band edge, in reading order.
+  const windowStart = wrapCtx.paraX + accepted.xOffset;
+  const windowEnd = windowStart + accepted.maxWidth;
+  transaction.endsAtExclusion = baseRtl
+    ? windowStart > lineBandX + 1e-9
+    : windowEnd < lineBandX + lineBandWidth - 1e-9;
+  transaction.snapshot = null;
+  if (accepted.narrowed) performCaptureGapSnapshot(operationState, true);
+}
+
+/** Record the rollback image of a narrowed fragment before its first unit.
+ * Called when the window is accepted (the iterator may hold the segment being
+ * processed) and again at each iterator step while the fragment is empty, so
+ * content re-queued by the preceding flush (e.g. kinsoku retraction) is kept. */
+export function performCaptureGapSnapshot(
+  operationState: PassOperationState,
+  includeInHand: boolean,
+): void {
+  const { breakerState } = operationState;
+  const transaction = breakerState.gapTransaction;
+  if (!transaction?.narrowed) return;
+  const {
+    lines, queue, currentLine: _line, latinLineGaps: _gaps, gapTransaction: _transaction,
+    inHand, snapBlock, ...scalars
+  } = breakerState;
+  transaction.snapshot = {
+    scalars: { ...scalars },
+    snapBlock: snapBlock ? { ...snapBlock } : null,
+    linesLength: lines.length,
+    queue: includeInHand && inHand ? [inHand, ...queue] : queue.slice(),
+  };
+}
+
+/** Called by every placement path that would force its unit into the
+ * current fragment. On a full band this is the established behavior; in a
+ * narrowed gap the fragment is rejected (or ended before the unit). */
+export function performForcedPlacement(
+  operationState: PassOperationState,
+  requiredWidth: number,
+  unitStart = 0,
+): void {
+  const { breakerState } = operationState;
+  const transaction = breakerState.gapTransaction;
+  if (!transaction?.narrowed || !transaction.snapshot) return;
+  // Inkless items before the unit (anchor characters, mark metrics) travel
+  // with it; only inked content can end the fragment before the unit.
+  const committed = breakerState.currentLine.slice(0, unitStart).some((item) => !isInklessLineItem(item));
+  const lead = committed ? breakerState.currentLine[unitStart] : undefined;
+  throw new LineGapRejection(requiredWidth, lead?.src ? { ...lead.src } : undefined);
+}
+
+function isInklessLineItem(item: LayoutSeg): boolean {
+  return ('text' in item && item.metricOnly === true) || ('imagePath' in item && Boolean(item.anchor));
+}
+
+/** Lower bound of a queued unit's line-head advance, from placement's measures. */
+function headUnitLowerBound(operationState: PassOperationState, segment: LayoutSeg | undefined): number {
+  if (!segment) return 0;
+  if ('text' in segment) return operationState.minimalLegalTextWidth(segment);
+  if ('imagePath' in segment) return segment.anchor ? 0 : segment.widthPt * operationState.scale;
+  if ('math' in segment) return segment.measuredWidth;
+  return 0;
+}
+
+/** Roll a rejected fragment back and continue the search. */
+export function performRejectGap(
+  operationState: PassOperationState,
+  rejection: LineGapRejection,
+): void {
+  const { breakerState, firstIndent, maxWidth } = operationState;
+  const transaction = breakerState.gapTransaction;
+  const snapshot = transaction?.snapshot;
+  if (!transaction || !snapshot || !transaction.window) throw rejection;
+  Object.assign(breakerState, snapshot.scalars);
+  breakerState.snapBlock = snapshot.snapBlock
+    ? { ...(snapshot.snapBlock as NonNullable<typeof breakerState.snapBlock>) }
+    : null;
+  breakerState.lines.length = snapshot.linesLength;
+  breakerState.queue = snapshot.queue.slice();
+  breakerState.currentLine = [];
+  breakerState.latinLineGaps = [];
+  breakerState.inHand = undefined;
+  // A replay ends the fragment before the forced unit. If the replay cannot
+  // reach that source boundary, the whole fragment is rejected instead.
+  if (rejection.stopBefore && !transaction.stopBefore) {
+    transaction.stopBefore = rejection.stopBefore;
+    return;
+  }
+  transaction.stopBefore = null;
+  const rejected = transaction.window;
+  const required = rejection.requiredWidth
+    + (breakerState.isFirst ? Math.max(0, firstIndent) : 0);
+  const hangingOffset = breakerState.isFirst ? Math.min(0, firstIndent) : 0;
+  // The forced unit did not fit this gap, so its advance exceeds the width
+  // the solver admitted. A lower bound that does not (non-monotone advances)
+  // sends the unit to the full band instead of creeping through gaps.
+  transaction.requirement = required > rejected.solverWidth
+    ? Math.max(transaction.requirement, required)
+    : maxWidth - hangingOffset;
+  placeLineWindow(operationState, transaction, rejected);
 }
 
 export function performAvailW(operationState: PassOperationState) {
@@ -266,7 +576,7 @@ export function performFlush(
   const {
     breakerState,
     materializeLatinSpaceCompression,
-    minLineStartWidth,
+    lineHeadRequirement,
     startLine,
     bidiCustomStopsPx,
     bidiIntervalPx,
@@ -281,6 +591,15 @@ export function performFlush(
     baseRtl,
   } = operationState;
 
+  // An anchor character or paragraph-mark metric has no advance; it moves
+  // with the unit that follows it. A narrowed fragment holding only such
+  // items cannot end before that unit: the unit is its head (forced here).
+  // Tabs and breaks are pen/line controls, not such units.
+  const followingUnit = headUnitLowerBound(operationState, breakerState.inHand);
+  if (!brTerminated && nextStart !== undefined && followingUnit > 0
+    && breakerState.currentLine.length > 0 && breakerState.currentLine.every(isInklessLineItem)) {
+    operationState.forcedPlacement(followingUnit);
+  }
   materializeLatinSpaceCompression();
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
@@ -307,35 +626,31 @@ export function performFlush(
   // provide a zero-position reference; tabs do not contribute vertical
   // metrics. The fixed drop-cap path intentionally keeps its paint-only
   // lowering and therefore opts out of this normalization.
-  let commonPositionPt: number | undefined;
-  let hasPositionReference = false;
   for (const segment of breakerState.currentLine) {
     if ('isTab' in segment) continue;
-    const positionPt = 'text' in segment ? (segment.position ?? 0) : 0;
-    if ('text' in segment && segment.positionExtendsLineBox === false) {
-      commonPositionPt = 0;
-      hasPositionReference = true;
-      break;
+    const position = 'text' in segment && segment.positionExtendsLineBox !== false
+      ? (segment.position ?? 0) : 0;
+    if (breakerState.positionReferencePt === undefined) breakerState.positionReferencePt = position;
+    else if (breakerState.positionReferencePt !== position) breakerState.positionReferencePt = null;
+    if (!('text' in segment)) {
+      breakerState.uniformPositionEligible = false;
+      continue;
     }
-    if (!hasPositionReference) {
-      commonPositionPt = positionPt;
-      hasPositionReference = true;
-    } else if (commonPositionPt !== positionPt) {
-      commonPositionPt = 0;
-      break;
-    }
+    breakerState.firstPositioned ??= segment;
+    const first = breakerState.firstPositioned;
+    breakerState.uniformPositionEligible &&= segment.text.length > 0
+      && !segment.metricOnly && !segment.ruby && !segment.vertAlign
+      && segment.positionExtendsLineBox !== false
+      && segment.position === first.position
+      && segment.fontFamily === first.fontFamily
+      && segment.fontRoute?.fingerprint === first.fontRoute?.fingerprint
+      && segment.bold === first.bold && segment.italic === first.italic
+      && segment.fontSize === first.fontSize
+      && segment.resolvedDesignDescentRatio === first.resolvedDesignDescentRatio
+      && segment.referenceFontVerticalMetric === first.referenceFontVerticalMetric
+      && segment.resolvedResourceVerticalMetric === first.resolvedResourceVerticalMetric;
   }
-  const linePositionReferencePt = hasPositionReference ? (commonPositionPt ?? 0) : 0;
-  if (linePositionReferencePt !== 0) {
-    for (const segment of breakerState.currentLine) {
-      if ('text' in segment) {
-        segment.lineRelativePosition = wordUniformRunPositionPaintPt(
-          segment.position ?? 0,
-          linePositionReferencePt,
-        );
-      }
-    }
-  }
+  const linePositionReferencePt = breakerState.positionReferencePt ?? 0;
   // §17.3.3.1 — the break is one run among the line's runs: its own size
   // participates in the line height but must not override a taller peer.
   const h =
@@ -367,35 +682,11 @@ export function performFlush(
   // visible text in one admitted face tuple. Canvas fallback geometry does
   // not reveal hhea descent, and mixed styles cannot share one descent
   // reserve. The rule uses face data, never a family-specific correction.
-  const positionedTexts = breakerState.currentLine.filter(
-    (segment): segment is LayoutTextSeg => 'text' in segment,
-  );
-  const firstPositioned = positionedTexts[0];
+  const firstPositioned = breakerState.firstPositioned;
   const uniformPositionAuto =
-    linePositionReferencePt !== 0 &&
-    positionedTexts.length > 0 &&
-    breakerState.currentLine.every((segment) => 'isTab' in segment || 'text' in segment) &&
-    firstPositioned?.resolvedDesignDescentRatio != null &&
-    (firstPositioned.referenceFontVerticalMetric ||
-      firstPositioned.resolvedResourceVerticalMetric) &&
-    positionedTexts.every(
-      (segment) =>
-        segment.text.length > 0 &&
-        !segment.metricOnly &&
-        !segment.ruby &&
-        !segment.vertAlign &&
-        segment.positionExtendsLineBox !== false &&
-        segment.position === linePositionReferencePt &&
-        segment.fontFamily === firstPositioned.fontFamily &&
-        segment.fontRoute?.fingerprint === firstPositioned.fontRoute?.fingerprint &&
-        segment.bold === firstPositioned.bold &&
-        segment.italic === firstPositioned.italic &&
-        segment.fontSize === firstPositioned.fontSize &&
-        segment.resolvedDesignDescentRatio === firstPositioned.resolvedDesignDescentRatio &&
-        segment.referenceFontVerticalMetric === firstPositioned.referenceFontVerticalMetric &&
-        segment.resolvedResourceVerticalMetric === firstPositioned.resolvedResourceVerticalMetric &&
-        (segment.referenceFontVerticalMetric || segment.resolvedResourceVerticalMetric),
-    )
+    linePositionReferencePt !== 0 && breakerState.uniformPositionEligible
+    && firstPositioned?.resolvedDesignDescentRatio != null
+    && (firstPositioned.referenceFontVerticalMetric || firstPositioned.resolvedResourceVerticalMetric)
       ? {
           normalSinglePx: Math.max(
             asc + desc - Math.abs(linePositionReferencePt * scale),
@@ -407,6 +698,7 @@ export function performFlush(
         }
       : undefined;
   breakerState.lines.push({
+    physicalLineIndex: breakerState.physicalLineIndex,
     segments: breakerState.currentLine,
     height: h,
     ascent: asc,
@@ -415,6 +707,7 @@ export function performFlush(
     visibleDescent,
     visibleIntendedSingle,
     intendedSingle: breakerState.lineIntendedSingle,
+    latinGridCountSingle: breakerState.lineLatinGridCountSingle,
     ...(inlinePictureTextSingle > 0 ? { inlinePictureTextSingle } : {}),
     uniformPositionAuto,
     // Empty/synthetic East Asian lines use the same design-height rule as a
@@ -430,7 +723,19 @@ export function performFlush(
     consumedEnd: nextStart ?? breakerState.queue[0]?.src ?? endBoundary,
   });
   if (wrapCtx) {
-    breakerState.currentLineTopY += wrapCtx.lineBoxH(
+    if (!brTerminated && nextStart !== undefined) {
+      breakerState.fragmentCursor = {
+        topY: breakerState.currentLineTopY,
+        left: wrapCtx.paraX + breakerState.lineXOffset
+          + (breakerState.isFirst ? Math.min(0, firstIndent) : 0),
+        right: wrapCtx.paraX + breakerState.lineXOffset + breakerState.lineMaxWidth,
+      };
+    }
+    // Use the physical allocation that supplied the exclusion probe. Local
+    // fragment metrics can be smaller than a later gap or paragraph-wide ruby
+    // reserve (§17.3.3.25); they cannot independently advance the next origin.
+    breakerState.currentLineTopY += operationState.probeHeights?.[breakerState.physicalLineIndex]
+      ?? wrapCtx.lineBoxH(
       asc,
       desc,
       breakerState.lineHasRuby,
@@ -439,6 +744,7 @@ export function performFlush(
       gridCountSingle,
       uniformPositionAuto,
       inlinePictureTextSingle,
+      breakerState.lineLatinGridCountSingle,
     );
   }
   breakerState.currentLine = [];
@@ -447,21 +753,8 @@ export function performFlush(
   breakerState.latinLineHomogeneous = true;
   breakerState.latinLineGaps = [];
   breakerState.latinUniformGapCapacity = undefined;
-  breakerState.lineHeight = 0;
-  breakerState.lineAscent = 0;
-  breakerState.lineDescent = 0;
-  breakerState.lineIntendedSingle = 0;
-  breakerState.lineHasInlinePicture = false;
-  breakerState.linePictureMarkSingle = 0;
-  breakerState.lineGridCountSingle = 0;
-  breakerState.lineVisibleAscent = 0;
-  breakerState.lineVisibleDescent = 0;
-  breakerState.lineVisibleIntendedSingle = 0;
-  breakerState.lineHasVisibleMetrics = false;
-  breakerState.lineHasRuby = false;
-  breakerState.lineEastAsian = false;
   breakerState.isFirst = false;
-  startLine(minLineStartWidth());
+  startLine(lineHeadRequirement(nextStart));
 }
 
 export function performProspectiveSnapAdvance(
@@ -667,6 +960,10 @@ export function performAddToLine(
               ? segmentEastAsiaFloorSingleLinePx(ts, intendedEm, segScriptHint)
               : 0,
           );
+    if (paintsInlineInk && !metricEastAsian && !ts.ruby
+      && ts.resolvedLatinGridCellAllocation === true) {
+      breakerState.lineLatinGridCountSingle = Math.max(breakerState.lineLatinGridCountSingle, designIntended);
+    }
     const intended = Math.max(designIntended, (nativeRatio ?? 0) * intendedEm);
     if (intended > breakerState.lineIntendedSingle) breakerState.lineIntendedSingle = intended;
     if (paintsInlineInk && intended > breakerState.lineVisibleIntendedSingle) {
