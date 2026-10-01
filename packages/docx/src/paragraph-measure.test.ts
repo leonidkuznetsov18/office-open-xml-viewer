@@ -1482,9 +1482,12 @@ function classifyDifference(
 // Ordinary unit runs retain the containment property; revision parity needs
 // both production implementations and therefore explicitly skips without it.
 const parityBaseline = process.env.VRT_BASELINE_CHECKOUT;
-it.skipIf(!parityBaseline)('classifies every float gap geometry difference from main', async () => {
+async function loadParityBaseline(): Promise<typeof import('./paragraph-measure.js')> {
   const BASELINE_PARAGRAPH_MEASURE = `${parityBaseline}/packages/docx/src/paragraph-measure.ts`;
-  const baseline = await import(BASELINE_PARAGRAPH_MEASURE) as typeof import('./paragraph-measure.js');
+  return await import(BASELINE_PARAGRAPH_MEASURE) as typeof import('./paragraph-measure.js');
+}
+it.skipIf(!parityBaseline)('classifies every float gap geometry difference from main', async () => {
+  const baseline = await loadParityBaseline();
   const counts: Record<string, number> = {};
   for (const [index, item] of atomicFloatPropertyCases().entries()) {
     // Interior exclusions exercise multiple gaps; edge exclusions exercise sole
@@ -1573,8 +1576,7 @@ it('keeps mixed sizes, pictures and ruby beside stacked exclusions convergent', 
 // With a single admitting gap (one exclusion at a paragraph edge leaving at
 // least one inch) and words that fit it, the model and main coincide exactly.
 it.skipIf(!parityBaseline)('matches main exactly when only one gap exists', async () => {
-  const BASELINE_PARAGRAPH_MEASURE = `${parityBaseline}/packages/docx/src/paragraph-measure.ts`;
-  const baseline = await import(BASELINE_PARAGRAPH_MEASURE) as typeof import('./paragraph-measure.js');
+  const baseline = await loadParityBaseline();
   let seed = 0x1683a;
   const random = (limit: number) => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
