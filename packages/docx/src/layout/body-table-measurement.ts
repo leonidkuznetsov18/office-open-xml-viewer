@@ -64,6 +64,11 @@ export interface BodyTableMeasurementOperations {
     contentWPt: number,
     sourceIndex: number,
   ) => { colWidthsPt: number[]; rowContentHeightsPt: number[]; rowHeightsPt: number[] };
+  readonly computeAdjacentTablePtLayouts: (
+    state: BodyAcquisitionState,
+    members: readonly Readonly<{ table: TableLayoutSource; sourceIndex: number }>[],
+    contentWPt: number,
+  ) => readonly RetainedTableAcquisition[];
   readonly ordinaryAcquisitionInputForAdjacentGroup: (
     group: ReturnType<typeof combineAdjacentTableLayoutInputs>,
   ) => TableLayoutInput;
@@ -317,13 +322,11 @@ function measureAdjacentTableGroup(
   if (request.cursor && request.cursor.kind !== 'adjacent-table-group') {
     throw new Error('Adjacent table group acquisition received an ordinary table cursor');
   }
-  const records = request.input.tables.map((tableInput) => {
+  const records = operations.computeAdjacentTablePtLayouts(state, request.input.tables.map((tableInput) => {
     const table = operations.sourceElement(dependencies.source, tableInput.source);
     if (table.type !== 'table') throw new Error('Table source kind mismatch');
-    const sourceIndex = tableInput.source.path[0]!;
-    operations.computeTablePtLayout(state, table, request.availableInlineExtentPt, sourceIndex);
-    return retainedTableRecord(state, sourceIndex).acquisition;
-  });
+    return { table, sourceIndex: tableInput.source.path[0]! };
+  }), request.availableInlineExtentPt);
   const combinedInput = operations.ordinaryAcquisitionInputForAdjacentGroup(
     combineAdjacentTableLayoutInputs(
       request.input.logicalSequenceId,
