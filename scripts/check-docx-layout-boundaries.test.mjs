@@ -160,6 +160,7 @@ function production(state, table, para, group) {
       + '  numberingMarkerShapeInput(): unknown;\n'
       + '  paragraphMarkShapeInput(): unknown;\n'
       + '  tableFormatInput(): unknown;\n'
+      + '  tableSourceAcquisitionInput(): unknown;\n'
       + '  tableColumnLayoutInput(): unknown;\n'
       + '  effectiveTablePreferredWidthPt(): unknown;\n'
       + '  tableParticipatesInOrdinaryFlow(): unknown;\n'

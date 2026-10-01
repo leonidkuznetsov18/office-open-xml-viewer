@@ -100,6 +100,21 @@ describe('Word table origin and occupied grid', () => {
     const modern = layoutTable(table(rows, options), 15);
     expect(modern.rows.map((r) => r.cells[0]?.flowBounds.xPt)).toEqual(jc === 'center' ? [162, 162] : [252, 252]);
   });
+  it.each([11, 12, 14, 15])('mode %s ignores nonleading indentation in AutoFit width acquisition', (mode) => {
+    // WORD_TABLE_ORIGIN_COMPATIBILITY: the mode-11/12/14/15 center/end
+    // controls vary omitted/zero/positive/negative indentation with explicit
+    // margins (pages 2/3 and RTL pages 5/6: zero, +36pt, −36pt controls).
+    // ECMA-376 §17.4.50 ignores it for every nonleading row.
+    // A preferred width beyond the band exposes the width-ceiling leak.
+    for (const jc of ['center', 'right']) {
+      for (const indentTwips of [null, 0, 720, -720]) {
+        const xml = table(`<w:tr>${cell(4680)}${cell(4680)}</w:tr>`, `<w:tblW w:type="dxa" w:w="10800"/><w:jc w:val="${jc}"/>${indentTwips === null ? '' : `<w:tblInd w:type="dxa" w:w="${indentTwips}"/>`}`)
+          .replace('w:tblLayout w:type="fixed"', 'w:tblLayout w:type="autofit"')
+          .replace('<w:gridCol w:w="2160"/><w:gridCol w:w="3600"/>', '<w:gridCol w:w="4680"/><w:gridCol w:w="4680"/>');
+        expect(layoutTable(xml, mode).columnWidthsPt).toEqual([234, 234]);
+      }
+    }
+  });
   it('first-row exceptions anchor every leading row with the first cell override', () => {
     const rows = `<w:tr><w:tblPrEx><w:tblInd w:type="dxa" w:w="720"/>${margins(240)}</w:tblPrEx>${cell(2160, 540)}${cell(3600)}</w:tr>${row}`;
     expect(layoutTable(table(rows, indent)).rows.map((r) => r.cells[0]?.flowBounds.xPt)).toEqual([81, 81]);
@@ -175,7 +190,11 @@ describe('Word table origin and occupied grid', () => {
       // Occupancy on either side of an authored seam must preserve track zero;
       // all-skipped members must still normalize. Different first-cell margins
       // also exercise the logical first-row leading anchor.
-      for (const rows of [[full, skipped], [skipped, full], [skipped, skipped], [override, full], [exception, full], [unpreferred, skipped]]) {
+      for (const rows of [[full, skipped], [skipped, full], [skipped, skipped], [override, full], [exception, full], [unpreferred, skipped],
+        [skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="dxa" w:w="6480"/></w:tblPrEx>'), skipped],
+        [skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="auto" w:w="0"/></w:tblPrEx>'), skipped],
+        [skipped, skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="dxa" w:w="6480"/></w:tblPrEx>')],
+      ]) {
         const single = layoutTable(gridTable(rows.join(''), preferred), mode);
         const split = layoutTable(rows.map((r) => gridTable(r, preferred)).join(''), mode);
         expect(geometry(split)).toEqual(geometry(single));
@@ -187,6 +206,15 @@ describe('Word table origin and occupied grid', () => {
             .toEqual(geometry(layoutTable(keepNext + gridTable(rows.join(''), preferred), mode)));
         }
       }
+    }
+    for (const layout of ['fixed', 'autofit']) {
+      const first = skipped.replace('<w:tr>', `<w:tr><w:tblPrEx><w:tblLayout w:type="${layout}"/></w:tblPrEx>`);
+      const authored = (rows: string) => gridTable(rows, false)
+        .replace('w:tblLayout w:type="fixed"', 'w:tblLayout w:type="autofit"');
+      expect(geometry(layoutTable(authored(first) + authored(skipped), mode)))
+        .toEqual(geometry(layoutTable(authored(first + skipped), mode)));
+      expect(geometry(layoutTable(authored(skipped) + authored(first), mode)))
+        .toEqual(geometry(layoutTable(authored(skipped + first), mode)));
     }
   });
 });

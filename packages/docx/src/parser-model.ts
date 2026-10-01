@@ -1961,6 +1961,7 @@ export const bodyAcquisitionInputProjections = Object.freeze({
   numberingMarkerShapeInput,
   paragraphMarkShapeInput,
   tableFormatInput,
+  tableSourceAcquisitionInput,
   effectiveTablePreferredWidthPt,
   tableColumnLayoutInput,
   tableParticipatesInOrdinaryFlow,

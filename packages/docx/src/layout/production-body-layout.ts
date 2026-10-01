@@ -59,8 +59,9 @@ import { gridForParagraphContext, paragraphMeasurementEnvironment } from './meas
 import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
 import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numbering-marker.js';
+import { projectTableColumnLayoutInput, projectEffectiveTablePreferredWidthPt, type TableSourceAcquisitionInput } from './table-source-acquisition.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
-import { wordFixedOccupiedGridInput, wordFixedOccupiedLogicalGridInputs } from './table-compatibility.js';
+import { wordFixedOccupiedGridInput, wordMeasuredTableOriginMode, wordTableWidthIndentPt } from './table-compatibility.js';
 import { measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
@@ -2269,30 +2270,41 @@ function computeAdjacentTablePtLayouts(
     return prior.map((record) => record!.acquisition);
   }
   const mode = state.layoutSettings.compat.compatibilityMode;
-  const acquired = members.map(({ table }) => acquireTableColumnInput(table, contentWPt, state));
   const first = members[0]!.table;
   const commonFrame = members.every(({ table }) => table.bidiVisual === first.bidiVisual
     && table.jc === first.jc && table.tblInd === first.tblInd);
-  const columns = wordFixedOccupiedLogicalGridInputs(
-    acquired.map((item) => item.input), mode,
-    commonFrame && acquired.every((item) => item.measuredScope),
-  );
-  const origins = members.map(({ table }) => tableOriginContext(
-    table, state.acquisitionInputs.tableFormatInput(table), mode,
-  ));
-  const logicalOrigin = {
-    ...origins[0]!,
-    measuredOrigin: origins.every((origin) => origin.measuredOrigin),
+  const commonGrid = members.every(({ table }) => table.colWidths.length === first.colWidths.length
+    && table.colWidths.every((width, i) => width === first.colWidths[i]));
+  // §17.4.37: decide the PR's table-wide properties only after concatenating
+  // logical rows. Keep each row's resolved margins/lexical constraints, but
+  // tblPrEx width/layout and the leading anchor belong to the first logical row.
+  // Differing authored frames/grids retain the established union policy.
+  const sources = members.map(({ table }) => state.acquisitionInputs.tableSourceAcquisitionInput(table));
+  const logicalTable = { ...first, rows: members.flatMap(({ table }) => table.rows) };
+  const logicalSource: TableSourceAcquisitionInput = {
+    semantic: { ...sources[0]!.semantic, rows: sources.flatMap((source) => source.semantic.rows) },
+    lexical: { ...sources[0]!.lexical, rows: sources.flatMap((source) => source.lexical.rows) },
+    format: { ...sources[0]!.format, rows: sources.flatMap((source) => source.format.rows) },
   };
+  const logicalOrigin = tableOriginContext(logicalTable, logicalSource.format, mode);
+  const logical = commonFrame && commonGrid && wordMeasuredTableOriginMode(mode)
+    && (logicalOrigin.measuredOrigin || logicalSource.format.firstRowException?.layout === 'fixed'
+      || logicalTable.layout === 'fixed')
+    ? acquireTableColumnInput(logicalTable, contentWPt, state, logicalSource) : null;
+  const normalized = logical ? wordFixedOccupiedGridInput(logical.input, mode, logical.measuredScope) : null;
+  const usesLogicalProperties = logical !== null
+    && (logicalOrigin.measuredOrigin || normalized !== logical.input);
+  const logicalColumns = usesLogicalProperties ? resolveTableColumnWidths(normalized!) : null;
   return members.map(({ table, sourceIndex }, i) => {
     // Only eligible logical groups share the observed leading anchor. Outside
     // that scope, preserve each member's established first-row indentation.
+    const memberOrigin = tableOriginContext(table, sources[i]!.format, mode);
     const origin = commonFrame && logicalOrigin.measuredOrigin ? logicalOrigin : {
-      ...origins[i]!,
-      measuredOrigin: commonFrame ? false : origins[i]!.measuredOrigin,
+      ...memberOrigin,
+      measuredOrigin: commonFrame ? false : memberOrigin.measuredOrigin,
     };
     computeTablePtLayout(state, table, contentWPt, sourceIndex, {
-      columns: resolveTableColumnWidths(columns[i]!),
+      columns: logicalColumns ?? resolveTableColumnWidths(acquireTableColumnInput(table, contentWPt, state).input),
       origin,
     });
     return retainedTableRecord(state, sourceIndex).acquisition;
@@ -2321,14 +2333,21 @@ function acquireTableColumnInput(
   table: TableLayoutSource,
   contentWPt: number,
   state: BodyMeasurementContext,
+  logicalSource?: TableSourceAcquisitionInput,
 ): Readonly<{ input: TableColumnLayoutInput; measuredScope: boolean }> {
-  const format = state.acquisitionInputs.tableFormatInput(table);
-  const baseIndentPt = Number.isFinite(table.tblInd) ? (table.tblInd ?? 0) : 0;
+  const format = logicalSource?.format ?? state.acquisitionInputs.tableFormatInput(table);
+  const origin = tableOriginContext(table, format, state.layoutSettings.compat.compatibilityMode);
+  const measuredOrigin = origin.measuredOrigin && state.storyContext?.story === 'body'
+    && state.storyContext.containers.length === 0;
+  const baseIndentPt = measuredOrigin ? origin.tableIndentPt
+    : Number.isFinite(table.tblInd) ? (table.tblInd ?? 0) : 0;
+  const widthIndent = (justification: string | null | undefined, indentPt: number) =>
+    wordTableWidthIndentPt({ measured: measuredOrigin, justification, indentPt });
   const rowIndentPts = format.rows.map((row) => {
     const exception = row.exception;
-    return exception?.indentAuthored
+    return widthIndent(row.justification ?? table.jc, !measuredOrigin && exception?.indentAuthored
       ? (exception.indentPt ?? 0)
-      : baseIndentPt;
+      : baseIndentPt);
   });
   // §17.18.87 lets AutoFit override its preferred width up to the page width.
   // For a table with a preferred tblW, keep the ordinary text-band ceiling
@@ -2349,9 +2368,9 @@ function acquireTableColumnInput(
   const isLeadingMarginPageStoryTable = format.ordinaryFlow
     && isTopLevelPageOwnedStory
     && !isVerticalTextDirection(state.sectionLayout.textDirection)
-    && [baseIndentPt, ...rowIndentPts].some((indentPt) => indentPt < 0);
+    && [widthIndent(table.jc, baseIndentPt), ...rowIndentPts].some((indentPt) => indentPt < 0);
   const rowPlacements = format.rows.length === 0
-    ? [{ justification: table.jc, indentPt: baseIndentPt }]
+    ? [{ justification: table.jc, indentPt: widthIndent(table.jc, baseIndentPt) }]
     : format.rows.map((row, rowIndex) => ({
         justification: row.justification ?? table.jc,
         indentPt: rowIndentPts[rowIndex] ?? baseIndentPt,
@@ -2392,9 +2411,9 @@ function acquireTableColumnInput(
   // grid/indent combinations or absolute origin policy (see the rule's limits).
   // WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE makes first-row tblPrEx/tblW authoritative for
   // the whole table. Use the solver's resolver, including auto clearing dxa.
-  const hasPreferredTableWidth = state.acquisitionInputs.effectiveTablePreferredWidthPt(
-    table, contentWPt,
-  ) !== null;
+  const hasPreferredTableWidth = (logicalSource
+    ? projectEffectiveTablePreferredWidthPt(logicalSource, contentWPt)
+    : state.acquisitionInputs.effectiveTablePreferredWidthPt(table, contentWPt)) !== null;
   const savedGridWidthPt = table.colWidths.reduce(
     (sum, width) => sum + (Number.isFinite(width) ? Math.max(0, width) : 0), 0,
   );
@@ -2476,7 +2495,7 @@ function acquireTableColumnInput(
 
   const intrinsicWidthsForTable = (
     owner: TableLayoutSource,
-    ownerFormat = state.acquisitionInputs.tableFormatInput(owner),
+    ownerFormat = owner === table ? format : state.acquisitionInputs.tableFormatInput(owner),
   ): ((cell: DeepReadonly<DocTableCell>, preferredWidth: TablePreferredWidthConstraint | null) => ReturnType<typeof measureTableCellIntrinsicWidths>) => {
     const ownerLayout = ownerFormat.firstRowException?.layout === 'fixed'
       || owner.layout === 'fixed' ? 'fixed' : 'autofit';
@@ -2567,21 +2586,16 @@ function acquireTableColumnInput(
       preferredWidth,
     );
   };
-  const columnInput = state.acquisitionInputs.tableColumnLayoutInput(
-    table,
-    contentWPt,
-    intrinsicWidthsForTable(table, format),
-    isFixedNestedTable
-      // ECMA-376 §17.18.87 resolves a fixed table from its authored tblGrid,
-      // tblW, and tcW constraints. A containing cell is not an implicit tblW:
-      // Word permits such a table to overflow its cell instead of scaling it.
-      // `null` explicitly removes the unrelated physical cell ceiling; it is
-      // not a numeric width and therefore cannot alter authored geometry.
-      ? null
-      : state.acquisitionInputs.tableParticipatesInOrdinaryFlow(table)
-      ? maximumTableWidthPt
-      : Math.max(contentWPt, state.pageWidth),
-  );
+  const maximumWidthPt = isFixedNestedTable
+    // ECMA-376 §17.18.87: the containing cell is not an implicit tblW.
+    ? null
+    : format.ordinaryFlow ? maximumTableWidthPt : Math.max(contentWPt, state.pageWidth);
+  const intrinsicWidths = intrinsicWidthsForTable(table, format);
+  const columnInput = logicalSource
+    ? projectTableColumnLayoutInput(logicalSource, contentWPt,
+        (rowIndex, cellIndex, preferred) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferred),
+        maximumWidthPt)
+    : state.acquisitionInputs.tableColumnLayoutInput(table, contentWPt, intrinsicWidths, maximumWidthPt);
   return {
     input: {
       ...columnInput,

@@ -535,6 +535,19 @@ export function wordDropsTrailingStructuralCellMarker(input: Readonly<{
     && input.lastParagraphRunCount === 0;
 }
 
+/** ECMA-376 §17.4.50 and WORD_TABLE_ORIGIN_COMPATIBILITY: measured
+ * center/end controls ignore tblInd for both placement and width fitting.
+ * Margin hanging is a separate placement correction, never a width indent.
+ * Unmeasured classes retain the established width/placement contract. */
+export function wordTableWidthIndentPt(input: Readonly<{
+  measured: boolean;
+  justification: string | null | undefined;
+  indentPt: number;
+}>): number {
+  return input.measured && (input.justification === 'center'
+    || input.justification === 'right' || input.justification === 'end') ? 0 : input.indentPt;
+}
+
 /** WORD_TABLE_ORIGIN_COMPATIBILITY. An unresolved/unmeasured class retains
  * its established translation rather than inventing a margin default. */
 export function wordTableOriginTranslationPt(input: Readonly<{
@@ -546,12 +559,13 @@ export function wordTableOriginTranslationPt(input: Readonly<{
   firstLeftMarginPt: number;
   rowLeftMarginPt: number;
 }>): number {
-  if (!input.measured) return input.indentPt;
-  if (input.justification === 'center') return 0;
+  const indentPt = wordTableWidthIndentPt(input);
+  if (!input.measured) return indentPt;
+  if (input.justification === 'center') return indentPt;
   if (input.justification === 'right' || input.justification === 'end') {
-    return input.mode === 15 ? 0 : input.rowLeftMarginPt;
+    return indentPt + (input.mode === 15 ? 0 : input.rowLeftMarginPt);
   }
-  return input.indentPt
+  return indentPt
     - (input.mode !== 15 && input.indentAuthored ? input.firstLeftMarginPt : 0);
 }
 
@@ -578,33 +592,4 @@ export function wordFixedOccupiedGridInput(
     gridWidthKeys: input.gridWidthKeys?.map((key, i) => i === 0 ? null : key),
     rows: input.rows.map((row) => ({ ...row, before: null })),
   };
-}
-
-/** Normalize the combined §17.4.37 row constraints before solving any member.
- * The unused-track observation requires one common authored grid and direction;
- * independently authored grid topologies remain on the existing union policy.
- * Occupancy and unsupported rows in any member veto elimination for the group. */
-export function wordFixedOccupiedLogicalGridInputs(
-  inputs: readonly TableColumnLayoutInput[],
-  mode: number | undefined,
-  measuredScope: boolean,
-): readonly TableColumnLayoutInput[] {
-  const first = inputs[0];
-  if (!first || !measuredScope || inputs.some((input) => input.layout !== 'fixed'
-    || input.gridWidthsPt.length !== first.gridWidthsPt.length
-    || input.gridWidthsPt.some((width, i) => width !== first.gridWidthsPt[i]))) return inputs;
-  const logical = { ...first, rows: inputs.flatMap((input) => input.rows) };
-  const normalized = wordFixedOccupiedGridInput(logical, mode, true);
-  if (normalized === logical) return inputs;
-  let rowOffset = 0;
-  return inputs.map((input) => {
-    const rows = normalized.rows.slice(rowOffset, rowOffset + input.rows.length);
-    rowOffset += input.rows.length;
-    return {
-      ...input,
-      gridWidthsPt: normalized.gridWidthsPt,
-      gridWidthKeys: input.gridWidthKeys?.map((key, i) => i === 0 ? null : key),
-      rows,
-    };
-  });
 }
