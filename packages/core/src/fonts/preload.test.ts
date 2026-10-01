@@ -20,6 +20,7 @@ afterEach(() => {
   _resetCssCacheForTests();
   _resetFontRegistryForTests(); // the FontFace refcount registry is module-global
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const CSS = `
@@ -82,7 +83,11 @@ interface FakeFace {
   load: () => Promise<FakeFace>;
 }
 
-function installFakes(opts: { failLoad?: boolean; quoteFamily?: boolean } = {}) {
+function installFakes(opts: {
+  failLoad?: boolean;
+  quoteFamily?: boolean;
+  load?: (face: FakeFace) => Promise<FakeFace>;
+} = {}) {
   const added: FakeFace[] = [];
   class FakeFontFace implements FakeFace {
     family: string; source: string; loadCalls = 0;
@@ -95,7 +100,7 @@ function installFakes(opts: { failLoad?: boolean; quoteFamily?: boolean } = {}) 
     }
     load(): Promise<FakeFace> {
       this.loadCalls++;
-      return opts.failLoad ? Promise.reject(new Error('net')) : Promise.resolve(this);
+      return opts.failLoad ? Promise.reject(new Error('net')) : (opts.load?.(this) ?? Promise.resolve(this));
     }
   }
   const set = {
@@ -115,6 +120,95 @@ const MAP: Record<string, FontPreloadEntry> = {
 };
 
 describe('preloadGoogleFonts', () => {
+  it.each(['main', 'worker'])('awaits a shared pending face alongside a new face (%s)', async (mode) => {
+    vi.useFakeTimers();
+    let finishShared!: () => void;
+    const sharedGate = new Promise<void>((resolve) => { finishShared = resolve; });
+    const { set, added } = installFakes({
+      load: (face) => face.family === 'Shared' ? sharedGate.then(() => face) : Promise.resolve(face),
+    });
+    set.ready = new Promise<void>(() => {});
+    if (mode === 'main') {
+      G.document = { fonts: set };
+      delete G.self;
+    } else {
+      delete G.document;
+      G.self = { fonts: set };
+    }
+    const map = {
+      shared: { url: 'https://fonts.example/shared.css' },
+      fresh: { url: 'https://fonts.example/fresh.css' },
+    };
+    G.fetch = vi.fn(async (url: string) => ({
+      ok: true,
+      text: async () => `@font-face { font-family: '${url === map.shared.url ? 'Shared' : 'Fresh'}'; src: url(font.woff2); }`,
+    }));
+
+    const a = preloadGoogleFonts(['Shared'], map);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(added.map((face) => face.family)).toEqual(['Shared']);
+    let bHeld: FontFace[] | undefined;
+    const b = preloadGoogleFonts(['Shared', 'Fresh'], map).then((faces) => { bHeld = faces; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(added.map((face) => face.family)).toEqual(['Shared', 'Fresh']);
+    // Fresh has finished; B must still await the shared face without relying on ready.
+    expect(bHeld).toBeUndefined();
+
+    finishShared();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bHeld).toEqual(added);
+    const aHeld = await a;
+    await b;
+    expect(bHeld?.[0]).toBe(aHeld[0]);
+  });
+
+  it.each(['main', 'worker'])('reports a failed reused face to its later holder (%s)', async (mode) => {
+    const { set } = installFakes({ failLoad: true });
+    if (mode === 'main') {
+      G.document = { fonts: set };
+      delete G.self;
+    } else {
+      delete G.document;
+      G.self = { fonts: set };
+    }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const aHeld = await preloadGoogleFonts(['Calibri'], MAP);
+    warn.mockClear();
+
+    const bHeld = await preloadGoogleFonts(['Calibri'], MAP);
+
+    expect(bHeld[0]).toBe(aHeld[0]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('carlito');
+  });
+
+  it.each(['main', 'worker'])('finishes individual loads without waiting on global ready (%s)', async (mode) => {
+    vi.useFakeTimers();
+    let finishLoads!: () => void;
+    const loadGate = new Promise<void>((resolve) => { finishLoads = resolve; });
+    const { set, added } = installFakes({ load: (face) => loadGate.then(() => face) });
+    set.ready = new Promise<void>(() => {});
+    if (mode === 'main') {
+      G.document = { fonts: set };
+      delete G.self;
+    } else {
+      delete G.document;
+      G.self = { fonts: set };
+    }
+    let loaded: FontFace[] | undefined;
+    const loading = preloadGoogleFonts(['Calibri'], MAP).then((faces) => { loaded = faces; });
+
+    // Neither the unresolved set.ready nor the safety ceiling decides readiness.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loaded).toBeUndefined();
+    finishLoads();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loaded).toHaveLength(2);
+    expect(loaded).toEqual(added);
+    expect(added.every((face) => face.loadCalls === 1)).toBe(true);
+    await loading;
+  });
+
   it('preserves a caller-supplied non-Google stylesheet map', async () => {
     const { set } = installFakes();
     G.document = { fonts: set };
@@ -332,7 +426,7 @@ describe('preloadGoogleFonts', () => {
     expect(bDone).toBe(true);
     // Faces are registered exactly once (the joined call reuses them via the
     // shared refcount registry, not re-adding) and the url is fetched once. The
-    // first holder force-loads each face; the second reuses it (already loaded).
+    // first holder starts each load; the second joins it via idempotent load().
     expect(added.map((f) => f.family)).toEqual(['Carlito', 'Carlito']);
     expect((G.fetch as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
     expect(added.every((f) => f.loadCalls >= 1)).toBe(true);
@@ -361,8 +455,6 @@ describe('preloadGoogleFonts — dedup + unloadGoogleFonts (SPA leak)', () => {
     expect(b).toHaveLength(2);
     expect(a[0]).toBe(b[0]);
     expect(a[1]).toBe(b[1]);
-    // Each shared face is force-loaded exactly once (not per preload).
-    expect(added.every((f) => f.loadCalls === 1)).toBe(true);
     // And the stylesheet was fetched once.
     expect((G.fetch as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
   });
