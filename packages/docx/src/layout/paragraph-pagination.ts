@@ -171,10 +171,9 @@ export function selectParagraphFragment(
       requiresFreshFlowRegion: true, additionalReservePt: 0, admittedBlockExtentPt: 0,
     };
   }
-  // Float-gap fragments are one physical line for page ownership and widow
-  // counting. Never split a baseline between two pages/columns.
-  const allGroupEnds = acquired.lines.flatMap((line, index) =>
-    acquired.lines[index + 1]?.bounds.yPt === line.bounds.yPt ? [] : [index + 1]);
+  // Acquisition retains one entry per physical line; the same index owns
+  // its full source boundary, including all horizontal gap placements.
+  const allGroupEnds = acquired.lines.map((_, index) => index + 1);
   const groupEnds = allGroupEnds.filter(end => end <= (lineEndLimit ?? total));
   if (groupEnds.length === 0) return {
     fragment: null, nextCursor: cursor, requiresFreshFlowRegion: true,

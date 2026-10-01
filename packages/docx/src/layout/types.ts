@@ -533,7 +533,12 @@ export type ParagraphPlacement =
   | ResourcePlacement
   | DrawingPlacement;
 
+/** One physical line for spacing, pagination, counters and source ownership.
+ * Overlays/hit testing use placements, never the bounding rectangle spanning
+ * the excluded area between disjoint gaps. */
 export interface LineLayout {
+  /** Disjoint float gaps retained only as horizontal shading allocations. */
+  readonly wrapFragments?: readonly LayoutRect[];
   /** Occupied float gap, independent of alignment/text ink. Paint uses this
    * retained allocation for paragraph shading without filling the obstacle. */
   readonly wrapBounds?: LayoutRect;

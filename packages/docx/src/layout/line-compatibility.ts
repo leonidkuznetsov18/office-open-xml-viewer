@@ -913,5 +913,9 @@ export const WORD_LATIN_DESIGN_GRID_CELLS = defineCompatibilityRule({
 });
 
 export function wordLatinDesignGridSingleHeight(natural: number, pitch: number, admittedDesign: number): number {
-  return admittedDesign > 0 ? Math.max(1, Math.ceil(admittedDesign / pitch)) * pitch : Math.max(natural, pitch);
+  // The admitted face controls only its own whole-cell reserve. Other fonts,
+  // inline objects and baseline displacements still own their natural extent
+  // (§17.3.1.33); admission of one run must not shrink any peer's line box.
+  return Math.max(natural, admittedDesign > 0
+    ? Math.max(1, Math.ceil(admittedDesign / pitch)) * pitch : pitch);
 }

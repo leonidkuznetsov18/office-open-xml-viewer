@@ -1079,6 +1079,35 @@ export function planLine(input: PlanLineInput): LineLayout {
   });
 }
 
+/** Gap placement is complete before retention. All downstream consumers see
+ * one physical line (§17.3.1.33 spacing, §17.6.8 numbering, §17.3.1.44 widows).
+ * Retain disjoint allocations solely for horizontal shading; source ranges,
+ * placements and vertical allocation belong to their common physical line.
+ * The union visits each fragment/placement once, with no measurement. */
+function retainPhysicalLines(fragments: readonly LineLayout[], physicalIds: readonly number[]): LineLayout[] {
+  const lines: LineLayout[] = [];
+  for (let start = 0; start < fragments.length;) {
+    const first = fragments[start]!;
+    let end = start + 1;
+    while (end < fragments.length && physicalIds[end] === physicalIds[start]) end += 1;
+    if (end === start + 1) lines.push(first);
+    else {
+      const group = fragments.slice(start, end);
+      const { wrapBounds: _wrapBounds, ...physical } = first;
+      lines.push({
+        ...physical,
+        range: { start: first.range.start, end: group.at(-1)!.range.end },
+        bounds: unionLayoutRects(group.map(fragment => fragment.bounds))!,
+        placements: group.flatMap(fragment => fragment.placements),
+        wrapFragments: group.flatMap(fragment => fragment.wrapFragments
+          ?? [fragment.wrapBounds ?? fragment.bounds]),
+      });
+    }
+    start = end;
+  }
+  return lines;
+}
+
 function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
   const continuation = input.continuation;
   const start = continuation?.lineStart ?? 0;
@@ -1100,7 +1129,6 @@ function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
       advancePt += Math.max(0,
         line.bounds.yPt - ((previous?.bounds.yPt ?? line.bounds.yPt) + (previous?.advancePt ?? 0)));
     }
-    if (index + 1 < end && input.lines[index + 1]?.bounds.yPt === line.bounds.yPt) continue;
     advancePt += finiteNonNegative(line.advancePt, 'line.advancePt');
   }
   if (input.lines.length === 0 && input.paragraphMark) {
@@ -2259,7 +2287,7 @@ function planMeasuredLines(
     && /^[+\-(]?[\d., ]+\)?%?$/u.test(visibleText)
       ? earliestTab.pos - context.physicalIndentLeftPt
       : undefined;
-  return measured.lines.map((measuredLine, lineIndex) => {
+  return retainPhysicalLines(measured.lines.map((measuredLine, lineIndex) => {
     const raw = measuredLine.layout;
     const baselinePt = plannedBaselinePt(measuredLine, context);
     let lineStartOffset = Number.POSITIVE_INFINITY;
@@ -2434,7 +2462,8 @@ function planMeasuredLines(
       paragraphXPt, availableWidthPt, alignment: paragraph.alignment,
       baseRtl: context.baseRtl,
       isFirstLine: lineIndex === 0,
-      isLastLine: lineIndex === measured.lines.length - 1,
+      isLastLine: (raw.physicalLineIndex ?? lineIndex)
+        === (measured.lines.at(-1)!.layout.physicalLineIndex ?? measured.lines.length - 1),
       stretchLastLine: context.stretchLastLine,
       exactLineSpacing: context.lineSpacing?.rule === 'exact',
       firstLineIndentPt: context.firstIndentPt,
@@ -2467,7 +2496,7 @@ function planMeasuredLines(
           heightPt: measuredLine.advancePt,
         } }
       : planned;
-  });
+  }), measured.lines.map((line, index) => line.layout.physicalLineIndex ?? index));
 }
 
 /** Retain §17.18.84 bar-tab rules for every laid-out line. A bar is measured

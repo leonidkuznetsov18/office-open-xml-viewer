@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { layoutLines, type LayoutTextSeg, type WrapLayoutCtx } from '../line-layout.js';
+import { layoutLines, lineBoxHeight, type LayoutTextSeg, type WrapLayoutCtx } from '../line-layout.js';
+import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
+import { runLineBreakerPass } from '../line-breaker/pass-driver.js';
+import { convergeLineWrap } from './line-wrap-convergence.js';
 import type { FloatRect } from './float-wrap.js';
 
 function context(): CanvasRenderingContext2D {
@@ -66,5 +69,58 @@ describe('Word measured gap continuation (#1670)', () => {
     const lines = layoutLines(context(), [token('AAAA'), { lineBreak: true, fontSize: 10, measuredWidth: 0 }, token('BBBB')],
       200, 0, 1, [], wrap([obstacle(40, 160, 'square')]));
     expect(lines.map(l => [l.topY, l.xOffset])).toEqual([[0, 0], [10, 0]]);
+  });
+});
+
+
+describe('physical line allocation regressions', () => {
+  it.each([20, 80])('probes all %i float gaps in the same pass', (count) => {
+    const width = count * 40 + 20;
+    const w = { ...wrap(Array.from({ length: count }, (_, i) => obstacle(i * 40 + 20, i * 40 + 40, 'square'))), columnWidthPt: width };
+    let passes = 0;
+    const lines = convergeLineWrap(probeHeights => {
+      passes += 1;
+      return runLineBreakerPass({ ctx: context(), segs: Array.from({ length: count + 1 }, () => token('AAA ')),
+        maxWidth: width, firstIndent: 0, scale: 1, tabStops: [], wrapCtx: w,
+        fontFamilyClasses: {}, tabOriginPx: 0, kinsoku: DEFAULT_KINSOKU_RULES,
+        defaultTabPt: 36, marginRightPx: width, baseRtl: false, isJustified: false,
+        stretchLastLine: false, widthPolicy: 'bounded', overflowPunct: true,
+        passContext: { probeHeights },
+      });
+    }, () => 10);
+    expect(passes).toBe(3);
+    expect(lines.map(line => [line.topY, line.xOffset])).toEqual(Array.from({ length: count + 1 }, (_, i) => [0, i * 40]));
+  });
+
+  it.each([false, true])('applies picture auto leading with later-gap picture=%s', (laterGap) => {
+    const w = wrap([obstacle(40, 160, 'square')]);
+    w.lineBoxH = (a, d, r, i, e, g, u, p, l) => lineBoxHeight(
+      { rule: 'auto', value: 1.5, explicit: true }, a, d, 1, undefined, r, i, e, g, undefined, u, p, l);
+    const picture = { imagePath: 'picture', mimeType: 'image/png', anchor: false, anchorXPt: 0,
+      anchorYPt: 0, anchorXFromMargin: false, anchorYFromPara: false, inlinePicture: true as const,
+      widthPt: 30, heightPt: 25, paragraphMarkSinglePx: 12, measuredWidth: 0 };
+    const lines = layoutLines(context(), [
+      ...(laterGap ? [token('BBBB '), picture] : [picture, token('BBBB ')]), token('CCCC'),
+    ], 200, 0, 1, [], w);
+    expect(lines.map(line => line.topY)).toEqual([0, 0, 33]);
+    expect(lines.slice(0, 2).map(line => line.inlinePictureTextSingle)).toEqual([12, 12]);
+  });
+
+  it.each(['font', 'picture'])('keeps taller %s content beside admitted Latin grid text', (kind) => {
+    const ctx = context();
+    ctx.measureText = (text: string) => ({ width: text.length * 5,
+      fontBoundingBoxAscent: text.startsWith('TALL') ? 32 : 8,
+      fontBoundingBoxDescent: text.startsWith('TALL') ? 8 : 2 }) as TextMetrics;
+    const w = { ...wrap([]), hasExclusions: false };
+    w.lineBoxH = (a, d, r, i, e, g, u, p, l) => lineBoxHeight(null, a, d, 1,
+      { type: 'lines', linePitchPt: 20 }, r, i, e, g, undefined, u, p, l);
+    const lines = layoutLines(ctx, [
+      { ...token('small '), resolvedLatinGridCellAllocation: true, resolvedLineHeightRatio: 1.15 },
+      ...(kind === 'font' ? [{ ...token('TALL '), fontSize: 40 }] : [
+        { imagePath: 'picture', mimeType: 'image/png', anchor: false, anchorXPt: 0, anchorYPt: 0, anchorXFromMargin: false, anchorYFromPara: false, inlinePicture: true as const, widthPt: 20, heightPt: 100, paragraphMarkSinglePx: 12, measuredWidth: 0 },
+      ]),
+      { lineBreak: true, fontSize: 10, measuredWidth: 0 }, token('NEXT'),
+    ], 200, 0, 1, [], w);
+    expect(lines[1].topY).toBeGreaterThanOrEqual(kind === 'font' ? 40 : 100);
   });
 });

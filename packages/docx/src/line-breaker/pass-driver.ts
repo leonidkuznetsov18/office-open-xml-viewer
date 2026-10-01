@@ -6,6 +6,7 @@ import type {
   MeasurementTextContext,
   VerticalGlyphMeasurementService,
 } from '../layout/measurement-capabilities.js';
+import { wordUniformRunPositionPaintPt } from '../layout/line-compatibility.js';
 import { calcEffectiveFontPx } from '../layout/text.js';
 import {
   type DocGridCtx,
@@ -405,27 +406,32 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   for (let start = 0; start < breakerState.lines.length;) {
     let end = start + 1;
     const first = breakerState.lines[start];
-    while (first.topY !== undefined && end < breakerState.lines.length
-      && breakerState.lines[end].topY === first.topY) end += 1;
-    if (end > start + 1) {
-      const metrics = {
-        ascent: 0, descent: 0, intendedSingle: 0, latinGridCountSingle: 0, gridCountSingle: 0,
-        visibleAscent: 0, visibleDescent: 0, visibleIntendedSingle: 0, hasRuby: false, eastAsian: false,
-      };
-      for (let index = start; index < end; index += 1) {
-        const line = breakerState.lines[index];
-        metrics.ascent = Math.max(metrics.ascent, line.ascent);
-        metrics.descent = Math.max(metrics.descent, line.descent);
-        metrics.intendedSingle = Math.max(metrics.intendedSingle, line.intendedSingle);
-        metrics.latinGridCountSingle = Math.max(metrics.latinGridCountSingle, line.latinGridCountSingle ?? 0);
-        metrics.gridCountSingle = Math.max(metrics.gridCountSingle, line.gridCountSingle ?? 0);
-        metrics.visibleAscent = Math.max(metrics.visibleAscent, line.visibleAscent ?? line.ascent);
-        metrics.visibleDescent = Math.max(metrics.visibleDescent, line.visibleDescent ?? line.descent);
-        metrics.visibleIntendedSingle = Math.max(metrics.visibleIntendedSingle, line.visibleIntendedSingle ?? line.intendedSingle);
-        metrics.hasRuby ||= line.hasRuby ?? false;
-        metrics.eastAsian ||= line.eastAsian ?? false;
+    while (end < breakerState.lines.length
+      && breakerState.lines[end].physicalLineIndex === first.physicalLineIndex) end += 1;
+    const last = breakerState.lines[end - 1];
+    // Metrics accumulate until horizontal continuation ends. Publish the final
+    // physical union, including object leading and position ownership, to all
+    // fragments; each segment is visited once, independent of gap count.
+    const { segments: _segments, xOffset: _x, availWidth: _width,
+      consumedEnd: _end, endsWithBreak: _break, ...metrics } = last;
+    let positionReference: number | undefined;
+    for (let index = start; index < end; index += 1) {
+      for (const segment of breakerState.lines[index].segments) {
+        if ('isTab' in segment) continue;
+        const position = 'text' in segment && segment.positionExtendsLineBox !== false
+          ? segment.position ?? 0 : 0;
+        positionReference = positionReference === undefined ? position
+          : positionReference === position ? positionReference : 0;
       }
-      for (let index = start; index < end; index += 1) Object.assign(breakerState.lines[index], metrics);
+    }
+    for (let index = start; index < end; index += 1) {
+      const line = breakerState.lines[index];
+      Object.assign(line, metrics);
+      line.endsWithBreak = last.endsWithBreak;
+      for (const segment of line.segments) {
+        if ('text' in segment) segment.lineRelativePosition =
+          wordUniformRunPositionPaintPt(segment.position ?? 0, positionReference ?? 0);
+      }
     }
     start = end;
   }

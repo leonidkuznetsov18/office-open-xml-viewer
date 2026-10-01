@@ -418,6 +418,9 @@ export type LayoutSeg = LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutL
 
 
 export interface LayoutLine {
+  /** Pass-local physical identity: gap fragments share it even if vertical
+   * rounding makes distinct physical lines have equal numeric tops. */
+  physicalLineIndex?: number;
   segments: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[];
   height: number;  // pt — max fontSize on line (for empty-line sizing fallback)
   ascent: number;  // px — fontBoundingBoxAscent (font-metric, stable per font+size)

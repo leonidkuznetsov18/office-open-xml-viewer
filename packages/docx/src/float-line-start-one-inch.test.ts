@@ -971,23 +971,16 @@ describe('layoutLines — float admission and probe convergence', () => {
     expect(lines[0].availWidth).toBe(20);
   });
 
-  it('diagnoses an exact non-adjacent line-window cycle without a pass cap', () => {
-    let calls = 0;
-    const cycling: WrapLayoutCtx = {
-      ...wrapCtx([]),
-      lineWindow: (input) => {
-        calls += 1;
-        return {
-          topYPt: input.topYPt,
-          xOffsetPt: 0,
-          maximumWidthPt: calls % 2 === 1 ? 50 : 100,
-        };
-      },
-    };
-
-    expect(() => layoutLines(
-      makeLinearCtx(), [textSeg('AAAAA '), textSeg('BBBBB')], 100, 0, 1, [], cycling, {}, 0,
-    )).toThrow(/measure\/resolve cycle did not converge/i);
+  it('diagnoses a height-dependent float reflow cycle', () => {
+    // A 10pt line misses the exclusion at y=15 and admits the 20pt run;
+    // that taller union intersects it and narrows to 50pt, excluding the run.
+    // The next measured short line reopens the band. This is a deterministic
+    // geometry cycle, independent of how many gap queries a pass performs.
+    const float: FloatRect = { ...leftBand(100, 100), xLeft: 50,
+      imageX: 50, imageW: 50, yTop: 15, imageY: 15, imageH: 85 };
+    const wrapping = { ...wrapCtx([float]), columnXPt: 0, columnWidthPt: 100 };
+    expect(() => layoutLines(makeLinearCtx(), [textSeg('AAAAA '), textSeg('BBB', 20)],
+      100, 0, 1, [], wrapping)).toThrow(/measure\/resolve cycle did not converge/i);
   });
 
   it('uses the first permitted through opening that admits the next atom', () => {

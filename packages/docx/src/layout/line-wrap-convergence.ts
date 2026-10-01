@@ -10,6 +10,7 @@ interface LineWrapStateSegment {
 }
 
 export interface LineWrapStateLine {
+  readonly physicalLineIndex?: number;
   readonly consumedEnd?: unknown;
   readonly topY?: number;
   readonly xOffset?: number;
@@ -38,21 +39,30 @@ export function cloneSegmentsForLinePass<T extends object>(segments: readonly T[
   return segments.map((segment) => ({ ...segment }));
 }
 
+function samePhysicalLine(left: LineWrapStateLine | undefined, right: LineWrapStateLine | undefined): boolean {
+  if (!left || !right) return false;
+  if (left.physicalLineIndex !== undefined || right.physicalLineIndex !== undefined) {
+    return left.physicalLineIndex === right.physicalLineIndex;
+  }
+  return left.topY !== undefined && left.topY === right.topY;
+}
+
 function lineWrapState(
   lines: readonly LineWrapStateLine[],
   probeHeights: readonly number[],
 ): string {
-  return JSON.stringify(lines.map((line, index) => ({
-    end: line.consumedEnd,
-    topY: line.topY,
-    xOffset: line.xOffset,
-    availableWidth: line.availWidth,
-    probeHeight: probeHeights[index],
-    segments: line.segments.map((segment) => ({
-      source: segment.src,
-      ...(segment.text === undefined ? {} : { text: segment.text }),
-    })),
-  })));
+  let physicalIndex = -1;
+  return JSON.stringify(lines.map((line, index) => {
+    if (!samePhysicalLine(lines[index - 1], line)) physicalIndex += 1;
+    return {
+      physicalLineIndex: line.physicalLineIndex,
+      end: line.consumedEnd, topY: line.topY, xOffset: line.xOffset,
+      availableWidth: line.availWidth, probeHeight: probeHeights[physicalIndex],
+      segments: line.segments.map(segment => ({ source: segment.src,
+        ...(segment.text === undefined ? {} : { text: segment.text }),
+      })),
+    };
+  }));
 }
 
 const MAX_LINE_WRAP_PASSES = 16;
@@ -61,7 +71,11 @@ const MAX_LINE_WRAP_PASSES = 16;
  * An adjacent exact-state repeat is the fixed point; a non-adjacent repeat is
  * a real cycle. The pass budget is a fail-closed resource guard for a
  * deterministic orbit whose geometric state cardinality has no useful small
- * bound; exhaustion never accepts stale line geometry.
+ * bound; exhaustion never accepts stale line geometry. Probes are indexed by
+ * physical lines, never gaps. For fixed metrics and one physical line, all G
+ * gaps are discovered in one resolving pass and confirmed in the next (three
+ * passes including initial measurement), irrespective of G. Variable-height
+ * reflow retains the same 16-state fail-closed budget.
  */
 export function convergeLineWrap<TLine extends LineWrapStateLine>(
   measure: (probeHeights: readonly number[] | null) => TLine[],
@@ -76,7 +90,9 @@ export function convergeLineWrap<TLine extends LineWrapStateLine>(
     return convergeExactState<Pass>({
       step: (previous) => {
         const lines = measure(previous?.probeHeights ?? null);
-        const probeHeights = Object.freeze(lines.map(lineBoxHeight));
+        const probeHeights = Object.freeze(lines.flatMap((line, index) =>
+          samePhysicalLine(line, lines[index + 1])
+            ? [] : [lineBoxHeight(line)]));
         return Object.freeze({
           lines,
           probeHeights,

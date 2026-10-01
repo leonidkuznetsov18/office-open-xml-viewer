@@ -17,6 +17,7 @@ import type {
   TableLayoutInput,
   TableRowLayoutInput,
 } from './types.js';
+import { gapParagraph } from '../test-support/gap-paragraph.test-support.js';
 import { layoutParagraph } from './paragraph.js';
 import { validateFloatingTableRegistryDelta } from './floating-table-transaction.js';
 
@@ -233,6 +234,26 @@ function take(
 describe('retained table pagination', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('splits a cell only after every gap of its admitted physical line', () => {
+    const p = gapParagraph().paragraph;
+    const result = take(acquisition([row(0, 30, { paragraph: p })]), 10);
+    const cell = result.fragment?.rows[0]?.cells[0];
+    expect(cell?.contentRanges).toEqual([{ kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 1 }]);
+    const retained = cell?.blocks[0]?.layout;
+    if (retained?.kind !== 'paragraph') throw new Error('missing cell paragraph');
+    expect(retained.lines[0]?.placements).toHaveLength(2);
+    expect(retained.advancePt).toBe(10);
+  });
+
+  it('applies cell widow control to physical lines rather than gap count', () => {
+    const p = gapParagraph().paragraph;
+    const original = row(0, 30, { paragraph: p });
+    const source = acquisition([{ ...original, cells: [{ ...original.cells[0]!,
+      blocks: [{ layout: p, sourceBlockIndex: 0, widowControl: true }],
+    }] }]);
+    expect(take(source, 20, startTableFragmentCursor(), { freshPageHeightPt: 30 }).requiresFreshPage).toBe(true);
   });
 
   it('charges a completed partial row from a bounded row window, not the whole suffix', () => {

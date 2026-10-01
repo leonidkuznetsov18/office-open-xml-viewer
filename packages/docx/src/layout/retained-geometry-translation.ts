@@ -167,6 +167,7 @@ export function translateLine(
     ...line,
     bounds: translateRect(line.bounds, delta),
     ...(line.wrapBounds ? { wrapBounds: translateRect(line.wrapBounds, delta) } : {}),
+    ...(line.wrapFragments ? { wrapFragments: line.wrapFragments.map(bounds => translateRect(bounds, delta)) } : {}),
     baselinePt: line.baselinePt + delta.yPt,
     placements: line.placements.map((placement) => translatePlacement(placement, delta, drawingTranslations)),
     ...(line.barTabRules ? { barTabRules: line.barTabRules.map((rule) => ({

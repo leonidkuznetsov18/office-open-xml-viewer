@@ -1055,10 +1055,12 @@ function measureBodyParagraphEntry(
   const { measured, layout } = acquired;
   const markOnLineGrid =
     measured.markOnly && resolveBodyParagraphLayoutContext(candidate, paragraph).lineGrid.active;
-  const allBoundaries = measured.lines.map((line) => {
+  const allBoundaries = measured.lines.flatMap((line, index) => {
+    if (line.layout.physicalLineIndex !== undefined
+      && measured.lines[index + 1]?.layout.physicalLineIndex === line.layout.physicalLineIndex) return [];
     const boundary = line.layout.consumedEnd;
     if (!boundary) throw new Error('Measured line omitted its source boundary');
-    return boundary;
+    return [boundary];
   });
   const retainedFloats = retainedBodyParagraphFloatEntries(sessionState, layout);
   const floatEntries = Object.freeze([...publicFloats, ...retainedFloats]);

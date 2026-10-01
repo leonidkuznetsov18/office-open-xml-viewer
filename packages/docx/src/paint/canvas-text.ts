@@ -219,11 +219,11 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
   }
   if (node.shading) {
     ctx.fillStyle = node.shading.color;
-    const boxes = node.lines.some(line => line.wrapBounds)
-      ? node.lines.map(line => line.wrapBounds ?? {
+    const boxes = node.lines.some(line => line.wrapBounds || line.wrapFragments)
+      ? node.lines.flatMap(line => line.wrapFragments ?? [line.wrapBounds ?? {
           xPt: node.inkBounds.xPt, yPt: line.bounds.yPt,
           widthPt: node.inkBounds.widthPt, heightPt: line.bounds.heightPt,
-        })
+        }])
       : [node.paragraphMark?.wrapBounds ?? node.inkBounds];
     for (const box of boxes) ctx.fillRect(box.xPt, box.yPt, box.widthPt, box.heightPt);
   }

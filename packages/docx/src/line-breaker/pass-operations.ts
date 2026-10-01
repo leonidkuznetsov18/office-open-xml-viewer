@@ -10,7 +10,6 @@ import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceT
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
-  wordUniformRunPositionPaintPt,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -234,6 +233,28 @@ export function performMinimumLineStartWidth(
   return 0;
 }
 
+/** Vertical allocation belongs to the physical line; only a failed gap
+ * continuation opens a new line. Horizontal queue/fit state resets per gap. */
+function resetPhysicalLineMetrics({ breakerState }: PassOperationState): void {
+  breakerState.lineHeight = 0;
+  breakerState.lineAscent = 0;
+  breakerState.lineDescent = 0;
+  breakerState.lineIntendedSingle = 0;
+  breakerState.lineHasInlinePicture = false;
+  breakerState.linePictureMarkSingle = 0;
+  breakerState.lineGridCountSingle = 0;
+  breakerState.lineLatinGridCountSingle = 0;
+  breakerState.lineVisibleAscent = 0;
+  breakerState.lineVisibleDescent = 0;
+  breakerState.lineVisibleIntendedSingle = 0;
+  breakerState.lineHasVisibleMetrics = false;
+  breakerState.lineHasRuby = false;
+  breakerState.lineEastAsian = false;
+  breakerState.positionReferencePt = undefined;
+  breakerState.firstPositioned = undefined;
+  breakerState.uniformPositionEligible = true;
+}
+
 export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
   const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
     operationState;
@@ -241,12 +262,21 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
   breakerState.lineMaxWidth = maxWidth;
-  if (!wrapCtx) return;
-  const probeH = probeHeights?.[breakerState.lines.length];
-  // The first pass measures this line without a float window. A later pass
-  // resolves it only once that exact line index has an observed line-box
-  // height; newly-created lines are likewise measured before they are probed.
-  if (probeH === undefined) return;
+  if (!wrapCtx) {
+    resetPhysicalLineMetrics(operationState);
+    if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+    return;
+  }
+  const cursor = breakerState.fragmentCursor;
+  breakerState.fragmentCursor = null;
+  // Every gap of this physical line uses the same observed band. New gaps
+  // are horizontal placements, so they need no additional convergence pass.
+  let probeH = probeHeights?.[breakerState.physicalLineIndex];
+  if (probeH === undefined) {
+    resetPhysicalLineMetrics(operationState);
+    if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+    return;
+  }
   // §17.3.1.12 removes a hanging indent from the paragraph's first-line
   // indentation, not from an object's exclusion (§20.4.2.17–.19). Query the
   // expanded first-line band before subtracting floats; applying the hanging
@@ -264,30 +294,28 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
   const requiredWidth = minWidth + (breakerState.isFirst ? Math.max(0, firstIndent) : 0);
-  const query = (topY: number, x: number, width: number) => {
+  const query = (topY: number, x: number, width: number, height: number) => {
     if (wrapCtx.lineWindow) {
       const win = wrapCtx.lineWindow({
         topYPt: topY, minimumStartWidthPt: requiredWidth,
-        squareMinimumStartWidthPt: requiredWidth, probeHeightPt: probeH,
+        squareMinimumStartWidthPt: requiredWidth, probeHeightPt: height,
         paragraphXPt: x, maximumWidthPt: width,
         columnXPt: wrapCtx.columnXPt, columnWidthPt: wrapCtx.columnWidthPt,
       });
       return { topY: win.topYPt, xOffset: win.xOffsetPt, maxWidth: win.maximumWidthPt };
     }
     return computePreparedLineFloatWindow(
-      topY, requiredWidth, probeH, x, width,
+      topY, requiredWidth, height, x, width,
       preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
       wrapCtx.columnXPt, wrapCtx.columnXPt + wrapCtx.columnWidthPt,
       reference, requiredWidth,
     );
   };
-  const cursor = breakerState.fragmentCursor;
-  breakerState.fragmentCursor = null;
   if (cursor) {
     const left = baseRtl ? lineBandX : cursor.right;
     const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
     if (right > left) {
-      const next = query(cursor.topY, left, right - left);
+      const next = query(cursor.topY, left, right - left, probeH);
       if (next.topY === cursor.topY && next.maxWidth >= requiredWidth) {
         // A strictly smaller unvisited band gives monotonic horizontal progress;
         // the original column and largest-side reference never shrink with it.
@@ -298,7 +326,11 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
       }
     }
   }
-  const win = query(breakerState.currentLineTopY, lineBandX, lineBandWidth);
+  resetPhysicalLineMetrics(operationState);
+  if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+  probeH = probeHeights?.[breakerState.physicalLineIndex];
+  if (probeH === undefined) return;
+  const win = query(breakerState.currentLineTopY, lineBandX, lineBandWidth, probeH);
   breakerState.currentLineTopY = win.topY;
   breakerState.lineXOffset = win.xOffset;
   breakerState.lineMaxWidth = win.maxWidth + hangingOffset;
@@ -357,22 +389,6 @@ export function performFlush(
     baseRtl,
   } = operationState;
 
-  // A physical line can contain several gap fragments. Carry its metric union
-  // into the last fragment so vertical progress uses the tallest contributor,
-  // even when the last gap has smaller text than the first.
-  const previous = breakerState.lines.at(-1);
-  if (wrapCtx && previous?.topY === breakerState.currentLineTopY) {
-    breakerState.lineAscent = Math.max(breakerState.lineAscent, previous.ascent);
-    breakerState.lineDescent = Math.max(breakerState.lineDescent, previous.descent);
-    breakerState.lineIntendedSingle = Math.max(breakerState.lineIntendedSingle, previous.intendedSingle);
-    breakerState.lineLatinGridCountSingle = Math.max(breakerState.lineLatinGridCountSingle, previous.latinGridCountSingle ?? 0);
-    breakerState.lineGridCountSingle = Math.max(breakerState.lineGridCountSingle, previous.gridCountSingle ?? 0);
-    breakerState.lineVisibleAscent = Math.max(breakerState.lineVisibleAscent, previous.visibleAscent ?? previous.ascent);
-    breakerState.lineVisibleDescent = Math.max(breakerState.lineVisibleDescent, previous.visibleDescent ?? previous.descent);
-    breakerState.lineVisibleIntendedSingle = Math.max(breakerState.lineVisibleIntendedSingle, previous.visibleIntendedSingle ?? previous.intendedSingle);
-    breakerState.lineHasRuby ||= previous.hasRuby ?? false;
-    breakerState.lineEastAsian ||= previous.eastAsian ?? false;
-  }
   materializeLatinSpaceCompression();
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
@@ -399,35 +415,31 @@ export function performFlush(
   // provide a zero-position reference; tabs do not contribute vertical
   // metrics. The fixed drop-cap path intentionally keeps its paint-only
   // lowering and therefore opts out of this normalization.
-  let commonPositionPt: number | undefined;
-  let hasPositionReference = false;
   for (const segment of breakerState.currentLine) {
     if ('isTab' in segment) continue;
-    const positionPt = 'text' in segment ? (segment.position ?? 0) : 0;
-    if ('text' in segment && segment.positionExtendsLineBox === false) {
-      commonPositionPt = 0;
-      hasPositionReference = true;
-      break;
+    const position = 'text' in segment && segment.positionExtendsLineBox !== false
+      ? (segment.position ?? 0) : 0;
+    if (breakerState.positionReferencePt === undefined) breakerState.positionReferencePt = position;
+    else if (breakerState.positionReferencePt !== position) breakerState.positionReferencePt = null;
+    if (!('text' in segment)) {
+      breakerState.uniformPositionEligible = false;
+      continue;
     }
-    if (!hasPositionReference) {
-      commonPositionPt = positionPt;
-      hasPositionReference = true;
-    } else if (commonPositionPt !== positionPt) {
-      commonPositionPt = 0;
-      break;
-    }
+    breakerState.firstPositioned ??= segment;
+    const first = breakerState.firstPositioned;
+    breakerState.uniformPositionEligible &&= segment.text.length > 0
+      && !segment.metricOnly && !segment.ruby && !segment.vertAlign
+      && segment.positionExtendsLineBox !== false
+      && segment.position === first.position
+      && segment.fontFamily === first.fontFamily
+      && segment.fontRoute?.fingerprint === first.fontRoute?.fingerprint
+      && segment.bold === first.bold && segment.italic === first.italic
+      && segment.fontSize === first.fontSize
+      && segment.resolvedDesignDescentRatio === first.resolvedDesignDescentRatio
+      && segment.referenceFontVerticalMetric === first.referenceFontVerticalMetric
+      && segment.resolvedResourceVerticalMetric === first.resolvedResourceVerticalMetric;
   }
-  const linePositionReferencePt = hasPositionReference ? (commonPositionPt ?? 0) : 0;
-  if (linePositionReferencePt !== 0) {
-    for (const segment of breakerState.currentLine) {
-      if ('text' in segment) {
-        segment.lineRelativePosition = wordUniformRunPositionPaintPt(
-          segment.position ?? 0,
-          linePositionReferencePt,
-        );
-      }
-    }
-  }
+  const linePositionReferencePt = breakerState.positionReferencePt ?? 0;
   // §17.3.3.1 — the break is one run among the line's runs: its own size
   // participates in the line height but must not override a taller peer.
   const h =
@@ -459,35 +471,11 @@ export function performFlush(
   // visible text in one admitted face tuple. Canvas fallback geometry does
   // not reveal hhea descent, and mixed styles cannot share one descent
   // reserve. The rule uses face data, never a family-specific correction.
-  const positionedTexts = breakerState.currentLine.filter(
-    (segment): segment is LayoutTextSeg => 'text' in segment,
-  );
-  const firstPositioned = positionedTexts[0];
+  const firstPositioned = breakerState.firstPositioned;
   const uniformPositionAuto =
-    linePositionReferencePt !== 0 &&
-    positionedTexts.length > 0 &&
-    breakerState.currentLine.every((segment) => 'isTab' in segment || 'text' in segment) &&
-    firstPositioned?.resolvedDesignDescentRatio != null &&
-    (firstPositioned.referenceFontVerticalMetric ||
-      firstPositioned.resolvedResourceVerticalMetric) &&
-    positionedTexts.every(
-      (segment) =>
-        segment.text.length > 0 &&
-        !segment.metricOnly &&
-        !segment.ruby &&
-        !segment.vertAlign &&
-        segment.positionExtendsLineBox !== false &&
-        segment.position === linePositionReferencePt &&
-        segment.fontFamily === firstPositioned.fontFamily &&
-        segment.fontRoute?.fingerprint === firstPositioned.fontRoute?.fingerprint &&
-        segment.bold === firstPositioned.bold &&
-        segment.italic === firstPositioned.italic &&
-        segment.fontSize === firstPositioned.fontSize &&
-        segment.resolvedDesignDescentRatio === firstPositioned.resolvedDesignDescentRatio &&
-        segment.referenceFontVerticalMetric === firstPositioned.referenceFontVerticalMetric &&
-        segment.resolvedResourceVerticalMetric === firstPositioned.resolvedResourceVerticalMetric &&
-        (segment.referenceFontVerticalMetric || segment.resolvedResourceVerticalMetric),
-    )
+    linePositionReferencePt !== 0 && breakerState.uniformPositionEligible
+    && firstPositioned?.resolvedDesignDescentRatio != null
+    && (firstPositioned.referenceFontVerticalMetric || firstPositioned.resolvedResourceVerticalMetric)
       ? {
           normalSinglePx: Math.max(
             asc + desc - Math.abs(linePositionReferencePt * scale),
@@ -499,6 +487,7 @@ export function performFlush(
         }
       : undefined;
   breakerState.lines.push({
+    physicalLineIndex: breakerState.physicalLineIndex,
     segments: breakerState.currentLine,
     height: h,
     ascent: asc,
@@ -549,20 +538,6 @@ export function performFlush(
   breakerState.latinLineHomogeneous = true;
   breakerState.latinLineGaps = [];
   breakerState.latinUniformGapCapacity = undefined;
-  breakerState.lineHeight = 0;
-  breakerState.lineAscent = 0;
-  breakerState.lineDescent = 0;
-  breakerState.lineIntendedSingle = 0;
-  breakerState.lineHasInlinePicture = false;
-  breakerState.linePictureMarkSingle = 0;
-  breakerState.lineGridCountSingle = 0;
-  breakerState.lineLatinGridCountSingle = 0;
-  breakerState.lineVisibleAscent = 0;
-  breakerState.lineVisibleDescent = 0;
-  breakerState.lineVisibleIntendedSingle = 0;
-  breakerState.lineHasVisibleMetrics = false;
-  breakerState.lineHasRuby = false;
-  breakerState.lineEastAsian = false;
   breakerState.isFirst = false;
   startLine(minLineStartWidth(nextStart));
 }
