@@ -96,17 +96,24 @@ it('bounds suffix work when probing many authored tab cells', () => {
   expect(render(8_000) / render(2_000)).toBeLessThan(6);
 });
 
-it('bounds late-tab atom reads by the current line, independent of consumed prefix length', () => {
+it.each([
+  { feature: 'CJK', tail: '日本語' },
+  { feature: 'kinsoku punctuation', tail: '日「本、語' },
+  { feature: 'tab', tail: '\txyz' },
+  { feature: 'mixed scripts and clusters', tail: 'ก้ខ្មែរ日\u0301𠀀אב' },
+])('bounds late $feature reads per line independently of consumed prefix length', ({ tail }) => {
   const maxWidth = 80;
-  const render = (size: number): number => {
+  const render = (size: number, nonMonotoneMeasure: boolean) => {
     let atoms: unknown[] | undefined;
-    let reads = 0;
-    let measuringTab = false;
-    let installed = false;
+    const reads: number[] = [];
+    let consumedReads = 0;
+    let lineIndex = -1;
+    const tailLine = size / maxWidth - 1;
+    const consumed = size - maxWidth;
     const push = Array.prototype.push;
-    // Capture the production atom array, then count indexed reads only once
-    // tab measurement starts. Whole-paragraph preprocessing is outside this
-    // phase; consumed lines must not be revisited by lazy suffix construction.
+    // Capture the production atom array. The budget getter marks each line's
+    // fitting phase, after one-time grapheme/script/opportunity preprocessing.
+    // This also excludes the non-monotone model built on the first line.
     Array.prototype.push = function (this: unknown[], ...items: unknown[]): number {
       const item = items[0];
       if (typeof item === 'object' && item !== null && 'run' in item) atoms = this;
@@ -114,33 +121,47 @@ it('bounds late-tab atom reads by the current line, independent of consumed pref
     };
     let lines: ReturnType<typeof breakDrawingMlText<string>>;
     try {
-      lines = breakDrawingMlText([{ type: 'text', text: `${'a'.repeat(size)}\txyz`, style: 'same' }], {
-        maxWidth, tabStops: [{ pos: 1, algn: 'l' }],
-        measureText(value) {
-          if (!installed && atoms) {
-            installed = true;
+      lines = breakDrawingMlText([{ type: 'text', text: 'a'.repeat(size) + tail, style: 'same' }], {
+        get maxWidth() {
+          if (lineIndex === -1 && atoms) {
             for (let i = 0; i < atoms.length; i++) {
               const atom = atoms[i];
               Object.defineProperty(atoms, i, {
                 configurable: true, enumerable: true,
-                get() { if (measuringTab) reads++; return atom; },
+                get() {
+                  if (lineIndex >= tailLine) {
+                    reads[lineIndex - tailLine]++;
+                    if (i < consumed) consumedReads++;
+                  }
+                  return atom;
+                },
               });
             }
           }
-          if (value === ' ') measuringTab = true;
-          return value.length;
+          lineIndex++;
+          if (lineIndex >= tailLine) reads.push(0);
+          return maxWidth;
         },
+        tabStops: [{ pos: 1, algn: 'l' }], nonMonotoneMeasure,
+        measureText: (value) => value.length,
       });
     } finally {
       Array.prototype.push = push;
     }
-    expect(lines.map((line) => line.segments.map((seg) => seg.type === 'text' ? seg.text : '\t').join('')))
-      .toEqual([...Array<string>(size / maxWidth - 1).fill('a'.repeat(maxWidth)), `${'a'.repeat(maxWidth)}\txyz`]);
-    expect(reads).toBeGreaterThan(0);
-    expect(reads).toBeLessThan(20 * (maxWidth + 4));
-    return reads;
+    const painted = lines.map((line) => line.segments.map((seg) => seg.type === 'text' ? seg.text : '\t').join(''));
+    expect(painted.slice(0, tailLine)).toEqual(Array<string>(tailLine).fill('a'.repeat(maxWidth)));
+    expect(painted.slice(tailLine).join('')).toBe('a'.repeat(maxWidth) + tail);
+    expect(consumedReads).toBe(0);
+    expect(reads.length).toBeGreaterThan(0);
+    for (const count of reads) {
+      expect(count).toBeGreaterThan(0);
+      expect(count).toBeLessThan(20 * (maxWidth + tail.length));
+    }
+    return { reads, lines: lines.slice(tailLine) };
   };
-  expect(render(8_000)).toBe(render(2_000));
+  for (const nonMonotoneMeasure of [false, true]) {
+    expect(render(8_000, nonMonotoneMeasure)).toEqual(render(2_000, nonMonotoneMeasure));
+  }
 });
 
 it('preserves code-point retraction across grapheme and supplementary-character offsets', () => {

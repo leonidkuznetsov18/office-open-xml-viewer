@@ -258,17 +258,21 @@ export function breakDrawingMlText<T>(
     };
 
     let kinsokuText: { chars: string[]; offsets: Int32Array } | null = null;
+    let kinsokuTextStart = 0;
     const kinsokuCodePoints = (): { chars: string[]; offsets: Int32Array } => {
       if (kinsokuText === null) {
-        // Flatten text atoms once per region, not the remaining suffix at
-        // every CJK wrap. Offsets preserve the old code-point split/retraction
-        // semantics for multi-code-point graphemes and non-text atoms.
+        // Flatten the unconsumed suffix once, starting at the current line.
+        // Line starts only advance: consumed atoms cannot affect kinsoku's
+        // line-local retraction floor and must not be scanned or retained.
+        // Suffix-relative offsets preserve the code-point split/retraction
+        // semantics for multi-code-point graphemes and omitted non-text atoms.
+        kinsokuTextStart = start;
         const chars: string[] = [];
-        const offsets = new Int32Array(end + 1);
-        for (let i = 0; i < end; i++) {
+        const offsets = new Int32Array(end - kinsokuTextStart + 1);
+        for (let i = kinsokuTextStart; i < end; i++) {
           const atom = atoms[i];
           if (atom.type === 'text') for (const ch of atom.text) chars.push(ch);
-          offsets[i + 1] = chars.length;
+          offsets[i + 1 - kinsokuTextStart] = chars.length;
         }
         kinsokuText = { chars, offsets };
       }
@@ -369,6 +373,9 @@ export function breakDrawingMlText<T>(
       gapValues: number[];
     }
     let model: NonMonotoneModel | null = null;
+    // nonMonotoneMeasure is fixed for this call: this model is built on the
+    // first finite-budget line, before any atoms can be consumed. Its segment,
+    // tab and block indexes are then reused; only bounded line heads are lazy.
     const atomText = (from: number, to: number): string => {
       let text = '';
       for (let i = from; i < to; i++) {
@@ -781,8 +788,8 @@ export function breakDrawingMlText<T>(
       if (eastAsianRules && split < end && atoms[split - 1].run === atoms[split].run
           && (isCjk(atoms[split - 1]) || isCjk(atoms[split]))) {
         const { chars, offsets } = kinsokuCodePoints();
-        const codeStart = offsets[start];
-        const codeSplit = offsets[split];
+        const codeStart = offsets[start - kinsokuTextStart];
+        const codeSplit = offsets[split - kinsokuTextStart];
         if (codeSplit - codeStart > 1 && codeSplit < chars.length) {
           const adjusted = kinsokuAdjustedSplit(chars, codeSplit, DEFAULT_KINSOKU_RULES, codeStart + 1);
           const retract = codeSplit - adjusted;
