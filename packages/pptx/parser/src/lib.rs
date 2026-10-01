@@ -506,7 +506,7 @@ fn serialize_presentation_bootstrap(
             .relationship_id
             .as_ref()
             .and_then(|id| shared.pres_rels.get(id))
-            .map(|target| resolve_path("ppt", target));
+            .map(|target| resolve_path("ppt/presentation.xml", target));
         let candidate = BootstrapSlideProjection {
             index: descriptor.index,
             part_name: part_name.as_deref(),
@@ -1316,7 +1316,7 @@ pub(crate) fn parse_rels(xml: &str) -> HashMap<String, String> {
 /// only for compatibility; the spec-driven relId path above is primary.
 pub(crate) fn build_smartart_drawings(
     rels_xml: &str,
-    source_dir: &str,
+    source_part: &str,
     zip: &mut PptxZip,
 ) -> HashMap<String, String> {
     let mut result: HashMap<String, String> = HashMap::new();
@@ -1346,7 +1346,7 @@ pub(crate) fn build_smartart_drawings(
     for (dm_rid, data_target) in data_rels {
         // 1) Canonical: read the data part's dataModelExt relId, resolve it in
         //    this same rels map.
-        let drawing_target = smartart_drawing_relid(&data_target, source_dir, zip)
+        let drawing_target = smartart_drawing_relid(&data_target, source_part, zip)
             .and_then(|drawing_rid| rid_target.get(&drawing_rid).cloned())
             // 2) Fallback: file-number-suffix match (heuristic, compat only).
             .or_else(|| {
@@ -1358,7 +1358,7 @@ pub(crate) fn build_smartart_drawings(
                 })
             });
         if let Some(dt) = drawing_target {
-            let drawing_path = resolve_path(source_dir, &dt);
+            let drawing_path = resolve_path(source_part, &dt);
             if let Ok(xml) = read_zip_str(zip, &drawing_path) {
                 result.insert(dm_rid, xml);
             }
@@ -1373,10 +1373,10 @@ pub(crate) fn build_smartart_drawings(
 /// be read or carries no `dataModelExt@relId`.
 fn smartart_drawing_relid(
     data_target: &str,
-    source_dir: &str,
+    source_part: &str,
     zip: &mut PptxZip,
 ) -> Option<String> {
-    let data_path = resolve_path(source_dir, data_target);
+    let data_path = resolve_path(source_part, data_target);
     let xml = read_zip_str(zip, &data_path).ok()?;
     let doc = parse_preflighted_pptx_xml(&xml).ok()?;
     doc.descendants()
@@ -1522,7 +1522,7 @@ fn parse_embedded_font_refs(
             {
                 continue;
             }
-            let part_path = resolve_path("ppt", &relationship.target);
+            let part_path = resolve_path("ppt/presentation.xml", &relationship.target);
             let Some(content_type) = content_types.for_part(&part_path) else {
                 continue;
             };
@@ -1542,20 +1542,13 @@ fn parse_embedded_font_refs(
     refs
 }
 
-/// Resolve a relative path against a base directory inside the ZIP.
+/// Resolve an internal relationship target against its source part.
 ///
-/// Thin alias for the shared [`ooxml_common::rels::resolve_target`], which
-/// handles both root-absolute (`/ppt/charts/chart5.xml`) and relative
-/// (`../charts/chart1.xml`) Targets with `..` normalization (ECMA-376 Part 2
-/// §9.3). Kept as a local name so the many call sites read unchanged.
-pub(crate) fn resolve_path(base_dir: &str, target: &str) -> String {
-    ooxml_common::rels::resolve_target(base_dir, target)
-}
-
-/// Directory containing an OPC source part. Relationship Targets are resolved
-/// relative to this directory (ECMA-376 Part 2 §6.5.2.3).
-fn part_directory(part_path: &str) -> &str {
-    part_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+/// ECMA-376 Part 2 §6.4.1 applies RFC 3986 resolution before validating and
+/// normalizing the result as an OPC part name. An invalid target becomes the
+/// empty lookup key, so callers follow their existing missing-part path.
+pub(crate) fn resolve_path(source_part: &str, target: &str) -> String {
+    ooxml_common::rels::resolve_part_name(source_part, target).unwrap_or_default()
 }
 
 // ===========================
@@ -1578,7 +1571,7 @@ fn slide_is_hidden(root: roxmltree::Node) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn parse_slide(
     xml: &str,
-    slide_dir: &str,
+    slide_part: &str,
     slide_rels_xml: &str,
     // The layout's single-pass extraction (placeholders + layout bg + layout
     // showMasterSp), built/cached by the caller against this slide's effective
@@ -1588,7 +1581,7 @@ fn parse_slide(
     parsed_layout: &ParsedLayout,
     layout_xml: Option<&str>,
     layout_rels: &HashMap<String, String>,
-    layout_dir: &str,
+    layout_part: &str,
     bundle: &ParsedMaster,
     eff: Option<&EffectiveMaster>,
     index: usize,
@@ -1614,7 +1607,7 @@ fn parse_slide(
         theme,
         master_xml,
         master_rels,
-        master_dir,
+        master_part,
         master_smartart_drawings,
         master_bg,
         master_decorative,
@@ -1635,7 +1628,7 @@ fn parse_slide(
     // flow through `parsed_layout`, already override-adjusted by the caller.)
     let theme: &PptxTheme = eff.map(|e| &e.theme).unwrap_or(theme);
     let master_xml: Option<&str> = master_xml.as_deref();
-    let master_dir: &str = master_dir.as_str();
+    let master_part: &str = master_part.as_str();
     let master_bg: Option<Fill> = match eff {
         Some(e) => e.master_bg.clone(),
         None => master_bg.clone(),
@@ -1696,7 +1689,7 @@ fn parse_slide(
     if let Some(n) = c_sld {
         let mut resolve = |rid: &str| -> Option<String> {
             let target = rels.get(rid)?;
-            let path = resolve_path(slide_dir, target);
+            let path = resolve_path(slide_part, target);
             // Resolve to the zip path; verify the part exists so a dangling
             // rId still yields None (the bg chain then falls through to the
             // next level), preserving the prior data-URL behaviour.
@@ -1757,7 +1750,7 @@ fn parse_slide(
                 if let Ok(mdoc) = parse_preflighted_pptx_xml(mxml) {
                     extract_decorative_shapes(
                         mdoc.root_element(),
-                        master_dir,
+                        master_part,
                         master_rels,
                         master_smartart_drawings,
                         theme,
@@ -1797,7 +1790,7 @@ fn parse_slide(
                         parse_sp_tree_node(
                             node,
                             &empty_lph,
-                            layout_dir,
+                            layout_part,
                             layout_rels,
                             smartart_drawings,
                             zip,
@@ -1824,7 +1817,7 @@ fn parse_slide(
         parse_sp_tree_node(
             node,
             &lph,
-            slide_dir,
+            slide_part,
             rels,
             smartart_drawings,
             zip,
@@ -1842,10 +1835,10 @@ fn parse_slide(
     debug_assert_eq!(elements.len(), element_sources.len());
 
     // ── Notes slide & comments (Phase 2 surfacing only — no rendering) ────
-    let notes = load_notes_slide(zip, slide_dir, rels);
+    let notes = load_notes_slide(zip, slide_part, rels);
     let comments = load_pptx_comments(
         zip,
-        slide_dir,
+        slide_part,
         slide_rels_xml,
         comment_authors,
         comment_authors_path,
@@ -1893,7 +1886,7 @@ fn broken_slide(index: usize, part: &str, detail: &str) -> Slide {
 /// the slide has no notes part or the part can't be read.
 fn load_notes_slide(
     zip: &mut PptxZip,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
 ) -> Option<String> {
     // rels here is the slide's _rels map (rId → Target) parsed by the caller.
@@ -1904,7 +1897,7 @@ fn load_notes_slide(
     let path = if target.starts_with('/') {
         target.trim_start_matches('/').to_string()
     } else {
-        resolve_path(slide_dir, target)
+        resolve_path(slide_part, target)
     };
     let xml = read_zip_str(zip, &path).ok()?;
     let doc = parse_preflighted_pptx_xml(&xml).ok()?;
@@ -2027,7 +2020,7 @@ fn parse_modern_comment_anchors(comment: roxmltree::Node<'_, '_>) -> Vec<PptxCom
 /// the 2018 PowerPoint namespace and relationship defined by [MS-PPTX] §2.1.5.
 fn load_pptx_comments(
     zip: &mut PptxZip,
-    slide_dir: &str,
+    slide_part: &str,
     rels_xml: &str,
     legacy_authors: &mut Option<HashMap<String, String>>,
     legacy_authors_path: Option<&str>,
@@ -2040,7 +2033,7 @@ fn load_pptx_comments(
     // XML order and HashMap iteration. Each relationship identifies its part;
     // no target-directory or filename convention is inferred.
     for target in [classic_target, modern_target].into_iter().flatten() {
-        let path = resolve_path(slide_dir, &target);
+        let path = resolve_path(slide_part, &target);
         let Ok(xml) = read_zip_str(zip, &path) else {
             continue;
         };
@@ -2623,7 +2616,7 @@ fn bootstrap_presentation(
     // major/minor fonts, hyperlink colors) and as the fallback theme for any
     // master that declares no /theme relationship of its own.
     let theme_path = find_rel_target_by_type(&pres_rels_xml, "/theme")
-        .map(|target| resolve_path("ppt", &target));
+        .map(|target| resolve_path("ppt/presentation.xml", &target));
     let theme = theme_path
         .as_deref()
         .map(|path| parse_theme_part(path, zip))
@@ -2633,16 +2626,16 @@ fn bootstrap_presentation(
     // The first slide master referenced by the presentation. Used for slides
     // whose layout→master→theme chain can't be resolved (simple/old decks), so
     // their behavior is unchanged from before per-slide resolution existed.
-    let pres_master_path: Option<String> =
-        find_rel_target_by_type(&pres_rels_xml, "/slideMaster").map(|t| resolve_path("ppt", &t));
+    let pres_master_path: Option<String> = find_rel_target_by_type(&pres_rels_xml, "/slideMaster")
+        .map(|t| resolve_path("ppt/presentation.xml", &t));
     let comment_authors_path = find_internal_rel_target_by_types(
         &pres_rels_xml,
         CLASSIC_COMMENT_AUTHOR_RELATIONSHIP_TYPES,
     )
-    .map(|target| resolve_path("ppt", &target));
+    .map(|target| resolve_path("ppt/presentation.xml", &target));
     let modern_comment_authors_path =
         find_internal_rel_target_by_types(&pres_rels_xml, MODERN_COMMENT_AUTHOR_RELATIONSHIP_TYPES)
-            .map(|target| resolve_path("ppt", &target));
+            .map(|target| resolve_path("ppt/presentation.xml", &target));
     let default_text_style = default_text_style_fragment(&pres_xml, pres_root);
 
     // This is a serialization-shaped projection of retained bootstrap state,
@@ -2717,7 +2710,7 @@ fn bootstrap_presentation(
 struct SlideRaw {
     index: usize,
     slide_path: String,
-    slide_dir: String,
+    slide_part: String,
     slide_xml: Result<String, String>,
     slide_rels_xml: String,
     slide_rels: HashMap<String, String>,
@@ -2827,8 +2820,8 @@ fn produce_slide_unit_with_journal<T>(
         // instead of producing `ppt//ppt/slides/slide1.xml`. Relative targets
         // (the common `slides/slide1.xml`) are unaffected. Same fix class as
         // the chart-rel resolution above.
-        let slide_path = resolve_path("ppt", &rel_target);
-        let slide_dir = part_directory(&slide_path).to_owned();
+        let slide_path = resolve_path("ppt/presentation.xml", &rel_target);
+        let slide_part = slide_path.clone();
         let rels_path = relationship_part_path(&slide_path);
 
         // RB7: a slide part that can't be read no longer aborts the whole deck.
@@ -2849,26 +2842,23 @@ fn produce_slide_unit_with_journal<T>(
         };
         let slide_rels_xml = read_zip_str(zip, &rels_path).unwrap_or_default();
         let slide_rels = parse_rels(&slide_rels_xml);
-        let smartart_drawings = build_smartart_drawings(&slide_rels_xml, &slide_dir, zip);
+        let smartart_drawings = build_smartart_drawings(&slide_rels_xml, &slide_part, zip);
 
         // Layout XML
         let layout_path = find_rel_target_by_type(&slide_rels_xml, "/slideLayout")
-            .map(|target| resolve_path(&slide_dir, &target));
+            .map(|target| resolve_path(&slide_path, &target));
 
         if let Some(path) = layout_path.as_deref() {
             if !layout_source_cache.contains_key(path) {
                 let xml = read_zip_str(zip, path).ok();
-                let dir = path
-                    .rsplit_once('/')
-                    .map(|(dir, _)| dir.to_owned())
-                    .unwrap_or_else(|| "ppt/slideLayouts".to_owned());
+                let dir = path.to_owned();
                 // Needed both for images inside the layout and for the
                 // layout→slideMaster chain (ECMA-376 §19.3.1.43).
                 let rels_path = relationship_part_path(path);
                 let rels_xml = read_zip_str(zip, &rels_path).unwrap_or_default();
                 let rels = parse_rels(&rels_xml);
                 let master_path = find_rel_target_by_type(&rels_xml, "/slideMaster")
-                    .map(|target| resolve_path(&dir, &target));
+                    .map(|target| resolve_path(path, &target));
                 let source = LayoutSource {
                     xml,
                     rels,
@@ -2896,7 +2886,7 @@ fn produce_slide_unit_with_journal<T>(
         let raw = SlideRaw {
             index: idx,
             slide_path,
-            slide_dir,
+            slide_part,
             slide_xml,
             slide_rels_xml,
             slide_rels,
@@ -2906,7 +2896,7 @@ fn produce_slide_unit_with_journal<T>(
         };
 
         let empty_layout_rels = HashMap::new();
-        let (layout_xml, layout_rels, layout_dir, master_path) = match raw.layout_source.as_deref()
+        let (layout_xml, layout_rels, layout_part, master_path) = match raw.layout_source.as_deref()
         {
             Some(source) => (
                 source.xml.as_deref(),
@@ -2914,7 +2904,12 @@ fn produce_slide_unit_with_journal<T>(
                 source.dir.as_str(),
                 source.master_path.as_deref(),
             ),
-            None => (None, &empty_layout_rels, "ppt/slideLayouts", None),
+            None => (
+                None,
+                &empty_layout_rels,
+                "ppt/slideLayouts/slideLayout.xml",
+                None,
+            ),
         };
 
         // RB7: a slide part that couldn't be READ (recorded above) degrades to a
@@ -3041,7 +3036,7 @@ fn produce_slide_unit_with_journal<T>(
                 let c_sld = child(root, "cSld")?;
                 let mut resolve = |rid: &str| -> Option<String> {
                     let target = bundle.master_rels.get(rid)?;
-                    let path = resolve_path(&bundle.master_dir, target);
+                    let path = resolve_path(&bundle.master_part, target);
                     // Existence check only — central-directory lookup, no inflate
                     // (former `read_zip_bytes` decompressed the entry to discard it).
                     zip.index_for_name(&path)?;
@@ -3061,7 +3056,7 @@ fn produce_slide_unit_with_journal<T>(
                         root,
                         &theme,
                         &bundle.master_rels,
-                        &bundle.master_dir,
+                        &bundle.master_part,
                     )
                 })
                 .unwrap_or_default();
@@ -3071,7 +3066,7 @@ fn produce_slide_unit_with_journal<T>(
                         root,
                         &theme,
                         &bundle.master_rels,
-                        &bundle.master_dir,
+                        &bundle.master_part,
                         zip,
                     )
                 })
@@ -3089,7 +3084,7 @@ fn produce_slide_unit_with_journal<T>(
                         root,
                         &theme,
                         &bundle.master_rels,
-                        &bundle.master_dir,
+                        &bundle.master_part,
                         dts,
                         zip,
                     )
@@ -3152,7 +3147,7 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_ea_ln_brk,
                 &bundle.master_spacing,
                 layout_theme,
-                layout_dir,
+                layout_part,
                 layout_rels,
                 zip,
             )
@@ -3205,12 +3200,12 @@ fn produce_slide_unit_with_journal<T>(
         let had_modern_comment_authors = modern_comment_authors.is_some();
         let slide = match parse_slide(
             slide_xml,
-            &raw.slide_dir,
+            &raw.slide_part,
             &raw.slide_rels_xml,
             parsed_layout,
             layout_xml,
             layout_rels,
-            layout_dir,
+            layout_part,
             bundle,
             effective_master.as_ref(),
             raw.index,
@@ -3613,7 +3608,7 @@ mod tests {
   <Relationship Id="rIdDrawB" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="../diagrams/drawing2.xml"/>
 </Relationships>"#;
 
-        let map = build_smartart_drawings(rels, "ppt/slides", &mut zip);
+        let map = build_smartart_drawings(rels, "ppt/slides/slide1.xml", &mut zip);
         // Keyed by the diagramData rel Id (= the slide's r:dm value).
         // data1 → dataModelExt relId rIdDrawB → drawing2.xml ("TWO").
         assert!(
@@ -3646,7 +3641,7 @@ mod tests {
   <Relationship Id="rIdData1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>
   <Relationship Id="rIdDraw1" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="../diagrams/drawing1.xml"/>
 </Relationships>"#;
-        let map = build_smartart_drawings(rels, "ppt/slides", &mut zip);
+        let map = build_smartart_drawings(rels, "ppt/slides/slide1.xml", &mut zip);
         assert!(
             map.get("rIdData1")
                 .map(|s| s.contains("ONE"))
@@ -3666,16 +3661,19 @@ mod tests {
         // load (read_zip_str on `ppt/slides/ppt/charts/chart5.xml`) and the
         // slide rendered the chart as a blank area.
         assert_eq!(
-            resolve_path("ppt/slides", "/ppt/charts/chart5.xml"),
+            resolve_path("ppt/slides/slide1.xml", "/ppt/charts/chart5.xml"),
             "ppt/charts/chart5.xml"
         );
         // Relative references are unaffected by the absolute-target handling.
         assert_eq!(
-            resolve_path("ppt/slides", "../charts/chart1.xml"),
+            resolve_path("ppt/slides/slide1.xml", "../charts/chart1.xml"),
             "ppt/charts/chart1.xml"
         );
         assert_eq!(
-            resolve_path("ppt/slideLayouts", "../slideMasters/slideMaster1.xml"),
+            resolve_path(
+                "ppt/slideLayouts/slideLayout1.xml",
+                "../slideMasters/slideMaster1.xml",
+            ),
             "ppt/slideMasters/slideMaster1.xml"
         );
     }
@@ -3688,13 +3686,31 @@ mod tests {
         // which must NOT become `ppt//ppt/slides/slide1.xml`. Guards the
         // `resolve_path("ppt", rel_target)` slide-loading path.
         assert_eq!(
-            resolve_path("ppt", "slides/slide1.xml"),
+            resolve_path("ppt/presentation.xml", "slides/slide1.xml"),
             "ppt/slides/slide1.xml"
         );
         assert_eq!(
-            resolve_path("ppt", "/ppt/slides/slide1.xml"),
+            resolve_path("ppt/presentation.xml", "/ppt/slides/slide1.xml"),
             "ppt/slides/slide1.xml"
         );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "./media/image.png"),
+            "ppt/slides/media/image.png"
+        );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "../media/%69mage.png"),
+            "ppt/media/image.png"
+        );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "../media/%ZZ.png"),
+            ""
+        );
+        let external = ooxml_common::rels::RelTarget {
+            target: "https://example.invalid/image.png".to_owned(),
+            relationship_type: None,
+            mode: ooxml_common::rels::TargetMode::External,
+        };
+        assert_eq!(external.resolve_part("ppt/slides/slide1.xml"), None);
     }
 
     #[test]
@@ -4582,7 +4598,7 @@ mod tests {
             doc.root_element(),
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
         match m.get("body").map(|b| b[0].resolve()) {
@@ -4704,7 +4720,7 @@ mod tests {
         let rels = parse_rels(&rels_xml);
         println!("rels: {:?}", rels);
 
-        let chart_path = resolve_path("ppt/slides", "../charts/chartEx1.xml");
+        let chart_path = resolve_path("ppt/slides/slide8.xml", "../charts/chartEx1.xml");
         println!("chart_path: {}", chart_path);
 
         let result = read_zip_str(&mut zip, &chart_path);
@@ -5015,7 +5031,7 @@ mod tests {
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &Default::default(),
             None,
@@ -5067,7 +5083,7 @@ mod tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &Default::default(),
             None,
@@ -5140,7 +5156,7 @@ mod tests {
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),
             &rels,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &Default::default(),
             None,
@@ -5253,7 +5269,7 @@ mod tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &mut zip,
         );
@@ -5285,7 +5301,7 @@ mod tests {
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &Default::default(),
             None,
@@ -5656,7 +5672,7 @@ mod tests {
             &LayoutPlaceholders::default(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -5755,7 +5771,7 @@ mod tests {
                 &placeholders,
                 &theme,
                 &HashMap::new(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 &mut zip,
             )
@@ -5879,7 +5895,7 @@ mod tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -6232,7 +6248,7 @@ mod tests {
             master_root,
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
         // The listed-but-missing part must not produce a Blip anywhere. With only
@@ -6263,7 +6279,7 @@ mod tests {
             master_root,
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip_ok,
         );
         match m_ok.get("body").map(|b| b[0].resolve()) {
@@ -6764,7 +6780,7 @@ mod tests {
             master_doc.root_element(),
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
         let body = m.get("body").expect("body bullets");
@@ -6893,7 +6909,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -7069,7 +7085,7 @@ mod tests {
                 &m_bool,
                 &HashMap::new(),
                 &theme,
-                "ppt/slideLayouts",
+                "ppt/slideLayouts/slideLayout1.xml",
                 &empty_rels,
                 &mut zip,
             )
@@ -7488,7 +7504,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -7504,7 +7520,7 @@ mod tests {
             body_doc.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             [None; 9],
             inherited,
@@ -7851,7 +7867,7 @@ mod tests {
             doc.root_element(),
             &theme,
             &rels,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &mut zip,
         );
@@ -7941,7 +7957,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9], // inherited_level_font_sizes
                 std::array::from_fn(|_| None),
@@ -8038,7 +8054,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8115,7 +8131,7 @@ mod tests {
                 doc.root_element(),
                 theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8182,7 +8198,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8272,7 +8288,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8348,7 +8364,7 @@ mod tests {
             doc.root_element(),
             &theme,
             &rels,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             [None; 9],
             std::array::from_fn(|_| None),
@@ -8402,7 +8418,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8520,7 +8536,7 @@ mod tests {
                 &t,
                 &theme,
                 &HashMap::new(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &dts,
                 &mut zip,
             )
@@ -8618,7 +8634,7 @@ mod tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -8679,7 +8695,7 @@ mod tests {
                 &t,
                 &theme,
                 &HashMap::new(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &dts,
                 &mut zip,
             )
@@ -8794,7 +8810,7 @@ mod tests {
                 &t,
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &crate::master::DefaultTextLevels::default(),
                 &mut zip,
             )
@@ -9063,7 +9079,7 @@ mod tests {
         rels.insert("rId1".to_string(), "../media/clip.m4v".to_string());
         rels.insert("rId2".to_string(), "../media/image1.png".to_string());
 
-        let media = parse_media(pic, "ppt/slides", &rels)
+        let media = parse_media(pic, "ppt/slides/slide1.xml", &rels)
             .expect("p14:media-only .m4v should parse as a MediaElement");
         assert_eq!(media.id.as_deref(), Some("5"));
         assert_eq!(media.media_kind, "video");
@@ -9102,7 +9118,7 @@ mod tests {
         let mut rels: HashMap<String, String> = HashMap::new();
         rels.insert("rId1".to_string(), "../media/sound.wav".to_string());
 
-        let media = parse_media(pic, "ppt/slides", &rels)
+        let media = parse_media(pic, "ppt/slides/slide1.xml", &rels)
             .expect("p14:media-only .wav should parse as a MediaElement");
         assert_eq!(media.media_kind, "audio");
         assert_eq!(media.mime_type, "audio/wav");
@@ -9148,7 +9164,7 @@ mod tests {
         rels.insert("rIdGood".to_string(), "../media/clip.mp4".to_string());
         rels.insert("rIdPoster".to_string(), "../media/image1.png".to_string());
 
-        let media = parse_media(pic, "ppt/slides", &rels)
+        let media = parse_media(pic, "ppt/slides/slide1.xml", &rels)
             .expect("a broken videoFile link must not shadow the good p14:media embed");
         assert_eq!(media.media_kind, "video");
         assert_eq!(media.media_path, "ppt/media/clip.mp4");
@@ -9855,7 +9871,7 @@ mod tests {
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
 
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for an SVG-blip picture");
 
         // PNG fallback is preserved as the raster image_path (regression-safe);
@@ -9911,7 +9927,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed");
         assert_eq!(pic.image_path, "ppt/media/image1.png");
         assert_eq!(pic.mime_type, "image/png");
@@ -9972,8 +9988,14 @@ mod tests {
         let data = build_blip_media_zip(b"png", b"<svg/>");
         let mut zip = PptxZip::new(Cursor::new(data)).unwrap();
 
-        let pic = parse_picture(doc.root_element(), "ppt/slides", &rels, &theme, &mut zip)
-            .expect("styled picture should parse");
+        let pic = parse_picture(
+            doc.root_element(),
+            "ppt/slides/slide1.xml",
+            &rels,
+            &theme,
+            &mut zip,
+        )
+        .expect("styled picture should parse");
 
         let stroke = pic.stroke.expect("lnRef should supply a picture border");
         assert_eq!(stroke.width, 19_050);
@@ -10030,7 +10052,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
         let duo = pic.duotone.expect("duotone must be surfaced");
         assert_eq!(duo.clr1, "000000", "clr1 = black prstClr");
@@ -10073,7 +10095,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
         assert!(pic.duotone.is_none());
         assert_eq!(
@@ -10126,7 +10148,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
         assert!(matches!(
             pic.fill,
@@ -10162,7 +10184,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed");
         assert!(pic.duotone.is_none(), "duotone must be None when absent");
     }
@@ -10209,7 +10231,7 @@ mod tests {
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
 
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture must succeed for an svgBlip-only picture (sample-12 case)");
 
         // The SVG original is surfaced on svg_image_path so the renderer prefers it.
