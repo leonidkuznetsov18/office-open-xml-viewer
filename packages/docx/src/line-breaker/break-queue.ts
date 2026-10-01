@@ -234,6 +234,9 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     isFirst: true,
     lineMaxWidth: maxWidth,
     lineXOffset: 0,
+    /** Exclusion-free width past the paragraph's trailing indent, up to the
+     *  text margin, that an aligned tab cell on this line may allocate. */
+    lineMarginExtension: 0,
     currentLineTopY: wrapCtx?.startPageY ?? 0,
     lineHasRuby: false,
     lineEastAsian: false,

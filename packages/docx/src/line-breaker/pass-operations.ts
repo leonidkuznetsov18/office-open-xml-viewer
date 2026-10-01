@@ -305,12 +305,19 @@ function openPhysicalLine(operationState: PassOperationState): void {
   if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
 }
 
+/** Width between the paragraph's trailing indent and the text margin (zero
+ * when a negative indent already reaches past the margin). */
+function marginExtensionWidth({ marginRightPx, maxWidth }: PassOperationState): number {
+  return Math.max(0, marginRightPx - maxWidth);
+}
+
 export function performStartLine(operationState: PassOperationState, requirement: number = 0): void {
   const { breakerState, maxWidth, wrapCtx, firstIndent, probeFloors } = operationState;
 
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
   breakerState.lineMaxWidth = maxWidth;
+  breakerState.lineMarginExtension = marginExtensionWidth(operationState);
   breakerState.gapTransaction = null;
   const cursor = breakerState.fragmentCursor;
   breakerState.fragmentCursor = null;
@@ -362,8 +369,8 @@ function placeLineWindow(
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
-  const query = (topY: number, x: number, width: number, height: number) => {
-    const requiredWidth = transaction.requirement;
+  const query = (topY: number, x: number, width: number, height: number,
+    requiredWidth = transaction.requirement) => {
     if (wrapCtx.lineWindow) {
       const win = wrapCtx.lineWindow({
         topYPt: topY, minimumStartWidthPt: requiredWidth,
@@ -412,6 +419,7 @@ function placeLineWindow(
     if (probeH === undefined) {
       breakerState.lineXOffset = 0;
       breakerState.lineMaxWidth = maxWidth;
+      breakerState.lineMarginExtension = marginExtensionWidth(operationState);
       transaction.window = null;
       transaction.narrowed = false;
       transaction.endsAtExclusion = false;
@@ -438,6 +446,19 @@ function placeLineWindow(
   breakerState.currentLineTopY = accepted.topY;
   breakerState.lineXOffset = accepted.xOffset;
   breakerState.lineMaxWidth = accepted.maxWidth;
+  // A trailing-indent extension exists only beside an unnarrowed band, and
+  // only where no exclusion intersects it on this line (§20.4.2.17–.19).
+  const extension = marginExtensionWidth(operationState);
+  const extensionProbeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+  if (accepted.narrowed || extension <= 0 || baseRtl) {
+    breakerState.lineMarginExtension = 0;
+  } else if (extensionProbeH === undefined) {
+    breakerState.lineMarginExtension = extension;
+  } else {
+    const free = query(accepted.topY, wrapCtx.paraX + maxWidth, extension, extensionProbeH, extension);
+    breakerState.lineMarginExtension = free.topY === accepted.topY && free.xOffset === 0
+      && free.maxWidth >= extension ? extension : 0;
+  }
   transaction.window = accepted;
   transaction.narrowed = accepted.narrowed;
   // Absolute line-end edge versus the paragraph band edge, in reading order.
@@ -726,6 +747,8 @@ export function performFlush(
     gridCountSingle,
     xOffset: breakerState.lineXOffset,
     availWidth: breakerState.lineMaxWidth,
+    ...(breakerState.currentLine.some((segment) => 'isTab' in segment && segment.marginAllocation)
+      ? { marginExtension: breakerState.lineMarginExtension } : {}),
     topY: wrapCtx ? breakerState.currentLineTopY : undefined,
     hasRuby: breakerState.lineHasRuby,
     eastAsian: breakerState.lineEastAsian,

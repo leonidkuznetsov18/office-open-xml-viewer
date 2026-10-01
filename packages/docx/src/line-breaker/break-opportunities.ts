@@ -542,6 +542,24 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
   }
 }
 
+/**
+ * Allocation available to an aligned (right/center/decimal) ordinary tab cell.
+ *
+ * ECMA-376 §17.3.1.37 positions custom stops relative to the page margins and
+ * does not bound them by the paragraph's trailing indent. So on a line that
+ * no float narrows, an aligned ordinary cell may extend to the text margin
+ * (or the indent edge when a negative indent lies beyond it) wherever no
+ * exclusion intersects that extension on the line; the pass records it as
+ * `lineMarginExtension`. A line that uses it carries the extension as part of
+ * its band, so alignment and justification slack are measured against the
+ * same allocation. Positional tabs, ordinary text and left tabs keep the
+ * actual band; a float-narrowed window keeps it too, since the #1672 Word
+ * controls overlap floats and that overlap is not emulated.
+ */
+function alignedTabCellAvailW(context: BreakOpportunityIteratorContext): number {
+  return context.availW() + context.breakerState.lineMarginExtension;
+}
+
 function processTabSegment(
   context: BreakOpportunityIteratorContext,
   seg: LayoutTabSeg,
@@ -563,6 +581,7 @@ function processTabSegment(
     tabFollowingMetrics,
     availW,
   } = context;
+  seg.marginAllocation = false;
 
   // Ordinary RTL stops still require the complete cell's visual order. A
   // positional tab additionally owns a normative next-line decision, which
@@ -743,7 +762,15 @@ function processTabSegment(
           : following.totalWidth;
     let tabW = stopX - absFromParaX - alignmentWidth;
     if (tabW <= 0) tabW = 0;
-    if (breakerState.currentWidth + tabW > availW()) {
+    // Stop coordinates are margin-relative (§17.3.1.37): a fitting cell keeps
+    // that allocation on an unnarrowed line, past an authored right indent.
+    // Otherwise the gap and cell are limited to the actual paragraph/float band.
+    const cellAvail = alignedTabCellAvailW(context);
+    const cellLimit = breakerState.currentWidth + tabW + following.totalWidth <= cellAvail
+      ? cellAvail : availW();
+    seg.marginAllocation = cellLimit > availW()
+      && breakerState.currentWidth + tabW + following.totalWidth > availW();
+    if (breakerState.currentWidth + tabW > cellLimit) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);
         breakerState.queue.unshift(seg);
@@ -753,11 +780,9 @@ function processTabSegment(
     }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    // Keep an aligned cell atomic only when it fits the available band.
-    // Oversized cells return to the iterator at their ordinary break sites.
-    // Stop coordinates do not confer an allocation outside the paragraph's
-    // indents. Library containment applies even when no float narrows the band.
-    if (breakerState.currentWidth + following.totalWidth <= availW()) {
+    // Keep an aligned cell atomic only when it fits its band. Oversized cells
+    // return to the iterator at their ordinary break sites.
+    if (breakerState.currentWidth + following.totalWidth <= cellLimit) {
       commitAlignedTabCell(context);
     }
     return;

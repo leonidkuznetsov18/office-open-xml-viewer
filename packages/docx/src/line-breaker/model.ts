@@ -320,6 +320,9 @@ export interface LayoutTabSeg extends LayoutSegSource {
   leader?: TabStop['leader'];
   /** Alignment selected from the effective stop during layout. */
   resolvedAlignment?: TabStop['alignment'];
+  /** Set when this aligned tab's cell was admitted past the paragraph's
+   *  trailing indent into the line's exclusion-free margin extension. */
+  marginAllocation?: boolean;
   /** Bold/italic of the run carrying the tab (ECMA-376 §17.3.1.37 — the leader
    *  characters take the formatting of the tab's run, e.g. a bold TOC1 entry's
    *  dot leader is bold). Threaded so {@link drawTabLeader} can match the font. */
@@ -457,6 +460,9 @@ export interface LayoutLine {
   xOffset: number;
   /** Effective available width (px) for this line after float exclusion. */
   availWidth: number;
+  /** Width (px) past `availWidth` up to the text margin that this line's
+   *  margin-allocated tab cell occupies as part of its band. */
+  marginExtension?: number;
   /** When wrap context is active, the absolute canvas Y where this line begins. */
   topY?: number;
   /** Confirmed fixed-point allocation that owns topY, in the same units as

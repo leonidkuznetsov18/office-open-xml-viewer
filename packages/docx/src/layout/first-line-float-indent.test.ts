@@ -110,9 +110,23 @@ describe('first-line indents beside floats through the DOCX parser', () => {
     }
   });
 
-  it.each([false, true])('wraps a margin-aligned cell wider than the paragraph band, positional=%s', (positional) => {
+  // ECMA-376 §17.3.1.37 stops are independent of the paragraph's right indent;
+  // without a float, a fitting ordinary aligned cell keeps that allocation on
+  // its line (sample-1 footer regression).
+  it('aligns a fitting ordinary cell at its stop past the right indent', () => {
     const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
-      { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional, noFloat: true }));
+      { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), noFloat: true }));
+    expect(paragraph.lines).toHaveLength(1);
+    const texts = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
+    const last = texts.at(-1);
+    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(352);
+  });
+
+  // Positional tabs keep the #1675 containment policy; their Word placement
+  // past a right indent is an open follow-up (see margin-tab-allocation.test).
+  it('wraps a margin ptab cell wider than the paragraph band', () => {
+    const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
+      { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional: true, noFloat: true }));
     expect(paragraph.lines.length).toBeGreaterThan(1);
     for (const line of paragraph.lines) {
       for (const text of line.placements) {
@@ -124,6 +138,62 @@ describe('first-line indents beside floats through the DOCX parser', () => {
       }
     }
   });
+
+  it.each([false, true])('wraps a no-float aligned cell wider than its text margin, positional=%s', (positional) => {
+    const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
+      { alignment: 'right', count: 1, text: 'word '.repeat(100).trim(), positional, noFloat: true }));
+    expect(paragraph.lines.length).toBeGreaterThan(1);
+    for (const line of paragraph.lines) {
+      for (const text of line.placements) {
+        if (text.kind === 'text') {
+          expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+          const trailingSpaceWidth = (text.text.length - text.text.trimEnd().length) * 5;
+          expect(text.bounds.xPt + text.bounds.widthPt - trailingSpaceWidth).toBeLessThanOrEqual(180);
+        }
+      }
+    }
+  });
+
+  // The margin extension is a line band only where no exclusion intersects
+  // it: a float inside the right indent keeps #1675's indent-band fitting.
+  it.each([false, true].flatMap((rtl) => [false, true].map((positional) => ({ rtl, positional }))))(
+    'keeps aligned cells out of a float inside the right indent, rtl=$rtl, positional=$positional', ({ rtl, positional }) => {
+      const paragraph = layoutParagraph(documentBytes('w:right="7200"', rtl, 268,
+        { alignment: 'right', count: 1, text: 'word', positional }));
+      const texts = paragraph.lines.flatMap((line) => line.placements).filter((node) => node.kind === 'text');
+      expect(texts.map((text) => text.text).join('')).toBe('word');
+      for (const text of texts) {
+        // Float occupies x=340–540pt, y=72–172pt.
+        const overlapsFloat = text.bounds.xPt + text.bounds.widthPt > 340 && text.bounds.yPt < 172;
+        expect(overlapsFloat).toBe(false);
+        expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+      }
+    });
+
+  it.each(['left', 'center', 'right', 'both', 'distribute'].flatMap((jc) => [false, true].flatMap((rtl) =>
+    [false, true].map((positional) => ({ jc, rtl, positional })))))(
+    'keeps a margin-allocated line inside its band under jc=$jc, rtl=$rtl, positional=$positional', ({ jc, rtl, positional }) => {
+      const paragraph = layoutParagraph(documentBytes(`w:right="7200"/><w:jc w:val="${jc}"`, rtl, 0,
+        { alignment: 'right', count: 1, text: 'word', positional, noFloat: true, prefix: 'prefix' }));
+      const texts = paragraph.lines.flatMap((line) => line.placements).filter((node) => node.kind === 'text');
+      expect(texts.map((text) => text.text).sort()).toEqual(['prefix', 'word']);
+      for (const text of texts) {
+        expect(text.bounds.xPt).toBeGreaterThanOrEqual(72);
+        expect(text.bounds.xPt + text.bounds.widthPt).toBeLessThanOrEqual(540);
+      }
+      if (!rtl && !positional) {
+        // An ordinary right stop at 352pt extends the band to the margin,
+        // leaving 188pt that center/right alignment distribute as usual.
+        expect(paragraph.lines).toHaveLength(1);
+        const prefix = texts.find((text) => text.text === 'prefix');
+        const word = texts.find((text) => text.text === 'word');
+        const shift = jc === 'center' ? 94 : jc === 'right' ? 188 : 0;
+        if (jc !== 'distribute') {
+          expect(prefix?.bounds.xPt).toBe(72 + shift);
+          expect((word?.bounds.xPt ?? 0) + (word?.bounds.widthPt ?? 0)).toBe(352 + shift);
+        }
+      }
+    });
 
   it('wraps content after an automatic tab in a narrowed float window', () => {
     const paragraph = layoutParagraph(documentBytes('w:left="720" w:hanging="720"', false, 268,
