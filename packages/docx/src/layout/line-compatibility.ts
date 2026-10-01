@@ -909,7 +909,7 @@ export const WORD_LATIN_DESIGN_GRID_CELLS = defineCompatibilityRule({
   id: 'word-latin-design-grid-cells',
   evidence: { kind: 'office-observation', syntheticFixtureId: 'float-grid-picture-origin',
     application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
-  description: 'Issue #1674 modes 14/15 controls reserve 20/40/40pt for 10/20/30pt Arial single lines on a 20pt grid, including a preceding 20pt line. No-grid and snap-off controls retain natural advances. Apply whole-cell counting only to visible text with an admitted non-Far-East reference design profile. Far-East reference faces, native fallback boxes, empty marks, ruby, explicit multiples and exact/atLeast spacing retain their established paths. Exact/atLeast baseline residuals up to 5.45pt are unresolved; no empirical baseline correction is established by these controls.',
+  description: 'Issue #1674 modes 14/15 controls reserve 20/40/40pt for 10/20/30pt Arial single lines on a 20pt grid, including a preceding 20pt line. No-grid and snap-off controls retain natural advances. Apply whole-cell counting only to visible text with an admitted non-Far-East reference design profile. Far-East reference faces, native fallback boxes, empty marks, ruby, explicit multiples and exact/atLeast spacing retain their established paths. Later independent-font and anchor-free controls established WORD_SPECIFIED_TEXT_LINE_BOX for its separately gated ordinary Latin class; every other exact/atLeast class retains the established placement.',
 });
 
 export function wordLatinDesignGridSingleHeight(natural: number, pitch: number, admittedDesign: number): number {
@@ -918,4 +918,44 @@ export function wordLatinDesignGridSingleHeight(natural: number, pitch: number, 
   // (§17.3.1.33); admission of one run must not shrink any peer's line box.
   return Math.max(natural, admittedDesign > 0
     ? Math.max(1, Math.ceil(admittedDesign / pitch)) * pitch : pitch);
+}
+
+export const WORD_SPECIFIED_TEXT_LINE_BOX = defineCompatibilityRule({
+  id: 'word-specified-text-line-box',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'specified-spacing-anchor-free-host-font-grid-matrix',
+    application: 'Microsoft Word',
+    version: 'export build unrecorded (16.113.3 installed at measurement)',
+    platform: 'macOS 27.0',
+  },
+  description: 'Issue #1674: 636 printing-PDF pages, modes 14/15, no grid and 20pt lines/linesAndChars grids, Arial/Times New Roman/MS Mincho/Yu Mincho/Verdana/Calibri Latin glyphs. Exact 12/20/24/30pt lines put the baseline four fifths down the authored line, independent of the 10pt visible face or zero/one/two hosts; 30pt visible-text and 30pt-host diagnostics distinguish font ascent, centering and host-height hypotheses. Off-grid atLeast 24/40pt retains the normal design descent and places added leading before the normal line box. Grid-atLeast remains unresolved and is excluded: 40pt minima keep anchor advances at 40pt but print successive text baselines 40.08pt apart; a centered normal-cell projection leaves an unexplained residual. Preserve the entire grid-atLeast class, including host allocation. In the admitted off-grid class a floating host does not enlarge a visible text line. Explicit auto=1 diagnostics on an active grid use the same normal grid box; off-grid diagnostics already agree with the established path, which is preserved. PDF coordinates/font sizes are quantized to 0.24pt; this is export precision, not a layout correction. The exact-height evidence interval is 12 through 30pt; smaller captions do not isolate baseline placement from accumulated printing cadence, and heights outside this interval retain the established path. Scope is homogeneous regular unpositioned undecorated Latin text and matching paragraph-mark face/size with an admitted authored reference profile and a native or positively loaded installed Office local() face. Registered local aliases retain the authored family from the resolver; Application-provided SFNT, CSS, embedded, Google and substitute resources remain outside the evidence. Float-exclusion-conditioned origins are also excluded: a narrow side-gap Office counterexample has a different physical partition, so this round does not isolate its baseline from the wrap origin. Admission is paragraph-wide: a mixed-script or decorated continuation paragraph cannot switch contracts on its ASCII-only undecorated physical lines. Mixed scripts/font axes/faces/sizes, differing paragraph marks, decorated/hyperlink text, transformed text, ruby, inline objects, numbering and resource/fallback faces are unmeasured and retain the established path.',
+});
+
+/** Word observation, not the normative centered-text rule: ECMA-376
+ * §17.3.1.33 defines exact/atLeast units and describes bottom placement/clipping
+ * for too-small lines and centering for too-large lines. [MS-OI29500]
+ * §2.1.60 discusses style-hierarchy spacing but supplies no baseline formula.
+ * The measured Word printing output instead preserves a fixed 4:1 exact baseline partition,
+ * including oversized text that visibly overhangs without top clipping.
+ * This partition is supported by the complete independent-font/host matrix,
+ * not a fitted ascent or a sample-specific offset. §17.6.5 makes exact spacing
+ * override the grid; non-exact normal boxes retain whole-cell grid leading.
+ * Unsupported classes are declined by specifiedTextLineMetrics beside its gate. */
+export function wordSpecifiedTextLineMetrics(input: Readonly<{
+  rule: string; value: number; descentPt: number;
+  singlePt: number; pitchPt: number | null;
+}>): Readonly<{ advancePt: number; baselineOffsetPt: number }> {
+  void WORD_SPECIFIED_TEXT_LINE_BOX;
+  if (input.rule === 'exact') {
+    return { advancePt: input.value, baselineOffsetPt: input.value * 4 / 5 };
+  }
+  const normalPt = input.pitchPt !== null && input.pitchPt > 0
+    ? Math.ceil(input.singlePt / input.pitchPt) * input.pitchPt
+    : input.singlePt;
+  const advancePt = input.rule === 'atLeast' ? Math.max(input.value, normalPt) : normalPt;
+  return {
+    advancePt,
+    baselineOffsetPt: advancePt - (normalPt - input.singlePt) / 2 - input.descentPt,
+  };
 }
