@@ -11,6 +11,10 @@
 // use the normative table. Unmeasured scripts retain the pre-1653 routing until
 // distinct-face controls settle Office's behaviour; no new script override is
 // inferred from a fallback font. This is intentionally incomplete Office coverage.
+// The extra Windows cycles settle European digits and exact Myanmar-extension
+// scalars, but NOT the symbol overrides' font/size independence: all 10/18/32 pt
+// boundary triples contain substitution. Retain their original routing while
+// that evidence gap remains open (POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE).
 import { isCjkBreakChar, isComplexScriptCodePoint } from '@silurus/ooxml-core';
 export { POWERPOINT_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
 
@@ -87,7 +91,6 @@ const ZH_TW = KO_KR;
 
 const HE_IL: readonly SlotRange[] = [
   [0x0030, 0x0039, 'cs'],
-  [0x00BB, 0x00BB, 'cs'],
   [0x00D7, 0x00D7, 'latin'],
   [0x00F7, 0x00F7, 'latin'],
   [0x2047, 0x2048, 'latin'],
@@ -104,17 +107,36 @@ const TH_TH: readonly SlotRange[] = [
 
 const HI_IN = TH_TH;
 
-// These extra controls identify only 1–3, unlike the full 0–9 he/ar/th/hi
-// sweep. Do not broaden them before the extra deck checks 0 and 4–9.
-// altLang is deliberately absent: en-US/altLang=he-IL retained Latin digits.
-const PARTIAL_CS_DIGITS: readonly SlotRange[] = [[0x0031, 0x0033, 'cs']];
+// Extra tagged-PDF cyclic controls at 20 pt settle 0–9 both alone and between
+// Latin letters for these exact language IDs. en-US with each tested altLang
+// retains latin digits; altLang does not replace the classification language.
+const CS_DIGITS: readonly SlotRange[] = [[0x0030, 0x0039, 'cs']];
+
+// Withdraw the former unconditional he/ar » override: complete cycles select
+// cs alone but latin between Latin letters, as do × ÷ and U+2018–201E under
+// the measured cs languages. A scalar/lang API cannot express this context.
+// Use »'s normative latin slot; keep other prior scalar routing pending varied
+// native-neighbour/itemization controls. Do not guess a general context rule.
+
+// ECMA-376 §21.1.2.3's otherwise-ea rule, confirmed by all three cyclic faces
+// for these exact Myanmar extension scalars under en-US/my-MM/ja-JP at 20 pt.
+// Marks U+A9E5/U+AA7B–AA7D and unassigned U+A9FF are not scalar observations.
+// Other language IDs retain the previous script policy rather than extrapolate.
+const MYANMAR_EXTENSION_EA: readonly SlotRange[] = [
+  [0xA9E0, 0xA9E4, 'ea'], [0xA9E6, 0xA9FE, 'ea'],
+  [0xAA60, 0xAA7A, 'ea'], [0xAA7E, 0xAA7F, 'ea'],
+];
+const MYANMAR_MEASURED_LANGUAGES = new Set(['en-us', 'my-mm', 'ja-jp']);
 
 const OBSERVED_OVERRIDES = new Map<string, readonly SlotRange[]>([
   ['en-us', EN_US], ['ja-jp', JA_JP], ['ko-kr', KO_KR],
   ['zh-cn', ZH_CN], ['zh-tw', ZH_TW], ['he-il', HE_IL],
+  // Additional 20 pt cycles settle U+201F for these exact quote-language IDs.
+  ['zh-hk', KO_KR], ['zh-mo', KO_KR], ['zh-sg', KO_KR], ['ii-cn', KO_KR],
   ['ar-sa', AR_SA], ['th-th', TH_TH], ['hi-in', HI_IN],
-  ['fa-ir', PARTIAL_CS_DIGITS], ['ur-pk', PARTIAL_CS_DIGITS],
-  ['yi-001', PARTIAL_CS_DIGITS], ['syr-sy', PARTIAL_CS_DIGITS], ['ug-cn', PARTIAL_CS_DIGITS],
+  ['fa-ir', CS_DIGITS], ['ur-pk', CS_DIGITS],
+  ['yi-001', CS_DIGITS], ['syr-sy', CS_DIGITS], ['ug-cn', CS_DIGITS],
+  ['ar-eg', CS_DIGITS], ['he', CS_DIGITS], ['ur-in', CS_DIGITS],
 ]);
 
 // The full sweep's block boundaries, including excluded/unextractable scalars.
@@ -151,6 +173,10 @@ export function powerPointFontSlot(cp: number, lang?: string): PowerPointFontSlo
   const overrides = OBSERVED_OVERRIDES.get(language);
   const observed = overrides && slotInRanges(cp, overrides);
   if (observed !== undefined) return observed;
+  if (MYANMAR_MEASURED_LANGUAGES.has(language)) {
+    const extensionSlot = slotInRanges(cp, MYANMAR_EXTENSION_EA);
+    if (extensionSlot !== undefined) return extensionSlot;
+  }
   if (cp >= 0x2018 && cp <= 0x201f && NORMATIVE_EA_QUOTE_LANGUAGES.has(language)) return 'ea';
   if (SWEPT_BLOCKS.some(([start, end]) => cp >= start && cp <= end)) {
     return slotInRanges(cp, NORMATIVE_SLOT_RANGES) ?? 'ea';

@@ -1661,6 +1661,10 @@ export function paragraphInputRuns(
     // base's font segment and a cluster never straddles two segments (one
     // stacked cell, one shaped horizontal glyph). An empty ea/cs slot draws
     // in PowerPoint's application default (issue #1627).
+    // Known evidence limit: Windows controls can split Myanmar U+1000/U+A9E5
+    // across cs/ea even within one authored run. Keep base-slot inheritance
+    // until varied shaping controls establish a general extender/itemization
+    // rule; do not special-case that pair or infer standalone-mark slots.
     let clusterStart = 0;
     let emitted = false;
     while (clusterStart < rawText.length) {

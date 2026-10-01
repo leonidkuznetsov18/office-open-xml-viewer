@@ -1,14 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import { POWERPOINT_FONT_SLOT_EVIDENCE, powerPointFontSlot } from './font-slot-compatibility.js';
+import { POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
 
 describe('PowerPoint slot compatibility evidence', () => {
-  it('matches every directly identified character/language observation', () => {
+  it('matches the original directly identified observations except the withdrawn scalar override', () => {
     // This independently recorded PDF corpus catches broadened symbol ranges,
     // lost language overrides and inverted endpoints; fallback fonts are not a
     // slot oracle. Renderer wiring is exercised in font-slot-render.test.ts.
     for (const [lang, ranges] of Object.entries(POWERPOINT_FONT_SLOT_EVIDENCE.coverage)) {
       for (const [start, end, outcome] of ranges) {
         if (outcome !== 'latin' && outcome !== 'ea' && outcome !== 'cs') continue;
+        for (let cp = start; cp <= end; cp++) {
+          // The extra cyclic controls disprove a context-independent » slot.
+          // Keep the original observation, but no longer assert it as policy.
+          if (cp === 0xbb && (lang === 'he-il' || lang === 'ar-sa')) continue;
+          expect(powerPointFontSlot(cp, lang), `${lang} U+${cp.toString(16)}`).toBe(outcome);
+        }
+      }
+    }
+  });
+
+  it('matches independently extracted cyclic controls with consistent scalar outcomes', () => {
+    for (const [lang, ranges] of Object.entries(POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE.coverage)) {
+      for (const [start, end, outcome] of ranges) {
         for (let cp = start; cp <= end; cp++) {
           expect(powerPointFontSlot(cp, lang), `${lang} U+${cp.toString(16)}`).toBe(outcome);
         }
@@ -26,7 +40,7 @@ describe('PowerPoint slot compatibility evidence', () => {
   it('uses normative defaults for unextractable symbols and retains unmeasured script policy', () => {
     expect(powerPointFontSlot(0x25aa, 'en-US')).toBe('ea');
     expect(powerPointFontSlot(0x2049, 'en-US')).toBe('ea');
-    expect(powerPointFontSlot(0x201f, 'zh-HK')).toBe('ea'); // normative; this variant is unmeasured
+    expect(powerPointFontSlot(0x201e, 'zh-HK')).toBe('ea');
     expect(powerPointFontSlot(0x1800, 'en-US')).toBe('latin'); // Mongolian: no new compatibility claim
     expect(powerPointFontSlot(0xa000, 'en-US')).toBe('latin'); // Yi: pending distinct-face controls
     expect(powerPointFontSlot(0xfe8e, 'ar-SA')).toBe('cs'); // retain Arabic shaping-script routing
@@ -35,13 +49,12 @@ describe('PowerPoint slot compatibility evidence', () => {
     expect(powerPointFontSlot(0xf0ff, 'en-US')).toBe('sym');
     expect(powerPointFontSlot(0xf100, 'en-US')).toBe('latin');
     expect(powerPointFontSlot(0x31, 'AR-sa')).toBe('cs');
-    for (const lang of ['fa-IR', 'ur-PK', 'yi-001', 'syr-SY', 'ug-CN']) {
-      expect(powerPointFontSlot(0x31, lang)).toBe('cs');
-      expect(powerPointFontSlot(0x33, lang)).toBe('cs');
-      expect(powerPointFontSlot(0x30, lang)).toBe('latin');
-      expect(powerPointFontSlot(0x34, lang)).toBe('latin');
-      expect(powerPointFontSlot(0x39, lang)).toBe('latin');
-    }
+    expect(powerPointFontSlot(0xa9e5, 'en-US')).toBe('cs'); // standalone mark is inconclusive
+    expect(powerPointFontSlot(0xa9ff, 'en-US')).toBe('latin'); // unassigned gap
+    expect(powerPointFontSlot(0xaa7b, 'my-MM')).toBe('cs'); // no standalone-mark extrapolation
+    expect(powerPointFontSlot(0xa9e0, 'fr-FR')).toBe('cs'); // unmeasured language retains policy
+    expect(powerPointFontSlot(0xbb, 'he-IL')).toBe('latin'); // withdraw unsupported scalar override
+    expect(powerPointFontSlot(0x30, 'fa')).toBe('latin'); // do not infer other region/language IDs
     expect(powerPointFontSlot(0x31, 'constructor')).toBe('latin'); // untrusted document language
   });
 });

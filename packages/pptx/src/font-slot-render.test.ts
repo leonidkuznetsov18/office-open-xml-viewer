@@ -62,15 +62,26 @@ describe('PPTX language-dependent font slots through the renderer', () => {
     expect(segments([run('“”', 'en-US', { altLang: 'ja-JP' })])[0].face).toBe('Corbel');
   });
 
-  it('selects cs for digits by lang and for the measured right guillemet only under he/ar', () => {
-    for (const lang of ['he-IL', 'ar-SA', 'th-TH', 'hi-IN', 'fa-IR', 'ur-PK', 'yi-001', 'syr-SY', 'ug-CN']) {
-      expect(segments([run('A123B', lang)]).map(({ text, face }) => [text, face]))
-        .toEqual([['A', 'Corbel'], ['123', 'Microsoft Sans Serif'], ['B', 'Corbel']]);
+  it('selects cs for all measured European digits without a scalar-only punctuation override', () => {
+    for (const lang of ['he-IL', 'ar-SA', 'th-TH', 'hi-IN', 'fa-IR', 'ur-PK', 'yi-001', 'syr-SY', 'ug-CN', 'ar-EG', 'he', 'ur-IN']) {
+      expect(segments([run('A0123456789B', lang)]).map(({ text, face }) => [text, face]))
+        .toEqual([['A', 'Corbel'], ['0123456789', 'Microsoft Sans Serif'], ['B', 'Corbel']]);
     }
     expect(segments([run('0123456789', 'en-US', { altLang: 'he-IL' })])[0].face).toBe('Corbel');
-    expect(segments([run('»', 'he-IL')])[0].face).toBe('Microsoft Sans Serif');
+    expect(segments([run('A»B', 'he-IL')])[0].face).toBe('Corbel');
     expect(segments([run('»', 'th-TH')])[0].face).toBe('Corbel');
     expect(segments([run('×÷⁇⁈“”', 'ar-SA')])[0].face).toBe('Corbel');
+  });
+
+  it('routes measured Myanmar extensions through layout and painting while keeping cluster limits', () => {
+    const text = '\u1000\ua9e0\uaa60\u1000\ua9e5';
+    expect(segments([run(text, 'my-MM')]).map(({ text, face }) => [text, face]))
+      .toEqual([['\u1000', 'Microsoft Sans Serif'], ['\ua9e0\uaa60', 'Meiryo UI'],
+        ['\u1000\ua9e5', 'Microsoft Sans Serif']]);
+    const { ctx, calls } = context();
+    renderTextBody(ctx, body([run(text, 'my-MM')]), 0, 0, 300, 100, SCALE);
+    expect(calls.find((c) => c.text.includes('\ua9e0'))?.font).toContain('"Meiryo UI"');
+    expect(calls.find((c) => c.text.includes('\u1000'))?.font).toContain('"Microsoft Sans Serif"');
   });
 
   it('measures and wraps in the selected cs face, including the shape-autofit probe', () => {

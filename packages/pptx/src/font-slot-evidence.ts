@@ -12,6 +12,7 @@
 
 export type SlotObservation = 'latin' | 'ea' | 'cs' | `fallback:${string}` | 'not-extracted';
 export type SlotCoverageRange = readonly [start: number, end: number, outcome: SlotObservation];
+export { POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE } from './font-slot-extra-evidence.js';
 
 const EN_US: readonly SlotCoverageRange[] = [
   [0x0021, 0x007E, 'latin'],
@@ -616,6 +617,8 @@ export const POWERPOINT_FONT_SLOT_EVIDENCE = {
     'th-th': TH_TH,
     'hi-in': HI_IN,
   },
+  // Original Mac controls, superseded only where the extra evidence settles
+  // a scalar/context. Preserve these observations, including historical gaps.
   // Repeated script-role controls: only Cherokee, Tamil, Thai, Bopomofo,
   // Hangul and Jamo distinguish the slot from fallback. Other scripts drew
   // the same fallback in all role permutations. Normative rules may still
