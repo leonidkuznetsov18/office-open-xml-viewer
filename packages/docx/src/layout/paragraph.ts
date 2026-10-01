@@ -1,3 +1,4 @@
+import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
 import {
@@ -157,6 +158,7 @@ import type {
   LayoutDiagnostic,
   LayoutRect,
   Matrix2DData,
+  NumberingMarkerShapeInput,
   ParagraphLayout,
   ParagraphPlacement,
   PointPt,
@@ -2272,6 +2274,8 @@ function planMeasuredLines(
   textService?: import('./text.js').TextLayoutService,
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   verticalPageFrame = false,
+  compatibilityMode?: number,
+  paragraphMarkShapeInput?: NumberingMarkerShapeInput,
 ): readonly LineLayout[] {
   let sourceOffset = 0;
   const consumedByRun = new Map<number, number>();
@@ -2288,9 +2292,16 @@ function planMeasuredLines(
     && /^[+\-(]?[\d., ]+\)?%?$/u.test(visibleText)
       ? earliestTab.pos - context.physicalIndentLeftPt
       : undefined;
+  const specifiedParagraph = specifiedTextParagraphIsHomogeneous(paragraph);
   return retainPhysicalLines(measured.lines.map((measuredLine, lineIndex) => {
     const raw = measuredLine.layout;
-    const baselinePt = plannedBaselinePt(measuredLine, context);
+    const specified = specifiedParagraph && !paragraph.numbering
+      ? specifiedTextLineMetrics(raw, context, paragraph, compatibilityMode, verticalPageFrame,
+          paragraphMarkShapeInput)
+      : null;
+    const baselinePt = specified
+      ? measuredLine.topYPt + specified.baselineOffsetPt
+      : plannedBaselinePt(measuredLine, context);
     let lineStartOffset = Number.POSITIVE_INFINITY;
     let lineEndOffset = sourceOffset;
     const segments: MeasuredLinePlanSegment[] = [];
@@ -5006,6 +5017,8 @@ export function paragraphLayoutFromMeasurement(
     occurrences, numberingPlan, options.environment.layoutServices?.text,
     options.environment.verticalGlyphMeasurement,
     options.environment.verticalPageFrame,
+    options.environment.compatibilityMode,
+    options.environment.paragraphMarkShapeInput,
   );
   if (options.sourceRangeStart !== undefined) {
     lines = rebaseMeasuredLineRanges(lines, options.sourceRangeStart);
