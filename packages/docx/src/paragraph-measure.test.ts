@@ -1225,6 +1225,20 @@ describe('float gap admission by placement', () => {
     ]);
   });
 
+  // Review round 4: emergency splitting keeps one grapheme, so a whole
+  // overwide grapheme must be rejected by its placed advance, not split index.
+  it.each(['A', 'e\u0301', '😀', '👩\u200d💻'])('rejects a gap narrower than the single grapheme %s', (value) => {
+    expect(gapLines([{ type: 'text', ...textRun(value) }], squareObstacle(2, 100))[0])
+      .toMatchObject({ top: 0, left: 100 });
+  });
+
+  it('rejects a gap narrower than a joined one-grapheme follower', () => {
+    const lines = gapLines([
+      { type: 'text', ...textRun('AB') }, { type: 'text', ...textRun('C') },
+    ], squareObstacle(12, 100));
+    expect(lines[0]).toMatchObject({ top: 0, left: 100, text: 'ABC' });
+  });
+
   it('rejects every narrower gap of a many-gap baseline with bounded work', () => {
     // Nine 10pt exclusions leave ten 10pt gaps; each 30pt word fits none.
     const obstacles = Array.from({ length: 9 }, (_, index) => squareObstacle(10 + index * 20, 20 + index * 20));
@@ -1273,12 +1287,21 @@ function atomicFloatPropertyCases() {
     () => [text('אב גד', { rtl: true, fitTextVal: 1200, fitTextId: 4 })],
     () => [text('אבג דהו זחט', { rtl: true })],
     () => [{ type: 'image', imagePath: 'test', mimeType: 'image/png', widthPt: 10 + random(80), heightPt: 10 } as { type: 'image' } & ImageRun],
+    // Single graphemes, combining and emoji ZWJ sequences, joined one-grapheme
+    // followers and a glyph wider than many gaps.
+    () => [text('A')],
+    () => [text('e\u0301')],
+    () => [text('😀')],
+    () => [text('👩\u200d💻')],
+    () => [text('AB'), text('C')],
+    () => [text('W', { fontSize: 40 })],
   ];
   return Array.from({ length: 304 }, (_, index) => {
     const rtl = random(2) === 1;
     const runs = [text('ABC '), ...constructs[index % constructs.length]!(), text(' NEXT'),
       ...constructs[random(constructs.length)]!()];
-    const left = 5 + random(120);
+    // Every fourth float leaves a leading gap narrower than one glyph.
+    const left = index % 4 === 0 ? 1 + random(4) : 5 + random(120);
     const right = left + 5 + random(195 - left);
     const float = random(3) === 0 ? tightObstacle(left, right) : squareObstacle(left, right);
     return { runs, rtl, float };

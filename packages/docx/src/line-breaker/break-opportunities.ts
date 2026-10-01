@@ -114,6 +114,20 @@ function joinedUnitStart(line: readonly LayoutSeg[]): number {
   return Math.max(0, index);
 }
 
+/** The single rollback predicate of a narrowed gap: the head unit's placed
+ * advance (from the line start, joined followers included, collapsible
+ * U+0020 suffix excluded outside RTL) exceeds the fragment. */
+function placedAdvanceExceeds(
+  context: BreakOpportunityIteratorContext,
+  segment: LayoutTextSeg,
+  placedText: string,
+): boolean {
+  const { breakerState, strAdvance, availW, fitsMeasuredWidth, baseRtl } = context;
+  // A line-end U+3000 run hangs as whitespace (word-ideographic-space hang).
+  const visible = (baseRtl ? placedText : placedText.replace(/ +$/u, '')).replace(/\u3000+$/u, '');
+  return !fitsMeasuredWidth(breakerState.currentWidth + strAdvance(segment, visible), availW());
+}
+
 function lineAdvanceFrom(line: readonly LayoutSeg[], start: number): number {
   let width = 0;
   for (let index = start; index < line.length; index += 1) {
@@ -836,8 +850,10 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     // space-delimited, so this cannot bypass an ordinary space opportunity.
     const semanticSplit = externalLinkSyntaxSplit(s, availW());
     const split = semanticSplit || emergencyTextSplit(s, availW());
-    // A URL syntax opportunity is a legal break; anything else is forced.
-    if (semanticSplit === 0 && split < s.text.length) {
+    // A URL syntax opportunity is a legal break; any other split is forced,
+    // and so is a retained prefix (even one whole grapheme) wider than the gap.
+    if ((semanticSplit === 0 && split < s.text.length)
+      || placedAdvanceExceeds(context, s, s.text.slice(0, split))) {
       context.forcedPlacement(context.minimalLegalTextWidth(s));
     }
     if (split >= s.text.length) {
@@ -893,7 +909,9 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
       const remaining = availW() - breakerState.currentWidth;
       const split = emergencyTextSplit(s, remaining, true);
       // Splitting a glued member, or letting it overflow, forces its unit.
-      if (split < s.text.length) {
+      const retained = (remaining > 0 || s.hardJoinPrev === true) && split > 0 && split < s.text.length
+        ? s.text.slice(0, split) : s.text;
+      if (split < s.text.length || placedAdvanceExceeds(context, s, retained)) {
         const unitStart = joinedUnitStart(breakerState.currentLine);
         context.forcedPlacement(
           lineAdvanceFrom(breakerState.currentLine, unitStart) + context.minimalLegalTextWidth(s),
@@ -1144,7 +1162,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     // fits; that retained prefix is forced unless a legal one exists.
     const legalSplit = kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, 0);
     const legalUtf16 = allChars.slice(0, legalSplit).join('').length;
-    if (legalTextSplitAtOrBefore(s, legalUtf16, 1) === 0) {
+    if (legalTextSplitAtOrBefore(s, legalUtf16, 1) === 0 || placedAdvanceExceeds(context, s, prefix)) {
       context.forcedPlacement(context.minimalLegalTextWidth(s));
     }
   }
@@ -1297,6 +1315,10 @@ function splitSeaOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     charSpacingDeltaPx(s, scale) >= 0 &&
     snapToCharsClass(s, characterGrid) !== 'latin';
   const split = fitSeaWordPrefix(s.text, s.seaBreaks, 0, available, measureSub, monotone);
+  if (split > 0 && breakerState.currentLine.length === 0
+    && placedAdvanceExceeds(context, s, s.text.slice(0, split))) {
+    context.forcedPlacement(context.minimalLegalTextWidth(s));
+  }
   if (split > 0) {
     const prefix = s.text.slice(0, split);
     const pw = strNaturalAdvance(s, prefix);
