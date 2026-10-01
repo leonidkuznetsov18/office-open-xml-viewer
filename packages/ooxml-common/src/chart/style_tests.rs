@@ -58,17 +58,11 @@ mod tests {
             r#"<cx:series xmlns:cx="{CX_NS}" xmlns:a="{A_NS}"><cx:dataLabels><cx:txPr><a:p><a:pPr><a:defRPr/></a:pPr></a:p></cx:txPr></cx:dataLabels></cx:series>"#
         );
         let chartex_document = root_of(&chartex_xml);
-        let budget = ChartexAllocationBudget::new(None, None);
-        let defaults = parse_chartex_series_labels(
-            chartex_document.root_element(),
-            1,
-            &StubResolver,
-            true,
-            &budget,
-        )
-        .expect("labels fit allocation budget")
-        .2
-        .unwrap();
+        let defaults =
+            parse_chartex_series_labels(chartex_document.root_element(), 1, &StubResolver, true)
+                .expect("labels fit allocation budget")
+                .2
+                .unwrap();
         assert_eq!((defaults.font_bold, defaults.font_italic), (None, None));
     }
 

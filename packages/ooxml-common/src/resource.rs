@@ -41,7 +41,7 @@ struct GovernorState {
     next_operation_id: u64,
     operations: HashMap<u64, LogicalOperationState>,
     hard_limit_totals: HashMap<HardResourceLimitKind, u64>,
-    hard_limit_part_totals: HashMap<(HardResourceLimitKind, String), u64>,
+    retained_instance_bytes: HashMap<(HardResourceLimitKind, String, String), u64>,
     first_error: Option<String>,
 }
 
@@ -284,7 +284,7 @@ impl ResourceGovernor {
             next_operation_id: 1,
             operations: HashMap::new(),
             hard_limit_totals: HashMap::new(),
-            hard_limit_part_totals: HashMap::new(),
+            retained_instance_bytes: HashMap::new(),
             first_error: None,
         })))
     }
@@ -547,74 +547,40 @@ pub fn observe_hard_limit(
     }))
 }
 
-/// Charge an allocation-like hard limit cumulatively for the package session.
+/// Retain one independently owned model instance for the package lifetime.
 ///
-/// Unlike [`observe_hard_limit`], this records every accepted increment. The
-/// counter belongs to the package governor rather than a logical operation, so
-/// separate parts and lazy operations cannot each consume a fresh allowance.
-/// Callers must charge before performing the corresponding allocation.
-pub fn charge_hard_limit(
+/// The key names both the source part and the concrete retention site. Repeated
+/// parsing of the same site (for example XLSX cursor preview and final
+/// materialization) observes only growth, while a second drawing that owns an
+/// equal model has a distinct site and is charged independently.
+pub fn retain_instance(
     kind: HardResourceLimitKind,
-    part: Option<&str>,
+    source_part: &str,
+    site: &str,
     limit: u64,
-    increment: u64,
+    bytes: u64,
 ) -> Result<(), String> {
     let Some(governor) = active_governor() else {
         return Ok(());
     };
     let mut state = governor.0.borrow_mut();
     state.assert_healthy()?;
-    let next = state
-        .hard_limit_totals
-        .get(&kind)
+    // Raw package identifiers stay internal. Public ChartEx violations omit
+    // them so filenames and relationship ids never cross the wire boundary.
+    let key = (kind, source_part.to_owned(), site.to_owned());
+    let old = state
+        .retained_instance_bytes
+        .get(&key)
         .copied()
-        .unwrap_or(0)
-        .saturating_add(increment);
-    state.hard_limit_totals.insert(kind, next);
-    if next <= limit {
-        return Ok(());
-    }
-    let (stage, resource, metric) = kind.wire_fields();
-    Err(state.fail(LimitCrossing {
-        stage,
-        resource,
-        metric,
-        part,
-        limit,
-        observed: next,
-        configurable: false,
-    }))
-}
-
-/// Observe one part's cumulative allocation-like work and charge only growth.
-///
-/// A package may parse the same OPC part more than once (for example an XLSX
-/// cursor preview followed by final materialization). Keeping the maximum seen
-/// for each `(kind, part)` makes those parses idempotent while still summing
-/// distinct parts and charging any later parse that genuinely allocates more.
-pub fn observe_part_hard_limit(
-    kind: HardResourceLimitKind,
-    part: &str,
-    limit: u64,
-    cumulative_for_part: u64,
-) -> Result<(), String> {
-    let Some(governor) = active_governor() else {
-        return Ok(());
-    };
-    let mut state = governor.0.borrow_mut();
-    state.assert_healthy()?;
-    // The raw package-session key stays internal and must distinguish every
-    // entry even when two unsafe names would share the same public redaction.
-    let key = (kind, part.to_owned());
-    let old = state.hard_limit_part_totals.get(&key).copied().unwrap_or(0);
-    let next_part = old.max(cumulative_for_part);
+        .unwrap_or(0);
+    let retained = old.max(bytes);
     let total = state
         .hard_limit_totals
         .get(&kind)
         .copied()
         .unwrap_or(0)
-        .saturating_add(next_part.saturating_sub(old));
-    state.hard_limit_part_totals.insert(key, next_part);
+        .saturating_add(retained.saturating_sub(old));
+    state.retained_instance_bytes.insert(key, retained);
     state.hard_limit_totals.insert(kind, total);
     if total <= limit {
         return Ok(());
@@ -624,8 +590,6 @@ pub fn observe_part_hard_limit(
         stage,
         resource,
         metric,
-        // ChartEx allocation violations intentionally omit package paths from
-        // the public wire error; `part` is only the internal idempotence key.
         part: None,
         limit,
         observed: total,

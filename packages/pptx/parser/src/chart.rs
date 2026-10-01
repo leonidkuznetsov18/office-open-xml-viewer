@@ -79,7 +79,7 @@ fn parse_chart_with_images(
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     is_chartex: bool,
     limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
-    allocation_part: Option<&str>,
+    retention_key: Option<ooxml_common::chart::ChartRetentionKey<'_>>,
 ) -> Option<ChartElement> {
     let doc = parse_preflighted_pptx_xml(xml).ok()?;
     let root = doc.root_element();
@@ -90,7 +90,7 @@ fn parse_chart_with_images(
     let context = ooxml_common::chart::ChartParseContext {
         host: ooxml_common::chart::ChartHost::PowerPoint,
         limit_reporter,
-        allocation_part,
+        retention_key,
         color_resolver: Some(&resolver),
         style_xml,
         color_style_xml,
@@ -239,7 +239,7 @@ pub(crate) fn parse_chartex_with_images(
     theme_format_scheme: Option<&ooxml_common::theme::ThemeFormatScheme>,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
-    allocation_part: Option<&str>,
+    retention_key: Option<ooxml_common::chart::ChartRetentionKey<'_>>,
 ) -> Option<ChartElement> {
     // The shared chart grammar reparses optional style XML after this entry.
     parse_chart_with_images(
@@ -252,7 +252,7 @@ pub(crate) fn parse_chartex_with_images(
         image_resolver,
         true,
         limit_reporter,
-        allocation_part,
+        retention_key,
     )
 }
 

@@ -3285,6 +3285,16 @@ fn parse_graphic_frame(
             if let Some(rel_target) = rels.get(&rid) {
                 let chart_path = resolve_path(slide_part, rel_target);
                 if let Ok(chart_xml) = read_zip_str(zip, &chart_path) {
+                    let graphic_frame_ordinal = node
+                        .document()
+                        .root_element()
+                        .descendants()
+                        .filter(|candidate| {
+                            candidate.is_element() && candidate.tag_name().name() == "graphicFrame"
+                        })
+                        .position(|candidate| candidate.id() == node.id())
+                        .unwrap_or(0);
+                    let retention_site = format!("graphicFrame:{graphic_frame_ordinal}");
                     let related_parts = load_chart_related_parts(zip, &chart_path);
                     let empty_theme_images =
                         ooxml_common::chart::ChartImageRelationships::default();
@@ -3309,7 +3319,10 @@ fn parse_graphic_frame(
                                     theme_source.format_scheme(),
                                     &image_resolver,
                                     Some(&reporter),
-                                    Some(&chart_path),
+                                    Some(ooxml_common::chart::ChartRetentionKey {
+                                        source_part: slide_part,
+                                        site: &retention_site,
+                                    }),
                                 )
                             })
                     } else {

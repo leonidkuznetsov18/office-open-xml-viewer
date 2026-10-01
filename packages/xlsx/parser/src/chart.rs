@@ -550,6 +550,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
         // size, ECMA-376 §20.5.2.24), or `<xdr:absoluteAnchor>` (absolute
         // `<xdr:pos x y>` + extent, §20.5.2.1; the normal chart-sheet form).
         // All three must produce the same bounded ChartAnchor wire shape.
+        let mut chart_anchor_ordinal = 0usize;
         for anchor in draw_doc
             .root_element()
             .children()
@@ -659,6 +660,8 @@ pub(crate) fn load_sheet_charts_with_theme_images(
             let mut graphic_frames = Vec::new();
             collect_selected_graphic_frames(anchor, &mut graphic_frames);
             for graphic_frame in graphic_frames {
+                let retention_site = format!("anchor:{chart_anchor_ordinal}");
+                chart_anchor_ordinal = chart_anchor_ordinal.saturating_add(1);
                 // ECMA-376 §20.1.2.2.8 CT_NonVisualDrawingProps@hidden: a hidden
                 // chart's own graphicFrame is not rendered.
                 if crate::drawing::xdr_node_hidden(&graphic_frame) {
@@ -771,7 +774,10 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                     }),
                 );
                 chart_context.limit_reporter = Some(&reporter);
-                chart_context.allocation_part = Some(&chart_path);
+                chart_context.retention_key = Some(ooxml_common::chart::ChartRetentionKey {
+                    source_part: &drawing_path,
+                    site: &retention_site,
+                });
                 chart_context.host = ooxml_common::chart::ChartHost::Excel;
                 let chart_opt = if is_chartex {
                     ooxml_common::chart::parse_chartex_part(

@@ -3,44 +3,40 @@ mod tests {
     use super::super::*;
 
     #[test]
-    fn chartex_heap_allocations_use_the_budget_gateway() {
-        let source = include_str!("chartex.rs");
-        let (_, after_begin) = source
-            .split_once("CHARTEX_ALLOCATION_GATEWAY_BEGIN")
-            .expect("allocation gateway begin marker");
-        let (_, after_gateway) = after_begin
-            .split_once("CHARTEX_ALLOCATION_GATEWAY_END")
-            .expect("allocation gateway end marker");
-        let before_gateway = source
-            .split_once("CHARTEX_ALLOCATION_GATEWAY_BEGIN")
-            .map(|(before, _)| before)
-            .expect("allocation gateway");
-        let parser_source = format!("{before_gateway}{after_gateway}");
-        for forbidden in [
-            "Vec::new(",
-            "Vec::with_capacity(",
-            "vec![",
-            "String::new(",
-            "Box::new(",
-            ".collect()",
-            ".collect::<Vec",
-            ".extend(",
-            ".reserve(",
-            ".reserve_exact(",
-            ".resize(",
-            "series[0].clone()",
+    fn chartex_retained_accounting_covers_every_model_type() {
+        let parser = include_str!("chartex.rs");
+        for removed_gateway in [
+            "ChartexAllocationBudget",
+            "budget.charge(",
+            "budget.vec_",
+            "budget.clone_series(",
         ] {
             assert!(
-                !parser_source.contains(forbidden),
-                "ChartEx heap allocation bypasses ChartexAllocationBudget: {forbidden}"
+                !parser.contains(removed_gateway),
+                "obsolete allocation-site accounting remains: {removed_gateway}"
             );
         }
-        for line in parser_source.lines().filter(|line| line.contains(".push(")) {
+
+        let model = include_str!("model.rs");
+        let retained = include_str!("retained.rs");
+        for line in model.lines().map(str::trim) {
+            let name = line
+                .strip_prefix("pub struct ")
+                .or_else(|| line.strip_prefix("pub enum "))
+                .and_then(|rest| rest.split([' ', '{', '(']).next());
+            let Some(name) = name else { continue };
             assert!(
-                line.contains("budget.push("),
-                "ChartEx Vec growth bypasses ChartexAllocationBudget: {line}"
+                retained.contains(&format!("impl_retained_struct!({name} "))
+                    || retained.contains(&format!("impl RetainedBytes for {name}")),
+                "{name} is missing structural retained-byte accounting"
             );
         }
+        assert!(
+            !retained
+                .lines()
+                .any(|line| line.trim() == ".." || line.contains("..,")),
+            "RetainedBytes destructuring must stay exhaustive"
+        );
     }
 
     fn allocation_chart(counts: &[usize], shared: bool) -> String {
@@ -58,6 +54,87 @@ mod tests {
         format!(
             r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData>{data}</cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
         )
+    }
+
+    fn formula_allocation_chart(count: usize) -> String {
+        format!(
+            r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:strDim type="cat"><cx:f>Sheet1!$A$1:$A${count}</cx:f></cx:strDim><cx:numDim type="val"><cx:f>Sheet1!$B$1:$B${count}</cx:f></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        )
+    }
+
+    fn later_owner_pareto_chart() -> String {
+        r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">A</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">1</cx:pt></cx:lvl></cx:numDim></cx:data><cx:data id="1"><cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">2</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series><cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series><cx:series layoutId="paretoLine" ownerIdx="1"><cx:dataId val="1"/></cx:series></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#.to_owned()
+    }
+
+    fn shared_rich_run_chart(series_count: usize, run_count: usize) -> String {
+        let runs = r#"<a:r><a:rPr typeface="Fixture"/><a:t>X</a:t></a:r>"#.repeat(run_count);
+        allocation_chart(&vec![1; series_count], true)
+            .replacen(
+                "xmlns:cx=",
+                r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:cx="#,
+                1,
+            )
+            .replacen(
+                r#"<cx:dataId val="0"/></cx:series>"#,
+                &format!(r#"<cx:dataId val="0"/><cx:dataLabels><cx:dataLabel idx="0"><cx:txPr><a:bodyPr/><a:lstStyle/><a:p>{runs}</a:p></cx:txPr></cx:dataLabel></cx:dataLabels></cx:series>"#),
+                1,
+            )
+    }
+
+    fn canonical_retention(xml: &str) -> (u64, ChartexBuild) {
+        let document = root_of(xml);
+        let root = document.root_element();
+        let lower = chartex_preparse_lower_bound(root).expect("fixture stays below the ceiling");
+        let mut references = EmptyChartReferenceResolver;
+        let canonical = build_chartex_canonical(
+            root,
+            &FixtureResolver,
+            None,
+            None,
+            &mut references,
+            &EmptyChartImageResolver,
+        );
+        (lower, canonical)
+    }
+
+    #[test]
+    fn chartex_preparse_bound_never_exceeds_canonical_retention() {
+        for xml in [
+            allocation_chart(&[1, 8, 32], false),
+            allocation_chart(&[4096; 32], true),
+            allocation_chart(&[4; 4], true).replace("clusteredColumn", "boxWhisker"),
+            formula_allocation_chart(4096),
+            shared_rich_run_chart(4, 8),
+        ] {
+            let (lower, canonical) = canonical_retention(&xml);
+            assert!(lower <= canonical.retained_bytes());
+        }
+    }
+
+    #[test]
+    fn chartex_projection_never_adds_retained_bytes() {
+        let matrices = [
+            allocation_chart(&[1, 8, 32], false),
+            allocation_chart(&[4096; 32], true),
+            allocation_chart(&[4; 4], true).replace("clusteredColumn", "boxWhisker"),
+            formula_allocation_chart(4096),
+            later_owner_pareto_chart(),
+            shared_rich_run_chart(4, 8),
+        ];
+        for xml in matrices {
+            for host in [
+                ChartHost::Unspecified,
+                ChartHost::Word,
+                ChartHost::Excel,
+                ChartHost::PowerPoint,
+            ] {
+                let (_, canonical) = canonical_retention(&xml);
+                let retained = canonical.retained_bytes();
+                if let Some(projected) = canonical.project(host) {
+                    assert!(projected.heap_bytes() <= retained, "{host:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -233,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn chartex_budget_covers_empty_series_and_nested_rich_run_clones() {
+    fn chartex_retained_measure_covers_empty_series_and_nested_rich_run_clones() {
         let empty_series = allocation_chart(&vec![0; 10_000], true);
         let runs = r#"<a:r><a:t>X</a:t></a:r>"#.repeat(1024);
         // 128 clones of a 1,024-run label exceed the byte ceiling while
@@ -271,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn chartex_allocation_budget_is_document_scoped_and_part_idempotent() {
+    fn chartex_retention_is_document_scoped_and_site_idempotent() {
         use crate::package_session::PackageSessionHandle;
         use crate::resource::OoxmlFormat;
         use std::io::{Cursor, Write};
@@ -304,14 +381,17 @@ mod tests {
                     let context = ChartParseContext {
                         host,
                         limit_reporter: Some(&reporter),
-                        allocation_part: Some("charts/chart1.xml"),
+                        retention_key: Some(ChartRetentionKey {
+                            source_part: "charts/chart1.xml",
+                            site: "test",
+                        }),
                         ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
                     };
                     parse_chartex_part(doc.root_element(), &context)
                         .ok_or_else(|| "first chart unexpectedly rejected".to_string())?;
                     Ok(())
                 })
-                .expect("first chart consumes the exact document budget");
+                .expect("first retained chart fits the document ceiling");
 
             package
                 .run_operation("second-chart", |operation| {
@@ -320,28 +400,34 @@ mod tests {
                     let context = ChartParseContext {
                         host,
                         limit_reporter: Some(&reporter),
-                        allocation_part: Some("charts/chart1.xml"),
+                        retention_key: Some(ChartRetentionKey {
+                            source_part: "charts/chart1.xml",
+                            site: "test",
+                        }),
                         ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
                     };
                     let _ = parse_chartex_part(doc.root_element(), &context);
                     Ok(())
                 })
-                .expect("reparsing the same part must be idempotent");
+                .expect("reparsing the same retention site must be idempotent");
 
             let error = package
-                .run_operation("distinct-chart", |operation| {
+                .run_operation("distinct-retention-site", |operation| {
                     let reporter = operation.limit_reporter()?;
                     let doc = root_of(&xml);
                     let context = ChartParseContext {
                         host,
                         limit_reporter: Some(&reporter),
-                        allocation_part: Some("charts/chart2.xml"),
+                        retention_key: Some(ChartRetentionKey {
+                            source_part: "charts/chart1.xml",
+                            site: "second-drawing",
+                        }),
                         ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
                     };
                     let _ = parse_chartex_part(doc.root_element(), &context);
                     Ok(())
                 })
-                .expect_err("distinct parts must share the document ceiling");
+                .expect_err("distinct retained copies must share the document ceiling");
             assert!(error.contains("chartex-allocation"), "{host:?}: {error}");
         }
     }
@@ -357,7 +443,7 @@ mod tests {
             "</cx:data>",
             r#"<cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">A</cx:pt></cx:lvl></cx:strDim></cx:data>"#,
         );
-        for xml in [implicit, legacy, categories] {
+        for xml in [implicit, legacy] {
             let doc = root_of(&xml);
             assert!(
                 parse_chartex_part(
@@ -368,6 +454,12 @@ mod tests {
                 "standalone parsing must also fail closed"
             );
         }
+        let doc = root_of(&categories);
+        assert!(parse_chartex_part(
+            doc.root_element(),
+            &ChartParseContext::new(&FixtureResolver, None, None, None, None)
+        )
+        .is_some());
         let unused = allocation_chart(&[32], true).replace(
             "</cx:chartData>",
             r#"<cx:data id="unused"><cx:numDim type="val"><cx:lvl ptCount="1048576"/></cx:numDim></cx:data></cx:chartData>"#,
@@ -1380,17 +1472,10 @@ mod tests {
         );
         let count_doc = chart_space_of(&huge_count);
         let mut references = EmptyChartReferenceResolver;
-        let budget = ChartexAllocationBudget::new(None, None);
+        assert!(chartex_string_levels(count_doc.root_element(), &mut references).is_none());
         assert!(
-            chartex_string_levels(count_doc.root_element(), &mut references, &budget).is_none()
+            chartex_number_values(count_doc.root_element(), &["size"], &mut references,).is_none()
         );
-        assert!(chartex_number_values(
-            count_doc.root_element(),
-            &["size"],
-            &mut references,
-            &budget,
-        )
-        .is_none());
 
         let huge_index = format!(
             r#"<cx:chartSpace xmlns:cx="{CX_NS}">
@@ -1401,17 +1486,10 @@ mod tests {
             </cx:chartSpace>"#,
         );
         let index_doc = chart_space_of(&huge_index);
-        let budget = ChartexAllocationBudget::new(None, None);
+        assert!(chartex_string_levels(index_doc.root_element(), &mut references).is_none());
         assert!(
-            chartex_string_levels(index_doc.root_element(), &mut references, &budget).is_none()
+            chartex_number_values(index_doc.root_element(), &["size"], &mut references,).is_none()
         );
-        assert!(chartex_number_values(
-            index_doc.root_element(),
-            &["size"],
-            &mut references,
-            &budget,
-        )
-        .is_none());
 
         let aggregate = format!(
             r#"<cx:chartSpace xmlns:cx="{CX_NS}">
@@ -1421,10 +1499,7 @@ mod tests {
             </cx:chartSpace>"#,
         );
         let aggregate_doc = chart_space_of(&aggregate);
-        let budget = ChartexAllocationBudget::new(None, None);
-        assert!(
-            chartex_string_levels(aggregate_doc.root_element(), &mut references, &budget).is_none()
-        );
+        assert!(chartex_string_levels(aggregate_doc.root_element(), &mut references).is_none());
     }
 
     /// (b) Treemap: the same deepest→root category levels as sunburst, plus the
@@ -1766,10 +1841,8 @@ mod tests {
         // series: authored provenance remains, but no structured recipe is
         // expanded for an arbitrary prefix of the chart.
         for series in series {
-            let budget = ChartexAllocationBudget::new(None, None);
-            let (_, _, defaults) =
-                parse_chartex_series_labels(series, 1, &FixtureResolver, false, &budget)
-                    .expect("labels fit allocation budget");
+            let (_, _, defaults) = parse_chartex_series_labels(series, 1, &FixtureResolver, false)
+                .expect("labels fit allocation budget");
             let label_box = defaults
                 .as_ref()
                 .and_then(|labels| labels.label_box.as_ref())
