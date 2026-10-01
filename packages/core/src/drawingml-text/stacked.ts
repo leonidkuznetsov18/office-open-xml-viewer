@@ -147,7 +147,12 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
         if (seg.type === 'text') return options.glyphs(seg.text, seg.style);
         if (seg.type === 'object') {
           if (!options.objectGlyph) throw new Error('Stacked inline objects require a host object adapter');
-          return [options.objectGlyph(seg)];
+          const glyph = options.objectGlyph(seg);
+          // Library fallback policy: a zero-size object (unavailable OMML in
+          // PPTX) contributes no inline glyph. Keep the breaker's display
+          // boundaries so an otherwise empty column uses the paragraph mark,
+          // just as the host's empty horizontal line does (§22.1.2.77–78).
+          return glyph.advance === 0 && glyph.thickness === 0 ? [] : [glyph];
         }
         return [];
       });

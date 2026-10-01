@@ -225,35 +225,15 @@ describe('cluster segmentation cost', () => {
   }, 60_000);
 });
 
-it.each(['wordArtVert', 'wordArtVertRtl'])('%s paints an atomic upright equation through core stacked layout', async (vert) => {
-  const b = body('A', vert);
-  const text = b.paragraphs[0].runs[0] as TextRunData;
-  b.paragraphs[0].runs = [text,
-    { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'italic' }], display: false, fontSize: 24 },
-    { ...text, text: 'B' }];
-  await prepareSlideMath({ elements: [{ type: 'shape', textBody: b }] } as unknown as import('./types.js').Slide, {
-    loadMathJax: async () => {},
-    mathMLToSvg: async () => ({ svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 }),
-  });
-  const { ctx, calls, images } = mockCtx();
-  renderTextBody(ctx, b, 0, 0, 200, 300, SCALE);
-  expect(calls.map((c) => c.text)).toEqual(['A', 'B']);
-  expect(images).toHaveLength(1);
-  expect(images[0]).toMatchObject({ w: 72, h: 48, rot: 0 });
-  expect(images[0].x + 36).toBeCloseTo(calls[0].x);
-  expect(images[0].y).toBeCloseTo(3.6 + CELL);
-  expect(calls[1].y - calls[0].y).toBeCloseTo(CELL + 48);
-});
-
-// Optional engines and resource failures follow the horizontal host contract,
-// including display equations and the absence of console warnings.
-it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation failure treatment in both stacked modes', async (failure) => {
+// Compare cached and unavailable OMML geometry with the horizontal host rule.
+it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation geometry in both stacked modes', async (failure) => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
   const error = vi.spyOn(console, 'error').mockImplementation(() => {});
   if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
   try {
     for (const display of [false, true]) {
       const outcomes = [];
+      let horizontalImage: { w: number; h: number } | undefined;
       for (const vert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
         warn.mockClear(); error.mockClear();
         const equation = { type: 'math' as const, nodes: [{ kind: 'run' as const, text: 'x', style: 'italic' as const }], display, fontSize: 18 };
@@ -272,9 +252,53 @@ it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves hor
         }
         const { ctx, calls, images } = mockCtx();
         renderTextBody(ctx, b, 0, 0, 300, 300, SCALE);
+        if (failure === 'cached') {
+          expect(images).toHaveLength(1);
+          const image = images[0];
+          expect(image).toMatchObject({ w: 54, h: 36, rot: 0 });
+          if (vert === 'horz') {
+            horizontalImage = image;
+            if (!display) {
+              expect(image.x - calls[0].x).toBeCloseTo(14.4);
+              expect(calls[1].x - image.x).toBeCloseTo(image.w);
+              expect(calls[1].y).toBeCloseTo(calls[0].y);
+            } else {
+              expect(image.y).toBeGreaterThan(calls[0].y);
+              expect(calls[1].y).toBeGreaterThan(image.y + image.h);
+            }
+          } else {
+            expect(image.w).toBe(horizontalImage!.w);
+            expect(image.h).toBe(horizontalImage!.h);
+            const sign = vert === 'wordArtVert' ? 1 : -1;
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display ? sign * (CELL + image.w) : 0);
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 0 : CELL + image.h);
+            expect(image.x + image.w / 2 - calls[0].x).toBeCloseTo(display ? sign * (CELL + image.w) / 2 : 0);
+            expect(image.y).toBeCloseTo(3.6 + (display ? 0 : CELL));
+          }
+        } else {
+          // Horizontal reserves a blank display line, but no inline advance.
+          // Its stacked counterpart uses the mark cell for that blank column.
+          const control = mockCtx();
+          const blank = { ...b, paragraphs: [{ ...b.paragraphs[0], runs: [text,
+            ...(display ? [{ type: 'break' as const }, { type: 'break' as const }] : []),
+            { ...text, text: 'B' }] }] };
+          renderTextBody(control.ctx, blank, 0, 0, 300, 300, SCALE);
+          if (vert !== 'horz') {
+            expect(calls).toEqual(control.calls);
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display
+              ? (vert === 'wordArtVert' ? 2 * CELL : -2 * CELL) : 0);
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 0 : CELL);
+          } else {
+            const lines = layoutParagraph(ctx, b.paragraphs[0], 300, 24, '#000', SCALE, 0);
+            expect(lines).toHaveLength(display ? 3 : 1);
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display ? 0 : 14.4);
+            // Mock font box = 1.1 em; horizontal default line leading = -1.2 px.
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 2 * (24 * 1.1 - 1.2) : 0);
+          }
+        }
         const outcome = { text: calls.map((c) => c.text).join(''), images: images.length,
           warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
-        expect(outcome).toEqual({ text: 'AB', images: 0, warnings: [], errors: [] });
+        expect(outcome).toEqual({ text: 'AB', images: failure === 'cached' ? 1 : 0, warnings: [], errors: [] });
         outcomes.push(outcome);
       }
       expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);

@@ -100,35 +100,15 @@ describe('Excel DrawingML stacked WordArt', () => {
 
 });
 
-// Non-square extents detect use of horizontal width as the column advance.
-it.each(['wordArtVert', 'wordArtVertRtl'])('%s retains an upright equation between text runs', async (vert) => {
-  const txt = body(vert);
-  const text = txt.paragraphs[0].runs[0] as Extract<import('./types.js').ShapeTextRun, { type: 'text' }>;
-  txt.paragraphs[0].runs = [{ ...text, text: 'A' },
-    { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'italic' }], display: false, fontSize: 18 },
-    { ...text, text: 'B' }];
-  await prepareWorksheetMath({ shapeGroups: [{ shapes: [{ text: txt }] }] } as unknown as Worksheet, {
-    loadMathJax: async () => {},
-    mathMLToSvg: async () => ({ svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 }),
-  });
-  const { ctx, calls, images } = record();
-  drawShapeText(ctx, txt, 300, 300, 1);
-  expect(calls.map((c) => c.text)).toEqual(['A', 'B']);
-  expect(images).toHaveLength(1);
-  expect(images[0]).toMatchObject({ w: 72, h: 48, angle: 0 });
-  expect(images[0].x + 36).toBeCloseTo(calls[0].x);
-  expect(calls[1].y - calls[0].y).toBeCloseTo(images[0].y + 48);
-});
-
-// Optional engines and resource failures follow the horizontal host contract,
-// including display equations and the absence of console warnings.
-it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation failure treatment in both stacked modes', async (failure) => {
+// Compare cached and unavailable OMML geometry with the horizontal host rule.
+it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation geometry in both stacked modes', async (failure) => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
   const error = vi.spyOn(console, 'error').mockImplementation(() => {});
   if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
   try {
     for (const display of [false, true]) {
       const outcomes = [];
+      let horizontalImage: { w: number; h: number } | undefined;
       for (const vert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
         warn.mockClear(); error.mockClear();
         const equation = { type: 'math' as const, nodes: [{ kind: 'run' as const, text: 'x', style: 'italic' as const }], display, fontSize: 18 };
@@ -147,13 +127,46 @@ it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves hor
         }
         const { ctx, calls, images } = record();
         drawShapeText(ctx, b, 300, 300, 1);
-        // Skipped display math must not introduce a break or reserve a cell.
-        const control = record();
-        drawShapeText(control.ctx, { ...b, paragraphs: [{ ...b.paragraphs[0], runs: b.paragraphs[0].runs.filter((r) => r.type !== 'math') }] }, 300, 300, 1);
-        expect(calls).toEqual(control.calls);
+        if (failure === 'cached') {
+          expect(images).toHaveLength(1);
+          const image = images[0];
+          expect(image).toMatchObject({ w: 72, h: 48, angle: 0 });
+          if (vert === 'horz') {
+            horizontalImage = image;
+            if (!display) {
+              expect(image.x - calls[0].x).toBeCloseTo(10);
+              expect(calls[1].x - image.x).toBeCloseTo(image.w);
+              expect(calls[1].y).toBeCloseTo(calls[0].y);
+            } else {
+              expect(image.y).toBeGreaterThan(calls[0].y);
+              expect(calls[1].y).toBeGreaterThan(image.y + image.h);
+            }
+          } else {
+            expect(image.w).toBe(horizontalImage!.w);
+            expect(image.h).toBe(horizontalImage!.h);
+            const cell = (7 / 6) * (2288 / 2048) * 24;
+            const sign = vert === 'wordArtVert' ? 1 : -1;
+            expect(calls[1].x - calls[0].x).toBeCloseTo(display ? sign * (cell + image.w) : 0);
+            expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 0 : cell + image.h);
+            expect(image.x + image.w / 2 - calls[0].x).toBeCloseTo(display ? sign * (cell + image.w) / 2 : 0);
+            expect(image.y).toBeCloseTo(display ? 0 : cell);
+          }
+        } else {
+          // Horizontal omits unavailable math, including its display boundary.
+          const control = record();
+          drawShapeText(control.ctx, { ...b, paragraphs: [{ ...b.paragraphs[0], runs: b.paragraphs[0].runs.filter((r) => r.type !== 'math') }] }, 300, 300, 1);
+          expect(calls).toEqual(control.calls);
+          if (vert === 'horz') {
+            expect(calls[0].x).toBeCloseTo(0);
+            expect(calls[0].y).toBeCloseTo(control.calls[0].y);
+          } else {
+            expect(calls[1].x).toBeCloseTo(calls[0].x);
+            expect(calls[1].y - calls[0].y).toBeCloseTo((7 / 6) * (2288 / 2048) * 24);
+          }
+        }
         const outcome = { text: calls.map((c) => c.text).join(''), images: images.length,
           warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
-        expect(outcome).toEqual({ text: 'AB', images: 0, warnings: [], errors: [] });
+        expect(outcome).toEqual({ text: 'AB', images: failure === 'cached' ? 1 : 0, warnings: [], errors: [] });
         outcomes.push(outcome);
       }
       expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);

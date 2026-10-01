@@ -4327,8 +4327,8 @@ function renderStackedTextBody(
     drawObject: (style, x, y) => {
       const equation = style.math!;
       const render = mathRenders.get(equation.nodes);
-      // Match horizontal paint: optional/failed math stays a zero-size object,
-      // preserving its authored display boundary without ink or a warning.
+      // Match horizontal paint: optional/failed math has no ink or warning.
+      // Core stacked layout preserves the display boundary's blank column.
       if (!render) return;
       const height = equation.ascent + equation.descent;
       if (equation.width > 0 && height > 0) {
