@@ -1,7 +1,7 @@
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { TabStop } from '../types';
 import type { KinsokuRules } from '@silurus/ooxml-core';
-import { wordMinLineStartPx, type PreparedFloatWrap } from '../float-layout.js';
+import { type PreparedFloatWrap } from '../float-layout.js';
 import type {
   MeasurementTextContext,
   VerticalGlyphMeasurementService,
@@ -24,6 +24,7 @@ import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
 import {
+  performMinimumLineStartWidth,
   performSameLatinSpaceFace,
   performMaterializeLatinSpaceCompression,
   performStartLine,
@@ -126,29 +127,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
       ? characterGrid.characterPitchPt * scale
       : null;
 
-  // Square-only compatibility side-space (px) a CONTENT line needs before it may
-  // START beside a square object rather than flow below its band.
-  // `word-square-line-start-one-inch` supplies the requirement through
-  // wordMinLineStartPx(scale), independent of a content line's text. The same
-  // threshold applies to a short token and a long word; a word that overruns
-  // the side gap is force-broken there by the overlong-word path. This replaced
-  // a per-line first-atomic-token
-  // width probe that wedged short-token lines into sub-inch gaps and refused
-  // ≥1-inch gaps to long-word lines (issue #676). Shared by the paint pass and the
-  // paginator's two mirror layouts (they call layoutLines with scale 1), so the
-  // flow/beside decision agrees across passes.
-  //
-  // NOTE — this 1-inch rule is the CONTENT-line threshold. A literally-empty
-  // paragraph's pilcrow is placed by resolveEmptyMarkTop / flowMarkLine
-  // (renderer.ts) against the NARROWER pilcrow-em threshold. An anchorHost-only
-  // paragraph still enters layoutLines so its anchor-character metrics size the
-  // mark line, but `isParagraphMarkOnlyFlow` selects the same narrow threshold
-  // for its first line. `word-empty-mark-float-side-gap` supplies that narrower
-  // threshold. #676 over-generalized one inch onto marks; inline
-  // content (including a content paragraph's trailing-break final line) keeps
-  // the square-only 1-inch rule. Tight/through are governed by their polygon
-  // openings (§20.4.2.18/.19), for which there is no corresponding evidence.
-  const minLineStartWidth = (): number => wordMinLineStartPx(scale);
+  const minLineStartWidth = (boundary?: LineBoundary): number =>
+    performMinimumLineStartWidth(operationState, boundary);
   const isParagraphMarkOnlyFlow =
     segs.length > 0 &&
     segs.every(
@@ -159,9 +139,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
 
   // Compute wrap constraints for a new line about to start. Mutates
   // lineXOffset/lineMaxWidth/currentLineTopY. `minWidth` is the smallest clear
-  // square side-space the upcoming line must have to START here. Polygon wraps
-  // receive MIN_LINE_GAP separately so the compatibility policy cannot erase a
-  // through opening explicitly permitted by §20.4.2.18.
+  // side-space the upcoming atom needs. Square and polygon gaps receive the
+  // same atom requirement; the geometry solver retains its numeric floor.
   const startLine = (minWidth: number = 0): void => performStartLine(operationState, minWidth);
 
   // Intrinsic acquisition deliberately disables automatic line wrapping while
@@ -420,6 +399,36 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
   else if (breakerState.trailingBreakFontSize !== null) flush(breakerState.trailingBreakFontSize);
 
+  // Gap fragments on a physical baseline share the tallest line metrics. The
+  // next convergence pass probes every fragment with that same band, so a
+  // taller later gap cannot silently collide with a polygon above/below it.
+  for (let start = 0; start < breakerState.lines.length;) {
+    let end = start + 1;
+    const first = breakerState.lines[start];
+    while (first.topY !== undefined && end < breakerState.lines.length
+      && breakerState.lines[end].topY === first.topY) end += 1;
+    if (end > start + 1) {
+      const metrics = {
+        ascent: 0, descent: 0, intendedSingle: 0, latinGridCountSingle: 0, gridCountSingle: 0,
+        visibleAscent: 0, visibleDescent: 0, visibleIntendedSingle: 0, hasRuby: false, eastAsian: false,
+      };
+      for (let index = start; index < end; index += 1) {
+        const line = breakerState.lines[index];
+        metrics.ascent = Math.max(metrics.ascent, line.ascent);
+        metrics.descent = Math.max(metrics.descent, line.descent);
+        metrics.intendedSingle = Math.max(metrics.intendedSingle, line.intendedSingle);
+        metrics.latinGridCountSingle = Math.max(metrics.latinGridCountSingle, line.latinGridCountSingle ?? 0);
+        metrics.gridCountSingle = Math.max(metrics.gridCountSingle, line.gridCountSingle ?? 0);
+        metrics.visibleAscent = Math.max(metrics.visibleAscent, line.visibleAscent ?? line.ascent);
+        metrics.visibleDescent = Math.max(metrics.visibleDescent, line.visibleDescent ?? line.descent);
+        metrics.visibleIntendedSingle = Math.max(metrics.visibleIntendedSingle, line.visibleIntendedSingle ?? line.intendedSingle);
+        metrics.hasRuby ||= line.hasRuby ?? false;
+        metrics.eastAsian ||= line.eastAsian ?? false;
+      }
+      for (let index = start; index < end; index += 1) Object.assign(breakerState.lines[index], metrics);
+    }
+    start = end;
+  }
   finalizeRetainedLineShapes(breakerState.lines, widthPolicy, measureText);
 
   return breakerState.lines;

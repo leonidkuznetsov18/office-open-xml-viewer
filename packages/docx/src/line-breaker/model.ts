@@ -81,6 +81,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   fontRoute?: CanvasFontRoute;
   /** Selected-route line ratio. It may come from parsed font bytes or a bounded
    * Canvas measurement; the latter does not reveal OpenType table identity. */
+  /** Admitted reference profile has no Far East code-page bits; its Latin
+   * single-line design height owns whole line-grid cells (#1674). */
+  resolvedLatinGridCellAllocation?: boolean;
   resolvedLineHeightRatio?: number;
   /** A selected route supplied this ratio from measured or parsed geometry. */
   resolvedResourceVerticalMetric?: true;
@@ -429,6 +432,8 @@ export interface LayoutLine {
   intendedSingle: number;
   /** Text-face single line that supplies automatic leading to an inline picture. */
   inlinePictureTextSingle?: number;
+  /** Admitted Latin design height; native fallback boxes do not establish grid cells. */
+  latinGridCountSingle?: number;
   /** Registered compatibility allocation for a uniform positioned, visible run. */
   uniformPositionAuto?: Readonly<{ normalSinglePx: number; positionPx: number; designDescentPx: number }>;
   /** px — DESIGN grid-count height: the max over segments of each run's
@@ -467,6 +472,7 @@ export interface LayoutLine {
 
 /** Additional context passed to layoutLines so it can honor floats on the current page. */
 export interface WrapLayoutCtx {
+  hasExclusions?: boolean;
   startPageY: number;   // absolute canvas Y where the first line should start
   paraX: number;        // absolute canvas X of the paragraph's INDENTED text left edge
   /** Absolute canvas X of the paragraph's raw COLUMN left edge. Distinct from
@@ -480,13 +486,13 @@ export interface WrapLayoutCtx {
   /** Minimum clear side-gap for an anchor-host-only paragraph mark. Such a
    *  zero-advance metric placeholder preserves the anchor character's line box,
    *  but is not inline content and therefore keeps the pilcrow-em threshold
-   *  instead of the 1-inch content-line threshold (issue #676). */
+   *  like visible content admitted by its next atom (#1670). */
   paragraphMarkLineStartWidth?: number;
   /** Placement-aware wrap boundary used by paragraph measurement. */
   lineWindow?: (input: {
     topYPt: number;
     minimumStartWidthPt: number;
-    /** `word-square-line-start-one-inch`, active only for a square object. */
+    /** Required atomic start width for a square-constrained gap. */
     squareMinimumStartWidthPt?: number;
     probeHeightPt: number;
     paragraphXPt: number;
@@ -509,7 +515,7 @@ export interface WrapLayoutCtx {
   /** Per-line box-height resolver (line natural ascent+descent → total px box height).
    *  `gridCountSinglePx` (the line's design grid-count height) keeps the
    *  float-wrap advance consistent with the final render's docGrid cell count. */
-  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number) => number;
+  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number, latinGridCountSingle?: number) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;
 }

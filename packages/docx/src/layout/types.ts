@@ -534,6 +534,9 @@ export type ParagraphPlacement =
   | DrawingPlacement;
 
 export interface LineLayout {
+  /** Occupied float gap, independent of alignment/text ink. Paint uses this
+   * retained allocation for paragraph shading without filling the obstacle. */
+  readonly wrapBounds?: LayoutRect;
   readonly range: TextRange;
   readonly bounds: LayoutRect;
   readonly baselinePt: number;
@@ -606,6 +609,7 @@ export interface ParagraphFlowEvent {
 
 export interface ParagraphMarkLayout {
   readonly hidden: boolean;
+  readonly wrapBounds?: LayoutRect;
   readonly bounds: LayoutRect;
 }
 

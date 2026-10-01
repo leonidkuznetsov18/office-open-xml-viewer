@@ -904,3 +904,14 @@ export function wordRubyUniformLineHeightPx(
 ): number {
   return hasRuby ? Math.max(0, ...lineHeightsPx) : 0;
 }
+
+export const WORD_LATIN_DESIGN_GRID_CELLS = defineCompatibilityRule({
+  id: 'word-latin-design-grid-cells',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'float-grid-picture-origin',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: 'Issue #1674 modes 14/15 controls reserve 20/40/40pt for 10/20/30pt Arial single lines on a 20pt grid, including a preceding 20pt line. No-grid and snap-off controls retain natural advances. Apply whole-cell counting only to visible text with an admitted non-Far-East reference design profile. Far-East reference faces, native fallback boxes, empty marks, ruby, explicit multiples and exact/atLeast spacing retain their established paths. Exact/atLeast baseline residuals up to 5.45pt are unresolved; no empirical baseline correction is established by these controls.',
+});
+
+export function wordLatinDesignGridSingleHeight(natural: number, pitch: number, admittedDesign: number): number {
+  return admittedDesign > 0 ? Math.max(1, Math.ceil(admittedDesign / pitch)) * pitch : Math.max(natural, pitch);
+}

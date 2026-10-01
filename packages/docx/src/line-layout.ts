@@ -141,6 +141,7 @@ export function layoutLines(
         line.gridCountSingle,
         line.uniformPositionAuto,
         line.inlinePictureTextSingle,
+        line.latinGridCountSingle,
       ),
     );
   }

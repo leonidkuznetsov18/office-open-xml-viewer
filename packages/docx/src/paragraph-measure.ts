@@ -67,6 +67,8 @@ export interface MeasuredLine {
 export interface MeasuredParagraph {
   readonly lines: readonly MeasuredLine[];
   readonly markOnly: boolean;
+  /** Selected empty-mark wrap gap, retained for measurement-free shading. */
+  readonly markWrapBounds?: { readonly xPt: number; readonly yPt: number; readonly widthPt: number; readonly heightPt: number };
   readonly requestedSpaceBeforePt: number;
   readonly requestedSpaceAfterPt: number;
   /** ECMA-376 §17.3.3.25 paragraph-wide uniform line advance in points, snapped
@@ -189,8 +191,9 @@ export function measureParagraph(
       environment.paragraphMarkShapeInput,
       environment.useFeLayout === true,
     );
+    let markWrapBounds: MeasuredParagraph['markWrapBounds'];
     if (placement.wrap) {
-      markTopPt = placement.wrap.lineWindow({
+      const window = placement.wrap.lineWindow({
         topYPt: markTopPt,
         minimumStartWidthPt: getDefaultFontSize(paragraph),
         squareMinimumStartWidthPt: wordEmptyMarkMinimumStartWidthPx(
@@ -204,9 +207,15 @@ export function measureParagraph(
         // COLUMN band, not the indented mark band above.
         columnXPt: placement.paragraphXPt,
         columnWidthPt: placement.availableWidthPt,
-      }).topYPt;
+      });
+      markTopPt = window.topYPt;
+      if (window.xOffsetPt !== 0 || window.maximumWidthPt !== paragraphWidthPt) {
+        markWrapBounds = { xPt: paragraphXPt + window.xOffsetPt, yPt: markTopPt,
+          widthPt: window.maximumWidthPt, heightPt: markAdvancePt };
+      }
     }
     return {
+      ...(markWrapBounds ? { markWrapBounds } : {}),
       lines: [],
       markOnly: true,
       requestedSpaceBeforePt,
@@ -271,8 +280,9 @@ export function measureParagraph(
           getDefaultFontSize(paragraph),
           1,
         ),
+        hasExclusions: placement.wrap!.hasExclusions,
         lineWindow: (input) => placement.wrap!.lineWindow(input),
-        lineBoxH: (ascent, descent, _hasRuby, intendedSingle, eastAsian, gridCountSingle, uniformPositionAuto, inlinePictureTextSingle) => lineBoxHeight(
+        lineBoxH: (ascent, descent, _hasRuby, intendedSingle, eastAsian, gridCountSingle, uniformPositionAuto, inlinePictureTextSingle, latinGridCountSingle) => lineBoxHeight(
           context.lineSpacing,
           ascent,
           descent,
@@ -287,6 +297,7 @@ export function measureParagraph(
           undefined,
           uniformPositionAuto,
           inlinePictureTextSingle,
+          latinGridCountSingle,
         ),
         pageH: placement.maximumYPt,
       }
@@ -357,7 +368,7 @@ export function measureParagraph(
           visibleDescent: Math.max(originalLine.visibleDescent ?? originalLine.descent, markerDescent),
         }
       : originalLine;
-    const topYPt = line.topY !== undefined && line.topY > cursorPt
+    const topYPt = line.topY !== undefined
       ? line.topY
       : cursorPt;
     const textSinglePt = Math.max(
@@ -391,6 +402,7 @@ export function measureParagraph(
           undefined,
           line.uniformPositionAuto,
           line.inlinePictureTextSingle,
+          line.latinGridCountSingle,
         );
     measuredLines.push({ layout: line, topYPt, advancePt });
     cursorPt = topYPt + advancePt;

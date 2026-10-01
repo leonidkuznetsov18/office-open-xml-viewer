@@ -112,6 +112,7 @@ import {
   wordLayoutInCellOwnsRowContainment,
   wordPreservesLowerLayerSameParagraphComposition,
   wordTextBoxVisibleAnchorExtentPt,
+  wordGridPictureLineOriginPt,
 } from './anchor-compatibility.js';
 import {
   wordRunVerticalAlignRaisePt,
@@ -803,7 +804,22 @@ export function planLine(input: PlanLineInput): LineLayout {
   }
 
   const drawnWidthPt = naturalWidthPt + distributedWidthPt;
-  const alignmentSlackPt = lineSlackPt - distributedWidthPt;
+  // WORD_FLOAT_GAP_FLOW aligns the visible word edge, while
+  // the trailing separator remains source-owned. Its advance must not shift
+  // centred/right-aligned gap text. Preserve ordinary lines' existing policy.
+  let trailingSeparatorPt = 0;
+  if (line.availableWidthPt < input.availableWidthPt && !bidi) {
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      const segment = segments[index];
+      if (segment?.kind !== 'text') break;
+      const visibleLength = segment.text.trimEnd().length;
+      trailingSeparatorPt += segment.clusters.filter(cluster =>
+        cluster.range.start >= segment.range.start + visibleLength)
+        .reduce((sum, cluster) => sum + cluster.advancePt, 0);
+      if (visibleLength > 0) break;
+    }
+  }
+  const alignmentSlackPt = lineSlackPt - distributedWidthPt + trailingSeparatorPt;
   const naturalAlignmentOffsetPt = edge === 'right'
     ? alignmentSlackPt
     : edge === 'center'
@@ -1084,6 +1100,7 @@ function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
       advancePt += Math.max(0,
         line.bounds.yPt - ((previous?.bounds.yPt ?? line.bounds.yPt) + (previous?.advancePt ?? 0)));
     }
+    if (index + 1 < end && input.lines[index + 1]?.bounds.yPt === line.bounds.yPt) continue;
     advancePt += finiteNonNegative(line.advancePt, 'line.advancePt');
   }
   if (input.lines.length === 0 && input.paragraphMark) {
@@ -2413,7 +2430,7 @@ function planMeasuredLines(
     const onlyMath = raw.segments.length === 1 && 'math' in (raw.segments[0] ?? {} as object)
       ? raw.segments[0] as LayoutMathSeg
       : undefined;
-    return planLine({
+    const planned = planLine({
       paragraphXPt, availableWidthPt, alignment: paragraph.alignment,
       baseRtl: context.baseRtl,
       isFirstLine: lineIndex === 0,
@@ -2442,6 +2459,14 @@ function planMeasuredLines(
         segments,
       },
     });
+    return raw.availWidth !== undefined && (raw.availWidth < availableWidthPt || (raw.xOffset ?? 0) !== 0)
+      ? { ...planned, wrapBounds: {
+          xPt: paragraphXPt + (raw.xOffset ?? 0) + (lineIndex === 0 ? Math.min(0, context.firstIndentPt) : 0),
+          yPt: measuredLine.topYPt,
+          widthPt: raw.availWidth - (lineIndex === 0 ? Math.min(0, context.firstIndentPt) : 0),
+          heightPt: measuredLine.advancePt,
+        } }
+      : planned;
   });
 }
 
@@ -3085,7 +3110,13 @@ function acquireAnchorOccurrence(
         widthPt: options.placement.availableWidthPt,
         heightPt: Math.max(0, paragraphHeightPt),
       },
-      line: line.bounds,
+      // WORD_GRID_PICTURE_LINE_ORIGIN keeps text leading separate from the
+      // reference frame; paragraph ownership already precedes before-spacing.
+      line: line.bounds.yPt === lines[0]?.bounds.yPt && options.context.lineGrid.active && outer.run.type === 'image'
+        ? { ...line.bounds, yPt: wordGridPictureLineOriginPt(
+            line.bounds.yPt, options.placement.startYPt, contentStartYPt,
+          ) }
+        : line.bounds,
       character: host.bounds,
       pageParity: baseFrames?.pageParity ?? null,
     },
@@ -5261,6 +5292,7 @@ export function paragraphLayoutFromMeasurement(
     ),
     ...(anchorResults.length ? { anchorFrames: anchorResults } : {}),
     paragraphMark: measured.markOnly ? {
+      ...(measured.markWrapBounds ? { wrapBounds: measured.markWrapBounds } : {}),
       hidden: paragraph.markVanish === true,
       bounds: { xPt: paragraphXPt, yPt: measured.contentStartYPt, widthPt: 0, heightPt: contentHeightPt },
     } : undefined,
@@ -5504,6 +5536,7 @@ export function sliceParagraphLayout(
         ? { paragraphMark: {
             ...acquired.paragraphMark,
             bounds: translateRectY(acquired.paragraphMark.bounds, deltaYPt),
+            ...(acquired.paragraphMark.wrapBounds ? { wrapBounds: translateRectY(acquired.paragraphMark.wrapBounds, deltaYPt) } : {}),
           } }
         : {}),
     continuation,

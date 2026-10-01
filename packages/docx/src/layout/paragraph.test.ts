@@ -56,11 +56,11 @@ function projectMeasuredSegment(
       },
       topYPt: 10, advancePt: 12,
     }],
-    markOnly: false, requestedSpaceBeforePt: 0, requestedSpaceAfterPt: 0,
+    markOnly: false, requestedSpaceBeforePt: context.spaceBeforePt, requestedSpaceAfterPt: 0,
     uniformRubyAdvancePt: 0, contentStartYPt: 10, contentEndYPt: 22,
     lastLineBelowBaselinePt: 2,
     placement: {
-      startYPt: 10, paragraphXPt: 10, availableWidthPt: 100,
+      startYPt: 10 - context.spaceBeforePt, paragraphXPt: 10, availableWidthPt: 100,
       maximumYPt: 500, suppressSpaceBefore: false,
     },
   } as unknown as MeasuredParagraph;
@@ -869,6 +869,29 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
         inkBounds: { xMinPt: 0, xMaxPt: 7, ascentPt: 7, descentPt: 3 },
       }],
     });
+  });
+
+  it.each(['paragraph', 'line'] as const)('keeps the first %s picture origin before paragraph spacing on a grid', (relativeFrom) => {
+    const occurrenceId = 'anchor:spacing-grid';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 0, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    });
+    // The retained text top is 10; paragraph/first-line origin is 4, and the
+    // authored picture offset is 3. Baseline leading does not move the picture.
+    expect(node.drawings[0]?.flowBounds.yPt).toBe(7);
   });
 
   it('matches one scoped host to one anchored payload and retains one drawing and exclusion', () => {

@@ -220,7 +220,7 @@ describe('measureParagraph', () => {
     expect(adjusted.placement.availableWidthPt).toBe(100);
   });
 
-  it('chooses the globally widest gap from one oracle containing every float', () => {
+  it('chooses the first usable gap from one oracle containing every float', () => {
     const float = (id: string, xLeft: number, xRight: number): FloatRect => ({
       kind: 'shape', mode: 'square', imageKey: id,
       imageX: xLeft, imageY: 0, imageW: xRight - xLeft, imageH: 20,
@@ -237,7 +237,7 @@ describe('measureParagraph', () => {
       topYPt: 0, minimumStartWidthPt: 1, probeHeightPt: 10,
       paragraphXPt: 0, maximumWidthPt: 100,
       columnXPt: 0, columnWidthPt: 100,
-    })).toEqual({ topYPt: 0, xOffsetPt: 60, maximumWidthPt: 40 });
+    })).toEqual({ topYPt: 0, xOffsetPt: 35, maximumWidthPt: 5 });
   });
 
   it('snapshots compiled polygon geometry once at oracle acquisition', () => {
@@ -255,7 +255,7 @@ describe('measureParagraph', () => {
       paraId: 0,
     }]);
     const query = () => oracle.lineWindow({
-      topYPt: 30, minimumStartWidthPt: 1, probeHeightPt: 10,
+      topYPt: 30, minimumStartWidthPt: 20, probeHeightPt: 10,
       paragraphXPt: 0, maximumWidthPt: 100,
       columnXPt: 0, columnWidthPt: 100,
     });
@@ -400,6 +400,16 @@ describe('measureParagraph', () => {
     expect(result.lines[0].layout.availWidth).toBe(120);
   });
 
+  it('retains the selected empty-mark gap for paragraph shading', () => {
+    const float: FloatRect = { kind: 'shape', mode: 'square', authoredWrap: 'square',
+      imageKey: 'empty-mark-gap', imageX: 40, imageY: 0, imageW: 120, imageH: 60,
+      xLeft: 40, xRight: 160, yTop: 0, yBottom: 60, side: 'bothSides',
+      distLeft: 0, distRight: 0, distTop: 0, distBottom: 0, paraId: 0 };
+    const result = measureParagraph(paragraph({ spaceBefore: 0, shading: 'FFFF00' }), layoutContext({ spaceBeforePt: 0 }),
+      placement({ paragraphXPt: 0, startYPt: 0, availableWidthPt: 200, wrap: createFloatWrapOracle([float]) }),
+      measurer, environment());
+    expect(result.markWrapBounds).toEqual({ xPt: 0, yPt: 0, widthPt: 40, heightPt: 10 });
+  });
   it('reserves one paragraph-mark line for an empty paragraph', () => {
     const result = measureParagraph(
       paragraph(), layoutContext(), placement(), measurer, environment(),

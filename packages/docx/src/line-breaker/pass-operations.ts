@@ -32,6 +32,7 @@ import {
   charScaleFactor,
   charSpacingDeltaPx,
   protectedNoBreakOffsets,
+  hardJoinPrefixEnd,
   segAdvanceWidth,
   segmentCharacterGridDeltaPx,
   slicedPunctuationCompressions,
@@ -46,7 +47,7 @@ import {
 } from './font-routes.js';
 import { rubyAscentReservePx } from './ruby-metrics.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import { rebaseSeaBreaks } from './text-runs.js';
+import { rebaseSeaBreaks, hasCJKBreakOpportunity } from './text-runs.js';
 import {
   keepLeadingKinsoku,
   retractLeadingKinsoku,
@@ -60,7 +61,7 @@ export interface PassOperationState extends LineBreakerPassInput {
   readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
   readonly materializeLatinSpaceCompression: () => void;
   readonly snapPitchPx: number | null;
-  readonly minLineStartWidth: () => number;
+  readonly minLineStartWidth: (boundary?: LineBoundary) => number;
   readonly isParagraphMarkOnlyFlow: boolean;
   readonly startLine: (minWidth?: number) => void;
   readonly availW: () => number;
@@ -166,6 +167,73 @@ export function performMaterializeLatinSpaceCompression(operationState: PassOper
   breakerState.latinAppliedPerGap = 0;
 }
 
+/** ECMA-376 §20.4.2.17–.19 permits wrap gaps. WORD_FLOAT_GAP_FLOW
+ * admits the next atomic word (CJK/SEA legal prefix), including sub-inch gaps.
+ * Emergency splitting remains available once the full paragraph band is free. */
+export function performMinimumLineStartWidth(
+  operationState: PassOperationState,
+  boundary?: LineBoundary,
+): number {
+  const { wrapCtx, segs, breakerState, scale, kinsoku, strAdvance, maxWidth } = operationState;
+  if (!wrapCtx || wrapCtx.hasExclusions === false
+    || (!wrapCtx.lineWindow && wrapCtx.floats.length === 0)) return 0;
+  const candidates = boundary ? segs : breakerState.queue;
+  const start = boundary?.segIndex ?? 0;
+  let segment = candidates[start];
+  let selectedIndex = start;
+  for (let index = start; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (('text' in candidate && !candidate.metricOnly && candidate.text.length > 0)
+      || ('imagePath' in candidate && !candidate.anchor) || 'math' in candidate
+      || 'isTab' in candidate || 'lineBreak' in candidate) {
+      segment = candidate;
+      selectedIndex = index;
+      break;
+    }
+  }
+  if (!segment) return 0;
+  if ('text' in segment) {
+    if (segment.metricOnly) return wrapCtx?.paragraphMarkLineStartWidth ?? segment.fontSize * scale;
+    const text = segment.text.slice(boundary && segment === segs[boundary.segIndex] ? boundary.charOffset : 0);
+    const offset = boundary && segment === segs[boundary.segIndex] ? boundary.charOffset : 0;
+    const atomicEnd = (member: LayoutTextSeg, suffix: string, startOffset: number): number => {
+      if (member.ruby || member.tateChuYoko || member.fitTextRegionIndex !== undefined) return suffix.length;
+      const protectedOffsets = protectedNoBreakOffsets(member);
+      const hardEnd = hardJoinPrefixEnd(member);
+      if (hardEnd !== undefined) return Math.max(0, hardEnd - startOffset);
+      const breaks = member.seaBreaks?.filter(end => end > startOffset).map(end => end - startOffset)
+        ?? (hasCJKBreakOpportunity(suffix) ? [...graphemeClusterOffsets(suffix), suffix.length] : []);
+      for (const end of breaks) {
+        if (end <= 0 || protectedOffsets.has(startOffset + end)) continue;
+        const before = Array.from(suffix.slice(0, end)).at(-1)?.codePointAt(0);
+        const after = suffix.codePointAt(end);
+        if (before !== undefined && kinsoku.lineEndForbidden.has(before)) continue;
+        if (after !== undefined && kinsoku.lineStartForbidden.has(after)) continue;
+        return end;
+      }
+      const externalEnd = member.externalLinkBreakOffsets?.find(end => end > startOffset && !protectedOffsets.has(end));
+      return externalEnd === undefined ? suffix.length : externalEnd - startOffset;
+    };
+    const end = atomicEnd(segment, text, offset);
+    let width = strAdvance(segment, text.slice(0, end).trimEnd());
+    // The source seam may belong to one word split across formatting runs.
+    // Include its glued prefix, matching the break queue's join contract.
+    if (end === text.length && !/\s$/u.test(text)) {
+      for (let index = selectedIndex + 1; index < candidates.length; index += 1) {
+        const next = candidates[index];
+        if (!('text' in next) || !next.joinPrev) break;
+        const nextEnd = atomicEnd(next, next.text, 0);
+        width += strAdvance(next, next.text.slice(0, nextEnd).trimEnd());
+        if (nextEnd < next.text.length || /\s$/u.test(next.text)) break;
+      }
+    }
+    return Math.min(maxWidth, Math.max(0, width));
+  }
+  if ('imagePath' in segment) return segment.anchor ? 0 : Math.min(maxWidth, segment.widthPt * scale);
+  if ('math' in segment) return Math.min(maxWidth, segment.measuredWidth);
+  return 0;
+}
+
 export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
   const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
     operationState;
@@ -195,37 +263,45 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
-  if (wrapCtx.lineWindow) {
-    const win = wrapCtx.lineWindow({
-      topYPt: breakerState.currentLineTopY,
-      minimumStartWidthPt: MIN_LINE_GAP,
-      squareMinimumStartWidthPt: minWidth,
-      probeHeightPt: probeH,
-      paragraphXPt: lineBandX,
-      maximumWidthPt: lineBandWidth,
-      columnXPt: wrapCtx.columnXPt,
-      columnWidthPt: wrapCtx.columnWidthPt,
-    });
-    breakerState.currentLineTopY = win.topYPt;
-    breakerState.lineXOffset = win.xOffsetPt;
-    breakerState.lineMaxWidth = win.maximumWidthPt + hangingOffset;
-  } else {
-    const win = computePreparedLineFloatWindow(
-      breakerState.currentLineTopY,
-      MIN_LINE_GAP,
-      probeH,
-      lineBandX,
-      lineBandWidth,
+  const requiredWidth = minWidth + (breakerState.isFirst ? Math.max(0, firstIndent) : 0);
+  const query = (topY: number, x: number, width: number) => {
+    if (wrapCtx.lineWindow) {
+      const win = wrapCtx.lineWindow({
+        topYPt: topY, minimumStartWidthPt: requiredWidth,
+        squareMinimumStartWidthPt: requiredWidth, probeHeightPt: probeH,
+        paragraphXPt: x, maximumWidthPt: width,
+        columnXPt: wrapCtx.columnXPt, columnWidthPt: wrapCtx.columnWidthPt,
+      });
+      return { topY: win.topYPt, xOffset: win.xOffsetPt, maxWidth: win.maximumWidthPt };
+    }
+    return computePreparedLineFloatWindow(
+      topY, requiredWidth, probeH, x, width,
       preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
-      wrapCtx.columnXPt,
-      wrapCtx.columnXPt + wrapCtx.columnWidthPt,
-      reference,
-      minWidth,
+      wrapCtx.columnXPt, wrapCtx.columnXPt + wrapCtx.columnWidthPt,
+      reference, requiredWidth,
     );
-    breakerState.currentLineTopY = win.topY;
-    breakerState.lineXOffset = win.xOffset;
-    breakerState.lineMaxWidth = win.maxWidth + hangingOffset;
+  };
+  const cursor = breakerState.fragmentCursor;
+  breakerState.fragmentCursor = null;
+  if (cursor) {
+    const left = baseRtl ? lineBandX : cursor.right;
+    const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
+    if (right > left) {
+      const next = query(cursor.topY, left, right - left);
+      if (next.topY === cursor.topY && next.maxWidth >= requiredWidth) {
+        // A strictly smaller unvisited band gives monotonic horizontal progress;
+        // the original column and largest-side reference never shrink with it.
+        breakerState.currentLineTopY = next.topY;
+        breakerState.lineXOffset = left - wrapCtx.paraX + next.xOffset;
+        breakerState.lineMaxWidth = next.maxWidth;
+        return;
+      }
+    }
   }
+  const win = query(breakerState.currentLineTopY, lineBandX, lineBandWidth);
+  breakerState.currentLineTopY = win.topY;
+  breakerState.lineXOffset = win.xOffset;
+  breakerState.lineMaxWidth = win.maxWidth + hangingOffset;
 }
 
 export function performAvailW(operationState: PassOperationState) {
@@ -281,6 +357,22 @@ export function performFlush(
     baseRtl,
   } = operationState;
 
+  // A physical line can contain several gap fragments. Carry its metric union
+  // into the last fragment so vertical progress uses the tallest contributor,
+  // even when the last gap has smaller text than the first.
+  const previous = breakerState.lines.at(-1);
+  if (wrapCtx && previous?.topY === breakerState.currentLineTopY) {
+    breakerState.lineAscent = Math.max(breakerState.lineAscent, previous.ascent);
+    breakerState.lineDescent = Math.max(breakerState.lineDescent, previous.descent);
+    breakerState.lineIntendedSingle = Math.max(breakerState.lineIntendedSingle, previous.intendedSingle);
+    breakerState.lineLatinGridCountSingle = Math.max(breakerState.lineLatinGridCountSingle, previous.latinGridCountSingle ?? 0);
+    breakerState.lineGridCountSingle = Math.max(breakerState.lineGridCountSingle, previous.gridCountSingle ?? 0);
+    breakerState.lineVisibleAscent = Math.max(breakerState.lineVisibleAscent, previous.visibleAscent ?? previous.ascent);
+    breakerState.lineVisibleDescent = Math.max(breakerState.lineVisibleDescent, previous.visibleDescent ?? previous.descent);
+    breakerState.lineVisibleIntendedSingle = Math.max(breakerState.lineVisibleIntendedSingle, previous.visibleIntendedSingle ?? previous.intendedSingle);
+    breakerState.lineHasRuby ||= previous.hasRuby ?? false;
+    breakerState.lineEastAsian ||= previous.eastAsian ?? false;
+  }
   materializeLatinSpaceCompression();
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
@@ -415,6 +507,7 @@ export function performFlush(
     visibleDescent,
     visibleIntendedSingle,
     intendedSingle: breakerState.lineIntendedSingle,
+    latinGridCountSingle: breakerState.lineLatinGridCountSingle,
     ...(inlinePictureTextSingle > 0 ? { inlinePictureTextSingle } : {}),
     uniformPositionAuto,
     // Empty/synthetic East Asian lines use the same design-height rule as a
@@ -430,6 +523,14 @@ export function performFlush(
     consumedEnd: nextStart ?? breakerState.queue[0]?.src ?? endBoundary,
   });
   if (wrapCtx) {
+    if (!brTerminated && nextStart !== undefined) {
+      breakerState.fragmentCursor = {
+        topY: breakerState.currentLineTopY,
+        left: wrapCtx.paraX + breakerState.lineXOffset
+          + (breakerState.isFirst ? Math.min(0, firstIndent) : 0),
+        right: wrapCtx.paraX + breakerState.lineXOffset + breakerState.lineMaxWidth,
+      };
+    }
     breakerState.currentLineTopY += wrapCtx.lineBoxH(
       asc,
       desc,
@@ -439,6 +540,7 @@ export function performFlush(
       gridCountSingle,
       uniformPositionAuto,
       inlinePictureTextSingle,
+      breakerState.lineLatinGridCountSingle,
     );
   }
   breakerState.currentLine = [];
@@ -454,6 +556,7 @@ export function performFlush(
   breakerState.lineHasInlinePicture = false;
   breakerState.linePictureMarkSingle = 0;
   breakerState.lineGridCountSingle = 0;
+  breakerState.lineLatinGridCountSingle = 0;
   breakerState.lineVisibleAscent = 0;
   breakerState.lineVisibleDescent = 0;
   breakerState.lineVisibleIntendedSingle = 0;
@@ -461,7 +564,7 @@ export function performFlush(
   breakerState.lineHasRuby = false;
   breakerState.lineEastAsian = false;
   breakerState.isFirst = false;
-  startLine(minLineStartWidth());
+  startLine(minLineStartWidth(nextStart));
 }
 
 export function performProspectiveSnapAdvance(
@@ -667,6 +770,10 @@ export function performAddToLine(
               ? segmentEastAsiaFloorSingleLinePx(ts, intendedEm, segScriptHint)
               : 0,
           );
+    if (paintsInlineInk && !metricEastAsian && !ts.ruby
+      && ts.resolvedLatinGridCellAllocation === true) {
+      breakerState.lineLatinGridCountSingle = Math.max(breakerState.lineLatinGridCountSingle, designIntended);
+    }
     const intended = Math.max(designIntended, (nativeRatio ?? 0) * intendedEm);
     if (intended > breakerState.lineIntendedSingle) breakerState.lineIntendedSingle = intended;
     if (paintsInlineInk && intended > breakerState.lineVisibleIntendedSingle) {

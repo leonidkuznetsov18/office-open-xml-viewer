@@ -89,6 +89,18 @@ const verticalEdgeParagraph = (
 });
 
 describe('paragraph page-local reserve selection', () => {
+  it('keeps gap fragments on one page and charges their physical baseline once', () => {
+    const original = paragraph();
+    const p: ParagraphLayout = { ...original, advancePt: 20,
+      lines: original.lines.map((line, index) => ({ ...line,
+        bounds: { ...line.bounds, yPt: index === 2 ? 10 : 0 }, baselinePt: index === 2 ? 18 : 8 })) };
+    const selected = selectParagraphFragment(p, { boundary: null },
+      splittable([{ segIndex: 0, charOffset: 1 }, { segIndex: 0, charOffset: 2 }, { segIndex: 0, charOffset: 3 }]),
+      10, 100, true, { keepLines: false, widowControl: false });
+    expect(selected.fragment?.lines).toHaveLength(2);
+    expect(selected.fragment?.advancePt).toBe(10);
+    expect(selected.nextCursor?.boundary).toEqual({ segIndex: 0, charOffset: 2 });
+  });
   it('does not require a source boundary for a single retained marker-only line', () => {
     const retained = {
       ...paragraph(),
