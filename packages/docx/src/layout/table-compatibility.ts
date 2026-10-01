@@ -1,6 +1,6 @@
 import { defineCompatibilityRule } from './compatibility.js';
 import type { ParagraphLayoutSource } from './text.js';
-import type { LayoutRect } from './types.js';
+import type { TableColumnLayoutInput, LayoutRect } from './types.js';
 
 export const WORD_ROTATED_CELL_AUTO_ROW_WRAP = defineCompatibilityRule({
   id: 'word-rotated-cell-auto-row-wrap',
@@ -107,14 +107,24 @@ export const WORD_SPACED_CELL_INSIDE_BORDER_CONFLICT = defineCompatibilityRule({
   description: 'With non-zero cell spacing, Word retains the narrow conditional tcBorders insideH/insideV conflict against the corresponding table inside border.',
 });
 
-export const WORD_TABLE_INDENT_ALL_ALIGNMENTS = defineCompatibilityRule({
-  id: 'word-table-indent-all-alignments',
-  evidence: {
-    kind: 'microsoft-note',
-    reference: '[MS-OI29500] §2.1.155',
-  },
-  description: 'Word applies tblInd as a signed leading-edge translation for every table alignment, reversing the translation for bidi visual order.',
+export const WORD_TABLE_ORIGIN_COMPATIBILITY = defineCompatibilityRule({
+  id: 'word-table-origin-compatibility',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'table-origin-compatibility-and-occupied-grid',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: '528 ordinary-table controls cover modes 11/12/14/15, LTR/RTL, leading/center/end, omitted/zero/positive/negative indentation, explicit zero/asymmetric cell margins, cell overrides, first-row exceptions, fixed/AutoFit, nested contents, borderless and full-band tables. For top-level body tables with positive dxa cell preferences, explicit legacy horizontal margins and zero spacing (fixed auto/dxa table width or AutoFit dxa table width), modes 11/12/14 hang the first cell left margin: leading placement only with authored indentation and anchored to the first row, end placement per row. Center and end ignore indentation, as ECMA-376 §17.4.50 specifies (contrary to MS-OI29500 §2.1.155). Mode 15 removes the margin hang. Border rasterization is separate from nominal grid geometry. Spaced tables and wholly omitted horizontal margins remain unresolved and retain the previous origin and content-inset behavior; Nested table origins, logical start/end margin spellings, and other compatibility modes are outside the measured scope.',
 });
+
+export const WORD_FIXED_UNUSED_LEADING_GRID = defineCompatibilityRule({
+  id: 'word-fixed-unused-leading-grid',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'table-origin-compatibility-and-occupied-grid',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: 'The original fixed gridBefore controls in modes 11/12/14/15 and 48 follow-ups in modes 14/15 show that a leading track skipped by every row has zero layout width. Fixed auto table width retains the occupied 108/180pt tracks; dxa 324pt scales them to 121.5/202.5pt. A preceding row occupying the 36pt track preserves it and ordinary skipped-row placement. wBefore of 0/18/36pt has no effect in either class. This refines ECMA-376 §§17.4.15 and 17.18.87 only for top-level body nonspaced fixed tables with auto/dxa table width and positive dxa cell preferences; nested and nonbody stories, percentage table width, AutoFit, trailing skips, spans, and nonpositive or missing cell preferences remain outside the observation.',
+});
+
+/** The observation is deliberately restricted to the exported mode boundaries. */
+export function wordMeasuredTableOriginMode(mode: number | undefined): boolean {
+  return mode === 11 || mode === 12 || mode === 14 || mode === 15;
+}
 
 export const WORD_EXACT_ROW_VERTICAL_CLIP_ONLY = defineCompatibilityRule({
   id: 'word-exact-row-vertical-clip-only',
@@ -523,4 +533,49 @@ export function wordDropsTrailingStructuralCellMarker(input: Readonly<{
     && input.lastKind === 'paragraph'
     && input.previousKind !== 'paragraph'
     && input.lastParagraphRunCount === 0;
+}
+
+/** WORD_TABLE_ORIGIN_COMPATIBILITY. An unresolved/unmeasured class retains
+ * its established translation rather than inventing a margin default. */
+export function wordTableOriginTranslationPt(input: Readonly<{
+  mode: number | undefined;
+  measured: boolean;
+  justification: string | null | undefined;
+  indentPt: number;
+  indentAuthored: boolean;
+  firstLeftMarginPt: number;
+  rowLeftMarginPt: number;
+}>): number {
+  if (!input.measured) return input.indentPt;
+  if (input.justification === 'center') return 0;
+  if (input.justification === 'right' || input.justification === 'end') {
+    return input.mode === 15 ? 0 : input.rowLeftMarginPt;
+  }
+  return input.indentPt
+    - (input.mode !== 15 && input.indentAuthored ? input.firstLeftMarginPt : 0);
+}
+
+/** Preserve grid indexes while dropping only the Office-measured unused track.
+ * O(rows + columns + cells), with no parser mutation or extra content walk. */
+export function wordFixedOccupiedGridInput(
+  input: TableColumnLayoutInput,
+  mode: number | undefined,
+  measuredScope: boolean,
+): TableColumnLayoutInput {
+  if (!wordMeasuredTableOriginMode(mode) || !measuredScope
+    || input.layout !== 'fixed' || input.rows.length === 0
+    || !input.rows.every((row) => row.cells.length > 0
+      && row.cells[0]?.columnStart === 1 && row.after === null
+      && row.cells.every((cell) => cell.columnSpan === 1 && cell.preferredWidth?.kind === 'dxa' && cell.preferredWidth.value > 0))) {
+    return input;
+  }
+  // A row occupying column zero is a measured counterexample. Only the single
+  // universally skipped leading track was varied; spans, trailing skips,
+  // missing preferences, and AutoFit retain their previous solver input.
+  return {
+    ...input,
+    gridWidthsPt: input.gridWidthsPt.map((width, i) => i === 0 ? 0 : width),
+    gridWidthKeys: input.gridWidthKeys?.map((key, i) => i === 0 ? null : key),
+    rows: input.rows.map((row) => ({ ...row, before: null })),
+  };
 }

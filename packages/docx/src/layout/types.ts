@@ -1303,7 +1303,12 @@ export interface TableRowFormatInput {
   readonly cellSpacingPt: number;
   readonly justification: string | null;
   readonly exception: TableRowExceptionInput | null;
-  readonly cells: readonly { readonly marginsPt: TableCellMarginsInput }[];
+  readonly cells: readonly {
+    readonly marginsPt: TableCellMarginsInput;
+    /** Null unless the effective margin comes from an authored/inherited
+     * legacy left element. Defaults and logical margins are unmeasured. */
+    readonly originLeftMarginPt?: number | null;
+  }[];
 }
 
 /** Immutable parser/model projection consumed by table acquisition. */
@@ -1379,7 +1384,8 @@ export interface TableRowLayoutInput {
   readonly exceptionBorders: TableEdgeInputs | null;
   /** Effective §17.4.27/.26 row alignment. */
   readonly alignment: 'left' | 'center' | 'right';
-  /** Effective table indent after Word's first-row tblPrEx rule. In an adjacent
+  /** Signed leading-axis origin translation after first-row tblPrEx and the
+   * measured margin-hang rule. In an adjacent
    * §17.4.37 group this is re-oriented into the group frame by the union
    * builder, so no separate physical-indent field is retained here. */
   readonly indentPt: number;

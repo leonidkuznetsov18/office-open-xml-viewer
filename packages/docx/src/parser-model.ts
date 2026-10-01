@@ -609,31 +609,35 @@ function effectiveTableCellMargins(
   exceptionMargins: TableMarginAcquisitionWire | null | undefined,
   tableMargins: TableMarginAcquisitionWire | null | undefined,
   styleMargins: TableMarginAcquisitionWire | null | undefined,
-): TableFormatInput['rows'][number]['cells'][number]['marginsPt'] {
+): TableFormatInput['rows'][number]['cells'][number] {
   const bidi = table.bidiVisual === true;
   const physical = (
     margins: TableMarginAcquisitionWire | null | undefined,
     edge: 'left' | 'right',
-  ): Readonly<{ width: TableWidthAcquisitionWire | null | undefined; edge: 'start' | 'end' }> => {
+  ): Readonly<{ width: TableWidthAcquisitionWire | null | undefined; edge: 'start' | 'end'; physicalLeftAuthored: boolean }> => {
     const logicalEdge = edge === 'left'
       ? (bidi ? 'end' : 'start')
       : (bidi ? 'start' : 'end');
-    return { width: margins?.[edge] ?? margins?.[logicalEdge], edge: logicalEdge };
+    return { width: margins?.[edge] ?? margins?.[logicalEdge], edge: logicalEdge,
+      physicalLeftAuthored: edge === 'left' && margins?.left != null };
   };
-  const firstMargin = (
+  const selectMargin = (
     edge: TableMarginEdge,
     ...candidates: readonly Readonly<{
       width: TableWidthAcquisitionWire | null | undefined;
       scope: TableMarginScope;
       edge?: TableMarginEdge;
+      physicalLeftAuthored?: boolean;
     }>[]
-  ): number | null => {
+  ): { value: number; originLeftMarginPt: number | null } | null => {
     for (const candidate of candidates) {
       const value = wordTableMarginPt(candidate.width, candidate.scope, candidate.edge ?? edge);
-      if (value !== null) return value;
+      if (value !== null) return { value, originLeftMarginPt: candidate.physicalLeftAuthored ? value : null };
     }
     return null;
   };
+  const firstMargin = (...args: Parameters<typeof selectMargin>): number | null =>
+    selectMargin(...args)?.value ?? null;
   const cellLeft = physical(cellMargins, 'left');
   const exceptionLeft = physical(exceptionMargins, 'left');
   const tableLeft = physical(tableMargins, 'left');
@@ -645,35 +649,43 @@ function effectiveTableCellMargins(
   const publicCellMargin = (value: number | null | undefined): number | null => (
     !hasPrivateCellWire && value != null && Number.isFinite(value) ? value : null
   );
-  return {
-    top: firstMargin('top',
-      { width: cellMargins?.top, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginTop) ?? firstMargin('top',
-      { width: exceptionMargins?.top, scope: 'exception' },
-      { width: tableMargins?.top, scope: 'table' },
-      { width: styleMargins?.top, scope: 'style' },
-    ) ?? table.cellMarginTop,
-    bottom: firstMargin('bottom',
-      { width: cellMargins?.bottom, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginBottom) ?? firstMargin('bottom',
-      { width: exceptionMargins?.bottom, scope: 'exception' },
-      { width: tableMargins?.bottom, scope: 'table' },
-      { width: styleMargins?.bottom, scope: 'style' },
-    ) ?? table.cellMarginBottom,
-    left: firstMargin(cellLeft.edge,
-      { ...cellLeft, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginLeft) ?? firstMargin(exceptionLeft.edge,
+  const publicLeft = publicCellMargin(cell.marginLeft);
+  // Preserve provenance at the same cascade decision as the value. A logical
+  // cell override above a legacy table margin is outside the observed origin
+  // rule, even though a lower layer still contains a legacy left element.
+  const left = selectMargin(cellLeft.edge, { ...cellLeft, scope: 'cell' })
+    ?? (publicLeft === null ? null : { value: publicLeft, originLeftMarginPt: null })
+    ?? selectMargin(exceptionLeft.edge,
       { ...exceptionLeft, scope: 'exception' },
       { ...tableLeft, scope: 'table' },
       { ...styleLeft, scope: 'style' },
-    ) ?? table.cellMarginLeft,
-    right: firstMargin(cellRight.edge,
-      { ...cellRight, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginRight) ?? firstMargin(exceptionRight.edge,
-      { ...exceptionRight, scope: 'exception' },
-      { ...tableRight, scope: 'table' },
-      { ...styleRight, scope: 'style' },
-    ) ?? table.cellMarginRight,
+    );
+  return {
+    originLeftMarginPt: left?.originLeftMarginPt ?? null,
+    marginsPt: {
+      top: firstMargin('top',
+        { width: cellMargins?.top, scope: 'cell' },
+      ) ?? publicCellMargin(cell.marginTop) ?? firstMargin('top',
+        { width: exceptionMargins?.top, scope: 'exception' },
+        { width: tableMargins?.top, scope: 'table' },
+        { width: styleMargins?.top, scope: 'style' },
+      ) ?? table.cellMarginTop,
+      bottom: firstMargin('bottom',
+        { width: cellMargins?.bottom, scope: 'cell' },
+      ) ?? publicCellMargin(cell.marginBottom) ?? firstMargin('bottom',
+        { width: exceptionMargins?.bottom, scope: 'exception' },
+        { width: tableMargins?.bottom, scope: 'table' },
+        { width: styleMargins?.bottom, scope: 'style' },
+      ) ?? table.cellMarginBottom,
+      left: left?.value ?? table.cellMarginLeft,
+      right: firstMargin(cellRight.edge,
+        { ...cellRight, scope: 'cell' },
+      ) ?? publicCellMargin(cell.marginRight) ?? firstMargin(exceptionRight.edge,
+        { ...exceptionRight, scope: 'exception' },
+        { ...tableRight, scope: 'table' },
+        { ...styleRight, scope: 'style' },
+      ) ?? table.cellMarginRight,
+    },
   };
 }
 
@@ -718,18 +730,13 @@ export function tableFormatInput(table: TableLayoutSource): TableFormatInput {
       ) ?? 0,
       justification: rowWire?.justification ?? exception?.justification ?? null,
       exception: normalizedTableRowException(exception),
-      cells: row.cells.map((cell, cellIndex) => ({
-        marginsPt: effectiveTableCellMargins(
-          table,
-          cell,
-          acquisition.rows[rowIndex]?.cells[cellIndex] !== null
-            && acquisition.rows[rowIndex]?.cells[cellIndex] !== undefined,
-          acquisition.rows[rowIndex]?.cells[cellIndex]?.margins,
-          exception?.cellMargins,
-          acquisition.table?.cellMargins,
-          rowWire?.styleCellMargins,
-        ),
-      })),
+      cells: row.cells.map((cell, cellIndex) => {
+        const wire = acquisition.rows[rowIndex]?.cells[cellIndex];
+        return effectiveTableCellMargins(
+          table, cell, wire != null, wire?.margins,
+          exception?.cellMargins, acquisition.table?.cellMargins, rowWire?.styleCellMargins,
+        );
+      }),
     };
   });
   const input = snapshotPlainData({

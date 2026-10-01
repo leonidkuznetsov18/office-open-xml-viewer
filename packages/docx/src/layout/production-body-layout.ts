@@ -59,6 +59,7 @@ import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
 import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numbering-marker.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
+import { wordFixedOccupiedGridInput } from './table-compatibility.js';
 import { measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
@@ -208,6 +209,7 @@ function buildMeasureState(
     retainedTableAcquisition: {
       layoutServices: (state) => state.layoutServices,
       tableFormat: bodyAcquisitionInputProjections.tableFormatInput,
+      compatibilityMode: (state) => state.layoutSettings.compat.compatibilityMode,
       resolveColumns: resolveColumnWidths,
       createCellState: (state, contentWidthPt, cell) => ({
         ...withTableCellStory(state),
@@ -2365,7 +2367,7 @@ function resolveColumnWidths(
         const leading = justification !== 'center' && !trailing;
         // The center/right controls retain the leading band's width in mode
         // 14, but use the full text band in mode 15. This is a width rule;
-        // signed placement remains governed separately by MS-OI29500 2.1.155.
+        // origin translation is acquired separately under WORD_TABLE_ORIGIN_COMPATIBILITY.
         return leading || outerCellMarginsHangOutsideBand ? contentWPt - indentPt : contentWPt;
       })))
     : contentWPt;
@@ -2524,7 +2526,10 @@ function resolveColumnWidths(
       : Math.max(contentWPt, state.pageWidth),
   );
   return [...resolveTableColumnWidths({
-    ...columnInput,
+    ...wordFixedOccupiedGridInput(columnInput, compatibilityMode,
+      format.ordinaryFlow && story === 'body' && state.storyContext?.containers.length === 0
+        && table.widthPct == null && format.firstRowException?.preferredWidth?.kind !== 'pct'
+        && format.rows.every((row) => row.cellSpacingPt === 0)),
     outerMarginAllowancePt: forcedFitOuterMarginsPt,
     growUnpreferredColumns: usesLeadingIndentBand,
   })];

@@ -12,6 +12,7 @@ import {
 import type { ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import { layoutTable, measureTableCellBlockFlowHeightPt } from './table.js';
 import { tableCellHorizontalSpacingInsets } from './table-columns.js';
+import { wordMeasuredTableOriginMode, wordTableOriginTranslationPt } from './table-compatibility.js';
 import { snapshotPlainData } from './plain-data.js';
 import { eastAsianUprightPaintOps } from './vertical-glyph-orientation.js';
 import type {
@@ -32,6 +33,7 @@ import type {
 } from './types.js';
 
 export interface RetainedTableAcquisitionDependencies<State> {
+  compatibilityMode?(state: State): number | undefined;
   layoutServices(state: State): LayoutServices | undefined;
   tableFormat(table: TableLayoutSource): TableFormatInput;
   resolveColumns(table: TableLayoutSource, contentWidthPt: number, state: State): readonly number[];
@@ -376,6 +378,23 @@ export function acquireRetainedTable<State>(
   const tableIndentPt = firstRowException?.indentAuthored
     ? (firstRowException.indentPt ?? 0)
     : (table.tblInd ?? 0);
+  const mode = dependencies.compatibilityMode?.(outerState);
+  // WORD_TABLE_ORIGIN_COMPATIBILITY: preserve the prior contract for unresolved
+  // margins/spacing, nested origins, positioned tables, and unmeasured modes.
+  const measuredOrigin = wordMeasuredTableOriginMode(mode) && format.ordinaryFlow
+    && sourcePath.length === 1 && sourceRoot.story === 'body'
+    && sourceRoot.storyInstance === 'body'
+    && table.widthPct == null
+    && (!firstRowException?.preferredWidthAuthored || firstRowException.preferredWidth?.kind !== 'pct')
+    && (firstRowException?.layout === 'fixed' || table.layout === 'fixed'
+      || (firstRowException?.preferredWidthAuthored
+        ? firstRowException.preferredWidth?.kind === 'dxa' && firstRowException.preferredWidth.value > 0
+        : table.widthPt != null && table.widthPt > 0))
+    && table.rows.every((row) => row.cells.every((cell) => cell.widthPt != null && cell.widthPt > 0 && cell.widthPct == null))
+    && format.rows.every((row) => row.cellSpacingPt === 0
+      && row.cells[0]?.originLeftMarginPt != null);
+  const indentAuthored = firstRowException?.indentAuthored || table.tblInd != null;
+  const firstLeftMarginPt = format.rows[0]?.cells[0]?.originLeftMarginPt ?? 0;
   const nestedById: Record<string, RetainedTableAcquisition> = {};
   const floatingTables: NestedFloatingTableOccurrence[] = [];
   const rotatedCells: RotatedCellAcquisition[] = [];
@@ -608,7 +627,16 @@ export function acquireRetainedTable<State>(
         ? retainedEdges(rowFormat.exception.borders)
         : null,
       alignment: physicalAlignment(rowFormat?.justification ?? table.jc, bidiVisual),
-      indentPt: tableIndentPt,
+      // Carry one signed leading-axis translation into the sole table layout
+      // algorithm. End alignment uses each row's first margin; leading alignment
+      // keeps the first-row anchor even when subsequent margins differ.
+      indentPt: wordTableOriginTranslationPt({
+        mode, measured: measuredOrigin,
+        justification: rowFormat?.justification ?? table.jc,
+        indentPt: tableIndentPt, indentAuthored,
+        firstLeftMarginPt,
+        rowLeftMarginPt: rowFormat?.cells[0]?.originLeftMarginPt ?? 0,
+      }),
       cells,
       repeatedHeader: rowFormat?.repeatedHeader ?? row.isHeader === true,
     };

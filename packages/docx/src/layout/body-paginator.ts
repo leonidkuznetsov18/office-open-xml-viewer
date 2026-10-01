@@ -553,7 +553,7 @@ function acceptNode(
       flowDomainId,
       translation: {
         // Ordinary table acquisition owns the complete inline placement:
-        // physical jc alignment followed by signed tblInd translation. Move
+        // physical jc alignment followed by the acquired leading-axis translation. Move
         // that acquisition-local frame into the page column without
         // normalizing its retained X origin away. Explicit out-of-flow
         // placements and paragraphs continue to own an exact destination.
