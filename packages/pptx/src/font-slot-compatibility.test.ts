@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { POWERPOINT_FONT_SLOT_EVIDENCE, powerPointFontSlot } from './font-slot-compatibility.js';
+import { POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE } from './font-slot-boundary-evidence.js';
 import { POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
 
 describe('PowerPoint slot compatibility evidence', () => {
-  it('matches every original directly identified observation', () => {
+  it('matches original observations except explicitly withdrawn boundary overrides', () => {
     // This independently recorded PDF corpus catches broadened symbol ranges,
     // lost language overrides and inverted endpoints; fallback fonts are not a
     // slot oracle. Renderer wiring is exercised in font-slot-render.test.ts.
@@ -11,6 +12,10 @@ describe('PowerPoint slot compatibility evidence', () => {
       for (const [start, end, outcome] of ranges) {
         if (outcome !== 'latin' && outcome !== 'ea' && outcome !== 'cs') continue;
         for (let cp = start; cp <= end; cp++) {
+          // Preserve the historical evidence; replacement cycles reject these
+          // overrides only for the two original symbol-sweep language IDs.
+          if ((lang === 'en-us' || lang === 'ja-jp')
+            && POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE.withdrawnOverrides.some((withdrawn) => withdrawn === cp)) continue;
           expect(powerPointFontSlot(cp, lang), `${lang} U+${cp.toString(16)}`).toBe(outcome);
         }
       }

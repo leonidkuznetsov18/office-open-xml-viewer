@@ -48,9 +48,30 @@ describe('PPTX language-dependent font slots through the renderer', () => {
   it('routes measured punctuation and symbol boundaries independently of line-break classes', () => {
     const result = segments([run('A§¨°±´×÷⁇⁈⓾⓿─▟■☙♰⚀❟❨❶B', 'en-US')]);
     expect(result.map(({ text, face }) => [text, face])).toEqual([
-      ['A', 'Corbel'], ['§¨°±´×÷⁇⁈⓾', 'Meiryo UI'], ['⓿─▟', 'Corbel'],
-      ['■', 'Meiryo UI'], ['☙♰⚀❟❨', 'Corbel'], ['❶', 'Meiryo UI'], ['B', 'Corbel'],
+      ['A', 'Corbel'], ['§¨°±´×÷⁇⁈⓾⓿', 'Meiryo UI'], ['─', 'Corbel'],
+      ['▟■☙', 'Meiryo UI'], ['♰', 'Microsoft Sans Serif'], ['⚀❟❨', 'Corbel'], ['❶', 'Meiryo UI'], ['B', 'Corbel'],
     ]);
+  });
+
+  it('uses normative symbol boundaries and measured quote endpoints for arbitrary faces and sizes', () => {
+    // Symbol cycles fail face independence; these are specification expectations,
+    // not an attempt to infer slots from the substituted PDF faces.
+    for (const [latin, ea, cs, size] of [['Calibri', 'Cambria', 'Arial', 10],
+      ['Times New Roman', 'Arial', 'Calibri', 32]] as const) {
+      const faces = { fontFamily: latin, fontFamilyEa: ea, fontFamilyCs: cs, fontSize: size };
+      for (const lang of ['en-US', 'ja-JP']) {
+        for (const [ch, face] of [['⓾', ea], ['⓿', ea], ['▟', ea], ['■', ea],
+          ['☙', ea], ['♰', cs], ['♱', cs], ['„', lang === 'ja-JP' ? ea : latin], ['‟', latin]]) {
+          const runs = [run(ch, lang, faces)];
+          expect(segments(runs).map(({ text, face }) => [text, face])).toEqual([[ch, face]]);
+          const { ctx, calls } = context();
+          renderTextBody(ctx, body(runs), 0, 0, 300, 100, SCALE);
+          expect(calls.find((c) => c.text === ch)?.font).toContain(`"${face}"`);
+        }
+        // Interior scalars without new contradictory evidence retain prior routing.
+        expect(segments([run('─', lang, faces)])[0].face).toBe(latin);
+      }
+    }
   });
 
   it('uses the East Asian slot for seven curly quotes but keeps U+201F Latin', () => {

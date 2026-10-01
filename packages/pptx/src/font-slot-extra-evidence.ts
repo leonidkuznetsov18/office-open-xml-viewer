@@ -373,11 +373,11 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
       codePoints: [0x24FE, 0x24FF, 0x259F, 0x25A0, 0x2619, 0x2670, 0x201E, 0x201F],
       sizesPt: [10, 18, 32],
       settledGroups: 0,
-      reason: 'No complete cyclic triple survives substitution. Original single-triple overrides are retained pending valid multi-triple/multi-size exports; P2 remains open.',
+      reason: 'This original matrix has no complete cycles. Replacement evidence is in POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE: quote independence settles, while tested symbol overrides are withdrawn because cycles remain inconsistent/substituted or contradict latin.',
     },
     scripts: 'Only Myanmar has complete scalar cycles. Other scripts retain previous routing; no block-level extrapolation across missing/mark/unassigned scalars.',
     clusters: 'Myanmar base U+1000 plus U+A9E5/U+AA7B/U+AA7C/U+AA7D selects cs/ea in single-run and same-language seam controls. Other bases, longer clusters, standalone marks and language-changing seams retain previous routing pending broader controls.',
     context: 'Measured standalone cs and Latin-surrounded latin punctuation are implemented for the 12 exact language IDs. Native/ascending controls with uncovered neighbours remain inconclusive and retain previous routing.',
-    sizeAndFaces: 'Script/digit controls are at 20 pt. Digit/punctuation scalar cycles use one distinguishable triple; Myanmar extension cycles use Myanmar Text/Noto Sans Myanmar/Noto Serif Myanmar. Boundary face/size variation is inconclusive.',
+    sizeAndFaces: 'Script/digit controls are at 20 pt. Digit/punctuation scalar cycles use one distinguishable triple; Myanmar extension cycles use Myanmar Text/Noto Sans Myanmar/Noto Serif Myanmar. Replacement boundary controls settle quote face/size independence; symbol variation remains inconclusive (see POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE).',
   },
 } as const;

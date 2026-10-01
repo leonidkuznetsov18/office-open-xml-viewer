@@ -9,9 +9,12 @@
 // the latter includes image-painted symbols and unmapped/combined glyphs.
 // Source runs were matched by row and code point, allowing bidi reordering,
 // U+2011 → hyphen and ja-JP U+005C → yen. No baseline/image fidelity is claimed.
+// Historical outcomes remain intact; the replacement boundary evidence records
+// the specific overrides withdrawn after cyclic controls rejected generalization.
 
 export type SlotObservation = 'latin' | 'ea' | 'cs' | `fallback:${string}` | 'not-extracted';
 export type SlotCoverageRange = readonly [start: number, end: number, outcome: SlotObservation];
+export { POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE } from './font-slot-boundary-evidence.js';
 export { POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE } from './font-slot-extra-evidence.js';
 
 const EN_US: readonly SlotCoverageRange[] = [

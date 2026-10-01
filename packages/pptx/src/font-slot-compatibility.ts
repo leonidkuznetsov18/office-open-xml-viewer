@@ -12,9 +12,10 @@
 // distinct-face controls settle Office's behaviour; no new script override is
 // inferred from a fallback font. This is intentionally incomplete Office coverage.
 // The extra Windows cycles settle European digits and exact Myanmar-extension
-// scalars, but NOT the symbol overrides' font/size independence: all 10/18/32 pt
-// boundary triples contain substitution. Retain their original routing while
-// that evidence gap remains open (POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE).
+// scalars. Replacement 10/18/32 pt boundary controls validate Japanese U+201F
+// across three face triples, but reject general symbol deviations at the tested
+// endpoints. Those overrides are withdrawn below; other unmeasured pairs retain
+// prior routing. See POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE for the full matrix.
 import { graphemeClusterOffsets, isCjkBreakChar, isComplexScriptCodePoint } from '@silurus/ooxml-core';
 export { POWERPOINT_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
 
@@ -54,9 +55,17 @@ const NORMATIVE_SLOT_RANGES: readonly SlotRange[] = [
 ];
 
 const EN_US: readonly SlotRange[] = [
-  [0x24FF, 0x259F, 'latin'],
-  [0x2619, 0x2619, 'latin'],
-  [0x2670, 0x2671, 'latin'],
+  // Observed interior routing is retained. Replacement cycles under en-US/ja-JP
+  // at 10/18/32 pt reject the former endpoints: U+24FF follows ea in one complete
+  // triple (two others substitute); U+259F follows a fixed face in all three
+  // triples. Neither supports a general latin override. ECMA's otherwise ea
+  // applies to those endpoints; U+2500 remains latin in its complete triple.
+  [0x2500, 0x259E, 'latin'],
+  // U+2619 and U+2670/2671 each have 18 inconsistent cycles (three triples ×
+  // three sizes × en-US/ja-JP), including nearby U+261A/266F/2672 counterexamples.
+  // Withdraw their single-triple latin overrides: normative otherwise ea for
+  // U+2619, explicit cs for U+2670/2671 (§21.1.2.3). Office slot independence
+  // remains unresolved; no font-name-dependent compatibility rule is inferred.
   [0x2680, 0x2691, 'latin'],
   [0x2698, 0x2698, 'latin'],
   [0x269A, 0x269A, 'latin'],
@@ -79,6 +88,10 @@ const EN_US: readonly SlotRange[] = [
   [0x2768, 0x2775, 'latin'],
 ];
 
+// Observed Japanese quote endpoint: all three cyclic assignments across three
+// face triples and 10/18/32 pt select latin for U+201F, while U+201D/E select ea.
+// en-US selects latin for all three. This supports the exact Japanese override,
+// not other language IDs, surrounding contexts or the remaining symbol ranges.
 const JA_JP: readonly SlotRange[] = [[0x201F, 0x201F, 'latin'], ...EN_US];
 
 const KO_KR: readonly SlotRange[] = [
