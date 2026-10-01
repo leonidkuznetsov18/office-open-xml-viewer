@@ -30,8 +30,8 @@ mod tests {
             for (counts, shared, accepted) in [
                 (vec![65536; 16], true, false),
                 (vec![1000; 32], true, true),
-                (vec![65536; 8], true, true),
-                (vec![65536, 458753], false, false),
+                (vec![524288], true, true),
+                (vec![524289], true, false),
             ] {
                 let xml = allocation_chart(&counts, shared);
                 let doc = root_of(&xml);
@@ -72,13 +72,106 @@ mod tests {
                     .expect("envelope JSON");
                     assert_eq!(json["details"]["stage"], "parsing");
                     let violation = &json["details"]["violation"];
-                    assert_eq!(violation["resource"], "chartex-cache");
+                    assert_eq!(violation["resource"], "chartex-allocation");
                     assert_eq!(violation["metric"], "elements");
                     assert_eq!(violation["limit"], 524288);
                     assert_eq!(violation["observed"], 524289);
                     assert_eq!(violation["configurable"], false);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn chartex_allocation_bound_covers_derived_box_bins_and_monotonic_widths() {
+        use crate::resource::{OoxmlFormat, ResourceGovernor};
+        let box_series =
+            r#"<cx:series layoutId="boxWhisker"><cx:dataId val="0"/></cx:series>"#.repeat(1024);
+        let box_xml = format!(
+            r#"<cx:chartSpace xmlns:cx="{CX_NS}"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{box_series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        );
+        let oversized_xmls = [
+            allocation_chart(&[1_048_577], true),
+            allocation_chart(&[4_294_967_295], true),
+            allocation_chart(&[1], true)
+                .replace(r#"ptCount="1""#, "")
+                .replace(r#"idx="0""#, r#"idx="4294967295""#),
+        ];
+        for (host, format) in [
+            (ChartHost::Word, OoxmlFormat::Docx),
+            (ChartHost::Excel, OoxmlFormat::Xlsx),
+            (ChartHost::PowerPoint, OoxmlFormat::Pptx),
+        ] {
+            for xml in std::iter::once(&box_xml).chain(oversized_xmls.iter()) {
+                let doc = root_of(xml);
+                let governor = ResourceGovernor::from_wasm(format, Some(0), Some(0), Some(0));
+                let _scope = governor.scope("parse-chart");
+                let context = ChartParseContext {
+                    host,
+                    ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                };
+                assert!(parse_chartex_part(doc.root_element(), &context).is_none());
+                let error = governor.first_error().expect("typed resource violation");
+                assert!(error.contains("chartex-allocation"), "{host:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn chartex_allocation_budget_is_shared_across_document_operations() {
+        use crate::package_session::PackageSessionHandle;
+        use crate::resource::OoxmlFormat;
+        use std::io::{Cursor, Write};
+
+        let xml = allocation_chart(&[524288], true);
+        for (host, format) in [
+            (ChartHost::Word, OoxmlFormat::Docx),
+            (ChartHost::Excel, OoxmlFormat::Xlsx),
+            (ChartHost::PowerPoint, OoxmlFormat::Pptx),
+        ] {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file("part.xml", zip::write::SimpleFileOptions::default())
+                .expect("ZIP entry");
+            writer.write_all(b"<root/>").expect("ZIP payload");
+            let package = PackageSessionHandle::open(
+                writer.finish().expect("ZIP").into_inner(),
+                format,
+                Some(0),
+                Some(0),
+                Some(0),
+            )
+            .expect("package session");
+
+            package
+                .run_operation("first-chart", |operation| {
+                    let reporter = operation.limit_reporter()?;
+                    let doc = root_of(&xml);
+                    let context = ChartParseContext {
+                        host,
+                        limit_reporter: Some(&reporter),
+                        ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                    };
+                    parse_chartex_part(doc.root_element(), &context)
+                        .ok_or_else(|| "first chart unexpectedly rejected".to_string())?;
+                    Ok(())
+                })
+                .expect("first chart consumes the exact document budget");
+
+            let error = package
+                .run_operation("second-chart", |operation| {
+                    let reporter = operation.limit_reporter()?;
+                    let doc = root_of(&xml);
+                    let context = ChartParseContext {
+                        host,
+                        limit_reporter: Some(&reporter),
+                        ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                    };
+                    let _ = parse_chartex_part(doc.root_element(), &context);
+                    Ok(())
+                })
+                .expect_err("second chart must share the document ceiling");
+            assert!(error.contains("chartex-allocation"), "{host:?}: {error}");
         }
     }
 
@@ -142,7 +235,7 @@ mod tests {
             assert!(governor
                 .first_error()
                 .expect("nested referenced cache must be charged")
-                .contains("chartex-cache"));
+                .contains("chartex-allocation"));
         }
         // A nested later duplicate owns dataId=0; its small cache must not be
         // replaced with the outer block's width merely because it closes first.
@@ -1116,10 +1209,17 @@ mod tests {
         );
         let count_doc = chart_space_of(&huge_count);
         let mut references = EmptyChartReferenceResolver;
-        assert!(chartex_string_levels(count_doc.root_element(), &mut references).is_none());
+        let budget = ChartexAllocationBudget::new(None);
         assert!(
-            chartex_number_values(count_doc.root_element(), &["size"], &mut references,).is_none()
+            chartex_string_levels(count_doc.root_element(), &mut references, &budget).is_none()
         );
+        assert!(chartex_number_values(
+            count_doc.root_element(),
+            &["size"],
+            &mut references,
+            &budget,
+        )
+        .is_none());
 
         let huge_index = format!(
             r#"<cx:chartSpace xmlns:cx="{CX_NS}">
@@ -1130,10 +1230,17 @@ mod tests {
             </cx:chartSpace>"#,
         );
         let index_doc = chart_space_of(&huge_index);
-        assert!(chartex_string_levels(index_doc.root_element(), &mut references).is_none());
+        let budget = ChartexAllocationBudget::new(None);
         assert!(
-            chartex_number_values(index_doc.root_element(), &["size"], &mut references,).is_none()
+            chartex_string_levels(index_doc.root_element(), &mut references, &budget).is_none()
         );
+        assert!(chartex_number_values(
+            index_doc.root_element(),
+            &["size"],
+            &mut references,
+            &budget,
+        )
+        .is_none());
 
         let aggregate = format!(
             r#"<cx:chartSpace xmlns:cx="{CX_NS}">
@@ -1143,7 +1250,10 @@ mod tests {
             </cx:chartSpace>"#,
         );
         let aggregate_doc = chart_space_of(&aggregate);
-        assert!(chartex_string_levels(aggregate_doc.root_element(), &mut references).is_none());
+        let budget = ChartexAllocationBudget::new(None);
+        assert!(
+            chartex_string_levels(aggregate_doc.root_element(), &mut references, &budget).is_none()
+        );
     }
 
     /// (b) Treemap: the same deepest→root category levels as sunburst, plus the
@@ -1485,7 +1595,10 @@ mod tests {
         // series: authored provenance remains, but no structured recipe is
         // expanded for an arbitrary prefix of the chart.
         for series in series {
-            let (_, _, defaults) = parse_chartex_series_labels(series, 1, &FixtureResolver, false);
+            let budget = ChartexAllocationBudget::new(None);
+            let (_, _, defaults) =
+                parse_chartex_series_labels(series, 1, &FixtureResolver, false, &budget)
+                    .expect("labels fit allocation budget");
             let label_box = defaults
                 .as_ref()
                 .and_then(|labels| labels.label_box.as_ref())

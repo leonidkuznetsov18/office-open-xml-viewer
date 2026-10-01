@@ -183,12 +183,21 @@ pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<C
 
 /// Parse a Microsoft chartEx part into the shared wire model.
 pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
-    preflight_chartex_cache_elements(root, context.limit_reporter)?;
+    let budget = ChartexAllocationBudget::new(context.limit_reporter);
     parse_part(
         root,
         context,
         |root, resolver, style, colors, refs, images| {
-            parse_chartex_impl(root, resolver, style, colors, refs, images, context.host)
+            parse_chartex_impl(
+                root,
+                resolver,
+                style,
+                colors,
+                refs,
+                images,
+                context.host,
+                &budget,
+            )
         },
     )
 }

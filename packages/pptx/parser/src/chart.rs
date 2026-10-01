@@ -307,7 +307,10 @@ mod tests {
                 .expect("typed prefix"),
         )
         .expect("typed JSON");
-        assert_eq!(json["details"]["violation"]["resource"], "chartex-cache");
+        assert_eq!(
+            json["details"]["violation"]["resource"],
+            "chartex-allocation"
+        );
         assert_eq!(json["details"]["violation"]["format"], "pptx");
         assert_eq!(json["details"]["violation"]["observed"], 524289);
     }

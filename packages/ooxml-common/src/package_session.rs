@@ -734,6 +734,25 @@ impl PackageSession {
         result
     }
 
+    fn charge_hard_limit(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        increment: u64,
+    ) -> Result<(), String> {
+        self.ensure_healthy()?;
+        self.assert_operation_active(operation_id)?;
+        let scope = self.governor.scope_operation(operation_id)?;
+        let result = resource::charge_hard_limit(kind, part, limit, increment);
+        drop(scope);
+        if result.is_err() {
+            self.converge_poison();
+        }
+        result
+    }
+
     #[cfg(test)]
     fn operation_inflated_bytes(&self, operation_id: ResourceOperation) -> Option<u64> {
         self.usage_for_operation(operation_id)
@@ -1204,6 +1223,23 @@ impl PackageLimitReporter {
             part,
             limit,
             observed,
+        )
+    }
+
+    /// Charge package-lifetime parser/model work before allocating it.
+    pub fn charge_hard_limit(
+        &self,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        increment: u64,
+    ) -> Result<(), String> {
+        self.handle.inner.borrow_mut().charge_hard_limit(
+            self.operation_id,
+            kind,
+            part,
+            limit,
+            increment,
         )
     }
 }
