@@ -18,18 +18,21 @@ function layoutTable(tableXml: string, mode = 14): TableLayout {
       <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
       <Default Extension="xml" ContentType="application/xml"/>
       <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+      <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
       <Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>
     </Types>`],
     ['_rels/.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
       <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
     </Relationships>`],
     ['word/_rels/document.xml.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
       <Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>
     </Relationships>`],
     ['word/document.xml', `<w:document xmlns:w="${W}"><w:body>${tableXml}
       <w:sectPr><w:pgSz w:w="12240" w:h="14400"/>
         <w:pgMar w:left="1440" w:right="1440" w:top="1440" w:bottom="1440"/>
       </w:sectPr></w:body></w:document>`],
+    ['word/styles.xml', `<w:styles xmlns:w="${W}"><w:style w:type="table" w:styleId="LogicalTable"><w:name w:val="Logical table"/></w:style></w:styles>`],
     ['word/settings.xml', `<w:settings xmlns:w="${W}"><w:compat>
       <w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="${mode}"/>
     </w:compat></w:settings>`],
@@ -63,7 +66,12 @@ function layoutTable(tableXml: string, mode = 14): TableLayout {
 const margins = (left = 360) => `<w:tblCellMar><w:left w:type="dxa" w:w="${left}"/><w:right w:type="dxa" w:w="180"/></w:tblCellMar>`;
 const cell = (width: number, left?: number) => `<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="${width}"/>${left === undefined ? '' : `<w:tcMar><w:left w:type="dxa" w:w="${left}"/></w:tcMar>`}</w:tcPr><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>`;
 function table(rows: string, options = ''): string {
-  return `<w:tbl><w:tblPr><w:tblLayout w:type="fixed"/>${margins()}${options}</w:tblPr><w:tblGrid><w:gridCol w:w="2160"/><w:gridCol w:w="3600"/></w:tblGrid>${rows}</w:tbl>`;
+  // ECMA-376 CT_TblPrBase orders style/width/placement before layout/margins.
+  const propertyOrder = ['tblStyle', 'bidiVisual', 'tblW', 'jc', 'tblCellSpacing', 'tblInd'];
+  const orderedOptions = [...options.matchAll(/<w:(\w+)\b[^>]*\/>/g)]
+    .sort((a, b) => propertyOrder.indexOf(a[1] ?? '') - propertyOrder.indexOf(b[1] ?? ''))
+    .map(([xml]) => xml).join('');
+  return `<w:tbl><w:tblPr>${orderedOptions}<w:tblLayout w:type="fixed"/>${margins()}</w:tblPr><w:tblGrid><w:gridCol w:w="2160"/><w:gridCol w:w="3600"/></w:tblGrid>${rows}</w:tbl>`;
 }
 const indent = '<w:tblInd w:type="dxa" w:w="108"/>';
 const row = `<w:tr>${cell(2160)}${cell(3600)}</w:tr>`;
@@ -111,6 +119,15 @@ describe('Word table origin and occupied grid', () => {
     const spaced = table(row, indent + '<w:tblCellSpacing w:type="dxa" w:w="120"/>');
     expect(layoutTable(spaced).flowBounds.xPt).toBeCloseTo(77.4, 8);
   });
+  it('preserves member indentation outside the measured logical-table scope', () => {
+    const style = '<w:tblStyle w:val="LogicalTable"/>';
+    const exception = row.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblInd w:type="dxa" w:w="720"/></w:tblPrEx>');
+    expect(layoutTable(table(exception, style) + table(row, style), 13).rows
+      .map((r) => r.cells[0]?.flowBounds.xPt)).toEqual([108, 72]);
+    const unpreferred = row.replaceAll('w:type="dxa"', 'w:type="auto"');
+    expect(layoutTable(table(exception, style) + table(unpreferred, style), 14).rows
+      .map((r) => r.cells[0]?.flowBounds.xPt)).toEqual([108, 72]);
+  });
   it('preserves the occupied-grid solver for unmeasured percentage, negative-width and nested classes', () => {
     const skipped = `<w:tr><w:trPr><w:gridBefore w:val="1"/></w:trPr>${cell(2160)}${cell(3600)}</w:tr>`;
     const gridTable = table(skipped, '<w:tblW w:type="auto" w:w="0"/>')
@@ -137,6 +154,39 @@ describe('Word table origin and occupied grid', () => {
       const occupied = layoutTable(gridTable(full + skipped(before), true), mode);
       expect(occupied.columnWidthsPt).toEqual([36, 108, 180]);
       expect(occupied.rows[1]?.cells[0]?.flowBounds.xPt).toBeCloseTo((mode === 15 ? 72 : 54) + 36, 8);
+    }
+  });
+  it.each([11, 12, 14, 15])('mode %s lays out split logical tables like a single tbl', (mode) => {
+    const skipped = `<w:tr><w:trPr><w:gridBefore w:val="1"/><w:wBefore w:type="dxa" w:w="720"/></w:trPr>${cell(2160)}${cell(3600)}</w:tr>`;
+    const full = `<w:tr>${cell(720)}${cell(2160)}${cell(3600)}</w:tr>`;
+    const override = full.replace(cell(720), cell(720, 540));
+    const exception = full.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblInd w:type="dxa" w:w="720"/></w:tblPrEx>');
+    const unpreferred = skipped.replace('<w:tcW w:type="dxa" w:w="2160"', '<w:tcW w:type="auto" w:w="0"');
+    const gridTable = (rows: string, preferred: boolean) => table(rows,
+      '<w:tblStyle w:val="LogicalTable"/><w:tblInd w:type="dxa" w:w="0"/>'
+      + (preferred ? '<w:tblW w:type="dxa" w:w="6480"/>' : '<w:tblW w:type="auto" w:w="0"/>'))
+      .replace('<w:tblGrid>', '<w:tblGrid><w:gridCol w:w="720"/>');
+    const geometry = (layout: TableLayout) => ({
+      columns: layout.columnWidthsPt,
+      bounds: layout.flowBounds,
+      rows: layout.rows.map((r) => r.cells.map((c) => c.flowBounds)),
+    });
+    for (const preferred of [false, true]) {
+      // Occupancy on either side of an authored seam must preserve track zero;
+      // all-skipped members must still normalize. Different first-cell margins
+      // also exercise the logical first-row leading anchor.
+      for (const rows of [[full, skipped], [skipped, full], [skipped, skipped], [override, full], [exception, full], [unpreferred, skipped]]) {
+        const single = layoutTable(gridTable(rows.join(''), preferred), mode);
+        const split = layoutTable(rows.map((r) => gridTable(r, preferred)).join(''), mode);
+        expect(geometry(split)).toEqual(geometry(single));
+        if (rows[0] === full && rows[1] === skipped) {
+          expect(split.rows[1]?.cells.map((c) => c.flowBounds.xPt))
+            .toEqual(mode === 15 ? [108, 216] : [90, 198]);
+          const keepNext = '<w:p><w:pPr><w:keepNext/></w:pPr><w:r><w:t>lead</w:t></w:r></w:p>';
+          expect(geometry(layoutTable(keepNext + rows.map((r) => gridTable(r, preferred)).join(''), mode)))
+            .toEqual(geometry(layoutTable(keepNext + gridTable(rows.join(''), preferred), mode)));
+        }
+      }
     }
   });
 });

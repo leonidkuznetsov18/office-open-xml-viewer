@@ -657,6 +657,36 @@ test('production table and frame acquisition cannot regain local fallback measur
   }
 });
 
+test('logical-table preparation retains source ownership and complete column contexts', () => {
+  const root = initializeCanonicalFixture('docx-layout-boundary-logical-table-');
+  const path = 'packages/docx/src/layout/production-body-layout.ts';
+  const canonical = readFileSync(join(root, path), 'utf8')
+    .replace('function resolveColumnWidths(state, paragraph) {',
+      'function resolveColumnWidths(state, paragraph) { return acquireTableColumnInput(state, paragraph); }\n'
+      + 'function acquireTableColumnInput(state, paragraph) {')
+    .replace('sourceIndex: number)',
+      'sourceIndex: number, prepared?: Readonly<{ columns: readonly number[]; origin: ReturnType<typeof tableOriginContext> }>)')
+    .replace('computeTablePtLayout(state, table, 100, 0)',
+      'computeTablePtLayout(state, table, 100, 0, { columns: [], origin: {} })');
+  write(root, path, canonical);
+  assert.equal(runChecker(root, '--final').status, 0);
+  for (const [label, source] of [
+    ['reduced extracted context', canonical.replace(
+      'const baseContext = resolveParagraphLayoutContext(',
+      'const baseContext = state.layoutSettings ? resolveParagraphLayoutContext(',
+    ).replace('    paragraph,\n  );\n  return baseContext;', '    paragraph,\n  ) : {};\n  return baseContext;')],
+    ['unowned source', canonical.replace('sourceIndex: number', 'sourceIndex?: number')],
+    ['untyped preparation', canonical.replace(
+      'prepared?: Readonly<{ columns: readonly number[]; origin: ReturnType<typeof tableOriginContext> }>',
+      'prepared?: unknown')],
+    ['unwired column authority', canonical.replace(
+      'return acquireTableColumnInput(state, paragraph);', 'return [];')],
+  ]) {
+    write(root, path, source);
+    expectDiagnostic(root, 'PRODUCTION_ACQUISITION_AUTHORITY', label, '--final');
+  }
+});
+
 test('extracted table measurement cannot import a local line-layout fallback', () => {
   const root = initializeCanonicalFixture('docx-layout-boundary-table-measurement-fallback-');
   write(root, 'packages/docx/src/layout/body-table-measurement.ts',

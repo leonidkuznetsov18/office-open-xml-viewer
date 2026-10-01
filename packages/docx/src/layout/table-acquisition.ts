@@ -344,6 +344,35 @@ function orientRotatedCellBlocks(
   });
 }
 
+/** WORD_TABLE_ORIGIN_COMPATIBILITY facts before source rows are acquired.
+ * §17.4.37 groups share the first logical row's leading anchor and must test
+ * the measured scope over every member, rather than restarting at each tbl. */
+export function tableOriginContext(
+  table: TableLayoutSource,
+  format: TableFormatInput,
+  mode: number | undefined,
+) {
+  const firstRowException = format.firstRowException;
+  const tableIndentPt = firstRowException?.indentAuthored
+    ? (firstRowException.indentPt ?? 0)
+    : (table.tblInd ?? 0);
+  // WORD_TABLE_ORIGIN_COMPATIBILITY: preserve the prior contract for unresolved
+  // margins/spacing, nested origins, positioned tables, and unmeasured modes.
+  const measuredOrigin = wordMeasuredTableOriginMode(mode) && format.ordinaryFlow
+    && table.widthPct == null
+    && (!firstRowException?.preferredWidthAuthored || firstRowException.preferredWidth?.kind !== 'pct')
+    && (firstRowException?.layout === 'fixed' || table.layout === 'fixed'
+      || (firstRowException?.preferredWidthAuthored
+        ? firstRowException.preferredWidth?.kind === 'dxa' && firstRowException.preferredWidth.value > 0
+        : table.widthPt != null && table.widthPt > 0))
+    && table.rows.every((row) => row.cells.every((cell) => cell.widthPt != null && cell.widthPt > 0 && cell.widthPct == null))
+    && format.rows.every((row) => row.cellSpacingPt === 0
+      && row.cells[0]?.originLeftMarginPt != null);
+  const indentAuthored = firstRowException?.indentAuthored || table.tblInd != null;
+  const firstLeftMarginPt = format.rows[0]?.cells[0]?.originLeftMarginPt ?? 0;
+  return { measuredOrigin, tableIndentPt, indentAuthored, firstLeftMarginPt };
+}
+
 /**
  * Acquire an ordinary or nested table from final-width retained children.
  * Parser-private authored-presence and lexical facts arrive only through the
@@ -357,6 +386,7 @@ export function acquireRetainedTable<State>(
   outerState: State,
   source: SourceRef | readonly number[],
   dependencies: RetainedTableAcquisitionDependencies<State>,
+  logicalOrigin?: ReturnType<typeof tableOriginContext>,
 ): RetainedTableAcquisition {
   const sourceRoot: SourceRef = Array.isArray(source)
     ? { story: 'body', storyInstance: 'body', path: source }
@@ -374,27 +404,12 @@ export function acquireRetainedTable<State>(
     : `${sourceRoot.story}:${sourceRoot.storyInstance}:table:${sourcePath.join('.')}`;
   const format = dependencies.tableFormat(table);
   const bidiVisual = table.bidiVisual === true;
-  const firstRowException = format.firstRowException;
-  const tableIndentPt = firstRowException?.indentAuthored
-    ? (firstRowException.indentPt ?? 0)
-    : (table.tblInd ?? 0);
   const mode = dependencies.compatibilityMode?.(outerState);
-  // WORD_TABLE_ORIGIN_COMPATIBILITY: preserve the prior contract for unresolved
-  // margins/spacing, nested origins, positioned tables, and unmeasured modes.
-  const measuredOrigin = wordMeasuredTableOriginMode(mode) && format.ordinaryFlow
+  const origin = logicalOrigin ?? tableOriginContext(table, format, mode);
+  const { tableIndentPt, indentAuthored, firstLeftMarginPt } = origin;
+  const measuredOrigin = origin.measuredOrigin
     && sourcePath.length === 1 && sourceRoot.story === 'body'
-    && sourceRoot.storyInstance === 'body'
-    && table.widthPct == null
-    && (!firstRowException?.preferredWidthAuthored || firstRowException.preferredWidth?.kind !== 'pct')
-    && (firstRowException?.layout === 'fixed' || table.layout === 'fixed'
-      || (firstRowException?.preferredWidthAuthored
-        ? firstRowException.preferredWidth?.kind === 'dxa' && firstRowException.preferredWidth.value > 0
-        : table.widthPt != null && table.widthPt > 0))
-    && table.rows.every((row) => row.cells.every((cell) => cell.widthPt != null && cell.widthPt > 0 && cell.widthPct == null))
-    && format.rows.every((row) => row.cellSpacingPt === 0
-      && row.cells[0]?.originLeftMarginPt != null);
-  const indentAuthored = firstRowException?.indentAuthored || table.tblInd != null;
-  const firstLeftMarginPt = format.rows[0]?.cells[0]?.originLeftMarginPt ?? 0;
+    && sourceRoot.storyInstance === 'body';
   const nestedById: Record<string, RetainedTableAcquisition> = {};
   const floatingTables: NestedFloatingTableOccurrence[] = [];
   const rotatedCells: RotatedCellAcquisition[] = [];

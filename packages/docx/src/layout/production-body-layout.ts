@@ -30,6 +30,7 @@ import type {
   StoryLayout,
   TableLayout,
   TableLayoutInput,
+  TableColumnLayoutInput,
   TablePreferredWidthConstraint,
 } from './types.js';
 import {
@@ -59,7 +60,7 @@ import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
 import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numbering-marker.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
-import { wordFixedOccupiedGridInput } from './table-compatibility.js';
+import { wordFixedOccupiedGridInput, wordFixedOccupiedLogicalGridInputs } from './table-compatibility.js';
 import { measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
@@ -70,6 +71,8 @@ import type { DocGridCtx } from '../line-layout.js';
 import { measureParagraph } from '../paragraph-measure.js';
 import {
   acquireRetainedTable,
+  tableOriginContext,
+  type RetainedTableAcquisition,
   retainedTableAcquisitionIsReusableAcrossPages,
 } from './table-acquisition.js';
 import { combineAdjacentTableLayoutInputs } from './adjacent-table-layout-input.js';
@@ -1256,13 +1259,11 @@ function measureFollowingBodyBlock(
   };
   applyBodyAcquisitionLocationTo(services, candidate, request.location);
   if (request.input.kind === 'adjacent-table-group') {
-    const records = request.input.tables.map((tableInput) => {
+    const records = computeAdjacentTablePtLayouts(candidate, request.input.tables.map((tableInput) => {
       const table = sourceElement(dependencies.source, tableInput.source);
       if (table.type !== 'table') throw new Error('Following table source kind mismatch');
-      const sourceIndex = tableInput.source.path[0]!;
-      computeTablePtLayout(candidate, table, request.availableInlineExtentPt, sourceIndex);
-      return retainedTableRecord(candidate, sourceIndex).acquisition;
-    });
+      return { table, sourceIndex: tableInput.source.path[0]! };
+    }), request.availableInlineExtentPt);
     const combinedInput = ordinaryAcquisitionInputForAdjacentGroup(
       combineAdjacentTableLayoutInputs(
         request.input.logicalSequenceId,
@@ -2135,7 +2136,7 @@ function openConcreteBodyLayoutSession(
       request: Parameters<NonNullable<BodyLayoutSession['measureTable']>>[0],
     ): ReturnType<NonNullable<BodyLayoutSession['measureTable']>> {
       return measureBodyTableEntry(sessionDependencies, request, {
-        setBodyAcquisitionLocation, sourceElement, computeTablePtLayout,
+        setBodyAcquisitionLocation, sourceElement, computeTablePtLayout, computeAdjacentTablePtLayouts,
         ordinaryAcquisitionInputForAdjacentGroup, reacquireBodyTableBlock,
       });
     },
@@ -2211,6 +2212,7 @@ function computeTablePtLayout(
   table: TableLayoutSource,
   contentWPt: number,
   sourceIndex: number,
+  prepared?: Readonly<{ columns: readonly number[]; origin: ReturnType<typeof tableOriginContext> }>,
 ): { colWidthsPt: number[]; rowContentHeightsPt: number[]; rowHeightsPt: number[] } {
   const prior = state.retainedTablesBySourceIndex.get(sourceIndex);
   if (prior?.contentWidthPt === contentWPt && prior.reusableAcrossPages) {
@@ -2221,7 +2223,7 @@ function computeTablePtLayout(
       rowHeightsPt: priorRowHeightsPt,
     };
   }
-  const colWidthsPt = resolveColumnWidths(table, contentWPt, state);
+  const colWidthsPt = prepared ? [...prepared.columns] : resolveColumnWidths(table, contentWPt, state);
   const dependencies = state.retainedTableAcquisition;
   const acquired = acquireRetainedTable(
     table,
@@ -2230,6 +2232,7 @@ function computeTablePtLayout(
     state,
     [sourceIndex],
     dependencies,
+    prepared?.origin,
   );
   // Split rows are page-local acquisitions, but an unchanged inline extent
   // retains one authoritative track vector for the table's full occurrence.
@@ -2253,6 +2256,49 @@ function computeTablePtLayout(
   return { colWidthsPt, rowContentHeightsPt: rowHeightsPt, rowHeightsPt };
 }
 
+/** Acquire columns after parser-owned §17.4.37 grouping. Both pagination and
+ * keep-next lookahead use this path, so no authored member can independently
+ * discard a leading track or restart the logical first-row margin anchor. */
+function computeAdjacentTablePtLayouts(
+  state: BodyAcquisitionState,
+  members: readonly Readonly<{ table: TableLayoutSource; sourceIndex: number }>[],
+  contentWPt: number,
+): readonly RetainedTableAcquisition[] {
+  const prior = members.map(({ sourceIndex }) => state.retainedTablesBySourceIndex.get(sourceIndex));
+  if (prior.every((record) => record?.contentWidthPt === contentWPt && record.reusableAcrossPages)) {
+    return prior.map((record) => record!.acquisition);
+  }
+  const mode = state.layoutSettings.compat.compatibilityMode;
+  const acquired = members.map(({ table }) => acquireTableColumnInput(table, contentWPt, state));
+  const first = members[0]!.table;
+  const commonFrame = members.every(({ table }) => table.bidiVisual === first.bidiVisual
+    && table.jc === first.jc && table.tblInd === first.tblInd);
+  const columns = wordFixedOccupiedLogicalGridInputs(
+    acquired.map((item) => item.input), mode,
+    commonFrame && acquired.every((item) => item.measuredScope),
+  );
+  const origins = members.map(({ table }) => tableOriginContext(
+    table, state.acquisitionInputs.tableFormatInput(table), mode,
+  ));
+  const logicalOrigin = {
+    ...origins[0]!,
+    measuredOrigin: origins.every((origin) => origin.measuredOrigin),
+  };
+  return members.map(({ table, sourceIndex }, i) => {
+    // Only eligible logical groups share the observed leading anchor. Outside
+    // that scope, preserve each member's established first-row indentation.
+    const origin = commonFrame && logicalOrigin.measuredOrigin ? logicalOrigin : {
+      ...origins[i]!,
+      measuredOrigin: commonFrame ? false : origins[i]!.measuredOrigin,
+    };
+    computeTablePtLayout(state, table, contentWPt, sourceIndex, {
+      columns: resolveTableColumnWidths(columns[i]!),
+      origin,
+    });
+    return retainedTableRecord(state, sourceIndex).acquisition;
+  });
+}
+
 /**
  * Acquire the parser/style facts and intrinsic content constraints required by
  * ECMA-376 §17.18.87, then resolve the shared table grid. `tblGrid` is the
@@ -2265,6 +2311,17 @@ function resolveColumnWidths(
   contentWPt: number,
   state: BodyMeasurementContext,
 ): number[] {
+  const acquired = acquireTableColumnInput(table, contentWPt, state);
+  return [...resolveTableColumnWidths(wordFixedOccupiedGridInput(
+    acquired.input, state.layoutSettings.compat.compatibilityMode, acquired.measuredScope,
+  ))];
+}
+
+function acquireTableColumnInput(
+  table: TableLayoutSource,
+  contentWPt: number,
+  state: BodyMeasurementContext,
+): Readonly<{ input: TableColumnLayoutInput; measuredScope: boolean }> {
   const format = state.acquisitionInputs.tableFormatInput(table);
   const baseIndentPt = Number.isFinite(table.tblInd) ? (table.tblInd ?? 0) : 0;
   const rowIndentPts = format.rows.map((row) => {
@@ -2525,14 +2582,16 @@ function resolveColumnWidths(
       ? maximumTableWidthPt
       : Math.max(contentWPt, state.pageWidth),
   );
-  return [...resolveTableColumnWidths({
-    ...wordFixedOccupiedGridInput(columnInput, compatibilityMode,
-      format.ordinaryFlow && story === 'body' && state.storyContext?.containers.length === 0
-        && table.widthPct == null && format.firstRowException?.preferredWidth?.kind !== 'pct'
-        && format.rows.every((row) => row.cellSpacingPt === 0)),
-    outerMarginAllowancePt: forcedFitOuterMarginsPt,
-    growUnpreferredColumns: usesLeadingIndentBand,
-  })];
+  return {
+    input: {
+      ...columnInput,
+      outerMarginAllowancePt: forcedFitOuterMarginsPt,
+      growUnpreferredColumns: usesLeadingIndentBand,
+    },
+    measuredScope: format.ordinaryFlow && story === 'body' && state.storyContext?.containers.length === 0
+      && table.widthPct == null && format.firstRowException?.preferredWidth?.kind !== 'pct'
+      && format.rows.every((row) => row.cellSpacingPt === 0),
+  };
 }
 
 // ===== Text frames & drop caps (ECMA-376 §17.3.1.11) =====
