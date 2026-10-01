@@ -527,7 +527,7 @@ export function performRejectGap(
 
 export function performAvailW(operationState: PassOperationState) {
   const { breakerState, firstIndent, widthPolicy } = operationState;
-  return widthPolicy === 'intrinsic'
+  return widthPolicy !== 'bounded'
     ? Number.POSITIVE_INFINITY
     : breakerState.lineMaxWidth - (breakerState.isFirst ? firstIndent : 0);
 }
@@ -545,7 +545,7 @@ export function performFitsMeasuredWidth(
   // (below), not an Office width allowance, before forcing an emergency split.
   if (used <= available + 1e-9) return true;
   if (
-    widthPolicy === 'intrinsic' ||
+    widthPolicy !== 'bounded' ||
     !Number.isFinite(used) ||
     !Number.isFinite(breakerState.lineMaxWidth)
   ) {

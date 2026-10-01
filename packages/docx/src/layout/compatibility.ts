@@ -86,3 +86,20 @@ export const WORD_FLOAT_GAP_FLOW = defineCompatibilityRule({
     application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
   description: 'Issue #1670 controlled exports in modes 14 and 15 fill successive gaps on one baseline in paragraph reading order, then restart at the leading gap of the next baseline. Two/three-gap square and rectangular tight/through controls, left/right/largest restrictions, 20–100pt gaps, 10/20pt text, alignment, indents, padding, empty marks and Hebrew RTL establish atom-fit admission, including 40pt gaps. An unbroken Latin word too wide for every gap moves below the object. These controls supersede the one-inch inference from issue #676. Geometry remains fail-closed on non-finite input and unavailable polygon contours; emergency splitting is retained in a full paragraph band.',
 });
+
+/** Word for Mac issue #1668 controls (527 cases including horizontal twins):
+ * both stacked WordArt values use continuous clockwise sideways Latin with
+ * ordinary horizontal advances, upright East Asian/emoji clusters, and left-to-right
+ * columns. Sizes 12–48 pt, face/style and character sweeps, wrapping, spacing,
+ * anchors, transforms and split graphemes showed no direction-mode exception.
+ * This is host compatibility, not ECMA-376 §20.1.10.83's stacked-letter rule.
+ * Reuse the existing mixed-orientation vertical pipeline; native glyph metrics
+ * and vertical glyph designs remain the text service's responsibility.
+ */
+export function wordTextBoxVerticalMode(
+  value: string | null | undefined,
+): 'vert' | 'vert270' | 'eaVert' | 'mongolianVert' | undefined {
+  if (value === 'wordArtVert' || value === 'wordArtVertRtl') return 'mongolianVert';
+  return value === 'vert' || value === 'vert270' || value === 'eaVert' || value === 'mongolianVert'
+    ? value : undefined;
+}

@@ -614,4 +614,15 @@ mod tests {
             Some(true)
         );
     }
+
+    #[test]
+    fn powerpoint_adapter_rejects_unsupported_chartex_layouts() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="pie"><cx:dataId val="0"/></cx:series>
+          </cx:plotAreaRegion></cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        assert!(parse_chartex(xml, None, None, &HashMap::new(), None).is_none());
+    }
 }

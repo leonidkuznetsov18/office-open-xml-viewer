@@ -1422,6 +1422,10 @@ export interface FlowContainer {
   /** Text boxes lay out complete overflow before applying bodyPr clipping or
    * spAutoFit to the outer frame. Other stories remain capacity-bounded. */
   readonly capacity?: 'bounded' | 'unbounded';
+  /** Authored DrawingML inline wrapping policy for text-box paragraphs. */
+  readonly noWrap?: boolean;
+  /** Upright inline math in a quarter-turn DrawingML WordArt frame. */
+  readonly quarterTurnMath?: boolean;
 }
 
 export interface FlowCursor extends PointPt {}

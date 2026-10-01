@@ -77,7 +77,7 @@ export interface LineBreakerPassInput {
   readonly isJustified: boolean;
   readonly stretchLastLine: boolean;
   readonly startBoundary?: LineBoundary;
-  readonly widthPolicy: 'bounded' | 'intrinsic';
+  readonly widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped';
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   readonly overflowPunct: boolean;
   readonly passContext: Readonly<{
@@ -144,9 +144,10 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   // search; placement itself admits or rejects a narrowed gap (#1670).
   const startLine = (requirement: number = 0): void => performStartLine(operationState, requirement);
 
-  // Intrinsic acquisition deliberately disables automatic line wrapping while
-  // retaining the real paragraph/anchor width for tab and alignment reference
-  // frames. This is a semantic mode, not a synthetic oversized page.
+  // Intrinsic acquisition and DrawingML wrap=none disable automatic wrapping
+  // while retaining the real paragraph/anchor width for tabs and alignment.
+  // Unwrapped paint still finalizes retained shapes; intrinsic measurement does
+  // not. Neither mode invents an oversized page.
   const availW = () => performAvailW(operationState);
 
   // AutoFit can set a table column to the measured text advance plus its

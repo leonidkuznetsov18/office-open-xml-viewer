@@ -36,7 +36,7 @@ export function layoutLines(
   isJustified?: boolean,
   stretchLastLine?: boolean,
   startBoundary?: LineBoundary,
-  widthPolicy?: 'bounded' | 'intrinsic',
+  widthPolicy?: 'bounded' | 'intrinsic' | 'unwrapped',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct?: boolean,
 ): LayoutLine[];
@@ -85,7 +85,7 @@ export function layoutLines(
   // kashida modes leave true-last/manual-break lines non-justified.
   stretchLastLine = false,
   startBoundary?: LineBoundary,
-  widthPolicy: 'bounded' | 'intrinsic' = 'bounded',
+  widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped' = 'bounded',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct = false,
   passContext?: Readonly<{
@@ -126,7 +126,7 @@ export function layoutLines(
       overflowPunct,
       { probeHeights, preparedFloatWrap },
     );
-    if (!wrapCtx || widthPolicy === 'intrinsic') return runPass(null);
+    if (!wrapCtx || widthPolicy !== 'bounded') return runPass(null);
     const preparedFloatWrap = wrapCtx.lineWindow
       ? undefined
       : prepareFloatWrap(wrapCtx.floats);
