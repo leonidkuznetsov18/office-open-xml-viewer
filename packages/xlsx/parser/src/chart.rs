@@ -739,6 +739,12 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                     theme_minor_font_latin: theme_fonts.1,
                     theme_format_scheme,
                 };
+                let Ok(reporter) = archive
+                    .operation()
+                    .and_then(|operation| operation.limit_reporter())
+                else {
+                    continue;
+                };
                 let mut references =
                     reference_context
                         .as_mut()
@@ -764,6 +770,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                         resolver as &mut dyn ooxml_common::chart::ChartReferenceResolver
                     }),
                 );
+                chart_context.limit_reporter = Some(&reporter);
                 chart_context.host = ooxml_common::chart::ChartHost::Excel;
                 let chart_opt = if is_chartex {
                     ooxml_common::chart::parse_chartex_part(
@@ -2170,6 +2177,43 @@ mod chartex_tests {
             zw.finish().unwrap();
         }
         crate::XlsxZip::new(Cursor::new(buf)).unwrap()
+    }
+
+    #[test]
+    fn chartex_allocation_limit_poisoning_survives_chart_adapter() {
+        let series =
+            r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>"#.repeat(16);
+        let xml = format!(
+            r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="65536"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        );
+        let mut archive = archive_with_chartex_part(&xml);
+        let error = archive
+            .run_operation("parse-sheet", |archive| {
+                let _ = load_sheet_charts_with_theme_images(
+                    archive,
+                    "worksheets/sheet1.xml",
+                    None,
+                    &theme(),
+                    (None, None),
+                    None,
+                    &ooxml_common::chart::ChartImageRelationships::default(),
+                );
+                Ok(())
+            })
+            .expect_err("chart adapter must not swallow resource violation");
+        assert_eq!(
+            archive.assert_healthy().expect_err("poisoned package"),
+            error
+        );
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed prefix"),
+        )
+        .expect("typed JSON");
+        assert_eq!(json["details"]["violation"]["resource"], "chartex-cache");
+        assert_eq!(json["details"]["violation"]["format"], "xlsx");
+        assert_eq!(json["details"]["violation"]["observed"], 524289);
     }
 
     #[test]

@@ -443,6 +443,20 @@ constants are checked in CI so browser option normalization, parser-native
 fallbacks, and effective hard caps cannot drift during calibration or later
 releases. Generation rejects a default that exceeds its hard ceiling.
 
+ChartEx has a non-configurable 524,288-element per-chart cache-expansion budget,
+from the same generated policy. Initial calibration measured a maximum of
+1,008 elements across 22,973 local ChartEx parts, leaving more than 520 times
+headroom; this is availability policy, not a document-format constraint.
+It sums sparse numeric and string level widths
+for each authored series' data reference, including repeated references, before
+allocating caches. Missing `ptCount` uses the highest point index plus one, as
+the cache parser does. Host visibility/layout filtering does not reduce this
+reservation, so DOCX (native and streaming), XLSX and PPTX agree. This is a
+proportional expansion count, not compressed ZIP size or exact allocator bytes;
+formula-only dimensions remain under host range-resolution limits. A crossing
+poisons the package with `chartex-cache:elements` at the parsing stage; it cannot
+silently omit series or select a DOCX picture fallback. No migration is required.
+
 Archive entry count, XML nesting, relationships, model complexity, serialized
 bytes, image dimensions, canvas pixels, and timeouts remain internal quotas or
 separate existing options unless evidence shows that users can tune them

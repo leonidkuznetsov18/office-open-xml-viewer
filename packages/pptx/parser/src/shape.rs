@@ -3297,14 +3297,20 @@ fn parse_graphic_frame(
                         // part's associated chartStyle sidecar
                         // (`styleN.xml`), reached via that part's OWN
                         // rels. Read it best-effort before parsing.
-                        parse_chartex_with_images(
-                            &chart_xml,
-                            related_parts.style_xml.as_deref(),
-                            related_parts.color_style_xml.as_deref(),
-                            theme,
-                            theme_source.format_scheme(),
-                            &image_resolver,
-                        )
+                        zip.operation()
+                            .and_then(|operation| operation.limit_reporter())
+                            .ok()
+                            .and_then(|reporter| {
+                                parse_chartex_with_images(
+                                    &chart_xml,
+                                    related_parts.style_xml.as_deref(),
+                                    related_parts.color_style_xml.as_deref(),
+                                    theme,
+                                    theme_source.format_scheme(),
+                                    &image_resolver,
+                                    Some(&reporter),
+                                )
+                            })
                     } else {
                         let user_shapes_xml =
                             load_chart_user_shapes_xml(zip, &chart_path, &chart_xml);

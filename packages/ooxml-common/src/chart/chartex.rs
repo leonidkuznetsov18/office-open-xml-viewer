@@ -578,6 +578,106 @@ pub(super) fn parse_chartex_series_labels(
     )
 }
 
+// [MS-ODRAWXML] §2.24.3.77 CT_Series.dataId selects CT_Data; numeric/string
+// levels (§2.24.3.64 CT_NumericLevel, CT_StringLevel) expand sparse ptCount
+// slots, not just authored points. This is library resource policy, not an
+// Office compatibility rule: reserve the sum of referenced cache slots for
+// every authored series before any cache/model allocation. Repeated dataId
+// references each count again because series expand/copy the same data.
+// Reserve before host visibility/layout filtering so Word, Excel and PowerPoint
+// have the same availability verdict even when one host discards extra series.
+// This proportional expansion budget is not an exact heap-byte measurement;
+// ZIP/XML/text and existing per-cache limits remain separate. Formula-only
+// dimensions have no cache slots and remain governed by host range resolution.
+pub(super) fn preflight_chartex_cache_elements(
+    root: Node,
+    reporter: Option<&crate::package_session::PackageLimitReporter>,
+) -> Option<()> {
+    use crate::resource::{
+        observe_hard_limit, HardResourceLimitKind, HARD_MAX_CHARTEX_CACHE_ELEMENTS,
+    };
+    // Count level slots once in document order. Each data subtree is a range
+    // of that running count, so even malformed nested data blocks cannot
+    // multiply XML scans. Descendants::next_back reads the subtree's last node
+    // in O(1). The pending stack is bounded by the existing XML depth limit;
+    // lookup metadata is O(data blocks), and total work is O(XML + series).
+    let mut counts = std::collections::HashMap::new();
+    let mut pending = Vec::new();
+    let mut slots = 0u128;
+    for node in root.descendants() {
+        if node.is_element() && node.tag_name().name() == "data" {
+            if let (Some(id), Some(last)) = (node.attribute("id"), node.descendants().next_back()) {
+                pending.push((last.id(), node.id(), id, slots));
+            }
+        }
+        if node.is_element()
+            && node.tag_name().name() == "lvl"
+            && node
+                .parent()
+                .is_some_and(|parent| matches!(parent.tag_name().name(), "numDim" | "strDim"))
+        {
+            // Match the existing no-allocation gate for invalid/oversized
+            // individual caches. u128 holds every possible u32 NodeId times
+            // a usize width; conversion to the policy counter saturates.
+            if let Some(count) = bounded_chartex_point_count(node) {
+                slots += count as u128;
+            }
+        }
+        while pending
+            .last()
+            .is_some_and(|(end, _, _, _)| *end == node.id())
+        {
+            if let Some((_, order, id, start)) = pending.pop() {
+                let width = u64::try_from(slots - start).unwrap_or(u64::MAX);
+                let entry = counts.entry(id).or_insert((order, width));
+                // Match the parser's last-in-document-order duplicate-id
+                // lookup, including a nested duplicate that closes earlier.
+                if order.get() > entry.0.get() {
+                    *entry = (order, width);
+                }
+            }
+        }
+    }
+    let fallback_count = u64::try_from(slots).unwrap_or(u64::MAX);
+    let mut total = 0u64;
+    for series in root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "series")
+    {
+        let count = match child(series, "dataId").and_then(|node| node.attribute("val")) {
+            Some(id) => counts.get(id).map(|(_, count)| *count).unwrap_or(0),
+            // Match the parser's legacy omitted-dataId fallback.
+            None => fallback_count,
+        };
+        total = total.saturating_add(count);
+        if total > HARD_MAX_CHARTEX_CACHE_ELEMENTS {
+            // Option-based chart adapters may omit unsupported charts, but a
+            // resource failure poisons the package operation and cannot become
+            // an omitted chart or an MCE picture fallback.
+            let report = |reporter: &crate::package_session::PackageLimitReporter| {
+                reporter.observe_hard_limit(
+                    HardResourceLimitKind::ChartexCacheElements,
+                    None,
+                    HARD_MAX_CHARTEX_CACHE_ELEMENTS,
+                    total,
+                )
+            };
+            if let Some(reporter) = reporter {
+                let _ = report(reporter);
+            } else {
+                let _ = observe_hard_limit(
+                    HardResourceLimitKind::ChartexCacheElements,
+                    None,
+                    HARD_MAX_CHARTEX_CACHE_ELEMENTS,
+                    total,
+                );
+            }
+            return None;
+        }
+    }
+    Some(())
+}
+
 pub(super) fn parse_chartex_impl(
     chartspace_root: Node,
     resolver: &dyn ColorResolver,

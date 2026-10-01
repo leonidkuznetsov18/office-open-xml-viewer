@@ -80,6 +80,7 @@ pub enum HardResourceLimitKind {
     PptxSlideJsonBytes,
     PptxSharedDependencyXmlBytes,
     XmlDomComplexity,
+    ChartexCacheElements,
     PptxSharedDependencyProjectionBytes,
     PptxSharedCacheEntries,
     PptxSharedCacheProjectionBytes,
@@ -116,6 +117,7 @@ impl HardResourceLimitKind {
             Self::PptxSharedDependencyXmlBytes => {
                 ("parsing", "pptx-shared-dependency-xml", "bytes")
             }
+            Self::ChartexCacheElements => ("parsing", "chartex-cache", "elements"),
             Self::XmlDomComplexity => ("parsing", "xml-dom", "complexity-units"),
             Self::PptxSharedDependencyProjectionBytes => {
                 ("parsing", "pptx-shared-dependency", "projected-bytes")

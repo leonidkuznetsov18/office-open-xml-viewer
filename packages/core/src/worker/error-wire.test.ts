@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { HARD_MAX_CHARTEX_CACHE_ELEMENTS } from './resource-policy.generated.js';
 import { OoxmlError, OoxmlResourceLimitError } from '../errors/ooxml-error.js';
 import {
   OoxmlDecodedImageLimitError,
@@ -56,6 +57,24 @@ describe('worker error wire', () => {
       configurable: true,
       usage: expect.objectContaining({ largestInflatedEntryBytes: 6 }),
     });
+  });
+
+  it('preserves the ChartEx hard limit and validates its wire semantics', () => {
+    const details = {
+      stage: 'parsing',
+      violation: { format: 'pptx', operation: 'parse', resource: 'chartex-cache',
+        metric: 'elements', limit: HARD_MAX_CHARTEX_CACHE_ELEMENTS,
+        observed: HARD_MAX_CHARTEX_CACHE_ELEMENTS + 1, configurable: false, usage: USAGE },
+    };
+    const message = () => `OOXML_RESOURCE_LIMIT:${JSON.stringify({ code: 'ooxml-resource-limit', details })}`;
+    const restored = deserializeWorkerError(structuredClone(serializeWorkerError(new Error(message()))));
+    expect(restored).toBeInstanceOf(OoxmlResourceLimitError);
+    expect((restored as OoxmlResourceLimitError).details).toEqual(details);
+    details.stage = 'serialization';
+    expect(parseResourceLimitError(new Error(message()))).toBeUndefined();
+    details.stage = 'parsing';
+    details.violation.configurable = true;
+    expect(parseResourceLimitError(new Error(message()))).toBeUndefined();
   });
 
   it('survives worker serialization and structured clone as a real typed error', () => {

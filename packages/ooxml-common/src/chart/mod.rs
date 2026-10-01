@@ -145,6 +145,8 @@ pub enum ChartHost {
 #[derive(Default)]
 pub struct ChartParseContext<'a> {
     pub host: ChartHost,
+    /// Package-operation capability: hard failures survive Option-based adapters.
+    pub limit_reporter: Option<&'a crate::package_session::PackageLimitReporter>,
     pub color_resolver: Option<&'a dyn ColorResolver>,
     pub style_xml: Option<&'a str>,
     pub color_style_xml: Option<&'a str>,
@@ -164,6 +166,7 @@ impl<'a> ChartParseContext<'a> {
     ) -> Self {
         Self {
             host: ChartHost::Unspecified,
+            limit_reporter: None,
             color_resolver: Some(color_resolver),
             style_xml,
             color_style_xml,
@@ -180,6 +183,7 @@ pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<C
 
 /// Parse a Microsoft chartEx part into the shared wire model.
 pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
+    preflight_chartex_cache_elements(root, context.limit_reporter)?;
     parse_part(
         root,
         context,

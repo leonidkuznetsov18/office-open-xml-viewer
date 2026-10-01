@@ -4545,6 +4545,12 @@ fn load_chart_map(
             &theme.chart_images,
         );
         let user_shapes_xml = load_chart_user_shapes_xml(zip, &path, &xml);
+        let Ok(reporter) = zip
+            .operation()
+            .and_then(|operation| operation.limit_reporter())
+        else {
+            continue;
+        };
         let mut exact_chartex_root = false;
         if let Some(mut chart) = parse_docx_chart_with_provenance(
             &xml,
@@ -4553,6 +4559,7 @@ fn load_chart_map(
             theme,
             &image_resolver,
             &mut exact_chartex_root,
+            Some(&reporter),
         ) {
             if let (Some(user_shapes_xml), Ok(chart_doc)) =
                 (user_shapes_xml.as_deref(), parse_guarded(&xml))
@@ -12892,6 +12899,7 @@ fn parse_docx_chart_with_style_parts_and_images(
         theme,
         image_resolver,
         &mut false,
+        None,
     )
 }
 
@@ -12902,6 +12910,7 @@ fn parse_docx_chart_with_provenance(
     theme: &ThemeColors,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     exact_chartex_root: &mut bool,
+    limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
 ) -> Option<ooxml_common::chart::ChartModel> {
     let doc = parse_guarded(chart_xml).ok()?;
     let root = doc.root_element();
@@ -12918,6 +12927,7 @@ fn parse_docx_chart_with_provenance(
             root,
             &ooxml_common::chart::ChartParseContext {
                 host: ooxml_common::chart::ChartHost::Word,
+                limit_reporter,
                 ..ooxml_common::chart::ChartParseContext::new(
                     &resolver,
                     style_xml,

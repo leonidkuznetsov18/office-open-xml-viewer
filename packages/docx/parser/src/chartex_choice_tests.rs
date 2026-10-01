@@ -872,3 +872,37 @@ fn unsupported_must_understand_on_substitute_fallback_keeps_parent_choice() {
     assert_eq!(native["model"], streaming["model"]);
     assert_eq!(first_type(&native), Some("unavailableDrawing"));
 }
+
+#[test]
+fn chartex_allocation_limit_poisoning_matches_native_and_streaming() {
+    let series =
+        r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>"#.repeat(16);
+    let xml = format!(
+        r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="65536"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+    );
+    let data = package_with(
+        &ac(&live("cx"), &picture()),
+        &chart_rel(
+            crate::chartex_choice::CHARTEX_REL,
+            "charts/chart.xml",
+            "Internal",
+        ),
+        Some(("word/charts/chart.xml", &xml)),
+    );
+    for streaming in [false, true] {
+        let result = outcome(&data, streaming);
+        assert_eq!(result["healthy"], false);
+        let error = result["error"]
+            .as_str()
+            .expect("chart resource limit must not select picture fallback");
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed prefix"),
+        )
+        .expect("typed JSON");
+        assert_eq!(json["details"]["violation"]["resource"], "chartex-cache");
+        assert_eq!(json["details"]["violation"]["format"], "docx");
+        assert_eq!(json["details"]["violation"]["observed"], 524289);
+    }
+}
