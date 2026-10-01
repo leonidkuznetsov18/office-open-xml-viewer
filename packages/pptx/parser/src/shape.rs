@@ -3355,6 +3355,16 @@ fn parse_graphic_frame(
             if let Some(rel_target) = rels.get(&rid) {
                 let chart_path = resolve_path(slide_part, rel_target);
                 if let Ok(chart_xml) = read_zip_str(zip, &chart_path) {
+                    let graphic_frame_ordinal = node
+                        .document()
+                        .root_element()
+                        .descendants()
+                        .filter(|candidate| {
+                            candidate.is_element() && candidate.tag_name().name() == "graphicFrame"
+                        })
+                        .position(|candidate| candidate.id() == node.id())
+                        .unwrap_or(0);
+                    let retention_site = format!("graphicFrame:{graphic_frame_ordinal}");
                     let related_parts = load_chart_related_parts(zip, &chart_path);
                     let empty_theme_images =
                         ooxml_common::chart::ChartImageRelationships::default();
@@ -3367,14 +3377,24 @@ fn parse_graphic_frame(
                         // part's associated chartStyle sidecar
                         // (`styleN.xml`), reached via that part's OWN
                         // rels. Read it best-effort before parsing.
-                        parse_chartex_with_images(
-                            &chart_xml,
-                            related_parts.style_xml.as_deref(),
-                            related_parts.color_style_xml.as_deref(),
-                            theme,
-                            theme_source.format_scheme(),
-                            &image_resolver,
-                        )
+                        zip.operation()
+                            .and_then(|operation| operation.limit_reporter())
+                            .ok()
+                            .and_then(|reporter| {
+                                parse_chartex_with_images(
+                                    &chart_xml,
+                                    related_parts.style_xml.as_deref(),
+                                    related_parts.color_style_xml.as_deref(),
+                                    theme,
+                                    theme_source.format_scheme(),
+                                    &image_resolver,
+                                    Some(&reporter),
+                                    Some(ooxml_common::chart::ChartRetentionKey {
+                                        source_part: slide_part,
+                                        site: &retention_site,
+                                    }),
+                                )
+                            })
                     } else {
                         let user_shapes_xml =
                             load_chart_user_shapes_xml(zip, &chart_path, &chart_xml);

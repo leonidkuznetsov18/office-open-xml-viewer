@@ -550,6 +550,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
         // size, ECMA-376 §20.5.2.24), or `<xdr:absoluteAnchor>` (absolute
         // `<xdr:pos x y>` + extent, §20.5.2.1; the normal chart-sheet form).
         // All three must produce the same bounded ChartAnchor wire shape.
+        let mut chart_anchor_ordinal = 0usize;
         for anchor in draw_doc
             .root_element()
             .children()
@@ -659,6 +660,8 @@ pub(crate) fn load_sheet_charts_with_theme_images(
             let mut graphic_frames = Vec::new();
             collect_selected_graphic_frames(anchor, &mut graphic_frames);
             for graphic_frame in graphic_frames {
+                let retention_site = format!("anchor:{chart_anchor_ordinal}");
+                chart_anchor_ordinal = chart_anchor_ordinal.saturating_add(1);
                 // ECMA-376 §20.1.2.2.8 CT_NonVisualDrawingProps@hidden: a hidden
                 // chart's own graphicFrame is not rendered.
                 if crate::drawing::xdr_node_hidden(&graphic_frame) {
@@ -739,6 +742,12 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                     theme_minor_font_latin: theme_fonts.1,
                     theme_format_scheme,
                 };
+                let Ok(reporter) = archive
+                    .operation()
+                    .and_then(|operation| operation.limit_reporter())
+                else {
+                    continue;
+                };
                 let mut references =
                     reference_context
                         .as_mut()
@@ -764,6 +773,11 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                         resolver as &mut dyn ooxml_common::chart::ChartReferenceResolver
                     }),
                 );
+                chart_context.limit_reporter = Some(&reporter);
+                chart_context.retention_key = Some(ooxml_common::chart::ChartRetentionKey {
+                    source_part: &drawing_path,
+                    site: &retention_site,
+                });
                 chart_context.host = ooxml_common::chart::ChartHost::Excel;
                 let chart_opt = if is_chartex {
                     ooxml_common::chart::parse_chartex_part(
@@ -2170,6 +2184,74 @@ mod chartex_tests {
             zw.finish().unwrap();
         }
         crate::XlsxZip::new(Cursor::new(buf)).unwrap()
+    }
+
+    #[test]
+    fn chartex_allocation_limit_poisoning_survives_chart_adapter() {
+        let series =
+            r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>"#.repeat(16);
+        let xml = format!(
+            r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="65536"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        );
+        let mut archive = archive_with_chartex_part(&xml);
+        let error = archive
+            .run_operation("parse-sheet", |archive| {
+                let _ = load_sheet_charts_with_theme_images(
+                    archive,
+                    "worksheets/sheet1.xml",
+                    None,
+                    &theme(),
+                    (None, None),
+                    None,
+                    &ooxml_common::chart::ChartImageRelationships::default(),
+                );
+                Ok(())
+            })
+            .expect_err("chart adapter must not swallow resource violation");
+        assert_eq!(
+            archive.assert_healthy().expect_err("poisoned package"),
+            error
+        );
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed prefix"),
+        )
+        .expect("typed JSON");
+        assert_eq!(
+            json["details"]["violation"]["resource"],
+            "chartex-allocation"
+        );
+        assert_eq!(json["details"]["violation"]["format"], "xlsx");
+        assert_eq!(json["details"]["violation"]["metric"], "bytes");
+        assert_eq!(
+            json["details"]["violation"]["limit"],
+            ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+        );
+        assert_eq!(json["details"]["violation"]["observed"], 12_582_913);
+    }
+
+    #[test]
+    fn chartex_allocation_accounting_is_idempotent_for_reparsed_chart_part() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="524288"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        for operation_name in ["cursor-preview", "cursor-final"] {
+            let charts = archive
+                .run_operation(operation_name, |archive| {
+                    Ok(load_sheet_charts_with_theme_images(
+                        archive,
+                        "worksheets/sheet1.xml",
+                        None,
+                        &theme(),
+                        (None, None),
+                        None,
+                        &ooxml_common::chart::ChartImageRelationships::default(),
+                    ))
+                })
+                .expect("the same ChartEx part is charged once per package");
+            assert_eq!(charts.len(), 1);
+        }
+        archive.assert_healthy().expect("package remains usable");
     }
 
     #[test]

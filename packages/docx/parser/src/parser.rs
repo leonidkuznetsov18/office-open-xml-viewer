@@ -804,6 +804,9 @@ pub(crate) fn parse_from_bytes_streamed_with_limits(
 struct ChartMap {
     models: HashMap<String, ooxml_common::chart::ChartModel>,
     renderable_chartex_rids: Rc<HashSet<String>>,
+    source_part: String,
+    limit_reporter: Option<ooxml_common::package_session::PackageLimitReporter>,
+    drawing_ordinal: std::cell::Cell<usize>,
 }
 impl std::ops::Deref for ChartMap {
     type Target = HashMap<String, ooxml_common::chart::ChartModel>;
@@ -814,6 +817,30 @@ impl std::ops::Deref for ChartMap {
 impl std::ops::DerefMut for ChartMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.models
+    }
+}
+
+impl ChartMap {
+    fn clone_for_drawing(&self, rid: &str) -> Option<ooxml_common::chart::ChartModel> {
+        let chart = self.models.get(rid)?;
+        let retained = chart.clone();
+        if self.renderable_chartex_rids.contains(rid) {
+            let ordinal = self.drawing_ordinal.get();
+            self.drawing_ordinal.set(ordinal.saturating_add(1));
+            if let Some(reporter) = self.limit_reporter.as_ref() {
+                let site = format!("drawing:{ordinal}");
+                reporter
+                    .retain_instance(
+                        ooxml_common::resource::HardResourceLimitKind::ChartexAllocationBytes,
+                        &self.source_part,
+                        &site,
+                        ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                        ooxml_common::chart::RetainedBytes::heap_bytes(&retained),
+                    )
+                    .ok()?;
+            }
+        }
+        Some(retained)
     }
 }
 
@@ -4517,7 +4544,15 @@ fn load_chart_map(
     // canonical location for a DrawingML chart part. `parse_chart_part` returns
     // `None` for a colors/style sidecar, so a stray non-chart `.xml` there is
     // harmless.
-    let mut chart_map: ChartMap = ChartMap::default();
+    let limit_reporter = zip
+        .operation()
+        .and_then(|operation| operation.limit_reporter())
+        .ok();
+    let mut chart_map = ChartMap {
+        source_part: source_part.to_owned(),
+        limit_reporter: limit_reporter.clone(),
+        ..ChartMap::default()
+    };
     for (rid, relationship) in relationships {
         // Use the stored ZIP item name (§6.2.2.3 equivalence); an absent part
         // is dropped exactly like an unreadable one.
@@ -4545,6 +4580,9 @@ fn load_chart_map(
             &theme.chart_images,
         );
         let user_shapes_xml = load_chart_user_shapes_xml(zip, &path, &xml);
+        let Some(reporter) = limit_reporter.as_ref() else {
+            continue;
+        };
         let mut exact_chartex_root = false;
         if let Some(mut chart) = parse_docx_chart_with_provenance(
             &xml,
@@ -4553,6 +4591,10 @@ fn load_chart_map(
             theme,
             &image_resolver,
             &mut exact_chartex_root,
+            Some(reporter),
+            // ChartMap is a parse-time lookup, not a model retained by the
+            // returned document. Each emitted DocRun clone is charged below.
+            None,
         ) {
             if let (Some(user_shapes_xml), Ok(chart_doc)) =
                 (user_shapes_xml.as_deref(), parse_guarded(&xml))
@@ -7958,14 +8000,13 @@ fn parse_inline_drawing_impl(
                         relationships::STRICT,
                         "id",
                     );
-                    if let Some(chart) = rid.and_then(|rid| chart_map.get(rid)) {
-                        // Require a parseable `<wp:extent>` (cx/cy EMU → pt), matching
-                        // the inline-image contract; a chart without one is dropped
-                        // rather than emitted at zero size. If absent, fall through to
-                        // the ordinary image path (which will also drop it).
-                        if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                    // Require a parseable `<wp:extent>` (cx/cy EMU → pt), matching
+                    // the inline-image contract. Charge and clone only when the
+                    // drawing will retain the ChartEx model.
+                    if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                        if let Some(chart) = rid.and_then(|rid| chart_map.clone_for_drawing(rid)) {
                             return vec![DocRun::Chart(Box::new(ChartRun {
-                                chart: chart.clone(),
+                                chart,
                                 width_pt,
                                 height_pt,
                                 anchor: false,
@@ -8189,13 +8230,12 @@ fn parse_inline_drawing_impl(
                     relationships::STRICT,
                     "id",
                 );
-                if let Some(chart) = rid.and_then(|rid| chart_map.get(rid)) {
-                    // Same `<wp:extent>` (cx/cy EMU → pt) contract as the inline
-                    // chart path: a chart without a parseable extent falls
-                    // through to the blip path (which also drops it).
-                    if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                // Same `<wp:extent>` (cx/cy EMU → pt) contract as the inline
+                // chart path. Charge and clone only when the drawing retains it.
+                if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                    if let Some(chart) = rid.and_then(|rid| chart_map.clone_for_drawing(rid)) {
                         return vec![DocRun::Chart(Box::new(ChartRun {
-                            chart: chart.clone(),
+                            chart,
                             width_pt,
                             height_pt,
                             anchor: true,
@@ -12892,9 +12932,12 @@ fn parse_docx_chart_with_style_parts_and_images(
         theme,
         image_resolver,
         &mut false,
+        None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_docx_chart_with_provenance(
     chart_xml: &str,
     style_xml: Option<&str>,
@@ -12902,6 +12945,8 @@ fn parse_docx_chart_with_provenance(
     theme: &ThemeColors,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     exact_chartex_root: &mut bool,
+    limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    retention_key: Option<ooxml_common::chart::ChartRetentionKey<'_>>,
 ) -> Option<ooxml_common::chart::ChartModel> {
     let doc = parse_guarded(chart_xml).ok()?;
     let root = doc.root_element();
@@ -12918,6 +12963,8 @@ fn parse_docx_chart_with_provenance(
             root,
             &ooxml_common::chart::ChartParseContext {
                 host: ooxml_common::chart::ChartHost::Word,
+                limit_reporter,
+                retention_key,
                 ..ooxml_common::chart::ChartParseContext::new(
                     &resolver,
                     style_xml,

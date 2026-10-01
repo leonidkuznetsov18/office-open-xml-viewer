@@ -97,6 +97,20 @@ pub(crate) fn xdr_node_hidden(node: &roxmltree::Node) -> bool {
     false
 }
 
+fn resolve_drawing_media_path(
+    drawing_rels: &HashMap<String, String>,
+    drawing_path: &str,
+    archive: &mut crate::XlsxZip,
+    rid: &str,
+) -> Option<String> {
+    let target = drawing_rels.get(rid)?;
+    let media_path = resolve_zip_path(drawing_path, target);
+    // Confirm the entry resolves before emitting its path. `index_for_name`
+    // reads only the central directory and does not inflate the media payload.
+    archive.index_for_name(&media_path)?;
+    Some(media_path)
+}
+
 /// Parse `<xdr:twoCellAnchor>` elements from a drawing XML and resolve
 /// embedded pictures into data URLs. `drawing_path` is the OPC source part.
 pub(crate) fn parse_drawing_anchors(
@@ -242,24 +256,15 @@ pub(crate) fn parse_drawing_anchors(
             }
         }
 
-        // Resolve a blip rId → the media part's zip path (verifying the entry
-        // exists, so a dangling rId is dropped exactly as before). The renderer
-        // fetches the bytes lazily via `extract_image`; no base64 is inlined.
-        let mut resolve = |rid: &str| -> Option<String> {
-            let target = drawing_rels.get(rid)?;
-            let media_path = resolve_zip_path(drawing_path, target);
-            // Confirm the entry resolves before emitting its path (preserves the
-            // previous "drop when bytes are missing" semantics). `index_for_name`
-            // reads only the central directory — no inflate, unlike the former
-            // `read_zip_bytes` which decompressed the entry only to discard it.
-            archive.index_for_name(&media_path)?;
-            Some(media_path)
-        };
-
         // Vector original first (so an svg-only picture is never dropped); raster
-        // fallback second.
-        let svg_image_path = svg_rid.as_deref().and_then(&mut resolve);
-        let raster_path = pic_rid.as_deref().and_then(&mut resolve);
+        // fallback second. Verify each selected target exists without inflating
+        // it; the renderer fetches the bytes lazily via `extract_image`.
+        let svg_image_path = svg_rid
+            .as_deref()
+            .and_then(|rid| resolve_drawing_media_path(drawing_rels, drawing_path, archive, rid));
+        let raster_path = pic_rid
+            .as_deref()
+            .and_then(|rid| resolve_drawing_media_path(drawing_rels, drawing_path, archive, rid));
 
         // A picture needs at least one drawable source. Prefer the raster as
         // `image_path` (Excel's compatibility fallback); when no raster is
