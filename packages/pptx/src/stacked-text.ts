@@ -183,7 +183,18 @@ function makeMeasurer<T extends StackedSegmentStyle>(ctx: Ctx2D) {
 export function renderStackedText<T extends StackedSegmentStyle>(
   ctx: Ctx2D,
   body: StackedBodyInput<T>,
-): StackedGlyphRun[] {
+  measureOnly?: false,
+): StackedGlyphRun[];
+export function renderStackedText<T extends StackedSegmentStyle>(
+  ctx: Ctx2D,
+  body: StackedBodyInput<T>,
+  measureOnly: true,
+): number;
+export function renderStackedText<T extends StackedSegmentStyle>(
+  ctx: Ctx2D,
+  body: StackedBodyInput<T>,
+  measureOnly = false,
+): StackedGlyphRun[] | number {
   const measure = makeMeasurer<T>(ctx);
   const paragraphs: StackedParagraph<T>[] = body.paragraphs.map((p) => ({
     runs: p.runs,
@@ -206,6 +217,23 @@ export function renderStackedText<T extends StackedSegmentStyle>(
     glyphs: measure,
     sameStyle: body.sameStyle,
   });
+  if (measureOnly) {
+    // §20.1.10.83: letters advance along the row's vertical axis; column
+    // thickness/blockWidth runs across it. Sum the same measured glyphs as
+    // paint, excluding alignment slack and cross-column paragraph spacing.
+    let longest = 0;
+    let column = -1;
+    let advance = 0;
+    for (const glyph of layout.glyphs) {
+      if (glyph.column !== column) {
+        longest = Math.max(longest, advance);
+        column = glyph.column;
+        advance = 0;
+      }
+      advance += glyph.advance;
+    }
+    return Math.max(longest, advance);
+  }
   const runs: StackedGlyphRun[] = [];
   const prevAlign = ctx.textAlign;
   const prevBaseline = ctx.textBaseline;

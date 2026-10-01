@@ -201,6 +201,98 @@ describe('PowerPoint table-cell paragraph boundaries', () => {
   });
 });
 
+describe('table row measurement along the text row axis', () => {
+  function recording(vert: string, text = 'A', height = 30, wrap = 'square', rowSpan = 1) {
+    const textBody = {
+      verticalAnchor: 't', paragraphs: [{
+        alignment: 'l', marL: 0, marR: 0, indent: 0,
+        spaceBefore: null, spaceAfter: null, spaceLine: null,
+        runs: [{ type: 'text', text, fontSize: 12, fontFamily: 'UnknownTestFace' }],
+        bullet: { type: 'none' },
+      }],
+      lIns: 0, rIns: 0, tIns: 0, bIns: 0,
+      wrap, vert, autoFit: 'none',
+    } as unknown as TextBody;
+    const t = tableOf([
+      [cell({ textBody, rowSpan, fill: { fillType: 'solid', color: 'FFFFFF' } })],
+      [cell({ vMerge: rowSpan > 1, fill: { fillType: 'solid', color: 'FFFFFF' } })],
+    ], [200 * EMU]);
+    t.rows[0].height = height * EMU;
+    t.rows[1].height = height * EMU;
+    t.height = 2 * height * EMU;
+    const rec = makeRecordingCtx();
+    rec.ctx.measureText = (text) => ({ width: text.length * 8,
+      fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2,
+      actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2 } as TextMetrics);
+    return { t, textBody, rec, render: () => renderTable(rec.ctx, t, SCALE) };
+  }
+
+  it.each(['vert', 'vert270', 'eaVert', 'wordArtVert', 'wordArtVertRtl', 'mongolianVert', 'horz'])(
+    '%s keeps a sufficient 30pt row in a 200pt-wide cell', (vert) => {
+      const { rec, render } = recording(vert);
+      render();
+      expect(rec.fills.map(f => [f.y, f.height])).toEqual([[0, 30], [30, 30]]);
+    },
+  );
+
+  it.each(['vert', 'eaVert'])('%s wraps along the authored row height, not cell width', (vert) => {
+    const { rec, render } = recording(vert, 'A A A A A A A A');
+    render();
+    expect(rec.fills[0].height).toBe(30);
+    expect(rec.fills[1].y).toBe(30);
+  });
+
+  it.each(['vert', 'vert270', 'eaVert'])('%s grows for unwrapped inline extent and insets', (vert) => {
+    const { textBody, rec, render } = recording(vert, 'AAAAA', 30, 'none');
+    // The existing rotated paint frame uses lIns/rIns on its inline axis.
+    textBody.lIns = 2 * EMU;
+    textBody.rIns = 3 * EMU;
+    render();
+    expect(rec.fills[0].height).toBe(45);
+    expect(rec.fills[1].y).toBe(45);
+  });
+
+  it.each(['wordArtVert', 'wordArtVertRtl'])('%s measures glyph advances and physical vertical insets', (vert) => {
+    const { textBody, rec, render } = recording(vert, 'AAA', 30, 'none');
+    textBody.tIns = 2 * EMU;
+    textBody.bIns = 3 * EMU;
+    render();
+    // UnknownTestFace uses the measured 8+2px face box: three upright
+    // cells, each 7/6 of that box, plus the 5px physical vertical insets.
+    expect(rec.fills[0].height).toBeCloseTo(40, 5);
+    expect(rec.fills[1].y).toBeCloseTo(40, 5);
+  });
+
+  it.each(['wordArtVert', 'wordArtVertRtl'])('%s wraps glyph columns within the authored row', (vert) => {
+    const { rec, render } = recording(vert, 'A A A A A A A A');
+    render();
+    expect(rec.fills[0].height).toBe(30);
+  });
+
+  it('includes rotated tab stops and paragraph margins in the row extent', () => {
+    const { textBody, rec, render } = recording('vert', 'A\tA', 30, 'none');
+    textBody.paragraphs[0].marL = 2 * EMU;
+    textBody.paragraphs[0].marR = 3 * EMU;
+    textBody.paragraphs[0].tabStops = [{ pos: 40 * EMU, algn: 'l' }];
+    render();
+    // The stop exceeds the 30px reading frame: paint clamps the tab at
+    // the right margin, then the final glyph extends 3px beyond the frame.
+    expect(rec.fills[0].height).toBe(33);
+  });
+
+  it('measures a rotated rowSpan against the combined row height', () => {
+    const { rec, render } = recording('vert', 'A A A A A A', 30, 'square', 2);
+    render();
+    expect(rec.fills[0].height).toBe(60);
+  });
+
+  it('derives a zero-height rotated row from text rather than box width', () => {
+    const { rec, render } = recording('vert', 'AAAAA', 0, 'none');
+    render();
+    expect(rec.fills[0].height).toBe(40);
+  });
+});
+
 describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent)', () => {
   it('measures the final natural descent under percentage and point spacing', () => {
     // Tagged PDF controls: 16pt Arial, 1pt insets, zero minimum. The final

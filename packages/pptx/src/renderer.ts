@@ -831,6 +831,57 @@ interface LayoutLine {
   metricMarks?: LayoutSegment[];
 }
 
+// Inline tab resolution is shared by rotated row measurement and paint;
+// a tab's advance depends on the same logical reading-frame wrap budget.
+function resolveLineTabs(
+  ctx: CanvasRenderingContext2D, line: LayoutLine, para: Paragraph,
+  firstLineOffset: number, maxWidth: number, scale: number,
+): void {
+  const baseRtl = para.rtl === true;
+  if (line.segments.some((seg) => seg.isTab)) {
+    // §21.1.2.1.x: resolve every inline tab in the logical READING frame.
+    // UAX#9 L2 later mirrors the resulting cells physically for an RTL base.
+    const marLPxE = emuToPx(para.marL, scale);
+    const marRPxE = emuToPx(para.marR, scale);
+    // The reading pen starts at the leading indent PLUS the draw-side
+    // first-line indent (firstLineOffset): a stop is an ABSOLUTE distance from the
+    // leading text-inset edge (§21.1.2.1), so the indent moves where content
+    // STARTS, not where a stop sits — omitting it would widen every gap by the
+    // indent and slide the cells past their stops. firstLineOffset only shifts the
+    // LTR pen (the RTL draw right-anchors and never applies it), so it joins
+    // the LTR frame only.
+    const leadingIndentPx = baseRtl ? marRPxE : marLPxE + firstLineOffset;
+    const limitPx = maxWidth + marLPxE + marRPxE;
+    const tabFontSeg = line.segments.find((seg) => seg.isTab) as LayoutSegment;
+    ctx.font = tabFontSeg.font;
+    const spaceW = ctx.measureText(' ').width;
+    const items = line.segments.map((seg) => {
+      if (seg.isTab) return { isTab: true, width: 0 };
+      if (seg.math) return { isTab: false, width: seg.math.width };
+      ctx.font = seg.font;
+      const ls = seg.letterSpacingPx ?? 0;
+      return {
+        isTab: false,
+        width: seg.text
+          ? (seg.leadingLetterSpacingPx ?? 0) + measureTextAdvance(ctx, seg.text, ls)
+          : 0,
+      };
+    });
+    const stops = (para.tabStops ?? []).map((stop) => ({
+      pos: emuToPx(stop.pos, scale),
+      algn: stop.algn,
+    }));
+    // Default tab grid (§21.1.2.2.7): explicit pPr value, else PowerPoint's
+    // universal 1-inch default so an unreached tab snaps to the grid (matching
+    // the wrap pass) rather than collapsing to a space (issue #1006).
+    const defTabSzPx = emuToPx(para.defTabSz ?? 914400, scale);
+    const widths = resolveTabWidths(items, stops, leadingIndentPx, limitPx, spaceW, defTabSzPx);
+    for (let i = 0; i < line.segments.length; i++) {
+      if (line.segments[i].isTab) line.segments[i].tabWidthPx = widths[i];
+    }
+  }
+}
+
 /**
  * Resolve OOXML theme font references (e.g. "+mn-ea", "+mj-lt") to CSS-safe font names.
  * Canvas will silently ignore an invalid CSS font string, keeping whatever font was set before —
@@ -4276,7 +4327,8 @@ function renderStackedTextBody(
   slideNumber: number | undefined,
   rc: RenderContext,
   onTextRun?: TextRunCallback,
-): void {
+  measureOnly = false,
+): number | void {
   const fontScale = body.autoFit === 'norm' && body.fontScale != null && body.fontScale > 0 && body.fontScale < 1
     ? body.fontScale : 1;
   const pxPerPt = PT_TO_EMU * scale;
@@ -4313,7 +4365,7 @@ function renderStackedTextBody(
       eastAsianLineBreak: para.eaLnBrk !== false,
     };
   });
-  const runs = renderStackedText(ctx, {
+  const input = {
     vert,
     rect: { left: bx + inner.left, top: by + inner.top, width: inner.width, height: inner.height },
     anchor: body.verticalAnchor,
@@ -4324,7 +4376,13 @@ function renderStackedTextBody(
     pxPerPt,
     paragraphs,
     sameStyle,
-  });
+  };
+  if (measureOnly) {
+    // A zero minimum has no wrap boundary yet; measure the natural column.
+    const measureInput = bh > 0 ? input : { ...input, wrap: false };
+    return emuToPx(body.tIns + body.bIns, scale) + renderStackedText(ctx, measureInput, true);
+  }
+  const runs = renderStackedText(ctx, input);
   if (!onTextRun) return;
   for (const run of runs) {
     onTextRun({
@@ -4364,20 +4422,23 @@ export function renderTextBody(
   // `vert`/`vert270` (whose spec meaning IS to rotate every glyph), keeping those
   // paths byte-identical.
   eaVertUpright = false,
+  // Internal rotated-frame measurement: inline width is the original row
+  // axis (§20.1.10.83), while horizontal content height is its column axis.
+  measureInlineExtent = false,
 ): number | void {
   // Stacked vertical text (wordArtVert / wordArtVertRtl): upright glyphs one
   // above another in columns; see stacked-text.ts and core layoutStackedText.
   if (body.vert === 'wordArtVert' || body.vert === 'wordArtVertRtl') {
-    // Like the rotated modes, a table row measures a vertical body by its box.
-    if (measureOnly) return bw;
-    renderStackedTextBody(ctx, body, body.vert, bx, by, bw, bh, scale, shapeDefaultTextColor ?? themeDefaultColor,
-      shapeRotation, slideNumber, rc, onTextRun);
-    return;
+    return renderStackedTextBody(ctx, body, body.vert, bx, by, bw, bh, scale, shapeDefaultTextColor ?? themeDefaultColor,
+      shapeRotation, slideNumber, rc, onTextRun, measureOnly);
   }
 
   // Vertical text: rotate rendering context so text flows top-to-bottom.
   // "vert" and "eaVert" both approximate to 90° clockwise rotation.
   // "vert270" rotates 270° (= 90° counterclockwise).
+  // mongolianVert retains the existing horizontal fallback: this renderer
+  // does not implement its left-to-right column progression. Measurement
+  // follows that same paint path rather than claiming vertical support.
   const isVert    = body.vert === 'vert' || body.vert === 'eaVert';
   const isVert270 = body.vert === 'vert270';
 
@@ -4414,9 +4475,12 @@ export function renderTextBody(
       : undefined;
 
     if (measureOnly) {
-      // The rotated sub-frame's content height runs along the original width
-      // axis; for a table row the vertical extent is the original box width.
-      return bw;
+      // Reuse paint's swapped frame and line breaking, then measure its
+      // inline extent, not its cross-axis height or the allocated box width.
+      // Zero minima have no inline wrap boundary until text supplies one.
+      return renderTextBody(ctx, { ...body, vert: 'horz', ...(bh <= 0 ? { wrap: 'none' } : {}) },
+        0, 0, bh, bw, scale, shapeDefaultTextColor, 0, false, false,
+        themeDefaultColor, slideNumber, rc, undefined, true, undefined, false, true);
     }
     ctx.save();
     ctx.translate(cx, cy);
@@ -4986,6 +5050,22 @@ export function renderTextBody(
     }
   }
 
+  if (measureOnly && measureInlineExtent) {
+    let extent = lPad;
+    for (const entry of allLines) {
+      resolveLineTabs(ctx, entry.line, entry.para, entry.textXOffset, entry.textMaxW, scale);
+      let width = 0;
+      for (const seg of entry.line.segments) {
+        ctx.font = seg.font;
+        width += seg.isTab ? seg.tabWidthPx ?? 0 : seg.math ? seg.math.width
+          : seg.text ? (seg.leadingLetterSpacingPx ?? 0) + measureTextAdvance(ctx, seg.text, seg.letterSpacingPx ?? 0) : 0;
+      }
+      extent = Math.max(extent, entry.textX - bx + entry.textXOffset + width
+        + emuToPx(entry.para.marR, scale));
+    }
+    return extent + rPad;
+  }
+
   // ── anchor="b" with bh=0: auto-height growing upward from by ────────────
   // When cy=0 and anchor="b", off_y is the bottom anchor; shape grows upward.
   const anchor = body.verticalAnchor ?? 't';
@@ -5121,48 +5201,7 @@ export function renderTextBody(
     const paraNeedsBidi = baseRtl || segmentsHaveRtl(line.segments);
     const hasTab = line.segments.some((seg) => seg.isTab);
 
-    if (hasTab) {
-      // §21.1.2.1.x: resolve every inline tab in the logical READING frame.
-      // UAX#9 L2 later mirrors the resulting cells physically for an RTL base.
-      const marLPxE = emuToPx(entry.para.marL, scale);
-      const marRPxE = emuToPx(entry.para.marR, scale);
-      // The reading pen starts at the leading indent PLUS the draw-side
-      // first-line indent (textXOffset): a stop is an ABSOLUTE distance from the
-      // leading text-inset edge (§21.1.2.1), so the indent moves where content
-      // STARTS, not where a stop sits — omitting it would widen every gap by the
-      // indent and slide the cells past their stops. textXOffset only shifts the
-      // LTR pen (the RTL draw right-anchors and never applies it), so it joins
-      // the LTR frame only.
-      const leadingIndentPx = baseRtl ? marRPxE : marLPxE + textXOffset;
-      const limitPx = textMaxW + marLPxE + marRPxE;
-      const tabFontSeg = line.segments.find((seg) => seg.isTab) as LayoutSegment;
-      ctx.font = tabFontSeg.font;
-      const spaceW = ctx.measureText(' ').width;
-      const items = line.segments.map((seg) => {
-        if (seg.isTab) return { isTab: true, width: 0 };
-        if (seg.math) return { isTab: false, width: seg.math.width };
-        ctx.font = seg.font;
-        const ls = seg.letterSpacingPx ?? 0;
-        return {
-          isTab: false,
-          width: seg.text
-            ? (seg.leadingLetterSpacingPx ?? 0) + measureTextAdvance(ctx, seg.text, ls)
-            : 0,
-        };
-      });
-      const stops = (entry.para.tabStops ?? []).map((stop) => ({
-        pos: emuToPx(stop.pos, scale),
-        algn: stop.algn,
-      }));
-      // Default tab grid (§21.1.2.2.7): explicit pPr value, else PowerPoint's
-      // universal 1-inch default so an unreached tab snaps to the grid (matching
-      // the wrap pass) rather than collapsing to a space (issue #1006).
-      const defTabSzPx = emuToPx(entry.para.defTabSz ?? 914400, scale);
-      const widths = resolveTabWidths(items, stops, leadingIndentPx, limitPx, spaceW, defTabSzPx);
-      for (let i = 0; i < line.segments.length; i++) {
-        if (line.segments[i].isTab) line.segments[i].tabWidthPx = widths[i];
-      }
-    }
+    if (hasTab) resolveLineTabs(ctx, line, entry.para, textXOffset, textMaxW, scale);
 
     // Measure line width and the metrics of the fonts Canvas actually resolved.
     // spAutoFit is a live recalculation, so its baseline must use the same
@@ -7020,7 +7059,9 @@ export function renderTable(
   // height. PowerPoint grows a row to fit its tallest cell's laid-out text. A
   // literal h=0 therefore becomes
   // content-driven. We measure each cell's text body at its spanned width
-  // (reusing the same renderTextBody machinery via measureOnly) and take
+  // and authored height (the wrap boundary for vertical/stacked columns).
+  // renderTextBody's measureOnly returns extent on the physical row axis,
+  // independent of column thickness or alignment slack. We take
   // max(tr@h, tallest single-row cell content). A rowSpan cell distributes
   // its content height across the rows it covers so it doesn't inflate the
   // first row.
@@ -7043,7 +7084,7 @@ export function renderTable(
       if (!cell.textBody) continue;
       const cellW = spannedWidth(ci, cell.gridSpan || 1);
       const needed = (renderTextBody(
-        ctx, tableTextBody(cell.textBody), 0, 0, cellW, 0, scale, null, 0, false, false,
+        ctx, tableTextBody(cell.textBody), 0, 0, cellW, authoredRowHeights[ri], scale, null, 0, false, false,
         '#000000', slideNumber, rc, undefined, true, undefined, false,
       ) as number) || 0;
       if (needed > rowHeights[ri]) rowHeights[ri] = needed;
@@ -7061,8 +7102,10 @@ export function renderTable(
       const span = cell.rowSpan || 1;
       if (span <= 1 || !cell.textBody) continue;
       const cellW = spannedWidth(ci, cell.gridSpan || 1);
+      let authoredCellH = 0;
+      for (let s = 0; s < span && ri + s < authoredRowHeights.length; s++) authoredCellH += authoredRowHeights[ri + s];
       const needed = (renderTextBody(
-        ctx, tableTextBody(cell.textBody), 0, 0, cellW, 0, scale, null, 0, false, false,
+        ctx, tableTextBody(cell.textBody), 0, 0, cellW, authoredCellH, scale, null, 0, false, false,
         '#000000', slideNumber, rc, undefined, true, undefined, false,
       ) as number) || 0;
       let have = 0;
