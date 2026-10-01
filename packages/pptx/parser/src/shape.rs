@@ -1818,6 +1818,16 @@ pub(crate) fn parse_table_styles_xml(
     xml: &str,
     theme_source: &(impl PptxThemeSource + ?Sized),
 ) -> HashMap<String, TableStyleDef> {
+    parse_table_styles_xml_with_relationships(xml, theme_source, &HashMap::new())
+}
+
+/// Explicit style blips belong to tableStyles.xml; fillRef blips belong to
+/// the theme. Never resolve either against the consuming slide's rIds.
+fn parse_table_styles_xml_with_relationships(
+    xml: &str,
+    theme_source: &(impl PptxThemeSource + ?Sized),
+    relationships: &HashMap<String, String>,
+) -> HashMap<String, TableStyleDef> {
     let theme = theme_source.colors();
     let mut map = HashMap::new();
     let Ok(doc) = crate::parse_preflighted_pptx_xml(xml) else {
@@ -1888,7 +1898,10 @@ pub(crate) fn parse_table_styles_xml(
             // §20.1.4.2.27: the role fill is `fill` or `fillRef`, never a fill
             // child directly on `tcStyle`.
             let fill = child(tc_style, "fill")
-                .and_then(|fill| parse_table_style_fill(fill, theme))
+                .and_then(|fill| {
+                    parse_table_blip_fill(fill, theme, relationships, "ppt")
+                        .or_else(|| parse_table_style_fill(fill, theme))
+                })
                 .or_else(|| {
                     child(tc_style, "fillRef").and_then(|fill_ref| {
                         let index = attr(&fill_ref, "idx")
@@ -1956,7 +1969,10 @@ pub(crate) fn parse_table_styles_xml(
         // Background effects (effect/effectRef) are not supported here.
         def.background = child(style_node, "tblBg").and_then(|background| {
             child(background, "fill")
-                .and_then(|fill| parse_table_style_fill(fill, theme))
+                .and_then(|fill| {
+                    parse_table_blip_fill(fill, theme, relationships, "ppt")
+                        .or_else(|| parse_table_style_fill(fill, theme))
+                })
                 .or_else(|| {
                     child(background, "fillRef").and_then(|reference| {
                         parse_style_matrix_fill_from_source(reference, theme_source)
@@ -2327,9 +2343,21 @@ pub(crate) fn parse_table(
 
     // Load style definitions once
     let table_styles_xml = read_zip_str(zip, "ppt/tableStyles.xml").ok();
+    let style_relationships = read_zip_str(zip, "ppt/_rels/tableStyles.xml.rels")
+        .ok()
+        .map(|xml| {
+            ooxml_common::rels::parse_rels(&xml)
+                .into_iter()
+                .filter(|(_, rel)| rel.mode == ooxml_common::rels::TargetMode::Internal)
+                .map(|(id, rel)| (id, rel.target))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let table_styles = table_styles_xml
         .as_deref()
-        .map(|xml| parse_table_styles_xml(xml, theme_source))
+        .map(|xml| {
+            parse_table_styles_xml_with_relationships(xml, theme_source, &style_relationships)
+        })
         .unwrap_or_default();
     let style_owned: Option<TableStyleDef> = style_id
         .as_deref()
@@ -2421,7 +2449,14 @@ pub(crate) fn parse_table(
     }
 
     Some(TableElement {
-        background: style.and_then(|s| s.background.clone()),
+        // §21.1.3.15 CT_TableProperties admits direct EG_FillProperties.
+        // Direct table formatting overrides the style's tblBg, including noFill.
+        background: tbl_pr
+            .and_then(|properties| {
+                parse_table_blip_fill(properties, theme, rels, source_dir)
+                    .or_else(|| parse_fill(properties, theme))
+            })
+            .or_else(|| style.and_then(|s| s.background.clone())),
         id: None,
         x: t.x,
         y: t.y,
@@ -2477,6 +2512,23 @@ pub(crate) fn parse_table_cell(
 ) -> TableCell {
     let chain = table_cell_chain(None, theme);
     parse_table_cell_with_chain(tc, theme, rels, source_dir, table_text, &chain, zip)
+}
+
+/// CT_TableCellProperties and CT_TableStyleCellStyle both admit blipFill
+/// (§§21.1.3.17 / 20.1.4.2.27). The generic colour fill parser deliberately
+/// cannot resolve image relationships; use the same blip grammar as shapes.
+fn parse_table_blip_fill(
+    node: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    relationships: &HashMap<String, String>,
+    source_dir: &str,
+) -> Option<Fill> {
+    let blip = child(node, "blipFill")?;
+    crate::fill::parse_blip_fill(blip, theme, &mut |id| {
+        relationships
+            .get(id)
+            .map(|target| resolve_path(source_dir, target))
+    })
 }
 
 fn parse_table_cell_with_chain(
@@ -2551,7 +2603,9 @@ fn parse_table_cell_with_chain(
         body
     });
 
-    let fill = tc_pr.and_then(|n| parse_fill(n, theme));
+    let fill = tc_pr.and_then(|n| {
+        parse_table_blip_fill(n, theme, rels, source_dir).or_else(|| parse_fill(n, theme))
+    });
 
     // ECMA-376 §21.1.3.17 (`CT_TableCellProperties`) makes direct formatting
     // the final cascade tier. Presence must be tracked separately because
@@ -3818,6 +3872,33 @@ mod style_ref_tests {
         assert_eq!(runs[0].font_family.as_deref(), Some("Arial"));
         assert_eq!(runs[0].font_family_ea.as_deref(), Some("MajorJpan"));
         assert_eq!(runs[1].font_family_cs.as_deref(), Some("MajorHebr"));
+    }
+
+    #[test]
+    fn table_cell_blip_retains_slide_relationships_and_tile_properties() {
+        let xml = r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <a:tcPr><a:blipFill dpi="300"><a:blip r:embed="image"/>
+            <a:srcRect l="25000"/><a:tile tx="12700" sx="50000" flip="x"/>
+          </a:blipFill></a:tcPr></a:tc>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = empty_zip();
+        let cell = parse_table_cell(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::from([("image".to_owned(), "../media/cell.png".to_owned())]),
+            "ppt/slides",
+            &TableTextLevels::default(),
+            &mut zip,
+        );
+        let fill = serde_json::to_value(cell.fill.unwrap()).unwrap();
+        assert_eq!(fill["fillType"], "image");
+        assert_eq!(fill["imagePath"], "ppt/media/cell.png");
+        assert_eq!(fill["dpi"], 300);
+        assert_eq!(fill["srcRect"]["l"], 0.25);
+        assert_eq!(fill["tile"]["tx"], 12700);
+        assert_eq!(fill["tile"]["sx"], 0.5);
+        assert_eq!(fill["tile"]["flip"], "x");
     }
 
     fn empty_zip() -> PptxZip {
