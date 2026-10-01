@@ -7540,7 +7540,7 @@ fn parse_run_inner(
                     // Choices never replace the selected Choice; only the authored
                     // drawing/pict fallback is eligible. General MCE stays intact.
                     let branch = if use_fallback {
-                        fallback.unwrap()
+                        fallback.unwrap_or(selected)
                     } else {
                         selected
                     };
