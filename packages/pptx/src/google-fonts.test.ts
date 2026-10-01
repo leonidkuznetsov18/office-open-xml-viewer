@@ -177,6 +177,24 @@ describe('PptxFontPreloadAccumulator', () => {
     expect(accumulator.names()).toEqual(expect.arrayContaining(['Noto Sans JP', 'Noto Serif JP']));
   });
 
+  it('preloads the same context-selected EA fallback as layout across run seams', () => {
+    const namesFor = (runs: object[]) => {
+      const slide = { elements: [{ type: 'shape', textBody: { paragraphs: [{ runs }] } }] } as unknown as Slide;
+      const accumulator = new PptxFontPreloadAccumulator(null, null);
+      accumulator.addSlide(slide);
+      return accumulator.names();
+    };
+    expect(namesFor([
+      { type: 'text', text: '\u1000', lang: 'my-MM', fontFamily: 'Corbel' },
+      { type: 'text', text: '\ua9e5', lang: 'my-MM', fontFamily: 'Corbel', fontFamilyEa: 'Meiryo UI' },
+    ])).toContain('Noto Sans JP');
+    expect(namesFor([
+      { type: 'text', text: 'A', lang: 'en-US', fontFamily: 'Corbel' },
+      { type: 'text', text: '×', lang: 'fa-IR', fontFamily: 'Corbel', fontFamilyEa: 'Meiryo UI' },
+      { type: 'text', text: 'B', lang: 'en-US', fontFamily: 'Corbel' },
+    ])).not.toContain('Noto Sans JP');
+  });
+
   it('preserves full-presentation shape, table, and chart text semantics incrementally', () => {
     const slide = {
       index: 0,

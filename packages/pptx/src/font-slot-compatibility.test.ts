@@ -3,7 +3,7 @@ import { POWERPOINT_FONT_SLOT_EVIDENCE, powerPointFontSlot } from './font-slot-c
 import { POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
 
 describe('PowerPoint slot compatibility evidence', () => {
-  it('matches the original directly identified observations except the withdrawn scalar override', () => {
+  it('matches every original directly identified observation', () => {
     // This independently recorded PDF corpus catches broadened symbol ranges,
     // lost language overrides and inverted endpoints; fallback fonts are not a
     // slot oracle. Renderer wiring is exercised in font-slot-render.test.ts.
@@ -11,9 +11,6 @@ describe('PowerPoint slot compatibility evidence', () => {
       for (const [start, end, outcome] of ranges) {
         if (outcome !== 'latin' && outcome !== 'ea' && outcome !== 'cs') continue;
         for (let cp = start; cp <= end; cp++) {
-          // The extra cyclic controls disprove a context-independent » slot.
-          // Keep the original observation, but no longer assert it as policy.
-          if (cp === 0xbb && (lang === 'he-il' || lang === 'ar-sa')) continue;
           expect(powerPointFontSlot(cp, lang), `${lang} U+${cp.toString(16)}`).toBe(outcome);
         }
       }
@@ -53,7 +50,7 @@ describe('PowerPoint slot compatibility evidence', () => {
     expect(powerPointFontSlot(0xa9ff, 'en-US')).toBe('latin'); // unassigned gap
     expect(powerPointFontSlot(0xaa7b, 'my-MM')).toBe('cs'); // no standalone-mark extrapolation
     expect(powerPointFontSlot(0xa9e0, 'fr-FR')).toBe('cs'); // unmeasured language retains policy
-    expect(powerPointFontSlot(0xbb, 'he-IL')).toBe('latin'); // withdraw unsupported scalar override
+    expect(powerPointFontSlot(0xbb, 'he-IL')).toBe('cs'); // original sweep routing
     expect(powerPointFontSlot(0x30, 'fa')).toBe('latin'); // do not infer other region/language IDs
     expect(powerPointFontSlot(0x31, 'constructor')).toBe('latin'); // untrusted document language
   });

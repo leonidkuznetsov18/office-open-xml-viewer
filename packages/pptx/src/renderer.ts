@@ -86,7 +86,6 @@ import {
   isGraphemeFillText,
   seaMixedBreakOffsets,
   fitSeaWordPrefix,
-  graphemeClusterOffsets,
   getCachedSvgImageByPath,
   getCachedBitmapByPath,
   getCachedDuotoneBitmapByPath,
@@ -169,7 +168,7 @@ import { renderStackedText, type StackedParagraphInput } from './stacked-text.js
 import {
   COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
 } from './east-asian-default.js';
-import { powerPointDisplayCluster, powerPointEastAsianText, powerPointFontSlot } from './font-slot-compatibility.js';
+import { powerPointDisplayCluster, powerPointFontRouting } from './font-slot-compatibility.js';
 import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
@@ -1486,9 +1485,8 @@ export function paragraphInputRuns(
   // Grapheme clusters are segmented once over the paragraph's text, not per
   // run, so an extender (combining mark, variation selector, ZWJ, trailing
   // jamo) that opens a run joins its base in the previous run's last segment.
-  // A cluster is one glyph and can carry only one format, so the carried
-  // extenders take the base run's formatting (font slot, colour, link,
-  // spacing). A line break or equation (an LF in the joined text) ends a
+  // Except for measured split-font units, carried extenders take the base
+  // run's formatting (font slot, colour, link, spacing). A line break or equation (an LF in the joined text) ends a
   // cluster. The boundary list is walked with one forward pointer, so the
   // phase stays linear in the paragraph length however the runs are cut.
   const runTexts = para.runs.map((run) => {
@@ -1496,14 +1494,10 @@ export function paragraphInputRuns(
     const text = run.fieldType === 'slidenum' && slideNumber !== undefined ? String(slideNumber) : run.text;
     return run.caps === 'all' || run.caps === 'small' ? text.toUpperCase() : text;
   });
-  const runStarts: number[] = [];
-  let joinedText = '';
-  for (const text of runTexts) {
-    runStarts.push(joinedText.length);
-    joinedText += text ?? '\n';
-  }
-  const clusterBounds = graphemeClusterOffsets(joinedText);
-  clusterBounds.push(joinedText.length);
+  const { starts: runStarts, text: joinedText, units: fontUnits, eastAsianText: eaRunTexts } = powerPointFontRouting(
+    para.runs.map((run, i) => ({ text: runTexts[i], lang: run.type === 'text' ? run.lang : undefined })),
+  );
+  const clusterBounds = fontUnits.map((unit) => unit.end);
   let boundIndex = 0;
   /** The first cluster boundary at or after `pos`; the pointer only moves forward. */
   const boundaryFrom = (pos: number): number => {
@@ -1575,7 +1569,7 @@ export function paragraphInputRuns(
     // East Asian text, before any leading cluster joins the previous seam.
     const eaDefaults = run.fontFamilyEa ? [] : eastAsianDefaultFaces(
       run.fontFamily ?? para.defFontFamily ?? rc.themeMinorFont ?? null,
-      powerPointEastAsianText(rawText, run.lang),
+      eaRunTexts[sourceRunId],
     );
     const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : eaDefaults[0];
     const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
@@ -1656,15 +1650,9 @@ export function paragraphInputRuns(
       }
       group = '';
     };
-    // Slots are chosen per grapheme cluster from its base character, so a
-    // combining mark, variation selector, ZWJ or other extender stays in its
-    // base's font segment and a cluster never straddles two segments (one
-    // stacked cell, one shaped horizontal glyph). An empty ea/cs slot draws
-    // in PowerPoint's application default (issue #1627).
-    // Known evidence limit: Windows controls can split Myanmar U+1000/U+A9E5
-    // across cs/ea even within one authored run. Keep base-slot inheritance
-    // until varied shaping controls establish a general extender/itemization
-    // rule; do not special-case that pair or infer standalone-mark slots.
+    // Most font units are whole grapheme clusters; routing records the measured
+    // Myanmar cs/ea split before this adapter carries extenders across seams.
+    // The same selected units feed measurement, wrapping and every paint mode.
     let clusterStart = 0;
     let emitted = false;
     while (clusterStart < rawText.length) {
@@ -1676,7 +1664,7 @@ export function paragraphInputRuns(
       // Slot choice precedes measurement, wrapping and every paint flow. It
       // is independent of core's CJK line-break predicate (issue #1653).
       let glyph = powerPointDisplayCluster(cluster, run.lang);
-      const slot = powerPointFontSlot(ch.codePointAt(0) ?? 0, run.lang);
+      const slot = fontUnits[boundIndex].slot;
       const eaGlyph = slot === 'ea';
       const csGlyph = slot === 'cs';
       const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;

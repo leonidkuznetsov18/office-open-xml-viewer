@@ -284,8 +284,9 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
   },
   // The same triple at 20 pt: » × ÷ and U+2018–201E follow cs alone,
   // latin between A/B. Native neighbours/ascending sequences are uncovered,
-  // so they cannot establish an itemization rule. Preserve scalar routing
-  // except withdrawing the unconditional he/ar right-guillemet override.
+  // so they cannot establish a broader itemization rule. Paragraph routing
+  // implements only isolated and Latin-neighbour contexts; other contexts
+  // keep their prior scalar routing, including the original he/ar » result.
   contextualPunctuation: {
     languages: ["ar-eg", "ar-sa", "fa-ir", "he", "he-il", "hi-in", "syr-sy", "th-th", "ug-cn", "ur-in", "ur-pk", "yi-001"],
     ranges: [[0x00BB, 0x00BB], [0x00D7, 0x00D7], [0x00F7, 0x00F7], [0x2018, 0x201E]],
@@ -309,7 +310,11 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
     splitCsEaGroups: 24,
     contexts: ['base-mark', 'base-mark-seam'],
     // This is a split-font observation, deliberately absent from scalar coverage.
-    splitCodePoints: [0x1000, 0xA9E5],
+    splitCodePoints: [0x1000, 0xA9E5, 0xAA7B, 0xAA7C, 0xAA7D],
+    languages: ['en-US', 'my-MM', 'ja-JP'],
+    baseSlot: 'cs',
+    markSlot: 'ea',
+    sizePt: 20,
   },
   scriptControls: {
     'Ethiopic': { scalarRanges: [
@@ -371,8 +376,8 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
       reason: 'No complete cyclic triple survives substitution. Original single-triple overrides are retained pending valid multi-triple/multi-size exports; P2 remains open.',
     },
     scripts: 'Only Myanmar has complete scalar cycles. Other scripts retain previous routing; no block-level extrapolation across missing/mark/unassigned scalars.',
-    clusters: 'Myanmar base U+1000 with U+A9E5 can split cs/ea in both single-run and seam controls. Existing base-slot inheritance remains an explicit limitation pending broader shaping controls.',
-    context: 'Standalone and Latin-surrounded punctuation disagree. No generalized itemization heuristic is inferred; native/ascending controls with uncovered neighbours remain inconclusive.',
+    clusters: 'Myanmar base U+1000 plus U+A9E5/U+AA7B/U+AA7C/U+AA7D selects cs/ea in single-run and same-language seam controls. Other bases, longer clusters, standalone marks and language-changing seams retain previous routing pending broader controls.',
+    context: 'Measured standalone cs and Latin-surrounded latin punctuation are implemented for the 12 exact language IDs. Native/ascending controls with uncovered neighbours remain inconclusive and retain previous routing.',
     sizeAndFaces: 'Script/digit controls are at 20 pt. Digit/punctuation scalar cycles use one distinguishable triple; Myanmar extension cycles use Myanmar Text/Noto Sans Myanmar/Noto Serif Myanmar. Boundary face/size variation is inconclusive.',
   },
 } as const;

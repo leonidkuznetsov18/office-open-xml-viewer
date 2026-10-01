@@ -14,7 +14,7 @@ import {
 import { ScriptPreloadAccumulator } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type { Presentation, Slide, SlideElement } from './types';
 import { eastAsianDefaultFaces } from './east-asian-default.js';
-import { powerPointEastAsianText } from './font-slot-compatibility.js';
+import { powerPointFontRouting } from './font-slot-compatibility.js';
 
 /** Theme-referenced typefaces commonly used by PPTX templates. Keys are
  *  lower-cased family names.
@@ -47,7 +47,11 @@ function* textBodyRuns(body: TextBody | null | undefined): Generator<string> {
 function* textBodyFontFamilies(body: TextBody | null | undefined, minorFont: string | null): Generator<string> {
   for (const paragraph of body?.paragraphs ?? []) {
     if (paragraph.defFontFamily) yield paragraph.defFontFamily;
-    for (const run of paragraph.runs) {
+    const { eastAsianText } = powerPointFontRouting(paragraph.runs.map((run) => ({
+      text: run.type === 'text' ? (run.caps === 'all' || run.caps === 'small' ? run.text.toUpperCase() : run.text) : null,
+      lang: run.type === 'text' ? run.lang : undefined,
+    })));
+    for (const [index, run] of paragraph.runs.entries()) {
       if (run.type !== 'text') continue;
       if (run.fontFamily) yield run.fontFamily;
       if (run.fontFamilyEa) yield run.fontFamilyEa;
@@ -57,7 +61,7 @@ function* textBodyFontFamilies(body: TextBody | null | undefined, minorFont: str
       // letters. Text-script preloading alone then misses its CSS fallback.
       // Resolve the same default tier as measurement; load only its primary
       // Noto fallback rather than every regional tail in the CSS safety net.
-      const eaText = powerPointEastAsianText(run.text, run.lang);
+      const eaText = eastAsianText[index];
       if (eaText) {
         const eaFace = run.fontFamilyEa ?? eastAsianDefaultFaces(
           run.fontFamily ?? paragraph.defFontFamily ?? minorFont, eaText,

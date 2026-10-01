@@ -62,26 +62,53 @@ describe('PPTX language-dependent font slots through the renderer', () => {
     expect(segments([run('“”', 'en-US', { altLang: 'ja-JP' })])[0].face).toBe('Corbel');
   });
 
-  it('selects cs for all measured European digits without a scalar-only punctuation override', () => {
+  it('selects cs for all measured European digits', () => {
     for (const lang of ['he-IL', 'ar-SA', 'th-TH', 'hi-IN', 'fa-IR', 'ur-PK', 'yi-001', 'syr-SY', 'ug-CN', 'ar-EG', 'he', 'ur-IN']) {
       expect(segments([run('A0123456789B', lang)]).map(({ text, face }) => [text, face]))
         .toEqual([['A', 'Corbel'], ['0123456789', 'Microsoft Sans Serif'], ['B', 'Corbel']]);
     }
     expect(segments([run('0123456789', 'en-US', { altLang: 'he-IL' })])[0].face).toBe('Corbel');
-    expect(segments([run('A»B', 'he-IL')])[0].face).toBe('Corbel');
-    expect(segments([run('»', 'th-TH')])[0].face).toBe('Corbel');
-    expect(segments([run('×÷⁇⁈“”', 'ar-SA')])[0].face).toBe('Corbel');
   });
 
-  it('routes measured Myanmar extensions through layout and painting while keeping cluster limits', () => {
-    const text = '\u1000\ua9e0\uaa60\u1000\ua9e5';
-    expect(segments([run(text, 'my-MM')]).map(({ text, face }) => [text, face]))
-      .toEqual([['\u1000', 'Microsoft Sans Serif'], ['\ua9e0\uaa60', 'Meiryo UI'],
-        ['\u1000\ua9e5', 'Microsoft Sans Serif']]);
-    const { ctx, calls } = context();
-    renderTextBody(ctx, body([run(text, 'my-MM')]), 0, 0, 300, 100, SCALE);
-    expect(calls.find((c) => c.text.includes('\ua9e0'))?.font).toContain('"Meiryo UI"');
-    expect(calls.find((c) => c.text.includes('\u1000'))?.font).toContain('"Microsoft Sans Serif"');
+  it('resolves measured standalone and Latin-neighbour punctuation across run seams', () => {
+    for (const lang of ['ar-EG', 'ar-SA', 'fa-IR', 'he', 'he-IL', 'hi-IN',
+      'syr-SY', 'th-TH', 'ug-CN', 'ur-IN', 'ur-PK', 'yi-001']) {
+      for (const ch of '»×÷‘’‚‛“”„') {
+        expect(segments([run(ch, lang)]).map(({ text, face }) => [text, face]))
+          .toEqual([[ch, 'Microsoft Sans Serif']]);
+        for (const runs of [[run(`A${ch}B`, lang)], [run('A', 'en-US'), run(ch, lang), run('B', 'en-US')]]) {
+          expect(segments(runs).map(({ text, face }) => [text, face]))
+            .toEqual(runs.length === 1 ? [[`A${ch}B`, 'Corbel']] : [['A', 'Corbel'], [ch, 'Corbel'], ['B', 'Corbel']]);
+        }
+      }
+    }
+    // Native neighbours and multi-punctuation sequences remain evidence gaps.
+    expect(segments([run('אב×אב', 'he-IL')]).map(({ text, face }) => [text, face]))
+      .toEqual([['אב', 'Microsoft Sans Serif'], ['×', 'Corbel'], ['אב', 'Microsoft Sans Serif']]);
+    expect(segments([run('×÷', 'fa-IR')])[0].face).toBe('Meiryo UI');
+  });
+
+  it('routes all measured split Myanmar marks within runs and across seams', () => {
+    expect(segments([run('\u1000\ua9e0\uaa60', 'my-MM')]).map(({ text, face }) => [text, face]))
+      .toEqual([['\u1000', 'Microsoft Sans Serif'], ['\ua9e0\uaa60', 'Meiryo UI']]);
+    for (const lang of ['en-US', 'my-MM', 'ja-JP']) {
+      for (const mark of '\ua9e5\uaa7b\uaa7c\uaa7d') {
+        for (const runs of [[run(`\u1000${mark}`, lang)], [run('\u1000', lang), run(mark, lang)]]) {
+          expect(segments(runs).map(({ text, face }) => [text, face]))
+            .toEqual([['\u1000', 'Microsoft Sans Serif'], [mark, 'Meiryo UI']]);
+          const { ctx, calls } = context();
+          renderTextBody(ctx, body(runs), 0, 0, 300, 100, SCALE);
+          expect(calls.find((c) => c.text.includes(mark))?.font).toContain('"Meiryo UI"');
+          expect(calls.find((c) => c.text.includes('\u1000'))?.font).toContain('"Microsoft Sans Serif"');
+        }
+      }
+    }
+    expect(segments([run('\u1000\ua9e5', 'fr-FR')])[0].text).toBe('\u1000\ua9e5');
+    expect(segments([run('\u1001\ua9e5', 'my-MM')])[0].text).toBe('\u1001\ua9e5');
+    expect(segments([run('\ua9e5', 'en-US')])[0].face).toBe('Microsoft Sans Serif');
+    expect(naturalWidthExceedsBbox(context().ctx, body([run('\u1000\ua9e5', 'my-MM')]),
+      32, 0, 0, SCALE, RC)).toBe(true);
+    expect(segments([run('\u1000', 'my-MM'), run('\ua9e5', 'en-US')])[0].text).toBe('\u1000\ua9e5');
   });
 
   it('measures and wraps in the selected cs face, including the shape-autofit probe', () => {

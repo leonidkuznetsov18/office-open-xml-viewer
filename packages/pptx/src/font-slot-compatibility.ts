@@ -15,7 +15,7 @@
 // scalars, but NOT the symbol overrides' font/size independence: all 10/18/32 pt
 // boundary triples contain substitution. Retain their original routing while
 // that evidence gap remains open (POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE).
-import { isCjkBreakChar, isComplexScriptCodePoint } from '@silurus/ooxml-core';
+import { graphemeClusterOffsets, isCjkBreakChar, isComplexScriptCodePoint } from '@silurus/ooxml-core';
 export { POWERPOINT_FONT_SLOT_EVIDENCE } from './font-slot-evidence.js';
 
 export type PowerPointFontSlot = 'latin' | 'ea' | 'cs' | 'sym';
@@ -91,6 +91,7 @@ const ZH_TW = KO_KR;
 
 const HE_IL: readonly SlotRange[] = [
   [0x0030, 0x0039, 'cs'],
+  [0x00BB, 0x00BB, 'cs'],
   [0x00D7, 0x00D7, 'latin'],
   [0x00F7, 0x00F7, 'latin'],
   [0x2047, 0x2048, 'latin'],
@@ -112,11 +113,15 @@ const HI_IN = TH_TH;
 // retains latin digits; altLang does not replace the classification language.
 const CS_DIGITS: readonly SlotRange[] = [[0x0030, 0x0039, 'cs']];
 
-// Withdraw the former unconditional he/ar » override: complete cycles select
-// cs alone but latin between Latin letters, as do × ÷ and U+2018–201E under
-// the measured cs languages. A scalar/lang API cannot express this context.
-// Use »'s normative latin slot; keep other prior scalar routing pending varied
-// native-neighbour/itemization controls. Do not guess a general context rule.
+// Complete 20 pt cyclic controls select cs for isolated » × ÷ and U+2018–201E,
+// and latin between Latin letters (tested with A/B), for these exact lang IDs.
+// This is observed PowerPoint itemization, not ECMA's scalar table. Native
+// neighbours, punctuation sequences and other lang IDs retain prior routing.
+const CONTEXTUAL_CS_LANGUAGES = new Set([
+  'ar-eg', 'ar-sa', 'fa-ir', 'he', 'he-il', 'hi-in',
+  'syr-sy', 'th-th', 'ug-cn', 'ur-in', 'ur-pk', 'yi-001',
+]);
+const LATIN_LETTER_RE = /^(?=\p{Script=Latin})\p{Letter}$/u;
 
 // ECMA-376 §21.1.2.3's otherwise-ea rule, confirmed by all three cyclic faces
 // for these exact Myanmar extension scalars under en-US/my-MM/ja-JP at 20 pt.
@@ -166,9 +171,26 @@ function slotInRanges(cp: number, ranges: readonly SlotRange[]): PowerPointFontS
   return undefined;
 }
 
-/** Select the base scalar's slot. Grapheme extenders inherit this slot in the adapter. */
-export function powerPointFontSlot(cp: number, lang?: string): PowerPointFontSlot {
+/** Paragraph context uses UTF-16 offsets before any display mapping. */
+export interface PowerPointFontContext { text: string; offset: number }
+
+/** Without paragraph context, preserve the historical scalar routing. */
+export function powerPointFontSlot(cp: number, lang?: string, context?: PowerPointFontContext): PowerPointFontSlot {
   const language = lang?.toLowerCase() ?? '';
+  if (context && CONTEXTUAL_CS_LANGUAGES.has(language)
+    && (cp === 0xbb || cp === 0xd7 || cp === 0xf7 || (cp >= 0x2018 && cp <= 0x201e))) {
+    if (context.text === String.fromCodePoint(cp)) return 'cs';
+    // A neighbouring scalar can occupy two UTF-16 code units. Reading just a
+    // code unit here would make a supplementary Latin letter a run-seam bug.
+    const beforeIndex = context.offset > 1
+      && context.text.charCodeAt(context.offset - 1) >= 0xdc00
+      && context.text.charCodeAt(context.offset - 1) <= 0xdfff ? context.offset - 2 : context.offset - 1;
+    const before = context.text.codePointAt(beforeIndex);
+    const after = context.text.codePointAt(context.offset + String.fromCodePoint(cp).length);
+    if (before !== undefined && after !== undefined
+      && LATIN_LETTER_RE.test(String.fromCodePoint(before))
+      && LATIN_LETTER_RE.test(String.fromCodePoint(after))) return 'latin';
+  }
   if (cp >= 0xf000 && cp <= 0xf0ff) return 'sym';
   const overrides = OBSERVED_OVERRIDES.get(language);
   const observed = overrides && slotInRanges(cp, overrides);
@@ -194,11 +216,79 @@ export function powerPointDisplayCluster(cluster: string, lang?: string): string
     ? `¥${cluster.slice(1)}` : cluster;
 }
 
-/** East Asian-slot text used by the default-face resolver and font preloader. */
-export function powerPointEastAsianText(text: string, lang?: string): string {
-  let result = '';
-  for (const ch of text) {
-    if (powerPointFontSlot(ch.codePointAt(0) ?? 0, lang) === 'ea') result += ch;
+interface PowerPointFontUnit {
+  start: number;
+  end: number;
+  slot: PowerPointFontSlot;
+}
+
+/** Resolve slots once on paragraph text, before layout, paint or font loading.
+ * Extenders normally inherit the base run's slot/format. The measured exception
+ * is precisely U+1000 plus one of U+A9E5/U+AA7B–AA7D under en-US/my-MM/ja-JP:
+ * all 24 single-run/seam cycles select cs for the base and ea for the mark.
+ * Split those two-scalar clusters into font units, preserving authored styles
+ * at a seam. Standalone marks, other bases, longer clusters and language-changing
+ * seams retain previous inheritance: they have no complete split-font evidence.
+ * Font units do not redefine Unicode graphemes or core's line-break policy.
+ */
+export function powerPointFontRouting(runs: readonly { text: string | null; lang?: string }[]): {
+  text: string;
+  starts: number[];
+  units: PowerPointFontUnit[];
+  eastAsianText: string[];
+} {
+  const starts: number[] = [];
+  let text = '';
+  for (const run of runs) {
+    starts.push(text.length);
+    text += run.text ?? '\n'; // objects and explicit breaks end contextual text
   }
-  return result;
+  const bounds = graphemeClusterOffsets(text);
+  bounds.push(text.length);
+  const units: PowerPointFontUnit[] = [];
+  let runIndex = 0;
+  const languageAt = (offset: number) => {
+    while (runIndex + 1 < starts.length && starts[runIndex + 1] <= offset) runIndex++;
+    return runs[runIndex]?.lang;
+  };
+  let start = 0;
+  let previousLanguage = '';
+  const isSplitMark = (cp: number) => cp === 0xa9e5 || (cp >= 0xaa7b && cp <= 0xaa7d);
+  for (const end of bounds) {
+    const lang = languageAt(start);
+    const cluster = text.slice(start, end);
+    const cp = text.codePointAt(start) ?? 0;
+    let slot = powerPointFontSlot(cp, lang, { text, offset: start });
+    const language = lang?.toLowerCase() ?? '';
+    // Spacing marks may already be separate ICU graphemes. The measured
+    // base/mark routing must not depend on that segmentation distinction.
+    const previous = units.at(-1);
+    if (cluster.length === 1 && isSplitMark(cp)
+      && previous?.start === start - 1 && text.charCodeAt(start - 1) === 0x1000
+      && MYANMAR_MEASURED_LANGUAGES.has(language) && previousLanguage === language) slot = 'ea';
+    if (cluster.length === 2 && cp === 0x1000
+      && isSplitMark(cluster.charCodeAt(1))
+      && MYANMAR_MEASURED_LANGUAGES.has(language)
+      && languageAt(start + 1)?.toLowerCase() === language) {
+      units.push({ start, end: start + 1, slot }, { start: start + 1, end, slot: 'ea' });
+    } else if (end > start) {
+      units.push({ start, end, slot });
+    }
+    previousLanguage = language;
+    start = end;
+  }
+  // Partition selected EA text by authored run with a forward cursor. Neither
+  // a long cross-run cluster nor many short runs may cause quadratic rescans.
+  const eastAsianText = runs.map(() => '');
+  runIndex = 0;
+  for (const unit of units) {
+    let offset = unit.start;
+    while (offset < unit.end) {
+      while (runIndex + 1 < starts.length && starts[runIndex + 1] <= offset) runIndex++;
+      const end = Math.min(unit.end, starts[runIndex + 1] ?? text.length);
+      if (unit.slot === 'ea' && runs[runIndex]?.text !== null) eastAsianText[runIndex] += text.slice(offset, end);
+      offset = end;
+    }
+  }
+  return { text, starts, units, eastAsianText };
 }
