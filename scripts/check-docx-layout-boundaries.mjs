@@ -625,6 +625,23 @@ function assertProductionBodyAcquisitionAuthority(root) {
     fail('PRODUCTION_ACQUISITION_AUTHORITY', `${PRODUCTION_BODY_LAYOUT}#resolveColumnWidths`);
   }
 
+  // Table eligibility belongs to the sole post-merge decision boundary.
+  // Reject imports as well as calls so aliasing cannot reopen member-level gates.
+  const decisionHelpers = new Set(['tableOriginContext', 'wordMeasuredTableOriginMode',
+    'wordFixedOccupiedGridInput', 'wordTableEffectiveIndentPt', 'wordTableOriginTranslationPt']);
+  for (const name of ['production-body-layout.ts', 'table-acquisition.ts']) {
+    const path = resolve(root, DOCX_SOURCE, 'layout', name);
+    if (!existsSync(path)) continue;
+    const consumer = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+    const visit = (node) => {
+      if (ts.isIdentifier(node) && decisionHelpers.has(node.text)) {
+        fail('TABLE_LOGICAL_DECISION_AUTHORITY', `${name}:${node.text}`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(consumer);
+  }
+
   const table = uniqueFunction('computeTablePtLayout');
   const tableSourceIndex = table?.parameters[3];
   const prepared = table?.parameters[4];
@@ -635,20 +652,20 @@ function assertProductionBodyAcquisitionAuthority(root) {
     && ts.isTypeLiteralNode(preparedType.typeArguments[0])
     ? preparedType.typeArguments[0].members : [];
   const preparedColumns = preparationFields.find((field) => field.name?.getText(source) === 'columns')?.type;
-  const preparedOrigin = preparationFields.find((field) => field.name?.getText(source) === 'origin')?.type;
-  // Permit only immutable solved columns and the acquired origin context;
+  const preparedDecision = preparationFields.find((field) => field.name?.getText(source) === 'decision')?.type;
+  const preparedMember = preparationFields.find((field) => field.name?.getText(source) === 'member')?.type;
+  // Permit only immutable solved columns and the acquired logical/member decision;
   // sourceIndex remains a required number at every call, including group rows.
   const allowsPreparation = prepared && ts.isIdentifier(prepared.name) && prepared.name.text === 'prepared'
-    && prepared.questionToken && preparationFields.length === 2
+    && prepared.questionToken && preparationFields.length === 3
     && preparedColumns && ts.isTypeOperatorNode(preparedColumns)
     && preparedColumns.operator === ts.SyntaxKind.ReadonlyKeyword
     && ts.isArrayTypeNode(preparedColumns.type)
     && preparedColumns.type.elementType.kind === ts.SyntaxKind.NumberKeyword
-    && preparedOrigin && ts.isTypeReferenceNode(preparedOrigin)
-    && preparedOrigin.typeName.getText(source) === 'ReturnType'
-    && preparedOrigin.typeArguments?.length === 1
-    && ts.isTypeQueryNode(preparedOrigin.typeArguments[0])
-    && preparedOrigin.typeArguments[0].exprName.getText(source) === 'tableOriginContext';
+    && preparedDecision && ts.isTypeReferenceNode(preparedDecision)
+    && preparedDecision.typeName.getText(source) === 'LogicalTableDecision'
+    && preparedMember && ts.isTypeReferenceNode(preparedMember)
+    && preparedMember.typeName.getText(source) === 'TableMemberDecision';
   const tableBodyCalls = table?.body ? callsNamed(table.body, 'acquireRetainedTable') : [];
   const tableCalls = callsNamed(source, 'computeTablePtLayout');
   const forbiddenTableCalls = [

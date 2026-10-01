@@ -12,7 +12,7 @@ import {
 import type { ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import { layoutTable, measureTableCellBlockFlowHeightPt } from './table.js';
 import { tableCellHorizontalSpacingInsets } from './table-columns.js';
-import { wordMeasuredTableOriginMode, wordTableOriginTranslationPt } from './table-compatibility.js';
+import { unmeasuredTableMemberDecision, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
 import { snapshotPlainData } from './plain-data.js';
 import { eastAsianUprightPaintOps } from './vertical-glyph-orientation.js';
 import type {
@@ -33,10 +33,10 @@ import type {
 } from './types.js';
 
 export interface RetainedTableAcquisitionDependencies<State> {
-  compatibilityMode?(state: State): number | undefined;
+  tableDecision?(table: TableLayoutSource, contentWidthPt: number, state: State): LogicalTableDecision;
   layoutServices(state: State): LayoutServices | undefined;
   tableFormat(table: TableLayoutSource): TableFormatInput;
-  resolveColumns(table: TableLayoutSource, contentWidthPt: number, state: State): readonly number[];
+  resolveColumns(table: TableLayoutSource, contentWidthPt: number, state: State, decision?: LogicalTableDecision): readonly number[];
   createCellState(state: State, contentWidthPt: number, cell: TableLayoutSource['rows'][number]['cells'][number]): State;
   acquireParagraph(
     state: State,
@@ -344,34 +344,6 @@ function orientRotatedCellBlocks(
   });
 }
 
-/** WORD_TABLE_ORIGIN_COMPATIBILITY facts before source rows are acquired.
- * §17.4.37 groups share the first logical row's leading anchor and must test
- * the measured scope over every member, rather than restarting at each tbl. */
-export function tableOriginContext(
-  table: TableLayoutSource,
-  format: TableFormatInput,
-  mode: number | undefined,
-) {
-  const firstRowException = format.firstRowException;
-  const tableIndentPt = firstRowException?.indentAuthored
-    ? (firstRowException.indentPt ?? 0)
-    : (table.tblInd ?? 0);
-  // WORD_TABLE_ORIGIN_COMPATIBILITY: preserve the prior contract for unresolved
-  // margins/spacing, nested origins, positioned tables, and unmeasured modes.
-  const measuredOrigin = wordMeasuredTableOriginMode(mode) && format.ordinaryFlow
-    && table.widthPct == null
-    && (!firstRowException?.preferredWidthAuthored || firstRowException.preferredWidth?.kind !== 'pct')
-    && (firstRowException?.layout === 'fixed' || table.layout === 'fixed'
-      || (firstRowException?.preferredWidthAuthored
-        ? firstRowException.preferredWidth?.kind === 'dxa' && firstRowException.preferredWidth.value > 0
-        : table.widthPt != null && table.widthPt > 0))
-    && table.rows.every((row) => row.cells.every((cell) => cell.widthPt != null && cell.widthPt > 0 && cell.widthPct == null))
-    && format.rows.every((row) => row.cellSpacingPt === 0
-      && row.cells[0]?.originLeftMarginPt != null);
-  const indentAuthored = firstRowException?.indentAuthored || table.tblInd != null;
-  const firstLeftMarginPt = format.rows[0]?.cells[0]?.originLeftMarginPt ?? 0;
-  return { measuredOrigin, tableIndentPt, indentAuthored, firstLeftMarginPt };
-}
 
 /**
  * Acquire an ordinary or nested table from final-width retained children.
@@ -386,7 +358,7 @@ export function acquireRetainedTable<State>(
   outerState: State,
   source: SourceRef | readonly number[],
   dependencies: RetainedTableAcquisitionDependencies<State>,
-  logicalOrigin?: ReturnType<typeof tableOriginContext>,
+  decision?: TableMemberDecision,
 ): RetainedTableAcquisition {
   const sourceRoot: SourceRef = Array.isArray(source)
     ? { story: 'body', storyInstance: 'body', path: source }
@@ -402,14 +374,11 @@ export function acquireRetainedTable<State>(
   const flowDomainId = sourceRoot.story === 'body' && sourceRoot.storyInstance === 'body'
     ? `table:${sourcePath.join('.')}`
     : `${sourceRoot.story}:${sourceRoot.storyInstance}:table:${sourcePath.join('.')}`;
-  const format = dependencies.tableFormat(table);
+  const member = decision ?? dependencies.tableDecision?.(table, contentWidthPt, outerState).logical
+    ?? unmeasuredTableMemberDecision(table, dependencies.tableFormat(table));
+  const format = member.source.format;
   const bidiVisual = table.bidiVisual === true;
-  const mode = dependencies.compatibilityMode?.(outerState);
-  const origin = logicalOrigin ?? tableOriginContext(table, format, mode);
-  const { tableIndentPt, indentAuthored, firstLeftMarginPt } = origin;
-  const measuredOrigin = origin.measuredOrigin
-    && sourcePath.length === 1 && sourceRoot.story === 'body'
-    && sourceRoot.storyInstance === 'body';
+  const tableIndentPt = member.tableIndentPt;
   const nestedById: Record<string, RetainedTableAcquisition> = {};
   const floatingTables: NestedFloatingTableOccurrence[] = [];
   const rotatedCells: RotatedCellAcquisition[] = [];
@@ -488,10 +457,12 @@ export function acquireRetainedTable<State>(
               sourceAt(paragraphPath),
             ),
             acquireNestedTable: (cellState, nestedTable, nestedContentWidthPt, nestedPath) => {
+              const nestedDecision = dependencies.tableDecision?.(nestedTable, nestedContentWidthPt, cellState);
               const nestedColumns = dependencies.resolveColumns(
                 nestedTable,
                 nestedContentWidthPt,
                 cellState,
+                nestedDecision,
               );
               const nested = acquireRetainedTable(
                 nestedTable,
@@ -500,6 +471,7 @@ export function acquireRetainedTable<State>(
                 cellState,
                 sourceAt(nestedPath),
                 dependencies,
+                nestedDecision?.logical,
               );
               nestedById[nested.layout.id] = nested;
               const nestedFormat = dependencies.tableFormat(nestedTable);
@@ -645,13 +617,7 @@ export function acquireRetainedTable<State>(
       // Carry one signed leading-axis translation into the sole table layout
       // algorithm. End alignment uses each row's first margin; leading alignment
       // keeps the first-row anchor even when subsequent margins differ.
-      indentPt: wordTableOriginTranslationPt({
-        mode, measured: measuredOrigin,
-        justification: rowFormat?.justification ?? table.jc,
-        indentPt: tableIndentPt, indentAuthored,
-        firstLeftMarginPt,
-        rowLeftMarginPt: rowFormat?.cells[0]?.originLeftMarginPt ?? 0,
-      }),
+      indentPt: member.rowTranslationsPt[rowIndex] ?? tableIndentPt,
       cells,
       repeatedHeader: rowFormat?.repeatedHeader ?? row.isHeader === true,
     };

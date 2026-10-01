@@ -666,9 +666,9 @@ test('logical-table preparation retains source ownership and complete column con
       'function resolveColumnWidths(state, paragraph) { return acquireTableColumnInput(state, paragraph); }\n'
       + 'function acquireTableColumnInput(state, paragraph) {')
     .replace('sourceIndex: number)',
-      'sourceIndex: number, prepared?: Readonly<{ columns: readonly number[]; origin: ReturnType<typeof tableOriginContext> }>)')
+      'sourceIndex: number, prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>)')
     .replace('computeTablePtLayout(state, table, 100, 0)',
-      'computeTablePtLayout(state, table, 100, 0, { columns: [], origin: {} })');
+      'computeTablePtLayout(state, table, 100, 0, { columns: [], decision: {}, member: {} })');
   write(root, path, canonical);
   assert.equal(runChecker(root, '--final').status, 0);
   for (const [label, source] of [
@@ -678,13 +678,23 @@ test('logical-table preparation retains source ownership and complete column con
     ).replace('    paragraph,\n  );\n  return baseContext;', '    paragraph,\n  ) : {};\n  return baseContext;')],
     ['unowned source', canonical.replace('sourceIndex: number', 'sourceIndex?: number')],
     ['untyped preparation', canonical.replace(
-      'prepared?: Readonly<{ columns: readonly number[]; origin: ReturnType<typeof tableOriginContext> }>',
+      'prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>',
       'prepared?: unknown')],
     ['unwired column authority', canonical.replace(
       'return acquireTableColumnInput(state, paragraph);', 'return [];')],
   ]) {
     write(root, path, source);
     expectDiagnostic(root, 'PRODUCTION_ACQUISITION_AUTHORITY', label, '--final');
+  }
+});
+
+test('member table acquisition cannot recompute logical compatibility eligibility', () => {
+  for (const helper of ['wordMeasuredTableOriginMode', 'wordFixedOccupiedGridInput', 'wordTableEffectiveIndentPt', 'wordTableOriginTranslationPt']) {
+    const root = initializeCanonicalFixture('docx-layout-boundary-table-decision-');
+    const path = 'packages/docx/src/layout/production-body-layout.ts';
+    write(root, path, `import { ${helper} as memberGate } from './table-compatibility.js';\n`
+      + readFileSync(join(root, path), 'utf8'));
+    expectDiagnostic(root, 'TABLE_LOGICAL_DECISION_AUTHORITY', helper, '--final');
   }
 });
 
