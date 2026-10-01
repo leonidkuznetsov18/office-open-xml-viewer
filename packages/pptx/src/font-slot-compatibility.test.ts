@@ -51,9 +51,9 @@ describe('PowerPoint slot compatibility evidence', () => {
     expect(powerPointFontSlot(0xf0ff, 'en-US')).toBe('sym');
     expect(powerPointFontSlot(0xf100, 'en-US')).toBe('latin');
     expect(powerPointFontSlot(0x31, 'AR-sa')).toBe('cs');
-    expect(powerPointFontSlot(0xa9e5, 'en-US')).toBe('cs'); // standalone mark is inconclusive
+    expect(powerPointFontSlot(0xa9e5, 'en-US')).toBe('ea'); // exact standalone-mark cycles
     expect(powerPointFontSlot(0xa9ff, 'en-US')).toBe('latin'); // unassigned gap
-    expect(powerPointFontSlot(0xaa7b, 'my-MM')).toBe('cs'); // no standalone-mark extrapolation
+    expect(powerPointFontSlot(0xaa7b, 'my-MM')).toBe('ea'); // exact standalone-mark cycles
     expect(powerPointFontSlot(0xa9e0, 'fr-FR')).toBe('cs'); // unmeasured language retains policy
     expect(powerPointFontSlot(0xbb, 'he-IL')).toBe('cs'); // original sweep routing
     expect(powerPointFontSlot(0x30, 'fa')).toBe('latin'); // do not infer other region/language IDs

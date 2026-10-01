@@ -5,11 +5,12 @@
 // A group settles only when all three cyclic assignments follow the same slot,
 // with exact authored/display scalar multisets (bidi order may differ). Fixed
 // fallback to an authored family is NOT sufficient: it changes slot on rotation.
-// Missing/substituted/rasterized glyphs, uncovered neighbours, standalone marks,
-// symbol mappings and layout controls are excluded. Base-cluster and seam data
-// are recorded separately; a split-font cluster cannot prove base-slot inheritance.
+// Missing/substituted/rasterized glyphs, uncovered neighbours, nonexact symbol
+// mappings and layout controls are excluded. Exact tagged U+2047/U+2048 and
+// standalone Myanmar marks have complete cycles and are included. Base-cluster
+// and seam data are recorded separately; a split-font cluster cannot prove base-slot inheritance.
 // coverage contains only scalar/language pairs consistent across settled contexts;
-// contextualPunctuation preserves conflicting observations, not routing rules.
+// contextualPunctuation records the isolated/Latin-neighbour routing contract.
 // No pixel fidelity or font/size independence is claimed for incomplete cycles.
 import type { SlotCoverageRange } from './font-slot-evidence.js';
 
@@ -42,15 +43,14 @@ const EN_US: readonly SlotCoverageRange[] = [
   [0x1090, 0x1099, 'cs'],
   [0x109E, 0x109F, 'cs'],
   [0x2018, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
   [0x2160, 0x216B, 'latin'],
   [0x2170, 0x217B, 'latin'],
   [0x217F, 0x217F, 'latin'],
   [0x3298, 0x3298, 'ea'],
   [0x329A, 0x32B0, 'ea'],
-  [0xA9E0, 0xA9E4, 'ea'],
-  [0xA9E6, 0xA9FE, 'ea'],
-  [0xAA60, 0xAA7A, 'ea'],
-  [0xAA7E, 0xAA7F, 'ea'],
+  [0xA9E0, 0xA9FE, 'ea'],
+  [0xAA60, 0xAA7F, 'ea'],
 ];
 
 const FA_IR: readonly SlotCoverageRange[] = [
@@ -81,6 +81,7 @@ const II_CN: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 const JA_JP: readonly SlotCoverageRange[] = [
@@ -101,15 +102,14 @@ const JA_JP: readonly SlotCoverageRange[] = [
   [0x109E, 0x109F, 'cs'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
   [0x2160, 0x216B, 'latin'],
   [0x2170, 0x217B, 'latin'],
   [0x217F, 0x217F, 'latin'],
   [0x3298, 0x3298, 'ea'],
   [0x329A, 0x32B0, 'ea'],
-  [0xA9E0, 0xA9E4, 'ea'],
-  [0xA9E6, 0xA9FE, 'ea'],
-  [0xAA60, 0xAA7A, 'ea'],
-  [0xAA7E, 0xAA7F, 'ea'],
+  [0xA9E0, 0xA9FE, 'ea'],
+  [0xAA60, 0xAA7F, 'ea'],
 ];
 
 const KO_KR: readonly SlotCoverageRange[] = [
@@ -119,6 +119,7 @@ const KO_KR: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 const MY_MM: readonly SlotCoverageRange[] = [
@@ -132,10 +133,8 @@ const MY_MM: readonly SlotCoverageRange[] = [
   [0x108E, 0x108E, 'cs'],
   [0x1090, 0x1099, 'cs'],
   [0x109E, 0x109F, 'cs'],
-  [0xA9E0, 0xA9E4, 'ea'],
-  [0xA9E6, 0xA9FE, 'ea'],
-  [0xAA60, 0xAA7A, 'ea'],
-  [0xAA7E, 0xAA7F, 'ea'],
+  [0xA9E0, 0xA9FE, 'ea'],
+  [0xAA60, 0xAA7F, 'ea'],
 ];
 
 const SYR_SY: readonly SlotCoverageRange[] = [
@@ -180,6 +179,7 @@ const ZH_CN: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 const ZH_HK: readonly SlotCoverageRange[] = [
@@ -189,6 +189,7 @@ const ZH_HK: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 const ZH_MO: readonly SlotCoverageRange[] = [
@@ -198,6 +199,7 @@ const ZH_MO: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 const ZH_SG: readonly SlotCoverageRange[] = [
@@ -207,6 +209,7 @@ const ZH_SG: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 const ZH_TW: readonly SlotCoverageRange[] = [
@@ -216,6 +219,7 @@ const ZH_TW: readonly SlotCoverageRange[] = [
   [0x00F7, 0x00F7, 'ea'],
   [0x2018, 0x201E, 'ea'],
   [0x201F, 0x201F, 'latin'],
+  [0x2047, 0x2048, 'ea'],
 ];
 
 export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
@@ -257,7 +261,10 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
     { id: 13, pages: 93, deckSha256: '6a1b1c77eb182faf5cecbd28fa82f3c1cddd3c93127cc1f90bc3e872ab9972c9',
       pdfSha256: '4d2f77a04ea5dd5991b1880c4c7cab54ae1fb1500b71912e0c4c3d0bf065d0c7' },
   ],
-  acceptanceGroups: {"settled": 2876, "inconsistent-cycle": 9294, "fallback-or-unextractable": 4565, "ineligible": 3222},
+  // Restore 178 complete exact cycles formerly excluded by Unicode category:
+  // 166 U+2047/U+2048 cycles (contextual and ea/altLang counterexamples), plus
+  // 12 standalone marks. Nonexact/substituted observations remain ineligible.
+  acceptanceGroups: {"settled": 3054, "inconsistent-cycle": 9294, "fallback-or-unextractable": 4565, "ineligible": 3044},
   coverage: {
     'ar-eg': AR_EG,
     'ar-sa': AR_SA,
@@ -282,14 +289,17 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
     'zh-sg': ZH_SG,
     'zh-tw': ZH_TW,
   },
-  // The same triple at 20 pt: » × ÷ and U+2018–201E follow cs alone,
+  // The same triple at 20 pt: » × ÷, U+2018–201E and U+2047/U+2048 follow cs alone,
   // latin between A/B. Native neighbours/ascending sequences are uncovered,
   // so they cannot establish a broader itemization rule. Paragraph routing
   // implements only isolated and Latin-neighbour contexts; other contexts
   // keep their prior scalar routing, including the original he/ar » result.
   contextualPunctuation: {
     languages: ["ar-eg", "ar-sa", "fa-ir", "he", "he-il", "hi-in", "syr-sy", "th-th", "ug-cn", "ur-in", "ur-pk", "yi-001"],
-    ranges: [[0x00BB, 0x00BB], [0x00D7, 0x00D7], [0x00F7, 0x00F7], [0x2018, 0x201E]],
+    ranges: [[0x00BB, 0x00BB], [0x00D7, 0x00D7], [0x00F7, 0x00F7], [0x2018, 0x201E], [0x2047, 0x2048]],
+    // 48 U+2047/U+2048 cycles (12 languages × two scalars × two contexts);
+    // 40 disagreed with the prior paragraph adapter. Exact cmap/ToUnicode
+    // scalars in embedded authored families distinguish these from substitutions.
     alone: 'cs',
     latinBetween: 'latin',
     triple: ['Segoe UI Symbol', 'Meiryo UI', 'Microsoft Sans Serif'],
@@ -301,6 +311,10 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
       'ja-JP', 'ko-KR', 'syr-SY', 'th-TH', 'ug-CN', 'ur-IN', 'ur-PK', 'yi-001',
       'zh-CN', 'zh-HK', 'zh-MO', 'zh-SG', 'zh-TW'],
     europeanDigits: [0x0030, 0x0039],
+    // 80 exact cycles: these scalars retain ea under every listed altLang,
+    // alone and between A/B. Together with the 38 ordinary ea cycles, these
+    // bound the 48 contextual cs/latin cycles above (166 complete in total).
+    punctuation: { codePoints: [0x2047, 0x2048], slot: 'ea', settledGroups: 80 },
     contexts: ['alone', 'latin-between'],
     slot: 'latin',
   },
@@ -349,11 +363,9 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
       [0x108E, 0x108E, 'cs'],
       [0x1090, 0x1099, 'cs'],
       [0x109E, 0x109F, 'cs'],
-      [0xA9E0, 0xA9E4, 'ea'],
-      [0xA9E6, 0xA9FE, 'ea'],
-      [0xAA60, 0xAA7A, 'ea'],
-      [0xAA7E, 0xAA7F, 'ea'],
-    ], settledGroups: 575, gaps: {"inconsistent-cycle": 340, "ineligible": 186, "fallback-or-unextractable": 18},
+      [0xA9E0, 0xA9FE, 'ea'],
+      [0xAA60, 0xAA7F, 'ea'],
+    ], settledGroups: 587, gaps: {"inconsistent-cycle": 340, "ineligible": 174, "fallback-or-unextractable": 18},
       authoringExclusions: {"unassigned": 1} },
     'Syriac': { scalarRanges: [
     ], settledGroups: 0, gaps: {"inconsistent-cycle": 176, "ineligible": 87, "fallback-or-unextractable": 168},
@@ -376,7 +388,7 @@ export const POWERPOINT_EXTRA_FONT_SLOT_EVIDENCE = {
       reason: 'This original matrix has no complete cycles. Replacement evidence is in POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE: quote independence settles, while tested symbol overrides are withdrawn because cycles remain inconsistent/substituted or contradict latin.',
     },
     scripts: 'Only Myanmar has complete scalar cycles. Other scripts retain previous routing; no block-level extrapolation across missing/mark/unassigned scalars.',
-    clusters: 'Myanmar base U+1000 plus U+A9E5/U+AA7B/U+AA7C/U+AA7D selects cs/ea in single-run and same-language seam controls. Other bases, longer clusters, standalone marks and language-changing seams retain previous routing pending broader controls.',
+    clusters: 'Myanmar base U+1000 plus U+A9E5/U+AA7B/U+AA7C/U+AA7D selects cs/ea in single-run and same-language seam controls. Standalone marks independently select ea in all 12 exact-scalar cycles (four scalars × three languages at 20 pt), with no dotted circle or extra extracted scalar. Other bases, longer clusters and language-changing seams retain previous inheritance pending broader controls.',
     context: 'Measured standalone cs and Latin-surrounded latin punctuation are implemented for the 12 exact language IDs. Native/ascending controls with uncovered neighbours remain inconclusive and retain previous routing.',
     sizeAndFaces: 'Script/digit controls are at 20 pt. Digit/punctuation scalar cycles use one distinguishable triple; Myanmar extension cycles use Myanmar Text/Noto Sans Myanmar/Noto Serif Myanmar. Replacement boundary controls settle quote face/size independence; symbol variation remains inconclusive (see POWERPOINT_BOUNDARY_FONT_SLOT_EVIDENCE).',
   },

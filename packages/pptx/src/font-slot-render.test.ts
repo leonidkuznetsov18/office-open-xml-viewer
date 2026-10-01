@@ -94,7 +94,7 @@ describe('PPTX language-dependent font slots through the renderer', () => {
   it('resolves measured standalone and Latin-neighbour punctuation across run seams', () => {
     for (const lang of ['ar-EG', 'ar-SA', 'fa-IR', 'he', 'he-IL', 'hi-IN',
       'syr-SY', 'th-TH', 'ug-CN', 'ur-IN', 'ur-PK', 'yi-001']) {
-      for (const ch of '»×÷‘’‚‛“”„') {
+      for (const ch of '»×÷‘’‚‛“”„⁇⁈') {
         expect(segments([run(ch, lang)]).map(({ text, face }) => [text, face]))
           .toEqual([[ch, 'Microsoft Sans Serif']]);
         for (const runs of [[run(`A${ch}B`, lang)], [run('A', 'en-US'), run(ch, lang), run('B', 'en-US')]]) {
@@ -126,10 +126,30 @@ describe('PPTX language-dependent font slots through the renderer', () => {
     }
     expect(segments([run('\u1000\ua9e5', 'fr-FR')])[0].text).toBe('\u1000\ua9e5');
     expect(segments([run('\u1001\ua9e5', 'my-MM')])[0].text).toBe('\u1001\ua9e5');
-    expect(segments([run('\ua9e5', 'en-US')])[0].face).toBe('Microsoft Sans Serif');
+    for (const mark of '\ua9e5\uaa7b\uaa7c\uaa7d') {
+      for (const lang of ['en-US', 'my-MM', 'ja-JP']) {
+        expect(segments([run(mark, lang)])[0].face).toBe('Meiryo UI');
+      }
+    }
     expect(naturalWidthExceedsBbox(context().ctx, body([run('\u1000\ua9e5', 'my-MM')]),
       32, 0, 0, SCALE, RC)).toBe(true);
     expect(segments([run('\u1000', 'my-MM'), run('\ua9e5', 'en-US')])[0].text).toBe('\u1000\ua9e5');
+  });
+
+  it('keeps split font units within the original grapheme in an overwide box', () => {
+    const ctx = context().ctx;
+    ctx.measureText = (text) => ({ width: [...text].reduce((sum, ch) => sum + (ch === '\u1000' ? 20 : 0), 0),
+      actualBoundingBoxAscent: 16, actualBoundingBoxDescent: 4,
+      fontBoundingBoxAscent: 16, fontBoundingBoxDescent: 4 }) as TextMetrics;
+    for (const [mark, expected] of [['\ua9e5', ['\u1000\ua9e5']], ['\uaa7c', ['\u1000\uaa7c']],
+      ['\uaa7b', ['\u1000', '\uaa7b']], ['\uaa7d', ['\u1000', '\uaa7d']]] as const) {
+      for (const runs of [[run(`\u1000${mark}`, 'my-MM')], [run('\u1000', 'my-MM'), run(mark, 'my-MM')]]) {
+        const result = layoutParagraph(ctx, paragraph(runs), 10, 20, '#000', SCALE, 0);
+        expect(result.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(expected);
+        expect(result[0].segments[0].faceFamily).toBe('Microsoft Sans Serif');
+        expect(result.at(-1)?.segments.at(-1)?.faceFamily).toBe('Meiryo UI');
+      }
+    }
   });
 
   it('measures and wraps in the selected cs face, including the shape-autofit probe', () => {

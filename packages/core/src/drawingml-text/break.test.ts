@@ -59,6 +59,41 @@ describe('matched PowerPoint and Excel DrawingML wrap controls', () => {
     expect(lines(['supercalifragilistic'], 80)).toEqual(['supercal', 'ifragili', 'stic']);
   });
 
+  it('keeps grapheme boundaries across paint styles during emergency wrapping', () => {
+    for (const nonMonotoneMeasure of [false, true]) {
+      for (const [mark, expected] of [['\ua9e5', ['\u1000\ua9e5']], ['\uaa7c', ['\u1000\uaa7c']],
+        ['\uaa7b', ['\u1000', '\uaa7b']], ['\uaa7d', ['\u1000', '\uaa7d']]] as const) {
+        const result = breakDrawingMlText([
+          { type: 'text', text: '\u1000', style: 'base' },
+          { type: 'text', text: mark, style: 'mark' },
+        ], { maxWidth: 10, nonMonotoneMeasure,
+          measureText: (text) => [...text].reduce((sum, ch) => sum + (ch === '\u1000' ? 20 : 0), 0) });
+        expect(result.map((line) => line.segments.map((segment) => segment.type === 'text' ? segment.text : '').join('')))
+          .toEqual(expected);
+        expect(result.flatMap((line) => line.segments).map((segment) => segment.style)).toEqual(['base', 'mark']);
+      }
+    }
+  });
+
+  it('fits complete cross-style graphemes and keeps a space-attached mark when wrapping', () => {
+    const wrapped = (base: string, width: number) => breakDrawingMlText([
+      { type: 'text', text: `A${base}`, style: 'base' },
+      { type: 'text', text: '\u0301B', style: 'mark' },
+    ], { maxWidth: width, measureText: (text) => [...text].reduce((sum, ch) => sum + (ch === '\u0301' ? 0 : 20), 0) })
+      .map((line) => line.segments.map((segment) => segment.type === 'text' ? segment.text : '').join(''));
+    expect(wrapped('', 20)).toEqual(['A\u0301', 'B']);
+    expect(wrapped(' ', 20)).toEqual(['A', ' \u0301', 'B']);
+  });
+
+  it('recovers grapheme boundaries shifted inside a styled run by regional-indicator pairing', () => {
+    const result = breakDrawingMlText([
+      { type: 'text', text: '🇦', style: 'first' },
+      { type: 'text', text: '🇧🇨🇩', style: 'rest' },
+    ], { maxWidth: 40, measureText: (text) => [...text].length * 20 });
+    expect(result.map((line) => line.segments.map((segment) => segment.type === 'text' ? segment.text : '').join('')))
+      .toEqual(['🇦🇧', '🇨🇩']);
+  });
+
   it('carries an overflowing tab to the next line and seats one glyph after its stop (C11)', () => {
     expect(lines(['abc\tdef'], 85)).toEqual(['abc', '\td', 'ef']);
   });

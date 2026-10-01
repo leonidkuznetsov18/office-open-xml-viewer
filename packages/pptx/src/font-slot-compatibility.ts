@@ -126,8 +126,9 @@ const HI_IN = TH_TH;
 // retains latin digits; altLang does not replace the classification language.
 const CS_DIGITS: readonly SlotRange[] = [[0x0030, 0x0039, 'cs']];
 
-// Complete 20 pt cyclic controls select cs for isolated » × ÷ and U+2018–201E,
-// and latin between Latin letters (tested with A/B), for these exact lang IDs.
+// Complete 20 pt cyclic controls select cs for isolated » × ÷, U+2018–201E
+// and U+2047/U+2048, and latin between Latin letters (tested with A/B), for
+// these exact lang IDs.
 // This is observed PowerPoint itemization, not ECMA's scalar table. Native
 // neighbours, punctuation sequences and other lang IDs retain prior routing.
 const CONTEXTUAL_CS_LANGUAGES = new Set([
@@ -138,11 +139,11 @@ const LATIN_LETTER_RE = /^(?=\p{Script=Latin})\p{Letter}$/u;
 
 // ECMA-376 §21.1.2.3's otherwise-ea rule, confirmed by all three cyclic faces
 // for these exact Myanmar extension scalars under en-US/my-MM/ja-JP at 20 pt.
-// Marks U+A9E5/U+AA7B–AA7D and unassigned U+A9FF are not scalar observations.
+// Standalone U+A9E5/U+AA7B–AA7D also have 12 complete exact-scalar cycles;
+// marks do not imply substitution. Unassigned U+A9FF has no scalar observation.
 // Other language IDs retain the previous script policy rather than extrapolate.
 const MYANMAR_EXTENSION_EA: readonly SlotRange[] = [
-  [0xA9E0, 0xA9E4, 'ea'], [0xA9E6, 0xA9FE, 'ea'],
-  [0xAA60, 0xAA7A, 'ea'], [0xAA7E, 0xAA7F, 'ea'],
+  [0xA9E0, 0xA9FE, 'ea'], [0xAA60, 0xAA7F, 'ea'],
 ];
 const MYANMAR_MEASURED_LANGUAGES = new Set(['en-us', 'my-mm', 'ja-jp']);
 
@@ -191,7 +192,7 @@ export interface PowerPointFontContext { text: string; offset: number }
 export function powerPointFontSlot(cp: number, lang?: string, context?: PowerPointFontContext): PowerPointFontSlot {
   const language = lang?.toLowerCase() ?? '';
   if (context && CONTEXTUAL_CS_LANGUAGES.has(language)
-    && (cp === 0xbb || cp === 0xd7 || cp === 0xf7 || (cp >= 0x2018 && cp <= 0x201e))) {
+    && (cp === 0xbb || cp === 0xd7 || cp === 0xf7 || (cp >= 0x2018 && cp <= 0x201e) || cp === 0x2047 || cp === 0x2048)) {
     if (context.text === String.fromCodePoint(cp)) return 'cs';
     // A neighbouring scalar can occupy two UTF-16 code units. Reading just a
     // code unit here would make a supplementary Latin letter a run-seam bug.
@@ -240,8 +241,9 @@ interface PowerPointFontUnit {
  * is precisely U+1000 plus one of U+A9E5/U+AA7B–AA7D under en-US/my-MM/ja-JP:
  * all 24 single-run/seam cycles select cs for the base and ea for the mark.
  * Split those two-scalar clusters into font units, preserving authored styles
- * at a seam. Standalone marks, other bases, longer clusters and language-changing
- * seams retain previous inheritance: they have no complete split-font evidence.
+ * at a seam. Standalone marks use their independently measured ea slot. Other
+ * bases, longer clusters and language-changing seams retain previous inheritance:
+ * they have no complete split-font evidence.
  * Font units do not redefine Unicode graphemes or core's line-break policy.
  */
 export function powerPointFontRouting(runs: readonly { text: string | null; lang?: string }[]): {
