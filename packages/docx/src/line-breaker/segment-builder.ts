@@ -26,6 +26,7 @@ import {
 import {
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
+  wordCompressedSpaceLineFitApplies,
   wordSourceRunSpaceContinuesSequence,
   wordBalancedConsecutiveSpaceCellApplies,
   wordBalancedLinesAndCharsGridDeltaFactor,
@@ -1252,8 +1253,14 @@ function emitResolvedTextSegment(
     resolvedSpan?.script ??
     authoritativeSpan?.script ??
     (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
+  // WORD_COMPRESSED_SPACE_LINE_FIT: compatibility modes below 15 with a
+  // compressing characterSpacingControl. Mode-15 justified lines belong to
+  // WORD_JUSTIFIED_INTERWORD_COMPRESSION; mode-15 left lines keep natural spaces.
   const latinSpaceCompressionEligible =
-    environment.characterSpacingControl === 'compressPunctuation' &&
+    wordCompressedSpaceLineFitApplies(
+      environment.compatibilityMode,
+      environment.characterSpacingControl,
+    ) &&
     // MS-OE376 §2.1.472 requires full advance for fit with this
     // compatibility switch, even if display uses compression. This gate
     // covers the measured Latin fit behavior; display-space placement
@@ -1267,8 +1274,9 @@ function emitResolvedTextSegment(
     !emissionState.reduced &&
     effectiveVertAlign == null &&
     (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
-    (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
-    effectiveKerningThreshold == null;
+    // The w:kern threshold and enableOpenTypeFeatures do not gate the space
+    // projection (WORD_COMPRESSED_SPACE_LINE_FIT kern/OpenType controls).
+    (effectiveCharacterScale == null || effectiveCharacterScale === 1);
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)
     : undefined;

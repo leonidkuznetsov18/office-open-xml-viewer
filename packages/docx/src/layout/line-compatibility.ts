@@ -433,8 +433,48 @@ export const WORD_LATIN_INTERWORD_XAVG_FLOOR = defineCompatibilityRule({
     version: '16.111.1',
     platform: 'macOS 26.5.2',
   },
-  description: 'For left-aligned homogeneous Latin words using one U+0020 separator and characterSpacingControl=compressPunctuation, Word reduces each natural inter-word space only as far as half the selected static face\'s positive OS/2 xAvgCharWidth. First-fit and beta-origin controls varied only U+0020 hmtx, then only xAvg, with fixed outlines and non-space advances at 8/11/16pt; a distinct Carlito outline provided a counterexample where natural U+0020 was narrower than the floor. Two-gap controls showed equal required-deficit allocation. A one-twip linesAndChars control preserved the xAvg-dependent deficit while moving both control and natural boundaries by the separate character-grid pitch. [MS-OE376] §2.1.472 documents lineWrapLikeWord6 as an explicit uncompressed-fit override. Mixed faces, explicit run spacing or scaling, justification, and snapToChars remain outside the observed scope.',
+  description: 'For left-aligned homogeneous Latin words using one U+0020 separator and characterSpacingControl=compressPunctuation, Word reduces each natural inter-word space only as far as half the selected static face\'s positive OS/2 xAvgCharWidth. First-fit and beta-origin controls varied only U+0020 hmtx, then only xAvg, with fixed outlines and non-space advances at 8/11/16pt; a distinct Carlito outline provided a counterexample where natural U+0020 was narrower than the floor. Two-gap controls showed equal required-deficit allocation. A one-twip linesAndChars control preserved the xAvg-dependent deficit while moving both control and natural boundaries by the separate character-grid pitch. [MS-OE376] §2.1.472 documents lineWrapLikeWord6 as an explicit uncompressed-fit override. Explicit run spacing or scaling and snapToChars remain outside the observed scope. WORD_COMPRESSED_SPACE_LINE_FIT later bounds this floor by a quarter of the font size, extends it to mixed faces/scripts and justified lines, and limits it to compatibility modes below 15.',
 });
+
+export const WORD_COMPRESSED_SPACE_LINE_FIT = defineCompatibilityRule({
+  id: 'word-compressed-space-line-fit',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'mixed-script-space-fit-1660-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'Issue #1660 controls (1773 Word-exported fixed-cell lines: 576 coarse, 595 fine one-twip, 602 hypothesis-targeted) extend WORD_LATIN_INTERWORD_XAVG_FLOOR to mixed CJK/Latin lines and settle its scope. In compatibility modes 12 and 14 with characterSpacingControl compressPunctuation or compressPunctuationAndJapaneseKana, every U+0020 on the line shrinks by the same amount (single, consecutive and source-run-split spaces alike) while ideographs, kana and other glyphs keep their natural advances; enableOpenTypeFeatures and the w:kern threshold do not gate it, and left, both and distribute alignment behave alike. Each space keeps at least min(xAvgCharWidth / 2, font size / 4) of its own face: Arial and Times New Roman follow half their OS/2 xAvgCharWidth, while BIZ UDGothic, Meiryo and Yu Gothic (xAvgCharWidth 0.84-0.96 em) and BIZ derivatives with only post.isFixedPitch or only the far-east code-page bits changed all stop at a quarter em, rejecting fixed-pitch, code-page and weighted-lowercase-average selectors. A candidate whose last character before trailing closing punctuation is East Asian is admitted only while its natural overflow, measured without that trailing punctuation, is at most half the font size: a final ideograph or half-width kana admits 0.5 em of overflow at 8.5/10.5/16 pt, a final ideograph or kana followed by a full-width closing parenthesis keeps that 0.5 em limit before the parenthesis (which keeps half its cell at the line end), and a Latin final word has no such limit beyond the space floors. characterSpacingControl omitted or doNotCompress, compatibility mode 15 and lineWrapLikeWord6 ([MS-OE376] §2.1.472) keep natural spaces; mode-15 justified Latin inter-word compression is a separate rule. Mode-15 justified mixed CJK/Latin lines (Word admits 2.60pt of overflow over four 4.25pt spaces but not 2.65pt) are unexplained and keep natural fitting.',
+});
+
+/** Gate of {@link WORD_COMPRESSED_SPACE_LINE_FIT}: compatibility modes below 15
+ * (12 and 14 measured; an omitted mode keeps the earlier unconditional Latin
+ * projection) with a compressing characterSpacingControl. */
+export function wordCompressedSpaceLineFitApplies(
+  compatibilityMode: number | undefined,
+  characterSpacingControl: string | undefined,
+): boolean {
+  return (compatibilityMode === undefined || compatibilityMode < 15)
+    && (characterSpacingControl === 'compressPunctuation'
+      || characterSpacingControl === 'compressPunctuationAndJapaneseKana');
+}
+
+/** Per-space minimum advance of {@link WORD_COMPRESSED_SPACE_LINE_FIT} and
+ * {@link WORD_LATIN_INTERWORD_XAVG_FLOOR}, in the caller's unit. */
+export function wordCompressedSpaceFloor(fontSize: number, averageWidthRatio: number): number {
+  return Math.min((fontSize * averageWidthRatio) / 2, fontSize / 4);
+}
+
+/** Natural-overflow limit of {@link WORD_COMPRESSED_SPACE_LINE_FIT} for a
+ * candidate ending (before trailing closing punctuation) in an East Asian
+ * character; undefined means no limit beyond the space floors. */
+export function wordCompressedSpaceEastAsianOverflowLimit(
+  lastCharacterIsEastAsian: boolean,
+  fontSize: number,
+): number | undefined {
+  return lastCharacterIsEastAsian ? fontSize / 2 : undefined;
+}
 
 export const WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE = defineCompatibilityRule({
   id: 'word-ideographic-space-line-end-allowance',

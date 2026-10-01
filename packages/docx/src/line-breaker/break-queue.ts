@@ -206,8 +206,12 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     latinLineFace: undefined as LayoutTextSeg | undefined,
     latinLineHomogeneous: true,
     latinLineGaps: [] as LayoutTextSeg[],
+    /** Total U+0020 carried by latinLineGaps (WORD_COMPRESSED_SPACE_LINE_FIT). */
+    latinLineSpaceCount: 0,
     latinUniformGapCapacity: undefined as number | undefined,
     latinAppliedGapCount: 0,
+    /** Spaces covered by latinAppliedPerGap (the applied gaps' U+0020 count). */
+    latinAppliedSpaceCount: 0,
     latinAppliedPerGap: 0,
     snapBlock: null as SnapBlockState | null,
     physicalLineIndex: 0,

@@ -1,3 +1,4 @@
+import { COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION } from './text-runs.js';
 import { measureFitTextUnit, measureJoinedTextUnit } from './atomic-units.js';
 import { justifiedCandidateFitWidth } from './justify-fit.js';
 import {
@@ -77,6 +78,8 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'sameLatinSpaceFace'
   | 'fitsMeasuredWidth'
   | 'fitHomogeneousLatinSpaces'
+  | 'compressedSpaceRequirement'
+  | 'applyCompressedSpaces'
   | 'appendQueuedIdeographicSpaceSegment'
   | 'emergencyTextSplit'
   | 'effectiveFontPx'
@@ -332,10 +335,18 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
     : s.text.endsWith(' ')
       ? w - strAdvance(s, trimmed)
       : 0;
-  s.latinNaturalTrailingSpacePx =
-    s.latinSpaceCompressionEligible === true && /^[^ ]+ $/u.test(s.text) && trailingSpaceW > 0
-      ? trailingSpaceW
-      : undefined;
+  // WORD_COMPRESSED_SPACE_LINE_FIT: every trailing U+0020 of a word, and a
+  // space-only run between visible content, is one shrinkable space. A
+  // space-only run at a line head is not a gap.
+  const trailingSpaceCount = s.text.length - trimmed.length;
+  const compressibleSpaces =
+    s.latinSpaceCompressionEligible === true &&
+    trailingSpaceW > 0 &&
+    !trimmed.includes(' ') &&
+    (trimmed.length > 0 ||
+      breakerState.currentLine.some((item) => 'text' in item && /\S/u.test(item.text)));
+  s.latinNaturalTrailingSpacePx = compressibleSpaces ? trailingSpaceW : undefined;
+  s.latinNaturalTrailingSpaceCount = compressibleSpaces ? trailingSpaceCount : undefined;
   s.latinSpaceCompressionPx = undefined;
   // Library containment policy: an RTL line is anchored at its right edge,
   // so even an invisible trailing-space advance shifts visible LTR cells left.
@@ -1146,6 +1157,29 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
       });
     }
   }
+  // WORD_COMPRESSED_SPACE_LINE_FIT: the line's U+0020 may shrink to admit
+  // further characters of this run. Extend the natural prefix while Word's
+  // space floors and East Asian overflow limit admit it; kinsoku below may
+  // still retract the break.
+  let compressedSpaceRequired: number | undefined;
+  if (breakerState.latinLineSpaceCount > 0 && breakerState.currentLine.length > 0) {
+    const characters = [...s.text];
+    for (let count = [...rawPrefix].length + 1; count <= characters.length; count += 1) {
+      const candidate = characters.slice(0, count).join('');
+      if (candidate.endsWith(' ')) break;
+      const required = context.compressedSpaceRequirement(
+        { ...s, text: candidate },
+        strAdvance(s, candidate),
+      );
+      if (required === undefined) {
+        // A trailing closing punctuation mark is judged with its predecessor.
+        if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(characters[count - 1]!)) continue;
+        break;
+      }
+      rawPrefix = candidate;
+      compressedSpaceRequired = required;
+    }
+  }
   // Apply kinsoku to the break position: retract leftwards so the tail
   // never begins with a 行頭禁則 char and the head never ends with a
   // 行末禁則 char (ECMA-376 §17.15.1.58–.60). When the current line
@@ -1195,6 +1229,14 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     }
   }
   if (prefix.length > 0) {
+    if (compressedSpaceRequired !== undefined) {
+      // Kinsoku may have retracted the extended break; commit the reduction the
+      // retained head still needs (none when it fits naturally).
+      const required = breakerState.currentWidth + strAdvance(s, prefix) > availW()
+        ? context.compressedSpaceRequirement({ ...s, text: prefix }, strAdvance(s, prefix))
+        : undefined;
+      if (required !== undefined) context.applyCompressedSpaces(required);
+    }
     // Grid advance for the head piece — the same model as the line box / draw.
     const pw = strNaturalAdvance(s, prefix);
     const headSeg: LayoutTextSeg = {

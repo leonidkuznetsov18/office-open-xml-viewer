@@ -32,6 +32,8 @@ import {
   performRejectGap,
   performCaptureGapSnapshot,
   performSameLatinSpaceFace,
+  performCompressedSpaceRequirement,
+  performApplyCompressedSpaces,
   performMaterializeLatinSpaceCompression,
   performStartLine,
   performAvailW,
@@ -258,6 +260,10 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * setting excludes the fit projection at segment acquisition. */
   const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
     performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
+  const compressedSpaceRequirement = (next: LayoutTextSeg, nextFitWidth: number): number | undefined =>
+    performCompressedSpaceRequirement(operationState, next, nextFitWidth);
+  const applyCompressedSpaces = (required: number): void =>
+    performApplyCompressedSpaces(operationState, required);
 
   /** Measure one text segment's canonical advance and vertical contribution.
    * Every path that commits a complete text segment to a line must use this
@@ -383,6 +389,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     eastAsianSnapCellCount,
     strAdvance,
     fitHomogeneousLatinSpaces,
+    compressedSpaceRequirement,
+    applyCompressedSpaces,
     textSegmentBox,
     appendQueuedIdeographicSpaceSegment,
     tabFollowWidth,
