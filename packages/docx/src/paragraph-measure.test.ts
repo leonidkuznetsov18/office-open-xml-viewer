@@ -1409,8 +1409,8 @@ function classifyDifference(
 // both production implementations and therefore explicitly skips without it.
 const parityBaseline = process.env.VRT_BASELINE_CHECKOUT;
 it.skipIf(!parityBaseline)('classifies every float gap geometry difference from main', async () => {
-  const baseline = await import(`${parityBaseline}/packages/docx/src/paragraph-measure.ts`) as
-    typeof import('./paragraph-measure.js');
+  const BASELINE_PARAGRAPH_MEASURE = `${parityBaseline}/packages/docx/src/paragraph-measure.ts`;
+  const baseline = await import(BASELINE_PARAGRAPH_MEASURE) as typeof import('./paragraph-measure.js');
   const counts: Record<string, number> = {};
   for (const [index, item] of atomicFloatPropertyCases().entries()) {
     // Interior exclusions exercise multiple gaps; edge exclusions exercise sole
