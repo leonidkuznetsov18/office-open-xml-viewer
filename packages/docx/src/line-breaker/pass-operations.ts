@@ -130,6 +130,7 @@ export interface PassOperationState extends LineBreakerPassInput {
     desc: number,
   ) => boolean;
   readonly probeHeights: readonly number[] | null;
+  readonly probeFloors: readonly number[] | null;
   readonly preparedFloatWrap?: PreparedFloatWrap;
 }
 
@@ -301,7 +302,7 @@ function openPhysicalLine(operationState: PassOperationState): void {
 }
 
 export function performStartLine(operationState: PassOperationState, requirement: number = 0): void {
-  const { breakerState, maxWidth, wrapCtx, firstIndent, probeHeights } = operationState;
+  const { breakerState, maxWidth, wrapCtx, firstIndent, probeFloors } = operationState;
 
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
@@ -312,7 +313,7 @@ export function performStartLine(operationState: PassOperationState, requirement
   // Every gap of this physical line uses the same observed band. New gaps
   // are horizontal placements, so they need no additional convergence pass.
   // Without an observed band (first pass), the line is measured unconstrained.
-  if (!wrapCtx || physicalProbeHeight(probeHeights, breakerState.physicalLineIndex) === undefined) {
+  if (!wrapCtx || physicalProbeHeight(probeFloors, breakerState.physicalLineIndex) === undefined) {
     openPhysicalLine(operationState);
     return;
   }
@@ -338,7 +339,7 @@ function placeLineWindow(
   transaction: GapTransaction,
   rejected: GapWindow | null,
 ): void {
-  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
+  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeFloors, preparedFloatWrap } =
     operationState;
   if (!wrapCtx) return;
   // §17.3.1.12 removes a hanging indent from the paragraph's first-line
@@ -378,7 +379,7 @@ function placeLineWindow(
   let accepted: GapWindow & { narrowed: boolean } | null = null;
   const cursor = transaction.cursor;
   if (cursor) {
-    const probeH = physicalProbeHeight(probeHeights, breakerState.physicalLineIndex);
+    const probeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
     const left = baseRtl ? lineBandX : cursor.right;
     const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
     if (probeH !== undefined && right > left) {
@@ -403,7 +404,7 @@ function placeLineWindow(
     }
   }
   if (!accepted) {
-    const probeH = physicalProbeHeight(probeHeights, breakerState.physicalLineIndex);
+    const probeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
     if (probeH === undefined) {
       breakerState.lineXOffset = 0;
       breakerState.lineMaxWidth = maxWidth;

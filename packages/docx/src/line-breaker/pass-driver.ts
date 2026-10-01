@@ -82,6 +82,8 @@ export interface LineBreakerPassInput {
   readonly overflowPunct: boolean;
   readonly passContext: Readonly<{
     probeHeights: readonly number[] | null;
+    /** Monotone per-physical-line exclusion probe heights (≥ probeHeights). */
+    probeFloors?: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
   }>;
 }
@@ -118,6 +120,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   } = input;
 
   const { probeHeights, preparedFloatWrap } = passContext;
+  const probeFloors = passContext.probeFloors ?? probeHeights;
   const breakerState = createLineBreakerState(maxWidth, wrapCtx);
 
   let operationState: PassOperationState;
@@ -349,6 +352,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   operationState = {
     ...input,
     probeHeights,
+    probeFloors,
     preparedFloatWrap,
     breakerState,
     sameLatinSpaceFace,

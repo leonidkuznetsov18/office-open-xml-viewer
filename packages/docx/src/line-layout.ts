@@ -90,6 +90,7 @@ export function layoutLines(
   overflowPunct = false,
   passContext?: Readonly<{
     probeHeights: readonly number[] | null;
+    probeFloors?: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
   }>,
 ): LayoutLine[] {
@@ -101,6 +102,7 @@ export function layoutLines(
     const runPass = (
       probeHeights: readonly number[] | null,
       preparedFloatWrap?: PreparedFloatWrap,
+      probeFloors: readonly number[] | null = null,
     ): LayoutLine[] => (layoutLines as unknown as (
       ...args: unknown[]
     ) => LayoutLine[])(
@@ -124,14 +126,14 @@ export function layoutLines(
       widthPolicy,
       verticalGlyphMeasurement,
       overflowPunct,
-      { probeHeights, preparedFloatWrap },
+      { probeHeights, probeFloors, preparedFloatWrap },
     );
     if (!wrapCtx || widthPolicy !== 'bounded') return runPass(null);
     const preparedFloatWrap = wrapCtx.lineWindow
       ? undefined
       : prepareFloatWrap(wrapCtx.floats);
     const lines = convergeLineWrap(
-      (probeHeights) => runPass(probeHeights, preparedFloatWrap),
+      (probeHeights, probeFloors) => runPass(probeHeights, preparedFloatWrap, probeFloors),
       (line) => wrapCtx.lineBoxH(
         line.ascent,
         line.descent,

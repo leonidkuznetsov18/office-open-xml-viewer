@@ -1354,12 +1354,15 @@ interface PlacedLine {
   readonly left: number;
   readonly width: number;
   readonly physical: number | undefined;
+  /** Allocated advance of the physical line (its probed band height). */
+  readonly height: number;
   readonly segments: readonly Readonly<{ text: string | null; width: number; visible: number }>[];
 }
 
 function placedGeometry(measured: ReturnType<typeof measureParagraph>): PlacedLine[] {
-  return measured.lines.map(({ layout: line, topYPt }) => ({
+  return measured.lines.map(({ layout: line, topYPt, advancePt }) => ({
     top: topYPt, left: line.xOffset, width: line.availWidth, physical: line.physicalLineIndex,
+    height: advancePt,
     segments: line.segments.map((segment) => {
       const isText = 'text' in segment;
       const fixed = isText && segment.fitTextRegionIndex !== undefined;
@@ -1376,10 +1379,8 @@ function placedGeometry(measured: ReturnType<typeof measureParagraph>): PlacedLi
 /** Every visible advance stays inside the paragraph band and outside the
  * exclusion, tested on the line band the solver probed. */
 function bandViolation(lines: readonly PlacedLine[], obstacle: FloatRect, rtl: boolean): string | null {
-  const tops = [...new Set(lines.map((line) => line.top))].sort((a, b) => a - b);
   for (const line of lines) {
-    const index = tops.indexOf(line.top);
-    const height = index + 1 < tops.length ? tops[index + 1]! - line.top : 10;
+    const height = line.height;
     const total = line.segments.reduce((sum, segment) => sum + segment.width, 0);
     let pen = line.left + (rtl ? line.width - total : 0);
     for (const segment of line.segments) {
@@ -1402,7 +1403,8 @@ function bandViolation(lines: readonly PlacedLine[], obstacle: FloatRect, rtl: b
         || (narrowed && outside && !hanging)) return `band ${JSON.stringify(line)}`;
       const meets = obstacle.wrapPolygon
         ? polygonMeetsRect(obstacle.wrapPolygon, line.top, height, start + 1e-9, end - 1e-9)
-        : line.top < obstacle.yBottom && end > obstacle.xLeft + 1e-9 && start < obstacle.xRight - 1e-9;
+        : line.top < obstacle.yBottom && line.top + height > obstacle.yTop
+          && end > obstacle.xLeft + 1e-9 && start < obstacle.xRight - 1e-9;
       if (meets) return `exclusion ${JSON.stringify(line)}`;
     }
   }
@@ -1511,3 +1513,140 @@ it.skipIf(!parityBaseline)('classifies every float gap geometry difference from 
   expect((counts.gapOrder ?? 0) + (counts.continuation ?? 0) + (counts.subInch ?? 0)).toBeGreaterThan(0);
   console.info('Float gap parity classifications:', counts);
 }, 60_000);
+
+// Review round 6: mixed physical-line heights beside stacked exclusions. A
+// short probe admitted a tall unit whose band then met the lower object; a
+// tall probe excluded it again. Monotone per-line probe floors end that cycle.
+function stackedObstacle(left: number, right: number, top: number, bottom: number): FloatRect {
+  return { ...squareObstacle(left, right), imageY: top, imageH: bottom - top, yTop: top, yBottom: bottom };
+}
+
+function stackedLines(runs: DocParagraph['runs'], obstacles: readonly FloatRect[], rtl = false) {
+  return measureParagraph(paragraph({ spaceBefore: 0, spaceAfter: 0, runs }),
+    layoutContext({ spaceBeforePt: 0, spaceAfterPt: 0, baseRtl: rtl }),
+    placement({ startYPt: 0, maximumYPt: 2000, wrap: createFloatWrapOracle(obstacles, gapReference(rtl)) }),
+    measurer, environment());
+}
+
+it('converges mixed-height gap lines beside stacked square exclusions', () => {
+  const runs: DocParagraph['runs'] = [10, 10, 24, 12, 24]
+    .map((fontSize) => ({ type: 'text', ...textRun('word ', { fontSize }) }));
+  const obstacles = [stackedObstacle(80, 120, 0, 115), stackedObstacle(40, 190, 45, 200)];
+  const measured = stackedLines(runs, obstacles);
+  const lines = placedGeometry(measured);
+  for (const obstacle of obstacles) expect(bandViolation(lines, obstacle, false)).toBeNull();
+  expect(physicalViolation(lines, false)).toBeNull();
+  expect(measuredTextSequence(measured).join('')).toBe('word '.repeat(5));
+});
+
+it('keeps mixed sizes, pictures and ruby beside stacked exclusions convergent', () => {
+  let seed = 0x16836;
+  const random = (limit: number) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % limit;
+  };
+  for (let index = 0; index < 120; index += 1) {
+    const runs: DocParagraph['runs'] = Array.from({ length: 4 + random(16) }, () => {
+      const kind = random(6);
+      if (kind === 0) {
+        return { type: 'image', imagePath: 'test', mimeType: 'image/png',
+          widthPt: 5 + random(40), heightPt: 5 + random(40) } as { type: 'image' } & ImageRun;
+      }
+      if (kind === 1) return { type: 'text', ...textRun('漢字', { ruby: { text: 'かんじ', fontSizePt: 5 + random(6) } }) };
+      return { type: 'text', ...textRun(['a ', 'word ', 'longer ', 'W '][random(4)]!, { fontSize: [8, 10, 12, 18, 24, 36][random(6)]! }) };
+    });
+    const obstacles = Array.from({ length: 1 + random(3) }, () => {
+      const left = random(150);
+      const right = left + 10 + random(200 - left - 10);
+      const top = random(150);
+      return stackedObstacle(left, right, top, top + 10 + random(150));
+    });
+    const rtl = random(4) === 0;
+    const label = `stacked case ${index}: ${JSON.stringify({ runs, obstacles, rtl })}`;
+    const measured = stackedLines(runs, obstacles, rtl);
+    const lines = placedGeometry(measured);
+    for (const obstacle of obstacles) expect(bandViolation(lines, obstacle, rtl), label).toBeNull();
+    expect(physicalViolation(lines, rtl), label).toBeNull();
+  }
+});
+
+// With a single admitting gap (one exclusion at a paragraph edge leaving at
+// least one inch) and words that fit it, the model and main coincide exactly.
+it.skipIf(!parityBaseline)('matches main exactly when only one gap exists', async () => {
+  const BASELINE_PARAGRAPH_MEASURE = `${parityBaseline}/packages/docx/src/paragraph-measure.ts`;
+  const baseline = await import(BASELINE_PARAGRAPH_MEASURE) as typeof import('./paragraph-measure.js');
+  let seed = 0x1683a;
+  const random = (limit: number) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % limit;
+  };
+  for (let index = 0; index < 120; index += 1) {
+    const words = Array.from({ length: 5 + random(40) }, () => 'abcdefgh'.slice(0, 1 + random(8)));
+    const runs: DocParagraph['runs'] = words.map((word) =>
+      ({ type: 'text', ...textRun(`${word} `, { fontSize: [10, 12][random(2)]! }) }));
+    const edge = 80 + random(40);
+    const obstacle = random(2) === 0
+      ? stackedObstacle(0, 200 - edge, 0, 20 + random(80))
+      : stackedObstacle(edge, 200, 0, 20 + random(80));
+    const render = (api: typeof baseline) => placedGeometry(api.measureParagraph(
+      paragraph({ spaceBefore: 0, spaceAfter: 0, runs }), layoutContext({ spaceBeforePt: 0, spaceAfterPt: 0 }),
+      placement({ startYPt: 0, maximumYPt: 2000, wrap: api.createFloatWrapOracle([obstacle], gapReference(false)) }),
+      measurer, environment())).map((line) => ({ ...line, physical: undefined }));
+    expect(render({ measureParagraph, createFloatWrapOracle } as typeof baseline),
+      `one-gap case ${index}: ${JSON.stringify({ words, obstacle })}`).toEqual(render(baseline));
+  }
+}, 60_000);
+
+// Review round 6 stress: a partition-dependent paragraph-wide allocation
+// (ruby, grid, exact/atLeast spacing, inline pictures) beside a tall tight
+// polygon and a stacked square. Cases 2485 and 4830 of this seeded generator
+// cycled before the monotone advance rule; the generator is replayed to reach them.
+it('converges partition-dependent allocations beside tall tight polygons', () => {
+  let seed = 1683610;
+  const random = (limit: number) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % limit;
+  };
+  for (let index = 0; index <= 4830; index += 1) {
+    const width = [200, 300, 500][random(3)]!;
+    const gap = [20, 40, 60, 80][random(4)]!;
+    const count = 20 + random(150);
+    const runs: DocParagraph['runs'] = Array.from({ length: count }, () =>
+      ({ type: 'text', ...textRun('word ', { fontSize: [8, 10, 12, 18, 24][random(5)] }) }));
+    if (index % 5 === 0) {
+      runs.splice(random(count), 0,
+        { type: 'image', imagePath: 'test', widthPt: 15, heightPt: 30 + random(80) } as { type: 'image' } & ImageRun);
+    }
+    const bottom = 60 + random(500);
+    const polygon = [{ xPt: gap, yPt: 0 }, { xPt: width - gap, yPt: 0 },
+      { xPt: width - gap - random(gap), yPt: bottom }, { xPt: gap + random(gap), yPt: bottom }];
+    const obstacles: FloatRect[] = [{ ...squareObstacle(gap, width - gap), authoredWrap: 'tight',
+      yBottom: bottom, imageH: bottom, wrapPolygon: polygon }];
+    if (index % 3 === 0) obstacles.push(stackedObstacle(random(width - 30), width - 10, 40, 200));
+    const context: { -readonly [K in keyof ParagraphLayoutContext]: ParagraphLayoutContext[K] } =
+      layoutContext({ spaceBeforePt: 0 });
+    let ruby = -1;
+    if (index % 7 === 0) {
+      context.hasRuby = true;
+      ruby = random(count);
+    }
+    if (index % 4 === 0) context.lineSpacing = { rule: 'exact', value: 12 };
+    if (index % 4 === 1) context.lineSpacing = { rule: 'atLeast', value: 12 };
+    if (index % 4 === 2) context.lineGrid = { active: true, pitchPt: 20 };
+    if (index !== 2485 && index !== 4830) continue;
+    if (ruby >= 0) {
+      const run = runs[ruby] as DocParagraph['runs'][number] & { ruby?: unknown };
+      run.ruby = { text: 'ルビ', fontSizePt: 6, fontFamily: null, bold: false, italic: false, hpsRaisePt: 4, align: 'center' };
+    }
+    const measured = measureParagraph(paragraph({ spaceBefore: 0, runs }), context,
+      placement({ startYPt: 0, availableWidthPt: width, maximumYPt: 700,
+        wrap: createFloatWrapOracle(obstacles, { xLeftPt: 0, xRightPt: width, readingDirection: 'ltr' }) }),
+      measurer, environment());
+    const physical = measured.lines.filter((line, position) => position === 0
+      || line.layout.physicalLineIndex !== measured.lines[position - 1]!.layout.physicalLineIndex);
+    for (let position = 1; position < physical.length; position += 1) {
+      expect(physical[position]!.topYPt + 1e-8)
+        .toBeGreaterThanOrEqual(physical[position - 1]!.topYPt + physical[position - 1]!.advancePt);
+    }
+  }
+});
