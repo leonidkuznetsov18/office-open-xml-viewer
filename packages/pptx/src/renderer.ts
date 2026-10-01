@@ -4327,7 +4327,9 @@ function renderStackedTextBody(
     drawObject: (style, x, y) => {
       const equation = style.math!;
       const render = mathRenders.get(equation.nodes);
-      if (!render) throw new Error('Stacked equations must be prepared before drawing');
+      // Match horizontal paint: optional/failed math stays a zero-size object,
+      // preserving its authored display boundary without ink or a warning.
+      if (!render) return;
       const height = equation.ascent + equation.descent;
       if (equation.width > 0 && height > 0) {
         ctx.drawImage(tintedMathImage(render, style.color), x, y, equation.width, height);

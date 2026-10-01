@@ -1,12 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { rasterizeMathSvg } from '@silurus/ooxml-core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { drawShapeText, renderViewport, prepareWorksheetMath } from './renderer.js';
 import type { ShapeText, Styles, Worksheet } from './types.js';
 
 vi.mock('@silurus/ooxml-core', async (load) => ({
   ...await load<typeof import('@silurus/ooxml-core')>(),
-  rasterizeMathSvg: async () => ({ source: {} }),
+  rasterizeMathSvg: vi.fn(async () => ({ source: {} })),
   tintMathRaster: () => ({}),
 }));
+
+afterEach(() => vi.restoreAllMocks());
 
 function record() {
   const calls: { text: string; x: number; y: number; angle: number }[] = [];
@@ -115,4 +118,47 @@ it.each(['wordArtVert', 'wordArtVertRtl'])('%s retains an upright equation betwe
   expect(images[0]).toMatchObject({ w: 72, h: 48, angle: 0 });
   expect(images[0].x + 36).toBeCloseTo(calls[0].x);
   expect(calls[1].y - calls[0].y).toBeCloseTo(images[0].y + 48);
+});
+
+// Optional engines and resource failures follow the horizontal host contract,
+// including display equations and the absence of console warnings.
+it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation failure treatment in both stacked modes', async (failure) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
+  try {
+    for (const display of [false, true]) {
+      const outcomes = [];
+      for (const vert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
+        warn.mockClear(); error.mockClear();
+        const equation = { type: 'math' as const, nodes: [{ kind: 'run' as const, text: 'x', style: 'italic' as const }], display, fontSize: 18 };
+        const engine = {
+          loadMathJax: async () => {},
+          mathMLToSvg: async () => {
+            if (failure === 'conversion') throw new Error('conversion failed');
+            return { svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 };
+          },
+        };
+        const b = body(vert);
+        const text = b.paragraphs[0].runs[0] as Extract<import('./types.js').ShapeTextRun, { type: 'text' }>;
+        b.paragraphs[0].runs = [{ ...text, text: 'A' }, equation, { ...text, text: 'B' }];
+        if (failure !== 'no engine') {
+          await prepareWorksheetMath({ shapeGroups: [{ shapes: [{ text: b }] }] } as unknown as Worksheet, engine);
+        }
+        const { ctx, calls, images } = record();
+        drawShapeText(ctx, b, 300, 300, 1);
+        // Skipped display math must not introduce a break or reserve a cell.
+        const control = record();
+        drawShapeText(control.ctx, { ...b, paragraphs: [{ ...b.paragraphs[0], runs: b.paragraphs[0].runs.filter((r) => r.type !== 'math') }] }, 300, 300, 1);
+        expect(calls).toEqual(control.calls);
+        const outcome = { text: calls.map((c) => c.text).join(''), images: images.length,
+          warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
+        expect(outcome).toEqual({ text: 'AB', images: 0, warnings: [], errors: [] });
+        outcomes.push(outcome);
+      }
+      expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);
+    }
+  } finally {
+    vi.mocked(rasterizeMathSvg).mockResolvedValue({ source: {} as CanvasImageSource, widthPx: 3, heightPx: 2 });
+  }
 });

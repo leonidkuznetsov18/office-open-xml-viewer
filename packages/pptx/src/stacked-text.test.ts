@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { rasterizeMathSvg } from '@silurus/ooxml-core';
 import type { HyperlinkTarget } from '@silurus/ooxml-core';
 import { layoutParagraph, prepareSlideMath, renderTextBody, shapeTextRotation, type PptxTextRunInfo } from './renderer.js';
 import { buildPptxTextLayer } from './text-layer.js';
@@ -6,7 +7,7 @@ import type { Paragraph, TextBody, TextRunData } from './types.js';
 
 vi.mock('@silurus/ooxml-core', async (load) => ({
   ...await load<typeof import('@silurus/ooxml-core')>(),
-  rasterizeMathSvg: async () => ({ source: {} }),
+  rasterizeMathSvg: vi.fn(async () => ({ source: {} })),
   tintMathRaster: () => ({}),
 }));
 
@@ -82,7 +83,7 @@ function fakeEl(): FakeEl {
   };
   return el;
 }
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 // Arial 24 pt: cell 7/6 × 1.1172 em × 24 = 31.28, descent 0.2119 em.
 const CELL = (7 / 6) * (2288 / 2048) * 24;
@@ -242,4 +243,43 @@ it.each(['wordArtVert', 'wordArtVertRtl'])('%s paints an atomic upright equation
   expect(images[0].x + 36).toBeCloseTo(calls[0].x);
   expect(images[0].y).toBeCloseTo(3.6 + CELL);
   expect(calls[1].y - calls[0].y).toBeCloseTo(CELL + 48);
+});
+
+// Optional engines and resource failures follow the horizontal host contract,
+// including display equations and the absence of console warnings.
+it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal equation failure treatment in both stacked modes', async (failure) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
+  try {
+    for (const display of [false, true]) {
+      const outcomes = [];
+      for (const vert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
+        warn.mockClear(); error.mockClear();
+        const equation = { type: 'math' as const, nodes: [{ kind: 'run' as const, text: 'x', style: 'italic' as const }], display, fontSize: 18 };
+        const engine = {
+          loadMathJax: async () => {},
+          mathMLToSvg: async () => {
+            if (failure === 'conversion') throw new Error('conversion failed');
+            return { svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 };
+          },
+        };
+        const b = body('A', vert);
+        const text = b.paragraphs[0].runs[0] as TextRunData;
+        b.paragraphs[0].runs = [text, equation, { ...text, text: 'B' }];
+        if (failure !== 'no engine') {
+          await prepareSlideMath({ elements: [{ type: 'shape', textBody: b }] } as unknown as import('./types.js').Slide, engine);
+        }
+        const { ctx, calls, images } = mockCtx();
+        renderTextBody(ctx, b, 0, 0, 300, 300, SCALE);
+        const outcome = { text: calls.map((c) => c.text).join(''), images: images.length,
+          warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
+        expect(outcome).toEqual({ text: 'AB', images: 0, warnings: [], errors: [] });
+        outcomes.push(outcome);
+      }
+      expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);
+    }
+  } finally {
+    vi.mocked(rasterizeMathSvg).mockResolvedValue({ source: {} as CanvasImageSource, widthPx: 3, heightPx: 2 });
+  }
 });

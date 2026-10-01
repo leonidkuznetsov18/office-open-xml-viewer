@@ -2,7 +2,19 @@ import { layoutDocument } from './document-layout.js';
 import { normalizeInternalDocumentModel } from './parser-model.js';
 import { createLayoutServices } from './layout-runtime.js';
 import { paintTextBoxLayout } from './paint/canvas-text.js';
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { rasterizeMathSvg } from '@silurus/ooxml-core';
+import { createPaintResourceRegistry } from './layout/paint-resources.js';
+import { createPaintResourceSession, unavailablePaintResourceHandle } from './paint/resource-session.js';
+import { createCanvasPaintResourcePainter } from './paint/canvas-page.js';
+import { canonicalCanvasPaintResourceHandlers } from './paint/canonical-resource-handlers.js';
+import { prepareMathResources } from './paint/math-resources.js';
+
+vi.mock('@silurus/ooxml-core', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core')>(),
+  rasterizeMathSvg: vi.fn(async () => ({ source: {} })),
+}));
+afterEach(() => vi.restoreAllMocks());
 import {
   acquireAndPaintShapeTextBox,
   acquireShapeTextBoxForTest,
@@ -741,4 +753,64 @@ it.each(['wordArtVert', 'wordArtVertRtl'])('%s retains a complete upright OMML o
   expect(norm(images[0].angleDeg)).toBeCloseTo(0);
   expect(images[0].devY - glyphs[0].devY).toBeCloseTo(10);
   expect(glyphs[1].devY - glyphs[0].devY).toBeCloseTo(30);
+});
+
+// Word keeps the same unavailable-resource treatment and diagnostic in all
+// body directions when the optional engine is absent or its output fails.
+it.each(['no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal math fallback and diagnostics in both stacked modes', async (failure) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
+  try {
+    for (const display of [false, true]) {
+      const outcomes = [];
+      for (const textVert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
+        warn.mockClear(); error.mockClear();
+        const { ctx, glyphs, images } = makeMatrixCtx();
+        const text = (value: string) => ({ type: 'text', text: value, fontSize: 10, fontFamily: 'NotInMetrics',
+          bold: false, italic: false, underline: false, strikethrough: false });
+        const paraProps = { alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+          spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [] };
+        const shape = { ...richTextbox([], textVert), widthPt: 200, heightPt: 100,
+          textBoxContent: [{ type: 'paragraph', ...paraProps, runs: [text('A'),
+            { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'italic' }], display, fontSize: 10 }, text('B')] }] };
+        const normalized = normalizeInternalDocumentModel({
+          section: { pageWidth: 300, pageHeight: 200, marginTop: 0, marginRight: 0, marginBottom: 0,
+            marginLeft: 0, headerDistance: 0, footerDistance: 0, titlePage: false, evenAndOddHeaders: false },
+          body: [{ type: 'paragraph', ...paraProps, runs: [shape] }],
+          headers: { default: null, first: null, even: null }, footers: { default: null, first: null, even: null },
+          fontFamilyClasses: {},
+        } as unknown as import('./types.js').DocxDocumentModel);
+        const prepared = failure === 'no engine' ? undefined : await prepareMathResources(normalized.mathOccurrences, {
+          loadMathJax: async () => {},
+          mathMLToSvg: async () => {
+            if (failure === 'conversion') throw new Error('conversion failed');
+            return { svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 };
+          },
+        });
+        const services = createLayoutServices(normalized.document, { measureContext: ctx,
+          mathResources: prepared?.records, mathDrawables: prepared?.drawables });
+        const layout = layoutDocument(normalized.document, services, { currentDateMs: 0 });
+        const paragraph = layout.pages[0].layers.body.find((node) => node.kind === 'paragraph');
+        if (!paragraph || paragraph.kind !== 'paragraph') throw new Error('expected body paragraph');
+        const registry = createPaintResourceRegistry(normalized.mathOccurrences.map(({ resourceKey }) => ({ kind: 'math', resourceKey })));
+        const session = createPaintResourceSession(registry, normalized.mathOccurrences.map(({ resourceKey }) => ({
+          kind: 'math', resourceKey, handle: unavailablePaintResourceHandle('optional or failed math'),
+        })));
+        paintTextBoxLayout(paragraph.textBoxes[0]!, { ctx, scale: 1, dpr: 1, resources:
+          createCanvasPaintResourcePainter(session, canonicalCanvasPaintResourceHandlers) });
+        const diagnostics = services.math.resolve(normalized.mathOccurrences[0].resourceKey).diagnostics;
+        const outcome = { text: glyphs.map((g) => g.text).join(''), images: images.length,
+          diagnostics, warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
+        expect(outcome).toEqual({ text: 'AB', images: 0, diagnostics: [{ code: 'UNSUPPORTED_FEATURE', severity: 'warning',
+          message: failure === 'no engine'
+            ? 'The optional math renderer is unavailable; using the deterministic text fallback'
+            : 'Math conversion failed; using the deterministic text fallback' }], warnings: [], errors: [] });
+        outcomes.push(outcome);
+      }
+      expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);
+    }
+  } finally {
+    vi.mocked(rasterizeMathSvg).mockResolvedValue({ source: {} as CanvasImageSource, widthPx: 3, heightPx: 2 });
+  }
 });

@@ -4843,7 +4843,9 @@ export function drawShapeText(
       return { ...textFont({ ...run, text, fontFace: face }, fontScale), face };
     }, (run, precedingSizePt) => {
       const render = mathRenders.get(run.nodes);
-      if (!render) throw new Error('Stacked equations must be prepared before drawing');
+      // Match horizontal input: optional/failed equations contribute neither
+      // ink nor a display break; preparation deliberately leaves them uncached.
+      if (!render) return undefined;
       const pxSize = (run.fontSize ?? precedingSizePt) * PT_TO_PX * cs * fontScale;
       const width = render.widthEm * pxSize;
       const height = (render.ascentEm + render.descentEm) * pxSize;

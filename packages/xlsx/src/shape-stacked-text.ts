@@ -38,7 +38,7 @@ export function drawShapeStackedText(
   rect: DrawingMlTextRect,
   pxPerPt: number,
   resolveFont: (run: TextRun, text: string) => { font: string; px: number; face?: string },
-  equation: (run: Extract<ShapeTextRun, { type: 'math' }>, precedingSizePt: number) => StackedEquation,
+  equation: (run: Extract<ShapeTextRun, { type: 'math' }>, precedingSizePt: number) => StackedEquation | undefined,
 ): void {
   const measure = (text: string, style: Style): Glyph[] => {
     ctx.font = style.font;
@@ -76,6 +76,7 @@ export function drawShapeStackedText(
       if (run.type === 'break') { runs.push({ type: 'break' }); continue; }
       if (run.type === 'math') {
         const object = equation(run, precedingSizePt);
+        if (!object) continue; // Same skip contract as horizontal shape text.
         const style: Style = { font: '', px: 0, color: run.color ?? '#000000',
           spacing: 0, bold: false, italic: false, equation: object };
         runs.push({ type: 'object', width: object.height, style, display: run.display });
