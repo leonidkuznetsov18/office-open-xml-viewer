@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
 import type { FloatRect } from './float-layout.js';
+import { polygonMeetsRect } from './layout/float-wrap.js';
 import {
   createFloatWrapOracle,
   measureParagraph,
@@ -1121,3 +1122,320 @@ describe('ruby physical-line allocation', () => {
     }
   });
 });
+
+function squareObstacle(left: number, right: number): FloatRect {
+  return { kind: 'shape', mode: 'square', authoredWrap: 'square', imageKey: 'test',
+    imageX: left, imageY: 0, imageW: right - left, imageH: 60,
+    xLeft: left, xRight: right, yTop: 0, yBottom: 60, side: 'bothSides',
+    distLeft: 0, distRight: 0, distTop: 0, distBottom: 0, paraId: 0 };
+}
+
+// Word controls longword-both-40 (#1670, modes 14/15): a word that fits no
+// side gap moves below the object instead of an emergency split in the gap.
+// A URL syntax opportunity is a legal break; this value has none that fits.
+it.each(['text', 'hyperlink', 'field'] as const)('moves an unsplittable %s word below a sole float gap', (kind) => {
+  const value = 'https://example.test/a-b/c';
+  const run: DocParagraph['runs'][number] = kind === 'field'
+    ? { type: 'field', ...textRun(''), fieldType: 'unknown', instruction: '', fallbackText: value }
+    : { type: 'text', ...textRun(value, kind === 'hyperlink' ? { hyperlink: value } : {}) };
+  const measured = measureParagraph(paragraph({ runs: [
+    { type: 'text', ...textRun('ABC ') }, run,
+  ] }), layoutContext({ spaceBeforePt: 0 }),
+  placement({ startYPt: 0, wrap: createFloatWrapOracle([squareObstacle(0, 97)]) }), measurer, environment());
+  expect(measured.lines.map(({ layout, topYPt }) => ({
+    top: topYPt, left: layout.xOffset,
+    text: layout.segments.map(segment => 'text' in segment ? segment.text : '').join(''),
+  }))).toEqual([
+    { top: 0, left: 97, text: 'ABC ' },
+    { top: 60, left: 0, text: value },
+  ]);
+});
+
+it('admits the complete fitText region with internal spaces beside a square float', () => {
+  const doc = paragraph({ spaceBefore: 0, runs: [
+    { type: 'text', ...textRun('AA BB', { fitTextVal: 1600, fitTextId: 1 }) },
+  ] });
+  const measured = measureParagraph(doc, layoutContext({ spaceBeforePt: 0 }),
+    placement({ startYPt: 0, wrap: createFloatWrapOracle([squareObstacle(40, 100)]) }),
+    measurer, environment());
+  expect(measured.lines[0].layout.xOffset).toBe(100);
+  expect(measured.lines[0].layout.availWidth).toBe(100);
+  expect(measured.lines[0].layout.segments.reduce((width, segment) => width + segment.measuredWidth, 0)).toBe(80);
+});
+
+// ── WORD_FLOAT_GAP_FLOW model (#1670) ────────────────────────────────────
+// Gaps of a physical line are candidates in reading order. A gap is admitted
+// iff ordinary placement puts its head unit there without a forced break or
+// overflow; otherwise the fragment rolls back and the next gap (or line) is
+// tried. These reviewer and continuation repros pin the model directly.
+
+function tightObstacle(left: number, right: number): FloatRect {
+  const points = [
+    { xPt: left, yPt: 0 }, { xPt: right, yPt: 0 }, { xPt: (left + right) / 2, yPt: 60 },
+  ];
+  return { ...squareObstacle(left, right), authoredWrap: 'tight', wrapPolygon: points };
+}
+
+/** Production supplies the paragraph's reading order to the oracle. */
+const gapReference = (rtl: boolean) =>
+  ({ xLeftPt: 0, xRightPt: 200, readingDirection: rtl ? 'rtl' : 'ltr' } as const);
+
+function gapLines(runs: DocParagraph['runs'], obstacle: FloatRect, rtl = false) {
+  return measureParagraph(paragraph({ runs }), layoutContext({ spaceBeforePt: 0, baseRtl: rtl }),
+    placement({ startYPt: 0, wrap: createFloatWrapOracle([obstacle], gapReference(rtl)) }), measurer, environment())
+    .lines.map(({ topYPt, layout }) => ({
+      top: topYPt, left: layout.xOffset, width: layout.availWidth,
+      text: layout.segments.map((segment) => 'text' in segment ? segment.text : '').join(''),
+      advance: layout.segments.reduce((sum, segment) => sum + segment.measuredWidth, 0),
+    }));
+}
+
+describe('float gap admission by placement', () => {
+  it('starts in the first gap in reading order that admits the head unit', () => {
+    // Main chose the widest gap (x=101); Word fills gaps left to right.
+    expect(gapLines([{ type: 'text', ...textRun('A') }], squareObstacle(87, 101)))
+      .toEqual([{ top: 0, left: 0, width: 87, text: 'A', advance: 5 }]);
+  });
+
+  it('measures a word joined across runs as one unit at the gap head', () => {
+    // "NEXT" + "AA BB": the 30pt word NEXTAA misses the 24pt gap, fits the 35pt one.
+    const lines = gapLines([
+      { type: 'text', ...textRun('NEXT') }, { type: 'text', ...textRun('AA BB') },
+    ], squareObstacle(24, 165));
+    expect(lines[0]).toMatchObject({ top: 0, left: 165, text: 'NEXTAA ' });
+    for (const line of lines) {
+      expect(line.advance - (line.text.length - line.text.trimEnd().length) * 5)
+        .toBeLessThanOrEqual(line.width);
+    }
+  });
+
+  it('admits a fitText region only where its complete cell fits', () => {
+    const lines = gapLines([
+      { type: 'text', ...textRun('AA BB', { fitTextVal: 1600, fitTextId: 1 }) },
+    ], squareObstacle(40, 100));
+    expect(lines[0]).toMatchObject({ top: 0, left: 100, width: 100, advance: 80 });
+  });
+
+  it('fills successive gaps of one baseline before opening the next line', () => {
+    const lines = gapLines([{ type: 'text', ...textRun('P008 [red] one two three') }],
+      squareObstacle(40, 110));
+    expect(lines.slice(0, 2)).toEqual([
+      expect.objectContaining({ top: 0, left: 0, text: 'P008 ' }),
+      expect.objectContaining({ top: 0, left: 110 }),
+    ]);
+  });
+
+  it('rejects every narrower gap of a many-gap baseline with bounded work', () => {
+    // Nine 10pt exclusions leave ten 10pt gaps; each 30pt word fits none.
+    const obstacles = Array.from({ length: 9 }, (_, index) => squareObstacle(10 + index * 20, 20 + index * 20));
+    const measured = measureParagraph(paragraph({ runs: [{ type: 'text', ...textRun('AAAAAA BBBBBB') }] }),
+      layoutContext({ spaceBeforePt: 0 }),
+      placement({ startYPt: 0, wrap: createFloatWrapOracle(obstacles) }), measurer, environment());
+    expect(measured.lines.map(({ topYPt, layout }) => [topYPt, layout.xOffset, layout.availWidth]))
+      .toEqual([[60, 0, 200]]);
+  });
+
+  it('fills gaps right to left in an RTL paragraph', () => {
+    const lines = gapLines([{ type: 'text', ...textRun('אב גד הו זח טי כל', { rtl: true }) }],
+      squareObstacle(60, 120), true);
+    expect(lines[0]!.left).toBe(120);
+    expect(lines[1]).toMatchObject({ top: 0, left: 0 });
+  });
+});
+
+// Fixed seed keeps boundary failures reproducible without storing generated fixtures.
+// Each construct also occurs after another cell, exercising flush/resume admission.
+function atomicFloatPropertyCases() {
+  let seed = 0x16831670;
+  const random = (limit: number) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % limit;
+  };
+  const text = (value: string, options: Partial<DocxTextRun> = {}): DocParagraph['runs'][number] =>
+    ({ type: 'text', ...textRun(value, options) });
+  const constructs: Array<() => DocParagraph['runs']> = [
+    () => [text('AA BB ', { fitTextVal: 400 + random(1600), fitTextId: 1 })],
+    () => [text('AA', { fitTextVal: 800, fitTextId: 7 }), text('漢 字', { fitTextVal: 1600, fitTextId: 8 })],
+    () => [text('AA ', { fitTextVal: 1600, fitTextId: 2 }), text('BB', { fitTextVal: 1600, fitTextId: 2, bold: true })],
+    () => [text('漢字', { ruby: { text: 'かんじ', fontSizePt: 5 } })],
+    () => [text('12', { eastAsianVert: true })],
+    () => [text('合成文字', { eastAsianCombine: true })],
+    () => [{ type: 'field', ...textRun(''), fieldType: 'unknown', instruction: 'EQ \\o(A,B)', fallbackText: 'AA BB' } as { type: 'field' } & FieldRun],
+    () => [text('https://example.test/a-b/c', { hyperlink: 'https://example.test/a-b/c' })],
+    () => [text('AA BB')],
+    () => [text('AA‑BB')],
+    () => [text('漢（字）文。')],
+    () => [text('漢（'), text('字）文。')],
+    () => [text('AA\tBB', { fitTextVal: 1000, fitTextId: 3 })],
+    () => [text('AA\tBB CC')],
+    () => [text('NEXT'), text('AA BB')],
+    () => [text('ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGH ')],
+    () => [text('אב גד', { rtl: true, fitTextVal: 1200, fitTextId: 4 })],
+    () => [text('אבג דהו זחט', { rtl: true })],
+    () => [{ type: 'image', imagePath: 'test', mimeType: 'image/png', widthPt: 10 + random(80), heightPt: 10 } as { type: 'image' } & ImageRun],
+  ];
+  return Array.from({ length: 304 }, (_, index) => {
+    const rtl = random(2) === 1;
+    const runs = [text('ABC '), ...constructs[index % constructs.length]!(), text(' NEXT'),
+      ...constructs[random(constructs.length)]!()];
+    const left = 5 + random(120);
+    const right = left + 5 + random(195 - left);
+    const float = random(3) === 0 ? tightObstacle(left, right) : squareObstacle(left, right);
+    return { runs, rtl, float };
+  });
+}
+
+interface PlacedLine {
+  readonly top: number;
+  readonly left: number;
+  readonly width: number;
+  readonly physical: number | undefined;
+  readonly segments: readonly Readonly<{ text: string | null; width: number; visible: number }>[];
+}
+
+function placedGeometry(measured: ReturnType<typeof measureParagraph>): PlacedLine[] {
+  return measured.lines.map(({ layout: line, topYPt }) => ({
+    top: topYPt, left: line.xOffset, width: line.availWidth, physical: line.physicalLineIndex,
+    segments: line.segments.map((segment) => {
+      const isText = 'text' in segment;
+      const fixed = isText && segment.fitTextRegionIndex !== undefined;
+      // Collapsible line-end whitespace carries no ink; tabs are pen moves.
+      const trailing = isText && !fixed
+        ? [...segment.text].length - [...segment.text.replace(/[ 　]+$/u, '')].length : 0;
+      const visible = 'isTab' in segment ? 0
+        : segment.measuredWidth - (isText ? trailing * segment.fontSize * 0.5 : 0);
+      return { text: isText ? segment.text : null, width: segment.measuredWidth, visible };
+    }),
+  }));
+}
+
+/** Every visible advance stays inside the paragraph band and outside the
+ * exclusion, tested on the line band the solver probed. */
+function bandViolation(lines: readonly PlacedLine[], obstacle: FloatRect, rtl: boolean): string | null {
+  const tops = [...new Set(lines.map((line) => line.top))].sort((a, b) => a - b);
+  for (const line of lines) {
+    const index = tops.indexOf(line.top);
+    const height = index + 1 < tops.length ? tops[index + 1]! - line.top : 10;
+    const total = line.segments.reduce((sum, segment) => sum + segment.width, 0);
+    let pen = line.left + (rtl ? line.width - total : 0);
+    for (const segment of line.segments) {
+      const start = pen;
+      const end = pen + segment.visible;
+      pen += segment.width;
+      if (!(segment.visible > 1e-9)) continue;
+      // The full paragraph band keeps its established edge rules (§17.3.1.21
+      // hanging punctuation, units wider than the column); a narrowed gap
+      // owns its complete ink.
+      const narrowed = line.width < 200 - 1e-9;
+      if (start < -1e-9 || (narrowed && end > 200 + 1e-9)) return `band ${JSON.stringify(line)}`;
+      const meets = obstacle.wrapPolygon
+        ? polygonMeetsRect(obstacle.wrapPolygon, line.top, height, start + 1e-9, end - 1e-9)
+        : line.top < obstacle.yBottom && end > obstacle.xLeft + 1e-9 && start < obstacle.xRight - 1e-9;
+      if (meets) return `exclusion ${JSON.stringify(line)}`;
+    }
+  }
+  return null;
+}
+
+/** One physical line presents as one line: shared top, disjoint fragments in
+ * reading order, and strictly increasing physical tops. */
+function physicalViolation(lines: readonly PlacedLine[], rtl: boolean): string | null {
+  for (let index = 1; index < lines.length; index += 1) {
+    const previous = lines[index - 1]!;
+    const line = lines[index]!;
+    if (line.physical === previous.physical) {
+      if (line.top !== previous.top) return `split physical line ${index}`;
+      const ordered = rtl ? line.left + line.width <= previous.left + 1e-9
+        : line.left >= previous.left + previous.width - 1e-9;
+      if (!ordered) return `fragment order ${index}`;
+    } else if (!(line.top > previous.top)) {
+      return `physical tops ${index}`;
+    }
+  }
+  return null;
+}
+
+it('keeps randomized content outside square and tight floats as physical lines', () => {
+  for (const [index, item] of atomicFloatPropertyCases().entries()) {
+    const measured = measureParagraph(paragraph({ runs: item.runs }),
+      layoutContext({ spaceBeforePt: 0, baseRtl: item.rtl }),
+      placement({ startYPt: 0, wrap: createFloatWrapOracle([item.float], gapReference(item.rtl)) }),
+      measurer, environment());
+    const lines = placedGeometry(measured);
+    const label = `case ${index}: ${JSON.stringify(item)}`;
+    expect(bandViolation(lines, item.float, item.rtl), label).toBeNull();
+    expect(physicalViolation(lines, item.rtl), label).toBeNull();
+  }
+});
+
+/** Classify the first difference from main using the model, never input IDs.
+ * (a) main's own geometry leaves the band or meets the exclusion;
+ * (b) the differing line exhibits a WORD_FLOAT_GAP_FLOW observation that
+ *     main's widest-gap/one-inch/emergency rule contradicts. */
+function classifyDifference(
+  candidate: readonly PlacedLine[], previous: readonly PlacedLine[], obstacle: FloatRect, rtl: boolean,
+): 'equal' | 'mainDefect' | 'gapOrder' | 'subInch' | 'continuation' | 'noGapEmergency' | null {
+  const key = (line: PlacedLine) => JSON.stringify({ ...line, physical: undefined });
+  const first = candidate.findIndex((line, index) =>
+    previous[index] === undefined || key(line) !== key(previous[index]!));
+  if (first < 0 && candidate.length === previous.length) return 'equal';
+  if (bandViolation(previous, obstacle, rtl) !== null) return 'mainDefect';
+  const index = first < 0 ? candidate.length : first;
+  const changed = candidate[index];
+  const old = previous[index];
+  const narrowed = (line: PlacedLine | undefined) =>
+    line !== undefined && line.top < obstacle.yBottom && line.width < 200 - 1e-9;
+  const textOf = (line: PlacedLine | undefined) =>
+    line?.segments.map((segment) => segment.text ?? '').join('') ?? '';
+  // Main broke a word inside a narrowed gap at a non-opportunity; Word moves
+  // that word below the object (controls longword-both-40).
+  const isWordCharacter = (character: string | undefined) =>
+    character !== undefined && /[\p{L}\p{N}:/.\-]/u.test(character)
+      && !/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(character);
+  if (narrowed(old) && isWordCharacter([...textOf(old)].at(-1))
+    && isWordCharacter([...textOf(previous[index + 1])][0])) return 'noGapEmergency';
+  if (!narrowed(changed)) return null;
+  if (candidate.filter((line) => line.top === changed!.top).length > 1) return 'continuation';
+  if (old && old.top === changed!.top
+    && (rtl ? changed!.left + changed!.width > old.left + old.width : changed!.left < old.left)) {
+    return 'gapOrder';
+  }
+  if (changed!.width < 72 && (!old || old.top > changed!.top || old.left !== changed!.left)) return 'subInch';
+  return null;
+}
+
+// Run with VRT_BASELINE_CHECKOUT naming the detached latest-main checkout.
+// Ordinary unit runs retain the containment property; revision parity needs
+// both production implementations and therefore explicitly skips without it.
+const parityBaseline = process.env.VRT_BASELINE_CHECKOUT;
+it.skipIf(!parityBaseline)('classifies every float gap geometry difference from main', async () => {
+  const baseline = await import(`${parityBaseline}/packages/docx/src/paragraph-measure.ts`) as
+    typeof import('./paragraph-measure.js');
+  const counts: Record<string, number> = {};
+  for (const [index, item] of atomicFloatPropertyCases().entries()) {
+    // Interior exclusions exercise multiple gaps; edge exclusions exercise sole
+    // gaps on either side, including the historical one-inch admission boundary.
+    const obstacles = item.float.wrapPolygon ? [item.float] : [item.float,
+      squareObstacle(0, item.float.xRight), squareObstacle(item.float.xLeft, 200)];
+    for (const obstacle of obstacles) {
+      const doc = paragraph({ runs: item.runs });
+      const context = layoutContext({ spaceBeforePt: 0, baseRtl: item.rtl });
+      const render = (api: typeof baseline) => placedGeometry(api.measureParagraph(doc, context,
+        placement({ startYPt: 0, wrap: api.createFloatWrapOracle([obstacle], gapReference(item.rtl)) }),
+        measurer, environment()));
+      const candidate = render({ measureParagraph, createFloatWrapOracle } as typeof baseline);
+      const previous = render(baseline);
+      const label = `case ${index}, obstacle ${obstacle.xLeft}..${obstacle.xRight}`;
+      expect(bandViolation(candidate, obstacle, item.rtl), `${label} ${JSON.stringify({ runs: item.runs.map((run) => 'text' in run ? run.text : run.type), rtl: item.rtl, candidate })}`).toBeNull();
+      const kind = classifyDifference(candidate, previous, obstacle, item.rtl);
+      expect(kind, `${label}: unclassified diff: ${JSON.stringify({ runs: item.runs, rtl: item.rtl, candidate, previous })}`)
+        .not.toBeNull();
+      counts[kind!] = (counts[kind!] ?? 0) + 1;
+    }
+  }
+  // Non-vacuity: the corpus exercises parity and the authorized differences.
+  expect(counts.equal).toBeGreaterThan(0);
+  expect(counts.mainDefect).toBeGreaterThan(0);
+  expect((counts.gapOrder ?? 0) + (counts.continuation ?? 0) + (counts.subInch ?? 0)).toBeGreaterThan(0);
+  console.info('Float gap parity classifications:', counts);
+}, 60_000);

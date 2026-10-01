@@ -1,7 +1,6 @@
 import { LineMeasurementAdapter } from './measurement-adapter.js';
-import { graphemeClusterOffsets } from '@silurus/ooxml-core';
+import { graphemeClusterOffsets, kinsokuAdjustedSplit } from '@silurus/ooxml-core';
 import {
-  MIN_LINE_GAP,
   prepareFloatWrap,
   computePreparedLineFloatWindow,
   type PreparedFloatWrap,
@@ -19,7 +18,7 @@ import {
   type LayoutTextSeg,
   type LineBoundary,
 } from './model.js';
-import { createLineBreakerState } from './break-queue.js';
+import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -32,6 +31,7 @@ import {
   charSpacingDeltaPx,
   protectedNoBreakOffsets,
   hardJoinPrefixEnd,
+  legalTextSplitAtOrBefore,
   segAdvanceWidth,
   segmentCharacterGridDeltaPx,
   slicedPunctuationCompressions,
@@ -60,9 +60,13 @@ export interface PassOperationState extends LineBreakerPassInput {
   readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
   readonly materializeLatinSpaceCompression: () => void;
   readonly snapPitchPx: number | null;
-  readonly minLineStartWidth: (boundary?: LineBoundary) => number;
-  readonly isParagraphMarkOnlyFlow: boolean;
-  readonly startLine: (minWidth?: number) => void;
+  readonly lineHeadRequirement: (boundary?: LineBoundary) => number;
+  readonly startLine: (requirement?: number) => void;
+  /** Report a forced placement of the unit starting at `unitStart` in the
+   * current line; throws LineGapRejection inside a narrowed float gap. */
+  readonly forcedPlacement: (requiredWidth: number, unitStart?: number) => void;
+  /** Smallest legal line-head advance of a text segment under placement rules. */
+  readonly minimalLegalTextWidth: (segment: LayoutTextSeg) => number;
   readonly availW: () => number;
   readonly fitsMeasuredWidth: (used: number, available: number) => boolean;
   readonly bidiCustomStopsPx: {
@@ -166,71 +170,94 @@ export function performMaterializeLatinSpaceCompression(operationState: PassOper
   breakerState.latinAppliedPerGap = 0;
 }
 
-/** ECMA-376 §20.4.2.17–.19 permits wrap gaps. WORD_FLOAT_GAP_FLOW
- * admits the next atomic word (CJK/SEA legal prefix), including sub-inch gaps.
- * Emergency splitting remains available once the full paragraph band is free. */
-export function performMinimumLineStartWidth(
+/**
+ * WORD_FLOAT_GAP_FLOW (#1670): one physical line may be split into fragments,
+ * one per free gap, filled in reading order. ECMA-376 §20.4.2.17–.19 permits
+ * text on both sides of a square/tight/through object but does not say how a
+ * line is partitioned. The registered rule selects the first gap in reading
+ * order whose width admits the content placed there, then continues into
+ * later gaps on the same baseline.
+ *
+ * Admission is a placement transaction, not a separate width predictor. A
+ * fragment narrowed by an exclusion is filled by ordinary placement. If any
+ * placement path would force content into it (an emergency split, an illegal
+ * kinsoku split, or an advance past the fragment edge), the fragment rolls
+ * back to its first placement and the search continues with a requirement
+ * strictly larger than the rejected gap. A full paragraph band (no exclusion
+ * narrows it) keeps the established forced-placement behavior, so progress is
+ * guaranteed once a unit fits no narrowed gap.
+ */
+export class LineGapRejection extends Error {
+  constructor(
+    /** Lower bound of the forced unit's advance, from placement's own measurement. */
+    readonly requiredWidth: number,
+    /** Complete units precede the forced unit: end the fragment before it. */
+    readonly stopBefore?: LineBoundary,
+  ) {
+    super('A narrowed float gap cannot admit the line-head unit');
+    this.name = 'LineGapRejection';
+  }
+}
+
+/** Seed requirement for a line head. Content needs no more than the solver's
+ * numeric floor: placement decides admission. A mark-only head (no inline
+ * content remains) keeps `word-empty-mark-float-side-gap`. */
+export function performLineHeadRequirement(
   operationState: PassOperationState,
   boundary?: LineBoundary,
 ): number {
-  const { wrapCtx, segs, breakerState, scale, kinsoku, strAdvance, maxWidth } = operationState;
-  if (!wrapCtx || wrapCtx.hasExclusions === false
-    || (!wrapCtx.lineWindow && wrapCtx.floats.length === 0)) return 0;
+  const { wrapCtx, segs, breakerState, scale } = operationState;
+  if (!wrapCtx) return 0;
   const candidates = boundary ? segs : breakerState.queue;
   const start = boundary?.segIndex ?? 0;
-  let segment = candidates[start];
-  let selectedIndex = start;
+  let mark: LayoutTextSeg | undefined;
   for (let index = start; index < candidates.length; index += 1) {
     const candidate = candidates[index];
     if (('text' in candidate && !candidate.metricOnly && candidate.text.length > 0)
       || ('imagePath' in candidate && !candidate.anchor) || 'math' in candidate
-      || 'isTab' in candidate || 'lineBreak' in candidate) {
-      segment = candidate;
-      selectedIndex = index;
-      break;
+      || 'isTab' in candidate || 'lineBreak' in candidate) return 0;
+    if ('text' in candidate && candidate.metricOnly) mark ??= candidate;
+  }
+  if (start >= candidates.length) return 0;
+  return wrapCtx.paragraphMarkLineStartWidth ?? (mark ? mark.fontSize * scale : 0);
+}
+
+/** Smallest prefix placement may legally put at a line head: the first SEA
+ * boundary, the first CJK split legal under kinsoku and protected ranges, the
+ * first URL syntax opportunity, a hard seam's protected prefix, else the whole
+ * segment (segments are already delimited at ordinary opportunities). Used
+ * only as the lower bound reported when a narrowed gap rejects its head. */
+export function performMinimalLegalTextWidth(
+  operationState: PassOperationState,
+  segment: LayoutTextSeg,
+): number {
+  const { kinsoku, strAdvance, baseRtl } = operationState;
+  const text = segment.text;
+  let end = text.length;
+  if (segment.fitTextRegionIndex === undefined && !segment.ruby && !segment.tateChuYoko) {
+    const protectedOffsets = protectedNoBreakOffsets(segment);
+    if (segment.hardJoinPrev === true) {
+      end = hardJoinPrefixEnd(segment) ?? text.length;
+    } else if (segment.seaBreaks !== undefined) {
+      end = segment.seaBreaks.find((offset) => offset > 0 && offset < text.length) ?? text.length;
+    } else if (hasCJKBreakOpportunity(text)) {
+      const characters = [...text];
+      for (let count = 1; count < characters.length; count += 1) {
+        if (kinsokuAdjustedSplit(characters, count, kinsoku, 0) !== count) continue;
+        const utf16 = characters.slice(0, count).join('').length;
+        if (legalTextSplitAtOrBefore(segment, utf16, 1) === utf16) {
+          end = utf16;
+          break;
+        }
+      }
+    } else {
+      end = segment.externalLinkBreakOffsets?.find((offset) =>
+        offset > 0 && offset < text.length && !protectedOffsets.has(offset)) ?? text.length;
     }
   }
-  if (!segment) return 0;
-  if ('text' in segment) {
-    if (segment.metricOnly) return wrapCtx?.paragraphMarkLineStartWidth ?? segment.fontSize * scale;
-    const text = segment.text.slice(boundary && segment === segs[boundary.segIndex] ? boundary.charOffset : 0);
-    const offset = boundary && segment === segs[boundary.segIndex] ? boundary.charOffset : 0;
-    const atomicEnd = (member: LayoutTextSeg, suffix: string, startOffset: number): number => {
-      if (member.ruby || member.tateChuYoko || member.fitTextRegionIndex !== undefined) return suffix.length;
-      const protectedOffsets = protectedNoBreakOffsets(member);
-      const hardEnd = hardJoinPrefixEnd(member);
-      if (hardEnd !== undefined) return Math.max(0, hardEnd - startOffset);
-      const breaks = member.seaBreaks?.filter(end => end > startOffset).map(end => end - startOffset)
-        ?? (hasCJKBreakOpportunity(suffix) ? [...graphemeClusterOffsets(suffix), suffix.length] : []);
-      for (const end of breaks) {
-        if (end <= 0 || protectedOffsets.has(startOffset + end)) continue;
-        const before = Array.from(suffix.slice(0, end)).at(-1)?.codePointAt(0);
-        const after = suffix.codePointAt(end);
-        if (before !== undefined && kinsoku.lineEndForbidden.has(before)) continue;
-        if (after !== undefined && kinsoku.lineStartForbidden.has(after)) continue;
-        return end;
-      }
-      const externalEnd = member.externalLinkBreakOffsets?.find(end => end > startOffset && !protectedOffsets.has(end));
-      return externalEnd === undefined ? suffix.length : externalEnd - startOffset;
-    };
-    const end = atomicEnd(segment, text, offset);
-    let width = strAdvance(segment, text.slice(0, end).trimEnd());
-    // The source seam may belong to one word split across formatting runs.
-    // Include its glued prefix, matching the break queue's join contract.
-    if (end === text.length && !/\s$/u.test(text)) {
-      for (let index = selectedIndex + 1; index < candidates.length; index += 1) {
-        const next = candidates[index];
-        if (!('text' in next) || !next.joinPrev) break;
-        const nextEnd = atomicEnd(next, next.text, 0);
-        width += strAdvance(next, next.text.slice(0, nextEnd).trimEnd());
-        if (nextEnd < next.text.length || /\s$/u.test(next.text)) break;
-      }
-    }
-    return Math.min(maxWidth, Math.max(0, width));
-  }
-  if ('imagePath' in segment) return segment.anchor ? 0 : Math.min(maxWidth, segment.widthPt * scale);
-  if ('math' in segment) return Math.min(maxWidth, segment.measuredWidth);
-  return 0;
+  const prefix = text.slice(0, end);
+  // The fit tests exclude a collapsible U+0020 suffix except in an RTL line.
+  return strAdvance(segment, baseRtl ? prefix : prefix.replace(/ +$/u, ''));
 }
 
 /** Vertical allocation belongs to the physical line; only a failed gap
@@ -255,28 +282,52 @@ function resetPhysicalLineMetrics({ breakerState }: PassOperationState): void {
   breakerState.uniformPositionEligible = true;
 }
 
-export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
-  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
-    operationState;
+function openPhysicalLine(operationState: PassOperationState): void {
+  const { breakerState } = operationState;
+  resetPhysicalLineMetrics(operationState);
+  if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+}
+
+export function performStartLine(operationState: PassOperationState, requirement: number = 0): void {
+  const { breakerState, maxWidth, wrapCtx, firstIndent, probeHeights } = operationState;
 
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
   breakerState.lineMaxWidth = maxWidth;
-  if (!wrapCtx) {
-    resetPhysicalLineMetrics(operationState);
-    if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
-    return;
-  }
+  breakerState.gapTransaction = null;
   const cursor = breakerState.fragmentCursor;
   breakerState.fragmentCursor = null;
   // Every gap of this physical line uses the same observed band. New gaps
   // are horizontal placements, so they need no additional convergence pass.
-  let probeH = probeHeights?.[breakerState.physicalLineIndex];
-  if (probeH === undefined) {
-    resetPhysicalLineMetrics(operationState);
-    if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+  // Without an observed band (first pass), the line is measured unconstrained.
+  if (!wrapCtx || probeHeights?.[breakerState.physicalLineIndex] === undefined) {
+    openPhysicalLine(operationState);
     return;
   }
+  const transaction: GapTransaction = {
+    cursor,
+    requestTopY: breakerState.currentLineTopY,
+    requirement: requirement + (breakerState.isFirst ? Math.max(0, firstIndent) : 0),
+    window: null,
+    narrowed: false,
+    snapshot: null,
+    stopBefore: null,
+  };
+  breakerState.gapTransaction = transaction;
+  if (!cursor) openPhysicalLine(operationState);
+  placeLineWindow(operationState, transaction, null);
+}
+
+/** Search the first admissible window for the transaction's requirement:
+ * a later gap on the continuation baseline, else a new physical line. */
+function placeLineWindow(
+  operationState: PassOperationState,
+  transaction: GapTransaction,
+  rejected: GapWindow | null,
+): void {
+  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeHeights, preparedFloatWrap } =
+    operationState;
+  if (!wrapCtx) return;
   // §17.3.1.12 removes a hanging indent from the paragraph's first-line
   // indentation, not from an object's exclusion (§20.4.2.17–.19). Query the
   // expanded first-line band before subtracting floats; applying the hanging
@@ -293,8 +344,8 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
-  const requiredWidth = minWidth + (breakerState.isFirst ? Math.max(0, firstIndent) : 0);
   const query = (topY: number, x: number, width: number, height: number) => {
+    const requiredWidth = transaction.requirement;
     if (wrapCtx.lineWindow) {
       const win = wrapCtx.lineWindow({
         topYPt: topY, minimumStartWidthPt: requiredWidth,
@@ -311,29 +362,159 @@ export function performStartLine(operationState: PassOperationState, minWidth: n
       reference, requiredWidth,
     );
   };
+  let accepted: GapWindow & { narrowed: boolean } | null = null;
+  const cursor = transaction.cursor;
   if (cursor) {
+    const probeH = probeHeights?.[breakerState.physicalLineIndex];
     const left = baseRtl ? lineBandX : cursor.right;
     const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
-    if (right > left) {
+    if (probeH !== undefined && right > left) {
       const next = query(cursor.topY, left, right - left, probeH);
-      if (next.topY === cursor.topY && next.maxWidth >= requiredWidth) {
-        // A strictly smaller unvisited band gives monotonic horizontal progress;
-        // the original column and largest-side reference never shrink with it.
-        breakerState.currentLineTopY = next.topY;
-        breakerState.lineXOffset = left - wrapCtx.paraX + next.xOffset;
-        breakerState.lineMaxWidth = next.maxWidth;
-        return;
+      if (next.topY === cursor.topY && next.maxWidth >= transaction.requirement) {
+        // A strictly smaller unvisited band gives monotonic horizontal
+        // progress; the column and largest-side reference never shrink.
+        accepted = {
+          topY: next.topY,
+          xOffset: left - wrapCtx.paraX + next.xOffset,
+          maxWidth: next.maxWidth,
+          solverWidth: next.maxWidth,
+          narrowed: true,
+        };
       }
     }
+    if (!accepted) {
+      // No later gap on this baseline admits the head: the physical line ends.
+      transaction.cursor = null;
+      openPhysicalLine(operationState);
+      breakerState.currentLineTopY = transaction.requestTopY;
+    }
   }
-  resetPhysicalLineMetrics(operationState);
-  if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
-  probeH = probeHeights?.[breakerState.physicalLineIndex];
-  if (probeH === undefined) return;
-  const win = query(breakerState.currentLineTopY, lineBandX, lineBandWidth, probeH);
-  breakerState.currentLineTopY = win.topY;
-  breakerState.lineXOffset = win.xOffset;
-  breakerState.lineMaxWidth = win.maxWidth + hangingOffset;
+  if (!accepted) {
+    const probeH = probeHeights?.[breakerState.physicalLineIndex];
+    if (probeH === undefined) {
+      breakerState.lineXOffset = 0;
+      breakerState.lineMaxWidth = maxWidth;
+      transaction.window = null;
+      transaction.narrowed = false;
+      transaction.snapshot = null;
+      return;
+    }
+    const win = query(transaction.requestTopY, lineBandX, lineBandWidth, probeH);
+    accepted = {
+      topY: win.topY,
+      xOffset: win.xOffset,
+      maxWidth: win.maxWidth + hangingOffset,
+      solverWidth: win.maxWidth,
+      narrowed: win.xOffset !== 0 || win.maxWidth !== lineBandWidth,
+    };
+  }
+  // After a rejection the requirement exceeds the rejected width. A window
+  // still narrower than it is not admitted by the solver's exact comparison
+  // (it differs only by representable rounding) or comes from a boundary
+  // that does not honor the requirement. Accept it without a transaction:
+  // forced placement is then the established behavior, and the search ends.
+  if (rejected && accepted.narrowed && accepted.solverWidth < transaction.requirement) {
+    accepted = { ...accepted, narrowed: false };
+  }
+  breakerState.currentLineTopY = accepted.topY;
+  breakerState.lineXOffset = accepted.xOffset;
+  breakerState.lineMaxWidth = accepted.maxWidth;
+  transaction.window = accepted;
+  transaction.narrowed = accepted.narrowed;
+  transaction.snapshot = null;
+  if (accepted.narrowed) performCaptureGapSnapshot(operationState, true);
+}
+
+/** Record the rollback image of a narrowed fragment before its first unit.
+ * Called when the window is accepted (the iterator may hold the segment being
+ * processed) and again at each iterator step while the fragment is empty, so
+ * content re-queued by the preceding flush (e.g. kinsoku retraction) is kept. */
+export function performCaptureGapSnapshot(
+  operationState: PassOperationState,
+  includeInHand: boolean,
+): void {
+  const { breakerState } = operationState;
+  const transaction = breakerState.gapTransaction;
+  if (!transaction?.narrowed) return;
+  const {
+    lines, queue, currentLine: _line, latinLineGaps: _gaps, gapTransaction: _transaction,
+    inHand, snapBlock, ...scalars
+  } = breakerState;
+  transaction.snapshot = {
+    scalars: { ...scalars },
+    snapBlock: snapBlock ? { ...snapBlock } : null,
+    linesLength: lines.length,
+    queue: includeInHand && inHand ? [inHand, ...queue] : queue.slice(),
+  };
+}
+
+/** Called by every placement path that would force its unit into the
+ * current fragment. On a full band this is the established behavior; in a
+ * narrowed gap the fragment is rejected (or ended before the unit). */
+export function performForcedPlacement(
+  operationState: PassOperationState,
+  requiredWidth: number,
+  unitStart = 0,
+): void {
+  const { breakerState } = operationState;
+  const transaction = breakerState.gapTransaction;
+  if (!transaction?.narrowed || !transaction.snapshot) return;
+  // Inkless items before the unit (anchor characters, mark metrics) travel
+  // with it; only inked content can end the fragment before the unit.
+  const committed = breakerState.currentLine.slice(0, unitStart).some((item) => !isInklessLineItem(item));
+  const lead = committed ? breakerState.currentLine[unitStart] : undefined;
+  throw new LineGapRejection(requiredWidth, lead?.src ? { ...lead.src } : undefined);
+}
+
+function isInklessLineItem(item: LayoutSeg): boolean {
+  return ('text' in item && item.metricOnly === true) || ('imagePath' in item && Boolean(item.anchor));
+}
+
+/** Lower bound of a queued unit's line-head advance, from placement's measures. */
+function headUnitLowerBound(operationState: PassOperationState, segment: LayoutSeg | undefined): number {
+  if (!segment) return 0;
+  if ('text' in segment) return operationState.minimalLegalTextWidth(segment);
+  if ('imagePath' in segment) return segment.anchor ? 0 : segment.widthPt * operationState.scale;
+  if ('math' in segment) return segment.measuredWidth;
+  return 0;
+}
+
+/** Roll a rejected fragment back and continue the search. */
+export function performRejectGap(
+  operationState: PassOperationState,
+  rejection: LineGapRejection,
+): void {
+  const { breakerState, firstIndent, maxWidth } = operationState;
+  const transaction = breakerState.gapTransaction;
+  const snapshot = transaction?.snapshot;
+  if (!transaction || !snapshot || !transaction.window) throw rejection;
+  Object.assign(breakerState, snapshot.scalars);
+  breakerState.snapBlock = snapshot.snapBlock
+    ? { ...(snapshot.snapBlock as NonNullable<typeof breakerState.snapBlock>) }
+    : null;
+  breakerState.lines.length = snapshot.linesLength;
+  breakerState.queue = snapshot.queue.slice();
+  breakerState.currentLine = [];
+  breakerState.latinLineGaps = [];
+  breakerState.inHand = undefined;
+  // A replay ends the fragment before the forced unit. If the replay cannot
+  // reach that source boundary, the whole fragment is rejected instead.
+  if (rejection.stopBefore && !transaction.stopBefore) {
+    transaction.stopBefore = rejection.stopBefore;
+    return;
+  }
+  transaction.stopBefore = null;
+  const rejected = transaction.window;
+  const required = rejection.requiredWidth
+    + (breakerState.isFirst ? Math.max(0, firstIndent) : 0);
+  const hangingOffset = breakerState.isFirst ? Math.min(0, firstIndent) : 0;
+  // The forced unit did not fit this gap, so its advance exceeds the width
+  // the solver admitted. A lower bound that does not (non-monotone advances)
+  // sends the unit to the full band instead of creeping through gaps.
+  transaction.requirement = required > rejected.solverWidth
+    ? Math.max(transaction.requirement, required)
+    : maxWidth - hangingOffset;
+  placeLineWindow(operationState, transaction, rejected);
 }
 
 export function performAvailW(operationState: PassOperationState) {
@@ -374,7 +555,7 @@ export function performFlush(
   const {
     breakerState,
     materializeLatinSpaceCompression,
-    minLineStartWidth,
+    lineHeadRequirement,
     startLine,
     bidiCustomStopsPx,
     bidiIntervalPx,
@@ -389,6 +570,15 @@ export function performFlush(
     baseRtl,
   } = operationState;
 
+  // An anchor character or paragraph-mark metric has no advance; it moves
+  // with the unit that follows it. A narrowed fragment holding only such
+  // items cannot end before that unit: the unit is its head (forced here).
+  // Tabs and breaks are pen/line controls, not such units.
+  const followingUnit = headUnitLowerBound(operationState, breakerState.inHand);
+  if (!brTerminated && nextStart !== undefined && followingUnit > 0
+    && breakerState.currentLine.length > 0 && breakerState.currentLine.every(isInklessLineItem)) {
+    operationState.forcedPlacement(followingUnit);
+  }
   materializeLatinSpaceCompression();
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
@@ -543,7 +733,7 @@ export function performFlush(
   breakerState.latinLineGaps = [];
   breakerState.latinUniformGapCapacity = undefined;
   breakerState.isFirst = false;
-  startLine(minLineStartWidth(nextStart));
+  startLine(lineHeadRequirement(nextStart));
 }
 
 export function performProspectiveSnapAdvance(

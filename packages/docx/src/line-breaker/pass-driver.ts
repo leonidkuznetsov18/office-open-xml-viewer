@@ -25,7 +25,11 @@ import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
 import {
-  performMinimumLineStartWidth,
+  performLineHeadRequirement,
+  performForcedPlacement,
+  performMinimalLegalTextWidth,
+  performRejectGap,
+  performCaptureGapSnapshot,
   performSameLatinSpaceFace,
   performMaterializeLatinSpaceCompression,
   performStartLine,
@@ -128,21 +132,17 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
       ? characterGrid.characterPitchPt * scale
       : null;
 
-  const minLineStartWidth = (boundary?: LineBoundary): number =>
-    performMinimumLineStartWidth(operationState, boundary);
-  const isParagraphMarkOnlyFlow =
-    segs.length > 0 &&
-    segs.every(
-      (segment) =>
-        ('text' in segment && segment.metricOnly === true) ||
-        ('imagePath' in segment && Boolean(segment.anchor)),
-    );
+  const lineHeadRequirement = (boundary?: LineBoundary): number =>
+    performLineHeadRequirement(operationState, boundary);
+  const forcedPlacement = (requiredWidth: number, unitStart?: number): void =>
+    performForcedPlacement(operationState, requiredWidth, unitStart);
+  const minimalLegalTextWidth = (segment: LayoutTextSeg): number =>
+    performMinimalLegalTextWidth(operationState, segment);
 
-  // Compute wrap constraints for a new line about to start. Mutates
-  // lineXOffset/lineMaxWidth/currentLineTopY. `minWidth` is the smallest clear
-  // side-space the upcoming atom needs. Square and polygon gaps receive the
-  // same atom requirement; the geometry solver retains its numeric floor.
-  const startLine = (minWidth: number = 0): void => performStartLine(operationState, minWidth);
+  // Compute wrap constraints for a new line fragment about to start. Mutates
+  // lineXOffset/lineMaxWidth/currentLineTopY. `requirement` seeds the gap
+  // search; placement itself admits or rejects a narrowed gap (#1670).
+  const startLine = (requirement: number = 0): void => performStartLine(operationState, requirement);
 
   // Intrinsic acquisition deliberately disables automatic line wrapping while
   // retaining the real paragraph/anchor width for tab and alignment reference
@@ -353,9 +353,10 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     sameLatinSpaceFace,
     materializeLatinSpaceCompression,
     snapPitchPx,
-    minLineStartWidth,
-    isParagraphMarkOnlyFlow,
+    lineHeadRequirement,
     startLine,
+    forcedPlacement,
+    minimalLegalTextWidth,
     availW,
     fitsMeasuredWidth,
     bidiCustomStopsPx,
@@ -388,13 +389,12 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     retractCurrentLineForLeadingKinsoku,
     keepLeadingKinsokuWithCurrentLine,
   };
-  startLine(
-    isParagraphMarkOnlyFlow
-      ? (wrapCtx?.paragraphMarkLineStartWidth ?? minLineStartWidth())
-      : minLineStartWidth(),
-  );
+  startLine(lineHeadRequirement());
 
-  iterateBreakOpportunities(operationState);
+  iterateBreakOpportunities(operationState, {
+    captureGapSnapshot: () => performCaptureGapSnapshot(operationState, false),
+    rejectGap: (rejection) => performRejectGap(operationState, rejection),
+  });
 
   if (breakerState.currentLine.length > 0) flush();
   // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
