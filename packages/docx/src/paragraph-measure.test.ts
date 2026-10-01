@@ -1249,6 +1249,47 @@ describe('float gap admission by placement', () => {
       .toEqual([[60, 0, 200]]);
   });
 
+  // Review round 5: lines discovered by a pass are probed in that pass, so
+  // convergence does not grow with the number of physical lines.
+  it('converges a fixed-metric paragraph beside a tall exclusion in one pass sequence', () => {
+    const tall = { ...squareObstacle(40, 460), yBottom: 400, imageH: 400 };
+    const measured = measureParagraph(paragraph({ spaceBefore: 0, runs: [{ type: 'text', ...textRun('word '.repeat(48)) }] }),
+      layoutContext({ spaceBeforePt: 0 }),
+      placement({ startYPt: 0, availableWidthPt: 500, maximumYPt: 700,
+        wrap: createFloatWrapOracle([tall], { xLeftPt: 0, xRightPt: 500, readingDirection: 'ltr' }) }),
+      measurer, environment());
+    expect(new Set(measured.lines.map(({ layout }) => layout.physicalLineIndex)).size).toBe(24);
+    expect(measured.contentEndYPt).toBe(240);
+  });
+
+  it('keeps many lines under tall exclusions convergent and contained', () => {
+    let seed = 0x1683;
+    const random = (limit: number) => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed % limit;
+    };
+    for (let index = 0; index < 40; index += 1) {
+      const left = 1 + random(60);
+      const right = left + 20 + random(200 - left - 20);
+      const bottom = 100 + random(400);
+      const obstacle = random(2) === 0
+        ? { ...squareObstacle(left, right), yBottom: bottom, imageH: bottom }
+        : { ...tightObstacle(left, right), yBottom: bottom, imageH: bottom,
+          wrapPolygon: [{ xPt: left, yPt: 0 }, { xPt: right, yPt: 0 }, { xPt: (left + right) / 2, yPt: bottom }] };
+      const words = Array.from({ length: 20 + random(60) }, () => ['a', 'word', 'longer', 'W'][random(4)]).join(' ');
+      const rtl = random(2) === 1;
+      const runs: DocParagraph['runs'] = [{ type: 'text', ...textRun(words, rtl ? { rtl: true } : {}) }];
+      const measured = measureParagraph(paragraph({ runs }), layoutContext({ spaceBeforePt: 0, baseRtl: rtl }),
+        placement({ startYPt: 0, maximumYPt: 2000, wrap: createFloatWrapOracle([obstacle], gapReference(rtl)) }),
+        measurer, environment());
+      const lines = placedGeometry(measured);
+      const label = `tall case ${index}: ${JSON.stringify({ obstacle, words, rtl })}`;
+      expect(bandViolation(lines, obstacle, rtl), label).toBeNull();
+      expect(physicalViolation(lines, rtl), label).toBeNull();
+      expect(measuredTextSequence(measured).join('').replace(/\s/gu, ''), label).toBe(words.replace(/\s/gu, ''));
+    }
+  });
+
   it('fills gaps right to left in an RTL paragraph', () => {
     const lines = gapLines([{ type: 'text', ...textRun('אב גד הו זח טי כל', { rtl: true }) }],
       squareObstacle(60, 120), true);

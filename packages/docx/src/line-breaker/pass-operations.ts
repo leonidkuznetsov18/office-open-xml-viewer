@@ -282,6 +282,18 @@ function resetPhysicalLineMetrics({ breakerState }: PassOperationState): void {
   breakerState.uniformPositionEligible = true;
 }
 
+/** Exclusion probe band of a physical line. The initial pass measures without
+ * exclusions. Afterwards every physical line is probed in the pass that
+ * reaches it: a line the previous pass did not produce uses the last resolved
+ * physical allocation, and the next pass replaces it with its own. With fixed
+ * metrics, the result converges in three passes (measure, resolve, confirm)
+ * regardless of how many physical lines or gaps exclusions create; varying
+ * metrics retain the fail-closed pass guard. */
+function physicalProbeHeight(probeHeights: readonly number[] | null, index: number): number | undefined {
+  if (!probeHeights || probeHeights.length === 0) return undefined;
+  return probeHeights[index] ?? probeHeights[probeHeights.length - 1];
+}
+
 function openPhysicalLine(operationState: PassOperationState): void {
   const { breakerState } = operationState;
   resetPhysicalLineMetrics(operationState);
@@ -300,7 +312,7 @@ export function performStartLine(operationState: PassOperationState, requirement
   // Every gap of this physical line uses the same observed band. New gaps
   // are horizontal placements, so they need no additional convergence pass.
   // Without an observed band (first pass), the line is measured unconstrained.
-  if (!wrapCtx || probeHeights?.[breakerState.physicalLineIndex] === undefined) {
+  if (!wrapCtx || physicalProbeHeight(probeHeights, breakerState.physicalLineIndex) === undefined) {
     openPhysicalLine(operationState);
     return;
   }
@@ -366,7 +378,7 @@ function placeLineWindow(
   let accepted: GapWindow & { narrowed: boolean } | null = null;
   const cursor = transaction.cursor;
   if (cursor) {
-    const probeH = probeHeights?.[breakerState.physicalLineIndex];
+    const probeH = physicalProbeHeight(probeHeights, breakerState.physicalLineIndex);
     const left = baseRtl ? lineBandX : cursor.right;
     const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
     if (probeH !== undefined && right > left) {
@@ -391,7 +403,7 @@ function placeLineWindow(
     }
   }
   if (!accepted) {
-    const probeH = probeHeights?.[breakerState.physicalLineIndex];
+    const probeH = physicalProbeHeight(probeHeights, breakerState.physicalLineIndex);
     if (probeH === undefined) {
       breakerState.lineXOffset = 0;
       breakerState.lineMaxWidth = maxWidth;
