@@ -4,7 +4,17 @@ import { normalizeInternalDocumentModel } from '../parser-model.js';
 import { describe, expect, it, vi } from 'vitest';
 
 // Counts body pagination passes: each pass opens exactly one kernel session.
-const passes = vi.hoisted(() => ({ opened: 0 }));
+const passes = vi.hoisted(() => ({ opened: 0, finalizedPages: 0, sessionCalls: 0 }));
+vi.mock('./page-factory.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./page-factory.js')>();
+  return {
+    ...actual,
+    finalizeLayoutPage: (...args: Parameters<typeof actual.finalizeLayoutPage>) => {
+      passes.finalizedPages += 1;
+      return actual.finalizeLayoutPage(...args);
+    },
+  };
+});
 vi.mock('./runtime-state.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./runtime-state.js')>();
   return {
@@ -14,7 +24,15 @@ vi.mock('./runtime-state.js', async (importOriginal) => {
       return kernel && {
         openBodyLayoutSession: (...args: Parameters<typeof kernel.openBodyLayoutSession>) => {
           passes.opened += 1;
-          return kernel.openBodyLayoutSession(...args);
+          // Every session call is layout work; counting them between host
+          // turns measures how long the host waited.
+          const session = kernel.openBodyLayoutSession(...args);
+          return Object.fromEntries(Object.entries(session).map(([key, value]) => [
+            key,
+            typeof value === 'function'
+              ? (...callArgs: unknown[]) => { passes.sessionCalls += 1; return value.apply(session, callArgs); }
+              : value,
+          ])) as typeof session;
         },
       };
     },
@@ -319,6 +337,58 @@ describe('progressive layout with page-owned anchors', () => {
     expect(stepsAtFirstPreview).not.toBeNull();
     expect(stepsAtFirstPreview!).toBeLessThan(run.input.sequence.length / 4);
     expect(previews.at(-1)!.layout.pages.length).toBeGreaterThan(5);
+  }, 300_000);
+
+  it('keeps host turns frequent while the second pass waits on the first', async () => {
+    // The ordinary table makes one second-pass entry wait for pages the first
+    // pass has not closed; the many one-line paragraphs after it are what the
+    // first pass must lay out meanwhile. Each must stay a suspension point.
+    const model = documentModel(300, [
+      [2, pageFloatingTable(468, 72, 3, 200, 0)],
+      [6, pageFloatingTable(468, 72, 3, 200, 0)],
+      [10, pageFloatingTable(468, 72, 3, 200, 0)],
+      [40, ordinaryTable(4 * 27, 24)],
+    ]);
+    const blocking = blockingLayout(model);
+    const run = open(model);
+    let since = 0;
+    let widest = 0;
+    let last = passes.sessionCalls;
+    const final = await layoutDocumentProgressively(run.input, run.services, run.options, {
+      onPreview: () => {},
+      scheduler: {
+        now: () => Number.MAX_SAFE_INTEGER,
+        sliceMs: 0,
+        yieldToHost: () => {
+          since = passes.sessionCalls - last;
+          widest = Math.max(widest, since);
+          last = passes.sessionCalls;
+          return Promise.resolve();
+        },
+      },
+    });
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blocking.layout));
+    // One body entry here is at most about fifteen session calls. Waiting
+    // synchronously for the first pass instead ran a whole page of entries
+    // (over 180 calls) inside one host turn.
+    expect(widest).toBeLessThan(40);
+  }, 300_000);
+
+  it('discovers first-pass destinations in work linear in the page count', async () => {
+    const finalizations = async (pages: number) => {
+      const model = documentModel(pages * 27, [[2, pageFloatingTable(468, 300, 2, 100, 0)]]);
+      const run = open(model);
+      const before = passes.finalizedPages;
+      await layoutDocumentProgressively(run.input, run.services, run.options, { onPreview: () => {} });
+      return passes.finalizedPages - before;
+    };
+    const small = await finalizations(11);
+    const medium = await finalizations(21);
+    const large = await finalizations(41);
+    // Doubling the document may at most roughly double the finalized pages;
+    // a full-prefix snapshot per closed page would quadruple them.
+    expect(medium / small).toBeLessThan(2.5);
+    expect(large / medium).toBeLessThan(2.5);
   }, 300_000);
 
   it('emits no stale page when cancelled during convergence', async () => {
