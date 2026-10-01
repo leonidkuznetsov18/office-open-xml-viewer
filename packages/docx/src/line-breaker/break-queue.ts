@@ -184,6 +184,9 @@ export interface GapTransaction {
   requirement: number;
   window: GapWindow | null;
   narrowed: boolean;
+  /** The fragment's line-end edge (reading order) is an exclusion, not the
+   * paragraph edge: §17.3.1.21 hanging punctuation may not cross it. */
+  endsAtExclusion: boolean;
   snapshot: Readonly<{
     scalars: Readonly<Record<string, unknown>>;
     snapBlock: unknown;

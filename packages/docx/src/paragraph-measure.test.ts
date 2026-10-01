@@ -1327,7 +1327,15 @@ function bandViolation(lines: readonly PlacedLine[], obstacle: FloatRect, rtl: b
       // hanging punctuation, units wider than the column); a narrowed gap
       // owns its complete ink.
       const narrowed = line.width < 200 - 1e-9;
-      if (start < -1e-9 || (narrowed && end > 200 + 1e-9)) return `band ${JSON.stringify(line)}`;
+      // §17.3.1.21 permits one punctuation character past the paragraph edge
+      // (never past an exclusion, which the check below covers).
+      // The overflow is at the line end: right in LTR, left in RTL.
+      const lineEnd = [...line.segments].reverse().find((item) => item.visible > 1e-9);
+      const hanging = /\p{P}$/u.test(lineEnd?.text?.trimEnd() ?? '')
+        && start >= -10 - 1e-9 && end <= 210 + 1e-9;
+      const outside = rtl ? start < -1e-9 : end > 200 + 1e-9;
+      if ((!rtl && start < -1e-9) || (rtl && end > 200 + 1e-9)
+        || (narrowed && outside && !hanging)) return `band ${JSON.stringify(line)}`;
       const meets = obstacle.wrapPolygon
         ? polygonMeetsRect(obstacle.wrapPolygon, line.top, height, start + 1e-9, end - 1e-9)
         : line.top < obstacle.yBottom && end > obstacle.xLeft + 1e-9 && start < obstacle.xRight - 1e-9;

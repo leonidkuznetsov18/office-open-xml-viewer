@@ -310,6 +310,7 @@ export function performStartLine(operationState: PassOperationState, requirement
     requirement: requirement + (breakerState.isFirst ? Math.max(0, firstIndent) : 0),
     window: null,
     narrowed: false,
+    endsAtExclusion: false,
     snapshot: null,
     stopBefore: null,
   };
@@ -396,6 +397,7 @@ function placeLineWindow(
       breakerState.lineMaxWidth = maxWidth;
       transaction.window = null;
       transaction.narrowed = false;
+      transaction.endsAtExclusion = false;
       transaction.snapshot = null;
       return;
     }
@@ -421,6 +423,12 @@ function placeLineWindow(
   breakerState.lineMaxWidth = accepted.maxWidth;
   transaction.window = accepted;
   transaction.narrowed = accepted.narrowed;
+  // Absolute line-end edge versus the paragraph band edge, in reading order.
+  const windowStart = wrapCtx.paraX + accepted.xOffset;
+  const windowEnd = windowStart + accepted.maxWidth;
+  transaction.endsAtExclusion = baseRtl
+    ? windowStart > lineBandX + 1e-9
+    : windowEnd < lineBandX + lineBandWidth - 1e-9;
   transaction.snapshot = null;
   if (accepted.narrowed) performCaptureGapSnapshot(operationState, true);
 }

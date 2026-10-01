@@ -386,7 +386,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // DrawingML exclusion (§20.4.2.17). A narrowed float gap owns its full ink.
   const admitsTrailingOverflowPunctuation =
     overflowPunct &&
-    breakerState.gapTransaction?.narrowed !== true &&
+    breakerState.gapTransaction?.endsAtExclusion !== true &&
     trailingOverflowCharacter !== undefined &&
     (breakerState.currentLine.length > 0 || textBeforeTrailingOverflow.length > 0) &&
     wordIsOverflowPunctuation(
@@ -1116,7 +1116,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // CJK split.
   const hangingSplit =
     overflowPunct &&
-    breakerState.gapTransaction?.narrowed !== true &&
+    breakerState.gapTransaction?.endsAtExclusion !== true &&
     rawSplit < allChars.length &&
     (breakerState.currentLine.length > 0 || rawSplit > 0) &&
     wordIsOverflowPunctuation(
