@@ -720,7 +720,7 @@ describe('measureParagraph', () => {
       spaceBeforePt: 0,
       hasRuby: true,
     });
-    const position = placement({ startYPt: 0, availableWidthPt: 18 });
+    const position = placement({ startYPt: 0, availableWidthPt: 18, wrap: createFloatWrapOracle([]) });
     const full = measureParagraph(doc, context, position, measurer, environment());
     const uniformAdvancePt = full.lines[0].advancePt;
 
@@ -743,6 +743,8 @@ describe('measureParagraph', () => {
     expect(continuation.lines.every((line) => line.advancePt === uniformAdvancePt)).toBe(true);
     expect(full.uniformRubyAdvancePt).toBe(uniformAdvancePt);
     expect(continuation.uniformRubyAdvancePt).toBe(uniformAdvancePt);
+    expect(continuation.lines.map(line => line.topYPt))
+      .toEqual(continuation.lines.map((_, index) => index * uniformAdvancePt));
 
     const secondContinuation = measureParagraph(
       doc,
@@ -1065,5 +1067,57 @@ describe('measureParagraph', () => {
 
     expect(first.lines.length).toBeGreaterThan(1);
     expect(measuredTextSequence(second)).toEqual(measuredTextSequence(first).slice(1));
+  });
+});
+
+describe('ruby physical-line allocation', () => {
+  const rubyParagraph = () => paragraph({
+    spaceBefore: 0,
+    runs: [
+      { type: 'text', ...textRun('aa', { ruby: { text: 'ruby', fontSizePt: 12 } }) },
+      { type: 'text', ...textRun(' bb cc dd ee ff gg') },
+    ],
+  });
+  const rubyContext = () => layoutContext({
+    lineGrid: { active: true, pitchPt: 10 }, spaceBeforePt: 0, hasRuby: true,
+  });
+
+  it('starts every physical line at its paragraph-wide allocated advance', () => {
+    const measured = measureParagraph(rubyParagraph(), rubyContext(),
+      placement({ startYPt: 0, availableWidthPt: 18, wrap: createFloatWrapOracle([]) }),
+      measurer, environment());
+    expect(measured.lines.map(line => line.topYPt)).toEqual([0, 30, 60, 90, 120, 150, 180]);
+    expect(measured.contentEndYPt).toBe(210);
+  });
+
+  it('probes and starts wrapped gaps with one allocated advance per physical baseline', () => {
+    const doc = rubyParagraph();
+    doc.runs.push({ type: 'text', ...textRun(' hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz') });
+    const obstacle: FloatRect = {
+      kind: 'shape', mode: 'square', authoredWrap: 'square', imageKey: 'test',
+      imageX: 40, imageY: 0, imageW: 120, imageH: 100,
+      xLeft: 40, xRight: 160, yTop: 0, yBottom: 100, side: 'bothSides',
+      distLeft: 0, distRight: 0, distTop: 0, distBottom: 0, paraId: 0,
+    };
+    const oracle = createFloatWrapOracle([obstacle]);
+    const probes: { topYPt: number; probeHeightPt: number }[] = [];
+    const measured = measureParagraph(doc, rubyContext(),
+      placement({ startYPt: 0, availableWidthPt: 200, wrap: {
+        ...oracle,
+        lineWindow: input => { probes.push(input); return oracle.lineWindow(input); },
+      } }), measurer, environment());
+    const physical = measured.lines.filter((line, index) => index === 0
+      || measured.lines[index - 1].layout.physicalLineIndex !== line.layout.physicalLineIndex);
+    expect(measured.lines.length).toBeGreaterThan(physical.length);
+    for (let index = 1; index < physical.length; index += 1) {
+      expect(physical[index].topYPt)
+        .toBeGreaterThanOrEqual(physical[index - 1].topYPt + physical[index - 1].advancePt);
+    }
+    for (const line of measured.lines) {
+      expect(probes).toContainEqual(expect.objectContaining({
+        topYPt: line.topYPt, probeHeightPt: 30,
+      }));
+      expect(line.topYPt).toBe(physical[line.layout.physicalLineIndex!].topYPt);
+    }
   });
 });

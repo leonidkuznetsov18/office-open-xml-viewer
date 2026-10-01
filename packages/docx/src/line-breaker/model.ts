@@ -451,6 +451,9 @@ export interface LayoutLine {
   availWidth: number;
   /** When wrap context is active, the absolute canvas Y where this line begins. */
   topY?: number;
+  /** Confirmed fixed-point allocation that owns topY, in the same units as
+   * the wrap context. Never infer ownership from a numeric top alone. */
+  wrapAllocation?: Readonly<{ physicalLineIndex: number; topYPt: number; advancePt: number }>;
   /** Set when at least one segment on this line carries a ruby annotation —
    *  enables docGrid pitch snapping in lineBoxHeight. */
   hasRuby?: boolean;
@@ -515,9 +518,12 @@ export interface WrapLayoutCtx {
   referenceWidthPt?: number;
   /** Reading order of the first line intersecting a centered `largest` object. */
   readingDirection?: 'ltr' | 'rtl';
-  /** Per-line box-height resolver (line natural ascent+descent → total px box height).
-   *  `gridCountSinglePx` (the line's design grid-count height) keeps the
-   *  float-wrap advance consistent with the final render's docGrid cell count. */
+  /** Paragraph-wide allocation (ruby, spacing, grid and inline objects).
+   * Supplies both float probes and physical-line cursor advancement. */
+  resolveLineAdvances?: (lines: readonly LayoutLine[]) => readonly number[];
+  /** Per-line box-height resolver for isolated line-layout callers. Paragraph
+   * measurement supplies resolveLineAdvances so origins and probes include its
+   * paragraph-wide allocation rather than only this fragment's metrics. */
   lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number, latinGridCountSingle?: number) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;

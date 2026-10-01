@@ -520,7 +520,11 @@ export function performFlush(
         right: wrapCtx.paraX + breakerState.lineXOffset + breakerState.lineMaxWidth,
       };
     }
-    breakerState.currentLineTopY += wrapCtx.lineBoxH(
+    // Use the physical allocation that supplied the exclusion probe. Local
+    // fragment metrics can be smaller than a later gap or paragraph-wide ruby
+    // reserve (§17.3.3.25); they cannot independently advance the next origin.
+    breakerState.currentLineTopY += operationState.probeHeights?.[breakerState.physicalLineIndex]
+      ?? wrapCtx.lineBoxH(
       asc,
       desc,
       breakerState.lineHasRuby,

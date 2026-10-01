@@ -80,6 +80,7 @@ const MAX_LINE_WRAP_PASSES = 16;
 export function convergeLineWrap<TLine extends LineWrapStateLine>(
   measure: (probeHeights: readonly number[] | null) => TLine[],
   lineBoxHeight: (line: TLine) => number,
+  resolveLineAdvances?: (lines: readonly TLine[]) => readonly number[],
 ): TLine[] {
   type Pass = Readonly<{
     lines: TLine[];
@@ -90,9 +91,10 @@ export function convergeLineWrap<TLine extends LineWrapStateLine>(
     return convergeExactState<Pass>({
       step: (previous) => {
         const lines = measure(previous?.probeHeights ?? null);
+        const advances = resolveLineAdvances?.(lines);
         const probeHeights = Object.freeze(lines.flatMap((line, index) =>
           samePhysicalLine(line, lines[index + 1])
-            ? [] : [lineBoxHeight(line)]));
+            ? [] : [advances?.[index] ?? lineBoxHeight(line)]));
         return Object.freeze({
           lines,
           probeHeights,

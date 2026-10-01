@@ -3141,7 +3141,9 @@ function acquireAnchorOccurrence(
       },
       // WORD_GRID_PICTURE_LINE_ORIGIN keeps text leading separate from the
       // reference frame; paragraph ownership already precedes before-spacing.
-      line: line.bounds.yPt === lines[0]?.bounds.yPt && options.context.lineGrid.active && outer.run.type === 'image'
+      // The retained host index owns first-line policy. Distinct physical
+      // lines can share a numeric top; equal coordinates do not transfer it.
+      line: hostLineIndex === 0 && options.context.lineGrid.active && outer.run.type === 'image'
         ? { ...line.bounds, yPt: wordGridPictureLineOriginPt(
             line.bounds.yPt, options.placement.startYPt, contentStartYPt,
           ) }

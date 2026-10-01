@@ -46,9 +46,10 @@ function projectMeasuredSegment(
   paragraphBorderEdges?: Parameters<typeof paragraphLayoutFromMeasurement>[1]['paragraphBorderEdges'],
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   verticalPageFrame = false,
+  precedingLines: MeasuredParagraph['lines'] = [],
 ) {
   const measured = {
-    lines: [{
+    lines: [...precedingLines, {
       layout: {
         segments: Array.isArray(segment) ? segment : [segment], height: 10, ascent: 8, descent: 2,
         visibleAscent: 8, visibleDescent: 2, intendedSingle: 10,
@@ -892,6 +893,38 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     // The retained text top is 10; paragraph/first-line origin is 4, and the
     // authored picture offset is 3. Baseline leading does not move the picture.
     expect(node.drawings[0]?.flowBounds.yPt).toBe(7);
+  });
+
+  it('uses physical host identity when later picture lines have the same numeric top', () => {
+    const occurrenceId = 'anchor:later-grid-line';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom: 'line' } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { ...(paragraph.runs[0] as object), text: 'A' },
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 1, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const precedingLine = {
+      layout: { segments: [{ ...host, text: 'A', metricOnly: undefined, sourceRunIndex: 0,
+        measuredWidth: 5, shapedClusters: [{ range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 5 }] }],
+        height: 10, ascent: 8, descent: 2, intendedSingle: 10, gridCountSingle: 10,
+        xOffset: 0, availWidth: 100 },
+      topYPt: 10, advancePt: 0,
+    };
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    }, undefined, undefined, false, [precedingLine]);
+    // Only the first physical line owns the before-spacing origin. A later
+    // line retains its own top even when numeric geometry happens to coincide.
+    expect(node.lines).toHaveLength(2);
+    expect(node.drawings[0]?.flowBounds.yPt).toBe(13);
   });
 
   it('matches one scoped host to one anchored payload and retains one drawing and exclusion', () => {

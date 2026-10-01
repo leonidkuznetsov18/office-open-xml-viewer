@@ -130,7 +130,7 @@ export function layoutLines(
     const preparedFloatWrap = wrapCtx.lineWindow
       ? undefined
       : prepareFloatWrap(wrapCtx.floats);
-    return convergeLineWrap(
+    const lines = convergeLineWrap(
       (probeHeights) => runPass(probeHeights, preparedFloatWrap),
       (line) => wrapCtx.lineBoxH(
         line.ascent,
@@ -143,7 +143,23 @@ export function layoutLines(
         line.inlinePictureTextSingle,
         line.latinGridCountSingle,
       ),
+      wrapCtx.resolveLineAdvances,
     );
+    const advances = wrapCtx.resolveLineAdvances?.(lines);
+    return lines.map((line, index) => ({
+      ...line,
+      // Publish provenance only after exact-state convergence confirms the
+      // same physical partition, probes and tops, never on an exploratory pass.
+      wrapAllocation: Object.freeze({
+        physicalLineIndex: line.physicalLineIndex!,
+        topYPt: line.topY!,
+        advancePt: advances?.[index] ?? wrapCtx.lineBoxH(
+          line.ascent, line.descent, line.hasRuby, line.intendedSingle,
+          line.eastAsian, line.gridCountSingle, line.uniformPositionAuto,
+          line.inlinePictureTextSingle, line.latinGridCountSingle,
+        ),
+      }),
+    }));
   }
   return runLineBreakerPass({
     ctx, segs, maxWidth, firstIndent, scale, tabStops, wrapCtx,
