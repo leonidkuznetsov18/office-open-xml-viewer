@@ -445,7 +445,7 @@ describe('table-cell parser-owned anchor reflow', () => {
     const exclusion = paragraph.exclusions.find((candidate) =>
       candidate.anchorOccurrenceId?.endsWith('cell-later'));
 
-    expect(lineTexts).toEqual(['AAAAAAAA', 'A', 'BBBB', 'BBBB']);
+    expect(lineTexts).toEqual(['AAAAAAAA', 'A', 'BBBBBBBB']);
     expect(exclusion).toBeDefined();
     expect(exclusion!.bounds).toMatchObject({
       xPt: 80,
@@ -474,7 +474,7 @@ describe('table-cell parser-owned anchor reflow', () => {
 
     expect(anchored!.exclusions).toHaveLength(1);
     expect(following!.flowBounds.yPt).toBe(20);
-    expect(followingLines).toEqual(['BBBB', 'BBBB']);
+    expect(followingLines).toEqual(['BBBBBBBB']);
     expect(following!.exclusions.map((candidate) =>
       candidate.anchorOccurrenceId)).toEqual([
       anchored!.exclusions[0]!.anchorOccurrenceId,

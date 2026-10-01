@@ -1302,6 +1302,7 @@ function emitResolvedTextSegment(
     fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
     fontRoute: resolvedSpan?.fontRoute,
     resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
+    resolvedLatinGridCellAllocation: referenceLineMetric?.farEastCodePage === false,
     ...(resourceFamilyLineMetric?.lineHeightRatio != null
       ? {
           resolvedResourceVerticalMetric: true as const,

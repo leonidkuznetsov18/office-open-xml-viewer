@@ -1,15 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   defineCompatibilityRule,
-  LINE_START_GAP_EPS_PT,
   WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT,
   WORD_EMPTY_MARK_FLOAT_SIDE_GAP,
   WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL,
-  WORD_MIN_LINE_START_PT,
-  WORD_SQUARE_LINE_START_ONE_INCH,
   WORD_SECTION_BTLR_TBRL_PAGE_FRAME,
   wordEmptyMarkMinimumStartWidthPx,
-  wordMinLineStartPx,
 } from './compatibility.js';
 import {
   WORD_PRE_BREAK_ANCHOR_PARAGRAPH,
@@ -315,15 +311,6 @@ describe('Word table row-cut observations', () => {
 });
 
 describe('float compatibility evidence', () => {
-  it('keeps the measured square line-start threshold behind one named rule', () => {
-    expect(WORD_SQUARE_LINE_START_ONE_INCH.evidence).toMatchObject({
-      kind: 'regression-test',
-    });
-    expect(WORD_MIN_LINE_START_PT).toBe(72);
-    expect(LINE_START_GAP_EPS_PT).toBe(0.05);
-    expect(wordMinLineStartPx(1)).toBeCloseTo(71.95, 10);
-  });
-
   it('names the established different-paragraph displacement policy', () => {
     expect(WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT).toMatchObject({
       id: 'word-float-different-paragraph-displacement',
