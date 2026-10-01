@@ -2430,7 +2430,11 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
             tableSource: node.source,
             bounds: Object.freeze({ ...node.flowBounds }),
             pageIndex: page.pageIndex,
-            flowDomainId: node.flowDomainId,
+            // Registered where its section region opens on the page, like a
+            // page-owned drawing (word-page-anchor-region-registration): a
+            // column transition is not prescanned, and the page-positioned
+            // table excludes text in every column of the region.
+            flowDomainId: regionFlowDomainOpening(page, node.flowDomainId),
           }));
         continue;
       }
@@ -2810,12 +2814,12 @@ function anchorStablePageLimit(
 // leaves the box unchanged: it can still change preceding/following flow.
 function anchorCarryIdentity(
   plan: ReadonlyMap<string, unknown>,
-  floors: ReadonlyMap<string, number>,
-  exempt: ReadonlySet<string>,
+  admission: AnchorAdmission,
   frontier: AnchorFrontier | null,
 ): string {
-  return `${anchorPlanIdentity(plan)}\u0004${anchorPlanIdentity(floors)}\u0004${
-    [...exempt].sort().join(',')}\u0004${JSON.stringify(frontier)}`;
+  return `${anchorPlanIdentity(plan)}\u0004${anchorPlanIdentity(admission.floors)}\u0004${
+    [...admission.exempt].sort().join(',')}\u0004${[...admission.retried].sort().join(',')}\u0004${
+    JSON.stringify(frontier)}`;
 }
 
 function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
@@ -2823,17 +2827,34 @@ function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
 }
 
 /**
- * Sequential admission state of the earliest page whose page-owned anchor
- * registrations disagree with the anchors that landed there (the frontier).
- * `accepted` were admitted on that page in source order; `candidate` is the
- * one anchor unit (a table, or the drawings of one anchor line) the applied
- * plan trials after them.
+ * Monotone admission decisions of one convergence run. Each only grows:
+ * `floors` (key → first page the unit may use), `exempt` (units placed
+ * without registration) and `retried` (`unit@region` re-registered once for
+ * geometry).
+ */
+type AnchorAdmission = Readonly<{
+  floors: ReadonlyMap<string, number>;
+  exempt: ReadonlySet<string>;
+  retried: ReadonlySet<string>;
+}>;
+
+const NO_ADMISSION: AnchorAdmission = Object.freeze({
+  floors: new Map<string, number>(),
+  exempt: new Set<string>(),
+  retried: new Set<string>(),
+});
+
+/**
+ * Where admission stands on the frontier region (a physical page and the
+ * section region opening on it, whose prescan registers its page-owned
+ * anchors): the units `accepted` there in source order, and the `candidate`
+ * selected from an observation of exactly those, with whether that
+ * observation placed the candidate's source first in the region (`leading`).
  */
 type AnchorFrontier = Readonly<{
-  pageIndex: number;
+  region: string;
   accepted: readonly string[];
-  candidate: readonly string[] | null;
-  geometryRetries: number;
+  candidate: Readonly<{ keys: readonly string[]; leading: boolean }> | null;
 }>;
 
 type PageOwnedDestination = Extract<PageWrapDestination, { kind: 'drawing' | 'floating-table' }>;
@@ -2864,33 +2885,41 @@ function pageOwnedDestinationIdentity(destination: PageOwnedDestination): string
       destination.bounds.yPt}|${destination.bounds.widthPt}|${destination.bounds.heightPt}`;
 }
 
-type PageOwnedByPage = Map<number, Map<string, PageOwnedDestination>>;
+function regionKey(pageIndex: number, flowDomainId: string): string {
+  return `${pageIndex}\u0000${flowDomainId}`;
+}
 
-function addByPage(
-  byPage: PageOwnedByPage,
+type PageOwnedByRegion = Map<string, Map<string, PageOwnedDestination>>;
+
+function addByRegion(
+  byRegion: PageOwnedByRegion,
   key: string,
   destination: PageOwnedDestination,
 ): void {
-  let page = byPage.get(destination.pageIndex);
-  if (!page) byPage.set(destination.pageIndex, page = new Map());
-  page.set(key, destination);
+  const region = regionKey(destination.pageIndex, destination.flowDomainId);
+  let entries = byRegion.get(region);
+  if (!entries) byRegion.set(region, entries = new Map());
+  entries.set(key, destination);
 }
 
-/** What a pass actually registered: the page-owned anchors of its prescans,
- * indexed by page (one pass over the reads). */
+/** What a pass actually registered, by region, and the regions in the order
+ * the pass opened them (one pass over the reads). */
 function registeredPageOwnedAnchors(
   events: readonly PageAnchorInputEvent[],
   exempt: ReadonlySet<string>,
-): PageOwnedByPage {
-  const byPage: PageOwnedByPage = new Map();
+): Readonly<{ byRegion: PageOwnedByRegion; opened: ReadonlyMap<string, number> }> {
+  const byRegion: PageOwnedByRegion = new Map();
+  const opened = new Map<string, number>();
   for (const event of events) {
     if (event.kind !== 'prescan') continue;
+    const region = regionKey(event.pageIndex, event.flowDomainId);
+    if (!opened.has(region)) opened.set(region, opened.size);
     for (const anchor of event.anchors) {
       if (anchor.kind === 'host-drawing') continue;
       const key = anchor.kind === 'drawing'
         ? anchor.occurrenceId : `table:${sourceKey(anchor.tableSource)}`;
       if (exempt.has(key)) continue;
-      addByPage(byPage, key, anchor.kind === 'drawing'
+      addByRegion(byRegion, key, anchor.kind === 'drawing'
         ? Object.freeze({
             kind: 'drawing', occurrenceId: anchor.occurrenceId,
             paragraphSource: anchor.paragraphSource,
@@ -2903,21 +2932,10 @@ function registeredPageOwnedAnchors(
           }));
     }
   }
-  return byPage;
+  return Object.freeze({ byRegion, opened });
 }
 
-function pageOwnedByPage(
-  plan: ReadonlyMap<string, PageWrapDestination>,
-  exempt: ReadonlySet<string>,
-): PageOwnedByPage {
-  const byPage: PageOwnedByPage = new Map();
-  for (const [key, destination] of plan) {
-    if (destination.kind !== 'host-drawing' && !exempt.has(key)) addByPage(byPage, key, destination);
-  }
-  return byPage;
-}
-
-function samePageAnchors(
+function sameRegionAnchors(
   left: ReadonlyMap<string, PageOwnedDestination> | undefined,
   right: ReadonlyMap<string, PageOwnedDestination> | undefined,
 ): boolean {
@@ -2931,19 +2949,26 @@ function samePageAnchors(
   return true;
 }
 
-/** Whether the unit's floor moved it to start page N in this pass: a table
- * advanced from an earlier page to its floor N, or the unit's anchor line was
- * deferred from page N-1. */
-function startedPageByFloor(
-  events: readonly PageAnchorInputEvent[],
-  unit: readonly string[],
+/** Whether `keys` (one unit) is the first body content of its region in
+ * `layout`: the region's first node is the unit's table, or a paragraph
+ * fragment whose first line anchors the unit. */
+function unitLeadsRegion(
+  layout: DocumentLayout,
   pageIndex: number,
+  flowDomainId: string,
+  keys: readonly string[],
 ): boolean {
-  const keys = new Set(unit);
-  return events.some((event) => (event.kind === 'page-owned-table'
-    && keys.has(event.key) && event.floor === pageIndex && event.pageIndex < pageIndex)
-    || (event.kind === 'anchor-line-deferral' && event.pageIndex === pageIndex - 1
-      && event.keys.some((key) => keys.has(key))));
+  const page = layout.pages.find((candidate) => candidate.pageIndex === pageIndex);
+  if (!page) return false;
+  const domains = new Set(page.sectionRegions.find((region) => (
+    region.flowDomainIds[0] === flowDomainId
+  ))?.flowDomainIds ?? [flowDomainId]);
+  const first = page.layers.body.find((node) => domains.has(node.flowDomainId));
+  if (!first) return false;
+  if (first.kind === 'table') return keys.length === 1 && keys[0] === `table:${sourceKey(first.source)}`;
+  if (first.kind !== 'paragraph') return false;
+  const lead = pageOwnedAnchorKeysByLine(first)[0] ?? [];
+  return keys.length > 0 && keys.every((key) => lead.includes(key));
 }
 
 /** Raised when a pass contradicts the admission invariant below. It is a
@@ -2960,57 +2985,67 @@ class AnchorAdmissionInvariantError extends Error {
  * margin-relative in both axes (§20.4.3.4-5), with any wrap (§20.4.2.17,
  * §20.4.2.20). Issue #1659.
  *
- * A pass registers each planned anchor on its planned page before laying that
- * page out, so text that precedes the anchor's source on the page wraps around
- * it. The anchor itself is placed where its source lands. A pass is consistent
- * when, on every page, the registered anchors are exactly the anchors that
- * landed there, with the registered geometry. Re-registering every observed
- * destination at once is not monotone: an anchor's own registration can push
- * its source off its page, and stale registrations of later anchors can
- * collide with it or reserve space it no longer uses, so plans can alternate.
+ * A pass registers each planned anchor where its section region opens on its
+ * planned page (word-page-anchor-region-registration), before laying the
+ * region out, so text that precedes the anchor's source there wraps around
+ * it. The anchor itself is placed where its source lands. A pass is
+ * consistent when, in every region, the registered anchors are exactly the
+ * anchors that landed there, with the registered geometry. Re-registering
+ * every observed destination at once is not monotone: an anchor's own
+ * registration can push its source away, and stale registrations of later
+ * anchors can collide with it or reserve space it no longer uses.
  *
- * Instead anchors are admitted like Word lays out pages: in page order and, on
- * one page, in source order. The first pass registers nothing and observes
- * where every anchor lands. Let N be the earliest page whose registrations
- * disagree with its landed anchors (the frontier). Pages before N agree, and a
- * pass is a deterministic function of its carry reads, so the next pass
- * reproduces them as long as no read before N changes; this function changes
- * reads only on N and later (pages after N keep the observed anchors as a
- * speculative registration). On N it keeps the units accepted so far:
+ * Instead anchors are admitted like Word lays out pages: in region order (the
+ * order the pass opens them) and, in one region, in source order. The first
+ * pass registers nothing. Let R be the earliest region whose registrations
+ * disagree with its landed anchors (the frontier). Regions before R agree,
+ * and a pass is a deterministic function of its carry reads, so the next pass
+ * reproduces them as long as no read before R changes; this function changes
+ * reads only in R and later regions (which keep the observed anchors as a
+ * speculative registration). In R it keeps the units accepted so far; a unit
+ * is a table, or the drawings anchored on one line (Word tests one line in
+ * one registration):
  *
- * - A pass that registered exactly the accepted units on N observes N: the
- *   earliest pending anchor that landed there, with the other drawings on its
- *   anchor line (Word tests one line in one registration), becomes the
- *   candidate unit, registered next after the accepted ones.
- * - A pass that registered exactly the accepted units plus that candidate is
- *   its trial. If the unit and every accepted anchor land on N with the
+ * - A pass that registered exactly the accepted units in R observes R: the
+ *   earliest pending unit that landed there becomes the candidate, recording
+ *   whether its source is the region's first body content in that placement.
+ * - The next pass registers exactly the accepted units plus the candidate: its
+ *   trial. If the unit and every accepted anchor land in R with the
  *   registered geometry, accept it (and select the next unit from the same
- *   pass). If the unit lands on N with other geometry, re-register it once.
- *   Otherwise its registration displaced its own source or an accepted
- *   anchor: reject it on N. Its floor becomes N+1, so the flow from its
- *   source starts the next page: a table is tried there (Word source-boundary
- *   control C06), and a drawing's anchor line moves there with the text above
- *   it kept unwrapped (word-page-anchor-line-deferral, issue #1615). A unit
- *   whose floor already started page N and that still fails cannot gain from
- *   another page: it is exempted from registration and placed where its
- *   source lands, with nothing before it on that page.
- * - Any other registration on N (speculation reaching the frontier) is
- *   replaced by the accepted units alone, to observe N.
+ *   pass). If only its geometry differs and it was not re-registered in R
+ *   before, re-register it. Otherwise its registration displaced its own
+ *   source or an accepted anchor. If the observation placed it first in R,
+ *   no later region can do better: exempt it, so it is placed unregistered
+ *   exactly as observed, with nothing before it in R. Otherwise reject it:
+ *   its floor becomes the next page, so the flow from its source starts
+ *   there: a table is tried there (Word source-boundary control C06), and a
+ *   drawing's anchor line moves there with the text above it kept
+ *   unwrapped (word-page-anchor-line-deferral, issue #1615).
+ * - Any other registration in R (speculation reaching the frontier) is
+ *   replaced by the accepted units alone, to observe R.
  *
- * Because a trial is always selected from an observation of exactly the
- * accepted units, rejecting it restores that observation's flow up to the
- * unit's source: no earlier anchor can then arrive on N, and the rejected unit
- * starts page N+1, where it is accepted or exempted.
+ * A trial is always selected from an observation of exactly the accepted
+ * units, so rejecting it restores that observation's flow up to the unit's
+ * source and no earlier anchor can then arrive in R.
  *
- * Termination: floors and exemptions only grow and are set only on the
- * frontier, and the frontier never moves back, because nothing before it
- * changes. Each pass that does not converge makes one frontier transition and
- * strictly increases (frontier page, units decided there, phase). A unit is
- * decided on at most two pages, each with one selection, at most one geometry
- * retry and one outcome; each frontier page (at most 2K) needs at most one
- * observation reset. K page-owned anchors therefore settle within 1 + 8K
- * passes. Host carries (WORD_LATER_ANCHOR_EARLIER_LINE_WRAP) only shrink;
- * while one changes on or before the frontier, page-owned reads through the
+ * Termination: the frontier region never moves back, because nothing before
+ * it changes, and `AnchorAdmission` only grows; both are bounded (regions by
+ * the page budget, decisions by the units and regions). Each pass that does
+ * not converge makes one transition that strictly increases (frontier
+ * region, units decided in it, decisions, phase), with no counter that can
+ * reset. With r_u rejections of unit u, at most 1 + 4·Σ(1 + r_u) passes are
+ * needed: per region one reset, per unit and region a selection, a retry
+ * and an outcome. A rejection is repeated only when content kept with the
+ * unit's source moves with it and precedes it again: keepNext predecessors
+ * (§17.3.1.15), or earlier lines of its own paragraph under keepLines or
+ * widow control (§17.3.1.14, §17.3.1.44). None of these is enforced at the
+ * top of a page, so each repetition leaves at least the first such paragraph
+ * (or the own-paragraph lines) behind: r_u ≤ 1 + c_u, where c_u counts the
+ * keepNext paragraphs chained before the unit plus one when its own
+ * paragraph keeps lines or controls widows. Hence at most 1 + 4(2K + C)
+ * passes for K units with C = Σc_u.
+ * Host carries (WORD_LATER_ANCHOR_EARLIER_LINE_WRAP) only shrink; while one
+ * changes on or before the frontier page, page-owned reads through the
  * frontier stay as applied for that pass.
  */
 /** @internal Exported for the admission work-count test. */
@@ -3020,17 +3055,22 @@ export function resolvePageOwnedAnchors(
   observed: ReadonlyMap<string, PageWrapDestination>,
   appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
   previous: AnchorFrontier | null,
-  floors: ReadonlyMap<string, number>,
-  exempt: ReadonlySet<string>,
+  admission: AnchorAdmission,
 ): Readonly<{
   plan: ReadonlyMap<string, PageWrapDestination>;
-  floors: ReadonlyMap<string, number>;
-  exempt: ReadonlySet<string>;
+  admission: AnchorAdmission;
   frontier: AnchorFrontier | null;
   changedAt: number;
 }> {
-  const registeredByPage = registeredPageOwnedAnchors(pass.anchorInputs, exempt);
-  const landedByPage = pageOwnedByPage(observed, exempt);
+  const { exempt } = admission;
+  const registeredAnchors = registeredPageOwnedAnchors(pass.anchorInputs, exempt);
+  const registeredByRegion = registeredAnchors.byRegion;
+  const landedByRegion: PageOwnedByRegion = new Map();
+  for (const [key, destination] of observed) {
+    if (destination.kind !== 'host-drawing' && !exempt.has(key)) {
+      addByRegion(landedByRegion, key, destination);
+    }
+  }
   let hostChangedAt = Number.POSITIVE_INFINITY;
   for (const key of new Set([...appliedPlan?.keys() ?? [], ...observed.keys()])) {
     const before = appliedPlan?.get(key);
@@ -3039,12 +3079,16 @@ export function resolvePageOwnedAnchors(
     if (JSON.stringify(before) === JSON.stringify(after)) continue;
     hostChangedAt = Math.min(hostChangedAt, before?.pageIndex ?? Infinity, after?.pageIndex ?? Infinity);
   }
-  // Compare each page once, in page order.
-  let N = Number.POSITIVE_INFINITY;
-  for (const page of [...new Set([...registeredByPage.keys(), ...landedByPage.keys()])]
-    .sort((left, right) => left - right)) {
-    if (!samePageAnchors(registeredByPage.get(page), landedByPage.get(page))) {
-      N = page;
+  // Compare each region once, in the order the pass opened them. A landed
+  // region the pass never opened sorts after the opened ones of its page.
+  const pageOf = (region: string) => Number(region.slice(0, region.indexOf('\u0000')));
+  const openedAt = (region: string) => registeredAnchors.opened.get(region) ?? Number.POSITIVE_INFINITY;
+  let frontierRegion: string | null = null;
+  for (const region of [...new Set([...registeredByRegion.keys(), ...landedByRegion.keys()])]
+    .sort((left, right) => pageOf(left) - pageOf(right) || openedAt(left) - openedAt(right)
+      || left.localeCompare(right))) {
+    if (!sameRegionAnchors(registeredByRegion.get(region), landedByRegion.get(region))) {
+      frontierRegion = region;
       break;
     }
   }
@@ -3052,25 +3096,24 @@ export function resolvePageOwnedAnchors(
   for (const [key, destination] of observed) {
     if (!exempt.has(key)) plan.set(key, destination);
   }
-  if (N === Number.POSITIVE_INFINITY) {
-    return Object.freeze({
-      plan, floors, exempt, frontier: previous, changedAt: hostChangedAt,
-    });
+  if (frontierRegion === null) {
+    return Object.freeze({ plan, admission, frontier: previous, changedAt: hostChangedAt });
   }
-  const registered = registeredByPage.get(N) ?? new Map<string, PageOwnedDestination>();
-  const landed = landedByPage.get(N) ?? new Map<string, PageOwnedDestination>();
-  // Pages before N agree; pages after N take the observed anchors as a
-  // speculative registration that later frontiers verify.
-  const setPage = (keep: ReadonlyMap<string, PageOwnedDestination>) => {
+  const N = pageOf(frontierRegion);
+  const flowDomainId = frontierRegion.slice(frontierRegion.indexOf('\u0000') + 1);
+  const registered = registeredByRegion.get(frontierRegion) ?? new Map<string, PageOwnedDestination>();
+  const landed = landedByRegion.get(frontierRegion) ?? new Map<string, PageOwnedDestination>();
+  const setRegion = (keep: ReadonlyMap<string, PageOwnedDestination>) => {
     for (const key of landed.keys()) plan.delete(key);
     for (const [key, destination] of keep) plan.set(key, destination);
   };
   if (hostChangedAt <= N) {
-    setPage(registered);
-    return Object.freeze({ plan, floors, exempt, frontier: previous, changedAt: hostChangedAt });
+    setRegion(registered);
+    return Object.freeze({ plan, admission, frontier: previous, changedAt: hostChangedAt });
   }
-  const accepted = previous?.pageIndex === N
-    && previous.accepted.every((key) => registered.has(key)) ? previous.accepted : [];
+  const current = previous?.region === frontierRegion ? previous : null;
+  const accepted = current && current.accepted.every((key) => registered.has(key))
+    ? current.accepted : [];
   const acceptedSet = new Set(accepted);
   const rank = (key: string) => order.get(key) ?? Number.POSITIVE_INFINITY;
   const byRank = (left: string, right: string) => rank(left) - rank(right) || left.localeCompare(right);
@@ -3092,6 +3135,10 @@ export function resolvePageOwnedAnchors(
       other !== key && !other.startsWith('table:') && positions!.get(other)?.lineKey === line
     ))];
   };
+  const select = (keys: readonly string[]) => Object.freeze({
+    keys: Object.freeze([...keys]),
+    leading: unitLeadsRegion(pass.layout, N, flowDomainId, keys),
+  });
   const trialed = [...registered.keys()].filter((key) => !acceptedSet.has(key));
   const same = (key: string) => {
     const before = registered.get(key);
@@ -3100,16 +3147,15 @@ export function resolvePageOwnedAnchors(
       && pageOwnedDestinationIdentity(before) === pageOwnedDestinationIdentity(after);
   };
   const keep = new Map(accepted.map((key) => [key, registered.get(key)!] as const));
-  const nextFloors = new Map(floors);
-  let nextExempt: ReadonlySet<string> = exempt;
-  const candidate = previous?.pageIndex === N ? previous.candidate : null;
+  let nextAdmission = admission;
   let frontier: AnchorFrontier;
-  if (candidate !== null && candidate[0] === first && trialed.length === candidate.length
-    && candidate.every((key) => registered.has(key))) {
+  const candidate = current?.candidate ?? null;
+  if (candidate !== null && candidate.keys[0] === first && trialed.length === candidate.keys.length
+    && candidate.keys.every((key) => registered.has(key))) {
     // A trial: exactly the accepted anchors plus the unit selected from an
     // observation of exactly the accepted anchors.
-    const unit = candidate;
-    const priorRetries = previous?.geometryRetries ?? 0;
+    const unit = candidate.keys;
+    const retryKey = `${unit[0]}@${frontierRegion}`;
     const acceptedHold = accepted.every(same);
     if (acceptedHold && unit.every(same)) {
       const admitted = [...accepted, ...unit];
@@ -3118,40 +3164,40 @@ export function resolvePageOwnedAnchors(
       const following = rest[0] === undefined ? null : unitOf(rest[0], rest);
       for (const key of following ?? []) keep.set(key, landed.get(key)!);
       frontier = Object.freeze({
-        pageIndex: N, accepted: Object.freeze(admitted),
-        candidate: following && Object.freeze([...following]), geometryRetries: 0,
+        region: frontierRegion, accepted: Object.freeze(admitted),
+        candidate: following && select(following),
       });
-    } else if (acceptedHold && unit.every((key) => landed.has(key)) && priorRetries < 1) {
+    } else if (acceptedHold && unit.every((key) => landed.has(key))
+      && !admission.retried.has(retryKey)) {
       for (const key of unit) keep.set(key, landed.get(key)!);
-      frontier = Object.freeze({
-        pageIndex: N, accepted, candidate: unit, geometryRetries: priorRetries + 1,
+      nextAdmission = Object.freeze({
+        ...admission, retried: new Set([...admission.retried, retryKey]),
       });
-    } else if (startedPageByFloor(pass.anchorInputs, unit, N)) {
-      // Its floor already started this page with the unit, and the unit
-      // still cannot stay: another page cannot help.
-      nextExempt = new Set([...exempt, ...unit]);
+      frontier = Object.freeze({ region: frontierRegion, accepted, candidate });
+    } else if (candidate.leading) {
+      nextAdmission = Object.freeze({ ...admission, exempt: new Set([...exempt, ...unit]) });
       for (const key of unit) plan.delete(key);
-      frontier = Object.freeze({ pageIndex: N, accepted, candidate: null, geometryRetries: 0 });
+      frontier = Object.freeze({ region: frontierRegion, accepted, candidate: null });
     } else {
-      for (const key of unit) nextFloors.set(key, Math.max(nextFloors.get(key) ?? 0, N + 1));
-      frontier = Object.freeze({ pageIndex: N, accepted, candidate: null, geometryRetries: 0 });
+      const floors = new Map(admission.floors);
+      for (const key of unit) floors.set(key, Math.max(floors.get(key) ?? 0, N + 1));
+      nextAdmission = Object.freeze({ ...admission, floors });
+      frontier = Object.freeze({ region: frontierRegion, accepted, candidate: null });
     }
   } else if (trialed.length === 0) {
     // An observation of exactly the accepted anchors: select the earliest
     // pending unit that landed here.
     const unit = unitOf(first, pending.filter((key) => landed.has(key)));
     for (const key of unit) keep.set(key, landed.get(key)!);
-    frontier = Object.freeze({
-      pageIndex: N, accepted, candidate: Object.freeze([...unit]), geometryRetries: 0,
-    });
+    frontier = Object.freeze({ region: frontierRegion, accepted, candidate: select(unit) });
   } else {
     // Speculative registrations reached the frontier, or an earlier anchor
-    // now lands on N: observe the page with exactly the accepted anchors.
-    frontier = Object.freeze({ pageIndex: N, accepted, candidate: null, geometryRetries: 0 });
+    // now lands in R: observe R with exactly the accepted anchors.
+    frontier = Object.freeze({ region: frontierRegion, accepted, candidate: null });
   }
-  setPage(keep);
+  setRegion(keep);
   return Object.freeze({
-    plan, floors: nextFloors, exempt: nextExempt, frontier, changedAt: Math.min(N, hostChangedAt),
+    plan, admission: nextAdmission, frontier, changedAt: Math.min(N, hostChangedAt),
   });
 }
 
@@ -3174,11 +3220,21 @@ function* paginateBodyWithAnchorConvergenceSteps(
 ): PaginationSteps<BodyPaginationPassResult> {
   const anchorOrder = pageOwnedAnchorOrder(input);
   const pageOwnedAnchorCount = anchorOrder.size;
+  // An upper bound of C in `resolvePageOwnedAnchors`: every keepNext
+  // paragraph, and every anchoring paragraph that keeps lines or controls
+  // widows.
+  let keptWithAnchors = 0;
+  for (const entry of input.sequence) {
+    if (entry.kind !== 'body-block' || entry.block.kind !== 'paragraph') continue;
+    if (entry.block.keepNext) keptWithAnchors += 1;
+    if ((entry.block.pageOwnedAnchorOccurrenceIds?.length ?? 0) > 0
+      && (entry.block.keepLines || entry.block.widowControl)) keptWithAnchors += 1;
+  }
   // Operational resource guard, not a claim about the state space: K
-  // page-owned anchors settle within 1 + 8K passes (`resolvePageOwnedAnchors`).
-  // Reaching it is a defensive assertion that renders the fallback below,
-  // never a failure.
-  let anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 8 * pageOwnedAnchorCount;
+  // page-owned anchors settle within 1 + 4(2K + C) passes
+  // (`resolvePageOwnedAnchors`). Reaching it is a defensive assertion that
+  // renders the fallback below, never a failure.
+  let anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 8 * pageOwnedAnchorCount + 4 * keptWithAnchors;
   // A carry-free pass may change from the first page that holds a carried
   // paragraph-relative drawing (WORD_LATER_ANCHOR_EARLIER_LINE_WRAP).
   const carryBounded = (limit: (pass: BodyPaginationPassResult) => number) =>
@@ -3205,42 +3261,36 @@ function* paginateBodyWithAnchorConvergenceSteps(
   };
   type AnchorPassCarry = Readonly<{
     plan: ReadonlyMap<string, PageWrapDestination>;
-    floors: ReadonlyMap<string, number>;
-    exempt: ReadonlySet<string>;
+    admission: AnchorAdmission;
     frontier: AnchorFrontier | null;
   }>;
-  const noFloors: ReadonlyMap<string, number> = new Map();
-  const noExempt: ReadonlySet<string> = new Set();
   /** The carry applied by the latest pass and the earliest page at which its
    * reads were changing (the frontier). */
   let latest: Readonly<{
     plan: ReadonlyMap<string, PageWrapDestination> | null;
-    floors: ReadonlyMap<string, number>;
-    exempt: ReadonlySet<string>;
+    admission: AnchorAdmission;
     changedAt: number;
   }> | null = null;
   let converged: AnchorPassCarry | null = null;
   const converge = function* (
     initial?: Readonly<{
       plan: ReadonlyMap<string, PageWrapDestination>;
-      floors?: ReadonlyMap<string, number>;
-      exempt?: ReadonlySet<string>;
+      admission?: AnchorAdmission;
     }>,
     publish = true,
   ) {
     latest = null;
-    const initialFloors = initial?.floors ?? noFloors;
-    const initialExempt = initial?.exempt ?? noExempt;
+    const initialAdmission = initial?.admission ?? NO_ADMISSION;
     const result = (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
       pass: BodyPaginationPassResult;
     }>, number, AnchorPassCarry>({
       ...(initial
-        ? { seedState: anchorCarryIdentity(initial.plan, initialFloors, initialExempt, null) }
+        ? { seedState: anchorCarryIdentity(initial.plan, initialAdmission, null) }
         : {}),
       step: function* anchorPass(previous) {
         const appliedPlan = previous?.plan ?? initial?.plan ?? null;
-        const appliedFloors = previous?.floors ?? initialFloors;
-        const appliedExempt = previous?.exempt ?? initialExempt;
+        const appliedAdmission = previous?.admission ?? initialAdmission;
+        const appliedFloors = appliedAdmission.floors;
         const pass = yield* paginateBodyPassSteps(
           input,
           services,
@@ -3257,14 +3307,14 @@ function* paginateBodyWithAnchorConvergenceSteps(
         }
         const record = (changedAt: number) => {
           latest = Object.freeze({
-            plan: appliedPlan, floors: appliedFloors, exempt: appliedExempt, changedAt,
+            plan: appliedPlan, admission: appliedAdmission, changedAt,
           });
         };
         let next: ReturnType<typeof resolvePageOwnedAnchors>;
         try {
           next = resolvePageOwnedAnchors(
             anchorOrder, pass, observed, appliedPlan,
-            previous?.frontier ?? null, appliedFloors, appliedExempt,
+            previous?.frontier ?? null, appliedAdmission,
           );
         } catch (error) {
           if (error instanceof AnchorAdmissionInvariantError) record(error.pageIndex);
@@ -3274,25 +3324,23 @@ function* paginateBodyWithAnchorConvergenceSteps(
         return Object.freeze({
           pass,
           plan: next.plan,
-          floors: next.floors,
-          exempt: next.exempt,
+          admission: next.admission,
           frontier: next.frontier,
         });
       },
-      stateOf: (value) => anchorCarryIdentity(value.plan, value.floors, value.exempt, value.frontier),
-      // The next anchor pass reads only the plan and the floors (exemptions
-      // are absent from the plan); the frontier only interprets its result.
+      stateOf: (value) => anchorCarryIdentity(value.plan, value.admission, value.frontier),
+      // The next anchor pass reads only the plan and the floors (exempt and
+      // retried units only shape the plan); the frontier only interprets it.
       // The superseded pass (its whole layout) is not carried.
       carry: (value) => Object.freeze({
         plan: value.plan,
-        floors: value.floors,
-        exempt: value.exempt,
+        admission: value.admission,
         frontier: value.frontier,
       }),
       limit: anchorPassLimit,
     })).value;
     converged = Object.freeze({
-      plan: result.plan, floors: result.floors, exempt: result.exempt, frontier: null,
+      plan: result.plan, admission: result.admission, frontier: null,
     });
     return result.pass;
   };
@@ -3312,7 +3360,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
     for (const [key, destination] of last?.plan ?? []) {
       if (destination.pageIndex < fromPage) plan.set(key, destination);
     }
-    const floors = last?.floors ?? noFloors;
+    const floors = last?.admission.floors ?? NO_ADMISSION.floors;
     return yield* paginateBodyPassSteps(
       input,
       services,
@@ -3364,12 +3412,12 @@ function* paginateBodyWithAnchorConvergenceSteps(
     settledCarry?.plan ?? pageAnchorDestinationPlan(settled.layout),
   );
   for (const [key, destination] of hostPlan) carriedPlan.set(key, destination);
-  anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 8 * pageOwnedAnchorCount + 4 * hostPlan.size;
+  anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 8 * pageOwnedAnchorCount + 4 * keptWithAnchors
+    + 4 * hostPlan.size;
   try {
     return yield* converge({
       plan: carriedPlan,
-      floors: settledCarry?.floors ?? noFloors,
-      exempt: settledCarry?.exempt ?? noExempt,
+      admission: settledCarry?.admission ?? NO_ADMISSION,
     }, false);
   } catch (error) {
     if (!isConvergenceFailure(error)) throw error;

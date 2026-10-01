@@ -97,36 +97,83 @@ function line(extraRuns: readonly unknown[] = []): BodyElement {
   } as unknown as BodyElement;
 }
 
-/** A paragraph anchoring a page- or margin-relative image (§20.4.3.4-5). */
+/** A paragraph anchoring an image positioned against the page or margin
+ * (page-owned, §20.4.3.4-5) or against its paragraph (host-owned). */
 function anchoredImageLine(spec: Readonly<{
   widthPt: number; heightPt: number; yPt: number;
-  relativeFrom: 'page' | 'margin'; wrap: 'topAndBottom' | 'square';
-}>): BodyElement {
-  return line([{
-    type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
-    widthPt: spec.widthPt, heightPt: spec.heightPt, anchor: true,
-    anchorXPt: 0, anchorYPt: spec.yPt, anchorXFromMargin: true, anchorYFromPara: false,
-    wrapMode: spec.wrap, wrapSide: 'bothSides',
-    anchorXRelativeFrom: 'margin', anchorYRelativeFrom: spec.relativeFrom,
-  }]);
+  relativeFrom: 'page' | 'margin' | 'paragraph'; wrap: 'topAndBottom' | 'square';
+}>, paragraph: Partial<Record<'keepNext' | 'keepLines' | 'widowControl', boolean>> = {}): BodyElement {
+  return {
+    ...line([{
+      type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+      widthPt: spec.widthPt, heightPt: spec.heightPt, anchor: true,
+      anchorXPt: 0, anchorYPt: spec.yPt, anchorXFromMargin: true,
+      anchorYFromPara: spec.relativeFrom === 'paragraph',
+      wrapMode: spec.wrap, wrapSide: 'bothSides',
+      anchorXRelativeFrom: 'margin', anchorYRelativeFrom: spec.relativeFrom,
+    }]),
+    ...paragraph,
+  } as BodyElement;
 }
 
-/** A one-row page/margin-positioned floating table (§17.4.57). */
+/** A paragraph of `count` text lines (each glyph is 5 pt wide at 10 pt). */
+function textParagraph(
+  count: number,
+  widthPt: number,
+  paragraph: Partial<Record<'keepNext' | 'keepLines' | 'widowControl', boolean>> = {},
+): BodyElement {
+  const base = line() as BodyElement & { runs: Array<Record<string, unknown>> };
+  const glyphs = Math.max(1, Math.floor(widthPt / 5) - 1) * count;
+  return {
+    ...base,
+    runs: [{ ...base.runs[0]!, text: 'x'.repeat(Math.max(1, glyphs - 1)) }],
+    ...paragraph,
+  } as BodyElement;
+}
+
+type Columns = Readonly<{ widthsPt: readonly number[]; spacePt: number }> | null;
+
+function columnsSpec(columns: Columns) {
+  if (!columns) return null;
+  return {
+    count: columns.widthsPt.length, spacePt: columns.spacePt,
+    equalWidth: false, sep: false,
+    cols: columns.widthsPt.map((widthPt) => ({ widthPt, spacePt: columns.spacePt })),
+  };
+}
+
+/** A section break ending a section of the given page size and columns. */
+function sectionBreak(
+  kind: 'nextPage' | 'continuous',
+  pageWidth: number,
+  pageHeight: number,
+  columns: Columns,
+): BodyElement {
+  return {
+    type: 'sectionBreak', kind, columns: columnsSpec(columns),
+    geom: {
+      pageWidth, pageHeight, marginTop: 72, marginRight: 72, marginBottom: 72, marginLeft: 72,
+      headerDistance: 36, footerDistance: 36,
+    },
+  } as unknown as BodyElement;
+}
+
+/** A page/margin-positioned floating table (§17.4.57) of exact-height rows. */
 function floatingTable(spec: Readonly<{
-  widthPt: number; heightPt: number; tblpY: number;
+  widthPt: number; heightPt: number | readonly number[]; tblpY: number;
   vertAnchor: 'page' | 'margin'; distancePt: number;
 }>): BodyElement {
   const noBorders = { top: null, bottom: null, left: null, right: null, insideH: null, insideV: null };
   return {
     type: 'table',
     colWidths: [spec.widthPt],
-    rows: [{
+    rows: (typeof spec.heightPt === 'number' ? [spec.heightPt] : spec.heightPt).map((rowHeight) => ({
       cells: [{
         content: [], colSpan: 1, vMerge: null, borders: noBorders,
         background: null, vAlign: 'top', widthPt: null,
       }],
-      rowHeight: spec.heightPt, rowHeightRule: 'exact', isHeader: false,
-    }],
+      rowHeight, rowHeightRule: 'exact', isHeader: false,
+    })),
     borders: noBorders,
     cellMarginTop: 0, cellMarginBottom: 0, cellMarginLeft: 0, cellMarginRight: 0,
     jc: 'left',
@@ -139,13 +186,18 @@ function floatingTable(spec: Readonly<{
   } as unknown as BodyElement;
 }
 
-function documentModel(body: BodyElement[]): DocxDocumentModel {
+function documentModel(
+  body: BodyElement[],
+  final: Readonly<{ pageWidth: number; pageHeight: number; columns: Columns }> = {
+    pageWidth: 612, pageHeight: 792, columns: null,
+  },
+): DocxDocumentModel {
   return {
     section: {
-      pageWidth: 612, pageHeight: 792,
+      pageWidth: final.pageWidth, pageHeight: final.pageHeight,
       marginTop: 72, marginRight: 72, marginBottom: 72, marginLeft: 72,
       headerDistance: 36, footerDistance: 36, titlePage: false, evenAndOddHeaders: false,
-      sectionStart: 'nextPage', columns: null,
+      sectionStart: 'nextPage', columns: columnsSpec(final.columns),
     },
     body,
     headers: { default: null, first: null, even: null },
@@ -189,8 +241,20 @@ function expectWellFormed(result: DocumentLayout): void {
   for (const page of result.pages) {
     const tables = page.layers.body.filter((node) => node.kind === 'table')
       .map((node) => node.flowBounds);
+    // Text is checked against page-owned root fragments. A row continuing in
+    // a later column or page is host-flow ("fresh-text" frame); its geometry
+    // is outside page-owned admission.
+    const pageOwnedTables = page.layers.body.filter((node) => (
+      node.kind === 'table' && node.sectionFlowOwnership === 'page'
+    )).map((node) => node.flowBounds);
     const drawings = page.layers.body.flatMap((node) => node.kind === 'paragraph'
       ? node.drawings.filter((drawing) => drawing.anchorLayer?.verticalOwnership === 'page')
+        .map((drawing) => drawing.flowBounds)
+      : []);
+    // Host-relative drawings may explain wrap gaps; their own overlap with
+    // earlier lines is outside page-owned admission.
+    const hostDrawings = page.layers.body.flatMap((node) => node.kind === 'paragraph'
+      ? node.drawings.filter((drawing) => drawing.anchorLayer?.verticalOwnership === 'host')
         .map((drawing) => drawing.flowBounds)
       : []);
     const text = page.layers.body.flatMap((node) => node.kind === 'paragraph' ? node.lines : [])
@@ -201,7 +265,7 @@ function expectWellFormed(result: DocumentLayout): void {
       }
     });
     for (const box of text) {
-      for (const obstacle of [...tables, ...drawings]) {
+      for (const obstacle of [...pageOwnedTables, ...drawings]) {
         expect(overlaps(box, obstacle), `page ${page.pageIndex} text over float`).toBe(false);
       }
     }
@@ -210,7 +274,7 @@ function expectWellFormed(result: DocumentLayout): void {
     // plus one 24 pt line that could not fit above it.
     const covered = [
       ...text.map((box) => [box.yPt, box.yPt + box.heightPt] as const),
-      ...[...tables, ...drawings].map((box) => [
+      ...[...tables, ...drawings, ...hostDrawings].map((box) => [
         box.yPt - 18 - 24 - 0.01, box.yPt + box.heightPt + 18.01,
       ] as const),
     ].sort((left, right) => left[0] - right[0]);
@@ -225,33 +289,83 @@ function expectWellFormed(result: DocumentLayout): void {
   }
 }
 
-function randomDocument(pick: <T>(values: readonly T[]) => T) {
+type Pick = <T>(values: readonly T[]) => T;
+
+const PAGE_SIZES = [[612, 792], [792, 612], [595, 842]] as const;
+
+function randomColumns(pick: Pick, pageWidth: number): Columns {
+  const count = pick([1, 1, 2, 3]);
+  if (count === 1) return null;
+  const spacePt = pick([12, 18, 36]);
+  const available = pageWidth - 144 - spacePt * (count - 1);
+  const shares = Array.from({ length: count }, () => pick([1, 2, 3]));
+  const total = shares.reduce((sum, share) => sum + share, 0);
+  const widthsPt = shares.map((share) => Math.floor((available * share) / total));
+  return { widthsPt, spacePt };
+}
+
+/**
+ * A random document of paragraphs (single- and multi-line, keepNext chains,
+ * keepLines, widow control), page/margin floating tables (one or several
+ * exact rows), page/margin and paragraph-relative drawings, in up to three
+ * sections with different page sizes and 1-3 unequal columns. Returns the
+ * page-owned anchor count K and C, the keepNext paragraphs plus the anchoring
+ * paragraphs that keep lines or control widows, for the bound 1 + 4(2K + C).
+ */
+function randomDocument(pick: Pick) {
   const body: BodyElement[] = [];
   let anchors = 0;
-  const count = pick([1, 2, 3, 4, 5]);
-  for (let index = 0; index < count; index += 1) {
-    body.push(...lines(pick([0, 3, 12, 20, 24, 25, 26, 27, 30])));
-    anchors += 1;
-    if (pick([true, false])) {
-      body.push(floatingTable({
-        widthPt: pick([150, 300, 468, 524]),
-        heightPt: pick([24, 120, 360, 600, 648]),
-        tblpY: pick([0, 36, 72, 144, 400]),
-        vertAnchor: pick(['page', 'margin'] as const),
-        distancePt: pick([0, 9, 18]),
-      }));
+  let kept = 0;
+  const sections = pick([1, 1, 2, 3]);
+  let final = { pageWidth: 612, pageHeight: 792, columns: null as Columns };
+  for (let section = 0; section < sections; section += 1) {
+    const [pageWidth, pageHeight] = pick(PAGE_SIZES);
+    const columns = randomColumns(pick, pageWidth);
+    const columnWidth = columns ? Math.min(...columns.widthsPt) : pageWidth - 144;
+    const count = pick([1, 2, 3, 4]);
+    for (let index = 0; index < count; index += 1) {
+      body.push(...lines(pick([0, 3, 12, 20, 24, 25, 26, 30])));
+      const chain = pick([0, 0, 1, 2]);
+      for (let member = 0; member < chain; member += 1) {
+        const lineCount = pick([1, 3]);
+        const keepLines = pick([false, true]);
+        const widowControl = pick([false, true]);
+        body.push(textParagraph(lineCount, columnWidth, { keepNext: true, keepLines, widowControl }));
+        kept += 1;
+      }
+      const kind = pick(['table', 'page-drawing', 'page-drawing', 'host-drawing'] as const);
+      if (kind === 'table') {
+        anchors += 1;
+        body.push(floatingTable({
+          widthPt: pick([150, 300, 468, 524]),
+          heightPt: pick([24, 120, 360, 600, 648, [120, 48, 48, 48, 240], [200, 200]]),
+          tblpY: pick([0, 36, 72, 144, 400]),
+          vertAnchor: pick(['page', 'margin'] as const),
+          distancePt: pick([0, 9, 18]),
+        }));
+      } else {
+        if (kind === 'page-drawing') anchors += 1;
+        const keepLines = pick([false, false, true]);
+        const widowControl = pick([false, true]);
+        kept += kind === 'page-drawing' && (keepLines || widowControl) ? 1 : 0;
+        body.push(anchoredImageLine({
+          widthPt: pick([150, 468]),
+          heightPt: pick([48, 120, 200, 360, 500, 624]),
+          yPt: pick([0, 36, 72, 144]),
+          relativeFrom: kind === 'host-drawing'
+            ? 'paragraph' : pick(['page', 'margin'] as const),
+          wrap: pick(['topAndBottom', 'square'] as const),
+        }, { keepLines, widowControl }));
+      }
+    }
+    body.push(...lines(pick([0, 1, 2])));
+    if (section < sections - 1) {
+      body.push(sectionBreak(pick(['nextPage', 'continuous'] as const), pageWidth, pageHeight, columns));
     } else {
-      body.push(anchoredImageLine({
-        widthPt: pick([150, 468]),
-        heightPt: pick([48, 120, 200, 360, 500]),
-        yPt: pick([0, 36, 72, 144]),
-        relativeFrom: pick(['page', 'margin'] as const),
-        wrap: pick(['topAndBottom', 'square'] as const),
-      }));
+      final = { pageWidth, pageHeight, columns };
     }
   }
-  body.push(...lines(pick([0, 1, 2])));
-  return { model: documentModel(body), anchors };
+  return { model: documentModel(body, final), anchors, kept };
 }
 
 describe('page-owned anchor admission', () => {
@@ -277,6 +391,47 @@ describe('page-owned anchor admission', () => {
     expectWellFormed(result.layout);
   });
 
+  it('rejects again when a keepNext predecessor follows the deferred anchor line', () => {
+    // Review repro: the 624 pt image and its anchor line fill a page; the
+    // keepNext predecessor moves with the deferred line, so on the next page
+    // the line does not lead and the image cannot stay with it. That is a
+    // second rejection, not an exemption that would overlap the predecessor.
+    const result = layout(documentModel([
+      ...lines(25),
+      { ...line(), keepNext: true } as BodyElement,
+      anchoredImageLine({
+        widthPt: 468, heightPt: 624, yPt: 0, relativeFrom: 'margin', wrap: 'topAndBottom',
+      }),
+      line(),
+    ]));
+    expect(result.fallbacks).toBe(0);
+    const pageOf = (index: number) => result.layout.pages.find((page) => (
+      page.layers.body.some((node) => node.source.path[0] === index)
+    ))!.pageIndex;
+    expect([pageOf(25), pageOf(26)]).toEqual([1, 2]);
+    expect(result.passes).toBeLessThanOrEqual(1 + 4 * (2 * 1 + 1));
+    expectWellFormed(result.layout);
+  });
+
+  it('registers a page-anchored table that moves to a later column', () => {
+    // Review repro: the table's trial moves its source from column 0 to
+    // column 1. Its destination is registered where the section region opens
+    // (a column transition is never prescanned), so the trial is read and
+    // settles instead of reselecting forever.
+    const result = layout(documentModel([
+      anchoredImageLine({
+        widthPt: 468, heightPt: 120, yPt: 72, relativeFrom: 'page', wrap: 'square',
+      }),
+      line(),
+      floatingTable({
+        widthPt: 300, heightPt: [120, 48, 48, 48, 240], tblpY: 72, vertAnchor: 'page', distancePt: 0,
+      }),
+    ], { pageWidth: 612, pageHeight: 792, columns: { widthsPt: [225, 225], spacePt: 18 } }));
+    expect(result.fallbacks).toBe(0);
+    expect(result.passes).toBeLessThanOrEqual(1 + 4 * 2 * 2);
+    expectWellFormed(result.layout);
+  });
+
   it('admits coupled page-anchored tables in source order', () => {
     // Review repro: T1/T2/T3 destination plans alternated (0, 1, 2) and
     // (absent, 4, 5). T1's own exclusion pushes its source to page 1 (Word
@@ -296,21 +451,20 @@ describe('page-owned anchor admission', () => {
     expectWellFormed(result.layout);
   });
 
-  it('settles random table and drawing mixes within 1 + 8K passes without the fallback', () => {
-    // Property: random interleavings of paragraphs, page/margin floating
-    // tables and page/margin drawings (heights up to the page body, varied
-    // offsets, wraps and distances) settle within the stated bound, never
-    // reach the defensive fallback, are well formed and deterministic.
+  it('settles random table, drawing, column, section and keep mixes within the bound', () => {
+    // Property (see randomDocument): every sample settles within
+    // 1 + 4(2K + C) passes, never reaches the defensive fallback, is well
+    // formed and is deterministic.
     let seed = 0x1659;
     const pick = <T>(values: readonly T[]): T => {
       seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
       return values[(seed >>> 8) % values.length]!;
     };
-    for (let sample = 0; sample < 300; sample += 1) {
-      const { model, anchors } = randomDocument(pick);
+    for (let sample = 0; sample < 500; sample += 1) {
+      const { model, anchors, kept } = randomDocument(pick);
       const first = layout(model);
       expect(first.fallbacks, `sample ${sample}`).toBe(0);
-      expect(first.passes, `sample ${sample}`).toBeLessThanOrEqual(1 + 8 * anchors);
+      expect(first.passes, `sample ${sample}`).toBeLessThanOrEqual(1 + 4 * (2 * anchors + kept));
       expectWellFormed(first.layout);
       if (sample % 10 === 0) {
         expect(layoutFingerprint(layout(model).layout)).toBe(layoutFingerprint(first.layout));
@@ -361,7 +515,8 @@ describe('page-owned anchor admission', () => {
       const result = resolvePageOwnedAnchors(
         order,
         { anchorInputs: counted, layout: { pages: [], diagnostics: [] } } as unknown as BodyPaginationPassResult,
-        plan, plan, null, new Map(), new Set(),
+        plan, plan, null,
+        { floors: new Map(), exempt: new Set(), retried: new Set() },
       );
       expect(result.frontier).toBeNull();
       return reads;
@@ -400,7 +555,9 @@ describe('page-owned anchor admission', () => {
         forced += result.fallbacks > 0 ? 1 : 0;
         const sources = new Set(result.layout.pages.flatMap((page) => page.layers.body)
           .map((node) => node.source.path[0]));
-        expect(sources.size).toBe(model.body.length);
+        expect(sources.size).toBe(model.body.filter((element) => (
+          element.type === 'paragraph' || element.type === 'table'
+        )).length);
         expectWellFormed(result.layout);
       }
       expect(forced).toBeGreaterThan(10);

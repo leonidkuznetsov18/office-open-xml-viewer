@@ -674,6 +674,7 @@ function convergeFloatingParentTransaction(
     freshAdmissionHeightPt,
   } = frame;
   let transaction: FloatingParentTransactionPass;
+  let lastResult: ReturnType<typeof takeTableFragment> | null = null;
   try {
     transaction = convergeExactState<FloatingParentTransactionPass>({
       step: (previous) => {
@@ -730,6 +731,7 @@ function convergeFloatingParentTransaction(
           reacquirePageDependentBlock: (request) =>
             operations.reacquireBodyTableBlock(state, dependencies.source, request),
         });
+        lastResult = result;
         if (!result.fragment || result.requiresFreshPage) {
           return Object.freeze({
             kind: 'fresh-flow-region' as const,
@@ -797,6 +799,14 @@ function convergeFloatingParentTransaction(
       limit: 16,
     }).value;
   } catch (error) {
+    // The parent frame alternates between two placements: at one the
+    // fragment fitted to the frame collides and is moved; at the other the
+    // smaller fragment resolves back. No placement in this flow region is
+    // stable, so the table continues in a fresh flow region, as when it
+    // cannot fit here (§17.4.57 positions are kept; only the region moves).
+    if (error instanceof ExactConvergenceError && error.reason === 'cycle' && lastResult) {
+      return Object.freeze({ kind: 'fresh-flow-region' as const, result: lastResult });
+    }
     if (error instanceof ExactConvergenceError) {
       throw new LayoutInvariantError(
         'NON_CONVERGENCE',
