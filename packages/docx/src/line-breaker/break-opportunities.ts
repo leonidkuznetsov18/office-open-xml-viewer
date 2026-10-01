@@ -1,13 +1,13 @@
+import { measureFitTextUnit, measureJoinedTextUnit } from './atomic-units.js';
 import { justifiedCandidateFitWidth } from './justify-fit.js';
 import {
-  DEFAULT_KINSOKU_RULES,
   kinsokuAdjustedSplit,
   isGraphemeFillText,
   isDictionarySeaText,
   fitSeaWordPrefix,
   graphemeClusterOffsets,
 } from '@silurus/ooxml-core';
-import { EAST_ASIAN_RE, nextTabStop } from '../layout/text.js';
+import { EAST_ASIAN_RE } from '../layout/text.js';
 import {
   wordIsOverflowPunctuation,
   wordIdeographicSpaceLineEndAllowanceCount,
@@ -18,19 +18,20 @@ import {
   type LayoutSeg,
   type LayoutTabSeg,
   type LayoutTextSeg,
+  type LineBoundary,
 } from './model.js';
 import {
   RESET_SLICED_TEXT_MEASUREMENT,
   charScaleFactor,
   charSpacingDeltaPx,
-  hardJoinPrefixEnd,
   legalTextSplitAtOrBefore,
   segAdvanceWidth,
   segmentCharacterGridDeltaPx,
   slicedTextMetadata,
   snapToCharsClass,
 } from './advance.js';
-import { tabAlignmentRole } from './tabs.js';
+import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
+import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
   extendThroughTrailingIdeographicSpaces,
@@ -38,7 +39,7 @@ import {
   rebaseSeaBreaks,
 } from './text-runs.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import type { PassOperationState } from './pass-operations.js';
+import { LineGapRejection, type PassOperationState } from './pass-operations.js';
 
 /** The iterator reads only its declared slice of the explicit pass state. */
 export type BreakOpportunityIteratorContext = Pick<
@@ -59,6 +60,9 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'tabStops'
   | 'defaultTabPt'
   | 'tabFollowingMetrics'
+  | 'bidiCustomStopsPx'
+  | 'bidiIntervalPx'
+  | 'decimalAlignmentPoint'
   | 'availW'
   | 'setMeasureFont'
   | 'fontFamilyClasses'
@@ -84,45 +88,124 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'keepLeadingKinsokuWithCurrentLine'
   | 'externalLinkSyntaxSplit'
   | 'queueEmergencyTail'
+  | 'forcedPlacement'
+  | 'minimalLegalTextWidth'
 >;
 
-/** Consume one prepared queue in source order, applying all legal break paths. */
-export function iterateBreakOpportunities(context: BreakOpportunityIteratorContext): void {
-  const { breakerState, flush } = context;
-  while (breakerState.queue.length > 0) {
-    const seg = breakerState.queue.shift()!;
+/** Transaction hooks for WORD_FLOAT_GAP_FLOW admission (#1670). */
+export interface GapTransactionHooks {
+  readonly captureGapSnapshot: () => void;
+  readonly rejectGap: (rejection: LineGapRejection) => void;
+}
 
-    // ── Line-break sentinel ──────────────────────────────
-    if ('lineBreak' in seg) {
-      // The line being flushed ends at a MANUAL break (§17.3.3.1) — mark it so a
-      // justified paragraph left-aligns it like its final line (§17.18.44).
-      flush(seg.fontSize, true);
-      breakerState.trailingBreakFontSize = seg.fontSize;
-      continue;
-    }
-    breakerState.trailingBreakFontSize = null;
+function sameBoundary(left: LineBoundary | undefined, right: LineBoundary): boolean {
+  return left !== undefined && left.segIndex === right.segIndex && left.charOffset === right.charOffset;
+}
 
-    // ── Tab segment ──────────────────────────────────────
-    if ('isTab' in seg) {
-      processTabSegment(context, seg);
-      continue;
-    }
-
-    // ── Image segment ────────────────────────────────────
-    if ('imagePath' in seg) {
-      processImageSegment(context, seg);
-      continue;
-    }
-
-    // ── Math segment ─────────────────────────────────────
-    if ('math' in seg) {
-      processMathSegment(context, seg);
-      continue;
-    }
-
-    // ── Text segment ─────────────────────────────────────
-    processTextSegment(context, seg as LayoutTextSeg);
+/** Index in the current line where the joined unit ending at its last item
+ * starts: source seams marked `joinPrev` permit no line boundary. */
+function joinedUnitStart(line: readonly LayoutSeg[]): number {
+  let index = line.length - 1;
+  while (index > 0) {
+    const item = line[index]!;
+    if (!('text' in item) || !item.joinPrev) break;
+    index -= 1;
   }
+  return Math.max(0, index);
+}
+
+/** The single rollback predicate of a narrowed gap: the head unit's placed
+ * advance (from the line start, joined followers included, collapsible
+ * U+0020 suffix excluded outside RTL) exceeds the fragment. */
+function placedAdvanceExceeds(
+  context: BreakOpportunityIteratorContext,
+  segment: LayoutTextSeg,
+  placedText: string,
+): boolean {
+  const { breakerState, strAdvance, availW, fitsMeasuredWidth, baseRtl } = context;
+  // A line-end U+3000 run hangs as whitespace (word-ideographic-space hang).
+  const visible = (baseRtl ? placedText : placedText.replace(/ +$/u, '')).replace(/\u3000+$/u, '');
+  return !fitsMeasuredWidth(breakerState.currentWidth + strAdvance(segment, visible), availW());
+}
+
+function lineAdvanceFrom(line: readonly LayoutSeg[], start: number): number {
+  let width = 0;
+  for (let index = start; index < line.length; index += 1) {
+    width += (line[index] as { measuredWidth?: number }).measuredWidth ?? 0;
+  }
+  return width;
+}
+
+/** Consume one prepared queue in source order, applying all legal break paths.
+ * A narrowed float-gap fragment is a transaction: a forced placement inside it
+ * rolls the fragment back (`rejectGap`) and processing resumes from the
+ * restored queue in the next admissible window. */
+export function iterateBreakOpportunities(
+  context: BreakOpportunityIteratorContext,
+  hooks?: GapTransactionHooks,
+): void {
+  const { breakerState, flush } = context;
+  const resolveCompletedTabCells = createBidiTabCellResolver();
+  while (breakerState.queue.length > 0) {
+    const transaction = breakerState.gapTransaction;
+    if (transaction?.narrowed) {
+      const head = breakerState.queue[0]!;
+      if (transaction.stopBefore && breakerState.currentLine.length > 0
+        && sameBoundary(head.src, transaction.stopBefore)) {
+        // Replay of a rejected fragment ends before its forced unit.
+        flush(undefined, false, head.src);
+        continue;
+      }
+      if (breakerState.currentLine.length === 0) hooks?.captureGapSnapshot();
+    }
+    const seg = breakerState.queue.shift()!;
+    breakerState.inHand = seg;
+    try {
+      processQueuedSegment(context, seg, resolveCompletedTabCells);
+    } catch (error) {
+      if (!(error instanceof LineGapRejection) || !hooks) throw error;
+      hooks.rejectGap(error);
+    }
+    breakerState.inHand = undefined;
+  }
+}
+
+function processQueuedSegment(
+  context: BreakOpportunityIteratorContext,
+  seg: LayoutSeg,
+  resolveCompletedTabCells: ReturnType<typeof createBidiTabCellResolver>,
+): void {
+  const { breakerState, flush } = context;
+  // ── Line-break sentinel ──────────────────────────────
+  if ('lineBreak' in seg) {
+    // The line being flushed ends at a MANUAL break (§17.3.3.1) — mark it so a
+    // justified paragraph left-aligns it like its final line (§17.18.44).
+    flush(seg.fontSize, true);
+    breakerState.trailingBreakFontSize = seg.fontSize;
+    return;
+  }
+  breakerState.trailingBreakFontSize = null;
+
+  // ── Tab segment ──────────────────────────────────────
+  if ('isTab' in seg) {
+    processTabSegment(context, seg, resolveCompletedTabCells);
+    return;
+  }
+
+  // ── Image segment ────────────────────────────────────
+  if ('imagePath' in seg) {
+    processImageSegment(context, seg);
+    return;
+  }
+
+  // ── Math segment ─────────────────────────────────────
+  if ('math' in seg) {
+    processMathSegment(context, seg);
+    return;
+  }
+
+  // ── Text segment ─────────────────────────────────────
+  processTextSegment(context, seg as LayoutTextSeg);
 }
 
 function processTextSegment(context: BreakOpportunityIteratorContext, seg: LayoutTextSeg): void {
@@ -221,16 +304,16 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // instead of violating the required internal non-wrap boundary.
   if (s.fitTextRegionIndex !== undefined) {
     if (s.fitTextRegionStart) {
-      let regionWidth = w;
-      for (const queued of breakerState.queue) {
-        if (!('text' in queued) || queued.fitTextRegionIndex !== s.fitTextRegionIndex) break;
-        regionWidth += segAdvance(queued);
-      }
+      const regionWidth = measureFitTextUnit(s, breakerState.queue, context);
       if (
         breakerState.currentLine.length > 0 &&
         breakerState.currentWidth + regionWidth > availW()
       ) {
         flush(undefined, false, s.src);
+      }
+      // The region is one fixed cell: it cannot be forced into a narrower gap.
+      if (breakerState.currentLine.length === 0 && !context.fitsMeasuredWidth(regionWidth, availW())) {
+        context.forcedPlacement(regionWidth);
       }
     }
     s.measuredWidth = w;
@@ -254,12 +337,15 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       ? trailingSpaceW
       : undefined;
   s.latinSpaceCompressionPx = undefined;
+  // Library containment policy: an RTL line is anchored at its right edge,
+  // so even an invisible trailing-space advance shifts visible LTR cells left.
+  // Count that advance during fitting instead of admitting glyphs past the band.
   const fitWidthFor = (
     widthPx: number,
     trailingSpacePx: number,
     next: LayoutSeg | undefined,
   ): number =>
-    justifiedCandidateFitWidth(widthPx, trailingSpacePx, next, {
+    justifiedCandidateFitWidth(widthPx, context.baseRtl ? 0 : trailingSpacePx, next, {
       isJustified,
       stretchLastLine,
       lineMaxWidth: breakerState.lineMaxWidth,
@@ -310,8 +396,11 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   const visibleSegmentScalars = [...trimmed];
   const trailingOverflowCharacter = visibleSegmentScalars.at(-1);
   const textBeforeTrailingOverflow = visibleSegmentScalars.slice(0, -1).join('');
+  // §17.3.1.21 permits paragraph-edge hanging, not intrusion into a
+  // DrawingML exclusion (§20.4.2.17). A narrowed float gap owns its full ink.
   const admitsTrailingOverflowPunctuation =
     overflowPunct &&
+    breakerState.gapTransaction?.endsAtExclusion !== true &&
     trailingOverflowCharacter !== undefined &&
     (breakerState.currentLine.length > 0 || textBeforeTrailingOverflow.length > 0) &&
     wordIsOverflowPunctuation(
@@ -376,6 +465,7 @@ function processMathSegment(context: BreakOpportunityIteratorContext, seg: Layou
     if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
       flush(undefined, false, seg.src);
     }
+    if (breakerState.currentLine.length === 0 && w > availW()) context.forcedPlacement(w);
     addToLine(seg, w, seg.fontSize, Math.max(asc, emPx * 0.8), Math.max(desc, emPx * 0.2));
     return;
   }
@@ -399,6 +489,7 @@ function processMathSegment(context: BreakOpportunityIteratorContext, seg: Layou
   if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
     flush(undefined, false, seg.src);
   }
+  if (breakerState.currentLine.length === 0 && w > availW()) context.forcedPlacement(w);
   addToLine(seg, w, seg.fontSize, lineAsc, lineDesc);
   return;
 }
@@ -417,11 +508,45 @@ function processImageSegment(context: BreakOpportunityIteratorContext, seg: Layo
   if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
     flush(undefined, false, seg.src);
   }
+  if (breakerState.currentLine.length === 0 && w > availW()) context.forcedPlacement(w);
   addToLine(seg, w, h, asc, 0);
   return;
 }
 
-function processTabSegment(context: BreakOpportunityIteratorContext, seg: LayoutTabSeg): void {
+/** Commit a cell already proven to fit its band. Keeping the aligned cell's
+ * measurement path preserves ordinary TOC/field allocation, while callers leave
+ * oversized cells in the queue for normal legal-break and emergency fitting. */
+function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
+  const { breakerState, scale, addToLine, measureText, verticalInkExtra, characterGrid } = context;
+  while (breakerState.queue.length > 0) {
+    const q = breakerState.queue[0];
+    if ('isTab' in q || 'lineBreak' in q) break;
+    breakerState.queue.shift();
+    if ('imagePath' in q) {
+      const w = q.widthPt * scale;
+      q.measuredWidth = w;
+      addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
+    } else if ('math' in q) {
+      addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
+    } else {
+      const m = measureText(q);
+      // #1014 — fold the vo=Tr ink deficit into the committed advance too.
+      const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
+      q.measuredWidth = w;
+      const asc =
+        m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
+      const desc =
+        m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
+      addToLine(q, w, q.fontSize, asc, desc);
+    }
+  }
+}
+
+function processTabSegment(
+  context: BreakOpportunityIteratorContext,
+  seg: LayoutTabSeg,
+  resolveCompletedTabCells: ReturnType<typeof createBidiTabCellResolver>,
+): void {
   const {
     breakerState,
     flush,
@@ -433,31 +558,96 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     maxWidth,
     marginRightPx,
     tabFollowWidth,
-    measureText,
-    verticalInkExtra,
-    characterGrid,
     tabStops,
     defaultTabPt,
     tabFollowingMetrics,
     availW,
   } = context;
 
-  // ── ECMA-376 §17.3.1.6 base-RTL ordinary tab ─────────────────────────
-  // The LTR pen math below resolves stops in LOGICAL order, which mis-places
-  // a bidi paragraph's tab-delimited cells (they reorder visually — see
-  // `layoutBidiTabStops`). Add the tab with a PROVISIONAL width of 0 and do
-  // NOT wrap on it; the per-line post-pass (`applyBidiTabs`, run in `flush`)
-  // recomputes every tab width in the visual frame once the line's content
-  // is known. A `<w:ptab>` (absolute-position tab) keeps the LTR path for
-  // now (no bidi ptab fixture; its own NOTE flags the gap).
-  if (baseRtl && !seg.ptab) {
+  // Ordinary RTL stops still require the complete cell's visual order. A
+  // positional tab additionally owns a normative next-line decision, which
+  // must happen here, while the queue can still move (§17.3.3.23).
+  if (baseRtl) {
+    let oversizedMarginLeading = false;
+    if (seg.ptab) {
+      const input = { ...context, ...breakerState };
+      breakerState.currentWidth += resolveCompletedTabCells(input);
+      const { startPen, leftLimit, frame } = bidiTabFrame(input);
+      let followingWidth = 0;
+      for (const q of breakerState.queue) {
+        if ('isTab' in q || 'lineBreak' in q) break;
+        followingWidth += tabFollowWidth(q);
+      }
+      const box = wordPositionalTabReferenceBox(
+        seg.ptab.relativeTo === 'indent' ? frame.indentStart : 0,
+        seg.ptab.relativeTo === 'indent' ? frame.indentEnd : leftLimit,
+        frame.bandStart, frame.bandEnd, frame.narrowed);
+      // Library scope policy preserves the established no-float normal-fitting
+      // contract for an oversized leading margin cell. Its complete contents
+      // cannot align within the reference, so retain the ordinary automatic
+      // gap used by that contract, without claiming an additional observed rule.
+      oversizedMarginLeading = !frame.narrowed && seg.ptab.alignment === 'left'
+        && seg.ptab.relativeTo === 'margin' && followingWidth > box.end - box.start;
+      const target = positionalTabTarget(seg.ptab.alignment, box.start, box.end, followingWidth);
+      if (target < startPen + breakerState.currentWidth && breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        return;
+      }
+    }
+    const input = { ...context, ...breakerState };
+    const { startPen, frame } = bidiTabFrame(input);
+    if (frame.narrowed || oversizedMarginLeading || seg.ptab?.relativeTo === 'indent') {
+      // Resolve leading gaps before fitting, in the same reading frame as
+      // paint. A provisional zero gap can fit text that the final tab would
+      // push into the exclusion. Without float exclusion, the final ordinary
+      // tab gap stays provisional, even after multiple tabs: the bidi walk can
+      // reduce the last gap as its cell fills the band. Freezing that gap here
+      // prematurely wraps otherwise in-band text. An indent-relative leading
+      // ptab instead has an authored fixed gap.
+      // Aligned cells retain post-pass alignment,
+      // bounded by the actual band after normal text fitting.
+      breakerState.currentWidth += resolveCompletedTabCells(input);
+      const pen = startPen + breakerState.currentWidth;
+      const stop = seg.ptab && !oversizedMarginLeading ? undefined : nextLineTabStop(pen,
+        context.bidiCustomStopsPx, context.bidiIntervalPx, frame.leadingShift);
+      const leading = seg.ptab ? seg.ptab.alignment === 'left'
+        : !stop || tabAlignmentRole(stop.alignment) === 'leading';
+      if (leading) {
+        const target = seg.ptab && !oversizedMarginLeading
+          ? wordPositionalTabReferenceBox(
+            seg.ptab.relativeTo === 'indent' ? frame.indentStart : 0,
+            seg.ptab.relativeTo === 'indent' ? frame.indentEnd : input.marginRightPx + tabOriginPx,
+            frame.bandStart, frame.bandEnd, frame.narrowed).start
+          : stop?.pos ?? pen;
+        if (target > frame.bandEnd && breakerState.currentLine.length > 0) {
+          flush(undefined, false, seg.src);
+          breakerState.queue.unshift(seg);
+          return;
+        }
+        const gap = target > frame.bandEnd ? 0 : Math.max(0, target - pen);
+        seg.readingGap = gap;
+        seg.measuredWidth = gap;
+        seg.leader = stop?.leader;
+        addToLine(seg, gap, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+        return;
+      }
+    } else if (!seg.ptab) {
+      // Earlier cells are complete when another ordinary tab is reached. Charge
+      // their resolved gaps so the next cell cannot overflow the line, but leave
+      // this final gap provisional: the bidi walk may shrink it as text fits.
+      breakerState.currentWidth += resolveCompletedTabCells(input);
+    }
     seg.measuredWidth = 0;
     addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
     return;
   }
 
-  // Absolute position on the line measured from paraX (line origin for continuation lines)
-  const absFromParaX = breakerState.currentWidth + (breakerState.isFirst ? firstIndent : 0);
+  // LTR pen coordinates include the available line window's displacement.
+  // RTL tabs are resolved in reading order by the post-pass above.
+  const lineOrigin = breakerState.lineXOffset;
+  const absFromParaX = lineOrigin + breakerState.currentWidth
+    + (breakerState.isFirst ? firstIndent : 0);
 
   // ── ECMA-376 §17.3.3.23 absolute-position tab (<w:ptab>) ──────────────
   // A ptab ignores the paragraph's custom tab stops and the default-tab
@@ -466,24 +656,14 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // ALSO governs how the text after the ptab aligns to that position (left /
   // centered / right). All coordinates below are paraX-relative px.
   //
-  // NOTE: the ptab target is resolved in LOGICAL (LTR) coordinates — this
-  // block runs before the per-line bidi reorder pass, so it has no notion
-  // of the paragraph's base direction. Interaction with bidi mirroring in
-  // an RTL paragraph (where "left"/"right" alignment and the box edges
-  // ought to mirror) is unverified; the primary use case (an LTR footer's
-  // centered/right-aligned PAGE field) is correct.
   if (seg.ptab) {
     seg.resolvedAlignment = seg.ptab.alignment;
-    // Reference box: "indent" ⇒ the paragraph content box [0, maxWidth];
-    // "margin" ⇒ the text-margin box [-tabOriginPx, marginRightPx].
-    const boxLeft = seg.ptab.relativeTo === 'indent' ? 0 : -tabOriginPx;
-    const boxRight = seg.ptab.relativeTo === 'indent' ? maxWidth : marginRightPx;
-    const target =
-      seg.ptab.alignment === 'left'
-        ? boxLeft
-        : seg.ptab.alignment === 'center'
-          ? (boxLeft + boxRight) / 2
-          : boxRight;
+    const bandLeft = breakerState.lineXOffset + (breakerState.isFirst ? Math.min(0, firstIndent) : 0);
+    const bandRight = breakerState.lineXOffset + breakerState.lineMaxWidth;
+    const box = wordPositionalTabReferenceBox(
+      seg.ptab.relativeTo === 'indent' ? 0 : -tabOriginPx,
+      seg.ptab.relativeTo === 'indent' ? maxWidth : marginRightPx,
+      bandLeft, bandRight, breakerState.lineXOffset !== 0 || breakerState.lineMaxWidth !== maxWidth);
     // Width of the content that trails the ptab up to the next tab / line end
     // — needed to right-/center-align it against `target` (the trailing text
     // is what aligns to the stop, §17.18.71).
@@ -492,14 +672,14 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
       if ('isTab' in q || 'lineBreak' in q) break;
       followW += tabFollowWidth(q);
     }
-    const frac = seg.ptab.alignment === 'center' ? 0.5 : seg.ptab.alignment === 'right' ? 1 : 0;
-    let tabW = target - absFromParaX - followW * frac;
+    const target = positionalTabTarget(seg.ptab.alignment, box.start, box.end, followW);
+    let tabW = target - absFromParaX;
     // §17.3.3.23: "If the alignment location … cannot be found on the current
     // line, because the starting location is past that point, then the tab …
     // shall advance to that location on the next available line." So when the
-    // pen already sits at/after the target, wrap the ptab (and its trailing
+    // pen already sits past the target, wrap the ptab (and its trailing
     // content) to a fresh line — unless the line is empty (nowhere to wrap).
-    if (tabW <= 0) {
+    if (tabW < 0) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);
         breakerState.queue.unshift(seg);
@@ -509,34 +689,21 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
       // segment so the line-height reflects the ptab's font.
       tabW = 0;
     }
+    if (breakerState.currentWidth + tabW > availW()) {
+      if (breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        return;
+      }
+      tabW = 0;
+    }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    // Commit the trailing content onto this line without a wrap re-check, so
-    // it sits exactly at the aligned position (mirrors the custom right/center
-    // tab path below).
-    if (seg.ptab.alignment !== 'left') {
-      while (breakerState.queue.length > 0) {
-        const q = breakerState.queue[0];
-        if ('isTab' in q || 'lineBreak' in q) break;
-        breakerState.queue.shift();
-        if ('imagePath' in q) {
-          const w = q.widthPt * scale;
-          q.measuredWidth = w;
-          addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
-        } else if ('math' in q) {
-          addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
-        } else {
-          const m = measureText(q);
-          // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-          const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
-          q.measuredWidth = w;
-          const asc =
-            m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
-          const desc =
-            m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
-          addToLine(q, w, q.fontSize, asc, desc);
-        }
-      }
+    // §17.3.3.23 selects the reference target independently of paragraph
+    // indents. Library policy limits allocation to the actual paragraph/float
+    // band: a fitting cell stays aligned, and all other cells use normal breaks.
+    if (seg.ptab.alignment !== 'left' && breakerState.currentWidth + followW <= availW()) {
+      commitAlignedTabCell(context);
     }
     return;
   }
@@ -552,13 +719,14 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
     alignment: t.alignment,
     leader: t.leader,
   }));
-  const stop = nextTabStop(curMarginPx, customStopsPx, defaultTabPt * scale);
+  const stop = nextLineTabStop(curMarginPx, customStopsPx, defaultTabPt * scale,
+    lineOrigin);
   seg.resolvedAlignment = stop?.alignment ?? 'left';
   // Convert the chosen margin-space stop back to paraX-relative px.
   const stopParaX = stop ? stop.pos - tabOriginPx : absFromParaX;
   // Right/center/decimal tab: place the tab + its trailing content (up to the next
-  // tab / line end) so the content ends at / centers on the stop, and commit that
-  // content directly so the normal wrap check doesn't push it past the stop
+  // tab / line end) so the content ends at / centers on the stop. An oversized
+  // cell still uses ordinary break opportunities
   // (ECMA-376 §17.3.1.37). This is what makes TOC "heading …… page" lines work.
   // Automatic stops returned by nextTabStop are left-aligned, so they fall
   // through to the left-tab path below.
@@ -575,30 +743,22 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
           : following.totalWidth;
     let tabW = stopX - absFromParaX - alignmentWidth;
     if (tabW <= 0) tabW = 0;
+    if (breakerState.currentWidth + tabW > availW()) {
+      if (breakerState.currentLine.length > 0) {
+        flush(undefined, false, seg.src);
+        breakerState.queue.unshift(seg);
+        return;
+      }
+      tabW = 0;
+    }
     seg.measuredWidth = tabW;
     addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
-    // Commit the trailing content onto this line without a wrap re-check.
-    while (breakerState.queue.length > 0) {
-      const q = breakerState.queue[0];
-      if ('isTab' in q || 'lineBreak' in q) break;
-      breakerState.queue.shift();
-      if ('imagePath' in q) {
-        const w = q.widthPt * scale;
-        q.measuredWidth = w;
-        addToLine(q, w, q.heightPt, q.heightPt * scale, 0);
-      } else if ('math' in q) {
-        addToLine(q, q.measuredWidth || 0, q.fontSize, q.mathAscent || 0, q.mathDescent || 0);
-      } else {
-        const m = measureText(q);
-        // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-        const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
-        q.measuredWidth = w;
-        const asc =
-          m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
-        const desc =
-          m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
-        addToLine(q, w, q.fontSize, asc, desc);
-      }
+    // Keep an aligned cell atomic only when it fits the available band.
+    // Oversized cells return to the iterator at their ordinary break sites.
+    // Stop coordinates do not confer an allocation outside the paragraph's
+    // indents. Library containment applies even when no float narrows the band.
+    if (breakerState.currentWidth + following.totalWidth <= availW()) {
+      commitAlignedTabCell(context);
     }
     return;
   }
@@ -608,17 +768,19 @@ function processTabSegment(context: BreakOpportunityIteratorContext, seg: Layout
   // "after all custom stops" automatic grid, so there is no separate fallback.
   let tabWidth = stopParaX - absFromParaX;
   if (stop) seg.leader = stop.leader;
-  // Clamp to avoid negative widths; if tab would overflow the line, wrap instead
-  if (tabWidth <= 0) {
-    flush(undefined, false, seg.src);
-    breakerState.queue.unshift(seg);
-    return;
+  // ECMA-376 §§17.3.1.37–38: an unavailable stop breaks the line. Library
+  // containment policy also applies to float-displaced targets. On an empty
+  // line an out-of-band tab contributes no gap, so its cell can use the normal
+  // fitting path rather than retrying an unreachable target forever.
+  if (breakerState.currentWidth + tabWidth > availW()) {
+    if (breakerState.currentLine.length > 0) {
+      flush(undefined, false, seg.src);
+      breakerState.queue.unshift(seg);
+      return;
+    }
+    tabWidth = 0;
   }
-  if (breakerState.currentWidth + tabWidth > availW() && breakerState.currentLine.length > 0) {
-    flush(undefined, false, seg.src);
-    breakerState.queue.unshift(seg);
-    return;
-  }
+  tabWidth = Math.max(0, tabWidth);
   seg.measuredWidth = tabWidth;
   addToLine(seg, tabWidth, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
   return;
@@ -686,7 +848,14 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     // than a full line, fit the widest character prefix (at least one
     // character), draw it, and re-queue the remainder. Segments are already
     // space-delimited, so this cannot bypass an ordinary space opportunity.
-    const split = externalLinkSyntaxSplit(s, availW()) || emergencyTextSplit(s, availW());
+    const semanticSplit = externalLinkSyntaxSplit(s, availW());
+    const split = semanticSplit || emergencyTextSplit(s, availW());
+    // A URL syntax opportunity is a legal break; any other split is forced,
+    // and so is a retained prefix (even one whole grapheme) wider than the gap.
+    if ((semanticSplit === 0 && split < s.text.length)
+      || placedAdvanceExceeds(context, s, s.text.slice(0, split))) {
+      context.forcedPlacement(context.minimalLegalTextWidth(s));
+    }
     if (split >= s.text.length) {
       // The visible glyphs actually fit (only a trailing space pushed it over the
       // fit test) — place the word whole.
@@ -739,6 +908,16 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
       // advance, not on the follower's standalone width.
       const remaining = availW() - breakerState.currentWidth;
       const split = emergencyTextSplit(s, remaining, true);
+      // Splitting a glued member, or letting it overflow, forces its unit.
+      const retained = (remaining > 0 || s.hardJoinPrev === true) && split > 0 && split < s.text.length
+        ? s.text.slice(0, split) : s.text;
+      if (split < s.text.length || placedAdvanceExceeds(context, s, retained)) {
+        const unitStart = joinedUnitStart(breakerState.currentLine);
+        context.forcedPlacement(
+          lineAdvanceFrom(breakerState.currentLine, unitStart) + context.minimalLegalTextWidth(s),
+          unitStart,
+        );
+      }
       if ((remaining > 0 || s.hardJoinPrev === true) && split > 0 && split < s.text.length) {
         const prefix = s.text.slice(0, split);
         const pw = strNaturalAdvance(s, prefix);
@@ -798,79 +977,9 @@ function prepareAtomicTextFit(
     ((breakerState.queue[0] as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
       !(s.seaBreaks && s.seaBreaks.length > 0))
   ) {
-    let groupW = w;
-    let groupTrail = trailingSpaceW;
-    let groupEnd = 0;
-    for (
-      ;
-      groupEnd < breakerState.queue.length &&
-      (breakerState.queue[groupEnd] as LayoutTextSeg).joinPrev;
-      groupEnd++
-    ) {
-      const f = breakerState.queue[groupEnd] as LayoutTextSeg;
-      const hardPrefixEnd = hardJoinPrefixEnd(f);
-      if (hardPrefixEnd !== undefined) {
-        const prefix = f.text.slice(0, hardPrefixEnd);
-        const prefixWidth = strAdvance(f, prefix);
-        groupW += prefixWidth;
-        groupTrail = prefix.endsWith(' ')
-          ? prefixWidth - strAdvance(f, prefix.replace(/ +$/, ''))
-          : 0;
-        // A whole hard member can lead into another hard member. Otherwise
-        // the first legal boundary after the seam ends the atomic prefix.
-        if (hardPrefixEnd < f.text.length) break;
-        continue;
-      }
-      const firstExternalBreak = f.externalLinkBreakOffsets?.[0];
-      if (firstExternalBreak !== undefined) {
-        const prefix = f.text.slice(0, firstExternalBreak);
-        const prefixWidth = strAdvance(f, prefix);
-        groupW += prefixWidth;
-        groupTrail = 0;
-        break;
-      }
-      // A CJK-BREAKABLE follower (e.g. "Roman" + "、あるいは…用いる。") is NOT
-      // atomic: only its LEADING run of line-start-forbidden chars would orphan
-      // at a line head (UAX#14 LB13 / §17.3.1.16); the rest splits at an
-      // inter-CJK boundary and wraps on its own. So glue only that prefix's
-      // advance to the lead and STOP summing here — mirror of the CJK-lead
-      // direction handled by the `!hasCJKBreakOpportunity(s.text)` gate above.
-      // Summing the whole breakable run would pre-flush the Latin lead alone,
-      // leaving a `both` line stretched sparse. A Latin / small-caps follower (no CJK break opportunity —
-      // the "I" + "NTRODUCTION" case) stays fully atomic: keep full-add.
-      if (hasCJKBreakOpportunity(f.text)) {
-        const chars = [...f.text];
-        let p = 0;
-        while (
-          p < chars.length &&
-          DEFAULT_KINSOKU_RULES.lineStartForbidden.has(chars[p].codePointAt(0)!)
-        )
-          p++;
-        if (p < chars.length) {
-          // Breakable rest exists past the leading non-starters: glue only the
-          // prefix (it may be empty — then "Roman" is effectively unglued and
-          // wraps on its own) and end the atomic group here.
-          const prefix = chars.slice(0, p).join('');
-          const prefixWidth = strAdvance(f, prefix);
-          groupW += prefixWidth;
-          groupTrail = 0;
-          break;
-        }
-        // Entirely non-starters (no breakable rest): fall through to full-add.
-      }
-      const fw = segAdvance(f);
-      groupW += fw;
-      const ft = f.text.replace(/ +$/, '');
-      const followerTrail = f.text.endsWith(' ') ? fw - strAdvance(f, ft) : 0;
-      // UAX #14 LB7 makes a consecutive SP sequence one trailing suffix even
-      // when a source-formatting boundary split it into multiple segments.
-      // Accumulate space-only followers so the line-end fit allowance is
-      // invariant to that non-textual boundary. A follower containing visible
-      // text starts a new suffix and therefore replaces the previous value.
-      groupTrail = ft.length === 0 && groupTrail > 0 ? groupTrail + followerTrail : followerTrail;
-    }
+    const group = measureJoinedTextUnit(s, breakerState.queue, context, w, trailingSpaceW);
     if (
-      breakerState.currentWidth + fitWidthFor(groupW, groupTrail, breakerState.queue[groupEnd]) >
+      breakerState.currentWidth + fitWidthFor(group.width, group.trailingSpace, group.next) >
       availW()
     ) {
       flush(undefined, false, s.src);
@@ -1025,6 +1134,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // CJK split.
   const hangingSplit =
     overflowPunct &&
+    breakerState.gapTransaction?.endsAtExclusion !== true &&
     rawSplit < allChars.length &&
     (breakerState.currentLine.length > 0 || rawSplit > 0) &&
     wordIsOverflowPunctuation(
@@ -1047,6 +1157,15 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   const proposedPrefix = allChars.slice(0, proposedSplit).join('').length;
   const protectedSplit = legalTextSplitAtOrBefore(s, proposedPrefix, minSplit > 0 ? 1 : 0);
   const prefix = s.text.slice(0, protectedSplit);
+  if (breakerState.currentLine.length === 0) {
+    // minSplit keeps progress on an empty line even when no legal prefix
+    // fits; that retained prefix is forced unless a legal one exists.
+    const legalSplit = kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, 0);
+    const legalUtf16 = allChars.slice(0, legalSplit).join('').length;
+    if (legalTextSplitAtOrBefore(s, legalUtf16, 1) === 0 || placedAdvanceExceeds(context, s, prefix)) {
+      context.forcedPlacement(context.minimalLegalTextWidth(s));
+    }
+  }
   if (prefix.length > 0) {
     // Grid advance for the head piece — the same model as the line box / draw.
     const pw = strNaturalAdvance(s, prefix);
@@ -1083,6 +1202,13 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     // re-validating, whitespace-guarded retraction count.
     const retraction = retractCurrentLineForLeadingKinsoku(s);
     if (retraction.kind === 'blocked') {
+      // Keeping the forbidden leader overflows the line: force its unit.
+      const unitStart = joinedUnitStart(breakerState.currentLine);
+      context.forcedPlacement(
+        lineAdvanceFrom(breakerState.currentLine, unitStart)
+          + strAdvance(s, s.text.slice(0, graphemeClusterOffsets(s.text).find((offset) => offset > 0) ?? s.text.length)),
+        unitStart,
+      );
       keepLeadingKinsokuWithCurrentLine(s, h, asc, desc);
       return;
     }
@@ -1189,6 +1315,10 @@ function splitSeaOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     charSpacingDeltaPx(s, scale) >= 0 &&
     snapToCharsClass(s, characterGrid) !== 'latin';
   const split = fitSeaWordPrefix(s.text, s.seaBreaks, 0, available, measureSub, monotone);
+  if (split > 0 && breakerState.currentLine.length === 0
+    && placedAdvanceExceeds(context, s, s.text.slice(0, split))) {
+    context.forcedPlacement(context.minimalLegalTextWidth(s));
+  }
   if (split > 0) {
     const prefix = s.text.slice(0, split);
     const pw = strNaturalAdvance(s, prefix);
@@ -1227,6 +1357,13 @@ function splitSeaOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     // 追い出し (§17.3.1.16) the CJK branch does.
     const retraction = retractCurrentLineForLeadingKinsoku(s);
     if (retraction.kind === 'blocked') {
+      // Keeping the forbidden leader overflows the line: force its unit.
+      const unitStart = joinedUnitStart(breakerState.currentLine);
+      context.forcedPlacement(
+        lineAdvanceFrom(breakerState.currentLine, unitStart)
+          + strAdvance(s, s.text.slice(0, graphemeClusterOffsets(s.text).find((offset) => offset > 0) ?? s.text.length)),
+        unitStart,
+      );
       keepLeadingKinsokuWithCurrentLine(s, h, asc, desc);
       return;
     }
@@ -1237,6 +1374,7 @@ function splitSeaOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     // Empty line and the first dictionary word is wider than the whole
     // column: emergency GRAPHEME-safe split (a code-point split would tear a
     // base + tone/combining mark, both BMP). Guarantee ≥1 cluster of progress.
+    context.forcedPlacement(context.minimalLegalTextWidth(s));
     const firstWordEnd = s.seaBreaks[0] ?? s.text.length;
     const firstWord = s.text.slice(0, firstWordEnd);
     const graphemes = graphemeClusterOffsets(firstWord);

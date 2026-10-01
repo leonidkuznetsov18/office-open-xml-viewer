@@ -81,6 +81,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   fontRoute?: CanvasFontRoute;
   /** Selected-route line ratio. It may come from parsed font bytes or a bounded
    * Canvas measurement; the latter does not reveal OpenType table identity. */
+  /** Admitted reference profile has no Far East code-page bits; its Latin
+   * single-line design height owns whole line-grid cells (#1674). */
+  resolvedLatinGridCellAllocation?: boolean;
   resolvedLineHeightRatio?: number;
   /** A selected route supplied this ratio from measured or parsed geometry. */
   resolvedResourceVerticalMetric?: true;
@@ -301,6 +304,10 @@ export interface LayoutTabSeg extends LayoutSegSource {
   isTab: true;
   fontSize: number;  // pt — for line-height purposes
   measuredWidth: number;
+  /** Queue-resolved reading-frame gap. The bidi post-pass must preserve the
+   * same gap that ordinary text fitting consumed, including a collapsed
+   * unreachable stop on an empty line. */
+  readingGap?: number;
   /** tab leader to fill the gap (e.g. TOC dot leaders); set during layout. */
   leader?: TabStop['leader'];
   /** Alignment selected from the effective stop during layout. */
@@ -411,6 +418,9 @@ export type LayoutSeg = LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutL
 
 
 export interface LayoutLine {
+  /** Pass-local physical identity: gap fragments share it even if vertical
+   * rounding makes distinct physical lines have equal numeric tops. */
+  physicalLineIndex?: number;
   segments: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[];
   height: number;  // pt — max fontSize on line (for empty-line sizing fallback)
   ascent: number;  // px — fontBoundingBoxAscent (font-metric, stable per font+size)
@@ -425,6 +435,8 @@ export interface LayoutLine {
   intendedSingle: number;
   /** Text-face single line that supplies automatic leading to an inline picture. */
   inlinePictureTextSingle?: number;
+  /** Admitted Latin design height; native fallback boxes do not establish grid cells. */
+  latinGridCountSingle?: number;
   /** Registered compatibility allocation for a uniform positioned, visible run. */
   uniformPositionAuto?: Readonly<{ normalSinglePx: number; positionPx: number; designDescentPx: number }>;
   /** px — DESIGN grid-count height: the max over segments of each run's
@@ -439,6 +451,9 @@ export interface LayoutLine {
   availWidth: number;
   /** When wrap context is active, the absolute canvas Y where this line begins. */
   topY?: number;
+  /** Confirmed fixed-point allocation that owns topY, in the same units as
+   * the wrap context. Never infer ownership from a numeric top alone. */
+  wrapAllocation?: Readonly<{ physicalLineIndex: number; topYPt: number; advancePt: number }>;
   /** Set when at least one segment on this line carries a ruby annotation —
    *  enables docGrid pitch snapping in lineBoxHeight. */
   hasRuby?: boolean;
@@ -463,6 +478,7 @@ export interface LayoutLine {
 
 /** Additional context passed to layoutLines so it can honor floats on the current page. */
 export interface WrapLayoutCtx {
+  hasExclusions?: boolean;
   startPageY: number;   // absolute canvas Y where the first line should start
   paraX: number;        // absolute canvas X of the paragraph's INDENTED text left edge
   /** Absolute canvas X of the paragraph's raw COLUMN left edge. Distinct from
@@ -476,13 +492,13 @@ export interface WrapLayoutCtx {
   /** Minimum clear side-gap for an anchor-host-only paragraph mark. Such a
    *  zero-advance metric placeholder preserves the anchor character's line box,
    *  but is not inline content and therefore keeps the pilcrow-em threshold
-   *  instead of the 1-inch content-line threshold (issue #676). */
+   *  like visible content admitted by its next atom (#1670). */
   paragraphMarkLineStartWidth?: number;
   /** Placement-aware wrap boundary used by paragraph measurement. */
   lineWindow?: (input: {
     topYPt: number;
     minimumStartWidthPt: number;
-    /** `word-square-line-start-one-inch`, active only for a square object. */
+    /** Required atomic start width for a square-constrained gap. */
     squareMinimumStartWidthPt?: number;
     probeHeightPt: number;
     paragraphXPt: number;
@@ -502,10 +518,13 @@ export interface WrapLayoutCtx {
   referenceWidthPt?: number;
   /** Reading order of the first line intersecting a centered `largest` object. */
   readingDirection?: 'ltr' | 'rtl';
-  /** Per-line box-height resolver (line natural ascent+descent → total px box height).
-   *  `gridCountSinglePx` (the line's design grid-count height) keeps the
-   *  float-wrap advance consistent with the final render's docGrid cell count. */
-  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number) => number;
+  /** Paragraph-wide allocation (ruby, spacing, grid and inline objects).
+   * Supplies both float probes and physical-line cursor advancement. */
+  resolveLineAdvances?: (lines: readonly LayoutLine[]) => readonly number[];
+  /** Per-line box-height resolver for isolated line-layout callers. Paragraph
+   * measurement supplies resolveLineAdvances so origins and probes include its
+   * paragraph-wide allocation rather than only this fragment's metrics. */
+  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number, latinGridCountSingle?: number) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;
 }

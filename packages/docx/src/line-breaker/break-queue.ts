@@ -161,6 +161,42 @@ export type SnapBlockState = {
   };
 
 
+/** A window accepted for one line fragment. `solverWidth` is the width the
+ * float solver compared with the requirement (before hanging-indent restore). */
+export interface GapWindow {
+  readonly topY: number;
+  readonly xOffset: number;
+  readonly maxWidth: number;
+  readonly solverWidth: number;
+}
+
+/** WORD_FLOAT_GAP_FLOW admission as a placement transaction (#1670).
+ * A fragment narrowed by an exclusion is filled by ordinary placement; if
+ * placement would need a forced break or overflow at the fragment head, the
+ * fragment rolls back and the next gap is searched with a strictly larger
+ * requirement. Admission and placement therefore share one implementation. */
+export interface GapTransaction {
+  /** Continuation origin while this physical line may still take a later gap. */
+  cursor: { topY: number; left: number; right: number } | null;
+  /** Top requested for a new physical line (solver searches downward from it). */
+  requestTopY: number;
+  /** Width the next gap must offer, in solver units (incl. positive first-line indent). */
+  requirement: number;
+  window: GapWindow | null;
+  narrowed: boolean;
+  /** The fragment's line-end edge (reading order) is an exclusion, not the
+   * paragraph edge: §17.3.1.21 hanging punctuation may not cross it. */
+  endsAtExclusion: boolean;
+  snapshot: Readonly<{
+    scalars: Readonly<Record<string, unknown>>;
+    snapBlock: unknown;
+    linesLength: number;
+    queue: readonly LayoutSeg[];
+  }> | null;
+  /** Complete units precede a forced unit: end the fragment before this source. */
+  stopBefore: LineBoundary | null;
+}
+
 export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx) {
   return {
     lines: [] as LayoutLine[],
@@ -173,6 +209,15 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     latinAppliedGapCount: 0,
     latinAppliedPerGap: 0,
     snapBlock: null as SnapBlockState | null,
+    physicalLineIndex: 0,
+    positionReferencePt: undefined as number | null | undefined,
+    firstPositioned: undefined as LayoutTextSeg | undefined,
+    uniformPositionEligible: true,
+    fragmentCursor: null as { topY: number; left: number; right: number } | null,
+    /** Pass-local admission transaction of the line fragment being filled. */
+    gapTransaction: null as GapTransaction | null,
+    /** Queue item taken by the iterator and not yet committed or re-queued. */
+    inHand: undefined as LayoutSeg | undefined,
     lineHeight: 0,
     lineAscent: 0,
     lineDescent: 0,
@@ -180,6 +225,7 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     lineHasInlinePicture: false,
     linePictureMarkSingle: 0,
     lineGridCountSingle: 0,
+    lineLatinGridCountSingle: 0,
     lineVisibleAscent: 0,
     lineVisibleDescent: 0,
     lineVisibleIntendedSingle: 0,

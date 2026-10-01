@@ -270,3 +270,14 @@ export const WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH = defineCompatibilityRule({
   },
   description: 'In compatibility mode 14, when the first line of the anchor paragraph of a wrapTight drawing cannot be placed at its start position, an earlier line whose bottom lies exactly on the polygon top also wraps around it. Otherwise a line touching the polygon top from above is not wrapped.',
 });
+
+export const WORD_GRID_PICTURE_LINE_ORIGIN = defineCompatibilityRule({
+  id: 'word-grid-picture-line-origin',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'float-grid-picture-origin',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: 'Issue #1674 controlled exports (74 picture-origin cases within the 142-case gap/grid suite) in modes 14/15 keep paragraph-relative pictures at the pre-before-spacing paragraph top. On an active line grid the first line-relative picture uses that same origin before authored before-spacing, and later line references use their actual line tops. Grid pitches 12–36pt, font sizes 10/20/30pt, offsets, phases, snap overrides, exact/atLeast/auto spacing, empty/multiline paragraphs, page/margin references and square/tight/none wrap disprove a universal half-pitch picture offset. Non-grid line references and non-picture payloads retain their previous reference frames.',
+});
+
+export function wordGridPictureLineOriginPt(lineTop: number, paragraphTop: number, contentStart: number): number {
+  return lineTop - (contentStart - paragraphTop);
+}

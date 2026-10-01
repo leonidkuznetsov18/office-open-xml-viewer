@@ -331,6 +331,7 @@ const EXACT_ACQUISITION_SURFACE_MEMBERS = new Map([
       'numberingMarkerShapeInput',
       'paragraphMarkShapeInput',
       'tableFormatInput',
+      'tableSourceAcquisitionInput',
       'effectiveTablePreferredWidthPt',
       'tableColumnLayoutInput',
       'tableParticipatesInOrdinaryFlow',
@@ -599,6 +600,10 @@ function assertProductionBodyAcquisitionAuthority(root) {
     return matches.length === 1 ? matches[0] : undefined;
   };
   const columns = uniqueFunction('resolveColumnWidths');
+  // Logical-table acquisition collects unnormalized member constraints through
+  // the same intrinsic-content owner before the sole column solver runs.
+  const columnInputs = uniqueFunction('acquireTableColumnInput');
+  const columnAuthority = columnInputs ?? columns;
   const baseContexts = [];
   const visitBaseContexts = (node) => {
     if (ts.isVariableDeclaration(node)
@@ -606,11 +611,13 @@ function assertProductionBodyAcquisitionAuthority(root) {
       && node.name.text === 'baseContext') baseContexts.push(node);
     ts.forEachChild(node, visitBaseContexts);
   };
-  if (columns?.body) visitBaseContexts(columns.body);
-  const paragraphContextCalls = columns?.body
-    ? callsNamed(columns.body, 'resolveParagraphLayoutContext')
+  if (columnAuthority?.body) visitBaseContexts(columnAuthority.body);
+  const paragraphContextCalls = columnAuthority?.body
+    ? callsNamed(columnAuthority.body, 'resolveParagraphLayoutContext')
     : [];
   if (!columns?.body
+    || !columnAuthority?.body
+    || (columnInputs && callsNamed(columns.body, 'acquireTableColumnInput').length !== 1)
     || baseContexts.length !== 1
     || paragraphContextCalls.length !== 1
     || callOf(baseContexts[0].initializer, 'resolveParagraphLayoutContext')
@@ -618,8 +625,47 @@ function assertProductionBodyAcquisitionAuthority(root) {
     fail('PRODUCTION_ACQUISITION_AUTHORITY', `${PRODUCTION_BODY_LAYOUT}#resolveColumnWidths`);
   }
 
+  // Table eligibility belongs to the sole post-merge decision boundary.
+  // Reject imports as well as calls so aliasing cannot reopen member-level gates.
+  const decisionHelpers = new Set(['tableOriginContext', 'wordMeasuredTableOriginMode',
+    'wordFixedOccupiedGridInput', 'wordTableEffectiveIndentPt', 'wordTableOriginTranslationPt']);
+  for (const name of ['production-body-layout.ts', 'table-acquisition.ts']) {
+    const path = resolve(root, DOCX_SOURCE, 'layout', name);
+    if (!existsSync(path)) continue;
+    const consumer = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+    const visit = (node) => {
+      if (ts.isIdentifier(node) && decisionHelpers.has(node.text)) {
+        fail('TABLE_LOGICAL_DECISION_AUTHORITY', `${name}:${node.text}`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(consumer);
+  }
+
   const table = uniqueFunction('computeTablePtLayout');
   const tableSourceIndex = table?.parameters[3];
+  const prepared = table?.parameters[4];
+  const preparedType = prepared?.type;
+  const preparationFields = preparedType && ts.isTypeReferenceNode(preparedType)
+    && ts.isIdentifier(preparedType.typeName) && preparedType.typeName.text === 'Readonly'
+    && preparedType.typeArguments?.length === 1
+    && ts.isTypeLiteralNode(preparedType.typeArguments[0])
+    ? preparedType.typeArguments[0].members : [];
+  const preparedColumns = preparationFields.find((field) => field.name?.getText(source) === 'columns')?.type;
+  const preparedDecision = preparationFields.find((field) => field.name?.getText(source) === 'decision')?.type;
+  const preparedMember = preparationFields.find((field) => field.name?.getText(source) === 'member')?.type;
+  // Permit only immutable solved columns and the acquired logical/member decision;
+  // sourceIndex remains a required number at every call, including group rows.
+  const allowsPreparation = prepared && ts.isIdentifier(prepared.name) && prepared.name.text === 'prepared'
+    && prepared.questionToken && preparationFields.length === 3
+    && preparedColumns && ts.isTypeOperatorNode(preparedColumns)
+    && preparedColumns.operator === ts.SyntaxKind.ReadonlyKeyword
+    && ts.isArrayTypeNode(preparedColumns.type)
+    && preparedColumns.type.elementType.kind === ts.SyntaxKind.NumberKeyword
+    && preparedDecision && ts.isTypeReferenceNode(preparedDecision)
+    && preparedDecision.typeName.getText(source) === 'LogicalTableDecision'
+    && preparedMember && ts.isTypeReferenceNode(preparedMember)
+    && preparedMember.typeName.getText(source) === 'TableMemberDecision';
   const tableBodyCalls = table?.body ? callsNamed(table.body, 'acquireRetainedTable') : [];
   const tableCalls = callsNamed(source, 'computeTablePtLayout');
   const forbiddenTableCalls = [
@@ -628,13 +674,14 @@ function assertProductionBodyAcquisitionAuthority(root) {
     'measureRetainedCellContentHeightPt',
   ].flatMap((name) => table?.body ? callsNamed(table.body, name) : []);
   if (!table?.body
-    || table.parameters.length !== 4
+    || (table.parameters.length !== 4 && !(table.parameters.length === 5 && allowsPreparation))
     || !tableSourceIndex
     || tableSourceIndex.questionToken
     || tableSourceIndex.type?.kind !== ts.SyntaxKind.NumberKeyword
     || tableBodyCalls.length !== 1
     || tableCalls.length === 0
-    || tableCalls.some((call) => call.arguments.length !== 4)
+    || tableCalls.some((call) => call.arguments.length !== 4
+      && !(allowsPreparation && call.arguments.length === 5))
     || forbiddenTableCalls.length !== 0) {
     fail('PRODUCTION_ACQUISITION_AUTHORITY', `${PRODUCTION_BODY_LAYOUT}#computeTablePtLayout`);
   }

@@ -1,3 +1,4 @@
+import { drawShapeStackedText } from './shape-stacked-text.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import {
   breakDrawingMlText, drawingMlTextRect, drawingMlLineHeight,
@@ -4675,7 +4676,21 @@ function drawShape(
   // Shape text body (ECMA-376 §20.5.2.34 `<xdr:txBody>`). Drawn after
   // fill/stroke so it sits on top of the shape's background.
   if (shape.text) {
-    drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+    const stacked = shape.text.vert === 'wordArtVert' || shape.text.vert === 'wordArtVertRtl';
+    if (stacked && (shape.flipH || shape.flipV)) {
+      // Issue #1668 Excel controls: WordArt stays readable under flipH;
+      // flipV turns its unmirrored frame 180 degrees. Cancel the shape mirror
+      // first, keeping the authored rotation and physical text insets.
+      ctx.save();
+      ctx.translate(sw / 2, sh / 2);
+      ctx.scale(shape.flipH ? -1 : 1, shape.flipV ? -1 : 1);
+      if (shape.flipV) ctx.rotate(Math.PI);
+      ctx.translate(-sw / 2, -sh / 2);
+      drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+      ctx.restore();
+    } else {
+      drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+    }
   }
   ctx.restore();
 }
@@ -4806,6 +4821,41 @@ export function drawShapeText(
   const innerH = rect.height;
   if (innerW <= 0 || innerH <= 0) return;
 
+  // Font string + px size for a text run (math runs have no run-level font).
+  const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>, fontScale = 1): { font: string; px: number } => {
+    const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
+    const px = size * PT_TO_PX * cs * fontScale;
+    const family = fontStackFor(run.fontFace, cjkFallback, run.text,
+      officeRoute(ctx, run.fontFace, run.bold, run.italic),
+      googleSubstitutesByContext.get(ctx) === true,
+      undefined, contextRegularAlias(ctx, run.fontFace));
+    return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
+  };
+
+  if (txt.vert === 'wordArtVert' || txt.vert === 'wordArtVertRtl') {
+    // ECMA-376 §21.1.2.1.3: scale each run's original font size before
+    // measuring its stacked cell. An omitted scale means 100%.
+    const fontScale = txt.autoFit === 'norm' ? txt.fontScale ?? 1 : 1;
+    if (fontScale === 0) return; // A zero font scale has no glyph ink.
+    drawShapeStackedText(ctx, txt, txt.vert, rect, PT_TO_PX * cs, (run, text) => {
+      const face = isCjkBreakChar(text.codePointAt(0) ?? 0)
+        ? run.fontFaceEa ?? run.fontFace : run.fontFace;
+      return { ...textFont({ ...run, text, fontFace: face }, fontScale), face };
+    }, (run, precedingSizePt) => {
+      const render = mathRenders.get(run.nodes);
+      // Match horizontal input: optional/failed equations contribute neither
+      // ink nor a display break; preparation deliberately leaves them uncached.
+      if (!render) return undefined;
+      const pxSize = (run.fontSize ?? precedingSizePt) * PT_TO_PX * cs * fontScale;
+      const width = render.widthEm * pxSize;
+      const height = (render.ascentEm + render.descentEm) * pxSize;
+      return { width, height, draw: (x, y) => {
+        if (width > 0 && height > 0) ctx.drawImage(tintedMathImage(render, run.color ?? '#000000'), x, y, width, height);
+      } };
+    });
+    return;
+  }
+
   // Excel's natural line box follows each run's font metrics (see
   // excelDrawingMlLineRatios): Arial 1.150 em, Calibri 1.221 em, Meiryo
   // 1.95 em, and so on, instead of a flat 1.2 em. A name alone cannot identify
@@ -4844,17 +4894,6 @@ export function drawShapeText(
   type Line = {
     segs: Seg[]; align: string; height: number; ascent: number; hasMath: boolean;
     leftInset: number; availW: number; gapBefore: number;
-  };
-
-  // Font string + px size for a text run (math runs have no run-level font).
-  const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>): { font: string; px: number } => {
-    const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
-    const px = size * PT_TO_PX * cs;
-    const family = fontStackFor(run.fontFace, cjkFallback, run.text,
-      officeRoute(ctx, run.fontFace, run.bold, run.italic),
-      googleSubstitutesByContext.get(ctx) === true,
-      undefined, contextRegularAlias(ctx, run.fontFace));
-    return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
   };
 
   // Real font ascent for a line's alphabetic baseline (used on lines that mix

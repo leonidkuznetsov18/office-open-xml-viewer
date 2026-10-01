@@ -77,7 +77,6 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
         chart_path,
         &relationships,
     );
-    let base_dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let internal_target = |suffix: &str| {
         relationships.values().find(|relationship| {
             relationship.mode == ooxml_common::rels::TargetMode::Internal
@@ -95,7 +94,9 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
                 .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
     });
     if let Some(style_relationship) = style_relationship {
-        let style_path = resolve_path(base_dir, &style_relationship.target);
+        let style_path = style_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.style_xml = Some(read_zip_str(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_str(zip, &style_rels_path) {
@@ -110,7 +111,9 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
     if let Some(color_relationship) =
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
-        let color_path = resolve_path(base_dir, &color_relationship.target);
+        let color_path = color_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.color_style_xml =
             Some(read_zip_str(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
@@ -342,14 +345,13 @@ fn load_chart_user_shapes_xml(
                     .is_some_and(|namespace| namespace.ends_with("/relationships"))
         })?
         .value();
-    let dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let rels_path = relationship_part_path(chart_path);
     let rels_xml = read_zip_str(zip, &rels_path).ok()?;
     let target = ooxml_common::rels::parse_rels(&rels_xml)
         .get(rid)?
         .target
         .clone();
-    let user_shapes_path = resolve_path(dir, &target);
+    let user_shapes_path = resolve_path(chart_path, &target);
     read_zip_str(zip, &user_shapes_path).ok()
 }
 
@@ -918,7 +920,7 @@ pub(crate) fn parse_shape(
     lph: &LayoutPlaceholders,
     theme_source: &(impl PptxThemeSource + ?Sized),
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     group_fill: Option<&Fill>,
     zip: &mut PptxZip,
 ) -> Option<ShapeElement> {
@@ -1283,7 +1285,7 @@ pub(crate) fn parse_shape(
             n,
             theme,
             rels,
-            source_dir,
+            source_part,
             inherited_font_size,
             inherited_level_font_sizes,
             inherited_level_colors,
@@ -1436,13 +1438,13 @@ pub(crate) fn parse_pic_prst_geom(
 /// so a dangling rId yields None (no SVG twin), matching the prior behaviour.
 pub(crate) fn svg_blip_path(
     blip: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
 ) -> Option<String> {
     let svg_rid = svg_blip_rid(blip)?;
     let svg_target = rels.get(&svg_rid)?;
-    let svg_path = resolve_path(slide_dir, svg_target);
+    let svg_path = resolve_path(slide_part, svg_target);
     // Existence check only — `index_for_name` reads the central directory
     // without inflating, unlike the former `read_zip_bytes` which decompressed
     // the whole SVG part just to discard the bytes.
@@ -1482,19 +1484,19 @@ pub(crate) struct BlipSource {
 /// OLE-preview picture paths resolve blips identically.
 pub(crate) fn resolve_blip_source(
     blip_fill: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
 ) -> Option<BlipSource> {
     let blip = child(blip_fill, "blip")?;
 
-    let svg_image_path = svg_blip_path(blip, slide_dir, rels, zip);
+    let svg_image_path = svg_blip_path(blip, slide_part, rels, zip);
 
     // Raster blip (`<a:blip r:embed>` → zip path + intrinsic PNG size).
     let raster: Option<(String, Option<(u32, u32)>)> = (|| {
         let r_id = attr_r(&blip, "embed")?;
         let rel_target = rels.get(&r_id)?;
-        let path = resolve_path(slide_dir, rel_target);
+        let path = resolve_path(slide_part, rel_target);
         // PNG dimensions live in the first 24 bytes. Do not inflate a potentially
         // huge image merely to discover its intrinsic size.
         let image_bytes = read_zip_head(zip, &path, 24).ok()?;
@@ -1529,7 +1531,7 @@ pub(crate) fn resolve_blip_source(
 
 pub(crate) fn parse_picture(
     pic_node: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     theme_source: &(impl PptxThemeSource + ?Sized),
     zip: &mut PptxZip,
@@ -1551,7 +1553,7 @@ pub(crate) fn parse_picture(
         intrinsic_width_px,
         intrinsic_height_px,
         svg_image_path,
-    } = resolve_blip_source(blip_fill, slide_dir, rels, zip)?;
+    } = resolve_blip_source(blip_fill, slide_part, rels, zip)?;
 
     // ECMA-376 §20.1.9.8 — `<p:pic>` may carry `<a:custGeom>` inside `<p:spPr>`,
     // in which case the bitmap is clipped to that custom path (e.g. a laptop
@@ -1625,7 +1627,7 @@ pub(crate) fn parse_picture(
 pub(crate) fn parse_ole_preview_picture(
     pic_node: roxmltree::Node<'_, '_>,
     gf: &Transform,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     theme: &HashMap<String, String>,
     zip: &mut PptxZip,
@@ -1642,7 +1644,7 @@ pub(crate) fn parse_ole_preview_picture(
         intrinsic_width_px,
         intrinsic_height_px,
         svg_image_path,
-    } = resolve_blip_source(blip_fill, slide_dir, rels, zip)?;
+    } = resolve_blip_source(blip_fill, slide_part, rels, zip)?;
 
     Some(PictureElement {
         id: own_cnv_pr(pic_node).and_then(|node| attr(&node, "id")),
@@ -1703,7 +1705,7 @@ pub(crate) fn png_size_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
 /// poster image and the media bytes. Returns None for regular pictures.
 pub(crate) fn parse_media(
     pic_node: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
 ) -> Option<MediaElement> {
     let nv_pic_pr = child(pic_node, "nvPicPr")?;
@@ -1763,7 +1765,7 @@ pub(crate) fn parse_media(
         if target.is_empty() {
             return None; // malformed rel with an empty Target (External links carry a non-empty URL)
         }
-        let path = resolve_path(slide_dir, target);
+        let path = resolve_path(slide_part, target);
         let mime = mime_from_ext(&path);
         let kind = match kind_hint {
             Some(k) => k.to_string(),
@@ -1790,7 +1792,7 @@ pub(crate) fn parse_media(
         let blip_fill = child(pic_node, "blipFill")?;
         let r_id = child(blip_fill, "blip").and_then(|b| attr_r(&b, "embed"))?;
         let rel_target = rels.get(&r_id)?;
-        let image_path = resolve_path(slide_dir, rel_target);
+        let image_path = resolve_path(slide_part, rel_target);
         let img_mime = mime_from_ext(&image_path).to_string();
         Some((image_path, img_mime))
     })()
@@ -1817,6 +1819,16 @@ pub(crate) fn parse_media(
 pub(crate) fn parse_table_styles_xml(
     xml: &str,
     theme_source: &(impl PptxThemeSource + ?Sized),
+) -> HashMap<String, TableStyleDef> {
+    parse_table_styles_xml_with_relationships(xml, theme_source, &HashMap::new())
+}
+
+/// Explicit style blips belong to tableStyles.xml; fillRef blips belong to
+/// the theme. Never resolve either against the consuming slide's rIds.
+fn parse_table_styles_xml_with_relationships(
+    xml: &str,
+    theme_source: &(impl PptxThemeSource + ?Sized),
+    relationships: &HashMap<String, String>,
 ) -> HashMap<String, TableStyleDef> {
     let theme = theme_source.colors();
     let mut map = HashMap::new();
@@ -1888,7 +1900,10 @@ pub(crate) fn parse_table_styles_xml(
             // §20.1.4.2.27: the role fill is `fill` or `fillRef`, never a fill
             // child directly on `tcStyle`.
             let fill = child(tc_style, "fill")
-                .and_then(|fill| parse_table_style_fill(fill, theme))
+                .and_then(|fill| {
+                    parse_table_blip_fill(fill, theme, relationships, "ppt/tableStyles.xml")
+                        .or_else(|| parse_table_style_fill(fill, theme))
+                })
                 .or_else(|| {
                     child(tc_style, "fillRef").and_then(|fill_ref| {
                         let index = attr(&fill_ref, "idx")
@@ -1950,6 +1965,23 @@ pub(crate) fn parse_table_styles_xml(
             }
         };
 
+        // ECMA-376 §20.1.4.2.25: tblBg is a table-sized paint below the
+        // thirteen cell roles. Keeping it separate preserves gradients and
+        // the alpha composition of band1H/band1V over that background.
+        // Background effects (effect/effectRef) are not supported here.
+        def.background = child(style_node, "tblBg").and_then(|background| {
+            child(background, "fill")
+                .and_then(|fill| {
+                    parse_table_blip_fill(fill, theme, relationships, "ppt/tableStyles.xml")
+                        .or_else(|| parse_table_style_fill(fill, theme))
+                })
+                .or_else(|| {
+                    child(background, "fillRef").and_then(|reference| {
+                        parse_style_matrix_fill_from_source(reference, theme_source)
+                    })
+                })
+        });
+
         macro_rules! parse_role {
             ($xml_name:literal, $field:ident) => {
                 if let Some(role) = child(style_node, $xml_name) {
@@ -1958,6 +1990,24 @@ pub(crate) fn parse_table_styles_xml(
             };
         }
         parse_role!("wholeTbl", whole_tbl);
+        // The cell's default grid survives an unspecified whole-table
+        // border; an explicit noFill line removes it. Tagged PDF controls
+        // distinguish a custom wholeTbl with empty tcBdr (1pt black grid)
+        // from the documented No Style, No Grid definition (all NoLine).
+        let grid = TableLineStyle::from_stroke(Some(table_style_presets::stroke("000000")));
+        for side in [
+            &mut def.whole_tbl.borders.left,
+            &mut def.whole_tbl.borders.right,
+            &mut def.whole_tbl.borders.top,
+            &mut def.whole_tbl.borders.bottom,
+            &mut def.whole_tbl.borders.inside_h,
+            &mut def.whole_tbl.borders.inside_v,
+        ] {
+            if matches!(side, TableLineStyle::Unspecified) {
+                *side = grid.clone();
+            }
+        }
+
         parse_role!("band1H", band1_h);
         parse_role!("band2H", band2_h);
         parse_role!("band1V", band1_v);
@@ -2111,7 +2161,13 @@ pub(crate) fn resolve_table_cell_style(
             TablePartRegion::Row,
         );
     }
-    if flags.band_col {
+    // ECMA-376 §20.1.4.2.2/.4 define vertical band roles. PowerPoint
+    // applies them to the interior
+    // columns after enabled first/last-column regions are reserved. Tagged
+    // PDF combined-flag controls distinguish this from overwriting a row
+    // band: an edge column retains its horizontal band but gets no vertical
+    // band fill (both-bands and all-flags counterexamples).
+    if flags.band_col && !(flags.first_col && col == 0 || flags.last_col && col == last_col) {
         let band_col = col.saturating_sub(usize::from(flags.first_col));
         overlay(
             &mut resolved,
@@ -2261,7 +2317,7 @@ pub(crate) fn parse_table(
     t: &Transform,
     theme_source: &(impl PptxThemeSource + ?Sized),
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     default_text: &DefaultTextLevels,
     zip: &mut PptxZip,
 ) -> Option<TableElement> {
@@ -2289,16 +2345,40 @@ pub(crate) fn parse_table(
 
     // Load style definitions once
     let table_styles_xml = read_zip_str(zip, "ppt/tableStyles.xml").ok();
+    let style_relationships = read_zip_str(zip, "ppt/_rels/tableStyles.xml.rels")
+        .ok()
+        .map(|xml| {
+            ooxml_common::rels::parse_rels(&xml)
+                .into_iter()
+                .filter(|(_, rel)| rel.mode == ooxml_common::rels::TargetMode::Internal)
+                .map(|(id, rel)| (id, rel.target))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let table_styles = table_styles_xml
         .as_deref()
-        .map(|xml| parse_table_styles_xml(xml, theme_source))
+        .map(|xml| {
+            parse_table_styles_xml_with_relationships(xml, theme_source, &style_relationships)
+        })
         .unwrap_or_default();
-    let style_owned: Option<TableStyleDef> = style_id.as_deref().and_then(|id| {
-        table_styles
-            .get(id)
-            .cloned()
-            .or_else(|| table_style_presets::lookup_builtin_table_style(id, theme))
-    });
+    let style_owned: Option<TableStyleDef> = style_id
+        .as_deref()
+        .and_then(|id| {
+            table_styles
+                .get(id)
+                .cloned()
+                .or_else(|| table_style_presets::lookup_builtin_table_style(id, theme_source))
+        })
+        .or_else(|| {
+            // [MS-OE376] §2.1.1343(a): an unresolved ID applies no table style.
+            // Tagged PowerPoint controls for omitted tblPr/ID, unknown and zero
+            // IDs (flags absent/all enabled) retain a plain 1pt black grid, even
+            // with a contrasting tblStyleLst default. Direct cell formatting wins.
+            table_style_presets::lookup_builtin_table_style(
+                "{5940675A-B579-460E-94D1-54222C63F5DA}",
+                theme_source,
+            )
+        });
     let style = style_owned.as_ref();
 
     let cols: Vec<i64> = tbl
@@ -2317,7 +2397,6 @@ pub(crate) fn parse_table(
     }
 
     let col_count = cols.len();
-    let last_col_idx = col_count.saturating_sub(1);
 
     let style_flags = TableStyleFlags {
         first_row,
@@ -2332,7 +2411,6 @@ pub(crate) fn parse_table(
         .filter(|n| n.is_element() && n.tag_name().name() == "tr")
         .collect();
     let row_count = row_nodes.len();
-    let last_row_idx = row_count.saturating_sub(1);
     // The table-style tier of each cell's text is known from its position, so
     // the cell text is parsed over it (see `table_cell_chain`).
     let cell_font = |ri: usize, ci: usize| -> Option<TableStyleFont> {
@@ -2349,7 +2427,7 @@ pub(crate) fn parse_table(
                 *tr,
                 theme,
                 rels,
-                source_dir,
+                source_part,
                 &default_text.table,
                 zip,
                 |ci| table_cell_chain(cell_font(ri, ci).as_ref(), theme),
@@ -2368,55 +2446,19 @@ pub(crate) fn parse_table(
                 // preserve an authored noFill/no-line, which is not equivalent to
                 // an omitted property inheriting the table style.
                 apply_resolved_table_cell_style(cell, effective);
-            } else {
-                // ── Fallback for built-in styles not defined in tableStyles.xml ──
-                // Approximate "Medium Style 2": accent1 header fill + thin outer box + row separators.
-                let thin = Stroke {
-                    color: "A0A096".to_string(),
-                    width: 9525,
-                    fill: None,
-                    dash_style: None,
-                    custom_dash: Vec::new(),
-                    line_cap: None,
-                    line_join: None,
-                    miter_limit: None,
-                    alignment: None,
-                    head_end: None,
-                    tail_end: None,
-                    cmpd: None,
-                };
-                if !cell.has_direct_fill && cell.fill.is_none() && first_row && ri == 0 {
-                    if let Some(color) = theme.get("accent1") {
-                        cell.fill = Some(Fill::Solid {
-                            color: color.clone(),
-                        });
-                    }
-                }
-                // Outer top
-                if !cell.has_direct_border_t && cell.border_t.is_none() && ri == 0 {
-                    cell.border_t = Some(thin.clone());
-                }
-                // Inner horizontal separators
-                if !cell.has_direct_border_t && cell.border_t.is_none() && ri > 0 {
-                    cell.border_t = Some(thin.clone());
-                }
-                // Outer bottom
-                if !cell.has_direct_border_b && cell.border_b.is_none() && ri == last_row_idx {
-                    cell.border_b = Some(thin.clone());
-                }
-                // Outer left edge
-                if !cell.has_direct_border_l && cell.border_l.is_none() && ci == 0 {
-                    cell.border_l = Some(thin.clone());
-                }
-                // Outer right edge
-                if !cell.has_direct_border_r && cell.border_r.is_none() && ci == last_col_idx {
-                    cell.border_r = Some(thin.clone());
-                }
             }
         }
     }
 
     Some(TableElement {
+        // §21.1.3.15 CT_TableProperties admits direct EG_FillProperties.
+        // Direct table formatting overrides the style's tblBg, including noFill.
+        background: tbl_pr
+            .and_then(|properties| {
+                parse_table_blip_fill(properties, theme, rels, source_part)
+                    .or_else(|| parse_fill(properties, theme))
+            })
+            .or_else(|| style.and_then(|s| s.background.clone())),
         id: None,
         x: t.x,
         y: t.y,
@@ -2435,7 +2477,7 @@ fn parse_table_row_with(
     tr: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     table_text: &TableTextLevels,
     zip: &mut PptxZip,
     chain_for: impl Fn(usize) -> LevelRunProperties,
@@ -2450,7 +2492,7 @@ fn parse_table_row_with(
                 tc,
                 theme,
                 rels,
-                source_dir,
+                source_part,
                 table_text,
                 &chain_for(ci),
                 zip,
@@ -2466,19 +2508,38 @@ pub(crate) fn parse_table_cell(
     tc: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     table_text: &TableTextLevels,
     zip: &mut PptxZip,
 ) -> TableCell {
     let chain = table_cell_chain(None, theme);
-    parse_table_cell_with_chain(tc, theme, rels, source_dir, table_text, &chain, zip)
+    parse_table_cell_with_chain(tc, theme, rels, source_part, table_text, &chain, zip)
+}
+
+/// CT_TableCellProperties and CT_TableStyleCellStyle both admit blipFill
+/// (§§21.1.3.17 / 20.1.4.2.27). The generic colour fill parser deliberately
+/// cannot resolve image relationships; use the same blip grammar as shapes.
+/// OPC Part 2 §6.4.1 resolves against the owning slide/layout/master part
+/// for direct fills, or tableStyles.xml for explicit style fills.
+fn parse_table_blip_fill(
+    node: roxmltree::Node<'_, '_>,
+    theme: &HashMap<String, String>,
+    relationships: &HashMap<String, String>,
+    source_part: &str,
+) -> Option<Fill> {
+    let blip = child(node, "blipFill")?;
+    crate::fill::parse_blip_fill(blip, theme, &mut |id| {
+        relationships
+            .get(id)
+            .map(|target| resolve_path(source_part, target))
+    })
 }
 
 fn parse_table_cell_with_chain(
     tc: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     table_text: &TableTextLevels,
     chain: &LevelRunProperties,
     zip: &mut PptxZip,
@@ -2505,7 +2566,7 @@ fn parse_table_cell_with_chain(
             n,
             theme,
             rels,
-            source_dir,
+            source_part,
             None,
             // Master otherStyle sizes (`TableTextLevels`); the table-style
             // face tier is in `chain` (`table_cell_chain`).
@@ -2529,6 +2590,15 @@ fn parse_table_cell_with_chain(
             [0; 9],
             zip,
         );
+        // ECMA-376 §21.1.3.17: cell margins belong to tcPr (defaults
+        // 0.1in horizontally and 0.05in vertically). Tagged PowerPoint PDF
+        // controls with bodyPr 9pt and tcPr 1pt retain the 1pt cell margins;
+        // bodyPr insets do not override these cell-owned properties.
+        let margin = |name, default| tc_pr.and_then(|n| attr_i64(&n, name)).unwrap_or(default);
+        body.l_ins = margin("marL", 91_440);
+        body.r_ins = margin("marR", 91_440);
+        body.t_ins = margin("marT", 45_720);
+        body.b_ins = margin("marB", 45_720);
         // Table-cell text direction is authored on tcPr rather than txBody's
         // bodyPr (ECMA-376 §21.1.3.17 CT_TableCellProperties@vert).
         if let Some(direction) = text_direction.as_deref() {
@@ -2537,7 +2607,9 @@ fn parse_table_cell_with_chain(
         body
     });
 
-    let fill = tc_pr.and_then(|n| parse_fill(n, theme));
+    let fill = tc_pr.and_then(|n| {
+        parse_table_blip_fill(n, theme, rels, source_part).or_else(|| parse_fill(n, theme))
+    });
 
     // ECMA-376 §21.1.3.17 (`CT_TableCellProperties`) makes direct formatting
     // the final cascade tier. Presence must be tracked separately because
@@ -2624,14 +2696,14 @@ fn parse_table_cell_with_chain(
 /// layout decorations). Placeholders are skipped (`skip_placeholders = true`).
 /// Extracted verbatim from the two inline spTree walks in `parse_slide` so the
 /// master decorations can be pre-computed once per cached master; `theme`,
-/// `rels`, `smartart_drawings`, and `part_dir` are the resolution context of the
+/// `rels`, `smartart_drawings`, and `source_part` are the resolution context of the
 /// tree being walked. Appends to `out` (callers control ordering/gating).
 // The part's rels/drawings, its theme and the presentation defaultTextStyle
 // levels are independent inheritance inputs of the decorative shape tree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_decorative_shapes(
     root: roxmltree::Node<'_, '_>,
-    part_dir: &str,
+    source_part: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     theme: &(impl PptxThemeSource + ?Sized),
@@ -2651,7 +2723,7 @@ pub(crate) fn extract_decorative_shapes(
             parse_sp_tree_node(
                 node,
                 &empty_lph,
-                part_dir,
+                source_part,
                 rels,
                 smartart_drawings,
                 zip,
@@ -2684,7 +2756,7 @@ pub(crate) fn extract_decorative_shapes(
 pub(crate) fn parse_sp_tree_node(
     node: roxmltree::Node<'_, '_>,
     lph: &LayoutPlaceholders,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     zip: &mut PptxZip,
@@ -2707,7 +2779,7 @@ pub(crate) fn parse_sp_tree_node(
         "sp" => parse_sp_node(
             node,
             lph,
-            slide_dir,
+            slide_part,
             rels,
             zip,
             theme_source,
@@ -2715,7 +2787,7 @@ pub(crate) fn parse_sp_tree_node(
             skip_placeholders,
             group_fill,
         ),
-        "pic" => parse_pic_node(node, lph, slide_dir, rels, zip, theme_source, out),
+        "pic" => parse_pic_node(node, lph, slide_part, rels, zip, theme_source, out),
         "AlternateContent" => {
             let before = out.len();
             // ECMA-376 Part 3 §9.3 — select the first Choice whose Requires namespaces
@@ -2741,7 +2813,7 @@ pub(crate) fn parse_sp_tree_node(
                     parse_sp_tree_node(
                         child_node,
                         lph,
-                        slide_dir,
+                        slide_part,
                         rels,
                         smartart_drawings,
                         zip,
@@ -2779,7 +2851,7 @@ pub(crate) fn parse_sp_tree_node(
         }
         "graphicFrame" => parse_graphic_frame(
             node,
-            slide_dir,
+            slide_part,
             rels,
             smartart_drawings,
             &lph.default_text,
@@ -2837,7 +2909,7 @@ pub(crate) fn parse_sp_tree_node(
                     parse_sp_tree_node(
                         child_node,
                         lph,
-                        slide_dir,
+                        slide_part,
                         rels,
                         smartart_drawings,
                         zip,
@@ -2883,7 +2955,7 @@ fn parse_connector_node(
 fn parse_sp_node(
     node: roxmltree::Node<'_, '_>,
     lph: &LayoutPlaceholders,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
     theme_source: &(impl PptxThemeSource + ?Sized),
@@ -2904,7 +2976,7 @@ fn parse_sp_node(
     // fillRef could paint a black rectangle instead.
     let sp_pr_node = child(node, "spPr");
     let blip_fill_node = sp_pr_node.and_then(|p| child(p, "blipFill"));
-    let blip_source = blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_dir, rels, zip));
+    let blip_source = blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_part, rels, zip));
     if let Some(BlipSource {
         image_path,
         mime_type,
@@ -3071,7 +3143,7 @@ fn parse_sp_node(
             }
         }
     }
-    if let Some(shape) = parse_shape(node, lph, theme_source, rels, slide_dir, group_fill, zip) {
+    if let Some(shape) = parse_shape(node, lph, theme_source, rels, slide_part, group_fill, zip) {
         out.push(SlideElement::Shape(shape));
     }
 }
@@ -3081,16 +3153,16 @@ fn parse_sp_node(
 fn parse_pic_node(
     node: roxmltree::Node<'_, '_>,
     lph: &LayoutPlaceholders,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
     theme_source: &(impl PptxThemeSource + ?Sized),
     out: &mut Vec<SlideElement>,
 ) {
     let theme = theme_source.colors();
-    if let Some(media) = parse_media(node, slide_dir, rels) {
+    if let Some(media) = parse_media(node, slide_part, rels) {
         out.push(SlideElement::Media(media));
-    } else if let Some(pic) = parse_picture(node, slide_dir, rels, theme_source, zip) {
+    } else if let Some(pic) = parse_picture(node, slide_part, rels, theme_source, zip) {
         out.push(SlideElement::Picture(pic));
     } else {
         // Placeholder pic: no xfrm in spPr — position comes from layout by_idx
@@ -3111,7 +3183,7 @@ fn parse_pic_node(
                 let r_id = blip.and_then(|b| attr_r(&b, "embed"));
                 if let Some(rid) = r_id {
                     if let Some(rel_target) = rels.get(&rid) {
-                        let image_path = resolve_path(slide_dir, rel_target);
+                        let image_path = resolve_path(slide_part, rel_target);
                         if let Ok(image_bytes) = read_zip_head(zip, &image_path, 24) {
                             let mime_type = mime_from_ext(&image_path).to_owned();
                             let (intrinsic_width_px, intrinsic_height_px) =
@@ -3122,7 +3194,7 @@ fn parse_pic_node(
                             // Microsoft 2016 SVG extension on the placeholder
                             // p:pic's blip — prefer the vector original.
                             let svg_image_path =
-                                blip.and_then(|b| svg_blip_path(b, slide_dir, rels, zip));
+                                blip.and_then(|b| svg_blip_path(b, slide_part, rels, zip));
                             let PictureShapeProperties {
                                 stroke,
                                 shadow,
@@ -3200,7 +3272,7 @@ fn parse_pic_node(
 #[allow(clippy::too_many_arguments)]
 fn parse_graphic_frame(
     node: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     default_text: &DefaultTextLevels,
@@ -3222,7 +3294,7 @@ fn parse_graphic_frame(
             &t,
             theme_source,
             rels,
-            slide_dir,
+            slide_part,
             default_text,
             zip,
         ) {
@@ -3255,12 +3327,12 @@ fn parse_graphic_frame(
                     }
                     // No prebaked drawing → data-model fallback. `rels` are
                     // the referencing part's, so `rels[dm_rid]` resolved
-                    // against `slide_dir` is the data part (§21.4.2.22
+                    // against `slide_part` is the data part (§21.4.2.22
                     // relIds `r:dm`). Emits M (content list) or S
                     // (placeholder); either way this graphicData is a
                     // diagram, so we return regardless of the outcome.
                     crate::smartart_fallback::emit_smartart_fallback(
-                        &dm_rid, &t, slide_dir, rels, theme, zip, out,
+                        &dm_rid, &t, slide_part, rels, theme, zip, out,
                     );
                     return;
                 }
@@ -3281,8 +3353,18 @@ fn parse_graphic_frame(
             .and_then(|n| attr_r(&n, "id"));
         if let Some(rid) = chart_rid {
             if let Some(rel_target) = rels.get(&rid) {
-                let chart_path = resolve_path(slide_dir, rel_target);
+                let chart_path = resolve_path(slide_part, rel_target);
                 if let Ok(chart_xml) = read_zip_str(zip, &chart_path) {
+                    let graphic_frame_ordinal = node
+                        .document()
+                        .root_element()
+                        .descendants()
+                        .filter(|candidate| {
+                            candidate.is_element() && candidate.tag_name().name() == "graphicFrame"
+                        })
+                        .position(|candidate| candidate.id() == node.id())
+                        .unwrap_or(0);
+                    let retention_site = format!("graphicFrame:{graphic_frame_ordinal}");
                     let related_parts = load_chart_related_parts(zip, &chart_path);
                     let empty_theme_images =
                         ooxml_common::chart::ChartImageRelationships::default();
@@ -3295,14 +3377,24 @@ fn parse_graphic_frame(
                         // part's associated chartStyle sidecar
                         // (`styleN.xml`), reached via that part's OWN
                         // rels. Read it best-effort before parsing.
-                        parse_chartex_with_images(
-                            &chart_xml,
-                            related_parts.style_xml.as_deref(),
-                            related_parts.color_style_xml.as_deref(),
-                            theme,
-                            theme_source.format_scheme(),
-                            &image_resolver,
-                        )
+                        zip.operation()
+                            .and_then(|operation| operation.limit_reporter())
+                            .ok()
+                            .and_then(|reporter| {
+                                parse_chartex_with_images(
+                                    &chart_xml,
+                                    related_parts.style_xml.as_deref(),
+                                    related_parts.color_style_xml.as_deref(),
+                                    theme,
+                                    theme_source.format_scheme(),
+                                    &image_resolver,
+                                    Some(&reporter),
+                                    Some(ooxml_common::chart::ChartRetentionKey {
+                                        source_part: slide_part,
+                                        site: &retention_site,
+                                    }),
+                                )
+                            })
                     } else {
                         let user_shapes_xml =
                             load_chart_user_shapes_xml(zip, &chart_path, &chart_xml);
@@ -3363,7 +3455,8 @@ fn parse_graphic_frame(
                 // The preview pic's own `<a:xfrm>` is 0,0-relative (or
                 // absent), so the graphicFrame's `<p:xfrm>` is authoritative
                 // for placement. Parse the blip, then stamp gf geometry.
-                if let Some(mut pic) = parse_picture(pic_node, slide_dir, rels, theme_source, zip) {
+                if let Some(mut pic) = parse_picture(pic_node, slide_part, rels, theme_source, zip)
+                {
                     pic.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
                     pic.x = t.x;
                     pic.y = t.y;
@@ -3371,7 +3464,7 @@ fn parse_graphic_frame(
                     pic.height = t.cy;
                     out.push(SlideElement::Picture(pic));
                 } else if let Some(mut pic) =
-                    parse_ole_preview_picture(pic_node, &t, slide_dir, rels, theme, zip)
+                    parse_ole_preview_picture(pic_node, &t, slide_part, rels, theme, zip)
                 {
                     // The pic lacked an `<a:xfrm>` (parse_picture requires
                     // one), but still carries a resolvable blip — build the
@@ -3717,7 +3810,7 @@ mod style_ref_tests {
                 doc.root_element(),
                 &theme,
                 &HashMap::new(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &crate::master::TableTextLevels::default(),
                 &chain,
                 &mut zip,
@@ -3785,7 +3878,7 @@ mod style_ref_tests {
             doc.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &chain,
             &mut zip,
@@ -3804,6 +3897,33 @@ mod style_ref_tests {
         assert_eq!(runs[0].font_family.as_deref(), Some("Arial"));
         assert_eq!(runs[0].font_family_ea.as_deref(), Some("MajorJpan"));
         assert_eq!(runs[1].font_family_cs.as_deref(), Some("MajorHebr"));
+    }
+
+    #[test]
+    fn table_cell_blip_retains_slide_relationships_and_tile_properties() {
+        let xml = r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <a:tcPr><a:blipFill dpi="300"><a:blip r:embed="image"/>
+            <a:srcRect l="25000"/><a:tile tx="12700" sx="50000" flip="x"/>
+          </a:blipFill></a:tcPr></a:tc>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = empty_zip();
+        let cell = parse_table_cell(
+            doc.root_element(),
+            &HashMap::new(),
+            &HashMap::from([("image".to_owned(), "../media/cell.png".to_owned())]),
+            "ppt/slides/slide1.xml",
+            &TableTextLevels::default(),
+            &mut zip,
+        );
+        let fill = serde_json::to_value(cell.fill.unwrap()).unwrap();
+        assert_eq!(fill["fillType"], "image");
+        assert_eq!(fill["imagePath"], "ppt/media/cell.png");
+        assert_eq!(fill["dpi"], 300);
+        assert_eq!(fill["srcRect"]["l"], 0.25);
+        assert_eq!(fill["tile"]["tx"], 12700);
+        assert_eq!(fill["tile"]["sx"], 0.5);
+        assert_eq!(fill["tile"]["flip"], "x");
     }
 
     fn empty_zip() -> PptxZip {
@@ -3836,7 +3956,7 @@ mod style_ref_tests {
             &LayoutPlaceholders::default(),
             &PptxTheme::default(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -3922,7 +4042,7 @@ mod style_ref_tests {
             &LayoutPlaceholders::default(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4035,7 +4155,7 @@ mod style_ref_tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4075,7 +4195,7 @@ mod style_ref_tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4097,7 +4217,7 @@ mod style_ref_tests {
     fn table_cell_projects_tcpr_vertical_text_and_margins_into_the_text_body() {
         let doc = roxmltree::Document::parse(
             r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-              <a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Vertical label</a:t></a:r></a:p></a:txBody>
+              <a:txBody><a:bodyPr lIns="9999" tIns="9999" rIns="9999" bIns="9999"/><a:lstStyle/><a:p><a:r><a:t>Vertical label</a:t></a:r></a:p></a:txBody>
               <a:tcPr vert="vert270" anchor="ctr" marL="100" marT="200" marR="300" marB="400"/>
             </a:tc>"#,
         )
@@ -4107,7 +4227,7 @@ mod style_ref_tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &mut zip,
         );
@@ -4165,7 +4285,7 @@ mod style_ref_tests {
             parse_sp_tree_node(
                 doc.root_element(),
                 &LayoutPlaceholders::default(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &HashMap::new(),
                 &HashMap::new(),
                 &mut zip,
@@ -4211,7 +4331,7 @@ mod style_ref_tests {
             cell.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &mut zip,
         );
@@ -4239,7 +4359,7 @@ mod style_ref_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &LayoutPlaceholders::default(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &HashMap::new(),
             &HashMap::new(),
             &mut zip,
@@ -4342,7 +4462,7 @@ mod picture_property_resolution_tests {
         parse_sp_tree_node(
             doc.root_element(),
             placeholders,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &HashMap::new(),
             zip,
@@ -4451,7 +4571,7 @@ mod picture_property_resolution_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &LayoutPlaceholders::default(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &HashMap::new(),
             &mut zip,
@@ -4494,7 +4614,7 @@ mod picture_property_resolution_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &LayoutPlaceholders::default(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &HashMap::new(),
             &mut zip,
@@ -4687,7 +4807,7 @@ mod ole_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &lph,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             rels,
             &smart,
             zip,
@@ -5091,7 +5211,7 @@ mod hidden_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &lph,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &smart,
             &mut zip,
@@ -5427,7 +5547,7 @@ mod strict_namespace_tests {
             parse_sp_tree_node(
                 node,
                 &lph,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 rels,
                 smart,
                 zip,

@@ -2,6 +2,47 @@ import { defineCompatibilityRule } from './compatibility.js';
 import { OFFICE_FAR_EAST_SINGLE_LINE_FACTOR, officeOpenTypeAutoLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 import type { LineSpacing, TabStop } from '../types.js';
 
+export const WORD_TAB_DISPLACED_READING_FRAME = defineCompatibilityRule({
+  id: 'word-float-tab-reading-frame',
+  evidence: {
+    kind: 'regression-test',
+    reference: 'packages/docx/src/layout/first-line-float-indent.test.ts#$kind $alignment ($count), rtl=$rtl, float=$float matches Word geometry',
+  },
+  description: 'Issue #1672 controlled Word exports cover ordinary left/right/center/decimal tabs, one/two tabs, both paragraph directions and either float edge, with no-float counterexamples. Eligibility stays margin-relative (ECMA-376 §17.3.1.37), but an authored target moves with a float-displaced leading line edge. Library policy retains this observation only where text fits the available float band. Word also overflows some tab cells into floats or past the margin; that unspecified fallback is intentionally unsupported. Out-of-band targets break the line and following text uses ordinary legal-break and emergency fitting, without an overflow allowance or a fabricated wide reference band.',
+});
+
+/** Projection of {@link WORD_TAB_DISPLACED_READING_FRAME}. The caller has already
+ * selected the next eligible stop in margin coordinates. */
+export function wordFloatTabStopPosition(
+  stopPosition: number,
+  custom: boolean,
+  leadingShift: number,
+): number {
+  return custom ? stopPosition + Math.max(0, leadingShift) : stopPosition;
+}
+
+export const WORD_POSITIONAL_TAB_AVAILABLE_BAND = defineCompatibilityRule({
+  id: 'word-positional-tab-available-band',
+  evidence: {
+    kind: 'regression-test',
+    reference: 'packages/docx/src/layout/first-line-float-indent.test.ts#$kind $alignment ($count), rtl=$rtl, float=$float matches Word geometry',
+  },
+  description: 'Issue #1672 Word exports cover all 36 positional-tab combinations of left/center/right alignment, margin/indent reference, LTR/RTL paragraph direction and no/left/right float. Word intersects the normative reference box (ECMA-376 §§17.3.3.23, 17.18.71, 17.18.73) with the available float band and aligns the following cell in reading order; no-float references remain unchanged. A target at the current pen is reachable without a line break; only a target behind it requires the next line. RTL must retain the positional descriptor through the bidi post-pass rather than resolving it as an ordinary tab.',
+});
+
+/** Reference-box projection of {@link WORD_POSITIONAL_TAB_AVAILABLE_BAND}. */
+export function wordPositionalTabReferenceBox(
+  referenceStart: number,
+  referenceEnd: number,
+  bandStart: number,
+  bandEnd: number,
+  narrowed: boolean,
+): Readonly<{ start: number; end: number }> {
+  return narrowed
+    ? { start: Math.max(referenceStart, bandStart), end: Math.min(referenceEnd, bandEnd) }
+    : { start: referenceStart, end: referenceEnd };
+}
+
 export const WORD_OPENTYPE_FEATURES_COMPAT_KERNING = defineCompatibilityRule({
   id: 'word-opentype-features-compat-kerning',
   evidence: {
@@ -862,4 +903,19 @@ export function wordRubyUniformLineHeightPx(
   lineHeightsPx: readonly number[],
 ): number {
   return hasRuby ? Math.max(0, ...lineHeightsPx) : 0;
+}
+
+export const WORD_LATIN_DESIGN_GRID_CELLS = defineCompatibilityRule({
+  id: 'word-latin-design-grid-cells',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'float-grid-picture-origin',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: 'Issue #1674 modes 14/15 controls reserve 20/40/40pt for 10/20/30pt Arial single lines on a 20pt grid, including a preceding 20pt line. No-grid and snap-off controls retain natural advances. Apply whole-cell counting only to visible text with an admitted non-Far-East reference design profile. Far-East reference faces, native fallback boxes, empty marks, ruby, explicit multiples and exact/atLeast spacing retain their established paths. Exact/atLeast baseline residuals up to 5.45pt are unresolved; no empirical baseline correction is established by these controls.',
+});
+
+export function wordLatinDesignGridSingleHeight(natural: number, pitch: number, admittedDesign: number): number {
+  // The admitted face controls only its own whole-cell reserve. Other fonts,
+  // inline objects and baseline displacements still own their natural extent
+  // (§17.3.1.33); admission of one run must not shrink any peer's line box.
+  return Math.max(natural, admittedDesign > 0
+    ? Math.max(1, Math.ceil(admittedDesign / pitch)) * pitch : pitch);
 }

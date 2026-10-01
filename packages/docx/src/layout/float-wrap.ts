@@ -5,8 +5,8 @@
 // policy lives in floats.ts. No canvas/drawing or document-model deps, so the
 // geometry can be unit-reasoned and shared by the renderer and the paginator.
 //
-// Compatibility behavior is named and evidence-backed in compatibility.ts;
-// this module receives its square-line minimum as an explicit input.
+// Word gap order is measured by the issue #1670 controls; callers supply
+// the next atom width, while this module owns geometry and numeric safety.
 
 import {
   assertValidPolygonCompileInput,
@@ -481,11 +481,10 @@ function floatBlockedIntervals(
  *   2. square floats (§20.4.2.17): text wraps around the float's rect + dist
  *      padding; tight/through use their compiled polygons (§20.4.2.18/.19).
  *      Multiple objects are composed only after each `largest` object selects
- *      its own permitted side under §20.4.3.7. The widest remaining gap wins.
+ *      its own permitted side under §20.4.3.7. The first usable gap in reading order wins.
  *
- * `word-square-line-start-one-inch` is a square-object compatibility rule, not
- * polygon geometry and not an ECMA-376 mandate. The prepared API therefore
- * receives square and polygon requirements separately.
+ * The prepared API can receive distinct square/polygon requirements for
+ * direct geometry probes; production supplies the next atom width to both.
  */
 export function resolveLineFloatWindow(
   topY: number,
@@ -588,12 +587,13 @@ function mergeAttributedIntervals(
   return merged;
 }
 
-function widestUsableFreeGap(
+function firstUsableFreeGap(
   blocked: readonly ExactAttributedGap[],
   left: number,
   right: number,
   polygonRequiredWidth: number,
   squareRequiredWidth: number,
+  readingDirection: 'ltr' | 'rtl',
 ): Readonly<{
   l: ExactRational;
   r: ExactRational;
@@ -649,14 +649,11 @@ function widestUsableFreeGap(
   if (compareExactRational(cursor, exactRight) < 0) {
     consider(cursor, exactRight, cursorSquareBoundary);
   }
-  let widestWidth: ExactRational = { numerator: 0n, denominator: 1n };
-  for (const gap of gaps) {
+  // WORD_FLOAT_GAP_FLOW selects physical gaps in reading order;
+  // width admission belongs to the next
+  // indivisible text atom, not a universal one-inch threshold (#1670).
+  for (const gap of readingDirection === 'rtl' ? gaps.reverse() : gaps) {
     const width = subtractUnreducedExact(gap.r, gap.l);
-    if (compareExactRational(width, widestWidth) > 0) widestWidth = width;
-  }
-  for (const gap of gaps) {
-    const width = subtractUnreducedExact(gap.r, gap.l);
-    if (compareExactRational(width, widestWidth) !== 0) continue;
     const requirement = Math.max(
       MIN_LINE_GAP,
       gap.squareConstrained ? squareRequiredWidth : polygonRequiredWidth,
@@ -829,12 +826,13 @@ function lineWindowAtY(
     blocked.push(...intervals);
   }
   if (blocked.length === 0) return { topY, xOffset: 0, maxWidth };
-  const best = widestUsableFreeGap(
+  const best = firstUsableFreeGap(
     blocked,
     paraXLeft,
     paraXRight,
     polygonRequiredWidth,
     squareRequiredWidth,
+    reference.readingDirection,
   );
   if (!best) return null;
   const zero: ExactRational = { numerator: 0n, denominator: 1n };

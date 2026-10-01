@@ -115,7 +115,6 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     let theme_xml = read_zip_str(zip, theme_path).unwrap_or_default();
     let mut theme = PptxTheme::from_xml(&theme_xml);
     let rels_xml = read_zip_str(zip, &relationship_part_path(theme_path)).unwrap_or_default();
-    let theme_dir = theme_path.rsplit_once('/').map_or("", |(dir, _)| dir);
 
     theme.chart_images.insert_part_relationships(
         ooxml_common::chart::ChartImageSource::Theme,
@@ -124,7 +123,7 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     );
 
     for (relationship_id, target) in parse_rels(&rels_xml) {
-        let path = resolve_path(theme_dir, &target);
+        let path = resolve_path(theme_path, &target);
         if zip.index_for_name(&path).is_some() {
             theme.insert(format!("{THEME_REL_PREFIX}{relationship_id}"), path);
         }
@@ -138,8 +137,55 @@ mod relationship_tests {
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
+    /// OPC Part 2 §6.4.1: a deferred fillRef retains the theme part's
+    /// relationship context, even when the consumer has a different base.
     #[test]
-    fn theme_part_relationships_are_resolved_from_the_theme_directory() {
+    fn theme_referenced_image_fill_resolves_relative_to_theme_part() {
+        let mut bytes = Vec::new();
+        {
+            let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = SimpleFileOptions::default();
+            archive
+                .start_file("ppt/theme/nested/theme1.xml", options)
+                .unwrap();
+            archive
+                .write_all(
+                    br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                <a:themeElements><a:fmtScheme name="S"><a:fillStyleLst>
+                <a:blipFill><a:blip r:embed="rIdImage"/><a:stretch/></a:blipFill>
+                </a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#,
+                )
+                .unwrap();
+            archive
+                .start_file("ppt/theme/nested/_rels/theme1.xml.rels", options)
+                .unwrap();
+            archive.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                Target="./media/background.png"/></Relationships>"#).unwrap();
+            archive
+                .start_file("ppt/theme/nested/media/background.png", options)
+                .unwrap();
+            archive.write_all(b"png").unwrap();
+            archive.finish().unwrap();
+        }
+        let mut zip = PptxZip::new(Cursor::new(bytes)).expect("open package");
+        let theme = parse_theme_part("ppt/theme/nested/theme1.xml", &mut zip);
+        let consumer = roxmltree::Document::parse(
+            r#"<a:fillRef xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" idx="1">
+            <a:srgbClr val="FFFFFF"/></a:fillRef>"#,
+        )
+        .unwrap();
+        match crate::fill::parse_style_matrix_fill(consumer.root_element(), &theme, false) {
+            Some(crate::Fill::Image { image_path, .. }) => {
+                assert_eq!(image_path, "ppt/theme/nested/media/background.png");
+            }
+            other => panic!("expected theme-relative image fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn theme_part_relationships_are_resolved_from_the_theme_part() {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));

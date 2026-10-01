@@ -1,3 +1,4 @@
+import { wordTextBoxVerticalMode } from './compatibility.js';
 import type { LayoutDiagnostic } from './types.js';
 import {
   classifyFontGeneric,
@@ -109,8 +110,7 @@ export function shapeRunToDocRun(
   run: ShapeTextRun,
   textVert?: string | null,
 ): ShapeTextDocRun {
-  const textBoxVertical = textVert === 'vert' || textVert === 'vert270'
-    || textVert === 'eaVert' || textVert === 'mongolianVert';
+  const textBoxVertical = wordTextBoxVerticalMode(textVert) !== undefined;
   return {
     type: 'text',
     text: run.text,

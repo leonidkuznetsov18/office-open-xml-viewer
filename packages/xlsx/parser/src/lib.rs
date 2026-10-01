@@ -388,7 +388,7 @@ impl XlsxThemeData {
         let Some(target) = find_internal_rel_target_by_type(workbook_rels_xml, "/theme") else {
             return Self::default();
         };
-        let theme_path = resolve_zip_path("xl", &target);
+        let theme_path = resolve_zip_path("xl/workbook.xml", &target);
         let Ok(xml) = read_zip_string(archive, &theme_path) else {
             return Self {
                 format_scheme_present: true,
@@ -2448,7 +2448,7 @@ fn load_sheet_comments(
     }
 
     let threaded_comments = if let Some(target) = threaded_target {
-        let tc_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let tc_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let comments = if let Ok(tc_xml) = read_zip_string(archive, &tc_path) {
             let persons = load_persons(archive, workbook_rels_xml);
             parse_threaded_comments_xml(&tc_xml, &persons)
@@ -2462,7 +2462,7 @@ fn load_sheet_comments(
 
     let mut classic_comments = Vec::new();
     if let Some(target) = classic_target {
-        let comments_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let comments_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         if let Ok(comments_xml) = read_zip_string(archive, &comments_path) {
             classic_comments = parse_comments_xml(&comments_xml);
         }
@@ -2568,7 +2568,7 @@ fn load_persons(archive: &mut XlsxZip, workbook_rels_xml: &str) -> HashMap<Strin
     else {
         return out;
     };
-    let path = resolve_zip_path("xl", &target);
+    let path = resolve_zip_path("xl/workbook.xml", &target);
     let Ok(xml) = read_zip_string(archive, &path) else {
         return out;
     };
@@ -2926,13 +2926,13 @@ fn load_hyperlinks(
         .collect()
 }
 
-/// Resolve a relative path ("../media/image1.png") against a base dir
-/// ("xl/drawings"). Thin alias for the shared
-/// [`ooxml_common::rels::resolve_target`], which handles root-absolute Targets
-/// (openpyxl's `/xl/...`) and `..` normalization uniformly (ECMA-376 Part 2
-/// §9.3). Kept as a local name so existing call sites read unchanged.
-pub(crate) fn resolve_zip_path(base_dir: &str, target: &str) -> String {
-    ooxml_common::rels::resolve_target(base_dir, target)
+/// Resolve an internal relationship target against its source part.
+///
+/// ECMA-376 Part 2 §6.4.1 applies RFC 3986 resolution before validating and
+/// normalizing the result as an OPC part name. An invalid target becomes the
+/// empty lookup key, so callers follow their existing missing-part path.
+pub(crate) fn resolve_zip_path(source_part: &str, target: &str) -> String {
+    ooxml_common::rels::resolve_part_name(source_part, target).unwrap_or_default()
 }
 
 pub(crate) fn resolve_fill_color(
@@ -4978,11 +4978,11 @@ mod resolve_zip_path_tests {
     #[test]
     fn relative_target_resolves_against_base() {
         assert_eq!(
-            resolve_zip_path("xl/worksheets", "../drawings/drawing1.xml"),
+            resolve_zip_path("xl/worksheets/sheet1.xml", "../drawings/drawing1.xml"),
             "xl/drawings/drawing1.xml"
         );
         assert_eq!(
-            resolve_zip_path("xl/drawings", "../media/image1.png"),
+            resolve_zip_path("xl/drawings/drawing1.xml", "../media/image1.png"),
             "xl/media/image1.png"
         );
     }
@@ -4992,13 +4992,35 @@ mod resolve_zip_path_tests {
     #[test]
     fn absolute_target_ignores_base() {
         assert_eq!(
-            resolve_zip_path("xl/worksheets", "/xl/drawings/drawing1.xml"),
+            resolve_zip_path("xl/worksheets/sheet1.xml", "/xl/drawings/drawing1.xml"),
             "xl/drawings/drawing1.xml"
         );
         assert_eq!(
-            resolve_zip_path("xl/drawings", "/xl/charts/chart1.xml"),
+            resolve_zip_path("xl/drawings/drawing1.xml", "/xl/charts/chart1.xml"),
             "xl/charts/chart1.xml"
         );
+    }
+
+    #[test]
+    fn opc_forms_and_external_mode_are_preserved() {
+        assert_eq!(
+            resolve_zip_path("xl/worksheets/sheet1.xml", "./drawing.xml"),
+            "xl/worksheets/drawing.xml"
+        );
+        assert_eq!(
+            resolve_zip_path("xl/worksheets/sheet1.xml", "../media/%69mage.png"),
+            "xl/media/image.png"
+        );
+        assert_eq!(
+            resolve_zip_path("xl/worksheets/sheet1.xml", "../media/%ZZ.png"),
+            ""
+        );
+        let external = ooxml_common::rels::RelTarget {
+            target: "https://example.invalid/image.png".to_owned(),
+            relationship_type: None,
+            mode: ooxml_common::rels::TargetMode::External,
+        };
+        assert_eq!(external.resolve_part("xl/worksheets/sheet1.xml"), None);
     }
 }
 

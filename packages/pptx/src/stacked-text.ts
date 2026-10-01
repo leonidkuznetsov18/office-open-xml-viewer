@@ -41,6 +41,7 @@ import type { HyperlinkTarget } from '@silurus/ooxml-core';
 
 /** The segment fields stacked layout and paint read (renderer's LayoutSegment). */
 export interface StackedSegmentStyle {
+  math?: { width: number; ascent: number; descent: number };
   font: string;
   sizePx: number;
   color: string;
@@ -77,6 +78,8 @@ export interface StackedBodyInput<T extends StackedSegmentStyle> {
   lnSpcReduction?: number;
   pxPerPt: number;
   paragraphs: readonly StackedParagraphInput<T>[];
+  /** Existing equation painter, supplied by the renderer's math-resource owner. */
+  drawObject?(style: T, x: number, y: number): void;
   sameStyle?(a: T, b: T): boolean;
 }
 
@@ -186,7 +189,10 @@ export function renderStackedText<T extends StackedSegmentStyle>(
 ): StackedGlyphRun[] {
   const measure = makeMeasurer<T>(ctx);
   const paragraphs: StackedParagraph<T>[] = body.paragraphs.map((p) => ({
-    runs: p.runs,
+    // Upright OMML's height is the advance along a stacked column; the
+    // horizontal equation width remains its cross-column extent.
+    runs: p.runs.map((run) => run.type === 'object' && run.style.math
+      ? { ...run, width: run.style.math.ascent + run.style.math.descent } : run),
     alignment: p.alignment,
     lineSpacing: p.lineSpacing,
     spaceBefore: p.spaceBefore,
@@ -205,6 +211,12 @@ export function renderStackedText<T extends StackedSegmentStyle>(
     pxPerPt: body.pxPerPt,
     glyphs: measure,
     sameStyle: body.sameStyle,
+    objectGlyph: ({ style }) => {
+      if (!style.math || !body.drawObject) throw new Error('Missing stacked equation adapter');
+      const height = style.math.ascent + style.math.descent;
+      return { text: '', style, kind: 'upright', advance: height, thickness: style.math.width,
+        space: false, box: { ascent: 0, descent: 0 }, cell: height };
+    },
   });
   const runs: StackedGlyphRun[] = [];
   const prevAlign = ctx.textAlign;
@@ -212,6 +224,10 @@ export function renderStackedText<T extends StackedSegmentStyle>(
   for (const placed of layout.glyphs) {
     const g = placed;
     const { style, box } = g;
+    if (style.math) {
+      body.drawObject!(style, placed.axisX - g.thickness / 2, placed.cellTop);
+      continue;
+    }
     const size = style.sizePx;
     runs.push({
       text: g.text, font: style.font, fontSize: size,
