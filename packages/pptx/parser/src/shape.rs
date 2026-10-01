@@ -77,7 +77,6 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
         chart_path,
         &relationships,
     );
-    let base_dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let internal_target = |suffix: &str| {
         relationships.values().find(|relationship| {
             relationship.mode == ooxml_common::rels::TargetMode::Internal
@@ -95,7 +94,9 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
                 .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
     });
     if let Some(style_relationship) = style_relationship {
-        let style_path = resolve_path(base_dir, &style_relationship.target);
+        let style_path = style_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.style_xml = Some(read_zip_str(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_str(zip, &style_rels_path) {
@@ -110,7 +111,9 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
     if let Some(color_relationship) =
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
-        let color_path = resolve_path(base_dir, &color_relationship.target);
+        let color_path = color_relationship
+            .resolve_part(chart_path)
+            .unwrap_or_default();
         result.color_style_xml =
             Some(read_zip_str(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
@@ -342,14 +345,13 @@ fn load_chart_user_shapes_xml(
                     .is_some_and(|namespace| namespace.ends_with("/relationships"))
         })?
         .value();
-    let dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let rels_path = relationship_part_path(chart_path);
     let rels_xml = read_zip_str(zip, &rels_path).ok()?;
     let target = ooxml_common::rels::parse_rels(&rels_xml)
         .get(rid)?
         .target
         .clone();
-    let user_shapes_path = resolve_path(dir, &target);
+    let user_shapes_path = resolve_path(chart_path, &target);
     read_zip_str(zip, &user_shapes_path).ok()
 }
 
@@ -918,7 +920,7 @@ pub(crate) fn parse_shape(
     lph: &LayoutPlaceholders,
     theme_source: &(impl PptxThemeSource + ?Sized),
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     group_fill: Option<&Fill>,
     zip: &mut PptxZip,
 ) -> Option<ShapeElement> {
@@ -1283,7 +1285,7 @@ pub(crate) fn parse_shape(
             n,
             theme,
             rels,
-            source_dir,
+            source_part,
             inherited_font_size,
             inherited_level_font_sizes,
             inherited_level_colors,
@@ -1436,13 +1438,13 @@ pub(crate) fn parse_pic_prst_geom(
 /// so a dangling rId yields None (no SVG twin), matching the prior behaviour.
 pub(crate) fn svg_blip_path(
     blip: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
 ) -> Option<String> {
     let svg_rid = svg_blip_rid(blip)?;
     let svg_target = rels.get(&svg_rid)?;
-    let svg_path = resolve_path(slide_dir, svg_target);
+    let svg_path = resolve_path(slide_part, svg_target);
     // Existence check only — `index_for_name` reads the central directory
     // without inflating, unlike the former `read_zip_bytes` which decompressed
     // the whole SVG part just to discard the bytes.
@@ -1482,19 +1484,19 @@ pub(crate) struct BlipSource {
 /// OLE-preview picture paths resolve blips identically.
 pub(crate) fn resolve_blip_source(
     blip_fill: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
 ) -> Option<BlipSource> {
     let blip = child(blip_fill, "blip")?;
 
-    let svg_image_path = svg_blip_path(blip, slide_dir, rels, zip);
+    let svg_image_path = svg_blip_path(blip, slide_part, rels, zip);
 
     // Raster blip (`<a:blip r:embed>` → zip path + intrinsic PNG size).
     let raster: Option<(String, Option<(u32, u32)>)> = (|| {
         let r_id = attr_r(&blip, "embed")?;
         let rel_target = rels.get(&r_id)?;
-        let path = resolve_path(slide_dir, rel_target);
+        let path = resolve_path(slide_part, rel_target);
         // PNG dimensions live in the first 24 bytes. Do not inflate a potentially
         // huge image merely to discover its intrinsic size.
         let image_bytes = read_zip_head(zip, &path, 24).ok()?;
@@ -1529,7 +1531,7 @@ pub(crate) fn resolve_blip_source(
 
 pub(crate) fn parse_picture(
     pic_node: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     theme_source: &(impl PptxThemeSource + ?Sized),
     zip: &mut PptxZip,
@@ -1551,7 +1553,7 @@ pub(crate) fn parse_picture(
         intrinsic_width_px,
         intrinsic_height_px,
         svg_image_path,
-    } = resolve_blip_source(blip_fill, slide_dir, rels, zip)?;
+    } = resolve_blip_source(blip_fill, slide_part, rels, zip)?;
 
     // ECMA-376 §20.1.9.8 — `<p:pic>` may carry `<a:custGeom>` inside `<p:spPr>`,
     // in which case the bitmap is clipped to that custom path (e.g. a laptop
@@ -1625,7 +1627,7 @@ pub(crate) fn parse_picture(
 pub(crate) fn parse_ole_preview_picture(
     pic_node: roxmltree::Node<'_, '_>,
     gf: &Transform,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     theme: &HashMap<String, String>,
     zip: &mut PptxZip,
@@ -1642,7 +1644,7 @@ pub(crate) fn parse_ole_preview_picture(
         intrinsic_width_px,
         intrinsic_height_px,
         svg_image_path,
-    } = resolve_blip_source(blip_fill, slide_dir, rels, zip)?;
+    } = resolve_blip_source(blip_fill, slide_part, rels, zip)?;
 
     Some(PictureElement {
         id: own_cnv_pr(pic_node).and_then(|node| attr(&node, "id")),
@@ -1703,7 +1705,7 @@ pub(crate) fn png_size_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
 /// poster image and the media bytes. Returns None for regular pictures.
 pub(crate) fn parse_media(
     pic_node: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
 ) -> Option<MediaElement> {
     let nv_pic_pr = child(pic_node, "nvPicPr")?;
@@ -1763,7 +1765,7 @@ pub(crate) fn parse_media(
         if target.is_empty() {
             return None; // malformed rel with an empty Target (External links carry a non-empty URL)
         }
-        let path = resolve_path(slide_dir, target);
+        let path = resolve_path(slide_part, target);
         let mime = mime_from_ext(&path);
         let kind = match kind_hint {
             Some(k) => k.to_string(),
@@ -1790,7 +1792,7 @@ pub(crate) fn parse_media(
         let blip_fill = child(pic_node, "blipFill")?;
         let r_id = child(blip_fill, "blip").and_then(|b| attr_r(&b, "embed"))?;
         let rel_target = rels.get(&r_id)?;
-        let image_path = resolve_path(slide_dir, rel_target);
+        let image_path = resolve_path(slide_part, rel_target);
         let img_mime = mime_from_ext(&image_path).to_string();
         Some((image_path, img_mime))
     })()
@@ -1899,7 +1901,7 @@ fn parse_table_styles_xml_with_relationships(
             // child directly on `tcStyle`.
             let fill = child(tc_style, "fill")
                 .and_then(|fill| {
-                    parse_table_blip_fill(fill, theme, relationships, "ppt")
+                    parse_table_blip_fill(fill, theme, relationships, "ppt/tableStyles.xml")
                         .or_else(|| parse_table_style_fill(fill, theme))
                 })
                 .or_else(|| {
@@ -1970,7 +1972,7 @@ fn parse_table_styles_xml_with_relationships(
         def.background = child(style_node, "tblBg").and_then(|background| {
             child(background, "fill")
                 .and_then(|fill| {
-                    parse_table_blip_fill(fill, theme, relationships, "ppt")
+                    parse_table_blip_fill(fill, theme, relationships, "ppt/tableStyles.xml")
                         .or_else(|| parse_table_style_fill(fill, theme))
                 })
                 .or_else(|| {
@@ -2315,7 +2317,7 @@ pub(crate) fn parse_table(
     t: &Transform,
     theme_source: &(impl PptxThemeSource + ?Sized),
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     default_text: &DefaultTextLevels,
     zip: &mut PptxZip,
 ) -> Option<TableElement> {
@@ -2425,7 +2427,7 @@ pub(crate) fn parse_table(
                 *tr,
                 theme,
                 rels,
-                source_dir,
+                source_part,
                 &default_text.table,
                 zip,
                 |ci| table_cell_chain(cell_font(ri, ci).as_ref(), theme),
@@ -2453,7 +2455,7 @@ pub(crate) fn parse_table(
         // Direct table formatting overrides the style's tblBg, including noFill.
         background: tbl_pr
             .and_then(|properties| {
-                parse_table_blip_fill(properties, theme, rels, source_dir)
+                parse_table_blip_fill(properties, theme, rels, source_part)
                     .or_else(|| parse_fill(properties, theme))
             })
             .or_else(|| style.and_then(|s| s.background.clone())),
@@ -2475,7 +2477,7 @@ fn parse_table_row_with(
     tr: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     table_text: &TableTextLevels,
     zip: &mut PptxZip,
     chain_for: impl Fn(usize) -> LevelRunProperties,
@@ -2490,7 +2492,7 @@ fn parse_table_row_with(
                 tc,
                 theme,
                 rels,
-                source_dir,
+                source_part,
                 table_text,
                 &chain_for(ci),
                 zip,
@@ -2506,28 +2508,30 @@ pub(crate) fn parse_table_cell(
     tc: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     table_text: &TableTextLevels,
     zip: &mut PptxZip,
 ) -> TableCell {
     let chain = table_cell_chain(None, theme);
-    parse_table_cell_with_chain(tc, theme, rels, source_dir, table_text, &chain, zip)
+    parse_table_cell_with_chain(tc, theme, rels, source_part, table_text, &chain, zip)
 }
 
 /// CT_TableCellProperties and CT_TableStyleCellStyle both admit blipFill
 /// (§§21.1.3.17 / 20.1.4.2.27). The generic colour fill parser deliberately
 /// cannot resolve image relationships; use the same blip grammar as shapes.
+/// OPC Part 2 §6.4.1 resolves against the owning slide/layout/master part
+/// for direct fills, or tableStyles.xml for explicit style fills.
 fn parse_table_blip_fill(
     node: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     relationships: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
 ) -> Option<Fill> {
     let blip = child(node, "blipFill")?;
     crate::fill::parse_blip_fill(blip, theme, &mut |id| {
         relationships
             .get(id)
-            .map(|target| resolve_path(source_dir, target))
+            .map(|target| resolve_path(source_part, target))
     })
 }
 
@@ -2535,7 +2539,7 @@ fn parse_table_cell_with_chain(
     tc: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     table_text: &TableTextLevels,
     chain: &LevelRunProperties,
     zip: &mut PptxZip,
@@ -2562,7 +2566,7 @@ fn parse_table_cell_with_chain(
             n,
             theme,
             rels,
-            source_dir,
+            source_part,
             None,
             // Master otherStyle sizes (`TableTextLevels`); the table-style
             // face tier is in `chain` (`table_cell_chain`).
@@ -2604,7 +2608,7 @@ fn parse_table_cell_with_chain(
     });
 
     let fill = tc_pr.and_then(|n| {
-        parse_table_blip_fill(n, theme, rels, source_dir).or_else(|| parse_fill(n, theme))
+        parse_table_blip_fill(n, theme, rels, source_part).or_else(|| parse_fill(n, theme))
     });
 
     // ECMA-376 §21.1.3.17 (`CT_TableCellProperties`) makes direct formatting
@@ -2692,14 +2696,14 @@ fn parse_table_cell_with_chain(
 /// layout decorations). Placeholders are skipped (`skip_placeholders = true`).
 /// Extracted verbatim from the two inline spTree walks in `parse_slide` so the
 /// master decorations can be pre-computed once per cached master; `theme`,
-/// `rels`, `smartart_drawings`, and `part_dir` are the resolution context of the
+/// `rels`, `smartart_drawings`, and `source_part` are the resolution context of the
 /// tree being walked. Appends to `out` (callers control ordering/gating).
 // The part's rels/drawings, its theme and the presentation defaultTextStyle
 // levels are independent inheritance inputs of the decorative shape tree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_decorative_shapes(
     root: roxmltree::Node<'_, '_>,
-    part_dir: &str,
+    source_part: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     theme: &(impl PptxThemeSource + ?Sized),
@@ -2719,7 +2723,7 @@ pub(crate) fn extract_decorative_shapes(
             parse_sp_tree_node(
                 node,
                 &empty_lph,
-                part_dir,
+                source_part,
                 rels,
                 smartart_drawings,
                 zip,
@@ -2752,7 +2756,7 @@ pub(crate) fn extract_decorative_shapes(
 pub(crate) fn parse_sp_tree_node(
     node: roxmltree::Node<'_, '_>,
     lph: &LayoutPlaceholders,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     zip: &mut PptxZip,
@@ -2775,7 +2779,7 @@ pub(crate) fn parse_sp_tree_node(
         "sp" => parse_sp_node(
             node,
             lph,
-            slide_dir,
+            slide_part,
             rels,
             zip,
             theme_source,
@@ -2783,7 +2787,7 @@ pub(crate) fn parse_sp_tree_node(
             skip_placeholders,
             group_fill,
         ),
-        "pic" => parse_pic_node(node, lph, slide_dir, rels, zip, theme_source, out),
+        "pic" => parse_pic_node(node, lph, slide_part, rels, zip, theme_source, out),
         "AlternateContent" => {
             let before = out.len();
             // ECMA-376 Part 3 §9.3 — select the first Choice whose Requires namespaces
@@ -2809,7 +2813,7 @@ pub(crate) fn parse_sp_tree_node(
                     parse_sp_tree_node(
                         child_node,
                         lph,
-                        slide_dir,
+                        slide_part,
                         rels,
                         smartart_drawings,
                         zip,
@@ -2847,7 +2851,7 @@ pub(crate) fn parse_sp_tree_node(
         }
         "graphicFrame" => parse_graphic_frame(
             node,
-            slide_dir,
+            slide_part,
             rels,
             smartart_drawings,
             &lph.default_text,
@@ -2905,7 +2909,7 @@ pub(crate) fn parse_sp_tree_node(
                     parse_sp_tree_node(
                         child_node,
                         lph,
-                        slide_dir,
+                        slide_part,
                         rels,
                         smartart_drawings,
                         zip,
@@ -2951,7 +2955,7 @@ fn parse_connector_node(
 fn parse_sp_node(
     node: roxmltree::Node<'_, '_>,
     lph: &LayoutPlaceholders,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
     theme_source: &(impl PptxThemeSource + ?Sized),
@@ -2972,7 +2976,7 @@ fn parse_sp_node(
     // fillRef could paint a black rectangle instead.
     let sp_pr_node = child(node, "spPr");
     let blip_fill_node = sp_pr_node.and_then(|p| child(p, "blipFill"));
-    let blip_source = blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_dir, rels, zip));
+    let blip_source = blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_part, rels, zip));
     if let Some(BlipSource {
         image_path,
         mime_type,
@@ -3139,7 +3143,7 @@ fn parse_sp_node(
             }
         }
     }
-    if let Some(shape) = parse_shape(node, lph, theme_source, rels, slide_dir, group_fill, zip) {
+    if let Some(shape) = parse_shape(node, lph, theme_source, rels, slide_part, group_fill, zip) {
         out.push(SlideElement::Shape(shape));
     }
 }
@@ -3149,16 +3153,16 @@ fn parse_sp_node(
 fn parse_pic_node(
     node: roxmltree::Node<'_, '_>,
     lph: &LayoutPlaceholders,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     zip: &mut PptxZip,
     theme_source: &(impl PptxThemeSource + ?Sized),
     out: &mut Vec<SlideElement>,
 ) {
     let theme = theme_source.colors();
-    if let Some(media) = parse_media(node, slide_dir, rels) {
+    if let Some(media) = parse_media(node, slide_part, rels) {
         out.push(SlideElement::Media(media));
-    } else if let Some(pic) = parse_picture(node, slide_dir, rels, theme_source, zip) {
+    } else if let Some(pic) = parse_picture(node, slide_part, rels, theme_source, zip) {
         out.push(SlideElement::Picture(pic));
     } else {
         // Placeholder pic: no xfrm in spPr — position comes from layout by_idx
@@ -3179,7 +3183,7 @@ fn parse_pic_node(
                 let r_id = blip.and_then(|b| attr_r(&b, "embed"));
                 if let Some(rid) = r_id {
                     if let Some(rel_target) = rels.get(&rid) {
-                        let image_path = resolve_path(slide_dir, rel_target);
+                        let image_path = resolve_path(slide_part, rel_target);
                         if let Ok(image_bytes) = read_zip_head(zip, &image_path, 24) {
                             let mime_type = mime_from_ext(&image_path).to_owned();
                             let (intrinsic_width_px, intrinsic_height_px) =
@@ -3190,7 +3194,7 @@ fn parse_pic_node(
                             // Microsoft 2016 SVG extension on the placeholder
                             // p:pic's blip — prefer the vector original.
                             let svg_image_path =
-                                blip.and_then(|b| svg_blip_path(b, slide_dir, rels, zip));
+                                blip.and_then(|b| svg_blip_path(b, slide_part, rels, zip));
                             let PictureShapeProperties {
                                 stroke,
                                 shadow,
@@ -3268,7 +3272,7 @@ fn parse_pic_node(
 #[allow(clippy::too_many_arguments)]
 fn parse_graphic_frame(
     node: roxmltree::Node<'_, '_>,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     default_text: &DefaultTextLevels,
@@ -3290,7 +3294,7 @@ fn parse_graphic_frame(
             &t,
             theme_source,
             rels,
-            slide_dir,
+            slide_part,
             default_text,
             zip,
         ) {
@@ -3323,12 +3327,12 @@ fn parse_graphic_frame(
                     }
                     // No prebaked drawing → data-model fallback. `rels` are
                     // the referencing part's, so `rels[dm_rid]` resolved
-                    // against `slide_dir` is the data part (§21.4.2.22
+                    // against `slide_part` is the data part (§21.4.2.22
                     // relIds `r:dm`). Emits M (content list) or S
                     // (placeholder); either way this graphicData is a
                     // diagram, so we return regardless of the outcome.
                     crate::smartart_fallback::emit_smartart_fallback(
-                        &dm_rid, &t, slide_dir, rels, theme, zip, out,
+                        &dm_rid, &t, slide_part, rels, theme, zip, out,
                     );
                     return;
                 }
@@ -3349,7 +3353,7 @@ fn parse_graphic_frame(
             .and_then(|n| attr_r(&n, "id"));
         if let Some(rid) = chart_rid {
             if let Some(rel_target) = rels.get(&rid) {
-                let chart_path = resolve_path(slide_dir, rel_target);
+                let chart_path = resolve_path(slide_part, rel_target);
                 if let Ok(chart_xml) = read_zip_str(zip, &chart_path) {
                     let related_parts = load_chart_related_parts(zip, &chart_path);
                     let empty_theme_images =
@@ -3431,7 +3435,8 @@ fn parse_graphic_frame(
                 // The preview pic's own `<a:xfrm>` is 0,0-relative (or
                 // absent), so the graphicFrame's `<p:xfrm>` is authoritative
                 // for placement. Parse the blip, then stamp gf geometry.
-                if let Some(mut pic) = parse_picture(pic_node, slide_dir, rels, theme_source, zip) {
+                if let Some(mut pic) = parse_picture(pic_node, slide_part, rels, theme_source, zip)
+                {
                     pic.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
                     pic.x = t.x;
                     pic.y = t.y;
@@ -3439,7 +3444,7 @@ fn parse_graphic_frame(
                     pic.height = t.cy;
                     out.push(SlideElement::Picture(pic));
                 } else if let Some(mut pic) =
-                    parse_ole_preview_picture(pic_node, &t, slide_dir, rels, theme, zip)
+                    parse_ole_preview_picture(pic_node, &t, slide_part, rels, theme, zip)
                 {
                     // The pic lacked an `<a:xfrm>` (parse_picture requires
                     // one), but still carries a resolvable blip — build the
@@ -3785,7 +3790,7 @@ mod style_ref_tests {
                 doc.root_element(),
                 &theme,
                 &HashMap::new(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &crate::master::TableTextLevels::default(),
                 &chain,
                 &mut zip,
@@ -3853,7 +3858,7 @@ mod style_ref_tests {
             doc.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &chain,
             &mut zip,
@@ -3887,7 +3892,7 @@ mod style_ref_tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::from([("image".to_owned(), "../media/cell.png".to_owned())]),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &TableTextLevels::default(),
             &mut zip,
         );
@@ -3931,7 +3936,7 @@ mod style_ref_tests {
             &LayoutPlaceholders::default(),
             &PptxTheme::default(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4017,7 +4022,7 @@ mod style_ref_tests {
             &LayoutPlaceholders::default(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4130,7 +4135,7 @@ mod style_ref_tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4170,7 +4175,7 @@ mod style_ref_tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -4202,7 +4207,7 @@ mod style_ref_tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &mut zip,
         );
@@ -4260,7 +4265,7 @@ mod style_ref_tests {
             parse_sp_tree_node(
                 doc.root_element(),
                 &LayoutPlaceholders::default(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &HashMap::new(),
                 &HashMap::new(),
                 &mut zip,
@@ -4306,7 +4311,7 @@ mod style_ref_tests {
             cell.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &crate::master::TableTextLevels::default(),
             &mut zip,
         );
@@ -4334,7 +4339,7 @@ mod style_ref_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &LayoutPlaceholders::default(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &HashMap::new(),
             &HashMap::new(),
             &mut zip,
@@ -4437,7 +4442,7 @@ mod picture_property_resolution_tests {
         parse_sp_tree_node(
             doc.root_element(),
             placeholders,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &HashMap::new(),
             zip,
@@ -4546,7 +4551,7 @@ mod picture_property_resolution_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &LayoutPlaceholders::default(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &HashMap::new(),
             &mut zip,
@@ -4589,7 +4594,7 @@ mod picture_property_resolution_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &LayoutPlaceholders::default(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &HashMap::new(),
             &mut zip,
@@ -4782,7 +4787,7 @@ mod ole_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &lph,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             rels,
             &smart,
             zip,
@@ -5186,7 +5191,7 @@ mod hidden_tests {
         parse_sp_tree_node(
             doc.root_element(),
             &lph,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &smart,
             &mut zip,
@@ -5522,7 +5527,7 @@ mod strict_namespace_tests {
             parse_sp_tree_node(
                 node,
                 &lph,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 rels,
                 smart,
                 zip,

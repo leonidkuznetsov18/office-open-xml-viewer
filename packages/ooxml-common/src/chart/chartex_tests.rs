@@ -1749,6 +1749,39 @@ mod tests {
         )
     }
 
+    #[test]
+    fn chartex_unknown_layout_fails_closed_for_every_host() {
+        let data = r#"<cx:data id="0">
+          <cx:strDim type="cat"><cx:lvl ptCount="1"><cx:pt idx="0">Only</cx:pt></cx:lvl></cx:strDim>
+          <cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim>
+        </cx:data>"#;
+        for host in [
+            ChartHost::Unspecified,
+            ChartHost::PowerPoint,
+            ChartHost::Excel,
+            ChartHost::Word,
+        ] {
+            assert!(
+                parse_chartex_xml(
+                    data,
+                    r#"<cx:series layoutId="pie"><cx:dataId val="0"/></cx:series>"#,
+                    host,
+                )
+                .is_none(),
+                "unsupported layout must not reach an ordinary renderer for {host:?}"
+            );
+            assert!(
+                parse_chartex_xml(
+                    data,
+                    r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series><cx:series layoutId="pie"><cx:dataId val="0"/></cx:series>"#,
+                    host,
+                )
+                .is_none(),
+                "one unsupported series must fail the complete ChartEx plot for {host:?}"
+            );
+        }
+    }
+
     const AGG_OWNER: &str = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>"#;
     const OWNED_LINE: &str = r#"<cx:series layoutId="paretoLine" ownerIdx="0"/>"#;
 
@@ -1850,17 +1883,16 @@ mod tests {
         let series = r#"<cx:series layoutId="futureLayout"><cx:dataId val="0"/></cx:series>
             <cx:series layoutId="clusteredColumn" hidden="1"><cx:dataId val="0"/></cx:series>
             <cx:series layoutId="paretoLine" ownerIdx="1"/>"#;
-        for host in [ChartHost::PowerPoint, ChartHost::Excel] {
-            let model = parse_chartex_xml(data, series, host).unwrap();
-            assert_eq!(model.chart_type, "futureLayout");
-            assert_eq!(model.chartex_pareto_owner_index, None);
-            assert_eq!(model.chartex_suppress_geometry, None);
-            assert_eq!(model.chartex_pareto_outline_owner, None);
-            assert_eq!(model.chartex_pareto_sort_descending, None);
-            assert!(model
-                .series
-                .iter()
-                .all(|series| series.series_type.as_deref() != Some("line")));
+        for host in [
+            ChartHost::Unspecified,
+            ChartHost::PowerPoint,
+            ChartHost::Excel,
+            ChartHost::Word,
+        ] {
+            assert!(
+                parse_chartex_xml(data, series, host).is_none(),
+                "an unknown layout must reject the complete mixed plot for {host:?}"
+            );
         }
     }
 
@@ -1926,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_chartex_preserves_an_unknown_future_layout_without_guessing() {
+    fn parse_chartex_rejects_an_unknown_future_layout_without_guessing() {
         for series_xml in [
             r#"<cx:series layoutId="futureLayout"><cx:dataId val="0"/></cx:series>"#,
             r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>
@@ -1944,24 +1976,18 @@ mod tests {
                 </cx:chartSpace>"#
             );
             let document = chart_space_of(&xml);
-            let model = parse_chartex_part(
-                document.root_element(),
-                &ChartParseContext {
-                    color_resolver: Some(&FixtureResolver),
-                    style_xml: None,
-                    ..Default::default()
-                },
-            )
-            .expect("future ChartEx layout remains inspectable");
-
-            assert_eq!(model.chart_type, "futureLayout");
-            assert_eq!(model.categories, vec!["A", "B"]);
-            assert_eq!(model.series[0].values, vec![Some(2.0), Some(-1.0)]);
-            assert!(model.chartex_histogram_binning.is_none());
-            assert!(model.chartex_box.is_none());
-            assert!(model.chartex_sunburst.is_none());
-            assert!(model.chartex_treemap.is_none());
-            assert!(model.chartex_region_map.is_none());
+            assert!(
+                parse_chartex_part(
+                    document.root_element(),
+                    &ChartParseContext {
+                        color_resolver: Some(&FixtureResolver),
+                        style_xml: None,
+                        ..Default::default()
+                    },
+                )
+                .is_none(),
+                "an unknown ChartEx layout must fail closed for the complete plot"
+            );
         }
     }
 

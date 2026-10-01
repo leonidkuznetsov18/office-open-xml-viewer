@@ -1,3 +1,4 @@
+import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
 import {
   effectiveParagraphTabStops,
@@ -3472,8 +3473,7 @@ function textBoxParagraphContext(
 type RetainedTextBoxVerticalMode = NonNullable<TextBoxLayout['verticalMode']>;
 
 function retainedTextBoxVerticalMode(value: string | null | undefined): RetainedTextBoxVerticalMode | undefined {
-  return value === 'vert' || value === 'vert270' || value === 'eaVert' || value === 'mongolianVert'
-    ? value : undefined;
+  return wordTextBoxVerticalMode(value);
 }
 
 /** ECMA-376 §21.1.2.1.1 `CT_TextBodyProperties@anchor`: resolve the text
@@ -3496,6 +3496,7 @@ function orientVerticalTextBoxParagraph(
   mode: RetainedTextBoxVerticalMode,
   innerBounds: LayoutRect,
   insets: Readonly<{ topPt: number; rightPt: number; bottomPt: number; leftPt: number }>,
+  wordArt = false,
 ): ParagraphLayout {
   const eastAsianUpright = mode === 'eaVert' || mode === 'mongolianVert';
   const lines = paragraph.lines.map((line) => {
@@ -3512,7 +3513,7 @@ function orientVerticalTextBoxParagraph(
       : 0;
     const mirroredBaselinePt = mode === 'mongolianVert'
       ? 2 * innerBounds.yPt + innerBounds.heightPt - line.baselinePt
-        + insets.bottomPt - insets.leftPt + rubyReservePt
+        + (wordArt ? 0 : insets.bottomPt - insets.leftPt) + rubyReservePt
       : line.baselinePt;
     const deltaYPt = mirroredBaselinePt - line.baselinePt;
     const mirroredY = line.bounds.yPt + deltaYPt;
@@ -3523,7 +3524,7 @@ function orientVerticalTextBoxParagraph(
           : placement;
       }
       const paintOps = eastAsianUpright
-        ? eastAsianUprightPaintOps(placement)
+        ? eastAsianUprightPaintOps(placement, wordArt)
         : placement.paintOps;
       return translatePlacementY({ ...placement, paintOps }, deltaYPt);
     });
@@ -3540,6 +3541,7 @@ function orientVerticalTextBoxParagraph(
 function orientVerticalTextBoxTable(
   table: import('./types.js').TableLayout,
   mode: RetainedTextBoxVerticalMode,
+  wordArt = false,
 ): import('./types.js').TableLayout {
   const orientChild = (
     child: ParagraphLayout | import('./types.js').TableLayout,
@@ -3554,8 +3556,9 @@ function orientVerticalTextBoxTable(
           mode === 'mongolianVert' ? 'eaVert' : mode,
           cellBounds,
           { topPt: 0, rightPt: 0, bottomPt: 0, leftPt: 0 },
+          wordArt,
         )
-      : orientVerticalTextBoxTable(child, mode);
+      : orientVerticalTextBoxTable(child, mode, wordArt);
   const oriented: import('./types.js').TableLayout = {
     ...table,
     rows: table.rows.map((row) => ({
@@ -3580,7 +3583,7 @@ function orientVerticalTextBoxTable(
     if (prior) return prior;
     const result = {
       ...placement,
-      child: orientVerticalTextBoxTable(placement.child, mode),
+      child: orientVerticalTextBoxTable(placement.child, mode, wordArt),
     };
     sourceMemo.set(placement, result);
     return result;
@@ -3604,14 +3607,15 @@ function orientVerticalTextBoxStory(
   mode: RetainedTextBoxVerticalMode,
   innerBounds: LayoutRect,
   insets: Readonly<{ topPt: number; rightPt: number; bottomPt: number; leftPt: number }>,
+  wordArt = false,
 ): StoryLayout {
   return {
     ...story,
     blocks: story.blocks.map((block) => {
       if (block.kind === 'paragraph') {
-        return orientVerticalTextBoxParagraph(block, mode, innerBounds, insets);
+        return orientVerticalTextBoxParagraph(block, mode, innerBounds, insets, wordArt);
       }
-      if (block.kind === 'table') return orientVerticalTextBoxTable(block, mode);
+      if (block.kind === 'table') return orientVerticalTextBoxTable(block, mode, wordArt);
       throw new Error(`Text-box story contains unsupported retained node: ${block.kind}`);
     }),
   };
@@ -3756,6 +3760,7 @@ export function acquireShapeTextBoxLayout(
     ? acquisition.blockCount
     : acquisition.paragraphs.length;
   if (blockCount === 0) return undefined;
+  const stackedWordArt = shape.textVert === 'wordArtVert' || shape.textVert === 'wordArtVertRtl';
   const verticalMode = retainedTextBoxVerticalMode(shape.textVert);
   const contentBounds: LayoutRect = verticalMode ? {
     xPt: -rect.heightPt / 2,
@@ -3766,7 +3771,13 @@ export function acquireShapeTextBoxLayout(
   const normalized = acquisition.kind === 'compatibility'
     ? acquisition.paragraphs
     : Object.freeze([]);
-  const insets = {
+  // A clockwise WordArt frame maps inline start/end to physical top/bottom,
+  // and logical block start/end to physical right/left. The LTR-column
+  // projection below mirrors the block axis without swapping authored insets.
+  const insets = stackedWordArt ? {
+    topPt: shape.textInsetR ?? 0, rightPt: shape.textInsetB ?? 0,
+    bottomPt: shape.textInsetL ?? 0, leftPt: shape.textInsetT ?? 0,
+  } : {
     topPt: shape.textInsetT ?? 0, rightPt: shape.textInsetR ?? 0,
     bottomPt: shape.textInsetB ?? 0, leftPt: shape.textInsetL ?? 0,
   };
@@ -3787,7 +3798,9 @@ export function acquireShapeTextBoxLayout(
         id: `${options.id}:story`,
         kind: 'textbox',
         bounds: innerBounds,
+        ...(stackedWordArt ? { quarterTurnMath: true } : {}),
         capacity: 'unbounded',
+        ...(stackedWordArt && shape.textWrap === 'none' ? { noWrap: true } : {}),
       },
       coordinateSpace: options.coordinateSpace ?? 'section-logical',
     });
@@ -3863,6 +3876,7 @@ export function acquireShapeTextBoxLayout(
         // The shared flow fold above owns the complete inter-paragraph gap.
         // Paragraph acquisition therefore starts at the resolved content edge.
         suppressSpaceBefore: true,
+        ...(stackedWordArt && shape.textWrap === 'none' ? { noWrap: true } : {}),
       },
       measurer: options.measurer,
       environment: options.environment,
@@ -3870,7 +3884,7 @@ export function acquireShapeTextBoxLayout(
     });
     yPt += child.advancePt - child.spacing.afterPt;
     previousInput = input;
-    return verticalMode ? orientVerticalTextBoxParagraph(child, verticalMode, innerBounds, insets) : child;
+    return verticalMode ? orientVerticalTextBoxParagraph(child, verticalMode, innerBounds, insets, stackedWordArt) : child;
   });
   const fittedExtentPt = completeStory
     ? Math.max(0, completeStory.advancePt + insets.topPt + insets.bottomPt)
@@ -3931,30 +3945,42 @@ export function acquireShapeTextBoxLayout(
       verticalMode,
       effectiveInnerBounds,
       insets,
+      stackedWordArt,
     );
   }
   story = translateTextBoxStory(
     story,
-    textBoxAnchorOffsetPt(
+    // WordArt columns advance rightwards: anchoring shifts the mirrored local
+    // block axis negatively so ctr/b move toward the physical trailing edge.
+    (stackedWordArt ? -1 : 1) * textBoxAnchorOffsetPt(
       shape.textAnchor,
       effectiveInnerBounds.heightPt,
       anchorStoryExtentPt,
     ),
     false,
   );
+  // Issue #1668 Word controls: 0/30/90 degree shape rotations carry the
+  // WordArt text frame; flipH keeps it readable, flipV turns it 180 degrees.
+  // Retain the composed transform here so paint/indexing use the same frame.
+  const textRotation = stackedWordArt
+    ? ((shape.rotation ?? 0) + (shape.flipV ? 180 : 0)) * Math.PI / 180 : 0;
+  const sin = Math.sin(textRotation);
+  const cos = Math.cos(textRotation);
   return deepFreezePlainData({
     kind: 'textbox', id: options.id, source: normalized[0]?.source ?? storySource,
     flowDomainId: `${options.flowDomainId}:textbox`, flowBounds: effectiveRect, inkBounds: effectiveRect,
     ...(shape.defaultTextColor ? {
       defaultTextColor: `#${shape.defaultTextColor.replace(/^#/u, '')}`,
     } : {}),
-    ...(shape.textAutofit === 'none' ? { clipBounds: effectiveInnerBounds } : {}),
+    // Word issue #1668 controls retain overflow in fixed stacked WordArt
+    // boxes (wrap square/none and multi-paragraph cases); do not add a body clip.
+    ...(shape.textAutofit === 'none' && !stackedWordArt ? { clipBounds: effectiveInnerBounds } : {}),
     advancePt: 0, ordinaryFlow: false, story,
     transform: verticalMode ? {
-      a: 0,
-      b: verticalMode === 'vert270' ? -1 : 1,
-      c: verticalMode === 'vert270' ? 1 : -1,
-      d: 0,
+      a: stackedWordArt ? -sin : 0,
+      b: verticalMode === 'vert270' ? -1 : cos,
+      c: verticalMode === 'vert270' ? 1 : -cos,
+      d: stackedWordArt ? -sin : 0,
       e: effectiveRect.xPt + effectiveRect.widthPt / 2,
       f: effectiveRect.yPt + effectiveRect.heightPt / 2,
     } : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
@@ -4237,13 +4263,14 @@ function paragraphAcquisitionKey(
     lineOnly ? null : options.flowDomainId,
     lineOnly ? null : options.ordinaryFlow,
     lineOnly
-      ? [plainPlacement.paragraphXPt, plainPlacement.availableWidthPt]
+      ? [plainPlacement.paragraphXPt, plainPlacement.availableWidthPt, plainPlacement.noWrap ?? false]
       : [
           plainPlacement.startYPt,
           plainPlacement.paragraphXPt,
           plainPlacement.availableWidthPt,
           plainPlacement.maximumYPt,
           plainPlacement.suppressSpaceBefore,
+          plainPlacement.noWrap ?? false,
           wrap ? cache.objectIdentity(wrap) : null,
         ],
     [

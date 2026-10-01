@@ -1955,6 +1955,9 @@ export interface ShapeParagraph {
     runs: ShapeTextRun[];
 }
 export interface ShapeText {
+    vert?: string;
+    anchorCtr?: boolean;
+    spcFirstLastPara?: boolean;
     anchor: string;
     wrap: string;
     autoFit?: string;
@@ -1972,6 +1975,7 @@ export type ShapeTextRun = {
     bold: boolean;
     italic: boolean;
     size: number;
+    spacing?: number;
     color?: string;
     fontFace?: string;
     fontFaceEa?: string;
