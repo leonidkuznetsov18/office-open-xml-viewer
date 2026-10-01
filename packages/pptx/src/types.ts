@@ -517,6 +517,10 @@ export interface Sp3d {
 }
 
 export interface TableElement {
+  /** Optional `a:tblBg` fill across the entire table beneath cell fills.
+   * Resolved from the active theme matrix; omitted means no background paint.
+   * Existing model producers may omit it. */
+  background?: Fill;
   type: 'table';
   /** `<p:nvGraphicFramePr><p:cNvPr @id>` for the table frame. */
   id?: string;

@@ -238,6 +238,10 @@ pub struct ChartElement {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TableElement {
+    /// ECMA-376 §20.1.4.2.25 `tblBg`: painted once below cell fills so
+    /// transparent bands reveal the theme background rather than the slide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Fill>,
     /// `<p:nvGraphicFramePr><p:cNvPr @id>` for the table frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

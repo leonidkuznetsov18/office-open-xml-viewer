@@ -454,6 +454,22 @@ async function planSlideImages(
   }
 
   for (const element of slide.elements) {
+    for (const { fill, width, height } of elementImageFillUsages(element)) {
+      if (!fill.tile && !pixelTransform(fill)) {
+        const fr = fill.fillRect ?? {};
+        const targetWidth = emuToPx(width, scale) * (1 - (fr.l ?? 0) - (fr.r ?? 0));
+        const targetHeight = emuToPx(height, scale) * (1 - (fr.t ?? 0) - (fr.b ?? 0));
+        const vector = fill.mimeType === 'image/svg+xml' || preferVectorBlip(fill);
+        if (!vector) push(
+          imagePlanKey(fill.imagePath, pixelTransform(fill)),
+          rasterTargetOptions(targetWidth, targetHeight, dpr, fill.srcRect),
+          fill.imagePath,
+          fill.mimeType,
+          fetchImage,
+          1,
+        );
+      }
+    }
     if (element.type === 'picture') {
       const vector = preferVectorBlip(element) || element.mimeType === 'image/svg+xml';
       if (!vector && !pixelTransform(element)) {
@@ -516,23 +532,6 @@ async function planSlideImages(
         }
       }
     } else if (element.type === 'shape') {
-      const fill = element.fill?.fillType === 'image' && shapeImageFillModeIsPaintable(element.fill)
-        ? element.fill
-        : null;
-      if (fill && !fill.tile && !pixelTransform(fill)) {
-        const fr = fill.fillRect ?? {};
-        const width = emuToPx(element.width, scale) * (1 - (fr.l ?? 0) - (fr.r ?? 0));
-        const height = emuToPx(element.height, scale) * (1 - (fr.t ?? 0) - (fr.b ?? 0));
-        const vector = fill.mimeType === 'image/svg+xml' || preferVectorBlip(fill);
-        if (!vector) push(
-          imagePlanKey(fill.imagePath, pixelTransform(fill)),
-          rasterTargetOptions(width, height, dpr, fill.srcRect),
-          fill.imagePath,
-          fill.mimeType,
-          fetchImage,
-          1,
-        );
-      }
       if (!element.textBody) continue;
       for (const paragraph of element.textBody.paragraphs) {
         const bullet = asBullet(paragraph.bullet);
@@ -563,12 +562,62 @@ async function planSlideImages(
   return planDecodedImageTargets(demands, policy);
 }
 
+/** ECMA-376 §§20.1.4.2.25/27 and 21.1.3.17 use the same
+ * EG_FillProperties as shapes. Styles and bands have already cascaded into
+ * cell.fill; only merge anchors own a painted fill. Use authored grid extents
+ * for decode demand (the unchanged text measurement owns the final paint box).
+ * A zero-minimum row uses the authored frame as its decode target, without
+ * changing or predicting text-driven growth. If both are zero, preparation
+ * uses a budget-checked native decode: text can still grow the painted row. */
+function* elementImageFillUsages(element: SlideElement): Generator<{
+  fill: ImageFill; width: number; height: number;
+}> {
+  const usage = (fill: Fill | null | undefined, width: number, height: number) =>
+    fill?.fillType === 'image' && shapeImageFillModeIsPaintable(fill)
+      ? { fill, width, height }
+      : null;
+  if (element.type === 'shape') {
+    const own = usage(element.fill, element.width, element.height);
+    if (own && element.height > 0) yield own;
+  } else if (element.type === 'table') {
+    // Prefix sums keep merged-cell resource planning linear in the grid,
+    // independent of the authored span lengths; no per-cell slice allocation.
+    const colExtents = [0];
+    for (const col of element.cols) colExtents.push(colExtents[colExtents.length - 1] + col);
+    const rowExtents = [0];
+    for (const row of element.rows) rowExtents.push(rowExtents[rowExtents.length - 1] + row.height);
+    const width = colExtents[colExtents.length - 1];
+    const height = rowExtents[rowExtents.length - 1] || element.height;
+    const background = usage(element.background, width, height);
+    if (background) yield background;
+    for (let ri = 0; ri < element.rows.length; ri++) {
+      const row = element.rows[ri];
+      for (let ci = 0; ci < row.cells.length; ci++) {
+        const cell = row.cells[ci];
+        if (cell.hMerge || cell.vMerge || cell.fill?.fillType !== 'image'
+          || !shapeImageFillModeIsPaintable(cell.fill)) continue;
+        const cellWidth = (colExtents[Math.min(ci + (cell.gridSpan || 1), element.cols.length)] ?? 0)
+          - (colExtents[ci] ?? 0);
+        const cellHeight = (rowExtents[Math.min(ri + (cell.rowSpan || 1), element.rows.length)]
+          - rowExtents[ri]) || element.height;
+        const own = usage(cell.fill, cellWidth, cellHeight);
+        if (own) yield own;
+      }
+    }
+  }
+}
+
+function* slideImageFillUsages(slide: Slide) {
+  for (const element of slide.elements) yield* elementImageFillUsages(element);
+}
+
 function slideMayDecodeImages(slide: Slide): boolean {
   if (slide.background?.fillType === 'image') return true;
   return slide.elements.some((element) => {
     if (element.type === 'picture') return true;
     if (element.type === 'media') return !!element.posterPath;
     if (element.type === 'chart') return collectChartImageFillUsages(element.chart).length > 0;
+    if (!elementImageFillUsages(element).next().done) return true;
     return element.type === 'shape' && (
       element.fill?.fillType === 'image'
       || !!element.textBody?.paragraphs.some(paragraph => asBullet(paragraph.bullet).type === 'blip')
@@ -7229,22 +7278,34 @@ export function renderTable(
     }
   }
 
+  // tblBg uses the full grown table rectangle, once, before alpha cell
+  // fills. A per-cell background would restart theme gradients at every row.
+  const tableHeight = rowHeights.reduce((sum, height) => sum + height, 0);
+  // Keep the theme paint and band alpha intact. Solid/gradient matrix
+  // controls agree with Office PDF vectors and Poppler rasterization; MuPDF
+  // can differ by 1–2 RGB levels on non-white alpha composites. That PDF
+  // rasterizer difference is not a colour compensation rule for Canvas.
+  // Image fills share shape decoding, effects, crop/tile placement and cache
+  // ownership; ordinary fills keep the canvas-aware gradient/pattern resolver.
+  const paintTableFill = (fill: Fill | null, x: number, y: number, w: number, h: number) => {
+    if (fill?.fillType === 'image') {
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      paintPreparedShapeImageFill(ctx, fill, rc.shapeFillImages?.get(shapeFillKey(fill)),
+        { x, y, w, h }, scale);
+    } else {
+      const paint = resolveShapeFill(fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
+      if (paint) {
+        ctx.fillStyle = paint;
+        ctx.fillRect(x, y, w, h);
+      }
+    }
+  };
+  paintTableFill(el.background ?? null, x0, y0, tableW, tableHeight);
+
   // Pass 1: fills + text bodies.
   for (const { cell, colX, rowY, cellW, cellH, ci, ri } of jobs) {
-    const fillPaint = resolveShapeFill(
-      cell.fill,
-      ctx,
-      colX,
-      rowY,
-      cellW,
-      cellH,
-      el.rotation,
-      scale * PT_TO_EMU,
-    );
-    if (fillPaint) {
-      ctx.fillStyle = fillPaint;
-      ctx.fillRect(colX, rowY, cellW, cellH);
-    }
+    paintTableFill(cell.fill, colX, rowY, cellW, cellH);
     // Text body — default run colour comes from the table style's tcTxStyle
     // (e.g. white header text on an accent fill); a run's explicit colour wins.
     // ECMA-376 Part 1 DrawingML CT_TableCell permits txBody to be absent. Empty
@@ -7861,20 +7922,16 @@ async function renderSlideLeased(
       preserveNaturalSize: boolean;
       hasSourceCrop: boolean;
     }>();
-    for (const element of slide.elements) {
-      const fill = element.type === 'shape' && element.fill?.fillType === 'image'
-        && shapeImageFillModeIsPaintable(element.fill)
-        ? element.fill
-        : null;
-      if (!fill || !(element.width > 0) || !(element.height > 0)) continue;
+    for (const { fill, width, height } of slideImageFillUsages(slide)) {
+      if (!(width > 0) || !(height >= 0)) continue;
       const key = shapeFillKey(fill);
       const prior = shapeFills.get(key);
-      const widthPt = element.width / PT_TO_EMU;
-      const heightPt = element.height / PT_TO_EMU;
+      const widthPt = width / PT_TO_EMU;
+      const heightPt = height / PT_TO_EMU;
       const fr = fill.fillRect ?? {};
       const target = rasterTargetOptions(
-        emuToPx(element.width, scale) * (1 - (fr.l ?? 0) - (fr.r ?? 0)),
-        emuToPx(element.height, scale) * (1 - (fr.t ?? 0) - (fr.b ?? 0)),
+        emuToPx(width, scale) * (1 - (fr.l ?? 0) - (fr.r ?? 0)),
+        emuToPx(height, scale) * (1 - (fr.t ?? 0) - (fr.b ?? 0)),
         effectiveDpr,
         fill.srcRect,
       );
