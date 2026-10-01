@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from 'node:fs';
+import init, { DocxArchive } from '../wasm/docx_parser.js';
+import { normalizeInternalDocumentModel } from '../parser-model.js';
 import { describe, expect, it, vi } from 'vitest';
 
 // Counts body pagination passes: each pass opens exactly one kernel session.
@@ -320,4 +323,79 @@ describe('progressive layout with page-owned anchors', () => {
       expectPublishedPagesFinal(previews, final);
     }
   }, 300_000);
+});
+
+describe('page-table destination cycle settlement', () => {
+  const coupledTables = () => documentModel(33, [
+    [13, pageFloatingTable(468, 72, 1, 360, 0)],
+    [15, pageFloatingTable(468, 72, 1, 600, 0)],
+    [33, pageFloatingTable(300, 72, 1, 600, 0)],
+  ]);
+
+  it('settles a near-page-tall table on the later page of its two-state cycle', () => {
+    const model = documentModel(56, [
+      [26, pageFloatingTable(524, 0, 1, 667, 0)],
+      [55, pageFloatingTable(524, 0, 1, 667, 0)],
+    ]);
+    model.section.pageHeight = 842;
+    const { layout } = blockingLayout(model);
+    // Main alternates (0, 1) and (2, 3). Recovery pins those later floors;
+    // subsequent ordinary collision admission may move a table farther.
+    expect(tablePages(layout, 26).placedPage).toBe(2);
+    expect(tablePages(layout, 55).placedPage).toBeGreaterThanOrEqual(3);
+  });
+
+  it('settles the coupled T1/T2/T3 cycle deterministically without overlapping body text', () => {
+    const model = coupledTables();
+    const { layout } = blockingLayout(model);
+    expect(layoutFingerprint(blockingLayout(model).layout)).toBe(layoutFingerprint(layout));
+    expect(layout.pages.flatMap((page) => page.layers.body)
+      .filter((node) => node.kind === 'table')).toHaveLength(3);
+    for (const page of layout.pages) {
+      const tables = page.layers.body.filter((node) => node.kind === 'table');
+      const lines = page.layers.body.flatMap((node) => node.kind === 'paragraph' ? node.lines : []);
+      const bands = [...tables.map((table) => table.flowBounds), ...lines.map((line) => line.bounds)];
+      for (const table of tables) {
+        for (const b of bands) {
+          const a = table.flowBounds;
+          if (a === b) continue;
+          expect(a.xPt >= b.xPt + b.widthPt || b.xPt >= a.xPt + a.widthPt
+            || a.yPt >= b.yPt + b.heightPt || b.yPt >= a.yPt + a.heightPt).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('keeps cycle-settled progressive pages equal to the blocking result', async () => {
+    const model = coupledTables();
+    const { final, previews } = await progressiveRun(model);
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blockingLayout(model).layout));
+    expectPublishedPagesFinal(previews, final);
+  });
+});
+
+// Local Word controls exercise the parser-to-paginator path without publishing
+// the non-redistributable fixtures. Placement fidelity is informational here:
+// this regression guarantees termination, not Word's logical anchor rule.
+describe('local page-table boundary controls', () => {
+  for (const name of ['heights', 'source-boundaries', 'wrap-widths', 'zero-boundaries']) {
+    const path = new URL(`../../public/private/docx/controls-1659/page-anchor-${name}.docx`, import.meta.url);
+    it.skipIf(!existsSync(path))(`lays out the ${name} controls without error`, async () => {
+      await init({ module_or_path: readFileSync(new URL('../wasm/docx_parser_bg.wasm', import.meta.url)) });
+      const archive = new DocxArchive(readFileSync(path));
+      let model: DocxDocumentModel;
+      try {
+        model = normalizeInternalDocumentModel(JSON.parse(new TextDecoder().decode(archive.parse()))).document;
+      } finally {
+        archive.free();
+      }
+      const { layout } = blockingLayout(model);
+      const tables = layout.pages.flatMap((page) => page.layers.body
+        .filter((node) => node.kind === 'table').map((node) => ({
+          source: node.source.path, page: page.pageIndex + 1, bounds: node.flowBounds,
+        })));
+      expect(tables).toHaveLength(model.body.filter((node) => node.type === 'table').length);
+      expect(layout.diagnostics.some((entry) => entry.code === 'NON_CONVERGENCE')).toBe(false);
+    }, 30_000);
+  }
 });
