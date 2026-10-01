@@ -31,7 +31,7 @@ import {
   snapToCharsClass,
 } from './advance.js';
 import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
-import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
+import { wordPositionalMarginTabGap, wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
   extendThroughTrailingIdeographicSpaces,
@@ -543,19 +543,18 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
 }
 
 /**
- * Allocation available to an aligned (right/center/decimal) tab cell.
+ * Allocation available to an aligned (right/center/decimal) ordinary tab cell.
  *
- * ECMA-376 §17.3.1.37 positions custom stops relative to the page margins,
- * and §17.3.3.23/§17.18.73 distinguish a `margin` positional reference from
- * an `indent` one: neither makes the paragraph's trailing indent a bound on
- * the stop. So on a line that no float narrows, an aligned cell may extend
- * to the text margin (or the indent edge when a negative indent lies beyond
- * it) wherever no exclusion intersects that extension on the line; the pass
- * records it as `lineMarginExtension`. A line that uses it carries the
- * extension as part of its band, so alignment and justification slack are
- * measured against the same allocation. A float-narrowed window keeps the
- * actual band: the #1672 Word controls overlap floats, and that overlap is not
- * emulated. Ordinary text and left tabs keep the indent band.
+ * ECMA-376 §17.3.1.37 positions custom stops relative to the page margins and
+ * does not bound them by the paragraph's trailing indent. So on a line that
+ * no float narrows, an aligned ordinary cell may extend to the text margin
+ * (or the indent edge when a negative indent lies beyond it) wherever no
+ * exclusion intersects that extension on the line; the pass records it as
+ * `lineMarginExtension`. A line that uses it carries the extension as part of
+ * its band, so alignment and justification slack are measured against the
+ * same allocation. Positional tabs, ordinary text and left tabs keep the
+ * actual band; a float-narrowed window keeps it too, since the #1672 Word
+ * controls overlap floats and that overlap is not emulated.
  */
 function alignedTabCellAvailW(context: BreakOpportunityIteratorContext): number {
   return context.availW() + context.breakerState.lineMarginExtension;
@@ -710,13 +709,15 @@ function processTabSegment(
       tabW = 0;
     }
     // §17.3.3.23 selects the reference target independently of paragraph
-    // indents. A fitting aligned cell keeps its margin-relative allocation on
-    // an unnarrowed line (alignedTabCellAvailW); every other gap and cell is
-    // limited to the actual paragraph/float band and uses normal breaks.
-    const cellAvail = alignedTabCellAvailW(context);
-    const cellLimit = seg.ptab.alignment !== 'left'
-      && breakerState.currentWidth + tabW + followW <= cellAvail ? cellAvail : availW();
-    seg.marginAllocation = cellLimit > availW() && breakerState.currentWidth + tabW + followW > availW();
+    // indents, but the positional cell's allocation stays within the actual
+    // paragraph/float band (unlike ordinary stops, see alignedTabCellAvailW).
+    // WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP projects a fitting margin cell
+    // whose target passes the unnarrowed indent band.
+    if (seg.ptab.alignment !== 'left' && seg.ptab.relativeTo === 'margin'
+      && breakerState.lineXOffset === 0 && breakerState.lineMaxWidth === maxWidth) {
+      tabW = wordPositionalMarginTabGap(tabW, breakerState.currentWidth, followW, availW());
+    }
+    const cellLimit = availW();
     if (breakerState.currentWidth + tabW > cellLimit) {
       if (breakerState.currentLine.length > 0) {
         flush(undefined, false, seg.src);

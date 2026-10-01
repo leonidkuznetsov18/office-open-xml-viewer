@@ -13,9 +13,9 @@ import type {
 } from './types';
 
 // ECMA-376 §§17.3.3.23 and 17.18.73 select margin/indent reference targets.
-// A margin target is independent of the paragraph's right indent, also in
-// table cells: a fitting aligned cell keeps that allocation when no float
-// narrows the line (the sample-1 footer regression of the #1672 containment).
+// Word nevertheless ends a fitting margin cell whose target passes the right
+// indent at that indent (WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP), also in
+// table cells.
 
 interface FillCall { text: string; x: number; }
 
@@ -112,18 +112,18 @@ async function render(el: CellElement): Promise<FillCall[]> {
   return fills;
 }
 
-describe('table-cell positional tabs resolve margin against paraW + right indent', () => {
+describe('table-cell positional tabs keep their cells inside the paragraph band', () => {
   // Cell content box = full 300 pt (zero cell margins). Paragraph has a 40 pt right
   // indent, so paraW = 260 and the TEXT MARGIN right edge = paraW + indRight = 300
   // (the cell content-box edge), independent of the indent.
   const INDENT_RIGHT = 40;
 
-  it('right ptab relativeTo="margin" right-aligns to the cell text margin, ignoring the right indent', async () => {
+  it('ends a right margin ptab past the cell paragraph right indent at that indent', async () => {
     const fills = await render(cellPara([ptabRun('right', 'margin'), textRun('99')], INDENT_RIGHT));
     const f = fills.find((c) => c.text === '99');
     expect(f, '"99" must be drawn').toBeDefined();
-    // Margin right edge = paraW(260) + indRight(40) = 300, past the indent band.
-    expect(f!.x + 2 * FS).toBeCloseTo(PAGE_W, 3);
+    // Margin target 300 lies past the 260 pt indent band; the cell ends at 260.
+    expect(f!.x + 2 * FS).toBeCloseTo(PAGE_W - INDENT_RIGHT, 3);
   });
 
   it('right ptab relativeTo="indent" aligns to the INDENTED content box (contrast)', async () => {

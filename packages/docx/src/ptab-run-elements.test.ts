@@ -163,15 +163,15 @@ describe('ptab (§17.3.3.23) absolute-position tab layout', () => {
     expect(f!.x + 2 * FS).toBeCloseTo(contentRightAbs, 3);
   });
 
-  it('right ptab relative to MARGIN ignores indents and aligns to the page margin', async () => {
+  it('ends a right margin ptab past the paragraph right indent at that indent', async () => {
     const fills = await render([
       para([ptabRun('right', 'margin'), textRun('99')], { left: 40, right: 20 }),
     ]);
     const f = fills.find((c) => c.text === '99');
     expect(f, '"99" must be drawn').toBeDefined();
-    // relativeTo="margin" ⇒ right edge on the text margin (PAGE_W = 300), past
-    // the 280 pt indent band; 2-glyph number starts at 300 − 20 = 280.
-    expect(f!.x + 2 * FS).toBeCloseTo(PAGE_W, 3);
+    // The margin target (300) lies past the 280 pt indent band; Word ends the
+    // cell at the indent (WORD_POSITIONAL_MARGIN_TAB_INDENT_CLAMP).
+    expect(f!.x + 2 * FS).toBeCloseTo(PAGE_W - 20, 3);
   });
 });
 
