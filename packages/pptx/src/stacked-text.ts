@@ -218,21 +218,14 @@ export function renderStackedText<T extends StackedSegmentStyle>(
     sameStyle: body.sameStyle,
   });
   if (measureOnly) {
-    // §20.1.10.83: letters advance along the row's vertical axis; column
-    // thickness/blockWidth runs across it. Sum the same measured glyphs as
-    // paint, excluding alignment slack and cross-column paragraph spacing.
-    let longest = 0;
-    let column = -1;
-    let advance = 0;
+    // Use the final placed glyph cells, including alignment and wrap, not
+    // sums of advances from a different frame (§20.1.10.83 row axis).
+    let overflow = 0;
     for (const glyph of layout.glyphs) {
-      if (glyph.column !== column) {
-        longest = Math.max(longest, advance);
-        column = glyph.column;
-        advance = 0;
-      }
-      advance += glyph.advance;
+      overflow = Math.max(overflow, body.rect.top - glyph.cellTop,
+        glyph.cellTop + glyph.advance - body.rect.top - body.rect.height);
     }
-    return Math.max(longest, advance);
+    return overflow;
   }
   const runs: StackedGlyphRun[] = [];
   const prevAlign = ctx.textAlign;

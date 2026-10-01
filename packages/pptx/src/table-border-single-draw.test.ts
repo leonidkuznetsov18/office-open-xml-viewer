@@ -275,9 +275,9 @@ describe('table row measurement along the text row axis', () => {
     textBody.paragraphs[0].marR = 3 * EMU;
     textBody.paragraphs[0].tabStops = [{ pos: 40 * EMU, algn: 'l' }];
     render();
-    // The stop exceeds the 30px reading frame: paint clamps the tab at
-    // the right margin, then the final glyph extends 3px beyond the frame.
-    expect(rec.fills[0].height).toBe(33);
+    // Row growth must re-resolve the stop on the final frame, retaining
+    // the final glyph and trailing 3pt paragraph margin: 40 + 8 + 3.
+    expect(rec.fills[0].height).toBe(51);
   });
 
   it('measures a rotated rowSpan against the combined row height', () => {
