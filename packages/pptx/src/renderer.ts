@@ -626,8 +626,9 @@ export function resolveShapeFill(
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
   patternPtToUserUnits = 4 / 3,
+  outline?: import('@silurus/ooxml-core').FillOutline,
 ): string | CanvasGradient | CanvasPattern | null {
-  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
+  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits, undefined, outline);
 }
 
 // ===== Text layout helpers =====
@@ -3655,9 +3656,20 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   }
 
   const geom = el.geometry.toLowerCase();
+  const fillOutline: import('@silurus/ooxml-core').FillOutline = (target, bx, by, bw, bh) => {
+    if (el.custGeom) {
+      const paths = el.custGeomPaint?.length === el.custGeom.length
+        ? el.custGeom.filter((_, index) => el.custGeomPaint?.[index].fill !== 'none')
+        : el.custGeom;
+      buildCustomPath(target, paths, bx, by, bw, bh);
+    } else if (!buildPresetGeometryFillPath(target, geom, bx, by, bw, bh,
+      [el.adj, el.adj2, el.adj3, el.adj4, el.adj5, el.adj6, el.adj7, el.adj8])) {
+      buildShapePath(target, geom, bx, by, bw, bh, el.adj, el.adj2, el.adj3, el.adj4);
+    }
+  };
   // The slide may render at any requested width. Convert the PDF-measured
   // one-point pattern cell through this render's EMU-to-canvas scale.
-  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
+  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU, fillOutline);
   const imageFill = el.fill?.fillType === 'image' && shapeImageFillModeIsPaintable(el.fill)
     ? el.fill
     : null;
@@ -3731,7 +3743,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     const tFill = silhouette ??
       (target === ctx && bx === x && by === y && bw === w && bh === h
         ? fillStyle
-        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU));
+        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU, fillOutline));
     const tStroke = silhouette
       ? null
       : el.stroke
@@ -6554,7 +6566,7 @@ function paintResolvedPicture(
       // visible through transparent pixels. Image fills need their own decode
       // and are not painted here.
       const backing = el.fill && el.fill.fillType !== 'none' && el.fill.fillType !== 'image'
-        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU)
+        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU, tracePictureSilhouetteSubpath)
         : null;
       if (backing) {
         target.save();

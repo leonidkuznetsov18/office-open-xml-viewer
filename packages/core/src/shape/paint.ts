@@ -2,6 +2,7 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
+import { resolvePathGradient, type FillOutline } from './path-gradient';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
@@ -13,6 +14,7 @@ function tiledGradient(
   w: number,
   h: number,
   shapeRotationDeg: number,
+  outline?: FillOutline,
 ): CanvasPattern | null {
   const tile = fill.tileRect;
   if (!tile) return null;
@@ -46,6 +48,9 @@ function tiledGradient(
     baseW,
     baseH,
     shapeRotationDeg,
+    undefined,
+    undefined,
+    outline,
   );
   if (!basePaint) return null;
   baseCtx.fillStyle = basePaint;
@@ -167,6 +172,7 @@ export function resolveFill(
   shapeRotationDeg = 0,
   patternPtToUserUnits?: number,
   patternCoordinateTransform?: DOMMatrix2DInit,
+  outline?: FillOutline,
 ): string | CanvasGradient | CanvasPattern | null {
   if (!fill || fill.fillType === 'none') return null;
   if (fill.fillType === 'solid') return hexToRgba(fill.color);
@@ -184,7 +190,7 @@ export function resolveFill(
     if (stops.length === 0) return null;
     if (stops.length === 1) return hexToRgba(stops[0].color);
 
-    const repeated = tiledGradient(fill, ctx, x, y, w, h, shapeRotationDeg);
+    const repeated = tiledGradient(fill, ctx, x, y, w, h, shapeRotationDeg, outline);
     if (repeated) return repeated;
 
     let gradient: CanvasGradient;
@@ -193,6 +199,13 @@ export function resolveFill(
     const tileY = y + h * (tile?.t ?? 0);
     const tileW = w * (1 - (tile?.l ?? 0) - (tile?.r ?? 0));
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
+    if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
+      // Canvas has no box/outline gradient. Allocation-unavailable hosts use
+      // the first stop as a stable flat fallback, rather than inventing a
+      // circular geometry. Real browser, worker and Node canvases rasterize it.
+      return resolvePathGradient(fill, ctx, tileX, tileY, tileW, tileH, shapeRotationDeg, outline)
+        ?? hexToRgba(stops[0].color);
+    }
     if (fill.gradType === 'radial') {
       // §20.1.8.31: fillToRect is the center-shade (focus) rectangle inside
       // the gradient tile. Canvas has a point focus rather than a rectangular
@@ -207,9 +220,7 @@ export function resolveFill(
       const cy = focusY + focusH / 2;
       const rx = Math.max(Math.abs(cx - tileX), Math.abs(tileX + tileW - cx));
       const ry = Math.max(Math.abs(cy - tileY), Math.abs(tileY + tileH - cy));
-      const r = fill.path === 'rect'
-        ? Math.max(rx, ry)
-        : Math.sqrt(rx * rx + ry * ry);
+      const r = Math.sqrt(rx * rx + ry * ry);
       gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(r, 1e-9));
     } else {
       const authoredAngle = fill.rotWithShape === false
@@ -237,6 +248,11 @@ export function resolveFill(
         cx + dx * gradLen, cy + dy * gradLen,
       );
     }
+    // Interpolation remains Canvas encoded RGB. PowerPoint primary-colour
+    // controls at 0/100 produce brighter two-stop midpoints (~186), but
+    // 20/80 stops produce encoded midpoints (~127), and full-range quarter
+    // colours reject a simple gamma/linear-light rule or one implicit stop.
+    // These boundaries do not establish a general colour transfer function.
     for (const stop of stops) {
       gradient.addColorStop(Math.min(1, Math.max(0, stop.position)), hexToRgba(stop.color));
     }

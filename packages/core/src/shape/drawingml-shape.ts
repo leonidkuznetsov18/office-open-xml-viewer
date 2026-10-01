@@ -90,14 +90,12 @@ export function withDrawingMLShapeTransform(
   }
 }
 
-/** Clip the current canvas state to the exact DrawingML shape silhouette.
- * The caller owns save/restore and should enter the shape transform first. */
-export function clipDrawingMLShape(
+/** Append the same fill-bearing silhouette for clipping and path shading. */
+function appendDrawingMLShapeOutline(
   ctx: CanvasRenderingContext2D,
   plan: DrawingMLShapePaintPlan,
+  x: number, y: number, w: number, h: number,
 ): void {
-  const { x, y, w, h } = plan.rect;
-  ctx.beginPath();
   if (plan.geometry.kind === 'preset') {
     const adjustments = [...plan.geometry.adjustments];
     if (!buildPresetGeometryFillPath(
@@ -117,6 +115,16 @@ export function clipDrawingMLShape(
       : plan.geometry.subpaths;
     buildCustomPath(ctx, subpaths as PathCmd[][], x, y, w, h);
   }
+}
+
+/** Clip the current state; the caller owns save/restore and the shape transform. */
+export function clipDrawingMLShape(
+  ctx: CanvasRenderingContext2D,
+  plan: DrawingMLShapePaintPlan,
+): void {
+  const { x, y, w, h } = plan.rect;
+  ctx.beginPath();
+  appendDrawingMLShapeOutline(ctx, plan, x, y, w, h);
   // Use Canvas's nonzero rule, matching normal DrawingML shape fill and PPTX
   // picture clipping. `evenodd` would turn overlapping silhouette subpaths into
   // XOR holes that do not exist in the authored geometry.
@@ -300,6 +308,8 @@ export function paintDrawingMLShape(
       h,
       plan.transform.rotationDeg,
       PATTERN_PT_TO_SHAPE_UNITS,
+      undefined,
+      (target, bx, by, bw, bh) => appendDrawingMLShapeOutline(target, plan, bx, by, bw, bh),
     );
     const stroke = plan.stroke as Stroke | null;
     const applyAndStroke = stroke

@@ -242,6 +242,7 @@ export {
   type CustGeomEndpoints,
 } from './shape/custgeom-endpoints';
 export { hexToRgba, relativeLuma, autoContrastColor, resolveFill, applyStroke, withPatternCoordinateSpace, withInheritedPatternScope } from './shape/paint';
+export type { FillOutline } from './shape/path-gradient';
 export { buildShapePath, drawStar, drawPolygon, ooxmlArcTo } from './shape/preset';
 export {
   paintDrawingMLShape,
