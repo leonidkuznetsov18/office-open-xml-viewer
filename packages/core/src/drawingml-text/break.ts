@@ -233,6 +233,7 @@ export function breakDrawingMlText<T>(
     }
 
     let explicitTabTail: Uint8Array | null = null;
+    let explicitTabTailStart = 0;
     const isSingleExplicitTabCell = (index: number): boolean => {
       const tab = atoms[index];
       const first = atoms[index + 1];
@@ -240,16 +241,20 @@ export function breakDrawingMlText<T>(
           || !/^[\p{Script_Extensions=Latin}\p{Number}]$/u.test(first.text)) return false;
       // Cache the unchanged suffix predicate; repeated tab-cell probes must
       // neither copy nor rescan the remaining paragraph on each wrapped line.
+      // Line starts only advance, so no later query can reach an already
+      // consumed line. Start storage and construction at the current line.
       if (explicitTabTail === null) {
-        explicitTabTail = new Uint8Array(end + 1);
-        explicitTabTail[end] = 1;
-        for (let i = end - 1; i >= 0; i--) {
+        explicitTabTailStart = start;
+        explicitTabTail = new Uint8Array(end - explicitTabTailStart + 1);
+        explicitTabTail[end - explicitTabTailStart] = 1;
+        for (let i = end - 1; i >= explicitTabTailStart; i--) {
           const atom = atoms[i];
-          explicitTabTail[i] = explicitTabTail[i + 1] && atom.type === 'text'
+          const offset = i - explicitTabTailStart;
+          explicitTabTail[offset] = explicitTabTail[offset + 1] && atom.type === 'text'
             && !isSpace(atom) && !isCjk(atom) ? 1 : 0;
         }
       }
-      return explicitTabTail[index + 1] === 1;
+      return explicitTabTail[index + 1 - explicitTabTailStart] === 1;
     };
 
     let kinsokuText: { chars: string[]; offsets: Int32Array } | null = null;

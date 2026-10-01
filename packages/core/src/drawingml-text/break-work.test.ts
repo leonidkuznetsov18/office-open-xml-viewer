@@ -96,6 +96,53 @@ it('bounds suffix work when probing many authored tab cells', () => {
   expect(render(8_000) / render(2_000)).toBeLessThan(6);
 });
 
+it('bounds late-tab atom reads by the current line, independent of consumed prefix length', () => {
+  const maxWidth = 80;
+  const render = (size: number): number => {
+    let atoms: unknown[] | undefined;
+    let reads = 0;
+    let measuringTab = false;
+    let installed = false;
+    const push = Array.prototype.push;
+    // Capture the production atom array, then count indexed reads only once
+    // tab measurement starts. Whole-paragraph preprocessing is outside this
+    // phase; consumed lines must not be revisited by lazy suffix construction.
+    Array.prototype.push = function (this: unknown[], ...items: unknown[]): number {
+      const item = items[0];
+      if (typeof item === 'object' && item !== null && 'run' in item) atoms = this;
+      return Reflect.apply(push, this, items);
+    };
+    let lines: ReturnType<typeof breakDrawingMlText<string>>;
+    try {
+      lines = breakDrawingMlText([{ type: 'text', text: `${'a'.repeat(size)}\txyz`, style: 'same' }], {
+        maxWidth, tabStops: [{ pos: 1, algn: 'l' }],
+        measureText(value) {
+          if (!installed && atoms) {
+            installed = true;
+            for (let i = 0; i < atoms.length; i++) {
+              const atom = atoms[i];
+              Object.defineProperty(atoms, i, {
+                configurable: true, enumerable: true,
+                get() { if (measuringTab) reads++; return atom; },
+              });
+            }
+          }
+          if (value === ' ') measuringTab = true;
+          return value.length;
+        },
+      });
+    } finally {
+      Array.prototype.push = push;
+    }
+    expect(lines.map((line) => line.segments.map((seg) => seg.type === 'text' ? seg.text : '\t').join('')))
+      .toEqual([...Array<string>(size / maxWidth - 1).fill('a'.repeat(maxWidth)), `${'a'.repeat(maxWidth)}\txyz`]);
+    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBeLessThan(20 * (maxWidth + 4));
+    return reads;
+  };
+  expect(render(8_000)).toBe(render(2_000));
+});
+
 it('preserves code-point retraction across grapheme and supplementary-character offsets', () => {
   const lines = breakDrawingMlText([{ type: 'text', text: '日\u0301「本、𠀀「語、次', style: 'same' }], {
     maxWidth: 3, measureText: (text) => [...text].length,
