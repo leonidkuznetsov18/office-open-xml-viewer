@@ -776,6 +776,7 @@ function acquireBodyStoryLayout(
           startYPt,
           paragraphXPt: placement.container.bounds.xPt,
           availableWidthPt: placement.container.bounds.widthPt,
+          ...(placement.container.noWrap ? { noWrap: true } : {}),
           maximumYPt: placement.availableBounds.yPt + placement.availableBounds.heightPt,
           suppressSpaceBefore: topBorder.suppressSpaceBefore,
         },

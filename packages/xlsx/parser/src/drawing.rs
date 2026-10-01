@@ -882,8 +882,7 @@ pub(crate) fn parse_tx_body(
     // ooxml_common::text::parse_body_pr over the bare ECMA-376 §21.1.2.1.1
     // defaults — xlsx has no theme objectDefaults / inheritance layer, so
     // BodyPrDefaults::spec() is the whole fallback (anchor `t`, wrap `square`,
-    // autofit `none`, insets 91440/45720 EMU). `vert` is parsed but xlsx does
-    // not model it. When there is no `<a:bodyPr>` the spec defaults apply.
+    // autofit `none`, insets 91440/45720 EMU). When there is no `<a:bodyPr>` the spec defaults apply.
     let body = tx_body
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "bodyPr")
@@ -905,6 +904,17 @@ pub(crate) fn parse_tx_body(
                 ln_spc_reduction: None,
             }
         });
+    let body_pr = tx_body
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "bodyPr");
+    let body_bool = |name| {
+        body_pr
+            .and_then(|bp| bp.attribute(name))
+            .is_some_and(|v| v == "1" || v == "true")
+    };
+    let anchor_ctr = body_bool("anchorCtr");
+    let spc_first_last_para = body_bool("spcFirstLastPara");
+    let vert = body.vert;
     let anchor = body.anchor;
     let wrap = body.wrap;
     // Text insets (EMU), §21.1.2.1.1. Emitted always (spec default when the
@@ -1001,6 +1011,7 @@ pub(crate) fn parse_tx_body(
                             let mut bold = false;
                             let mut italic = false;
                             let mut size: f64 = 0.0;
+                            let mut spacing = None;
                             let mut color: Option<String> = None;
                             let mut font_face: Option<String> = None;
                             // ECMA-376 §21.1.2.3.1 `<a:ea>` / `<a:cs>` typefaces.
@@ -1015,6 +1026,10 @@ pub(crate) fn parse_tx_body(
                                         bold = rc.attribute("b").map(|v| v == "1").unwrap_or(false);
                                         italic =
                                             rc.attribute("i").map(|v| v == "1").unwrap_or(false);
+                                        spacing = rc
+                                            .attribute("spc")
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .map(|v| v / 100.0);
                                         size = rc
                                             .attribute("sz")
                                             .and_then(|s| s.parse::<f64>().ok())
@@ -1055,6 +1070,7 @@ pub(crate) fn parse_tx_body(
                                     bold,
                                     italic,
                                     size,
+                                    spacing,
                                     color,
                                     font_face,
                                     font_face_ea,
@@ -1098,6 +1114,9 @@ pub(crate) fn parse_tx_body(
         None
     } else {
         Some(ShapeText {
+            vert,
+            anchor_ctr,
+            spc_first_last_para,
             anchor,
             wrap,
             auto_fit,
@@ -2592,6 +2611,25 @@ mod math_tests {
             vt.get("lnSpcReduction").is_none(),
             "lnSpcReduction omitted when unset"
         );
+    }
+
+    #[test]
+    fn stacked_body_preserves_direction_and_spacing() {
+        for vert in ["wordArtVert", "wordArtVertRtl"] {
+            let xml = format!(
+                r#"<xdr:txBody {NS}>
+              <a:bodyPr vert="{vert}" anchorCtr="1" spcFirstLastPara="1"/>
+              <a:p><a:r><a:rPr spc="125"/><a:t>AB</a:t></a:r></a:p>
+            </xdr:txBody>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let text = parse_tx_body(&doc.root_element(), &[]).unwrap();
+            let value = serde_json::to_value(text).unwrap();
+            assert_eq!(value["vert"], vert);
+            assert_eq!(value["anchorCtr"], true);
+            assert_eq!(value["spcFirstLastPara"], true);
+            assert_eq!(value["paragraphs"][0]["runs"][0]["spacing"], 1.25);
+        }
     }
 
     /// `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5): spcPct → a

@@ -48,6 +48,7 @@ function makeMatrixCtx(): {
   ctx: CanvasRenderingContext2D;
   glyphs: GlyphCall[];
   images: ImageCall[];
+  clips: boolean[];
 } {
   let m = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
   const stack: (typeof m)[] = [];
@@ -60,6 +61,7 @@ function makeMatrixCtx(): {
   let fontKerning = 'auto';
   const glyphs: GlyphCall[] = [];
   const images: ImageCall[] = [];
+  const clips: boolean[] = [];
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const ctx = {
     get font() { return font; },
@@ -95,11 +97,16 @@ function makeMatrixCtx(): {
         f: m.f,
       };
     },
+    transform(a: number, b: number, c: number, d: number, e: number, f: number) {
+      m = { a: m.a * a + m.c * b, b: m.b * a + m.d * b,
+        c: m.a * c + m.c * d, d: m.b * c + m.d * d,
+        e: m.a * e + m.c * f + m.e, f: m.b * e + m.d * f + m.f };
+    },
     scale(sx: number, sy: number) {
       m = { ...m, a: m.a * sx, b: m.b * sx, c: m.c * sy, d: m.d * sy };
     },
     beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, rect() {},
-    fill() {}, stroke() {}, clip() {}, fillRect() {}, strokeRect() {}, clearRect() {},
+    fill() {}, stroke() {}, clip() { clips.push(true); }, fillRect() {}, strokeRect() {}, clearRect() {},
     setTransform() {}, resetTransform() {},
     measureText(s: string) {
       const p = px();
@@ -125,7 +132,7 @@ function makeMatrixCtx(): {
       images.push({ angleDeg, devX, devY, w, h });
     },
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, glyphs, images };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, glyphs, images, clips };
 }
 
 function richTextbox(
@@ -187,6 +194,71 @@ describe('§20.1.10.83 textbox <wps:bodyPr vert> — vertical text-box rendering
     expect(lat, 'Latin glyph drawn').toBeDefined();
     expect(NEAR(norm(cjk!.angleDeg), 0), `CJK @${cjk!.angleDeg}`).toBe(true);
     expect(NEAR(norm(lat!.angleDeg), 90), `Latin @${lat!.angleDeg}`).toBe(true);
+  });
+
+  it.each(['wordArtVert', 'wordArtVertRtl'])(
+    '%s: Word keeps Latin sideways, CJK upright and columns left-to-right',
+    (mode) => {
+      const { ctx, glyphs } = makeMatrixCtx();
+      const shape = richTextbox([run('AB'), run(CJK)], mode);
+      shape.textBlocks = [...shape.textBlocks!, { text: 'CD', fontSizePt: 10, alignment: 'left', runs: [run('CD')] }];
+      acquireAndPaintShapeTextBox(shape, 0, 0, 200, 100, ctx, 1, {});
+      const a = glyphs.find((g) => g.text === 'A')!;
+      const b = glyphs.find((g) => g.text === 'B')!;
+      const c = glyphs.find((g) => g.text === 'C')!;
+      const cjk = glyphs.find((g) => g.text === CJK)!;
+      expect(norm(a.angleDeg)).toBeCloseTo(90);
+      expect(norm(cjk.angleDeg)).toBeCloseTo(0);
+      expect(b.devY - a.devY).toBeCloseTo(10); // ordinary horizontal advance
+      expect(b.devX).toBeCloseTo(a.devX);
+      expect(c.devX).toBeGreaterThan(a.devX);
+    },
+  );
+
+  it('WordArt wrap=none retains one continuous overflowing column', () => {
+    const { ctx, glyphs, clips } = makeMatrixCtx();
+    const shape = Object.assign(richTextbox([run('ABCDE')], 'wordArtVert'), { textWrap: 'none', textAutofit: 'none' });
+    acquireAndPaintShapeTextBox(shape, 0, 0, 100, 30, ctx, 1, {});
+    expect(glyphs.map((g) => g.text).join('')).toBe('ABCDE');
+    expect(glyphs.every((g) => Math.abs(g.devX - glyphs[0].devX) < 0.001)).toBe(true);
+    expect(glyphs.at(-1)!.devY).toBeGreaterThan(30);
+    expect(clips).toEqual([]);
+  });
+
+  it('WordArt keeps physical inset axes and moves anchors along LTR columns', () => {
+    const draw = (extra: Partial<ShapeRun>) => {
+      const { ctx, glyphs } = makeMatrixCtx();
+      const shape = Object.assign(richTextbox([run('AB')], 'wordArtVert'), extra);
+      acquireAndPaintShapeTextBox(shape, 0, 0, 100, 100, ctx, 1, {});
+      return glyphs[0];
+    };
+    const start = draw({});
+    const inset = draw({ textInsetL: 10, textInsetT: 20 });
+    expect(inset.devX - start.devX).toBeCloseTo(10);
+    expect(inset.devY - start.devY).toBeCloseTo(20);
+    const center = draw({ textAnchor: 'ctr' });
+    const end = draw({ textAnchor: 'b' });
+    expect(center.devX).toBeGreaterThan(start.devX);
+    expect(end.devX).toBeGreaterThan(center.devX);
+  });
+
+  it('WordArt keeps emoji presentation clusters upright alongside sideways Latin', () => {
+    const { ctx, glyphs } = makeMatrixCtx();
+    acquireAndPaintShapeTextBox(richTextbox([run('A👩‍💻🇯🇵')], 'wordArtVert'), 0, 0, 200, 100, ctx, 1, {});
+    expect(norm(glyphs.find((g) => g.text === 'A')!.angleDeg)).toBeCloseTo(90);
+    const emoji = glyphs.filter((g) => /\p{Emoji_Presentation}/u.test(g.text));
+    expect(emoji.length).toBeGreaterThan(0);
+    for (const glyph of emoji) expect(norm(glyph.angleDeg)).toBeCloseTo(0);
+  });
+
+  it.each([
+    [30, false, false, 120], [90, false, false, 180],
+    [0, true, false, 90], [0, false, true, -90],
+  ])('WordArt text frame rotation=%s flipH=%s flipV=%s', (rotation, flipH, flipV, angle) => {
+    const { ctx, glyphs } = makeMatrixCtx();
+    const shape = { ...richTextbox([run('AB')], 'wordArtVert'), rotation, flipH, flipV };
+    acquireAndPaintShapeTextBox(shape, 0, 0, 200, 100, ctx, 1, {});
+    expect(norm(glyphs.find((g) => g.text === 'A')!.angleDeg)).toBeCloseTo(norm(angle));
   });
 
   it('rotated glyphs land INSIDE the physical box (transform pivots on box centre)', () => {

@@ -973,6 +973,11 @@ pub use ooxml_common::text::SpaceLine;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeText {
+    /// DrawingML direction, ECMA-376 §20.1.10.83. Preserve it for host layout.
+    pub vert: String,
+    /// ECMA-376 §21.1.2.1.1 body-axis alignment and paragraph-edge spacing.
+    pub anchor_ctr: bool,
+    pub spc_first_last_para: bool,
     /// `<a:bodyPr@anchor>` — vertical alignment of the text block within the
     /// shape rect. `t` (top, default), `ctr` (middle), `b` (bottom),
     /// `just`/`dist` (treated as top).
@@ -1083,6 +1088,9 @@ pub enum ShapeTextRun {
         /// field is already converted). 0 means "inherit from default" →
         /// renderer falls back to its own default.
         size: f64,
+        /// `<a:rPr@spc>` in points, ECMA-376 §20.1.10.74.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spacing: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         color: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

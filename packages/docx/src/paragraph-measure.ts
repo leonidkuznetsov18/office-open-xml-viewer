@@ -56,6 +56,8 @@ export interface ParagraphPlacement {
   readonly maximumYPt: number;
   readonly suppressSpaceBefore: boolean;
   readonly wrap?: WrapOracle;
+  /** DrawingML wrap=none: keep the real alignment band, allow inline overflow. */
+  readonly noWrap?: boolean;
 }
 
 export interface MeasuredLine {
@@ -311,7 +313,7 @@ export function measureParagraph(
     context.isJustified,
     context.stretchLastLine,
     continuation?.boundary,
-    undefined,
+    placement.noWrap ? 'unwrapped' : undefined,
     environment.verticalGlyphMeasurement,
     context.overflowPunct !== false,
   );
