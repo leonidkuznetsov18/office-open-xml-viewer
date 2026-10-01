@@ -110,9 +110,21 @@ describe('first-line indents beside floats through the DOCX parser', () => {
     }
   });
 
-  it.each([false, true])('wraps a margin-aligned cell wider than the paragraph band, positional=%s', (positional) => {
+  // ECMA-376 §17.3.1.37 stops and §17.3.3.23 margin references are independent
+  // of the paragraph's right indent; without a float, a fitting aligned cell
+  // keeps that allocation on its line (sample-1 footer regression).
+  it.each([false, true])('aligns a fitting cell at its margin-relative stop past the right indent, positional=%s', (positional) => {
     const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
       { alignment: 'right', count: 1, text: 'word '.repeat(10).trim(), positional, noFloat: true }));
+    expect(paragraph.lines).toHaveLength(1);
+    const texts = paragraph.lines[0].placements.filter((node) => node.kind === 'text');
+    const last = texts.at(-1);
+    expect(last ? last.bounds.xPt + last.bounds.widthPt : undefined).toBe(positional ? 540 : 352);
+  });
+
+  it.each([false, true])('wraps a no-float aligned cell wider than its text margin, positional=%s', (positional) => {
+    const paragraph = layoutParagraph(documentBytes('w:right="7200"', false, 0,
+      { alignment: 'right', count: 1, text: 'word '.repeat(100).trim(), positional, noFloat: true }));
     expect(paragraph.lines.length).toBeGreaterThan(1);
     for (const line of paragraph.lines) {
       for (const text of line.placements) {

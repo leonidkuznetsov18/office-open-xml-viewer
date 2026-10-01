@@ -163,16 +163,15 @@ describe('ptab (§17.3.3.23) absolute-position tab layout', () => {
     expect(f!.x + 2 * FS).toBeCloseTo(contentRightAbs, 3);
   });
 
-  it('contains a margin ptab whose target is past the paragraph right indent', async () => {
+  it('right ptab relative to MARGIN ignores indents and aligns to the page margin', async () => {
     const fills = await render([
       para([ptabRun('right', 'margin'), textRun('99')], { left: 40, right: 20 }),
     ]);
     const f = fills.find((c) => c.text === '99');
     expect(f, '"99" must be drawn').toBeDefined();
-    // The margin target is 300 pt, outside this paragraph's 280 pt band.
-    // Library containment policy discards an unreachable empty-line gap.
-    expect(f!.x).toBeGreaterThanOrEqual(40);
-    expect(f!.x + 2 * FS).toBeLessThanOrEqual(PAGE_W - 20);
+    // relativeTo="margin" ⇒ right edge on the text margin (PAGE_W = 300), past
+    // the 280 pt indent band; 2-glyph number starts at 300 − 20 = 280.
+    expect(f!.x + 2 * FS).toBeCloseTo(PAGE_W, 3);
   });
 });
 
