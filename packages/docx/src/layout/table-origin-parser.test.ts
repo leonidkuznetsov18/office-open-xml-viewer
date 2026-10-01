@@ -112,6 +112,10 @@ describe('Word table origin and occupied grid', () => {
           .replace('w:tblLayout w:type="fixed"', 'w:tblLayout w:type="autofit"')
           .replace('<w:gridCol w:w="2160"/><w:gridCol w:w="3600"/>', '<w:gridCol w:w="4680"/><w:gridCol w:w="4680"/>');
         expect(layoutTable(xml, mode).columnWidthsPt).toEqual([234, 234]);
+        // §17.4.50 uses the resulting row justification, including tblPrEx.
+        const rowAligned = xml.replace(`<w:jc w:val="${jc}"/>`, '<w:jc w:val="left"/>')
+          .replace('<w:tr>', `<w:tr><w:tblPrEx><w:jc w:val="${jc}"/></w:tblPrEx>`);
+        expect(layoutTable(rowAligned, mode).columnWidthsPt).toEqual([234, 234]);
       }
     }
   });

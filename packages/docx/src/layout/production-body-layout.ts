@@ -2278,9 +2278,10 @@ function computeAdjacentTablePtLayouts(
     && table.jc === first.jc && table.tblInd === first.tblInd);
   const commonGrid = members.every(({ table }) => table.colWidths.length === first.colWidths.length
     && table.colWidths.every((width, i) => width === first.colWidths[i]));
-  // §17.4.37: decide the PR's table-wide properties only after concatenating
+  // §17.4.37: resolve measured table-wide properties only after concatenating
   // logical rows. Keep each row's resolved margins/lexical constraints, but
-  // tblPrEx width/layout and the leading anchor belong to the first logical row.
+  // WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE selects width/layout/indent from
+  // the first logical row, which also owns the leading cell-margin anchor.
   // Differing authored frames/grids retain the established union policy.
   const sources = members.map(({ table }) => state.acquisitionInputs.tableSourceAcquisitionInput(table));
   const logicalTable = Object.freeze({
@@ -2379,7 +2380,12 @@ function acquireTableColumnInput(
   const isLeadingMarginPageStoryTable = format.ordinaryFlow
     && isTopLevelPageOwnedStory
     && !isVerticalTextDirection(state.sectionLayout.textDirection)
-    && [widthIndent(table.jc, baseIndentPt), ...rowIndentPts].some((indentPt) => indentPt < 0);
+    // §17.4.50 is based on the resulting row jc. A leading table default
+    // cannot promote the ceiling when every measured row is nonleading.
+    // Keep the historical default-indent check for unmeasured classes.
+    && (measuredOrigin && format.rows.length > 0
+      ? rowIndentPts : [widthIndent(table.jc, baseIndentPt), ...rowIndentPts])
+      .some((indentPt) => indentPt < 0);
   const rowPlacements = format.rows.length === 0
     ? [{ justification: table.jc, indentPt: widthIndent(table.jc, baseIndentPt) }]
     : format.rows.map((row, rowIndex) => ({
