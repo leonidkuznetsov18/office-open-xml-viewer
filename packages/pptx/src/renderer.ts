@@ -831,57 +831,6 @@ interface LayoutLine {
   metricMarks?: LayoutSegment[];
 }
 
-// Inline tab resolution is shared by rotated row measurement and paint;
-// a tab's advance depends on the same logical reading-frame wrap budget.
-function resolveLineTabs(
-  ctx: CanvasRenderingContext2D, line: LayoutLine, para: Paragraph,
-  firstLineOffset: number, maxWidth: number, scale: number,
-): void {
-  const baseRtl = para.rtl === true;
-  if (line.segments.some((seg) => seg.isTab)) {
-    // §21.1.2.1.x: resolve every inline tab in the logical READING frame.
-    // UAX#9 L2 later mirrors the resulting cells physically for an RTL base.
-    const marLPxE = emuToPx(para.marL, scale);
-    const marRPxE = emuToPx(para.marR, scale);
-    // The reading pen starts at the leading indent PLUS the draw-side
-    // first-line indent (firstLineOffset): a stop is an ABSOLUTE distance from the
-    // leading text-inset edge (§21.1.2.1), so the indent moves where content
-    // STARTS, not where a stop sits — omitting it would widen every gap by the
-    // indent and slide the cells past their stops. firstLineOffset only shifts the
-    // LTR pen (the RTL draw right-anchors and never applies it), so it joins
-    // the LTR frame only.
-    const leadingIndentPx = baseRtl ? marRPxE : marLPxE + firstLineOffset;
-    const limitPx = maxWidth + marLPxE + marRPxE;
-    const tabFontSeg = line.segments.find((seg) => seg.isTab) as LayoutSegment;
-    ctx.font = tabFontSeg.font;
-    const spaceW = ctx.measureText(' ').width;
-    const items = line.segments.map((seg) => {
-      if (seg.isTab) return { isTab: true, width: 0 };
-      if (seg.math) return { isTab: false, width: seg.math.width };
-      ctx.font = seg.font;
-      const ls = seg.letterSpacingPx ?? 0;
-      return {
-        isTab: false,
-        width: seg.text
-          ? (seg.leadingLetterSpacingPx ?? 0) + measureTextAdvance(ctx, seg.text, ls)
-          : 0,
-      };
-    });
-    const stops = (para.tabStops ?? []).map((stop) => ({
-      pos: emuToPx(stop.pos, scale),
-      algn: stop.algn,
-    }));
-    // Default tab grid (§21.1.2.2.7): explicit pPr value, else PowerPoint's
-    // universal 1-inch default so an unreached tab snaps to the grid (matching
-    // the wrap pass) rather than collapsing to a space (issue #1006).
-    const defTabSzPx = emuToPx(para.defTabSz ?? 914400, scale);
-    const widths = resolveTabWidths(items, stops, leadingIndentPx, limitPx, spaceW, defTabSzPx);
-    for (let i = 0; i < line.segments.length; i++) {
-      if (line.segments[i].isTab) line.segments[i].tabWidthPx = widths[i];
-    }
-  }
-}
-
 /**
  * Resolve OOXML theme font references (e.g. "+mn-ea", "+mj-lt") to CSS-safe font names.
  * Canvas will silently ignore an invalid CSS font string, keeping whatever font was set before —
@@ -4327,8 +4276,7 @@ function renderStackedTextBody(
   slideNumber: number | undefined,
   rc: RenderContext,
   onTextRun?: TextRunCallback,
-  measureOnly = false,
-): number | void {
+): void {
   const fontScale = body.autoFit === 'norm' && body.fontScale != null && body.fontScale > 0 && body.fontScale < 1
     ? body.fontScale : 1;
   const pxPerPt = PT_TO_EMU * scale;
@@ -4365,7 +4313,7 @@ function renderStackedTextBody(
       eastAsianLineBreak: para.eaLnBrk !== false,
     };
   });
-  const input = {
+  const runs = renderStackedText(ctx, {
     vert,
     rect: { left: bx + inner.left, top: by + inner.top, width: inner.width, height: inner.height },
     anchor: body.verticalAnchor,
@@ -4376,15 +4324,7 @@ function renderStackedTextBody(
     pxPerPt,
     paragraphs,
     sameStyle,
-  };
-  if (measureOnly) {
-    // The inset rectangle itself must fit, including an empty body. Its
-    // height is clamped at zero by drawingMlTextRect, so glyph overflow alone
-    // cannot recover a frame smaller than the sum of its physical insets.
-    return Math.max(bh, emuToPx(body.tIns + body.bIns, scale))
-      + renderStackedText(ctx, input, true);
-  }
-  const runs = renderStackedText(ctx, input);
+  });
   if (!onTextRun) return;
   for (const run of runs) {
     onTextRun({
@@ -4424,23 +4364,26 @@ export function renderTextBody(
   // `vert`/`vert270` (whose spec meaning IS to rotate every glyph), keeping those
   // paths byte-identical.
   eaVertUpright = false,
-  // Internal rotated-frame measurement: inline width is the original row
-  // axis (§20.1.10.83), while horizontal content height is its column axis.
-  measureInlineExtent = false,
+  // A zero-height table row asks PowerPoint to derive its height from the
+  // natural line box. Office treats a positive a:tr@h as an authored minimum
+  // ([MS-OE376] §2.1.1347): use the glyph-size box when checking whether content
+  // actually exceeds that minimum, so implicit leading alone does not enlarge
+  // an already-sufficient row.
+  measureNaturalLineSpacing = measureOnly,
 ): number | void {
   // Stacked vertical text (wordArtVert / wordArtVertRtl): upright glyphs one
   // above another in columns; see stacked-text.ts and core layoutStackedText.
   if (body.vert === 'wordArtVert' || body.vert === 'wordArtVertRtl') {
-    return renderStackedTextBody(ctx, body, body.vert, bx, by, bw, bh, scale, shapeDefaultTextColor ?? themeDefaultColor,
-      shapeRotation, slideNumber, rc, onTextRun, measureOnly);
+    // Like the rotated modes, a table row measures a vertical body by its box.
+    if (measureOnly) return bw;
+    renderStackedTextBody(ctx, body, body.vert, bx, by, bw, bh, scale, shapeDefaultTextColor ?? themeDefaultColor,
+      shapeRotation, slideNumber, rc, onTextRun);
+    return;
   }
 
   // Vertical text: rotate rendering context so text flows top-to-bottom.
   // "vert" and "eaVert" both approximate to 90° clockwise rotation.
   // "vert270" rotates 270° (= 90° counterclockwise).
-  // mongolianVert retains the existing horizontal fallback: this renderer
-  // does not implement its left-to-right column progression. Measurement
-  // follows that same paint path rather than claiming vertical support.
   const isVert    = body.vert === 'vert' || body.vert === 'eaVert';
   const isVert270 = body.vert === 'vert270';
 
@@ -4477,12 +4420,9 @@ export function renderTextBody(
       : undefined;
 
     if (measureOnly) {
-      // Re-enter the exact swapped paint frame, including its wrap boundary.
-      // The placed inline overflow is the physical row-axis deficit; table
-      // growth rechecks this routine until the final frame has no deficit.
-      return renderTextBody(ctx, { ...body, vert: 'horz' },
-        0, 0, bh, bw, scale, shapeDefaultTextColor, 0, false, false,
-        themeDefaultColor, slideNumber, rc, undefined, true, undefined, false, true);
+      // The rotated sub-frame's content height runs along the original width
+      // axis; for a table row the vertical extent is the original box width.
+      return bw;
     }
     ctx.save();
     ctx.translate(cx, cy);
@@ -4858,21 +4798,34 @@ export function renderTextBody(
       // shapes all keep the same omitted-lnSpc pitch at a given point size.
       // Percentage spacing scales this renderer's PowerPoint-compatible natural
       // line box (ECMA-376 §21.1.2.2.5/.11 defines the authored percentage;
-      // Office output supplies the line-box compatibility behaviour). Paint
-      // and table measurement use the same natural line; the row's final
-      // extent uses the last baseline plus its natural descent below.
+      // Office output supplies the line-box compatibility behaviour). A positive
+      // a:tr@h remains a minimum. A PowerPoint table control with 16pt text,
+      // 120% lnSpc and 8.5pt vertical cell margins grows a 36.85pt row;
+      // changing only lnSpc to 100% or the margins to zero does not. Explicit
+      // percentage spacing therefore consumes the painted natural line box
+      // even for one final line. Omitted lnSpc keeps its glyph-box exception
+      // in a positive row. Neither path uses a substituted font's design box.
       const naturalSingle = maxSizePx * 1.2;
       const useResolvedFontMetrics = isSpAutoFit && resolvedFontLine > naturalSingle;
       // A live resolved font box describes containment, not baseline advance.
       // Keeping the two values separate prevents a tall Meiryo design box from
       // being repeated between every pair of lines under spAutoFit (#1473).
       const implicitSingle = naturalSingle;
-      // Earlier lines consume each full authored advance. There is no
-      // separate glyph-size-only measurement path for positive table rows.
+      // Paint and table measurement must agree for explicitly authored
+      // percentage spacing. Positive rows with omitted lnSpc retain the
+      // existing glyph-box containment rule: the implicit leading is not by
+      // itself evidence that PowerPoint grows the authored minimum. An explicit
+      // percentage, however, is part of the authored content extent, and every
+      // line in a multi-line body consumes the painted line box.
       const paintedLineHeight = drawingMlLineHeight(
         implicitSingle, para.spaceLine, PT_TO_EMU * scale,
       );
       let lineHeight = paintedLineHeight;
+      if (measureOnly && !isSpAutoFit && !measureNaturalLineSpacing) {
+        if (!para.spaceLine) {
+          lineHeight = maxSizePx;
+        }
+      }
       // PowerPoint retains its established percentage-line advance, but seats
       // glyphs from a tall resolved fallback inside the authored percentage
       // box. Keeping that box separate from `lineHeight` fixes the first-line
@@ -4933,7 +4886,7 @@ export function renderTextBody(
           seg.fontAlgnOffsetPx = offset;
         }
       }
-      if (metric && metricOk) {
+      if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
         const natural = alignedLine ?? (compatOff
           ? powerPointCompatOffNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, box: r.face.excel! })))
           : metricRuns.length > 0
@@ -5052,6 +5005,13 @@ export function renderTextBody(
     }
   }
 
+  // ── measure-only: return the content height the text body needs ─────────
+  // Used by renderTable to grow rows to fit their tallest cell (ECMA-376
+  // §21.1.3.18: a:tr@h is a minimum). Returns padding + laid-out text height.
+  if (measureOnly) {
+    return tPad + requiredHeight + bPad;
+  }
+
   // ── anchor="b" with bh=0: auto-height growing upward from by ────────────
   // When cy=0 and anchor="b", off_y is the bottom anchor; shape grows upward.
   const anchor = body.verticalAnchor ?? 't';
@@ -5083,13 +5043,6 @@ export function renderTextBody(
     && lastMetric.metricNaturalDescent !== undefined
     ? requiredHeight - (lastMetric.lineHeight - lastMetric.metricAscent) + lastMetric.metricNaturalDescent
     : requiredHeight;
-  // A table row must hold the final baseline plus its natural descent,
-  // rather than terminal lnSpc leading. Tagged PDF row controls at 16pt
-  // with 1pt insets: omitted/100% = 21.2pt, 120% = 22.92pt, 24pt =
-  // 23.64pt. Earlier full line advances and interior paragraph gaps remain.
-  // Extents are collected below, after the SAME column, tab and alignment
-  // placement as paint. A pre-placement line width is not a row requirement.
-  let inlineOverflow = 0;
   let cursorY: number;
   const contentH = Math.max(0, effectiveBh - tPad - bPad);
   if (anchor === 'ctr') {
@@ -5189,7 +5142,48 @@ export function renderTextBody(
     const paraNeedsBidi = baseRtl || segmentsHaveRtl(line.segments);
     const hasTab = line.segments.some((seg) => seg.isTab);
 
-    if (hasTab) resolveLineTabs(ctx, line, entry.para, textXOffset, textMaxW, scale);
+    if (hasTab) {
+      // §21.1.2.1.x: resolve every inline tab in the logical READING frame.
+      // UAX#9 L2 later mirrors the resulting cells physically for an RTL base.
+      const marLPxE = emuToPx(entry.para.marL, scale);
+      const marRPxE = emuToPx(entry.para.marR, scale);
+      // The reading pen starts at the leading indent PLUS the draw-side
+      // first-line indent (textXOffset): a stop is an ABSOLUTE distance from the
+      // leading text-inset edge (§21.1.2.1), so the indent moves where content
+      // STARTS, not where a stop sits — omitting it would widen every gap by the
+      // indent and slide the cells past their stops. textXOffset only shifts the
+      // LTR pen (the RTL draw right-anchors and never applies it), so it joins
+      // the LTR frame only.
+      const leadingIndentPx = baseRtl ? marRPxE : marLPxE + textXOffset;
+      const limitPx = textMaxW + marLPxE + marRPxE;
+      const tabFontSeg = line.segments.find((seg) => seg.isTab) as LayoutSegment;
+      ctx.font = tabFontSeg.font;
+      const spaceW = ctx.measureText(' ').width;
+      const items = line.segments.map((seg) => {
+        if (seg.isTab) return { isTab: true, width: 0 };
+        if (seg.math) return { isTab: false, width: seg.math.width };
+        ctx.font = seg.font;
+        const ls = seg.letterSpacingPx ?? 0;
+        return {
+          isTab: false,
+          width: seg.text
+            ? (seg.leadingLetterSpacingPx ?? 0) + measureTextAdvance(ctx, seg.text, ls)
+            : 0,
+        };
+      });
+      const stops = (entry.para.tabStops ?? []).map((stop) => ({
+        pos: emuToPx(stop.pos, scale),
+        algn: stop.algn,
+      }));
+      // Default tab grid (§21.1.2.2.7): explicit pPr value, else PowerPoint's
+      // universal 1-inch default so an unreached tab snaps to the grid (matching
+      // the wrap pass) rather than collapsing to a space (issue #1006).
+      const defTabSzPx = emuToPx(entry.para.defTabSz ?? 914400, scale);
+      const widths = resolveTabWidths(items, stops, leadingIndentPx, limitPx, spaceW, defTabSzPx);
+      for (let i = 0; i < line.segments.length; i++) {
+        if (line.segments[i].isTab) line.segments[i].tabWidthPx = widths[i];
+      }
+    }
 
     // Measure line width and the metrics of the fonts Canvas actually resolved.
     // spAutoFit is a live recalculation, so its baseline must use the same
@@ -5291,7 +5285,7 @@ export function renderTextBody(
     }
 
     // Draw bullet.
-    if (!measureOnly && bulletLabel) {
+    if (bulletLabel) {
       ctx.font = bulletFont;
       // §21.1.2.4.5 buClrTx follows the first run's patterned fill in the
       // PowerPoint control. Keep the existing solid-colour inheritance path
@@ -5318,7 +5312,7 @@ export function renderTextBody(
     // warmed by renderSlide's prefetch pass; if its decode hasn't resolved yet
     // (or fetchImage is absent), draw nothing — the marker simply appears once
     // the image source is ready, never blocking the frame.
-    if (!measureOnly && bulletImage && fetchImage) {
+    if (bulletImage && fetchImage) {
       if (bulletBmp) {
         // The bullet HEIGHT is the text-derived size (× buSzPct); the WIDTH is
         // derived from the decoded bitmap's intrinsic aspect ratio so a
@@ -5361,8 +5355,6 @@ export function renderTextBody(
         penX = effectiveTextX;
       }
     }
-
-    const inlineStart = penX;
 
     // Justified alignment (ECMA-376 §20.1.10.59 ST_TextAlignType): just/justLow
     // fill the column by widening inter-word + inter-CJK gaps with the
@@ -5437,7 +5429,7 @@ export function renderTextBody(
         const render = mathRenders.get(seg.math.nodes);
         const w = seg.math.width;
         const h = seg.math.ascent + seg.math.descent;
-        if (!measureOnly && render && w > 0 && h > 0) {
+        if (render && w > 0 && h > 0) {
           const top = baseline - seg.math.ascent;
           const img = tintedMathImage(render, seg.color);
           ctx.drawImage(img, penX, top, w, h);
@@ -5451,14 +5443,9 @@ export function renderTextBody(
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
       const segBaseline = referenceY + (seg.fontAlgnOffsetPx ?? 0) + baselineShift;
-      const ls = seg.letterSpacingPx ?? 0;
-      const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
-      if (measureOnly) {
-        penX += segW + jext;
-        continue;
-      }
       const glyphPaint = resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
       ctx.fillStyle = glyphPaint;
+      const ls = seg.letterSpacingPx ?? 0;
 
       // Run-level text highlight (rPr > a:highlight, ECMA-376 §21.1.2.3.4).
       // Box advance = glyph measure + letter spacing + justification stretch
@@ -5674,6 +5661,7 @@ export function renderTextBody(
       if (segShadow && !seg.noFill) ctx.restore();
 
       ctx.font = seg.font;
+      const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
 
       // Run-level text outline (rPr > a:ln). Strokes each glyph in addition
       // to the fill so the text reads as a thin lined character. ECMA-376
@@ -5771,27 +5759,12 @@ export function renderTextBody(
       penX += segW;
       penX += jext;
     }
-    if (measureOnly) {
-      // §21.1.2.1.1 numCol/rtlCol and §21.1.2.2.14 tabLst: measure the
-      // actual placed pen after tabs, justification and visual ordering.
-      // Include both margins/edges; vert270 reverses the physical row axis.
-      inlineOverflow = Math.max(inlineOverflow,
-        bx + lPad + emuToPx(entry.para.marL, scale) - inlineStart,
-        penX + emuToPx(entry.para.marR, scale) + rPad - bx - bw);
-    }
     if (paraNeedsBidi) ctx.direction = 'ltr';
 
     cursorY += linePx;
   }
 
   ctx.restore();
-  if (measureOnly) return measureInlineExtent
-    ? bw + inlineOverflow
-    // The horizontal block's extent is the same natural baseline/descent
-    // block used to anchor paint above. Measuring it before translating to
-    // a bottom/centre anchor avoids cancellation from subtracting the frame
-    // and then adding it back; that must not manufacture an extra row ulp.
-    : tPad + anchorHeight + bPad;
 }
 
 // The lazy image-byte source closure (one stable identity per Presentation, so
@@ -7062,62 +7035,70 @@ export function renderTable(
     return w;
   };
 
-  // ECMA-376 §21.1.3.18 / [MS-OE376] §2.1.1347: saved heights are
-  // minima (Office-produced row controls include zero/positive minima and
-  // frames below/equal/above their sum). Library containment policy: grow
-  // against renderTextBody's placed extent, then lay out again on that frame.
-  // Growth can change rotated wrapping, tab clamping, column offsets and a
-  // neighbouring rowSpan's frame; ALL cells must pass a final unchanged sweep.
-  // Heights increase monotonically; they never shrink when wrapping reduces
-  // the requirement. Keep computed Canvas extents at their full precision:
-  // tr@h is authored in integer EMUs, but a measured font box is continuous.
-  // No fit tolerance or re-quantization is applied. Balanced columns can
-  // converge geometrically; clamped tabs may instead advance by a fixed glyph
-  // deficit until their authored stop is reached. Bound work to 4096 sweeps
-  // as resource policy, and fail instead
-  // of painting an unverified frame if malformed/pathological input exhausts
-  // it. This bound is not an Office compatibility rule or a fit heuristic.
-  const rowHeights = el.rows.map(r => emuToPx(r.height, scale));
-  try {
-    for (let pass = 0; ; pass++) {
-      if (pass === 4096) throw new Error('Table text layout did not converge');
-      let grew = false;
-      // Resolve every single-row minimum first. A merged deficit belongs
-      // only to the space still missing AFTER those minima, otherwise a tall
-      // cell in a later row would spuriously inflate an earlier row.
-      for (const merged of [false, true]) {
-        for (let ri = 0; ri < el.rows.length; ri++) {
-          for (let ci = 0; ci < el.rows[ri].cells.length; ci++) {
-            const cell = el.rows[ri].cells[ci];
-            if (cell.hMerge || cell.vMerge || !cell.textBody) continue;
-            const span = Math.min(cell.rowSpan || 1, rowHeights.length - ri);
-            if ((span > 1) !== merged) continue;
-            const cellW = spannedWidth(ci, cell.gridSpan || 1);
-            let cellH = 0;
-            for (let s = 0; s < span; s++) cellH += rowHeights[ri + s];
-            const needed = renderTextBody(
-              ctx, tableTextBody(cell.textBody), 0, 0, cellW, cellH, scale,
-              null, 0, false, false, '#000000', slideNumber, rc, undefined, true,
-            ) as number;
-            if (!Number.isFinite(needed)) throw new Error('Invalid table text extent');
-            if (needed <= cellH) continue;
-            const extra = (needed - cellH) / span;
-            let increased = false;
-            for (let s = 0; s < span; s++) {
-              const next = rowHeights[ri + s] + extra;
-              increased ||= next > rowHeights[ri + s];
-              rowHeights[ri + s] = next;
-            }
-            if (!increased) throw new Error('Table text growth lost floating-point precision');
-            grew = true;
-          }
-        }
-      }
-      if (!grew) break;
+  // ── Row heights: Office minimum-row semantics ─────────────────────────────
+  // ECMA-376 §21.1.3.18 defines a:tr@h as the row height; [MS-OE376]
+  // §2.1.1347 additionally constrains it to zero or at least the minimum row
+  // height. PowerPoint grows a row to fit its tallest cell's laid-out text. A
+  // literal h=0 therefore becomes
+  // content-driven. We measure each cell's text body at its spanned width
+  // (reusing the same renderTextBody machinery via measureOnly) and take
+  // max(tr@h, tallest single-row cell content). A rowSpan cell distributes
+  // its content height across the rows it covers so it doesn't inflate the
+  // first row.
+  const authoredRowHeights = el.rows.map(r => emuToPx(r.height, scale));
+  const rowHeights = [...authoredRowHeights];
+  const authoredRowsTotalEmu = el.rows.reduce((sum, row) => sum + row.height, 0);
+  // The graphic-frame extent is the table's authored outer height. PowerPoint
+  // can leave slack between that extent and the sum of positive a:tr@h minima;
+  // that discrepancy signals that text-driven row growth was present when the
+  // table was authored. When the positive minima already fill the frame, do not
+  // invent growth merely because browser font metrics wrap differently.
+  const hasAuthoredRowGrowthSignal = el.height > authoredRowsTotalEmu;
+
+  // First pass: single-row (rowSpan ≤ 1) cells set their own row's minimum.
+  for (let ri = 0; ri < el.rows.length; ri++) {
+    const row = el.rows[ri];
+    for (let ci = 0; ci < row.cells.length; ci++) {
+      const cell = row.cells[ci];
+      if (cell.hMerge || cell.vMerge) continue;
+      if ((cell.rowSpan || 1) > 1) continue;
+      if (!cell.textBody) continue;
+      if (row.height > 0 && !hasAuthoredRowGrowthSignal) continue;
+      const cellW = spannedWidth(ci, cell.gridSpan || 1);
+      const needed = (renderTextBody(
+        ctx, tableTextBody(cell.textBody), 0, 0, cellW, 0, scale, null, 0, false, false,
+        '#000000', slideNumber, rc, undefined, true, undefined, false, row.height === 0,
+      ) as number) || 0;
+      if (needed > rowHeights[ri]) rowHeights[ri] = needed;
     }
-  } catch (error) {
-    ctx.restore();
-    throw error;
+  }
+
+  // Second pass: rowSpan cells. If the content needs more than the sum of the
+  // rows it spans, distribute the deficit across those rows so the merged area
+  // grows without inflating any single row beyond what its own content needs.
+  for (let ri = 0; ri < el.rows.length; ri++) {
+    const row = el.rows[ri];
+    for (let ci = 0; ci < row.cells.length; ci++) {
+      const cell = row.cells[ci];
+      if (cell.hMerge || cell.vMerge) continue;
+      const span = cell.rowSpan || 1;
+      if (span <= 1 || !cell.textBody) continue;
+      const cellW = spannedWidth(ci, cell.gridSpan || 1);
+      const hasAutoHeightRow = el.rows
+        .slice(ri, Math.min(el.rows.length, ri + span))
+        .some((spannedRow) => spannedRow.height === 0);
+      if (!hasAutoHeightRow && !hasAuthoredRowGrowthSignal) continue;
+      const needed = (renderTextBody(
+        ctx, tableTextBody(cell.textBody), 0, 0, cellW, 0, scale, null, 0, false, false,
+        '#000000', slideNumber, rc, undefined, true, undefined, false, hasAutoHeightRow,
+      ) as number) || 0;
+      let have = 0;
+      for (let s = 0; s < span && ri + s < rowHeights.length; s++) have += rowHeights[ri + s];
+      if (needed > have) {
+        const extra = (needed - have) / span;
+        for (let s = 0; s < span && ri + s < rowHeights.length; s++) rowHeights[ri + s] += extra;
+      }
+    }
   }
 
   // ── Column x-positions ────────────────────────────────────────────────────

@@ -201,120 +201,36 @@ describe('PowerPoint table-cell paragraph boundaries', () => {
   });
 });
 
-describe('table row measurement along the text row axis', () => {
-  function recording(vert: string, text = 'A', height = 30, wrap = 'square', rowSpan = 1) {
-    const textBody = {
-      verticalAnchor: 't', paragraphs: [{
-        alignment: 'l', marL: 0, marR: 0, indent: 0,
-        spaceBefore: null, spaceAfter: null, spaceLine: null,
-        runs: [{ type: 'text', text, fontSize: 12, fontFamily: 'UnknownTestFace' }],
-        bullet: { type: 'none' },
-      }],
-      lIns: 0, rIns: 0, tIns: 0, bIns: 0,
-      wrap, vert, autoFit: 'none',
-    } as unknown as TextBody;
-    const t = tableOf([
-      [cell({ textBody, rowSpan, fill: { fillType: 'solid', color: 'FFFFFF' } })],
-      [cell({ vMerge: rowSpan > 1, fill: { fillType: 'solid', color: 'FFFFFF' } })],
-    ], [200 * EMU]);
-    t.rows[0].height = height * EMU;
-    t.rows[1].height = height * EMU;
-    t.height = 2 * height * EMU;
-    const rec = makeRecordingCtx();
-    rec.ctx.measureText = (text) => ({ width: text.length * 8,
-      fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2,
-      actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2 } as TextMetrics);
-    return { t, textBody, rec, render: () => renderTable(rec.ctx, t, SCALE) };
-  }
-
-  it.each(['vert', 'vert270', 'eaVert', 'wordArtVert', 'wordArtVertRtl', 'mongolianVert', 'horz'])(
-    '%s keeps a sufficient 30pt row in a 200pt-wide cell', (vert) => {
-      const { rec, render } = recording(vert);
-      render();
-      expect(rec.fills.map(f => [f.y, f.height])).toEqual([[0, 30], [30, 30]]);
-    },
-  );
-
-  it.each(['vert', 'eaVert'])('%s wraps along the authored row height, not cell width', (vert) => {
-    const { rec, render } = recording(vert, 'A A A A A A A A');
-    render();
-    expect(rec.fills[0].height).toBe(30);
-    expect(rec.fills[1].y).toBe(30);
-  });
-
-  it.each(['vert', 'vert270', 'eaVert'])('%s grows for unwrapped inline extent and insets', (vert) => {
-    const { textBody, rec, render } = recording(vert, 'AAAAA', 30, 'none');
-    // The existing rotated paint frame uses lIns/rIns on its inline axis.
-    textBody.lIns = 2 * EMU;
-    textBody.rIns = 3 * EMU;
-    render();
-    expect(rec.fills[0].height).toBe(45);
-    expect(rec.fills[1].y).toBe(45);
-  });
-
-  it.each(['wordArtVert', 'wordArtVertRtl'])('%s measures glyph advances and physical vertical insets', (vert) => {
-    const { textBody, rec, render } = recording(vert, 'AAA', 30, 'none');
-    textBody.tIns = 2 * EMU;
-    textBody.bIns = 3 * EMU;
-    render();
-    // UnknownTestFace uses the measured 8+2px face box: three upright
-    // cells, each 7/6 of that box, plus the 5px physical vertical insets.
-    expect(rec.fills[0].height).toBeCloseTo(40, 5);
-    expect(rec.fills[1].y).toBeCloseTo(40, 5);
-  });
-
-  it.each(['wordArtVert', 'wordArtVertRtl'])('%s wraps glyph columns within the authored row', (vert) => {
-    const { rec, render } = recording(vert, 'A A A A A A A A');
-    render();
-    expect(rec.fills[0].height).toBe(30);
-  });
-
-  it('includes rotated tab stops and paragraph margins in the row extent', () => {
-    const { textBody, rec, render } = recording('vert', 'A\tA', 30, 'none');
-    textBody.paragraphs[0].marL = 2 * EMU;
-    textBody.paragraphs[0].marR = 3 * EMU;
-    textBody.paragraphs[0].tabStops = [{ pos: 40 * EMU, algn: 'l' }];
-    render();
-    // Row growth must re-resolve the stop on the final frame, retaining
-    // the final glyph and trailing 3pt paragraph margin: 40 + 8 + 3.
-    expect(rec.fills[0].height).toBe(51);
-  });
-
-  it('measures a rotated rowSpan against the combined row height', () => {
-    const { rec, render } = recording('vert', 'A A A A A A', 30, 'square', 2);
-    render();
-    expect(rec.fills[0].height).toBe(60);
-  });
-
-  it('derives a zero-height rotated row from text rather than box width', () => {
-    const { rec, render } = recording('vert', 'AAAAA', 0, 'none');
-    render();
-    expect(rec.fills[0].height).toBe(40);
-  });
-});
-
 describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent)', () => {
-  it('measures the final natural descent under percentage and point spacing', () => {
-    // Tagged PDF controls: 16pt Arial, 1pt insets, zero minimum. The final
-    // line's extra lnSpc descent is not part of the row's required extent.
-    const height = (spaceLine: TextBody['paragraphs'][number]['spaceLine']): number => {
+  it('grows a positive header row for explicit percentage line spacing and cell margins', () => {
+    // PowerPoint PDF of a table with 16pt text, 36.85pt header minimum,
+    // 8.5pt top/bottom margins and 120% lnSpc grows the header. The same
+    // table at 100% lnSpc, or with zero vertical margins, keeps the minimum.
+    const boundary = (pct: number, marginPt: number): number => {
       const textBody = {
-        verticalAnchor: 't', paragraphs: [{
-          alignment: 'l', marL: 0, marR: 0, indent: 0,
-          spaceBefore: null, spaceAfter: null, spaceLine,
-          runs: [{ type: 'text', text: 'Hxg', fontSize: 16, fontFamily: 'Arial' }],
-          bullet: { type: 'none' },
+        verticalAnchor: 'b', paragraphs: [{
+          alignment: 'ctr', marL: 0, marR: 0, indent: 0,
+          spaceBefore: null, spaceAfter: 300,
+          spaceLine: { type: 'pct', val: pct },
+          runs: [{ type: 'text', text: 'Header', fontSize: 16, fontFamily: 'Yu Gothic' }],
+          bullet: { type: 'none' }, eaLnBrk: true,
         }],
-        lIns: EMU, rIns: EMU, tIns: EMU, bIns: EMU,
+        defaultFontSize: null, defaultBold: null, defaultItalic: null,
+        lIns: 108000, rIns: 108000,
+        tIns: marginPt * EMU, bIns: marginPt * EMU,
         wrap: 'square', vert: 'horz', autoFit: 'none',
       } as unknown as TextBody;
-      const t = tableOf([[cell({ textBody, fill: { fillType: 'solid', color: 'FFFFFF' } })]], [COL]);
-      t.rows[0].height = 0;
-      return renderRecording(t).fills[0].height;
+      const t = tableOf([
+        [cell({ textBody, borderB: ln() })],
+        [cell({ borderT: ln() })],
+      ], [200 * EMU]);
+      t.rows[0].height = 36.85 * EMU;
+      t.height = 60 * EMU; // authored frame exceeds the row minima
+      return render(t).find((s) => s.y1 === s.y2 && s.y1 > 0)?.y1 ?? -1;
     };
-    expect(height({ type: 'pct', val: 100000 })).toBeCloseTo(21.2, 2);
-    expect(height({ type: 'pct', val: 120000 })).toBeCloseTo(22.92, 2);
-    expect(height({ type: 'pts', val: 24 })).toBeCloseTo(23.64, 2);
+
+    expect(boundary(120000, 8.5) - boundary(100000, 8.5)).toBeCloseTo(4, 2);
+    expect(boundary(120000, 0)).toBeCloseTo(boundary(100000, 8.5), 2);
   });
 
   it('composes a table background below translucent cell bands', () => {
@@ -377,9 +293,11 @@ describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent
     expect(horizontalAt(render(t), 21.2)).toHaveLength(1);
   });
 
-  it('grows a positive row to the natural line box even when its frame has no slack', () => {
-    // Tagged PowerPoint PDF controls: 0/10/18pt minima all grow to 21.2pt
-    // for 16pt Arial and 1pt insets, with frame below/equal/above row sum.
+  it('keeps a positive authored row height when the glyph box and insets fit', () => {
+    // ECMA-376 §21.1.3.18 makes a:tr@h a minimum, not an auto-height request.
+    // PowerPoint keeps this 18pt minimum because the 16pt glyph box plus 1pt
+    // top/bottom insets fits. Applying the auto-row 120% leading here would
+    // incorrectly enlarge the row to 21.2pt.
     const textBody = {
       verticalAnchor: 'ctr',
       paragraphs: [{
@@ -395,7 +313,7 @@ describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent
     const t = tableOf([[cell({ textBody, borderB: ln() })]], [COL]);
     t.rows[0].height = 18 * EMU;
 
-    expect(horizontalAt(render(t), 21.2)).toHaveLength(1);
+    expect(horizontalAt(render(t), 18)).toHaveLength(1);
   });
 
   it('grows a positive row for every painted baseline before the final glyph box', () => {
@@ -429,7 +347,7 @@ describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent
     expect(horizontalAt(render(t), 72)).toHaveLength(1);
   });
 
-  it('fits multiline content when positive row minima already fill the frame', () => {
+  it('does not invent positive-row growth when row minima already fill the frame', () => {
     const textBody = {
       verticalAnchor: 'ctr',
       paragraphs: [{
@@ -457,7 +375,7 @@ describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent
     t.rows[1].height = 40 * EMU;
     t.height = 100 * EMU;
 
-    expect(horizontalAt(render(t), 72)).toHaveLength(1);
+    expect(horizontalAt(render(t), 60)).toHaveLength(1);
   });
 
   it('shared VERTICAL gridline is drawn exactly ONCE (not once per cell)', () => {

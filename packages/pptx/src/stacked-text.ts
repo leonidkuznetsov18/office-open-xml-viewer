@@ -183,18 +183,7 @@ function makeMeasurer<T extends StackedSegmentStyle>(ctx: Ctx2D) {
 export function renderStackedText<T extends StackedSegmentStyle>(
   ctx: Ctx2D,
   body: StackedBodyInput<T>,
-  measureOnly?: false,
-): StackedGlyphRun[];
-export function renderStackedText<T extends StackedSegmentStyle>(
-  ctx: Ctx2D,
-  body: StackedBodyInput<T>,
-  measureOnly: true,
-): number;
-export function renderStackedText<T extends StackedSegmentStyle>(
-  ctx: Ctx2D,
-  body: StackedBodyInput<T>,
-  measureOnly = false,
-): StackedGlyphRun[] | number {
+): StackedGlyphRun[] {
   const measure = makeMeasurer<T>(ctx);
   const paragraphs: StackedParagraph<T>[] = body.paragraphs.map((p) => ({
     runs: p.runs,
@@ -217,16 +206,6 @@ export function renderStackedText<T extends StackedSegmentStyle>(
     glyphs: measure,
     sameStyle: body.sameStyle,
   });
-  if (measureOnly) {
-    // Use the final placed glyph cells, including alignment and wrap, not
-    // sums of advances from a different frame (§20.1.10.83 row axis).
-    let overflow = 0;
-    for (const glyph of layout.glyphs) {
-      overflow = Math.max(overflow, body.rect.top - glyph.cellTop,
-        glyph.cellTop + glyph.advance - body.rect.top - body.rect.height);
-    }
-    return overflow;
-  }
   const runs: StackedGlyphRun[] = [];
   const prevAlign = ctx.textAlign;
   const prevBaseline = ctx.textBaseline;
