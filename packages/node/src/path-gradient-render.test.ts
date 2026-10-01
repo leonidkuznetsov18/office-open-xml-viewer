@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { paintDrawingMLShape, resolveFill, type GradientFill } from '@silurus/ooxml-core';
+import {
+  paintDrawingMLShape, resolveFill, buildCustomPath, buildPresetGeometryFillPath, buildShapePath,
+  type GradientFill, type DrawingMLShapeGeometry, type PathCmd,
+} from '@silurus/ooxml-core';
 import type { Presentation, ShapeElement } from '@silurus/ooxml-pptx';
 import type { Styles, Worksheet } from '@silurus/ooxml-xlsx';
 import { renderViewport } from '../../xlsx/src/renderer';
@@ -36,7 +39,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     shades.forEach(shade => expect(shade).toBeLessThan(132));
   });
 
-  it('fills the complete asymmetric focus area and interpolates alpha once', () => {
+  it('uses the ECMA focus rectangle and interpolates alpha once', () => {
     const { ctx } = canvas();
     paint({ ...fill, fillToRect: { l: .2, r: .4, t: .25, b: .25 },
       stops: [{ position: 0, color: 'FF000080' }, { position: 1, color: '0000FF00' }],
@@ -47,40 +50,49 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(pixel(ctx, 192, 60)[3]).toBeLessThan(67);
   });
 
-  it('contracts a triangle outline rather than shading its bounding circle', () => {
-    const { ctx } = canvas();
-    paintDrawingMLShape(ctx, {
-      rect: { x: 0, y: 0, w: 240, h: 120 },
-      geometry: { kind: 'preset', name: 'triangle', adjustments: [] },
-      fill: { ...fill, path: 'shape' }, stroke: null,
-      transform: { rotationDeg: 0, flipH: false, flipV: false },
-    }, 1);
-    // Both points lie on the triangle contracted halfway toward (120,60).
-    for (const [x, y] of [[120, 30], [75, 75]]) {
-      const u = (x + .5 - 120) / 120;
-      const v = (y + .5 - 60) / 60;
-      const expected = 255 * Math.max(v, 2 * Math.abs(u) - v);
-      // One contour quantization step plus antialiasing at the sloping edge.
-      expect(Math.abs(pixel(ctx, x, y)[0] - expected)).toBeLessThanOrEqual(3);
-    }
-    expect(pixel(ctx, 20, 10)[3]).toBe(0);
-  });
-
-  it('keeps concave custom boundaries at the outer stop and leaves the notch empty', () => {
-    const { ctx } = canvas(120, 120);
+  it('retains the legacy radial shape approximation across convex and concave geometry', () => {
     const vertices = [[0, 0], [1, 0], [1, 1], [.65, 1], [.65, .4], [.35, .4], [.35, 1], [0, 1]];
-    paintDrawingMLShape(ctx, {
-      rect: { x: 0, y: 0, w: 120, h: 120 },
-      geometry: { kind: 'custom', subpaths: [[
+    const geometries: DrawingMLShapeGeometry[] = [
+      ...['rect', 'ellipse', 'rightArrow', 'triangle', 'star5'].map(name => ({
+        kind: 'preset' as const, name, adjustments: [],
+      })),
+      { kind: 'custom', subpaths: [[
         ...vertices.map(([x, y], index) => ({ cmd: index ? 'lineTo' as const : 'moveTo' as const, x, y })),
         { cmd: 'close' },
       ]] },
-      fill: { ...fill, path: 'shape', fillToRect: { l: .5, r: .5, t: .2, b: .8 } },
-      stroke: null, transform: { rotationDeg: 0, flipH: false, flipV: false },
-    }, 1);
-    expect(pixel(ctx, 60, 80)[3]).toBe(0);
-    expect(pixel(ctx, 41, 80)[0]).toBeGreaterThan(245);
-    expect(pixel(ctx, 60, 24)[0]).toBeLessThan(12);
+    ];
+    for (const geometry of geometries) {
+      for (const focus of [undefined, fill.fillToRect, { l: .2, r: .4, t: .25, b: .25 }]) {
+        const actual = canvas(120, 120).ctx;
+        const previous = canvas(120, 120).ctx;
+        const plan = {
+          rect: { x: 0, y: 0, w: 120, h: 120 }, geometry, stroke: null,
+          transform: { rotationDeg: 0, flipH: false, flipV: false },
+        };
+        paintDrawingMLShape(actual, { ...plan, fill: { ...fill, path: 'shape', fillToRect: focus } }, 1);
+        // Independent legacy contract: a native radial gradient focused at
+        // the authored rectangle's center, reaching its farthest box corner.
+        const cx = 60 * (1 + (focus?.l ?? 0) - (focus?.r ?? 0));
+        const cy = 60 * (1 + (focus?.t ?? 0) - (focus?.b ?? 0));
+        const radius = Math.max(...[[0, 0], [120, 0], [0, 120], [120, 120]]
+          .map(([x, y]) => Math.hypot(x - cx, y - cy)));
+        const gradient = previous.createRadialGradient(cx, cy, 0, cx, cy, radius);
+        gradient.addColorStop(0, '#000000'); gradient.addColorStop(1, '#FFFFFF');
+        previous.fillStyle = gradient;
+        previous.beginPath();
+        if (geometry.kind === 'preset') {
+          if (!buildPresetGeometryFillPath(previous, geometry.name, 0, 0, 120, 120, [])) {
+            buildShapePath(previous, geometry.name, 0, 0, 120, 120);
+          }
+        } else {
+          buildCustomPath(previous, geometry.subpaths as PathCmd[][], 0, 0, 120, 120);
+        }
+        previous.fill();
+        const actualBytes = Buffer.from(actual.getImageData(0, 0, 120, 120).data);
+        const previousBytes = Buffer.from(previous.getImageData(0, 0, 120, 120).data);
+        expect(actualBytes.equals(previousBytes), JSON.stringify({ geometry: geometry.kind === 'preset' ? geometry.name : 'custom', focus })).toBe(true);
+      }
+    }
   });
 
   it('repeats box tiles with reflection, retaining all authored stops and plateaus', () => {
@@ -96,7 +108,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(pixel(ctx, 60, 12)[1]).toBeGreaterThan(245);
   });
 
-  it('paints custom geometry outside the authored transform box without unbounded allocation', () => {
+  it('keeps out-of-box rect shading opaque without moving the authored gradient frame', () => {
     const { ctx } = canvas();
     paintDrawingMLShape(ctx, {
       rect: { x: 0, y: 0, w: 120, h: 120 },
@@ -104,12 +116,35 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         { cmd: 'moveTo', x: 0, y: 0 }, { cmd: 'lineTo', x: 2, y: 1 },
         { cmd: 'lineTo', x: 0, y: 1 }, { cmd: 'close' },
       ]] },
-      fill: { ...fill, path: 'shape' }, stroke: null,
+      fill, stroke: null,
       transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
-    expect(pixel(ctx, 180, 105)[3]).toBe(255);
-    expect(pixel(ctx, 180, 105)[0]).toBeGreaterThan(150);
-    expect(pixel(ctx, 180, 105)[0]).toBeLessThan(254);
+    expect(pixel(ctx, 180, 105)).toEqual([255, 255, 255, 255]);
+    // Enlarging coverage to 240px must leave the authored focus at (60,60).
+    expect(pixel(ctx, 60, 60)[0]).toBeLessThan(5);
+    expect(pixel(ctx, 90, 90)[0]).toBeGreaterThan(125);
+    expect(pixel(ctx, 90, 90)[0]).toBeLessThan(133);
+  });
+
+  it('observes coverage without changing the caller path or canvas state', () => {
+    const { ctx } = canvas();
+    ctx.translate(10, 5);
+    ctx.globalAlpha = .5;
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.rect(20, 20, 10, 10);
+    ctx.fillStyle = resolveFill(fill, ctx, 0, 0, 120, 120, 0, undefined, undefined,
+      (target, x, y, w, h) => {
+        target.moveTo(x, y);
+        target.lineTo(x + w * 2, y + h);
+        target.lineTo(x, y + h);
+        target.closePath();
+      }) as CanvasPattern;
+    ctx.fill();
+    expect(pixel(ctx, 34, 29)[3]).toBe(128);
+    expect(pixel(ctx, 80, 60)[3]).toBe(0);
+    expect(ctx.globalAlpha).toBe(.5);
+    expect(ctx.lineWidth).toBe(7);
   });
 
   it('counter-rotates the shade within a reflected host without leaving transparent corners', () => {
@@ -142,13 +177,74 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
-  it('wires PPTX shape outlines through the complete slide painter', async () => {
+  it('keeps repeated rect shading to one ramp pass even for a complex outline', () => {
+    const { ctx } = canvas(512, 512);
+    const Canvas = (skia as NonNullable<typeof skia>).Canvas;
+    const work = { fills: 0, readbacks: 0, writes: 0 };
+    vi.stubGlobal('OffscreenCanvas', class extends Canvas {
+      getContext(type: '2d') {
+        const target = super.getContext(type);
+        for (const method of ['fill', 'fillRect'] as const) {
+          const original = target[method].bind(target);
+          vi.spyOn(target, method).mockImplementation((...args: unknown[]) => {
+            work.fills++;
+            return Reflect.apply(original, target, args);
+          });
+        }
+        for (const method of ['getImageData', 'putImageData'] as const) {
+          const original = target[method].bind(target);
+          vi.spyOn(target, method).mockImplementation((...args: unknown[]) => {
+            if (method === 'getImageData') work.readbacks++; else work.writes++;
+            return Reflect.apply(original, target, args);
+          });
+        }
+        return target;
+      }
+    });
+    let commands = 0;
+    const outline = (target: CanvasRenderingContext2D) => {
+      target.moveTo(0, 0);
+      for (let i = 0; i < 4000; i++) {
+        commands++;
+        target.lineTo(i % 512, Math.floor(i / 512));
+      }
+      target.closePath();
+    };
+    try {
+      for (let i = 0; i < 5; i++) {
+        ctx.fillStyle = resolveFill(fill, ctx, 0, 0, 512, 512, 0, undefined, undefined, outline) as CanvasPattern;
+        ctx.fillRect(0, 0, 512, 512);
+        expect(pixel(ctx, 256, 256)[3]).toBe(255);
+        expect(pixel(ctx, 256, 256)[0]).toBeLessThan(4);
+      }
+      // One bounds traversal, one ramp fill/readback, one pixel write per
+      // repaint. Replaying a complex outline for each contour violates this.
+      expect(commands).toBe(5 * 4000);
+      expect(work).toEqual({ fills: 5, readbacks: 5, writes: 5 });
+    } finally { vi.unstubAllGlobals(); vi.restoreAllMocks(); }
+  });
+
+  it('wires rect fills and legacy shape-path strokes through the retained DOCX painter', () => {
+    const { ctx } = canvas();
+    paintDrawingMLShape(ctx, {
+      rect: { x: 0, y: 0, w: 240, h: 120 },
+      geometry: { kind: 'preset', name: 'triangle', adjustments: [] },
+      fill, stroke: { color: '000000', width: 8, fill: { ...fill, path: 'shape' } },
+      transform: { rotationDeg: 0, flipH: false, flipV: false },
+    }, 1);
+    expect(pixel(ctx, 120, 30)[0]).toBeGreaterThan(124);
+    expect(pixel(ctx, 120, 30)[0]).toBeLessThan(133);
+    expect(pixel(ctx, 120, 117)[0]).toBeGreaterThan(107);
+    expect(pixel(ctx, 120, 117)[0]).toBeLessThan(112);
+  });
+
+  it('wires PPTX rectangular shading through the complete slide painter', async () => {
     const { c, ctx } = canvas();
     const px = (n: number) => n * 9525;
     const shape = {
       type: 'shape', x: 0, y: 0, width: px(240), height: px(120),
       rotation: 0, flipH: false, flipV: false, geometry: 'triangle',
-      fill: { ...fill, path: 'shape' }, stroke: null, textBody: null,
+      fill, stroke: { color: '000000', width: px(8), fill: { ...fill, path: 'shape' } }, textBody: null,
       custGeom: null, shadow: null,
     } as ShapeElement;
     const presentation = {
@@ -159,6 +255,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     await renderSlideNode(c, presentation, 0, { width: 240, dpr: 1 });
     expect(pixel(ctx, 120, 30)[0]).toBeGreaterThan(124);
     expect(pixel(ctx, 120, 30)[0]).toBeLessThan(133);
+    // Shape-path strokes retain the host-box radial field in every format.
+    expect(pixel(ctx, 120, 117)[0]).toBeGreaterThan(107);
+    expect(pixel(ctx, 120, 117)[0]).toBeLessThan(112);
   });
 
   it('wires XLSX custom coordinates and excludes unfilled decorative paths', () => {
@@ -175,9 +274,10 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       shapeGroups: [{ fromCol: 0, fromRow: 0, fromColOff: 0, fromRowOff: 0,
         toCol: 1, toRow: 1, toColOff: 0, toRowOff: 0, editAs: 'oneCell',
         nativeExtCx: 240 * 9525, nativeExtCy: 120 * 9525,
-        shapes: [{ x: 0, y: 0, w: 1, h: 1, rot: 0, strokeWidth: 0,
-          fill: { ...fill, path: 'shape' }, geom: { type: 'custom', paths: [
-            { w: 240, h: 120, commands: triangle, stroke: false },
+        shapes: [{ x: 0, y: 0, w: 1, h: 1, rot: 0, strokeColor: '000000', strokeWidth: 8 * 9525,
+          strokeFill: { ...fill, path: 'shape' },
+          fill, geom: { type: 'custom', paths: [
+            { w: 240, h: 120, commands: triangle },
             { w: 240, h: 120, fill: 'none', stroke: false, commands: [
               { op: 'moveTo', x: 0, y: 0 }, { op: 'lineTo', x: 240, y: 0 },
               { op: 'lineTo', x: 240, y: 120 }, { op: 'lineTo', x: 0, y: 120 }, { op: 'close' },
@@ -189,6 +289,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     renderViewport(ctx, worksheet, styles, { row: 1, col: 1, rows: 1, cols: 1 });
     expect(pixel(ctx, 120, 30)[0]).toBeGreaterThan(124);
     expect(pixel(ctx, 120, 30)[0]).toBeLessThan(133);
+    // Shape-path strokes retain the host-box radial field in every format.
+    expect(pixel(ctx, 120, 117)[0]).toBeGreaterThan(107);
+    expect(pixel(ctx, 120, 117)[0]).toBeLessThan(112);
     expect(pixel(ctx, 20, 10)).toEqual([255, 255, 255, 255]);
   });
 });

@@ -2,7 +2,7 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolvePathGradient, type FillOutline } from './path-gradient';
+import { resolveRectPathGradient, type FillOutline } from './path-gradient';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
@@ -199,14 +199,24 @@ export function resolveFill(
     const tileY = y + h * (tile?.t ?? 0);
     const tileW = w * (1 - (tile?.l ?? 0) - (tile?.r ?? 0));
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
-    if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
-      // Canvas has no box/outline gradient. Allocation-unavailable hosts use
+    if (fill.gradType === 'radial' && fill.path === 'rect') {
+      // Canvas has no box gradient. Allocation-unavailable hosts use
       // the first stop as a stable flat fallback, rather than inventing a
       // circular geometry. Real browser, worker and Node canvases rasterize it.
-      return resolvePathGradient(fill, ctx, tileX, tileY, tileW, tileH, shapeRotationDeg, outline)
+      return resolveRectPathGradient(fill, ctx, tileX, tileY, tileW, tileH, shapeRotationDeg, outline)
         ?? hexToRgba(stops[0].color);
     }
     if (fill.gradType === 'radial') {
+      // Keep the pre-existing shape-path radial approximation. Office-produced
+      // rect/ellipse/triangle/rightArrow/star/concave controls do not establish
+      // one contour/focus rule. Omitted and centered focus controls coincide
+      // in all six; asymmetric focus leaves ellipse/arrow/concave shading
+      // unchanged, whereas rect/triangle/star respond. ECMA §20.1.8.46 requires
+      // shape-following paths but does not define that interpolation algorithm.
+      // Neither affine outline contraction nor a boundary-clearance correction
+      // is established by those controls; defer shape-path support as a whole.
+      // Stroke hosts in all three formats also retain this box-based resolver:
+      // fill-bearing silhouettes exclude unfilled, stroked decorative paths.
       // §20.1.8.31: fillToRect is the center-shade (focus) rectangle inside
       // the gradient tile. Canvas has a point focus rather than a rectangular
       // focus, so use its authored centre and retain the full rectangle on the

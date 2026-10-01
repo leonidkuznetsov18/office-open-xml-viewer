@@ -5316,11 +5316,13 @@ function strokeShapePath(
   const stroke = shapeStroke(shape);
   if (!stroke) return;
   applyStroke(ctx, stroke, 1 / EMU_PER_PX);
+  // Match DOCX/PPTX stroke hosts: use the authored box, not the fill-bearing
+  // silhouette (which excludes decorative paths that may still be stroked).
+  // Shape-path shading remains the shared legacy radial approximation.
   if (stroke.fill) {
     const paint = resolveFill(
       stroke.fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
       axisAlignedPatternTransform(shape, width, height),
-      (target, x, y, w, h) => appendSpreadsheetShapeOutline(target, shape, x, y, w, h),
     );
     if (paint) ctx.strokeStyle = paint;
   }
