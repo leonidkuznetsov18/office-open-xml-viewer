@@ -232,14 +232,42 @@ export function breakDrawingMlText<T>(
       }
     }
 
+    let explicitTabTail: Uint8Array | null = null;
     const isSingleExplicitTabCell = (index: number): boolean => {
       const tab = atoms[index];
       const first = atoms[index + 1];
-      return tab?.type === 'tab' && !!options.tabStops?.length
-        && first?.type === 'text'
-        && /^[\p{Script_Extensions=Latin}\p{Number}]$/u.test(first.text)
-        && atoms.slice(index + 1).every((atom) => atom.type === 'text'
-          && !isSpace(atom) && !isCjk(atom));
+      if (tab?.type !== 'tab' || !options.tabStops?.length || first?.type !== 'text'
+          || !/^[\p{Script_Extensions=Latin}\p{Number}]$/u.test(first.text)) return false;
+      // Cache the unchanged suffix predicate; repeated tab-cell probes must
+      // neither copy nor rescan the remaining paragraph on each wrapped line.
+      if (explicitTabTail === null) {
+        explicitTabTail = new Uint8Array(end + 1);
+        explicitTabTail[end] = 1;
+        for (let i = end - 1; i >= 0; i--) {
+          const atom = atoms[i];
+          explicitTabTail[i] = explicitTabTail[i + 1] && atom.type === 'text'
+            && !isSpace(atom) && !isCjk(atom) ? 1 : 0;
+        }
+      }
+      return explicitTabTail[index + 1] === 1;
+    };
+
+    let kinsokuText: { chars: string[]; offsets: Int32Array } | null = null;
+    const kinsokuCodePoints = (): { chars: string[]; offsets: Int32Array } => {
+      if (kinsokuText === null) {
+        // Flatten text atoms once per region, not the remaining suffix at
+        // every CJK wrap. Offsets preserve the old code-point split/retraction
+        // semantics for multi-code-point graphemes and non-text atoms.
+        const chars: string[] = [];
+        const offsets = new Int32Array(end + 1);
+        for (let i = 0; i < end; i++) {
+          const atom = atoms[i];
+          if (atom.type === 'text') for (const ch of atom.text) chars.push(ch);
+          offsets[i + 1] = chars.length;
+        }
+        kinsokuText = { chars, offsets };
+      }
+      return kinsokuText;
     };
 
     const appendAtom = (segments: DrawingMlLineSegment<T>[], atom: Atom<T>): void => {
@@ -747,11 +775,12 @@ export function breakDrawingMlText<T>(
       // eaLnBrk="0" lifts the East Asian line-start/line-end rules (E01).
       if (eastAsianRules && split < end && atoms[split - 1].run === atoms[split].run
           && (isCjk(atoms[split - 1]) || isCjk(atoms[split]))) {
-        const left = atoms.slice(start, split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
-        const right = atoms.slice(split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
-        if (left.length > 1 && right.length > 0) {
-          const adjusted = kinsokuAdjustedSplit([...left, ...right], left.length, DEFAULT_KINSOKU_RULES, 1);
-          const retract = left.length - adjusted;
+        const { chars, offsets } = kinsokuCodePoints();
+        const codeStart = offsets[start];
+        const codeSplit = offsets[split];
+        if (codeSplit - codeStart > 1 && codeSplit < chars.length) {
+          const adjusted = kinsokuAdjustedSplit(chars, codeSplit, DEFAULT_KINSOKU_RULES, codeStart + 1);
+          const retract = codeSplit - adjusted;
           if (retract > 0 && split - retract > start) split -= retract;
         }
       }
