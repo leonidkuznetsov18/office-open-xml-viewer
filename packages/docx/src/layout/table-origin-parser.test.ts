@@ -115,6 +115,12 @@ describe('Word table origin and occupied grid', () => {
       }
     }
   });
+  it("keeps main's AutoFit ceiling in an unmeasured compatibility mode", () => {
+    const xml = table(`<w:tr>${cell(4680)}${cell(4680)}</w:tr>`, '<w:tblW w:type="dxa" w:w="10800"/><w:jc w:val="center"/><w:tblInd w:type="dxa" w:w="-720"/>')
+      .replace('w:tblLayout w:type="fixed"', 'w:tblLayout w:type="autofit"')
+      .replace('<w:gridCol w:w="2160"/><w:gridCol w:w="3600"/>', '<w:gridCol w:w="4680"/><w:gridCol w:w="4680"/>');
+    expect(layoutTable(xml, 13).columnWidthsPt).toEqual([270, 270]);
+  });
   it('first-row exceptions anchor every leading row with the first cell override', () => {
     const rows = `<w:tr><w:tblPrEx><w:tblInd w:type="dxa" w:w="720"/>${margins(240)}</w:tblPrEx>${cell(2160, 540)}${cell(3600)}</w:tr>${row}`;
     expect(layoutTable(table(rows, indent)).rows.map((r) => r.cells[0]?.flowBounds.xPt)).toEqual([81, 81]);
@@ -194,6 +200,7 @@ describe('Word table origin and occupied grid', () => {
         [skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="dxa" w:w="6480"/></w:tblPrEx>'), skipped],
         [skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="auto" w:w="0"/></w:tblPrEx>'), skipped],
         [skipped, skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="dxa" w:w="6480"/></w:tblPrEx>')],
+        ['', skipped.replace('<w:tr>', '<w:tr><w:tblPrEx><w:tblW w:type="dxa" w:w="6480"/></w:tblPrEx>')],
       ]) {
         const single = layoutTable(gridTable(rows.join(''), preferred), mode);
         const split = layoutTable(rows.map((r) => gridTable(r, preferred)).join(''), mode);

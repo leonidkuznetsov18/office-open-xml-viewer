@@ -111,7 +111,7 @@ export const WORD_TABLE_ORIGIN_COMPATIBILITY = defineCompatibilityRule({
   id: 'word-table-origin-compatibility',
   evidence: { kind: 'office-observation', syntheticFixtureId: 'table-origin-compatibility-and-occupied-grid',
     application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
-  description: '528 ordinary-table controls cover modes 11/12/14/15, LTR/RTL, leading/center/end, omitted/zero/positive/negative indentation, explicit zero/asymmetric cell margins, cell overrides, first-row exceptions, fixed/AutoFit, nested contents, borderless and full-band tables. For top-level body tables with positive dxa cell preferences, explicit legacy horizontal margins and zero spacing (fixed auto/dxa table width or AutoFit dxa table width), modes 11/12/14 hang the first cell left margin: leading placement only with authored indentation and anchored to the first row, end placement per row. Center and end ignore indentation, as ECMA-376 §17.4.50 specifies (contrary to MS-OI29500 §2.1.155). Mode 15 removes the margin hang. Border rasterization is separate from nominal grid geometry. Spaced tables and wholly omitted horizontal margins remain unresolved and retain the previous origin and content-inset behavior; Nested table origins, logical start/end margin spellings, and other compatibility modes are outside the measured scope.',
+  description: '528 ordinary-table controls cover modes 11/12/14/15, LTR/RTL, leading/center/end, omitted/zero/positive/negative indentation, explicit zero/asymmetric cell margins, cell overrides, first-row exceptions, fixed/AutoFit, nested contents, borderless and full-band tables. For top-level body tables with positive dxa cell preferences, explicit legacy horizontal margins and zero spacing (fixed auto/dxa table width or AutoFit dxa table width), modes 11/12/14 hang the first cell left margin: leading placement only with authored indentation and anchored to the first row, end placement per row. Center and end ignore indentation in both placement and width fitting, as ECMA-376 §17.4.50 specifies (contrary to MS-OI29500 §2.1.155). Mode 15 removes the margin hang. Border rasterization is separate from nominal grid geometry. Spaced tables and wholly omitted horizontal margins remain unresolved and retain the previous origin and content-inset behavior; Nested table origins, logical start/end margin spellings, and other compatibility modes are outside the measured scope.',
 });
 
 export const WORD_FIXED_UNUSED_LEADING_GRID = defineCompatibilityRule({
@@ -539,7 +539,7 @@ export function wordDropsTrailingStructuralCellMarker(input: Readonly<{
  * center/end controls ignore tblInd for both placement and width fitting.
  * Margin hanging is a separate placement correction, never a width indent.
  * Unmeasured classes retain the established width/placement contract. */
-export function wordTableWidthIndentPt(input: Readonly<{
+export function wordTableEffectiveIndentPt(input: Readonly<{
   measured: boolean;
   justification: string | null | undefined;
   indentPt: number;
@@ -559,7 +559,7 @@ export function wordTableOriginTranslationPt(input: Readonly<{
   firstLeftMarginPt: number;
   rowLeftMarginPt: number;
 }>): number {
-  const indentPt = wordTableWidthIndentPt(input);
+  const indentPt = wordTableEffectiveIndentPt(input);
   if (!input.measured) return indentPt;
   if (input.justification === 'center') return indentPt;
   if (input.justification === 'right' || input.justification === 'end') {

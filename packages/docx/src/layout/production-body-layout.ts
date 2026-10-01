@@ -62,7 +62,7 @@ import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, res
 import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numbering-marker.js';
 import { projectTableColumnLayoutInput, projectEffectiveTablePreferredWidthPt, type TableSourceAcquisitionInput } from './table-source-acquisition.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
-import { wordFixedOccupiedGridInput, wordMeasuredTableOriginMode, wordTableWidthIndentPt } from './table-compatibility.js';
+import { wordFixedOccupiedGridInput, wordMeasuredTableOriginMode, wordTableEffectiveIndentPt } from './table-compatibility.js';
 import { measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
@@ -2283,17 +2283,22 @@ function computeAdjacentTablePtLayouts(
   // tblPrEx width/layout and the leading anchor belong to the first logical row.
   // Differing authored frames/grids retain the established union policy.
   const sources = members.map(({ table }) => state.acquisitionInputs.tableSourceAcquisitionInput(table));
-  const logicalTable = { ...first, rows: members.flatMap(({ table }) => table.rows) };
-  const logicalSource: TableSourceAcquisitionInput = {
-    semantic: { ...sources[0]!.semantic, rows: sources.flatMap((source) => source.semantic.rows) },
-    lexical: { ...sources[0]!.lexical, rows: sources.flatMap((source) => source.lexical.rows) },
-    format: { ...sources[0]!.format, rows: sources.flatMap((source) => source.format.rows) },
-  };
+  const logicalTable = Object.freeze({
+    ...first, rows: Object.freeze(members.flatMap(({ table }) => table.rows)),
+  });
+  const logicalRows = Object.freeze(sources.flatMap((source) => source.format.rows));
+  const logicalSource: TableSourceAcquisitionInput = Object.freeze({
+    semantic: Object.freeze({ ...sources[0]!.semantic, rows: Object.freeze(sources.flatMap((source) => source.semantic.rows)) }),
+    lexical: Object.freeze({ ...sources[0]!.lexical, rows: Object.freeze(sources.flatMap((source) => source.lexical.rows)) }),
+    format: Object.freeze({
+      ...sources[0]!.format, rows: logicalRows, firstRowException: logicalRows[0]?.exception ?? null,
+    }),
+  });
   const logicalOrigin = tableOriginContext(logicalTable, logicalSource.format, mode);
   const logical = commonFrame && commonGrid && wordMeasuredTableOriginMode(mode)
     && (logicalOrigin.measuredOrigin || logicalSource.format.firstRowException?.layout === 'fixed'
       || logicalTable.layout === 'fixed')
-    ? acquireTableColumnInput(logicalTable, contentWPt, state, logicalSource) : null;
+    ? acquireTableColumnInput(logicalTable, contentWPt, state, { source: logicalSource, origin: logicalOrigin }) : null;
   const normalized = logical ? wordFixedOccupiedGridInput(logical.input, mode, logical.measuredScope) : null;
   const usesLogicalProperties = logical !== null
     && (logicalOrigin.measuredOrigin || normalized !== logical.input);
@@ -2301,14 +2306,13 @@ function computeAdjacentTablePtLayouts(
   return members.map(({ table, sourceIndex }, i) => {
     // Only eligible logical groups share the observed leading anchor. Outside
     // that scope, preserve each member's established first-row indentation.
-    const memberOrigin = tableOriginContext(table, sources[i]!.format, mode);
-    const origin = commonFrame && logicalOrigin.measuredOrigin ? logicalOrigin : {
-      ...memberOrigin,
-      measuredOrigin: commonFrame ? false : memberOrigin.measuredOrigin,
-    };
+    const origin = commonFrame && logicalOrigin.measuredOrigin ? logicalOrigin
+      : tableOriginContext(table, sources[i]!.format, mode);
+    const memberOrigin = commonFrame && !logicalOrigin.measuredOrigin
+      ? { ...origin, measuredOrigin: false } : origin;
     computeTablePtLayout(state, table, contentWPt, sourceIndex, {
       columns: logicalColumns ?? resolveTableColumnWidths(acquireTableColumnInput(table, contentWPt, state).input),
-      origin,
+      origin: memberOrigin,
     });
     return retainedTableRecord(state, sourceIndex).acquisition;
   });
@@ -2336,16 +2340,20 @@ function acquireTableColumnInput(
   table: TableLayoutSource,
   contentWPt: number,
   state: BodyMeasurementContext,
-  logicalSource?: TableSourceAcquisitionInput,
+  logicalContext?: Readonly<{
+    source: TableSourceAcquisitionInput; origin: ReturnType<typeof tableOriginContext>;
+  }>,
 ): Readonly<{ input: TableColumnLayoutInput; measuredScope: boolean }> {
+  const logicalSource = logicalContext?.source;
   const format = logicalSource?.format ?? state.acquisitionInputs.tableFormatInput(table);
-  const origin = tableOriginContext(table, format, state.layoutSettings.compat.compatibilityMode);
+  const origin = logicalContext?.origin
+    ?? tableOriginContext(table, format, state.layoutSettings.compat.compatibilityMode);
   const measuredOrigin = origin.measuredOrigin && state.storyContext?.story === 'body'
     && state.storyContext.containers.length === 0;
   const baseIndentPt = measuredOrigin ? origin.tableIndentPt
     : Number.isFinite(table.tblInd) ? (table.tblInd ?? 0) : 0;
   const widthIndent = (justification: string | null | undefined, indentPt: number) =>
-    wordTableWidthIndentPt({ measured: measuredOrigin, justification, indentPt });
+    wordTableEffectiveIndentPt({ measured: measuredOrigin, justification, indentPt });
   const rowIndentPts = format.rows.map((row) => {
     const exception = row.exception;
     return widthIndent(row.justification ?? table.jc, !measuredOrigin && exception?.indentAuthored
