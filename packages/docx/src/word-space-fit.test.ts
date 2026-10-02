@@ -116,3 +116,139 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT controls', () => {
     expect(narrow([text.slice(0, -1), text.slice(-1)])).toEqual(narrow([text]));
   });
 });
+
+// Deterministic PRNG (mulberry32) so property cases are reproducible.
+function random(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Split points inside visible text only: a U+0020 at a source-run boundary
+ * has its own registered seam rule (WORD_SOURCE_RUN_SPACE_SEQUENCE). */
+function randomChunks(text: string, next: () => number): string[] {
+  const characters = [...text];
+  const legal = characters.flatMap((character, index) => index > 0
+    && character !== ' ' && characters[index - 1] !== ' ' ? [index] : []);
+  const cuts = [...new Set(Array.from({ length: 1 + Math.floor(next() * 3) },
+    () => legal[Math.floor(next() * legal.length)]!))].sort((a, b) => a - b);
+  return [0, ...cuts].map((start, index) =>
+    characters.slice(start, cuts[index] ?? characters.length).join(''));
+}
+
+describe('WORD_COMPRESSED_SPACE_LINE_FIT properties', () => {
+  const mixed = inScope.filter((variant) => variant.sourceRuns === 'single'
+    && /[　-鿿＀-￯]/u.test(variant.text));
+  const paragraph = (variant: Variant, chunks: readonly string[], widthTwips: number) =>
+    layoutStubParagraph({
+      runs: chunks.map((text) => ({
+        text, ascii: variant.ascii, eastAsia: variant.eastAsia, sizePt: variant.sizePt,
+        bold: variant.bold, kerning: kerning(variant),
+      })),
+      environment: {
+        compatibilityMode: variant.compatibilityMode,
+        ...(variant.characterSpacingControl
+          ? { characterSpacingControl: variant.characterSpacingControl } : {}),
+        enableOpenTypeFeatures: variant.enableOpenTypeFeatures,
+      },
+      bandPt: widthTwips / 20 - BAND_DEFICIT_PT[variant.borderEighths]!,
+      justification: variant.justification,
+    });
+  const summary = (lines: ReturnType<typeof paragraph>) => lines.map((line) => ({
+    text: line.map((segment) => segment.text).join(''),
+    // Per-segment widths are rounded to 1e-6pt by the stub; compare sums at 1e-4.
+    width: Number(line.reduce((sum, segment) => sum + segment.width, 0).toFixed(4)),
+    compression: Number(line.reduce((sum, segment) => sum + segment.compression, 0).toFixed(4)),
+  }));
+
+  it('is invariant under source-run seams inside visible text', () => {
+    const next = random(1660);
+    let compared = 0;
+    for (const variant of mixed) {
+      for (const width of variant.widthsTwips) {
+        const joined = summary(paragraph(variant, [variant.text], width));
+        for (let trial = 0; trial < 3; trial += 1) {
+          const chunks = randomChunks(variant.text, next);
+          expect(summary(paragraph(variant, chunks, width)), `${variant.variant} ${width} ${chunks.join('|')}`)
+            .toEqual(joined);
+          compared += 1;
+        }
+      }
+    }
+    expect(compared).toBeGreaterThan(3000);
+  });
+
+  it('keeps the measured Latin-terminal control seam-invariant', () => {
+    // Review round 2: `ABCD` split as `A` / `BCD` at the 106.25pt band.
+    const variant = mixed.find((item) => item.variant === 'cap-latin-word')!;
+    const text = variant.text;
+    const split = [text.slice(0, -3), text.slice(-3)];
+    for (const width of variant.widthsTwips) {
+      expect(summary(paragraph(variant, split, width))).toEqual(
+        summary(paragraph(variant, [text], width)));
+    }
+    // Word's first fit (authored 107.25pt, the measured 106.25pt band).
+    expect(paragraph(variant, split, 2145)).toHaveLength(1);
+  });
+
+  it('shrinks exactly the overflow, equally per space, never below the floor', () => {
+    let compressedLines = 0;
+    for (const variant of mixed) {
+      for (const width of variant.widthsTwips) {
+        const band = width / 20 - BAND_DEFICIT_PT[variant.borderEighths]!;
+        for (const line of paragraph(variant, [variant.text], width)) {
+          const placed = line.reduce((sum, segment) => sum + segment.width, 0);
+          const reduction = line.reduce((sum, segment) => sum + segment.compression, 0);
+          if (reduction === 0) {
+            expect(placed).toBeLessThanOrEqual(band + 1e-9);
+            continue;
+          }
+          compressedLines += 1;
+          // Placed advances end exactly at the band: no excess contraction.
+          expect(placed).toBeCloseTo(band, 5);
+          const perSpace = line.filter((segment) => segment.compression > 0)
+            .map((segment) => segment.compression / (segment.text.length - segment.text.trimEnd().length));
+          for (const value of perSpace) expect(value).toBeCloseTo(perSpace[0]!, 5);
+        }
+      }
+    }
+    expect(compressedLines).toBeGreaterThan(300);
+  });
+
+  it('accounts spaces committed after the line was first shrunk', () => {
+    // Review round 2: a gap added after an admission must not restore a
+    // reduction that was never applied to it. 甲 admits by shrinking, then
+    // `+ ` (a new gap) and 乙 follow on the same run.
+    const run = { ascii: 'BIZ UDGothic', eastAsia: 'BIZ UDGothic', sizePt: 8.5, bold: true } as const;
+    const text = '甲甲甲甲 + 乙乙 + 丙丙丙丙';
+    for (const chunks of [
+      [text], ['甲甲甲甲 + 乙乙 ', '+ 丙丙丙丙'], ['甲甲甲甲 +', ' 乙乙 + 丙丙丙丙'],
+      // Space-only runs committed after the admitting ideograph.
+      [text, ' ', ' '], [`${text} `, '丙'],
+    ]) {
+      const lines = layoutStubParagraph({
+        runs: chunks.map((chunk) => ({ ...run, text: chunk })),
+        environment: { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' },
+        bandPt: 106.25, justification: 'left',
+      });
+      // Line one holds the whole text; its visible advance ends exactly at the
+      // band, a line-end space keeps its natural advance, and every inner
+      // space shrinks by the same 1.0625pt (4.25pt over four spaces).
+      const first = lines[0]!;
+      expect(first.map((segment) => segment.text).join('').trimEnd()).toBe(text);
+      const end = first.at(-1)!;
+      const lineEndSpace = end.compression === 0
+        ? 4.25 * (end.text.length - end.text.trimEnd().length) : 0;
+      const placed = first.reduce((sum, segment) => sum + segment.width, 0) - lineEndSpace;
+      expect(placed).toBeCloseTo(106.25, 5);
+      const inner = first.filter((segment) => segment.compression > 0);
+      expect(inner).toHaveLength(4);
+      for (const segment of inner) expect(segment.compression).toBeCloseTo(1.0625, 9);
+    }
+  });
+});

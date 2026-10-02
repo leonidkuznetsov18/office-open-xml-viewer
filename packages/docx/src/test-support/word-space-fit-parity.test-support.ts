@@ -69,7 +69,8 @@ export function parityGroups(): Map<string, string> {
   }
   const results = new Map<string, unknown[]>();
   for (const [key, paragraph] of cases) {
-    const lines = layoutStubParagraph(paragraph);
+    const lines = layoutStubParagraph(paragraph)
+      .map((line) => line.map(({ text, width }) => ({ text, width })));
     results.set(key, [...(results.get(key) ?? []), lines]);
   }
   for (const [key, value] of results) {

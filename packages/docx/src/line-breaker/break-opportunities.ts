@@ -79,7 +79,7 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'fitsMeasuredWidth'
   | 'fitHomogeneousLatinSpaces'
   | 'mixedSpaceRequirement'
-  | 'applyMixedSpaces'
+  | 'markMixedSpacesCompressed'
   | 'appendQueuedIdeographicSpaceSegment'
   | 'emergencyTextSplit'
   | 'effectiveFontPx'
@@ -429,10 +429,9 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // WORD_COMPRESSED_SPACE_LINE_FIT: once a mixed line's spaces are shrunk, a
   // following unit (such as a closing mark split into its own source run) is
   // judged by the same reduction rule; joined and split runs must agree.
-  if (breakerState.mixedSpace.appliedPerSpace > 0) {
-    const required = context.mixedSpaceRequirement(s, wForFit);
+  if (breakerState.mixedSpace.compressed) {
+    const required = context.mixedSpaceRequirement({ pieces: [{ segment: s, text: s.text }], fitWidth: wForFit });
     if (required !== undefined) {
-      context.applyMixedSpaces(required);
       s.measuredWidth = w;
       addToLine(s, w, h, asc, desc);
       context.appendQueuedIdeographicSpaceSegment(s);
@@ -855,10 +854,12 @@ function fitMixedSpaces(
   segment: LayoutTextSeg,
   fitWidth: number,
 ): boolean {
-  if (context.breakerState.mixedSpace.spaceCount === 0) return false;
-  const required = context.mixedSpaceRequirement(segment, fitWidth);
+  const required = context.mixedSpaceRequirement({
+    pieces: [{ segment, text: segment.text }],
+    fitWidth,
+  });
   if (required === undefined) return false;
-  context.applyMixedSpaces(required);
+  if (required > 0) context.markMixedSpacesCompressed();
   return true;
 }
 
@@ -1044,9 +1045,12 @@ function prepareAtomicTextFit(
       !(s.seaBreaks && s.seaBreaks.length > 0))
   ) {
     const group = measureJoinedTextUnit(s, breakerState.queue, context, w, trailingSpaceW);
+    const groupFitWidth = fitWidthFor(group.width, group.trailingSpace, group.next);
     if (
-      breakerState.currentWidth + fitWidthFor(group.width, group.trailingSpace, group.next) >
-      availW()
+      breakerState.currentWidth + groupFitWidth > availW() &&
+      // WORD_COMPRESSED_SPACE_LINE_FIT judges a joined unit as one candidate,
+      // so a source-run seam inside it cannot change the decision.
+      context.mixedSpaceRequirement({ pieces: group.pieces, fitWidth: groupFitWidth }) === undefined
     ) {
       flush(undefined, false, s.src);
     }
@@ -1192,12 +1196,15 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // floors and the East Asian overflow limit admit it; kinsoku below may still
   // retract the break.
   let mixedSpaceExtended = false;
-  if (breakerState.mixedSpace.spaceCount > 0 && breakerState.currentLine.length > 0) {
+  if (breakerState.currentLine.length > 0) {
     const characters = [...s.text];
     for (let count = [...rawPrefix].length + 1; count <= characters.length; count += 1) {
       const candidate = characters.slice(0, count).join('');
       if (candidate.endsWith(' ')) break;
-      const required = context.mixedSpaceRequirement({ ...s, text: candidate }, strAdvance(s, candidate));
+      const required = context.mixedSpaceRequirement({
+        pieces: [{ segment: s, text: candidate }],
+        fitWidth: strAdvance(s, candidate),
+      });
       if (required === undefined) {
         // A trailing closing mark is judged together with its predecessor.
         if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(characters[count - 1]!)) continue;
@@ -1257,9 +1264,8 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   }
   if (prefix.length > 0) {
     if (mixedSpaceExtended && breakerState.currentWidth + strAdvance(s, prefix) > availW()) {
-      // Commit the reduction the retained (possibly kinsoku-retracted) head needs.
-      const required = context.mixedSpaceRequirement({ ...s, text: prefix }, strAdvance(s, prefix));
-      if (required !== undefined) context.applyMixedSpaces(required);
+      // The retained (possibly kinsoku-retracted) head still overflows naturally.
+      context.markMixedSpacesCompressed();
     }
     // Grid advance for the head piece — the same model as the line box / draw.
     const pw = strNaturalAdvance(s, prefix);

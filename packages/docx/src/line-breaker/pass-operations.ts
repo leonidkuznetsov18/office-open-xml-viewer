@@ -22,7 +22,7 @@ import { createLineBreakerState, type GapTransaction, type GapWindow } from './b
 import {
   createMixedSpaceState,
   performSettleMixedSpaces,
-  performTrackMixedSpaces,
+  type MixedSpaceCandidate,
 } from './mixed-space-fit.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
@@ -111,8 +111,8 @@ export interface PassOperationState extends LineBreakerPassInput {
   ) => number;
   readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
   /** WORD_COMPRESSED_SPACE_LINE_FIT (mixed-script lines); see mixed-space-fit.ts. */
-  readonly mixedSpaceRequirement: (next: LayoutTextSeg, nextFitWidth: number) => number | undefined;
-  readonly applyMixedSpaces: (required: number) => void;
+  readonly mixedSpaceRequirement: (candidate: MixedSpaceCandidate) => number | undefined;
+  readonly markMixedSpacesCompressed: () => void;
   readonly textSegmentBox: (
     s: LayoutTextSeg,
   ) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
@@ -944,7 +944,6 @@ export function performAddToLine(
     materializeLatinSpaceCompression();
     breakerState.latinLineHomogeneous = false;
   }
-  performTrackMixedSpaces(operationState, s);
   if (h > breakerState.lineHeight) breakerState.lineHeight = h;
   if ('imagePath' in s && s.inlinePicture === true) {
     breakerState.lineHasInlinePicture = true;

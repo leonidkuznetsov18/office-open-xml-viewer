@@ -25,7 +25,11 @@ import { buildFont } from './font-routes.js';
 import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
-import { performApplyMixedSpaces, performMixedSpaceRequirement } from './mixed-space-fit.js';
+import {
+  performMarkMixedSpacesCompressed,
+  performMixedSpaceRequirement,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
 import {
   performLineHeadRequirement,
   performForcedPlacement,
@@ -259,10 +263,9 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * setting excludes the fit projection at segment acquisition. */
   const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
     performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
-  const mixedSpaceRequirement = (next: LayoutTextSeg, nextFitWidth: number): number | undefined =>
-    performMixedSpaceRequirement(operationState, next, nextFitWidth);
-  const applyMixedSpaces = (required: number): void =>
-    performApplyMixedSpaces(operationState, required);
+  const mixedSpaceRequirement = (candidate: MixedSpaceCandidate): number | undefined =>
+    performMixedSpaceRequirement(operationState, candidate);
+  const markMixedSpacesCompressed = (): void => performMarkMixedSpacesCompressed(operationState);
 
   /** Measure one text segment's canonical advance and vertical contribution.
    * Every path that commits a complete text segment to a line must use this
@@ -389,7 +392,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     strAdvance,
     fitHomogeneousLatinSpaces,
     mixedSpaceRequirement,
-    applyMixedSpaces,
+    markMixedSpacesCompressed,
     textSegmentBox,
     appendQueuedIdeographicSpaceSegment,
     tabFollowWidth,

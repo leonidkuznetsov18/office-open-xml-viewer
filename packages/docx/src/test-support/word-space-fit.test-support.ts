@@ -180,5 +180,6 @@ export function layoutStubParagraph(paragraph: StubParagraph) {
     'bounded', undefined, false).map((line) => line.segments.map((segment) => ({
     text: (segment as LayoutTextSeg).text ?? '',
     width: Math.round(segment.measuredWidth * 1e6) / 1e6,
+    compression: (segment as LayoutTextSeg).latinSpaceCompressionPx ?? 0,
   })));
 }
