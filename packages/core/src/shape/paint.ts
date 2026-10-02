@@ -352,6 +352,9 @@ export function withInheritedPatternScope<T>(
   deviceOffset?: { x: number; y: number },
   sourceDeviceToTargetDevice?: PatternMatrix,
 ): T {
+  // Path tracking is observational: mixed pattern fills/path-gradient strokes
+  // must inherit the same point grid and slide frame as the original context.
+  source = paintPathSource(source);
   const scale = activePatternPointScale.get(source);
   const root = activePatternCoordinateRoot.get(source);
   // An effect canvas may crop the source, while a bevel canvas additionally

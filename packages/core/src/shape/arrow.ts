@@ -90,12 +90,14 @@ export function drawArrowHead(
   const { lw, halfW, len } = arrowGeom(arrowEnd, stroke, scale);
   const paint = effectivePaint ?? hexToRgba(stroke.color);
 
-  const hostTransform = typeof ctx.getTransform === 'function' ? ctx.getTransform() : undefined;
+  // Only the new untiled rect/shape raster is authored in the host frame.
+  // Ordinary patterns and tiled gradients retain main's decoration-local CTM;
+  // native solid/linear/circle paints also keep their existing frames. A
+  // CanvasPattern alone cannot distinguish those brushes from a path raster.
+  const hostTransform = stroke.fill?.fillType === 'gradient' && stroke.fill.gradType === 'radial'
+    && stroke.fill.tileRect == null && (stroke.fill.path === 'rect' || stroke.fill.path === 'shape')
+    && typeof ctx.getTransform === 'function' ? ctx.getTransform() : undefined;
   const anchorPaint = () => {
-    // Tiled brushes keep the previous decoration-local pattern frame. Live
-    // tiled geometry is outside the new path-shade evidence (#1599), so the
-    // untiled raster anchoring must not change their inherited pixels.
-    if (stroke.fill?.fillType === 'gradient' && stroke.fill.tileRect != null) return;
     // Canvas patterns follow the paint-time CTM; native gradients retain their
     // creation frame. The path has already captured the decoration transform.
     // Paint a host-box pattern at the host CTM so rotating/translating the

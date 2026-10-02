@@ -4592,7 +4592,7 @@ function drawShape(
   loadedImages?: Map<string, CanvasImageSource | null>,
   cjkFallback?: CjkLang,
 ): void {
-  if (shape.strokeFill?.fillType === 'gradient' && shape.strokeFill.gradType === 'radial'
+  if (shape.strokeFill?.fillType === 'gradient' && shape.strokeFill.gradType === 'radial' && shape.strokeFill.tileRect == null
     && (shape.strokeFill.path === 'rect' || shape.strokeFill.path === 'shape')) ctx = trackPaintPath(ctx);
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {

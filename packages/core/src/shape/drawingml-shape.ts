@@ -279,7 +279,7 @@ export function paintDrawingMLShape(
   plan: DrawingMLShapePaintPlan,
   unitToDevice: number,
 ): void {
-  if (plan.stroke?.fill?.fillType === 'gradient' && plan.stroke.fill.gradType === 'radial'
+  if (plan.stroke?.fill?.fillType === 'gradient' && plan.stroke.fill.gradType === 'radial' && plan.stroke.fill.tileRect == null
     && (plan.stroke.fill.path === 'rect' || plan.stroke.fill.path === 'shape')) ctx = trackPaintPath(ctx);
   const { x, y, w, h } = plan.rect;
   withDrawingMLShapeTransform(ctx, plan, () => {
