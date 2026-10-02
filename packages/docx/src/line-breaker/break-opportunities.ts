@@ -34,9 +34,10 @@ import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTab
 import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
+  mixedCandidateMayShrink,
   mixedLineHasVisibleText,
-  mixedLineMayShrink,
   noteMixedSpaceWork,
+  type MixedSpaceCandidate,
 } from './mixed-space-fit.js';
 import {
   extendThroughTrailingIdeographicSpaces,
@@ -296,7 +297,15 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
         if (!('text' in candidate) || candidate.paragraphFinalIdeographicSpaceTail !== true) break;
         trailingTailWidth += segAdvance(candidate);
       }
-      if (breakerState.currentWidth + trailingTailWidth > availW()) {
+      if (
+        breakerState.currentWidth + trailingTailWidth > availW() &&
+        // WORD_COMPRESSED_SPACE_LINE_FIT: a shrinking line decides the tail
+        // with the same predicate as the joined text would.
+        !(mixedCandidateMayShrink(breakerState, s.text) && context.mixedSpaceRequirement({
+          pieces: [{ segment: s, text: s.text }],
+          fitWidth: trailingTailWidth,
+        }) !== undefined)
+      ) {
         flush(undefined, false, s.src);
         breakerState.queue.unshift(s);
         return;
@@ -434,8 +443,8 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // WORD_COMPRESSED_SPACE_LINE_FIT: once a mixed line's spaces are shrunk, a
   // following unit (such as a closing mark split into its own source run) is
   // judged by the same reduction rule; joined and split runs must agree.
-  if (breakerState.mixedSpace.compressed) {
-    const required = context.mixedSpaceRequirement({ pieces: [{ segment: s, text: s.text }], fitWidth: wForFit });
+  if (breakerState.mixedSpace.compressed && mixedCandidateMayShrink(breakerState, s.text)) {
+    const required = context.mixedSpaceRequirement(mixedSeamCandidate(context, s, s.text, wForFit));
     if (required !== undefined) {
       s.measuredWidth = w;
       addToLine(s, w, h, asc, desc);
@@ -853,16 +862,76 @@ interface TextFitFrame {
   readonly admitsTrailingOverflowPunctuation: boolean | undefined;
 }
 
+/**
+ * WORD_COMPRESSED_SPACE_LINE_FIT decides on the paragraph's joined character
+ * sequence, not on source runs. When admitted text ends exactly at a run seam
+ * that the joined text does not break at — a kinsoku line-end/line-start pair
+ * across the seam (§17.15.1.58-.60), a non-starter or word continuation that
+ * segmentation marks `joinPrev`/`hardJoinPrev`, or a word without break
+ * opportunities continuing in the next run — the following text up to the
+ * joined sequence's next legal break joins the candidate. Bounded by the
+ * appended characters.
+ */
+function mixedSeamCandidate(
+  context: BreakOpportunityIteratorContext,
+  segment: LayoutTextSeg,
+  text: string,
+  fitWidth: number,
+): MixedSpaceCandidate {
+  const pieces: { segment: LayoutTextSeg; text: string }[] = [{ segment, text }];
+  if (text !== segment.text || text.length === 0 || text.endsWith(' ')) return { pieces, fitWidth };
+  const { kinsoku, strAdvance } = context;
+  const pairIllegal = (previous: string, next: string): boolean => kinsoku.enabled && (
+    kinsoku.lineEndForbidden.has(previous.codePointAt(0)!) ||
+    kinsoku.lineStartForbidden.has(next.codePointAt(0)!)
+  );
+  let previous = [...text].at(-1)!;
+  let width = fitWidth;
+  for (const follower of context.breakerState.queue) {
+    if (!('text' in follower) || follower.text.length === 0) break;
+    const characters = [...follower.text];
+    const breakable = hasCJKBreakOpportunity(follower.text);
+    let take = 0;
+    let complete = false;
+    while (take < characters.length) {
+      const character = characters[take]!;
+      if (character === ' ') {
+        while (take < characters.length && characters[take] === ' ') take += 1;
+        complete = true;
+        break;
+      }
+      const illegal = take === 0
+        ? follower.joinPrev === true || follower.hardJoinPrev === true || pairIllegal(previous, character)
+        : !breakable || pairIllegal(previous, character);
+      if (!illegal) {
+        complete = true;
+        break;
+      }
+      previous = character;
+      take += 1;
+    }
+    if (take > 0) {
+      const piece = characters.slice(0, take).join('');
+      noteMixedSpaceWork(piece.length);
+      pieces.push({ segment: follower, text: piece });
+      const visible = piece.replace(/ +$/u, '');
+      if (visible.length > 0) width += strAdvance(follower, visible);
+    }
+    if (complete || take < characters.length) break;
+  }
+  return { pieces, fitWidth: width };
+}
+
 /** WORD_COMPRESSED_SPACE_LINE_FIT admission of a whole segment. */
 function fitMixedSpaces(
   context: BreakOpportunityIteratorContext,
   segment: LayoutTextSeg,
   fitWidth: number,
 ): boolean {
-  const required = context.mixedSpaceRequirement({
-    pieces: [{ segment, text: segment.text }],
-    fitWidth,
-  });
+  if (!mixedCandidateMayShrink(context.breakerState, segment.text)) return false;
+  const required = context.mixedSpaceRequirement(
+    mixedSeamCandidate(context, segment, segment.text, fitWidth),
+  );
   if (required === undefined) return false;
   if (required > 0) context.markMixedSpacesCompressed();
   return true;
@@ -1055,7 +1124,8 @@ function prepareAtomicTextFit(
       breakerState.currentWidth + groupFitWidth > availW() &&
       // WORD_COMPRESSED_SPACE_LINE_FIT judges a joined unit as one candidate,
       // so a source-run seam inside it cannot change the decision.
-      context.mixedSpaceRequirement({ pieces: group.pieces, fitWidth: groupFitWidth }) === undefined
+      !(mixedCandidateMayShrink(breakerState, group.pieces.map((piece) => piece.text).join(''))
+        && context.mixedSpaceRequirement({ pieces: group.pieces, fitWidth: groupFitWidth }) !== undefined)
     ) {
       flush(undefined, false, s.src);
     }
@@ -1206,20 +1276,56 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // least as far. The longest admitted prefix is therefore found by binary
   // search, measuring O(log n) prefixes; lines outside the rule's scope stop
   // at the O(1) gate before any candidate text is built.
+  const allChars = [...s.text];
+  const minSplit = breakerState.currentLine.length > 0 ? 0 : 1;
+  const proposedPrefixFor = (split: number, extensions: boolean): string => {
+    const hangingSplit =
+      extensions &&
+      overflowPunct &&
+      breakerState.gapTransaction?.endsAtExclusion !== true &&
+      split < allChars.length &&
+      (breakerState.currentLine.length > 0 || split > 0) &&
+      wordIsOverflowPunctuation(
+        allChars[split],
+        s.eastAsiaLanguage,
+        s.overflowPunctuationEastAsianRun === true,
+        s.script === 'ascii' || s.script === 'highAnsi',
+        s.script === 'complexScript',
+        s.overflowPunctuationBidiLanguage,
+      )
+        ? split + 1
+        : null;
+    const adjusted = hangingSplit ?? kinsokuAdjustedSplit(allChars, split, kinsoku, minSplit);
+    const proposedSplit = extensions
+      ? extendThroughTrailingIdeographicSpaces(
+          allChars,
+          adjusted,
+          paragraphFinalIdeographicSpaceTail && maximumIdeographicSpaceHang === 0
+            ? 0
+            : maximumIdeographicSpaceHang,
+        )
+      : adjusted;
+    const proposedPrefix = allChars.slice(0, proposedSplit).join('').length;
+    return s.text.slice(0, legalTextSplitAtOrBefore(s, proposedPrefix, minSplit > 0 ? 1 : 0));
+  };
   let mixedSpaceExtended = false;
-  if (breakerState.currentLine.length > 0 && mixedLineMayShrink(breakerState)) {
+  const naturalRawSplit = [...rawPrefix].length;
+  if (breakerState.currentLine.length > 0 && mixedCandidateMayShrink(breakerState, s.text)) {
     const characters = [...s.text];
     const admitted = (count: number): boolean => {
       const candidate = characters.slice(0, count).join('');
       noteMixedSpaceWork(candidate.length);
-      return !candidate.endsWith(' ') && context.mixedSpaceRequirement({
-        pieces: [{ segment: s, text: candidate }],
-        fitWidth: strAdvance(s, candidate),
-      }) !== undefined;
+      return !candidate.endsWith(' ') && context.mixedSpaceRequirement(
+        mixedSeamCandidate(context, s, candidate, strAdvance(s, candidate)),
+      ) !== undefined;
     };
     // Galloping bound, then binary search: every measured prefix is at most
     // twice the admitted extension past the natural break.
-    let low = [...rawPrefix].length;
+    // Start from the natural break as the ordinary pipeline resolves it
+    // (including a hanging line-end U+3000), so an allowance that needs no
+    // reduction is not turned into one by a source-run seam.
+    const naturalHead = [...proposedPrefixFor(naturalRawSplit, true)].length;
+    let low = Math.max(naturalRawSplit, naturalHead);
     let high = characters.length;
     for (let step = 1; low + step <= characters.length; step *= 2) {
       if (!admitted(low + step)) {
@@ -1237,7 +1343,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     // a kinsoku-legal break inside this run, so the extension never relies on
     // kinsoku's unrestricted fallback (a seam before closing marks must
     // resolve exactly like the joined text, by cross-run retraction).
-    const natural = [...rawPrefix].length;
+    const natural = Math.max(naturalRawSplit, naturalHead);
     const legal = (count: number): boolean => !kinsoku.enabled || count >= characters.length || (
       !kinsoku.lineStartForbidden.has(characters[count]!.codePointAt(0)!) &&
       !kinsoku.lineEndForbidden.has(characters[count - 1]!.codePointAt(0)!)
@@ -1255,38 +1361,47 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // whole run moves to the next (fresh) line, which is Word's 追い出し.
   // When the line is empty we keep at least one char (minSplit=1) so we
   // never lose forward progress.
-  const allChars = [...s.text];
   const rawSplit = [...rawPrefix].length;
-  const minSplit = breakerState.currentLine.length > 0 ? 0 : 1;
   // ECMA-376 §17.3.1.21 permits one punctuation character beyond the
   // paragraph extents. The isolated compatibility projection resolves the
   // language-specific set and its precedence over kinsoku at this internal
   // CJK split.
-  const hangingSplit =
-    overflowPunct &&
-    breakerState.gapTransaction?.endsAtExclusion !== true &&
-    rawSplit < allChars.length &&
-    (breakerState.currentLine.length > 0 || rawSplit > 0) &&
-    wordIsOverflowPunctuation(
-      allChars[rawSplit],
-      s.eastAsiaLanguage,
-      s.overflowPunctuationEastAsianRun === true,
-      s.script === 'ascii' || s.script === 'highAnsi',
-      s.script === 'complexScript',
-      s.overflowPunctuationBidiLanguage,
-    )
-      ? rawSplit + 1
-      : null;
-  const proposedSplit = extendThroughTrailingIdeographicSpaces(
-    allChars,
-    hangingSplit ?? kinsokuAdjustedSplit(allChars, rawSplit, kinsoku, minSplit),
-    paragraphFinalIdeographicSpaceTail && maximumIdeographicSpaceHang === 0
-      ? 0
-      : maximumIdeographicSpaceHang,
-  );
-  const proposedPrefix = allChars.slice(0, proposedSplit).join('').length;
-  const protectedSplit = legalTextSplitAtOrBefore(s, proposedPrefix, minSplit > 0 ? 1 : 0);
-  const prefix = s.text.slice(0, protectedSplit);
+  let prefix = proposedPrefixFor(rawSplit, true);
+  if (mixedSpaceExtended) {
+    // Every fit decision on a shrinking line goes through the one predicate:
+    // the final head (after punctuation hanging, U+3000 extension and source
+    // protection) must itself be admitted. Otherwise keep the checked
+    // kinsoku-legal head, and failing that the natural break.
+    const needsShrink = (head: string): boolean =>
+      head.length > 0 && breakerState.currentWidth + strAdvance(s, head) > availW();
+    // The break after the head must be legal in the joined character sequence
+    // (kinsoku pair with the next character, here or in a following run).
+    const nextCharacter = (head: string): string | undefined => {
+      if (head.length < s.text.length) return [...s.text.slice(head.length)][0];
+      for (const follower of breakerState.queue) {
+        if (!('text' in follower)) return undefined;
+        if (follower.text.length > 0) return [...follower.text][0];
+      }
+      return undefined;
+    };
+    const legalBreakAfter = (head: string): boolean => {
+      if (!kinsoku.enabled || head.length === 0) return true;
+      const next = nextCharacter(head);
+      return next === undefined || (
+        !kinsoku.lineStartForbidden.has(next.codePointAt(0)!) &&
+        !kinsoku.lineEndForbidden.has([...head].at(-1)!.codePointAt(0)!)
+      );
+    };
+    const admittedHead = (head: string): boolean => !needsShrink(head) || (
+      legalBreakAfter(head) &&
+      context.mixedSpaceRequirement(mixedSeamCandidate(context, s, head, strAdvance(s, head))) !== undefined
+    );
+    if (!admittedHead(prefix)) {
+      const checked = proposedPrefixFor(rawSplit, false);
+      prefix = admittedHead(checked) ? checked : proposedPrefixFor(naturalRawSplit, true);
+    }
+    mixedSpaceExtended = needsShrink(prefix);
+  }
   if (breakerState.currentLine.length === 0) {
     // minSplit keeps progress on an empty line even when no legal prefix
     // fits; that retained prefix is forced unless a legal one exists.
@@ -1297,8 +1412,8 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     }
   }
   if (prefix.length > 0) {
-    if (mixedSpaceExtended && breakerState.currentWidth + strAdvance(s, prefix) > availW()) {
-      // The retained (possibly kinsoku-retracted) head still overflows naturally.
+    if (mixedSpaceExtended) {
+      // The retained head overflows naturally and was admitted above.
       context.markMixedSpacesCompressed();
     }
     // Grid advance for the head piece — the same model as the line box / draw.

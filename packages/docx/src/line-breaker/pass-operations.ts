@@ -913,7 +913,7 @@ export function performAddToLine(
   } else {
     breakerState.snapBlock = null;
   }
-  commitMixedLineItem(breakerState, s, scale, operationState.strNaturalAdvance);
+  commitMixedLineItem(breakerState, s, scale);
   breakerState.currentWidth += committedWidth;
   if (
     'text' in s &&
@@ -1606,7 +1606,6 @@ export function performRetractCurrentLineForLeadingKinsoku(
     strAdvance,
     next,
     operationState.scale,
-    operationState.strNaturalAdvance,
   );
 }
 

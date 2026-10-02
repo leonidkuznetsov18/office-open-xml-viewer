@@ -4,7 +4,7 @@ import {
   setMixedSpaceSummaryAssertions,
 } from './line-breaker/mixed-space-fit.js';
 import {
-  BAND_DEFICIT_PT, FONTS, VARIANTS, advancePt, layoutStubParagraph, type Variant,
+  BAND_DEFICIT_PT, FONTS, VARIANTS, advancePt, layoutStubParagraph, stubMeasurements, type Variant,
 } from './test-support/word-space-fit.test-support.js';
 
 // WORD_COMPRESSED_SPACE_LINE_FIT. Every case is a synthetic Word control
@@ -221,6 +221,43 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT properties', () => {
     expect(compared).toBeGreaterThan(1000);
   }, 120_000);
 
+  it('decides on the joined character sequence for random seams in mixed punctuation', () => {
+    // Review round 6: opening brackets, U+3000, small kana, prolonged sound
+    // marks and full-/half-width punctuation, split at random positions over
+    // the whole text. Wherever the rule takes part (either form shrinks a
+    // space) the partition and every line width must not depend on the seam.
+    const run = { ascii: 'BIZ UDGothic', eastAsia: 'BIZ UDGothic', sizePt: 8.5, bold: true } as const;
+    const alphabet = [...'丙ｱ（「『【）」』】　ぁゃッー、。，．()A1ｰｧ'];
+    const next = random(6060);
+    const layout = (chunks: readonly string[], bandPt: number) => layoutStubParagraph({
+      runs: chunks.map((text) => ({ ...run, text })),
+      environment: { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' },
+      bandPt, justification: 'left',
+    });
+    const view = (lines: ReturnType<typeof layout>) => lines.map((line) => ({
+      text: line.map((segment) => segment.text).join(''),
+      width: Number(line.reduce((sum, segment) => sum + segment.width, 0).toFixed(4)),
+    }));
+    const shrinks = (lines: ReturnType<typeof layout>) =>
+      lines.some((line) => line.some((segment) => segment.compression > 0));
+    let engaged = 0;
+    for (let trial = 0; trial < 2500; trial += 1) {
+      const tail = Array.from({ length: 2 + Math.floor(next() * 5) },
+        () => alphabet[Math.floor(next() * alphabet.length)]!).join('');
+      const text = `甲甲甲甲  + 乙乙 +  丙丙${tail}`;
+      const characters = [...text];
+      const cut = 1 + Math.floor(next() * (characters.length - 1));
+      const split = [characters.slice(0, cut).join(''), characters.slice(cut).join('')];
+      const bandPt = 92 + Math.round(next() * 88) / 4;
+      const joined = layout([text], bandPt);
+      const separate = layout(split, bandPt);
+      if (!shrinks(joined) && !shrinks(separate)) continue;
+      engaged += 1;
+      expect(view(separate), `${bandPt} ${split.join('|')}`).toEqual(view(joined));
+    }
+    expect(engaged).toBeGreaterThan(300);
+  }, 120_000);
+
   it('keeps the measured Latin-terminal control seam-invariant', () => {
     // Review round 2: `ABCD` split as `A` / `BCD` at the 106.25pt band.
     const variant = mixed.find((item) => item.variant === 'cap-latin-word')!;
@@ -389,6 +426,35 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT work', () => {
       }
     } finally {
       setMixedSpaceSummaryAssertions(true);
+    }
+  }, 120_000);
+});
+
+describe('WORD_COMPRESSED_SPACE_LINE_FIT scope cost', () => {
+  it('measures Latin-only paragraphs exactly as often as outside the rule', () => {
+    // Review round 6: Latin-only text in scope (mode 14 + compressPunctuation)
+    // follows main's path. Mode 15 keeps the same Latin projection and has no
+    // mixed-script rule, so its glyph-measurement count is main's.
+    const run = { ascii: 'Arial', eastAsia: 'Arial', sizePt: 8.5, bold: true } as const;
+    const measure = (mode: number, runs: readonly string[], bandPt: number) => {
+      stubMeasurements(true);
+      layoutStubParagraph({
+        runs: runs.map((text) => ({ ...run, text })),
+        environment: { compatibilityMode: mode, characterSpacingControl: 'compressPunctuation' },
+        bandPt, justification: 'left', freshServices: true,
+      });
+      return stubMeasurements(true);
+    };
+    for (const runs of [
+      [`${'AV To '.repeat(400)}AV`],
+      Array.from({ length: 400 }, (_, index) => (index % 2 ? 'To ' : 'A')),
+      Array.from({ length: 400 }, (_, index) => (index % 3 ? ' ' : 'AV')),
+    ]) {
+      for (const bandPt of [100, 233.3, 468]) {
+        const latin14 = measure(14, runs, bandPt);
+        expect(latin14).toBeGreaterThan(0);
+        expect(latin14, `${runs.length} runs, ${bandPt}pt`).toBe(measure(15, runs, bandPt));
+      }
     }
   }, 120_000);
 });

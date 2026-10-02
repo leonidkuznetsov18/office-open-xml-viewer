@@ -39,8 +39,9 @@ interface Contribution {
   readonly capacity: number;
   /** The gap differs in face or floor from the line's first gap. */
   readonly mismatched: boolean;
-  /** Terminal-cluster facts of the committed line ending with this item. */
-  readonly tail: LineTail;
+  /** Terminal-cluster facts of the committed line ending with this item,
+   * derived lazily (only East Asian lines ever ask) and then cached. */
+  tail?: LineTail;
 }
 
 /**
@@ -63,10 +64,26 @@ export type MixedSpaceMeasure = (segment: LayoutTextSeg, text: string) => number
 /** Split `text` into its core and terminal cluster (U+0020, then closing marks). */
 function clusterCore(text: string): string {
   let core = text.replace(/ +$/u, '');
-  while (core.length > 0 && COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(core.at(-1)!)) {
+  while (
+    core.length > 0 &&
+    (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(core.at(-1)!) || core.at(-1) === IDEOGRAPHIC_SPACE)
+  ) {
     core = core.slice(0, -1);
   }
   return core;
+}
+
+const IDEOGRAPHIC_SPACE = '\u3000';
+
+/** Trailing U+3000 of a candidate or line hang past the band under
+ * WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE; the ordinary pipeline never
+ * counts them toward fit, so this projection does not either (a paragraph-
+ * final tail keeps its own width-bearing count rule). */
+function hangingIdeographicSpaceText(segment: LayoutTextSeg, text: string): string | undefined {
+  // A paragraph-final tail is width-bearing unless its visible text was forced
+  // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE); an admitted line is not forced.
+  if (!text.endsWith(IDEOGRAPHIC_SPACE) || segment.paragraphFinalIdeographicSpaceTail === true) return undefined;
+  return text.replace(/\u3000+$/u, '');
 }
 
 /**
@@ -136,30 +153,31 @@ function tailAfter(previous: LineTail, item: LayoutSeg, measure: MixedSpaceMeasu
   const core = clusterCore(item.text);
   if (core.length === 0) return { tailPx: previous.tailPx + item.measuredWidth, coreLast: previous.coreLast };
   if (core.length === item.text.length) return { tailPx: 0, coreLast: core.at(-1) };
+  // A plain U+0020 tail reuses the advance ordinary fitting already derived.
+  if (
+    item.mixedNaturalTrailingSpacePx !== undefined &&
+    item.text.replace(/ +$/u, '').length === core.length
+  ) {
+    return { tailPx: item.mixedNaturalTrailingSpacePx, coreLast: core.at(-1) };
+  }
   summaryWork += item.text.length;
   return { tailPx: item.measuredWidth - measure(item, core), coreLast: core.at(-1) };
 }
 
-function contributionOf(
-  state: MixedSpaceState,
-  item: LayoutSeg,
-  scale: number,
-  measure: MixedSpaceMeasure,
-): Contribution {
+function contributionOf(state: MixedSpaceState, item: LayoutSeg, scale: number): Contribution {
   summaryWork += 1;
-  const tail = tailAfter(state.contributions.at(-1)?.tail ?? EMPTY_TAIL, item, measure);
   if (inkless(item)) {
     return {
       item, inkless: true,
       // The visible-content predicate counts every text item, as before.
       visibleText: 'text' in item && /\S/u.test(item.text), eastAsian: false,
-      invalid: false, gapCount: 0, capacity: 0, mismatched: false, tail,
+      invalid: false, gapCount: 0, capacity: 0, mismatched: false,
     };
   }
   if (!('text' in item)) {
     return {
       item, inkless: false, visibleText: false, eastAsian: false,
-      invalid: true, gapCount: 0, capacity: 0, mismatched: false, tail,
+      invalid: true, gapCount: 0, capacity: 0, mismatched: false,
     };
   }
   const eastAsian = EAST_ASIAN_RE.test(item.text);
@@ -178,12 +196,12 @@ function contributionOf(
     );
     return {
       item, inkless: false, visibleText, eastAsian, invalid: false,
-      gapCount: spaces, capacity, mismatched, tail,
+      gapCount: spaces, capacity, mismatched,
     };
   }
   return {
     item, inkless: false, visibleText, eastAsian, invalid: !neutral(item, item.text),
-    gapCount: 0, capacity: 0, mismatched: false, tail,
+    gapCount: 0, capacity: 0, mismatched: false,
   };
 }
 
@@ -214,11 +232,10 @@ export function commitMixedLineItem(
   breakerState: BreakerState,
   item: LineItem,
   scale: number,
-  measure: MixedSpaceMeasure,
 ): void {
   breakerState.currentLine.push(item);
   if (!breakerState.mixedSpaceEnabled) return;
-  addContribution(breakerState.mixedSpace, contributionOf(breakerState.mixedSpace, item, scale, measure));
+  addContribution(breakerState.mixedSpace, contributionOf(breakerState.mixedSpace, item, scale));
 }
 
 /** Remove the last committed item from the line and its summary. */
@@ -232,10 +249,24 @@ export function replaceLastMixedLineItem(
   breakerState: BreakerState,
   item: LineItem,
   scale: number,
-  measure: MixedSpaceMeasure,
 ): void {
   popMixedLineItem(breakerState);
-  commitMixedLineItem(breakerState, item, scale, measure);
+  commitMixedLineItem(breakerState, item, scale);
+}
+
+/** Terminal-cluster facts of the committed line; amortized O(1): each
+ * contribution's tail is derived once from its predecessor and cached. */
+function lineTail(state: MixedSpaceState, measure: MixedSpaceMeasure): LineTail {
+  const contributions = state.contributions;
+  let start = contributions.length - 1;
+  while (start >= 0 && contributions[start]!.tail === undefined) start -= 1;
+  let tail = start >= 0 ? contributions[start]!.tail! : EMPTY_TAIL;
+  for (let index = start + 1; index < contributions.length; index += 1) {
+    summaryWork += 1;
+    tail = tailAfter(tail, contributions[index]!.item, measure);
+    contributions[index]!.tail = tail;
+  }
+  return tail;
 }
 
 /** The committed line holds visible (non-whitespace) text; O(1). Only asked
@@ -253,6 +284,14 @@ export function mixedLineMayShrink(breakerState: BreakerState): boolean {
     && state.spaceCount > 0
     && state.invalidItems === 0
     && state.mismatchedGaps === 0;
+}
+
+/** Scope gate for a candidate holding `text`: the line can shrink and the
+ * candidate or the committed line holds East Asian text. Latin-only lines
+ * stop here before any candidate is built or measured. */
+export function mixedCandidateMayShrink(breakerState: BreakerState, text: string): boolean {
+  return mixedLineMayShrink(breakerState)
+    && (breakerState.mixedSpace.eastAsianItems > 0 || EAST_ASIAN_RE.test(text));
 }
 
 /** Line facts from the running summary; O(1). */
@@ -276,7 +315,7 @@ function assertSummary(breakerState: BreakerState, scale: number, measure: Mixed
   const summary = summaryLine(state);
   let tail = EMPTY_TAIL;
   for (const item of line) tail = tailAfter(tail, item, measure);
-  const top = state.contributions.at(-1)?.tail ?? EMPTY_TAIL;
+  const top = lineTail(state, measure);
   const same = state.contributions.length === line.length
     && state.contributions.every((contribution, index) => contribution.item === line[index])
     && state.visibleItems === line.filter((item) => 'text' in item && /\S/u.test(item.text)).length
@@ -439,8 +478,14 @@ export function performMixedSpaceRequirement(
   const capacity = line.perSpaceCapacity * line.count;
   if (!(capacity > 0)) return undefined;
   const naturalWidth = breakerState.currentWidth;
-  const required = Math.max(0, naturalWidth + candidate.fitWidth - availW());
-  if (required > capacity || !fitsMeasuredWidth(naturalWidth + candidate.fitWidth - required, availW())) {
+  const lastPiece = pieces.at(-1)!;
+  const hungBefore = hangingIdeographicSpaceText(lastPiece.segment, lastPiece.text);
+  const fitWidth = hungBefore === undefined
+    ? candidate.fitWidth
+    : candidate.fitWidth - (operationState.strAdvance(lastPiece.segment, lastPiece.text)
+      - operationState.strAdvance(lastPiece.segment, hungBefore));
+  const required = Math.max(0, naturalWidth + fitWidth - availW());
+  if (required > capacity || !fitsMeasuredWidth(naturalWidth + fitWidth - required, availW())) {
     return undefined;
   }
   // An East Asian final core character may overflow by at most half its font
@@ -455,7 +500,7 @@ export function performMixedSpaceRequirement(
     if (cores[last]!.length > 0) break;
     last -= 1;
   }
-  const tail = breakerState.mixedSpace.contributions.at(-1)?.tail ?? EMPTY_TAIL;
+  const tail = last >= 0 ? EMPTY_TAIL : lineTail(breakerState.mixedSpace, strNaturalAdvance);
   const lastCharacter = last >= 0 ? cores[last]!.at(-1) : tail.coreLast;
   const limitSegment = last >= 0 ? pieces[last]!.segment : pieces[0]!.segment;
   const limit = wordCompressedSpaceEastAsianOverflowLimit(
@@ -506,6 +551,14 @@ export function performSettleMixedSpaces(operationState: PassOperationState): vo
       gaps.pop();
       lineEndSpacePx += gap.segment.mixedNaturalTrailingSpacePx!;
       if (gap.segment.text.trim().length > 0) break;
+    }
+    // A hanging line-end U+3000 is not fitted either.
+    const lastItem = breakerState.currentLine.at(-1);
+    if (lastItem && 'text' in lastItem && lineEndSpacePx === 0) {
+      const hungBefore = hangingIdeographicSpaceText(lastItem, lastItem.text);
+      if (hungBefore !== undefined) {
+        lineEndSpacePx += lastItem.measuredWidth - strNaturalAdvance(lastItem, hungBefore);
+      }
     }
     const count = gaps.reduce((sum, gap) => sum + gap.count, 0);
     const needed = Math.max(0, breakerState.currentWidth - lineEndSpacePx - availW());

@@ -59,6 +59,15 @@ export function advancePt(face: Face, text: string, sizePt: number): number {
   return (units * sizePt) / face.unitsPerEm;
 }
 
+let measurements = 0;
+
+/** Glyph measurements (Canvas and text-service) since the last reset. */
+export function stubMeasurements(reset = false): number {
+  const value = measurements;
+  if (reset) measurements = 0;
+  return value;
+}
+
 let canvasFont = '';
 export const canvas = {
   get font() { return canvasFont; },
@@ -66,6 +75,7 @@ export const canvas = {
   letterSpacing: '0px',
   fontKerning: 'auto',
   measureText(text: string) {
+    measurements += 1;
     const px = Number(/([\d.]+)px/.exec(canvasFont)?.[1] ?? 10);
     const weight = /\bbold\b|\b700\b/.test(canvasFont) ? 700 : 400;
     const family = canvasFont.slice(canvasFont.indexOf('px') + 2).trim();
@@ -109,6 +119,7 @@ export function services(families: readonly string[]) {
     measurer: {
       fingerprint: 'word-space-fit-controls',
       measure: (request) => {
+        measurements += 1;
         const face = faceOf(request.fontRoute.familyList, request.weight);
         const characters = [...request.text];
         const visible = characters.filter((character) => character !== ' ');
@@ -159,6 +170,8 @@ export interface StubParagraph {
   readonly environment: Partial<LineLayoutEnvironment>;
   readonly bandPt: number;
   readonly justification: 'left' | 'both' | 'distribute' | 'center';
+  /** Build uncached text services (for measurement counting). */
+  readonly freshServices?: boolean;
 }
 
 /** Production buildSegments + layoutLines over the fixture faces; returns each
@@ -172,7 +185,7 @@ export function layoutStubParagraph(paragraph: StubParagraph) {
     lang: 'en-US', langEastAsia: 'ja-JP',
   })) as unknown as DocRun[];
   const segments = buildSegments(runs, {
-    pageIndex: 0, totalPages: 1, layoutServices: cachedServices(families), ...paragraph.environment,
+    pageIndex: 0, totalPages: 1, layoutServices: paragraph.freshServices ? services(families) : cachedServices(families), ...paragraph.environment,
   });
   const justified = paragraph.justification === 'both' || paragraph.justification === 'distribute';
   return layoutLines(canvas, segments, paragraph.bandPt, 0, 1, [], undefined, {}, 0, undefined,
