@@ -234,6 +234,19 @@ describe('pptx rPr@spc uses Canvas shaping-cluster advances', () => {
       expect(x.x).toBeCloseTo(a.x + 24, 6);
     });
 
+    it(`preserves cluster font ownership in manual tracking when Canvas letterSpacing is ${mode}`, () => {
+      const { ctx, fills } = mockCtx(mode);
+      const text = 'A\u0301B';
+      const seen: Array<{ text: string; x: number; w: number }> = [];
+      renderTextBody(ctx, body([run(text, 4, '000000'), run('X', 0, 'FF0000')]),
+        0, 0, 400, 100, SCALE, null, 0, false, false, '#000000', undefined, RC,
+        (info) => seen.push({ text: info.text, x: info.inShapeX, w: info.w }));
+      expect(fills.map((call) => call.text)).toEqual(['A\u0301', 'B', 'X']);
+      expect(fills[1].x - fills[0].x).toBeCloseTo(14, 6);
+      expect(fills[2].x - fills[0].x).toBeCloseTo(24, 6);
+      expect(seen.find((info) => info.text === text)?.w).toBeCloseTo(24, 6);
+    });
+
     it(`manually paints fully-distributed glyph positions when Canvas letterSpacing is ${mode}`, () => {
       const { ctx, fills } = mockCtx(mode);
       renderTextBody(

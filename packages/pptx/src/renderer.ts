@@ -1,6 +1,7 @@
 import type { PptxEmbeddedFontMetrics } from './embedded-fonts.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import { openTypeResourceCoversCodePoint } from '@silurus/ooxml-core';
+import { fontResourceCoversCluster } from '@silurus/ooxml-core/internal/font-cluster-coverage';
 import type { CjkLang } from '@silurus/ooxml-core';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type {
@@ -28,6 +29,7 @@ import type {
 } from './types';
 import { asBullet } from './types';
 import {
+  graphemeClusterOffsets,
   renderChart,
   crispOffset,
   buildCustomPath as buildCustomPathCore,
@@ -1247,23 +1249,29 @@ function lineMetricFor(
   bold: boolean,
   italic: boolean,
   rc: RenderContext,
-  codePoint?: number,
+  cluster?: string,
 ): PowerPointFaceMetrics | undefined {
   if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
   if (rc.embeddedFontAuthoredFamilies?.has(family)) {
-    return embeddedResourceFor(family, bold, italic, rc, codePoint).metrics;
+    return embeddedResourceFor(family, bold, italic, rc, cluster).metrics;
   }
+  // Installed named slots retain the established catalogue line model. Their
+  // catalogue records OS/2 metrics, not a complete Unicode/sequence repertoire;
+  // resource inference through the empty-ea fallback chain is separately
+  // coverage-gated below (decisions B/c). Do not fragment a shaping run merely
+  // because the partial symbol/CJK catalogue cannot describe its marks.
   return powerPointFaceMetrics(family, bold, italic);
 }
 
 /** Resolve the actual composite resource before lending its metrics. CSS
  * Fonts §5.2 matches style before weight, then tests a same-slot composite
- * face's cmaps in reverse insertion order (§4.6); Font Loading §4.2 puts
+ * face's complete-cluster coverage in reverse insertion order (§4.6 / §5.3);
+ * Font Loading §4.2 puts
  * non-CSS-connected faces after CSS faces in their insertion order. A repeated
  * registry retain does not reinsert a face. Unknown tables/cmap stop ownership
  * inference, just as for a single part; never union distinct resources' cmaps
  * and attach one part's metrics to that union. Library policy: without a
- * glyph (a mark or unused Latin slot), a composite has no unique resource
+ * cluster (a mark or unused Latin slot), a composite has no unique resource
  * authority, so keep it unresolved. No glyph-result cache is kept.
  */
 function embeddedResourceFor(
@@ -1271,7 +1279,7 @@ function embeddedResourceFor(
   bold: boolean,
   italic: boolean,
   rc: RenderContext,
-  codePoint?: number,
+  cluster?: string,
 ): { metrics: PowerPointFaceMetrics | undefined; coverage: boolean | undefined } {
   const authored = rc.embeddedFontAuthoredFamilies?.get(family);
   const metrics = rc.embeddedFontMetrics;
@@ -1286,11 +1294,11 @@ function embeddedResourceFor(
     if (!rc.embeddedFontTuples?.has(key) && !metrics.has(key)) continue;
     const resources = metrics.get(key);
     if (!resources) return unknown;
-    if (codePoint === undefined && resources.length !== 1) return unknown;
+    if (cluster === undefined && resources.length !== 1) return unknown;
     for (let index = resources.length - 1; index >= 0; index--) {
       const entry = resources[index];
-      if (codePoint === undefined) return { metrics: entry, coverage: undefined };
-      const coverage = openTypeResourceCoversCodePoint(entry, codePoint);
+      if (cluster === undefined) return { metrics: entry, coverage: undefined };
+      const coverage = fontResourceCoversCluster(cluster, (cp) => openTypeResourceCoversCodePoint(entry, cp));
       if (coverage !== false) return { metrics: coverage ? entry : undefined, coverage };
     }
     // Glyph absence in the matched style slot moves to the next CSS family,
@@ -1496,10 +1504,8 @@ function tokenHasCjk(s: string): boolean {
 }
 
 /** Number of Unicode code points in `s` (NOT UTF-16 code units). Used only by
- *  text paths that deliberately paint per code point (WordArt / vertical text)
- *  and by the fallback for Canvas implementations without native
- *  `letterSpacing`. Native horizontal text uses {@link measureTextAdvance} so
- *  the browser's shaping-cluster boundaries remain authoritative. */
+ *  scalar-indexed justification metadata and native letter-spacing detection.
+ *  Actual paint units remain complete graphemes; see graphemeTexts. */
 function codePointCount(s: string): number {
   let n = 0;
   for (const _ of s) n++;
@@ -1538,13 +1544,20 @@ function hasNativeLetterSpacing(ctx: CanvasRenderingContext2D): boolean {
   return supported;
 }
 
-/** Measure the Canvas advance with the tracking derived from DrawingML
- * `rPr@spc`. Native `measureText()` uses the same shaping clusters as paint,
- * which matters for combining sequences, emoji ZWJ runs, flags, and Indic
- * conjuncts. Canvas includes one trailing spacing unit in its reported width;
- * DrawingML spacing is only between characters in the run, so remove that
- * terminal unit. Older/inert implementations use the same n-1 code-point
- * approximation as the manual paint fallback. */
+/** Paint units for paths that transform or manually space individual glyphs.
+ * Use the core's grapheme boundaries so splitting cannot change the resource
+ * selected for a base + modifiers (CSS Fonts §5.3). */
+function graphemeTexts(text: string): string[] {
+  if (!text) return [];
+  const starts = [0, ...graphemeClusterOffsets(text)];
+  return starts.map((start, i) => text.slice(start, starts[i + 1] ?? text.length));
+}
+
+/** Measure with the same tracking state and paint units used by drawWithFont.
+ * Native Canvas shapes the entire string; DrawingML omits the trailing spacing
+ * unit. Older/inert Canvas measures and paints complete graphemes individually,
+ * preserving cluster ownership even though inter-cluster shaping is unavailable.
+ */
 function measureTextAdvance(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -1563,8 +1576,10 @@ function measureTextAdvance(
       try { spacingCtx.letterSpacing = previous; } catch { /* inert implementation */ }
     }
   }
-  const internalBoundaries = Math.max(0, codePointCount(text) - 1);
-  return ctx.measureText(text).width + letterSpacingPx * internalBoundaries;
+  if (letterSpacingPx === 0) return ctx.measureText(text).width;
+  const clusters = graphemeTexts(text);
+  return clusters.reduce((advance, cluster) => advance + ctx.measureText(cluster).width, 0)
+    + letterSpacingPx * Math.max(0, clusters.length - 1);
 }
 
 /**
@@ -1612,13 +1627,13 @@ export function paragraphInputRuns(
     while (boundIndex < clusterBounds.length && clusterBounds[boundIndex] < pos) boundIndex++;
     return boundIndex < clusterBounds.length ? clusterBounds[boundIndex] : joinedText.length;
   };
-  // The previous text run's last emitted segment, the base of a carried cluster.
-  let seam: { text: string } | null = null;
+  // Whether preceding text owns a unit extending across this run seam.
+  let hasSeam = false;
   // The line-metric mark of every a:br, keyed by its input index (see
   // `followingMark` in layoutParagraph).
   const breakMarks = new Map<number, LayoutSegment>();
   for (const [sourceRunId, run] of para.runs.entries()) {
-    if (run.type !== 'text') seam = null;
+    if (run.type !== 'text') hasSeam = false;
     if (run.type === 'break') {
       const sizePx = run.fontSize != null
         ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
@@ -1691,10 +1706,13 @@ export function paragraphInputRuns(
     // Offset of rawText's first code unit in the joined paragraph text.
     let runOffset = runStarts[sourceRunId];
     const runEnd = runOffset + rawText.length;
-    if (seam && rawText) {
+    if (hasSeam && rawText) {
       const firstEnd = Math.min(boundaryFrom(runOffset), runEnd);
       if (firstEnd > runOffset) {
-        seam.text += rawText.slice(0, firstEnd - runOffset);
+        // The base run already resolved and emitted this entire font unit
+        // from joinedText, including modifiers authored in later runs. Only
+        // skip those code units here; appending them after metric selection
+        // would give the base-only resource authority across a run seam.
         rawText = rawText.slice(firstEnd - runOffset);
         runOffset = firstEnd;
       }
@@ -1728,16 +1746,17 @@ export function paragraphInputRuns(
     // resource selected by lineMetricFor. Unknown coverage must stop the
     // search: an earlier embedded face might paint the glyph. Never borrow
     // an installed same-name resource's cmap (ECMA-376 §19.2.1.9 / §15.2.13).
-    const resourceCoverage = (catalogue: typeof powerPointSymbolCoverage): typeof powerPointSymbolCoverage =>
+    const resourceCoverage = (catalogue: typeof powerPointSymbolCoverage, cluster: string): typeof powerPointSymbolCoverage =>
       (face, b, i, cp) => {
-        if (!rc.embeddedFontAliases?.has(face.trim().toLowerCase())) return catalogue(face, b, i, cp);
-        return embeddedResourceFor(normalizeFontFamily(face, rc), b, i, rc, cp).coverage;
+        if (!rc.embeddedFontAliases?.has(face.trim().toLowerCase())) {
+          return cluster === String.fromCodePoint(cp) ? catalogue(face, b, i, cp)
+            : fontResourceCoversCluster(cluster, (point) => catalogue(face, b, i, point));
+        }
+        return embeddedResourceFor(normalizeFontFamily(face, rc), b, i, rc, cluster).coverage;
       };
-    const symbolCoverage = resourceCoverage(powerPointSymbolCoverage);
-    const cjkCoverage = resourceCoverage(powerPointCjkCoverage);
-    const emptyEastAsianFaceFor = (ch: string): string | null => {
-      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, ch, bold, italic,
-        symbolCoverage, cjkCoverage);
+    const emptyEastAsianFaceFor = (cluster: string): string | null => {
+      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, cluster, bold, italic,
+        resourceCoverage(powerPointSymbolCoverage, cluster), resourceCoverage(powerPointCjkCoverage, cluster));
       return drawing === null ? null : normalizeFontFamily(drawing, rc);
     };
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
@@ -1774,6 +1793,7 @@ export function paragraphInputRuns(
     let groupShare: PowerPointFaceMetrics | undefined;
     let groupFamily: string | undefined = family;
     const latinShare = lineMetricFor(family, bold, italic, rc) ?? null;
+    let groupLatinShare: PowerPointFaceMetrics | null = latinShare;
     const emitGroup = () => {
       if (group) {
         input.push({ type: 'text', text: group,
@@ -1781,7 +1801,7 @@ export function paragraphInputRuns(
             // When Latin itself paints this glyph, its concrete resource owns
             // both contributions. A composite family's unused Latin slot has
             // no single resource; latinShare stays unresolved in that case.
-            lineMetricLatin: groupFamily === family ? groupShare ?? null : latinShare,
+            lineMetricLatin: groupFamily === family ? groupShare ?? null : groupLatinShare,
             faceFamily: groupFamily, faceFamilyLatin: family } });
       }
       group = '';
@@ -1793,7 +1813,11 @@ export function paragraphInputRuns(
     let emitted = false;
     while (clusterStart < rawText.length) {
       const clusterEnd = Math.min(boundaryFrom(runOffset + clusterStart + 1), runEnd) - runOffset;
-      const cluster = rawText.slice(clusterStart, clusterEnd);
+      // Resolve the complete unit before borrowing metrics, even when an
+      // extender starts a subsequent authored run. It takes the base style;
+      // the next run skips it above. Measured Myanmar slot splits remain font
+      // units, as specified by powerPointFontRouting, rather than new breaks.
+      const cluster = joinedText.slice(runOffset + clusterStart, boundaryFrom(runOffset + clusterStart + 1));
       clusterStart = clusterEnd;
       emitted = true;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
@@ -1815,9 +1839,9 @@ export function paragraphInputRuns(
       // face, so it adds no face to its line's metric model.
       let face: string | null = eaGlyph
         ? run.fontFamilyEa ? familyEa
-          : emptyEastAsianFaceFor(ch)
+          : emptyEastAsianFaceFor(glyph)
         : csFace;
-      let share = face === null ? undefined : lineMetricFor(face, bold, italic, rc, glyph.codePointAt(0));
+      let share = face === null ? undefined : lineMetricFor(face, bold, italic, rc, glyph);
       if (slot === 'sym' && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         const mapped = symbolFontToUnicode(ch, symbolFamily);
@@ -1827,16 +1851,23 @@ export function paragraphInputRuns(
         share = undefined;
         face = mapped === ch ? symbolFamily : 'sans-serif';
       }
-      if (group && (font !== groupFont || share !== groupShare || (face ?? undefined) !== groupFamily)) emitGroup();
+      // A modified cluster whose owner is unresolved must not borrow the
+      // base-only Latin resource through the secondary line contribution.
+      const clusterLatinShare = rc.embeddedFontAuthoredFamilies?.has(family)
+        && glyph !== String.fromCodePoint(glyph.codePointAt(0) as number)
+        ? lineMetricFor(family, bold, italic, rc, glyph) ?? null : latinShare;
+      if (group && (font !== groupFont || share !== groupShare || clusterLatinShare !== groupLatinShare
+        || (face ?? undefined) !== groupFamily)) emitGroup();
       group += glyph;
       groupFont = font;
       groupShare = share;
+      groupLatinShare = clusterLatinShare;
       groupFamily = face ?? undefined;
     }
     emitGroup();
     if (emitted) {
       const last = input[input.length - 1];
-      seam = last?.type === 'text' ? last : null;
+      hasSeam = last?.type === 'text';
     }
   }
 
@@ -3103,7 +3134,9 @@ function renderWarpedText(
         : undefined;
       const outlineWidth = outline ? Math.max(0.5, emuToPx(outline.width, scale)) : 0;
       const ls = seg.letterSpacingPx ?? 0;
-      const chars = [...seg.text];
+      // Keep the complete cluster in each warped transform/strip stack;
+      // scalar painting would reselect a base-only subset after attribution.
+      const chars = graphemeTexts(seg.text);
       for (const ch of chars) {
         const chW = ctx.measureText(ch).width + ls;
         if (seg.noFill && !outlinePaint) { penW += chW; continue; }
@@ -5653,11 +5686,11 @@ export function renderTextBody(
             paint(text, atX, segBaseline);
             try { lctx.letterSpacing = prev; } catch { /* inert implementation */ }
           } else {
-            // Pre-letterSpacing Canvas fallback. It cannot preserve contextual
-            // shaping across the split, but its manual advance matches the
-            // code-point approximation in measureTextAdvance.
+            // Pre-letterSpacing Canvas fallback shares complete paint clusters
+            // and measured advances with measureTextAdvance. Contextual shaping
+            // across clusters is unavailable; cluster resource ownership remains.
             let x = atX;
-            const cps = [...text];
+            const cps = graphemeTexts(text);
             for (let index = 0; index < cps.length; index++) {
               const ch = cps[index];
               paint(ch, x, segBaseline);
@@ -5728,13 +5761,14 @@ export function renderTextBody(
             paint(seg.text, penX, segBaseline);
             try { lctx.letterSpacing = prev; } catch { /* inert implementation */ }
           } else {
-            // Old/inert Canvas: use the same code-point pitch approximation as
-            // measureTextAdvance so distributed layout and paint stay aligned.
+            // Old/inert Canvas: space whole clusters, matching the fallback
+            // measurement without changing the painting resource of a modifier.
             let x = penX;
-            for (let index = 0; index < cps.length; index++) {
-              const ch = cps[index];
+            const clusters = graphemeTexts(seg.text);
+            for (let index = 0; index < clusters.length; index++) {
+              const ch = clusters[index];
               paint(ch, x, segBaseline);
-              if (index < cps.length - 1) x += target.measureText(ch).width + pitch;
+              if (index < clusters.length - 1) x += target.measureText(ch).width + pitch;
             }
           }
         } else if (pieces) {

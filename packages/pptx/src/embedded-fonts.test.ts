@@ -72,6 +72,25 @@ function cjkResource(codePoint = 0x6f22, ascent = 700): Uint8Array {
   return bytes;
 }
 
+// Distinct single-glyph groups make subset ownership independent of metrics.
+function clusterResource(text: string, ascent: number): Uint8Array {
+  const points = [...new Set([...text].map((ch) => ch.codePointAt(0) as number))].sort((a, b) => a - b);
+  const bytes = new Uint8Array(272 + points.length * 12);
+  bytes.set(cjkResource().subarray(0, 272));
+  const view = new DataView(bytes.buffer);
+  view.setUint32(72, 28 + points.length * 12);
+  view.setUint32(260, 16 + points.length * 12);
+  view.setUint32(268, points.length);
+  view.setUint16(240, ascent);
+  view.setUint16(242, 1000 - ascent);
+  for (const [index, cp] of points.entries()) {
+    view.setUint32(272 + index * 12, cp);
+    view.setUint32(276 + index * 12, cp);
+    view.setUint32(280 + index * 12, index + 1);
+  }
+  return bytes;
+}
+
 // The full-Unicode cmap adds a BMP glyph absent from the BMP-only map,
 // as permitted by OpenType cmap “Encoding records and encodings”.
 function supersetCjkResource(): Uint8Array {
@@ -262,6 +281,72 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
       .input.filter((item) => item.type === 'text');
     expect(items.map((item) => [item.text, item.style.lineMetric?.share, item.style.lineMetricLatin?.share]))
       .toEqual([['A', 0.7, 0.7], ['§', 0.85, 0.85]]);
+    unregisterEmbeddedFonts(loaded.faces);
+  });
+
+  it('attributes complete clusters, including run seams, to the covering subset in window and worker', async () => {
+    for (const worker of [false, true]) {
+      installFontFaceSet();
+      if (worker) {
+        globals.self = { fonts: (globals.document as { fonts: unknown }).fonts };
+        delete globals.document;
+      }
+      const loaded = await loadEmbeddedFonts(['complete', 'base'].map((partPath) => ({
+        fontName: 'Cluster Family', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
+      })), async (path) => clusterResource(path === 'complete'
+        ? 'A§\u0301\u1100\u1161\u11a8\u0915\u093f\u1000\u1031' : 'A§\u1100\u0915\u1000', path === 'complete' ? 850 : 700));
+      const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+        embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+        embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+      for (const [text, slot] of [['A\u0301', 'latin'], ['§\u0301', 'cs'], ['§\u0301', 'ea'],
+        ['\u1100\u1161\u11a8', 'ea'], ['\u0915\u093f', 'cs'], ['\u1000\u1031', 'cs']] as const) {
+        for (const seam of [false, true]) {
+          const para = { runs: (seam ? [...text] : [text]).map((text) => ({
+            type: 'text', text, fontFamily: slot === 'latin' ? 'Cluster Family' : 'Avenir',
+            fontFamilyCs: slot === 'cs' ? 'Cluster Family' : undefined,
+            fontFamilyEa: slot === 'ea' ? 'Cluster Family' : undefined, lang: 'en-US', fontSize: 22,
+          })), tabStops: [] } as unknown as Paragraph;
+          const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+            .input.filter((item) => item.type === 'text');
+          expect(items.map((item) => item.text).join('')).toBe(text);
+          expect(items.map((item) => item.style.lineMetric?.share), `${slot} ${text} seam=${seam}`).toEqual([0.85]);
+          if (slot === 'latin') expect(items[0].style.lineMetricLatin?.share).toBe(0.85);
+          if (text === '§\u0301' && slot === 'cs' && !seam) {
+            const ys: number[] = [];
+            const ctx = { font: '', measureText: () => ({ width: 10 }), save() {}, restore() {},
+              fillText: (_text: string, _x: number, y: number) => ys.push(y),
+            } as unknown as CanvasRenderingContext2D;
+            const body = { paragraphs: [{ ...para, alignment: 'l', marL: 0, marR: 0,
+              indent: 0, bullet: { type: 'none' } }], defaultFontSize: 22, verticalAnchor: 't',
+              lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'none', vert: 'horz', autoFit: 'none' } as TextBody;
+            renderTextBody(ctx, body, 0, 0, 400, 100, 1 / 12700,
+              undefined, 0, false, false, undefined, undefined, rc);
+            expect(ys).toHaveLength(1);
+            expect(ys[0]).toBeCloseTo(22.44, 10);
+          }
+        }
+      }
+      unregisterEmbeddedFonts(loaded.faces);
+    }
+  });
+
+  it('does not lend a base-only resource metrics to an unresolved modified cluster', async () => {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts([{
+      fontName: 'Base Only', style: 'regular', partPath: 'base', contentType: 'application/x-font-ttf',
+    }], async () => clusterResource('A§❤👩💻\u200d\ufe0e\ufe0f', 700));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    for (const text of ['§\u0301', 'A\u0301', '§\ufe0e', '§\ufe0f', '👩\u200d💻']) {
+      const para = { runs: [{ type: 'text', text, fontFamily: 'Base Only', lang: 'en-US', fontSize: 22 }],
+        tabStops: [] } as unknown as Paragraph;
+      const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+        .input.filter((item) => item.type === 'text');
+      expect(items.map((item) => item.text).join('')).toBe(text);
+      expect(items[0].style.lineMetric, text).toBeUndefined();
+      expect(items[0].style.lineMetricLatin, text).toBeNull();
+    }
     unregisterEmbeddedFonts(loaded.faces);
   });
 
