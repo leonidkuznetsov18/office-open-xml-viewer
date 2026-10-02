@@ -258,4 +258,16 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     }
   });
 
+  it('retains the measured T-space advance across matching source runs', async () => {
+    const { fills } = await render([textRun('T', { kerning: 8 }), textRun(' beyond', { kerning: 8 })]);
+    expect(drawOf(fills, ' ').x - drawOf(fills, 'T').x).toBe(FONT_PX - 1);
+    const changed = await render([textRun('T', { kerning: 8 }), textRun(' beyond', { kerning: 8, charSpacing: 1 })]);
+    expect(drawOf(changed.fills, ' ').x - drawOf(changed.fills, 'T').x).toBe(FONT_PX);
+    const letters = await render([textRun('A', { kerning: 8 }), textRun('V', { kerning: 8 })]);
+    expect(drawOf(letters.fills, 'V').x - drawOf(letters.fills, 'A').x).toBe(FONT_PX);
+    for (const kerning of [undefined, 0, 28]) {
+      const { fills } = await render([textRun('T', { kerning }), textRun(' beyond', { kerning })]);
+      expect(drawOf(fills, ' ').x - drawOf(fills, 'T').x).toBe(FONT_PX);
+    }
+  });
 });

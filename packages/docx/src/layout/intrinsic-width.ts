@@ -141,6 +141,7 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
       request.genericFamily ?? null,
       request.letterSpacingPt ?? null,
       request.kerning ?? null,
+      request.kerningSpaceAfter ?? false,
     ] : null,
     segment.bold,
     segment.italic,

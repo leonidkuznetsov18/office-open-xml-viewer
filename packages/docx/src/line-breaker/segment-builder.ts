@@ -699,6 +699,34 @@ export function finalizeBuiltSegments(
   retainHorizontalPunctuationInkClearance(segs);
 }
 
+/** Preserve only the measured identical-property source seam before U+0020.
+ * Direct letter-pair seams, font/property changes and authored spacing keep
+ * their existing shaping boundaries (WORD_KERN_THRESHOLD_AUTHORITY gaps).
+ * One property key per run and one segment sweep keep acquisition linear. */
+function retainSourceSpaceKerning(runs: readonly ParagraphLayoutRun[], segs: LayoutSeg[]): void {
+  const keys = runs.map((run) => {
+    if (run.type !== 'text' || run.charSpacing != null || run.charScale != null
+      || run.fitTextVal != null || run.ruby || run.rtl || run.cs || run.smallCaps
+      || run.vertAlign || run.eastAsianVert || run.noteRef) return undefined;
+    // Plain run metadata is bounded independently of text length. Do not
+    // serialize complete source text once per word/segment.
+    const { text: _text, ...properties } = run;
+    return JSON.stringify(properties);
+  });
+  for (let index = 1; index < segs.length; index += 1) {
+    const previous = segs[index - 1];
+    const next = segs[index];
+    if ('isTab' in previous || 'isTab' in next || !('text' in previous) || !('text' in next)
+      || previous.sourceRunIndex == null || next.sourceRunIndex == null
+      || previous.sourceRunIndex === next.sourceRunIndex || !next.text.startsWith(' ')
+      || previous.text.endsWith(' ') || !previous.textShapeRequest?.kerning
+      || previous.fontRoute?.fingerprint !== next.fontRoute?.fingerprint
+      || keys[previous.sourceRunIndex] === undefined
+      || keys[previous.sourceRunIndex] !== keys[next.sourceRunIndex]) continue;
+    previous.textShapeRequest = Object.freeze({ ...previous.textShapeRequest, kerningSpaceAfter: true });
+  }
+}
+
 export function buildSegments(
   runs: readonly ParagraphLayoutRun[],
   environment: LineLayoutEnvironment,
@@ -791,6 +819,7 @@ export function buildSegments(
 
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
+  retainSourceSpaceKerning(runs, segs);
   finalizeBuiltSegments(runs, environment, segs);
   withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
 

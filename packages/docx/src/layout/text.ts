@@ -282,6 +282,9 @@ export interface TextShapeRequest {
   /** Resolved §17.3.2.19 w:kern state at this run size. Absence preserves the
    * measurement adapter's inherited kerning policy, matching the paint path. */
   readonly kerning?: boolean;
+  /** WORD_KERN_THRESHOLD_AUTHORITY: a matching source run begins with U+0020.
+   * Retain only the preceding glyph's pair advance, without merging ownership. */
+  readonly kerningSpaceAfter?: boolean;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;
   /** Aggregate-only acquisition may omit per-grapheme contextual advances.
@@ -320,6 +323,7 @@ export function sliceTextShapeRequest(
   return {
     ...request,
     text: request.text.slice(start, end),
+    kerningSpaceAfter: end === request.text.length ? request.kerningSpaceAfter : undefined,
     substituteContext: { text: context.text, offset: context.offset + start },
   };
 }
@@ -330,7 +334,7 @@ export function independentTextShapeRequest(
   request: Readonly<TextShapeRequest>,
   text: string,
 ): TextShapeRequest {
-  return { ...request, text, substituteContext: { text, offset: 0 } };
+  return { ...request, text, kerningSpaceAfter: undefined, substituteContext: { text, offset: 0 } };
 }
 
 /** Transform this range in its run (e.g. inserting justification kashidas),
@@ -1005,6 +1009,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.genericFamily ?? null,
         request.letterSpacingPt ?? null,
         request.kerning ?? null,
+        request.kerningSpaceAfter ?? false,
         request.measure ?? null,
         request.clusterGeometry ?? null,
         ...(scopeDescriptor !== undefined ? [scopeDescriptor] : []),
@@ -1090,8 +1095,23 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           letterSpacingPt: request.letterSpacingPt ?? 0,
           kerning: request.kerning,
         });
+        // Only the last span owns the external separator pair. Measure a
+        // bounded two-scalar context; never reshape or concatenate source runs.
+        // Ink remains that of the actual text; the pair changes its trailing
+        // advance, so following placements and the last cluster share it.
+        let trailingPairPt = 0;
+        if (request.measure !== false && request.kerning === true
+          && request.kerningSpaceAfter && group.end === request.text.length) {
+          const tail = group.text.slice(-2);
+          const terminal = (tail.codePointAt(0) ?? 0) > 0xffff ? tail : tail.slice(-1);
+          const pairAdvance = (text: string) => measureGlyph({
+            text, fontRoute: font.route, fontSizePt: request.fontSizePt,
+            weight: font.weight, style: font.style, letterSpacingPt: 0, kerning: true,
+          }).advancePt;
+          trailingPairPt = pairAdvance(terminal + ' ') - pairAdvance(terminal) - pairAdvance(' ');
+        }
         return Object.freeze({
-          ...group, ...measurement, font, fontRoute: font.route,
+          ...group, ...measurement, advancePt: measurement.advancePt + trailingPairPt, font, fontRoute: font.route,
           // Excluded spans also depend on the full run: a mark attached to a
           // Latin base must not become Arabic proof when measured in isolation.
           ...(scopeDescriptor !== undefined ? { substituteScope: substituteScript } : {}),
