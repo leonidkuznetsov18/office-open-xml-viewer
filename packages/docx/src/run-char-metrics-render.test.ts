@@ -46,7 +46,7 @@ function makeRecordingCanvas(advance?: (text: string, size: number) => number): 
     measureText: (s: string) => {
       const p = px();
       const w = advance?.(s, p) ?? [...s].length * p - (fontKerning === 'normal' ?
-        (s.includes('AV') ? 2 : 0) + (s.includes('T ') ? 1 : 0) : 0);
+        (s.includes('AV') ? 2 : 0) + (s.includes('T ') ? 1 : 0) + (s.includes(' A') ? 1.5 : 0) : 0);
       return {
         width: w,
         fontBoundingBoxAscent: p * 0.8,
@@ -273,6 +273,15 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     }
   });
 
+  it('retains a same-source space-letter pair at a word segmentation seam', async () => {
+    const { runs } = await render([textRun('T A', { kerning: 8 })], { compatibilityMode: 15 });
+    const a = runs.find(run => run.text === 'A')!;
+    const t = runs.find(run => run.text === 'T ')!;
+    expect(a.x - t.x).toBe(2 * FONT_PX - 1 - 1.5);
+    const older = await render([textRun('T A', { kerning: 8 })], { compatibilityMode: 14 });
+    expect(older.runs.find(run => run.text === 'A')!.x - older.runs[0]!.x).toBe(2 * FONT_PX - 1);
+  });
+
   it.each(['right', 'center'] as const)('compares source formatting by value for %s alignment', async (alignment) => {
     const first = textRun('T', { kerning: 8 });
     const second = textRun(' X', { kerning: 8 });
@@ -303,7 +312,7 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
   });
 });
 
-describe('kerning authority exposes unresolved justified fitting', () => {
+describe('kerning authority and justified fitting share measured advances', () => {
   // Word 16.113.3 mode-15 K3/K4 controls, with the independently pinned
   // Times New Roman cmap/hmtx advances (2048 upm). These scalar metrics isolate
   // zero/absent kerning from the fitting decision; they are not fitted widths.
@@ -337,10 +346,7 @@ describe('kerning authority exposes unresolved justified fitting', () => {
   it.each(controls)('preserves the Word rejection below the fitting boundary (threshold $kerning)', async ({ prefix, kerning, rejectWidth, rejected }) => {
     expect(await lines(prefix, kerning, rejectWidth)).toEqual(rejected);
   });
-  // Review finding P1 remains a blocker. The later compression correction
-  // restores these Word-accepted partitions; kerning amount/switch evidence
-  // cannot justify inventing a fitting allowance in this change.
-  it.fails.each(controls)('pending justified compression: Word accepts the prefix (threshold $kerning)', async ({ prefix, kerning, acceptWidth }) => {
+  it.each(controls)('accepts the Word prefix above the compression boundary (threshold $kerning)', async ({ prefix, kerning, acceptWidth }) => {
     expect(await lines(prefix, kerning, acceptWidth)).toEqual([prefix, 'beyond']);
   });
 });

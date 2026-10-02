@@ -1,3 +1,4 @@
+import { lineGapModel } from '../line-breaker/line-gaps.js';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
 import {
@@ -2101,6 +2102,71 @@ describe('planLine visual geometry', () => {
       offset: { xPt: 0, yPt: 0 }, advancePt: widthPt,
     }],
   });
+
+  it.each(['a😀 b  c', `a${' '.repeat(50_000)}b`])(
+    'projects retained proportional gaps through clusters and contextual paint ops in one sweep', (value) => {
+      let utf16 = 0;
+      let xPt = 0;
+      let spaceIndex = 0;
+      const spaceWidths = new Map<number, number>();
+      const clusters = [...value].map((character, cpIndex) => {
+        const advancePt = character === ' ' ? 2 + (spaceIndex++ % 3) : 3;
+        if (character === ' ') spaceWidths.set(cpIndex, advancePt);
+        const cluster = {
+          range: { start: utf16, end: utf16 + character.length },
+          offset: { xPt, yPt: 0 }, advancePt,
+        };
+        utf16 += character.length;
+        xPt += advancePt;
+        return cluster;
+      });
+      const segment = { ...measuredText(value, 0, xPt), clusters };
+      // The small case crosses op, surrogate and unequal-gap boundaries. The
+      // large case exposes a rescan per gap without a flaky timing threshold.
+      if (value.length < 20) {
+        segment.basePaintOps = [
+          { ...segment.basePaintOps[0]!, text: value.slice(0, 4), range: { start: 0, end: 4 } },
+          { ...segment.basePaintOps[0]!, text: value.slice(4), range: { start: 4, end: value.length },
+            offset: { xPt: clusters[3]!.offset.xPt, yPt: 0 } },
+        ];
+      }
+      const model = lineGapModel([{ text: value, widthPx: xPt, spacePx: 0, spaceWidths }]);
+      const slack = model.S / 8;
+      const line = planLine({
+        paragraphXPt: 0, availableWidthPt: xPt + slack,
+        alignment: 'both', baseRtl: false,
+        isFirstLine: true, isLastLine: false, stretchLastLine: false,
+        line: {
+          range: segment.range, topPt: 0, baselinePt: 10, advancePt: 12,
+          xOffsetPt: 0, availableWidthPt: xPt + slack, endsWithBreak: false,
+          justifiedCompressionPt: 0, gapPlan: { ...model, expansionGaps: [] },
+          segments: [segment],
+        },
+      });
+      const placement = line.placements[0];
+      if (placement?.kind !== 'text') throw new Error('Expected retained text');
+      const characters = [...value];
+      let deltaPt = 0;
+      for (let i = 0; i < clusters.length; i++) {
+        const previous = characters[i - 1];
+        if (previous === ' ') deltaPt += clusters[i - 1]!.advancePt / 8;
+        expect(placement.clusters[i]!.offset.xPt).toBe(clusters[i]!.offset.xPt + deltaPt);
+      }
+      expect(placement.advancePt).toBe(xPt + slack);
+      expect(placement.paintOps.map(op => op.text).join('')).toBe(value);
+      // Independent small reference can afford repeated scans; the stress
+      // expectation above is incremental to keep the test itself linear.
+      if (value.length < 20) {
+        for (const op of placement.paintOps) {
+          const before = clusters.filter(c => c.range.end <= op.range.start
+            && value.slice(c.range.start, c.range.end) === ' ')
+            .reduce((sum, c) => sum + c.advancePt / 8, 0);
+          const natural = clusters.find(c => c.range.start === op.range.start)!;
+          expect(op.offset.xPt).toBe(natural.offset.xPt + before);
+        }
+      }
+    },
+  );
 
   it.each([
     ['left', false, [10, 30]],

@@ -24,7 +24,10 @@ import type { DocParagraph } from './types.js';
 import type { WrapOracle } from './layout/float-wrap-oracle.js';
 import type { NumberingMarkerShapeInput, WritingMode } from './layout/types.js';
 import { wordEmptyMarkMinimumStartWidthPx } from './layout/compatibility.js';
-import { WORD_NUMBERING_MARKER_FIRST_LINE_UNION } from './layout/line-compatibility.js';
+import {
+  WORD_NUMBERING_MARKER_FIRST_LINE_UNION,
+  wordJustifiedInterwordCompressionApplies,
+} from './layout/line-compatibility.js';
 import { LayoutInvariantError } from './layout/diagnostics.js';
 import type { MeasurementTextContext } from './layout/measurement-capabilities.js';
 
@@ -421,6 +424,9 @@ export function measureParagraph(
     placement.noWrap ? 'unwrapped' : undefined,
     environment.verticalGlyphMeasurement,
     context.overflowPunct !== false,
+    wordJustifiedInterwordCompressionApplies(
+      paragraph.alignment, environment.compatibilityMode, environment.lineWrapLikeWord6,
+    ) && environment.verticalCJK !== true,
   );
   if (lines.length === 0) return measureMarkOnly();
 

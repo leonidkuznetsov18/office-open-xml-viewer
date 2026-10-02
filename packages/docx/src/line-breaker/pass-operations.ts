@@ -1,6 +1,7 @@
 import { textBreakOffsetAt, textBreakOffsets } from './text-break-window.js';
+import { candidateUnit, lineGapModel, type GapSegment } from './line-gaps.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
-import { graphemeClusterOffsets, kinsokuAdjustedSplit } from '@silurus/ooxml-core';
+import { enumerateGaps, graphemeClusterOffsets, kinsokuAdjustedSplit } from '@silurus/ooxml-core';
 import {
   prepareFloatWrap,
   computePreparedLineFloatWindow,
@@ -10,6 +11,7 @@ import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceT
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
+  wordJustifiedInterwordCompressionFactor,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -35,6 +37,7 @@ import {
 import {
   RESET_SLICED_TEXT_MEASUREMENT,
   charScaleFactor,
+  segLetterSpacingPx,
   charSpacingDeltaPx,
   protectedNoBreakOffsets,
   hardJoinPrefixEnd,
@@ -743,6 +746,19 @@ export function performFlush(
       : undefined;
   breakerState.lines.push({
     physicalLineIndex: breakerState.physicalLineIndex,
+    ...(justifiedCompressionApplies(operationState)
+      ? {
+          justifiedCompressionPx: breakerState.justifiedCompressionPx,
+          gapPlan: {
+            ...lineGapModel(breakerState.currentLine.map(s => gapSegment(operationState, s))),
+            // CJK/ideographic/SEA expansion has no proportional measurement.
+            // Retain its previous opportunities; family selection lives in core.
+            expansionGaps: enumerateGaps(breakerState.currentLine.map(s => ({
+              text: 'text' in s && !s.metricOnly && s.fitTextRegionIndex === undefined && s.snapGridClass === undefined
+                ? s.text : undefined,
+            })), { lastDrawnSi: Infinity }).gaps,
+          },
+        } : {}),
     segments: breakerState.currentLine,
     height: h,
     ascent: asc,
@@ -795,6 +811,9 @@ export function performFlush(
   }
   breakerState.currentLine = [];
   breakerState.currentWidth = 0;
+  breakerState.justifiedGapModel = undefined;
+  breakerState.justifiedCompressionPx = 0;
+  breakerState.justifiedUnitEnd = undefined;
   breakerState.latinLineFace = undefined;
   breakerState.latinLineHomogeneous = true;
   breakerState.latinLineGaps = [];
@@ -917,10 +936,15 @@ export function performAddToLine(
   }
   commitMixedLineItem(breakerState, s, scale);
   breakerState.currentWidth += committedWidth;
+  if (justifiedCompressionApplies(operationState)) {
+    const previous = breakerState.justifiedGapModel;
+    breakerState.justifiedGapModel = previous?.segmentCount === breakerState.currentLine.length - 1
+      ? lineGapModel([gapSegment(operationState, s)], previous, false)
+      : lineGapModel(breakerState.currentLine.map(item => gapSegment(operationState, item)), undefined, false);
+  }
   if (
     'text' in s &&
-    s.latinSpaceCompressionEligible === true &&
-    s.latinSpaceAverageWidthRatio != null &&
+    s.latinSpaceCompressionEligible === true && s.latinSpaceAverageWidthRatio != null &&
     s.fontRoute
   ) {
     if (breakerState.latinLineFace && !sameLatinSpaceFace(s, breakerState.latinLineFace)) {
@@ -929,10 +953,13 @@ export function performAddToLine(
     }
     breakerState.latinLineFace ??= s;
     if (s.latinNaturalTrailingSpacePx !== undefined) {
-      const floor =
-        ((calcEffectiveFontPx(s, scale) * s.latinSpaceAverageWidthRatio) / 2) * charScaleFactor(s) +
-        segmentCharacterGridDeltaPx(s, characterGrid, scale);
-      const capacity = Math.max(0, s.latinNaturalTrailingSpacePx - floor);
+      const capacity = Math.max(
+        0,
+        s.latinNaturalTrailingSpacePx - (
+          ((calcEffectiveFontPx(s, scale) * s.latinSpaceAverageWidthRatio!) / 2) * charScaleFactor(s) +
+          segmentCharacterGridDeltaPx(s, characterGrid, scale)
+        ),
+      );
       if (
         breakerState.latinUniformGapCapacity !== undefined &&
         Math.abs(capacity - breakerState.latinUniformGapCapacity) > 1e-6
@@ -943,7 +970,9 @@ export function performAddToLine(
       breakerState.latinUniformGapCapacity ??= capacity;
       breakerState.latinLineGaps.push(s);
     }
-  } else {
+  } else if (!(operationState.isJustified && isInklessLineItem(s))) {
+    // In a justified line an anchor character or paragraph-mark metric has no
+    // advance or separator, so it neither forms nor interrupts a gap.
     materializeLatinSpaceCompression();
     breakerState.latinLineHomogeneous = false;
   }
@@ -1241,6 +1270,99 @@ export function performFitHomogeneousLatinSpaces(
   return true;
 }
 
+/** Closed paragraph/layout gates only; no source/content/face taxonomy. */
+export function justifiedCompressionApplies(state: Pick<PassOperationState,
+  'justifiedCompression' | 'baseRtl' | 'widthPolicy' | 'characterGrid'>): boolean {
+  return state.justifiedCompression === true && !state.baseRtl
+    && state.widthPolicy === 'bounded'
+    && state.characterGrid?.type !== 'snapToChars'
+    && state.characterGrid?.type !== 'linesAndChars';
+}
+
+function gapSegment(state: Pick<PassOperationState, 'strAdvance' | 'scale' | 'characterGrid'>, segment: LayoutSeg): GapSegment {
+  if ('text' in segment) {
+    // §17.3.2.14 owns fixed-width fitText geometry and atomic wrapping.
+    // Its interaction with proportional justification is unmeasured: keep
+    // the cell and adjacent spaces fixed, as for the existing pitch policy.
+    if (segment.fitTextRegionIndex !== undefined) {
+      return { widthPx: segment.measuredWidth, spacePx: 0 };
+    }
+    const spaceWidths = new Map<number, number>();
+    const spaceClusters = segment.shapedSpaceClusters ?? segment.shapedClusters;
+    if (spaceClusters && !segment.ruby) {
+      const advances = new Map(spaceClusters.map(cluster => [cluster.range.start, cluster.advancePt]));
+      let utf16 = 0;
+      let cpOffset = 0;
+      for (const character of segment.text) {
+        if (character === ' ') {
+          const advance = advances.get(utf16);
+          if (advance === undefined) throw new Error('A text space lacks authoritative cluster geometry');
+          spaceWidths.set(cpOffset, advance * charScaleFactor(segment)
+            + segLetterSpacingPx(segment, state.characterGrid, state.scale));
+        }
+        utf16 += character.length;
+        cpOffset += 1;
+      }
+    }
+    const start = segment.text.indexOf(' ');
+    const spacePx = spaceWidths.values().next().value ?? (start >= 0 && !segment.ruby
+      ? state.strAdvance({ ...segment, text: ' ', ...slicedTextMetadata(segment, start, start + 1) }, ' ')
+      : 0);
+    return {
+      text: segment.metricOnly ? '' : segment.ruby ? undefined : segment.text,
+      widthPx: segment.measuredWidth, spacePx, spaceWidths,
+    };
+  }
+  return { widthPx: segment.measuredWidth, spacePx: 0 };
+}
+
+/** Admit the whole unit against the same natural gap model that layout uses
+ * for paint. Advances are never shortened here; compression is line-owned. */
+export function fitJustifiedCompression(state: Pick<PassOperationState,
+  'justifiedCompression' | 'baseRtl' | 'widthPolicy' | 'characterGrid' | 'breakerState'
+  | 'segAdvance' | 'strAdvance' | 'availW' | 'textSegmentBox' | 'addToLine' | 'scale'>, first: LayoutTextSeg): boolean {
+  if (!justifiedCompressionApplies(state) || first.fitTextRegionIndex !== undefined) return false;
+  const { breakerState: breaker } = state;
+  if (breaker.justifiedUnitEnd) {
+    if (breaker.justifiedUnitEnd === first) breaker.justifiedUnitEnd = undefined;
+    return false;
+  }
+  const members = candidateUnit(first, breaker.queue);
+  // Opaque successors stay with their own placement path. Ruby is itself an
+  // opaque, measured text unit and participates without opening adjacent gaps.
+  if (members.some(member => !('text' in member))) return false;
+  const boxes = members.map(member => {
+    if (!('text' in member)) throw new Error('A text candidate lost its placement unit');
+    const box = state.textSegmentBox(member);
+    member.measuredWidth = box.width;
+    return box;
+  });
+  if (!breaker.justifiedGapModel || breaker.justifiedGapModel.segmentCount !== breaker.currentLine.length) {
+    breaker.justifiedGapModel = lineGapModel(breaker.currentLine.map(s => gapSegment(state, s)), undefined, false);
+  }
+  const previous = breaker.justifiedGapModel;
+  const model = lineGapModel(members.map(s => gapSegment(state, s)), previous, false);
+  const overflow = model.visibleWidthPx - state.availW();
+  const factor = overflow > 0 ? wordJustifiedInterwordCompressionFactor({
+    overflow, naturalGapSum: model.S,
+    candidateLineEndSeparator: model.lineEndSeparatorPx,
+    previousOpportunitySum: previous.S + previous.lineEndSeparatorPx,
+    expansionWithoutCandidate: state.availW() - previous.visibleWidthPx,
+  }) : 0;
+  if (factor === undefined) {
+    if (members.length > 1) breaker.justifiedUnitEnd = members.at(-1);
+    return false;
+  }
+  for (const [index, member] of members.entries()) {
+    if (member !== first) breaker.queue.shift();
+    if (!('text' in member)) throw new Error('A text candidate lost its placement unit');
+    const box = boxes[index];
+    state.addToLine(member, member.measuredWidth, box.height, box.ascent, box.descent);
+  }
+  breaker.justifiedCompressionPx = Math.max(0, overflow);
+  return true;
+}
+
 export function performTextSegmentBox(
   operationState: PassOperationState,
   s: LayoutTextSeg,
@@ -1261,7 +1383,11 @@ export function performTextSegmentBox(
     characterGrid,
   } = operationState;
 
-  const measured = measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
+  // Fitting needs the spaces' contextual advances, not every prefix of a
+  // possibly overlong word. Full cluster acquisition belongs to final slices.
+  const measured = justifiedCompressionApplies(operationState) && s.text.includes(' ') && !s.ruby
+    ? measurement.measureSegment(s, 'spaces')
+    : measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
   const width = segAdvanceWidth(
     s,
     measured.width + verticalInkExtra(s, s.text),

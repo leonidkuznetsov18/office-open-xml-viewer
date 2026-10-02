@@ -1,5 +1,7 @@
 import { revisionIsOmitted } from './revision-visibility.js';
 import { wordKerningApplies } from './line-compatibility.js';
+import type { LineGapPlan } from '../line-breaker/line-gaps.js';
+import { distributeLineSlack as distributeProportionalSlack } from '@silurus/ooxml-core';
 import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
@@ -320,6 +322,8 @@ export type MeasuredLinePlanSegment =
   | MeasuredAnchorHostPlanSegment;
 
 export interface MeasuredLinePlanInput {
+  readonly justifiedCompressionPt?: number;
+  readonly gapPlan?: LineGapPlan;
   readonly range: import('./types.js').TextRange;
   readonly topPt: number;
   readonly baselinePt: number;
@@ -399,6 +403,22 @@ function keepGraphemeSafeCuts(
   segments: readonly MeasuredLinePlanSegment[],
 ): DistributeResult | null {
   if (!distribution) return null;
+  if ([...distribution.perSeg.values()].some(stretch => stretch.gapDeltas !== undefined)) {
+    // The fit enumerator retained only atomic space opportunities, including
+    // combining-mark seams. Suppressing one here would change its arithmetic.
+    for (const [index, stretch] of distribution.perSeg) {
+      const segment = segments[index];
+      if (segment?.kind !== 'text') continue;
+      const starts = new Set(segment.clusters.map(cluster => cluster.range.start - segment.range.start));
+      const chars = [...segment.text];
+      let utf16 = 0;
+      const offsets = chars.map(character => { const start = utf16; utf16 += character.length; return start; });
+      if (stretch.splitBefore.some(cut => !starts.has(offsets[cut]))) {
+        throw new Error('Proportional space justification requires a retained cluster boundary');
+      }
+    }
+    return distribution;
+  }
   const totalDeltaPt = distributedDelta(distribution);
   const retained = new Map<number, SegStretch>();
   let gapCount = 0;
@@ -433,133 +453,102 @@ function keepGraphemeSafeCuts(
   return { perGap, perSeg: retained };
 }
 
+/** Merge sorted gap, cluster and paint-op boundaries. Every cursor only moves
+ * forward: O(code points + clusters + gaps + operations), including long runs
+ * of consecutive spaces. Deltas are owned by the accepted line's gap plan. */
 function retainedTextGeometry(
   segment: MeasuredTextPlanSegment,
   stretch: SegStretch | undefined,
   perGapPt: number,
-): Readonly<{
-  clusters: readonly import('./types.js').TextClusterLayout[];
-  paintOps: readonly import('./types.js').TextPaintOp[];
-}> {
+): Readonly<{ clusters: readonly TextClusterLayout[]; paintOps: readonly TextPaintOp[] }> {
   if (!stretch || stretch.splitBefore.length === 0) {
     return { clusters: segment.clusters, paintOps: segment.basePaintOps };
   }
-  const codePoints = [...segment.text];
-  const cuts = [...stretch.splitBefore];
-  if (cuts.some((cut, index) => cut <= 0 || cut >= codePoints.length || (index > 0 && cut <= (cuts[index - 1] ?? 0)))) {
+  const cuts = stretch.splitBefore;
+  const deltas = stretch.gapDeltas;
+  if (deltas && deltas.length !== cuts.length) {
+    throw new Error('Internal paragraph justification has incomplete gap deltas');
+  }
+  const absoluteCuts: number[] = [];
+  let cpIndex = 0;
+  let utf16 = segment.range.start;
+  let cutIndex = 0;
+  for (const character of segment.text) {
+    if (cuts[cutIndex] === cpIndex) {
+      absoluteCuts.push(utf16);
+      cutIndex += 1;
+    }
+    cpIndex += 1;
+    utf16 += character.length;
+  }
+  if (cutIndex !== cuts.length || cuts.some((cut, index) =>
+    cut <= 0 || (index > 0 && cut <= cuts[index - 1]!))) {
     throw new Error('Internal paragraph justification contains an invalid code-point cut');
   }
-  const utf16Offsets = [0];
-  for (const codePoint of codePoints) {
-    utf16Offsets.push((utf16Offsets.at(-1) ?? 0) + codePoint.length);
-  }
-  const cutUtf16 = cuts.map((cut) => utf16Offsets[cut] ?? -1);
-  const clusterStarts = new Set(segment.clusters.map((cluster) =>
-    cluster.range.start - segment.range.start));
-  if (cutUtf16.some((cut) => !clusterStarts.has(cut))) {
+
+  let gapCursor = 0;
+  let cumulativePt = 0;
+  const clusters = segment.clusters.map(cluster => {
+    const cut = absoluteCuts[gapCursor];
+    if (cut !== undefined && cut < cluster.range.start) {
+      throw new Error('Internal paragraph justification must split at shaped cluster boundaries');
+    }
+    if (cut === cluster.range.start) {
+      cumulativePt += deltas?.[gapCursor] ?? perGapPt;
+      gapCursor += 1;
+    }
+    return { ...cluster, offset: { ...cluster.offset, xPt: cluster.offset.xPt + cumulativePt } };
+  });
+  if (gapCursor !== absoluteCuts.length) {
     throw new Error('Internal paragraph justification must split at shaped cluster boundaries');
   }
-  const boundaries = [0, ...cuts, codePoints.length];
-  const paintSlices: Array<Readonly<{
-    range: import('./types.js').TextRange;
-    offset: import('./types.js').PointPt;
-  }>> = [];
-  for (let index = 0; index < boundaries.length - 1; index += 1) {
-    const from = boundaries[index] ?? 0;
-    const to = boundaries[index + 1] ?? from;
-    const start = segment.range.start + (utf16Offsets[from] ?? 0);
-    const firstCluster = segment.clusters.find((cluster) => cluster.range.start === start);
-    if (!firstCluster) throw new Error('Internal paragraph justification is missing shaped cluster geometry');
-    paintSlices.push({
-      range: { start, end: segment.range.start + (utf16Offsets[to] ?? 0) },
-      offset: { xPt: firstCluster.offset.xPt + index * perGapPt, yPt: firstCluster.offset.yPt },
-    });
-  }
-  const clusters = segment.clusters.map((cluster) => {
-    const relativeStart = cluster.range.start - segment.range.start;
-    const precedingGaps = cutUtf16.filter((cut) => cut <= relativeStart).length;
-    return {
-      ...cluster,
-      offset: { ...cluster.offset, xPt: cluster.offset.xPt + precedingGaps * perGapPt },
-    };
-  });
-  if (segment.basePaintOps.length > 1) {
-    let cursor = segment.range.start;
-    for (const operation of segment.basePaintOps) {
-      if (operation.range.start !== cursor || operation.range.end <= operation.range.start) {
-        throw new Error('Internal paragraph justification has incomplete retained paint operations');
-      }
-      cursor = operation.range.end;
-    }
-    if (cursor !== segment.range.end) {
+  let cursor = segment.range.start;
+  for (const operation of segment.basePaintOps) {
+    if (operation.range.start !== cursor || operation.range.end <= cursor) {
       throw new Error('Internal paragraph justification has incomplete retained paint operations');
     }
-    const absoluteCuts = cutUtf16.map((cut) => segment.range.start + cut);
-    const boundaries = [...new Set([
-      segment.range.start,
-      segment.range.end,
-      ...absoluteCuts,
-      ...segment.basePaintOps.flatMap((operation) => [operation.range.start, operation.range.end]),
-    ])].sort((left, right) => left - right);
-    const paintOps: import('./types.js').TextPaintOp[] = [];
-    for (let index = 0; index < boundaries.length - 1; index += 1) {
-      const start = boundaries[index] ?? segment.range.start;
-      const end = boundaries[index + 1] ?? start;
-      const operation = segment.basePaintOps.find((candidate) =>
-        candidate.range.start <= start && candidate.range.end >= end);
-      if (!operation) {
-        throw new Error('Internal paragraph justification lost a retained paint slice');
+    cursor = operation.range.end;
+  }
+  if (cursor !== segment.range.end || segment.basePaintOps.length === 0) {
+    throw new Error('Internal paragraph justification has incomplete retained paint operations');
+  }
+  const baseOp = segment.basePaintOps[0]!;
+  if (segment.basePaintOps.length === 1 && cuts.length === cpIndex - 1
+    && cuts.every((cut, index) => cut === index + 1)
+    && (!deltas || deltas.every(delta => delta === deltas[0]))) {
+    // Preserve contextual shaping when uniform letter spacing can represent
+    // every boundary (notably Japanese punctuation measured in context).
+    return { clusters, paintOps: [{ ...baseOp,
+      letterSpacingPt: baseOp.letterSpacingPt + (deltas?.[0] ?? perGapPt) }] };
+  }
+  const paintOps: TextPaintOp[] = [];
+  let clusterCursor = 0;
+  gapCursor = 0;
+  cumulativePt = 0;
+  for (const operation of segment.basePaintOps) {
+    let start = operation.range.start;
+    while (start < operation.range.end) {
+      while (absoluteCuts[gapCursor] !== undefined && absoluteCuts[gapCursor]! <= start) {
+        cumulativePt += deltas?.[gapCursor] ?? perGapPt;
+        gapCursor += 1;
       }
-      const precedingGaps = absoluteCuts.filter((cut) => cut <= start).length;
-      const firstCluster = clusters.find((cluster) => cluster.range.start === start);
-      if (!firstCluster) {
+      while (clusters[clusterCursor] && clusters[clusterCursor]!.range.start < start) clusterCursor += 1;
+      const firstCluster = clusters[clusterCursor];
+      if (!firstCluster || firstCluster.range.start !== start) {
         throw new Error('Internal paragraph justification is missing retained slice geometry');
       }
+      const end = Math.min(operation.range.end, absoluteCuts[gapCursor] ?? operation.range.end);
       paintOps.push({
         ...operation,
-        text: operation.text.slice(
-          start - operation.range.start,
-          end - operation.range.start,
-        ),
+        text: operation.text.slice(start - operation.range.start, end - operation.range.start),
         range: { start, end },
         offset: start === operation.range.start
-          ? {
-              ...operation.offset,
-              xPt: operation.offset.xPt + precedingGaps * perGapPt,
-            }
+          ? { ...operation.offset, xPt: operation.offset.xPt + cumulativePt }
           : firstCluster.offset,
       });
+      start = end;
     }
-    return {
-      clusters,
-      paintOps,
-    };
   }
-  const baseOp = segment.basePaintOps.length === 1 ? segment.basePaintOps[0] : undefined;
-  if (!baseOp) throw new Error('Internal paragraph justification requires one contextual paint op');
-  const fullyDistributed = cuts.length === codePoints.length - 1
-    && cuts.every((cut, index) => cut === index + 1);
-  if (fullyDistributed) {
-    // Canvas applies uniform letter spacing without breaking the contextual
-    // shaping unit. Keeping one op is essential for Japanese punctuation whose
-    // isolated advance/ink differs from its `…：［…` context.
-    return {
-      clusters,
-      paintOps: [{
-        ...baseOp,
-        letterSpacingPt: baseOp.letterSpacingPt + perGapPt,
-      }],
-    };
-  }
-  const paintOps: import('./types.js').TextPaintOp[] = paintSlices.map((slice) => ({
-    ...baseOp,
-    text: segment.text.slice(
-      slice.range.start - segment.range.start,
-      slice.range.end - segment.range.start,
-    ),
-    range: slice.range,
-    offset: slice.offset,
-  }));
   return { clusters, paintOps };
 }
 
@@ -799,11 +788,40 @@ export function planLine(input: PlanLineInput): LineLayout {
   let perGapPt = 0;
   let distributedWidthPt = 0;
   const distSegments = distributionSegments(segments);
-  if (applyJustify) {
+  if (line.justifiedCompressionPt !== undefined) {
+    const model = line.gapPlan;
+    if (!model) throw new Error('Justified line is missing its retained gap plan');
+    const retainedNaturalWidthPt = naturalWidthPt;
+    naturalWidthPt = model.visibleWidthPx;
+    lineSlackPt = effectiveAvailableWidthPt - physicalStartOffsetPt - naturalWidthPt;
+    if (applyJustify || line.justifiedCompressionPt > 0) {
+      // Opportunities and measured advances belong to the breaker. No text or
+      // width reconstruction may change its accepted line in retained planning.
+      const distribution = keepGraphemeSafeCuts(distributeProportionalSlack(
+        [], lineSlackPt, {
+          gapModel: { gaps: model.gaps, state: model.scan },
+          proportional: true,
+          unweightedExpansion: {
+            gaps: model.expansionGaps,
+            slack: effectiveAvailableWidthPt - physicalStartOffsetPt - retainedNaturalWidthPt,
+          },
+        },
+      ), segments);
+      if (distribution?.usedUnweightedExpansion) {
+        naturalWidthPt = retainedNaturalWidthPt;
+        lineSlackPt = effectiveAvailableWidthPt - physicalStartOffsetPt - naturalWidthPt;
+      }
+      stretchByIndex = distribution?.perSeg ?? null;
+      perGapPt = distribution?.perGap ?? 0;
+      distributedWidthPt = distributedDelta(distribution);
+      if (line.justifiedCompressionPt > 0
+        && Math.abs(distributedWidthPt + line.justifiedCompressionPt) > 1e-7) {
+        throw new Error(`Justified fit and retained paint disagree: delta=${distributedWidthPt}, C=${line.justifiedCompressionPt}, slack=${lineSlackPt}, visible=${model.visibleWidthPx}, end=${model.lineEndSeparatorPx}`);
+      }
+    }
+  } else if (applyJustify) {
     const distribution = keepGraphemeSafeCuts(distributeLineSlack(
-      distSegments,
-      lineSlackPt,
-      firstContentIndex,
+      distSegments, lineSlackPt, firstContentIndex,
       bidi ? lastDrawnIndex : segments.length,
       -(line.baselinePt - line.topPt) * .25,
       lineSlackPt > 0,
@@ -937,7 +955,7 @@ export function planLine(input: PlanLineInput): LineLayout {
             .filter((cluster) => cluster.range.start >= segment.range.start + trailingWhitespaceStart)
             .reduce((sum, cluster) => sum + cluster.advancePt, 0)
         : 0;
-      const ownedTrailingSlackPt = stretch?.trailingGap ? perGapPt : 0;
+      const ownedTrailingSlackPt = stretch?.trailingGap ? stretch.trailingDelta ?? perGapPt : 0;
       const origin = { xPt: xPt + rtlLeadingGapPt, yPt: line.baselinePt };
       const baselineOffsetPt = textGeometry.paintOps[0]?.offset.yPt ?? 0;
       const geometryOrigin = {
@@ -1038,7 +1056,7 @@ export function planLine(input: PlanLineInput): LineLayout {
       placements.push(placed);
     }
     xPt += widthPt;
-    if (stretch?.trailingGap) xPt += perGapPt;
+    if (stretch?.trailingGap) xPt += stretch.trailingDelta ?? perGapPt;
   }
   for (const [placementIndex, trimPt] of terminalDecorationTrims) {
     const placement = placements[placementIndex];
@@ -2548,6 +2566,8 @@ function planMeasuredLines(
         xOffsetPt: raw.xOffset,
         availableWidthPt: raw.availWidth,
         ...(raw.marginExtension ? { marginExtensionPt: raw.marginExtension } : {}),
+        justifiedCompressionPt: raw.justifiedCompressionPx,
+        gapPlan: raw.gapPlan,
         endsWithBreak: raw.endsWithBreak ?? false,
         segments,
       },
@@ -4462,8 +4482,7 @@ function paragraphAcquisitionKey(
       lineOnly ? null : environment.pageWritingMode,
       environment.verticalCJK ?? null,
       lineOnly ? null : environment.verticalPageFrame ?? null,
-      // Mode changes the acquired zero-threshold and source-space shaping
-      // decisions even when no retained placement is requested.
+      // Mode owns acquired kerning and justified-compression decisions.
       environment.compatibilityMode ?? null,
       environment.documentHasEastAsianText,
       environment.useFeLayout ?? null,

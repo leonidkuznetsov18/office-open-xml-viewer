@@ -9,6 +9,7 @@ import { type DocGridCtx, type LayoutSeg, type LayoutTextSeg } from './model.js'
  * measurement and addToLine recompute these facts from the new text. */
 export const RESET_SLICED_TEXT_MEASUREMENT = {
   shapedClusters: undefined,
+  shapedSpaceClusters: undefined,
   selectedFaceInkBounds: undefined,
   selectedFaceFontBox: undefined,
   snapGridClass: undefined,

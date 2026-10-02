@@ -87,6 +87,7 @@ export interface LineBreakerPassInput {
   readonly widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped';
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   readonly overflowPunct: boolean;
+  readonly justifiedCompression?: boolean;
   readonly passContext: Readonly<{
     probeHeights: readonly number[] | null;
     /** Monotone per-physical-line exclusion probe heights (≥ probeHeights). */

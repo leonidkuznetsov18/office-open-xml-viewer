@@ -45,7 +45,7 @@ import {
   rebaseSeaBreaks,
 } from './text-runs.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import { LineGapRejection, type PassOperationState } from './pass-operations.js';
+import { LineGapRejection, fitJustifiedCompression, justifiedCompressionApplies, type PassOperationState } from './pass-operations.js';
 
 /** The iterator reads only its declared slice of the explicit pass state. */
 export type BreakOpportunityIteratorContext = Pick<
@@ -78,8 +78,10 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'prospectiveSnapAdvance'
   | 'segAdvance'
   | 'strAdvance'
+  | 'justifiedCompression'
   | 'isJustified'
   | 'stretchLastLine'
+  | 'widthPolicy'
   | 'overflowPunct'
   | 'sameLatinSpaceFace'
   | 'fitsMeasuredWidth'
@@ -342,7 +344,11 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       ? w - strAdvance(s, trimmed)
       : 0;
   s.latinNaturalTrailingSpacePx =
-    s.latinSpaceCompressionEligible === true && /^[^ ]+ $/u.test(s.text) && trailingSpaceW > 0
+    trailingSpaceW > 0 &&
+    // One U+0020 after a word. A separator emitted as its own run is outside
+    // both observed classes and makes the line inhomogeneous.
+    s.latinSpaceCompressionEligible === true &&
+    /^[^ ]+ $/u.test(s.text)
       ? trailingSpaceW
       : undefined;
   s.latinSpaceCompressionPx = undefined;
@@ -357,6 +363,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       mixedLineHasVisibleText(breakerState));
   s.mixedNaturalTrailingSpacePx = mixedSpaces ? trailingSpaceW : undefined;
   s.mixedNaturalTrailingSpaceCount = mixedSpaces ? s.text.length - trimmed.length : undefined;
+  const interwordCompression = justifiedCompressionApplies(context);
   // Library containment policy: an RTL line is anchored at its right edge,
   // so even an invisible trailing-space advance shifts visible LTR cells left.
   // Count that advance during fitting instead of admitting glyphs past the band.
@@ -397,6 +404,10 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // stays a pure "this is a non-starter" marker; the atomic-vs-breakable decision lives here. A
   // non-breakable Latin / small-caps lead is genuinely atomic, so the pre-flush
   // (and the over-long-word char-break path below) still applies there.
+  // Complete-unit justified admission precedes the ordinary natural-only
+  // joined-unit preflight, so a style/source seam cannot bypass compression.
+  s.measuredWidth = w;
+  if (!prefersWholeWordAtScriptBoundary(context, s) && fitJustifiedCompression(context, s)) return;
   if (prepareAtomicTextFit(context, { s, w, trailingSpaceW, sDictSea, fitWidthFor })) return;
 
   // §17.3.1.21 permits one eligible punctuation character past the text

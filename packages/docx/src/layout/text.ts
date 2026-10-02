@@ -285,9 +285,10 @@ export interface TextShapeRequest {
   readonly kerning?: boolean;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;
-  /** Aggregate-only acquisition may omit per-grapheme contextual advances.
-   * Script spans and aggregate metrics remain authoritative. */
-  readonly clusterGeometry?: boolean;
+  /** False acquires only aggregate metrics; 'spaces' acquires contextual
+   * scalar U+0020 advances for fit arithmetic. Full clusters are acquired after
+   * wrapping, avoiding repeated prefix shaping of overlong words. */
+  readonly clusterGeometry?: boolean | 'spaces';
   /** The same run's surrounding text, with this request's offset in it. A
    * script-scoped substitute's scope is decided over the whole contiguous
    * context, so a word of Arabic digits after proven Arabic text continues it,
@@ -420,7 +421,9 @@ export interface TextShapeResult extends GlyphMeasurement {
   readonly spans: readonly TextShapeSpan[];
   /** UTF-16 offsets at which line splitting may legally separate graphemes. */
   readonly graphemeBoundaries: readonly number[];
-  /** Contextually measured source clusters, relative to the shaped request. */
+  /** Contextually measured source clusters, relative to the shaped request.
+   * For clusterGeometry:'spaces' these are scalar space ranges; the caller
+   * must preserve grapheme-safe cuts when allocating their advances. */
   readonly clusters?: readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;
     offsetPt: number;
@@ -1168,8 +1171,21 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
               prefixAdvances.set(boundary, advancePt);
               return advancePt;
             };
-            return Object.freeze(graphemeBoundaries.slice(0, -1).map((start, index) => {
-              const end = graphemeBoundaries[index + 1] ?? start;
+            const selected: Array<{ start: number; end: number }> = [];
+            if (request.clusterGeometry === 'spaces') {
+              // Scalar spaces need not start a grapheme (Prepend + SPACE).
+              // Acquire their exact contextual prefix difference; gap
+              // selection independently rejects cuts inside a grapheme.
+              for (let start = request.text.indexOf(' '); start >= 0;
+                start = request.text.indexOf(' ', start + 1)) {
+                selected.push({ start, end: start + 1 });
+              }
+            } else {
+              for (let index = 0; index < graphemeBoundaries.length - 1; index += 1) {
+                selected.push({ start: graphemeBoundaries[index]!, end: graphemeBoundaries[index + 1]! });
+              }
+            }
+            return Object.freeze(selected.map(({ start, end }) => {
               const offsetPt = prefixAdvance(start);
               return Object.freeze({
                 range: Object.freeze({ start, end }),

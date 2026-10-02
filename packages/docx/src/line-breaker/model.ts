@@ -135,6 +135,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
     offsetPt: number;
     advancePt: number;
   }>[];
+  /** Sparse, contextual U+0020 cluster geometry used only during gap fitting. */
+  shapedSpaceClusters?: LayoutTextSeg['shapedClusters'];
   /** Tight selected-face ink retained by the authoritative shape call that
    * also produced `shapedClusters`. */
   selectedFaceInkBounds?: GlyphInkBounds;
@@ -441,6 +443,10 @@ export type LayoutSeg = LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutL
 
 
 export interface LayoutLine {
+  /** Present (including zero) for the measured proportional gap policy. The
+   * natural advances stay intact; layout applies this slack once to paint. */
+  justifiedCompressionPx?: number;
+  gapPlan?: import('./line-gaps.js').LineGapPlan;
   /** Pass-local physical identity: gap fragments share it even if vertical
    * rounding makes distinct physical lines have equal numeric tops. */
   physicalLineIndex?: number;

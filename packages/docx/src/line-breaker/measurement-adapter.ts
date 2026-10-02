@@ -65,7 +65,7 @@ export class LineMeasurementAdapter {
     }
   }
 
-  measureSegment(segment: LayoutTextSeg, clusterGeometry = false): TextMetrics {
+  measureSegment(segment: LayoutTextSeg, clusterGeometry: boolean | 'spaces' = false): TextMetrics {
     if (segment.textLayoutService && segment.textShapeRequest) {
       if (segment.textShapeRequest.text !== segment.text) {
         throw new Error('Segment measurement does not match its retained text range context');
@@ -77,7 +77,8 @@ export class LineMeasurementAdapter {
         clusterGeometry,
       });
       if (clusterGeometry) {
-        segment.shapedClusters = shaped.clusters;
+        if (clusterGeometry === 'spaces') segment.shapedSpaceClusters = shaped.clusters;
+        else segment.shapedClusters = shaped.clusters;
         segment.selectedFaceFontBox = {
           ascentPt: shaped.ascentPt,
           descentPt: shaped.descentPt,

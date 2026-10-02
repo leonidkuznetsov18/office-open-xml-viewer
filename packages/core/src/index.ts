@@ -694,6 +694,9 @@ export {
 export { highlightBox } from './text/highlight-box';
 export {
   distributeLineSlack,
+  enumerateGaps,
+  type GapScanState,
+  type LineGap,
   type DistributeSeg,
   type DistributeResult,
   type DistributeOptions,
