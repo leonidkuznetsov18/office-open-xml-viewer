@@ -277,8 +277,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
    *  font size ≥ the threshold. Absent at every style level disables kerning
-   *  unless `enableOpenTypeFeatures` explicitly enables it for the
-   *  document; Canvas `auto` is not the WordprocessingML default. */
+   *  regardless of `enableOpenTypeFeatures`. WORD_KERN_THRESHOLD_AUTHORITY
+   *  additionally disables zero in mode 15; unmeasured modes retain the previous
+   *  zero size comparison. Canvas `auto` is not the WordprocessingML default. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横). Set by {@link buildSegments} ONLY when the run declares `w:vert`

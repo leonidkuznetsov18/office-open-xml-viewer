@@ -85,9 +85,9 @@ describe('parser-to-body-acquisition projection capability', () => {
 
   it.each([
     { threshold: undefined, expected: false },
-    { threshold: 0, expected: false },
+    { threshold: 0, expected: true },
     { threshold: 8, expected: true },
-  ])('projects threshold $threshold consistently for marks and numbering', ({ threshold, expected }) => {
+  ])('preserves unmeasured marker/mark zero semantics with threshold $threshold', ({ threshold, expected }) => {
     const facts = { fontSize: 10, fontFamily: 'serif', kerning: threshold };
     const source: InternalDocParagraph = { ...paragraph(), paragraphMarkFontFacts: facts };
     const numbering: InternalNumberingInfo = {

@@ -1370,6 +1370,9 @@ export function numberingMarkerShapeInput(
     complexScript,
     fontHint: facts?.fontHint,
     eastAsiaLanguage: facts?.langEastAsia,
+    // Marker-specific zero-threshold observations are absent. Preserve its
+    // previous size comparison; the mode-15 content-run extension is not
+    // evidence for generated numbering glyphs.
     kerning: wordKerningApplies(fontSizePt, facts?.kerning),
   });
 }
@@ -1428,6 +1431,7 @@ export function paragraphMarkShapeInput(
     complexScript,
     fontHint: facts.fontHint,
     eastAsiaLanguage: facts.langEastAsia,
+    // Paragraph marks likewise have no measured zero-threshold evidence.
     kerning: wordKerningApplies(fontSizePt, facts.kerning),
   });
 }

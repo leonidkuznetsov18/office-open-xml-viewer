@@ -39,7 +39,9 @@ export class LineMeasurementAdapter {
     // ECMA-376 §17.3.2.19: an absent w:kern disables pair kerning even when
     // Canvas would otherwise choose its automatic kerning behavior.
     const previous = this.selectedKerning;
-    const selected = wordKerningApplies(segment.fontSize, segment.kerning)
+    // The acquisition request owns the mode-scoped decision; retained paint
+    // consumes that same value. Standalone segments have no compatibility mode.
+    const selected = (segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning))
       ? 'normal'
       : 'none';
     this.context.fontKerning = selected;

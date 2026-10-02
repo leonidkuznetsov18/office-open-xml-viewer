@@ -663,7 +663,8 @@ describe('table intrinsic content widths', () => {
     const widths = measureParagraphIntrinsicWidths(source, intrinsicContext(), 200,
       { context: ctx, fontFamilyClasses: {} },
       { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
-        documentHasEastAsianText: false, layoutServices: services, enableOpenTypeFeatures: true });
+        documentHasEastAsianText: false, layoutServices: services, enableOpenTypeFeatures: true,
+        compatibilityMode: 15 });
     expect(widths).toEqual(kerning === 8 || kerning === 10
       ? { minWidthPt: 18, maxWidthPt: 18 } : { minWidthPt: 20, maxWidthPt: 20 });
   });

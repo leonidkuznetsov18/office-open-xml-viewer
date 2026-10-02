@@ -1440,7 +1440,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    kerning: wordKerningApplies(segment.fontSize, segment.kerning),
+    kerning: segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning),
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1514,7 +1514,7 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: wordKerningApplies(segment.fontSize, segment.kerning) ? 'normal' : 'none',
+      kerning: (segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning)) ? 'normal' : 'none',
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),
@@ -4412,7 +4412,9 @@ function paragraphAcquisitionKey(
       lineOnly ? null : environment.pageWritingMode,
       environment.verticalCJK ?? null,
       lineOnly ? null : environment.verticalPageFrame ?? null,
-      lineOnly ? null : environment.compatibilityMode ?? null,
+      // Mode changes the acquired zero-threshold and source-space shaping
+      // decisions even when no retained placement is requested.
+      environment.compatibilityMode ?? null,
       environment.documentHasEastAsianText,
       environment.useFeLayout ?? null,
       environment.balanceSingleByteDoubleByteWidth ?? null,

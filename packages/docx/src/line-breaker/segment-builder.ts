@@ -703,7 +703,10 @@ export function finalizeBuiltSegments(
  * Direct letter-pair seams, font/property changes and authored spacing keep
  * their existing shaping boundaries (WORD_KERN_THRESHOLD_AUTHORITY gaps).
  * One property key per run and one segment sweep keep acquisition linear. */
-function retainSourceSpaceKerning(runs: readonly ParagraphLayoutRun[], segs: LayoutSeg[]): void {
+function retainSourceSpaceKerning(runs: readonly ParagraphLayoutRun[], segs: LayoutSeg[], compatibilityMode?: number): void {
+  // Only mode 15 has measured seam evidence. Missing/future/older modes keep
+  // their previous shaping boundaries, including public-model input.
+  if (compatibilityMode !== 15) return;
   const keys = runs.map((run) => {
     if (run.type !== 'text' || run.charSpacing != null || run.charScale != null
       || run.fitTextVal != null || run.ruby || run.rtl || run.cs || run.smallCaps
@@ -711,7 +714,12 @@ function retainSourceSpaceKerning(runs: readonly ParagraphLayoutRun[], segs: Lay
     // Plain run metadata is bounded independently of text length. Do not
     // serialize complete source text once per word/segment.
     const { text: _text, ...properties } = run;
-    return JSON.stringify(properties);
+    // Formatting is a value, not the insertion order used by the parser or a
+    // public-model caller. Canonicalize nested records as well as the run.
+    return JSON.stringify(properties, (_key, value: unknown) =>
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))
+        : value);
   });
   for (let index = 1; index < segs.length; index += 1) {
     const previous = segs[index - 1];
@@ -819,7 +827,7 @@ export function buildSegments(
 
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
-  retainSourceSpaceKerning(runs, segs);
+  retainSourceSpaceKerning(runs, segs, environment.compatibilityMode);
   finalizeBuiltSegments(runs, environment, segs);
   withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
 
@@ -1057,7 +1065,7 @@ function pushSegmentPiece(
     fontHint: r.fontHint,
     eastAsiaLanguage: r.langEastAsia,
     kerning:
-      wordKerningApplies(cs ? csFontSize : base.fontSize, effectiveKerningThreshold),
+      wordKerningApplies(cs ? csFontSize : base.fontSize, effectiveKerningThreshold, environment.compatibilityMode),
     measure: false,
   });
   const shaped = authoritativeSpan
@@ -1350,6 +1358,12 @@ function emitResolvedTextSegment(
     (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
     // WORD_LATIN_INTERWORD_XAVG_FLOOR retains its existing OpenType gate;
     // threshold authority must not widen this separate fit policy's scope.
+    // Evidence gap: disabling implicit/zero kerning exposes justified fitting
+    // losses in mode-15 zero/absent-threshold controls, and mode-14 space fitting
+    // remains unresolved. Preserve this fit gate pending the separate justified
+    // compression correction; do not infer an allowance from pair advances or
+    // apply a font-specific scale. Positive-threshold fit contradictions likewise
+    // do not establish a different shaping-table or kerning-switch rule.
     environment.enableOpenTypeFeatures !== true &&
     effectiveKerningThreshold == null;
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
