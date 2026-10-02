@@ -328,15 +328,6 @@ export const WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION = defineCompatibilityRu
   description: 'Keep leading whitespace used as a first-line text indent fixed while distributing justified-line slack across content in a left-to-right line.',
 });
 
-export const WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT = defineCompatibilityRule({
-  id: 'word-justified-candidate-separator-fit',
-  evidence: {
-    kind: 'regression-test',
-    reference: 'packages/docx/src/justify-shrink-overshoot.test.ts#counts a candidate trailing space when the prospective line will justify',
-  },
-  description: 'On a full paragraph-width line that will be fully justified, include the candidate word separator in its wrap-fit width; lines narrowed by DrawingML wrap exclusions retain collapsible line-end separator fit behavior.',
-});
-
 export const WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS = defineCompatibilityRule({
   id: 'word-overflow-punctuation-language-sets',
   evidence: {
@@ -625,18 +616,6 @@ export function wordIsOverflowPunctuation(
     return ALL_WORD_OVERFLOW_PUNCTUATION.has(character);
   }
   return parentRunHasLatinText && LATIN_WORD_OVERFLOW_PUNCTUATION.has(character);
-}
-
-/** Compatibility projection governed by {@link WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT}. */
-export function wordCandidateFitWidthPx(input: Readonly<{
-  widthPx: number;
-  trailingSpacePx: number;
-  lineWillJustify: boolean;
-  wrapNarrowed?: boolean;
-}>): number {
-  return input.lineWillJustify && input.wrapNarrowed !== true
-    ? input.widthPx
-    : input.widthPx - input.trailingSpacePx;
 }
 
 export const WORD_RUBY_PARAGRAPH_UNIFORM_LINE_ADVANCE = defineCompatibilityRule({

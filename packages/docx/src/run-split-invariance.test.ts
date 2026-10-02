@@ -168,7 +168,8 @@ beforeAll(async () => {
 // Feed the complete WASM wire graph to the production source-store adapter.
 // Extracting public runs here would discard the retained typography inputs and
 // would miss a content-dependent acquisition key (the r4 regression).
-function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTextRun> = {}, runProperties: string[] = []): DocxDocumentModel {
+function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTextRun> = {}, runProperties: string[] = [],
+  options: { alignment?: DocParagraph['alignment']; compatibilityMode?: number; widthPt?: number } = {}): DocxDocumentModel {
   const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
   const O = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
   const escape = (text: string) => text.replace(/&/gu, '&amp;').replace(/</gu, '&lt;');
@@ -191,14 +192,14 @@ function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTe
     if (wrapper === 'complex-fields') return `<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>AUTHOR</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>${run}<w:r><w:fldChar w:fldCharType="end"/></w:r>`;
     return run;
   }).join('');
-  const p = (indented = false) => `<w:p><w:pPr><w:jc w:val="right"/><w:spacing w:before="0" w:after="0"/>${indented ? '<w:ind w:right="3604"/>' : ''}</w:pPr>${runs}</w:p>`;
+  const p = (indented = false) => `<w:p><w:pPr><w:jc w:val="${options.alignment ?? 'right'}"/><w:spacing w:before="0" w:after="0"/>${indented ? `<w:ind w:right="${Math.round((200 - (options.widthPt ?? 19.8)) * 20)}"/>` : ''}</w:pPr>${runs}</w:p>`;
   const table = (kind: 'fixed' | 'autofit') => `<w:tbl><w:tblPr><w:tblLayout w:type="${kind}"/><w:tblW w:w="396" w:type="dxa"/><w:tblCellMar><w:top w:w="0"/><w:left w:w="0"/><w:bottom w:w="0"/><w:right w:w="0"/></w:tblCellMar></w:tblPr><w:tblGrid><w:gridCol w:w="396"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="396" w:type="dxa"/></w:tcPr>${p()}</w:tc></w:tr></w:tbl>`;
   const box = `<w:p><w:r><w:pict><v:shape id="box" type="#_x0000_t202" style="width:19.8pt;height:100pt"><v:textbox inset="0,0,0,0"><w:txbxContent>${p()}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>`;
   const body = p(true) + table('fixed') + table('autofit') + box + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>';
   const files = new Map<string, string>([
     ['word/document.xml', `<w:document xmlns:w="${W}" xmlns:r="${O}" xmlns:v="urn:schemas-microsoft-com:vml"><w:body>${body}<w:sectPr><w:headerReference w:type="default" r:id="hdr"/><w:footerReference w:type="default" r:id="ftr"/><w:pgSz w:w="4000" w:h="20000"/><w:pgMar w:top="2400" w:right="0" w:bottom="2400" w:left="0" w:header="300" w:footer="300"/></w:sectPr></w:body></w:document>`],
     ['word/styles.xml', `<w:styles xmlns:w="${W}"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${format.fontFamily ?? 'Arial'}" w:hAnsi="${format.fontFamily ?? 'Arial'}"/><w:sz w:val="${2 * (format.fontSize ?? 18)}"/><w:kern w:val="${2 * (format.kerning ?? 8)}"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>`],
-    ['word/settings.xml', `<w:settings xmlns:w="${W}"><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`],
+    ['word/settings.xml', `<w:settings xmlns:w="${W}"><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="${options.compatibilityMode ?? 15}"/></w:compat></w:settings>`],
     ['word/header1.xml', `<w:hdr xmlns:w="${W}">${table('fixed')}</w:hdr>`],
     ['word/footer1.xml', `<w:ftr xmlns:w="${W}">${table('fixed')}</w:ftr>`],
     ['word/footnotes.xml', `<w:footnotes xmlns:w="${W}"><w:footnote w:id="1">${table('fixed')}</w:footnote></w:footnotes>`],
@@ -225,6 +226,20 @@ function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed
 }
 
 describe('complete DOCX parser inputs preserve formatting-only split invariance', () => {
+  it('fits the visible justified prefix across a real formatting boundary in mode 14', () => {
+    const acquire = (parts: string[], properties: string[]) => {
+      const doc = parsedDocument(parts, 'rsid', {}, properties,
+        { alignment: 'both', compatibilityMode: 14, widthPt: 14 });
+      const layout = layoutDocument(doc, createLayoutServices(doc, { measureContext: context() }));
+      return geometry(paragraphs(layout).filter(p => p.source.story === 'body' && p.source.path.length === 1))[0];
+    };
+    // The independent metrics above give "i i" a 13pt natural advance.
+    // Its following 5pt separator is a line edge, so the visible prefix fits
+    // the 14pt band. The last authored word remains genuinely bold.
+    const whole = acquire(['i i i', ' i'], ['', '<w:b/>']);
+    expect(whole?.lines.map(l => l.text.trim())).toEqual(['i i', 'i i']);
+    expect(acquire(['i i', ' i', ' i'], ['', '', '<w:b/>'])).toEqual(whole);
+  });
   it.each(['deletion-seam', 'moveFrom-seam', 'deleted-break-seam', 'deleted-tab-seam', 'deleted-math-seam'])('keeps omitted %s content out of final-view shaping boundaries', wrapper => {
     const whole = acquireParsed(['T i'], wrapper);
     const doc = parsedDocument(['T', ' i'], wrapper);

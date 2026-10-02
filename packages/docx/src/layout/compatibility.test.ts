@@ -47,7 +47,6 @@ import {
   WORD_HANGING_TAB_SAME_POSITION_PRECEDENCE,
   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL,
   WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION,
-  WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT,
   WORD_MIXED_ANCHOR_VISIBLE_LINE_METRICS,
   WORD_NUMBERING_MARKER_OVERFLOW_TAB_ADVANCE,
   WORD_NUMBERING_MARKER_PARAGRAPH_MARK_FALLBACK,
@@ -76,7 +75,6 @@ import {
   wordGridRightIndentAdjustmentPt,
   wordUseFeLayoutParagraphMarkGridAdvancePx,
   wordUseFeLayoutInheritedGridHeightPx,
-  wordCandidateFitWidthPx,
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
   wordNumberingSuffixAcceptsCoincidentListTab,
@@ -361,7 +359,6 @@ describe('layout compatibility inventory', () => {
       WORD_AUTO_MULTIPLE_BASELINE_PIN,
       WORD_MIXED_ANCHOR_VISIBLE_LINE_METRICS,
       WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION,
-      WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT,
       WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS,
       WORD_FULL_WIDTH_CHARACTER_SPACING_SCOPE,
       WORD_AUTHORED_CHARACTER_SPACING_PITCH_PRIORITY,
@@ -671,22 +668,6 @@ describe('layout compatibility inventory', () => {
       20,
       { pos: 20, alignment: 'left' },
     )).toBe(false);
-    expect(wordCandidateFitWidthPx({
-      widthPx: 60,
-      trailingSpacePx: 12,
-      lineWillJustify: true,
-    })).toBe(60);
-    expect(wordCandidateFitWidthPx({
-      widthPx: 60,
-      trailingSpacePx: 12,
-      lineWillJustify: true,
-      wrapNarrowed: true,
-    })).toBe(48);
-    expect(wordCandidateFitWidthPx({
-      widthPx: 60,
-      trailingSpacePx: 12,
-      lineWillJustify: false,
-    })).toBe(48);
   });
 
   it('pins East Asian grid allocation and the untabled Far East metric factor', () => {

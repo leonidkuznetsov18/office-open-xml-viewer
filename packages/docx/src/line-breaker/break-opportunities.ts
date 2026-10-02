@@ -1,5 +1,4 @@
 import { measureFitTextUnit, measureJoinedTextUnit } from './atomic-units.js';
-import { justifiedCandidateFitWidth } from './justify-fit.js';
 import {
   kinsokuAdjustedSplit,
   isGraphemeFillText,
@@ -362,16 +361,20 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   const fitWidthFor = (
     widthPx: number,
     trailingSpacePx: number,
-    next: LayoutSeg | undefined,
-  ): number =>
-    justifiedCandidateFitWidth(widthPx, context.baseRtl ? 0 : trailingSpacePx, next, {
-      isJustified,
-      stretchLastLine,
-      lineMaxWidth: breakerState.lineMaxWidth,
-      lineXOffset: breakerState.lineXOffset,
-      maxWidth,
-    });
-  const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW, breakerState.queue.peek());
+  ): number => {
+    // Library fit contract: a collapsible U+0020 at the prospective line edge
+    // is outside its visible advance, even when the line will justify. ST_Jc
+    // (§17.18.44) defines inter-word justification, not an extra edge-space
+    // admission charge. Word mode-14 mixed-format Latin output confirms that
+    // a naturally fitting prefix stays on the line when only its edge space
+    // exceeds the band; the mode-15 compression controls use the same visible
+    // prefix. This removes a regression-test-only separator policy which made
+    // canonical run joining reject words previously admitted at source seams.
+    // No compression allowance is added to older modes. RTL retains its
+    // separately documented advance-origin constraint above.
+    return widthPx - (context.baseRtl ? 0 : trailingSpacePx);
+  };
+  const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW);
   // ECMA-376 §17.3.1.33 does not prescribe a line-breaking tolerance.
   // Word-for-Mac controls with Calibri and Arial, left/center/right aligned
   // 10pt table cells, wrap a trailing Latin word below its natural advance
