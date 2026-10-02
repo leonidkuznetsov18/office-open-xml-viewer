@@ -256,13 +256,17 @@ describe('WORD_JUSTIFIED_INTERWORD_COMPRESSION', () => {
     expect(words((await renderLines(paragraph(text, 'both'), 56.55))[0])).toEqual(['Quiet']);
   });
 
-  it('keeps the previous visible-width fit under a character grid', async () => {
-    // Without the grid the visible-word fit admits `across` at 190pt (its
-    // separator does not fit); a linesAndChars grid keeps the separator fit.
+  it('keeps natural visible fit but excludes compression under a character grid', async () => {
     const grid = { docGridType: 'linesAndChars', docGridLinePitch: 18, docGridCharSpace: 0 };
-    const [plain] = await renderLines(paragraph(CONTROL, 'both'), 190);
+    // A prospective line's edge separator cannot reject visible text that
+    // naturally fits, with or without a grid. The grid excludes the observed
+    // compression allowance only when the visible prefix really overflows.
+    const visible = GEORGIA_SUM('Quiet rivers carry morning light across') * 11 / 2048;
+    const [natural] = await renderLines(paragraph(CONTROL, 'both'), 190, undefined, grid);
+    expect(words(natural).at(-1)).toBe('across');
+    const [plain] = await renderLines(paragraph(CONTROL, 'both'), visible - 0.5);
     expect(words(plain).at(-1)).toBe('across');
-    const [gridded] = await renderLines(paragraph(CONTROL, 'both'), 190, undefined, grid);
+    const [gridded] = await renderLines(paragraph(CONTROL, 'both'), visible - 0.5, undefined, grid);
     expect(words(gridded).at(-1)).toBe('light');
   });
 
