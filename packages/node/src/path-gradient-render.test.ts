@@ -57,41 +57,33 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   });
 
-  it('places the focus at the fillToRect fixed point with no flat area', () => {
-    const asymmetric = canvas().ctx;
-    paint({ ...fill, fillToRect: { l: .2, r: .4, t: .25, b: .25 } }, asymmetric, 240, 120);
-    // Focus x = l/(l+r) = 1/3 → (80, 60). (60, 60) lies inside the ECMA focus
-    // rectangle yet is a quarter of the way to the left edge.
-    expect(pixel(asymmetric, 80, 60)[0]).toBeLessThan(6);
-    expect(Math.abs(pixel(asymmetric, 60, 60)[0] - 64)).toBeLessThanOrEqual(3);
-    expect(Math.abs(pixel(asymmetric, 160, 60)[0] - 128)).toBeLessThanOrEqual(3);
+  it('fills the inscribed focus area with the first stop and shades the band to the outline', () => {
+    const area = canvas().ctx;
+    paint({ ...fill, fillToRect: { l: .2, r: .4, t: .25, b: .25 } }, area, 240, 120);
+    // Focus rectangle x 48..144, y 30..90 is flat first stop (§20.1.8.31).
+    for (const [x, y] of [[50, 32], [80, 60], [141, 87]]) expect(pixel(area, x, y)[0]).toBeLessThan(4);
+    // Halfway from the focus edge to the outline: s = .5 → 128.
+    expect(Math.abs(pixel(area, 24, 60)[0] - 125)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(area, 192, 60)[0] - 129)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(area, 96, 105)[0] - 130)).toBeLessThanOrEqual(3);
     const zero = canvas().ctx;
     paint({ ...fill, fillToRect: { l: 0, t: 0, r: 0, b: 0 } }, zero, 240, 120);
-    expect(pixel(zero, 2, 2)[0]).toBeLessThan(8);
-    expect(Math.abs(pixel(zero, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
+    for (const [x, y] of [[2, 2], [120, 60], [237, 117]]) expect(pixel(zero, x, y)).toEqual([0, 0, 0, 255]);
+    const segment = canvas().ctx;
+    paint({ ...fill, fillToRect: { l: .2, r: .2, t: .5, b: .5 } }, segment, 240, 120);
+    for (const x of [50, 120, 190]) expect(pixel(segment, x, 60)[0]).toBeLessThan(6);
+    expect(Math.abs(pixel(segment, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
     const omitted = canvas().ctx;
     paint({ ...fill, fillToRect: undefined }, omitted, 240, 120);
     expect(pixel(omitted, 120, 60)[0]).toBeLessThan(6);
   });
 
-  it('applies the Office two-stop transfer and keeps other stop lists linear', () => {
-    const { ctx } = canvas(400, 30);
-    const linear = (stops: GradientFill['stops'], y: number) => {
-      ctx.fillStyle = resolveFill({ fillType: 'gradient', gradType: 'linear', angle: 0, stops },
-        ctx, 0, 0, 400, 30) as CanvasGradient;
-      ctx.fillRect(0, y, 400, 10);
-    };
-    linear(twoStop, 0);
-    linear([{ position: 0, color: 'FF0000' }, { position: 1, color: '00FF00' }], 10);
-    linear([{ position: .2, color: '000000' }, { position: .8, color: 'FFFFFF' }], 20);
-    // Φ-sigma weights then gamma 2.2: w(.25) = .1424, w(.5) = .5.
-    expect(Math.abs(pixel(ctx, 100, 5)[0] - 105)).toBeLessThanOrEqual(1);
-    expect(Math.abs(pixel(ctx, 200, 5)[0] - 186)).toBeLessThanOrEqual(1);
-    expect(Math.abs(pixel(ctx, 300, 5)[0] - 238)).toBeLessThanOrEqual(1);
-    const mid = pixel(ctx, 200, 15);
-    expect(Math.abs(mid[0] - 186)).toBeLessThanOrEqual(1);
-    expect(Math.abs(mid[1] - 186)).toBeLessThanOrEqual(1);
-    expect(Math.abs(pixel(ctx, 200, 25)[0] - 128)).toBeLessThanOrEqual(1);
+  it('keeps Canvas interpolation for two-stop gradients', () => {
+    const { ctx } = canvas(400, 10);
+    ctx.fillStyle = resolveFill({ fillType: 'gradient', gradType: 'linear', angle: 0, stops: twoStop },
+      ctx, 0, 0, 400, 10) as CanvasGradient;
+    ctx.fillRect(0, 0, 400, 10);
+    expect(Math.abs(pixel(ctx, 200, 5)[0] - 128)).toBeLessThanOrEqual(1);
   });
 
   it('follows star-shaped outlines with a focus fan in path order', () => {
@@ -101,7 +93,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       { cmd: 'close' },
     ]] };
     for (const [fillToRect, focus] of [
-      [undefined, [100, 60]], [{ l: 0, t: 0, r: 1, b: 1 }, [0, 0]], [{ l: .3, t: .5, r: .1, b: .5 }, [150, 60]],
+      [undefined, [100, 60]], [{ l: 0, t: 0, r: 1, b: 1 }, [0, 0]], [{ l: .75, t: .5, r: .25, b: .5 }, [150, 60]],
     ] as const) {
       const { ctx } = canvas(200, 120);
       paintDrawingMLShape(ctx, {
@@ -115,30 +107,49 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   });
 
-  it('substitutes the circle path for outlines not star-shaped about their center', () => {
-    for (const name of ['rightArrow', 'donut', 'chevron']) {
-      for (const fillToRect of [undefined, { l: .2, r: .4, t: .25, b: .25 }]) {
-        const plan = (path: string) => ({
-          rect: { x: 0, y: 0, w: 120, h: 120 }, stroke: null,
-          geometry: { kind: 'preset' as const, name, adjustments: [] },
-          fill: { ...fill, path, fillToRect }, transform: { rotationDeg: 0, flipH: false, flipV: false },
-        });
-        const shape = canvas(120, 120).ctx; const circle = canvas(120, 120).ctx;
-        paintDrawingMLShape(shape, plan('shape'), 1);
-        paintDrawingMLShape(circle, plan('circle'), 1);
-        expect(Buffer.from(shape.getImageData(0, 0, 120, 120).data)
-          .equals(Buffer.from(circle.getImageData(0, 0, 120, 120).data)), name).toBe(true);
+  it('shades outlines not star-shaped about their center as a circle about the focus point', () => {
+    const arrow: DrawingMLShapeGeometry = { kind: 'preset', name: 'rightArrow', adjustments: [] };
+    for (const [fillToRect, focus] of [
+      [{ l: 0, t: 0, r: 0, b: 0 }, [0, 0]], [{ l: 0, t: 0, r: 1, b: 1 }, [0, 0]],
+      [{ l: .2, t: 0, r: 0, b: 0 }, [120, 0]], [{ l: .2, r: .2, t: .2, b: .2 }, [60, 60]], [undefined, [60, 60]],
+    ] as const) {
+      const { ctx } = canvas(120, 120);
+      paintDrawingMLShape(ctx, {
+        rect: { x: 0, y: 0, w: 120, h: 120 }, geometry: arrow, stroke: null,
+        fill: { ...fill, path: 'shape', fillToRect }, transform: { rotationDeg: 0, flipH: false, flipV: false },
+      }, 1);
+      const radius = Math.max(...[[0, 0], [120, 0], [0, 120], [120, 120]]
+        .map(([x, y]) => Math.hypot(x - focus[0], y - focus[1])));
+      for (const [x, y] of [[10, 40], [50, 60], [90, 50], [72, 30], [100, 62]]) {
+        const expected = 255 * Math.min(1, Math.hypot(x + .5 - focus[0], y + .5 - focus[1]) / radius);
+        expect(Math.abs(pixel(ctx, x, y)[0] - expected), JSON.stringify({ fillToRect, x, y })).toBeLessThanOrEqual(3);
       }
     }
-    // A convex preset is shaded by its own outline instead.
+    // A convex ellipse instead keeps its inscribed focus area.
     const ellipse = canvas(120, 120).ctx;
     paintDrawingMLShape(ellipse, {
       rect: { x: 0, y: 0, w: 120, h: 120 }, stroke: null,
       geometry: { kind: 'preset', name: 'ellipse', adjustments: [] },
-      fill: { ...fill, path: 'shape' }, transform: { rotationDeg: 0, flipH: false, flipV: false },
+      fill: { ...fill, path: 'shape', fillToRect: { l: .2, r: .2, t: .2, b: .2 } },
+      transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
-    for (const [x, y] of [[90, 60], [60, 30], [81, 81]]) {
-      expect(Math.abs(pixel(ellipse, x, y)[0] - 128)).toBeLessThanOrEqual(4);
+    expect(pixel(ellipse, 60, 60)[0]).toBeLessThan(4);
+    expect(pixel(ellipse, 60 + 33, 60)[0]).toBeLessThan(4);
+    // Contour radius .3 + .2s: radius .4 of the box is s = .5.
+    expect(Math.abs(pixel(ellipse, 60 + 48, 60)[0] - 133)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(ellipse, 60, 60 - 48)[0] - 123)).toBeLessThanOrEqual(3);
+  });
+
+  it('keeps wide gradient strokes opaque outside the host box', () => {
+    for (const path of ['rect', 'shape'] as const) {
+      const { ctx } = canvas(200, 200);
+      ctx.lineWidth = 20;
+      ctx.strokeStyle = resolveFill({ ...fill, path }, ctx, 50, 50, 100, 100) as CanvasPattern;
+      ctx.strokeRect(50, 50, 100, 100);
+      // main painted these pixels opaque; the shade beyond the frame is the outer stop.
+      expect(pixel(ctx, 41, 100)).toEqual([255, 255, 255, 255]);
+      expect(pixel(ctx, 100, 158)).toEqual([255, 255, 255, 255]);
+      expect(pixel(ctx, 158, 158)[3]).toBe(255);
     }
   });
 
@@ -195,7 +206,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(ctx.getTransform().e).toBe(10);
   });
 
-  it('interpolates translucent stops once even where triangles overlap', () => {
+  it('interpolates translucent stops once', () => {
     const { ctx } = canvas();
     paint({ ...fill, stops: [{ position: 0, color: 'FF0000FF' }, { position: .5, color: 'FF000080' },
       { position: 1, color: 'FF000000' }] }, ctx, 240, 120);
@@ -206,7 +217,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
 
   it('frames a non-rotating shade by the device bounds of the rotated, mirrored host', () => {
     const { ctx } = canvas(160, 160);
-    const recipe = { ...fill, fillToRect: { l: 0, r: 0, t: 0, b: 0 }, rotWithShape: false };
+    const recipe = { ...fill, fillToRect: { l: 0, r: 1, t: 0, b: 1 }, rotWithShape: false };
     ctx.translate(80, 80); ctx.rotate(Math.PI / 4); ctx.scale(-1, 1); ctx.translate(-50, -50);
     ctx.fillStyle = resolveFill(recipe, ctx, 0, 0, 100, 100, 45) as CanvasPattern;
     ctx.fillRect(0, 0, 100, 100);
@@ -225,7 +236,8 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     vi.stubGlobal('OffscreenCanvas', class extends Canvas {
       constructor(w: number, h: number) {
         allocations.push([w, h]);
-        expect(w).toBeLessThanOrEqual(512); expect(h).toBeLessThanOrEqual(512);
+        // The shade raster, or the 1024×1 stop ramp.
+        expect(w * h).toBeLessThanOrEqual(512 * 512); expect(Math.max(w, h)).toBeLessThanOrEqual(1024);
         super(w, h);
       }
     });
@@ -270,8 +282,33 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         ctx.fillRect(0, 0, 512, 512);
         expect(pixel(ctx, 256, 256)[0]).toBeLessThan(4);
       }
-      expect(work).toEqual({ surfaces: 3, readbacks: 0, writes: 3, outlines: 3 });
+      // Per paint: the shade raster plus the 1024×1 stop ramp and its readback.
+      expect(work).toEqual({ surfaces: 6, readbacks: 3, writes: 3, outlines: 3 });
     } finally { vi.unstubAllGlobals(); vi.restoreAllMocks(); }
+  });
+
+  it('bounds corner-focus work on very complex star outlines', () => {
+    const { ctx } = canvas(512, 512);
+    for (const edges of [20000, 200000]) {
+      let outlines = 0;
+      const outline = (target: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) => {
+        outlines++;
+        for (let i = 0; i < edges; i++) {
+          const angle = i / edges * Math.PI * 2; const r = i % 2 ? .5 : .03;
+          target[i ? 'lineTo' : 'moveTo'](x + w * (.5 + r * Math.cos(angle)), y + h * (.5 + r * Math.sin(angle)));
+        }
+        target.closePath();
+      };
+      const started = performance.now();
+      ctx.fillStyle = resolveFill({ ...fill, path: 'shape', fillToRect: { l: 0, t: 0, r: 1, b: 1 } },
+        ctx, 0, 0, 512, 512, 0, undefined, undefined, outline) as CanvasPattern;
+      // O(edges × rows + pixels) with edges clustered to ≤ 32768: a generous
+      // wall-clock guard against the former O(edges × pixels) fan scan.
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(outlines).toBe(1);
+      ctx.fillRect(0, 0, 512, 512);
+      expect(pixel(ctx, 2, 2)[0]).toBeLessThan(12);
+    }
   });
 
   it('wires rect fills and host-box shape-path strokes through the retained DOCX painter', () => {

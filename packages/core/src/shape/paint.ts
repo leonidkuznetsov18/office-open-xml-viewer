@@ -2,8 +2,7 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolvePathShade, pathShadeFocus, type FillOutline } from './path-gradient';
-import { officeGradientStops } from './gradient-transfer';
+import { resolvePathShade, pathShadeFocusRect, type FillOutline } from './path-gradient';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
@@ -42,40 +41,35 @@ function tiledGradient(
   const baseCtx = base?.getContext('2d');
   if (!base || !baseCtx) return null;
   const tileFill = { ...fill, tileRect: undefined, flip: undefined };
-  // Office path shades in a tile (issue #1599 PowerPoint controls): a shape
-  // outline and its focus are scaled into the tile, whereas a rect path keeps
-  // its focus relative to the shape box ([MS-OE376] §2.1.1377 b). Tiles repeat
-  // unmirrored whatever flip is authored.
+  // Path shades in a tile (issue #1599 PowerPoint point-focus rasters): a
+  // shape outline and its focus are scaled into the tile, whereas a rect path
+  // keeps its focus relative to the shape box ([MS-OE376] §2.1.1377 b). Tiles
+  // repeat unmirrored whatever flip is authored.
   const pathShade = fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape');
-  const baseBox = { x: 0, y: 0, w: baseW, h: baseH };
-  let shade: CanvasPattern | 'circle' | null = null;
+  let basePaint: string | CanvasGradient | CanvasPattern | null;
   if (pathShade) {
-    const [fx, fy] = pathShadeFocus(fill);
-    const focus: [number, number] | undefined = fill.path === 'rect'
-      ? [(fx * w + x - tileX) / tileW, (fy * h + y - tileY) / tileH]
+    const box = pathShadeFocusRect(fill);
+    const focus = fill.path === 'rect'
+      ? {
+        origin: [(box.origin[0] * w + x - tileX) / tileW, (box.origin[1] * h + y - tileY) / tileH] as [number, number],
+        size: [box.size[0] * w / tileW, box.size[1] * h / tileH] as [number, number],
+      }
       : undefined;
-    shade = resolvePathShade(tileFill, baseCtx as CanvasRenderingContext2D, baseBox, baseBox,
+    const baseBox = { x: 0, y: 0, w: baseW, h: baseH };
+    basePaint = resolvePathShade(tileFill, baseCtx as CanvasRenderingContext2D, baseBox, baseBox,
       fill.path === 'shape' ? outline : undefined, focus);
+  } else {
+    basePaint = resolveFill(
+      tileFill, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg,
+      undefined, undefined, outline,
+    );
   }
-  const unmirrored = pathShade && shade !== 'circle';
-  const basePaint = shade && shade !== 'circle' ? shade : resolveFill(
-    shade === 'circle' ? { ...tileFill, path: 'circle' } : tileFill,
-    baseCtx as CanvasRenderingContext2D,
-    0,
-    0,
-    baseW,
-    baseH,
-    shapeRotationDeg,
-    undefined,
-    undefined,
-    outline,
-  );
   if (!basePaint) return null;
   baseCtx.fillStyle = basePaint;
   baseCtx.fillRect(0, 0, baseW, baseH);
 
-  const flipX = !unmirrored && (fill.flip === 'x' || fill.flip === 'xy');
-  const flipY = !unmirrored && (fill.flip === 'y' || fill.flip === 'xy');
+  const flipX = !pathShade && (fill.flip === 'x' || fill.flip === 'xy');
+  const flipY = !pathShade && (fill.flip === 'y' || fill.flip === 'xy');
   let patternSource = base;
   if (flipX || flipY) {
     const repeatW = baseW * (flipX ? 2 : 1);
@@ -218,17 +212,14 @@ export function resolveFill(
     const tileW = w * (1 - (tile?.l ?? 0) - (tile?.r ?? 0));
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
     if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
-      // Canvas has no shape-following shade; resolvePathShade rasterizes the
-      // Office fan model. Allocation-unavailable hosts use the first stop as a
-      // stable flat fallback rather than inventing another geometry.
-      const shade = resolvePathShade(
+      // Canvas has no shape-following shade; resolvePathShade rasterizes it.
+      // Allocation-unavailable hosts use the first stop as a stable flat
+      // fallback rather than inventing another geometry.
+      return resolvePathShade(
         fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, { x, y, w, h }, outline,
-      );
-      if (shade !== 'circle') return shade ?? hexToRgba(stops[0].color);
+      ) ?? hexToRgba(stops[0].color);
     }
     if (fill.gradType === 'radial') {
-      // Circle path, also Office's substitute for shape outlines that are not
-      // star-shaped about their center (see resolvePathShade).
       // §20.1.8.31: fillToRect is the center-shade (focus) rectangle inside
       // the gradient tile. Canvas has a point focus rather than a rectangular
       // focus, so use its authored centre. PowerPoint's PDF export emits every
@@ -271,9 +262,10 @@ export function resolveFill(
         cx + dx * gradLen, cy + dy * gradLen,
       );
     }
-    // Office interpolates a two-stop 0%/100% list with its sigma/gamma
-    // transfer and every other list linearly (see gradient-transfer.ts).
-    for (const stop of officeGradientStops([...stops].sort((a, b) => a.position - b.position))) {
+    // Two-stop midpoint/transfer behaviour is out of scope (#1599): PowerPoint's
+    // primary-colour exports do not determine a general blend rule, and Word/
+    // Excel are unmeasured. Canvas interpolation of the authored stops remains.
+    for (const stop of stops) {
       gradient.addColorStop(Math.min(1, Math.max(0, stop.position)), hexToRgba(stop.color));
     }
     return gradient;

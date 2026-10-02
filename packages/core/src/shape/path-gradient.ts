@@ -1,6 +1,5 @@
 import type { GradientFill, GradientStop } from '../types/common';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { officeGradientStops } from './gradient-transfer';
 
 /** Append the fill-bearing outline; coordinates belong to the supplied box.
  * The caller owns beginPath. Decorative, unfilled paths must be excluded. */
@@ -13,13 +12,16 @@ type Point = [number, number];
 type Matrix = [number, number, number, number, number, number];
 
 // Resource policy, not an OOXML rule: the shade raster is at most 512² device
-// pixels. Each paint flattens the outline once, buckets its edges by angle
-// around the focus and makes one bounded pixel pass; a pixel tests only the
-// edges spanning its angle. No geometry or raster is retained between paints.
+// pixels and the outline at most EDGE_LIMIT edges (clustered beyond that with
+// a stated pixel error). Each paint scan-converts every edge's band once over
+// the rows it spans and solves every pixel at most once: O(edges × rows +
+// pixels) ≤ 32768 × 512 + 512² steps, independent of the focus position.
+// Nothing is retained between paints.
 const MAX_EDGE = 512;
 const MARGIN = 2;
 const BEZIER_SEGMENTS = 16;
 const ARC_STEP = Math.PI / 32;
+const EDGE_LIMIT = 32768;
 
 const apply = (m: Matrix, x: number, y: number): Point =>
   [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
@@ -30,7 +32,8 @@ const multiply = (m: Matrix, n: Matrix): Matrix => [
 ];
 function invert(m: Matrix): Matrix | null {
   const det = m[0] * m[3] - m[1] * m[2];
-  if (!Number.isFinite(det) || Math.abs(det) < 1e-12) return null;
+  const scale = Math.max(Math.abs(m[0]), Math.abs(m[1]), Math.abs(m[2]), Math.abs(m[3]));
+  if (!Number.isFinite(det) || !(Math.abs(det) > scale * scale * 1e-12)) return null;
   return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det,
     (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
 }
@@ -174,12 +177,11 @@ export function isStrictlyStarShaped(polygons: Point[][], center: Point, box: Sh
   return sign !== 0 && Math.abs(Math.abs(turning) - Math.PI * 2) < 1e-6;
 }
 
-/** Office focus point of a path shade, normalized to its frame. */
+/** Fixed point of the frame→fillToRect scaling, normalized to the frame:
+ * l/(l+r), t/(t+b). Omitted fillToRect centers it; the identity mapping (all
+ * zero) has no fixed point and uses the frame origin. */
 export function pathShadeFocus(fill: GradientFill): Point {
   const rect = fill.fillToRect;
-  // Omitted fillToRect centers the shade. Otherwise the focus is the fixed
-  // point of the frame→fillToRect scaling, l/(l+r) and t/(t+b). The identity
-  // mapping (all zero) has no fixed point; Office then uses the frame origin.
   if (!rect) return [0.5, 0.5];
   const axis = (low = 0, high = 0) => {
     const sum = low + high;
@@ -188,10 +190,20 @@ export function pathShadeFocus(fill: GradientFill): Point {
   return [axis(rect.l, rect.r), axis(rect.t, rect.b)];
 }
 
-function rgbaChannels(color: string): [number, number, number, number] {
-  const hex = color.charCodeAt(0) === 35 ? color.slice(1) : color;
-  const value = (offset: number) => Number.parseInt(hex.slice(offset, offset + 2), 16);
-  return [value(0), value(2), value(4), hex.length >= 8 ? value(6) : 255];
+/** The focus (center-shade) rectangle normalized to the frame: origin and
+ * size. Omitted fillToRect is the frame center point; an inverted axis
+ * collapses to its fixed point. */
+export function pathShadeFocusRect(fill: GradientFill): { origin: Point; size: Point } {
+  const rect = fill.fillToRect;
+  if (!rect) return { origin: [0.5, 0.5], size: [0, 0] };
+  const [fx, fy] = pathShadeFocus(fill);
+  const axis = (low = 0, high = 0, fixed: number): [number, number] => {
+    const size = 1 - low - high;
+    return Number.isFinite(size) && size > 0 ? [low, size] : [fixed, 0];
+  };
+  const [ox, kx] = axis(rect.l, rect.r, fx);
+  const [oy, ky] = axis(rect.t, rect.b, fy);
+  return { origin: [ox, oy], size: [kx, ky] };
 }
 
 const rectangle = (box: ShadeBox): Point[] =>
@@ -206,138 +218,156 @@ function boundsOf(points: Point[]): ShadeBox {
   return { x: left, y: top, w: right - left, h: bottom - top };
 }
 
-const LUT_STEPS = 4095;
-
-/** RGBA lookup over gradient position, interpolating the (Office-expanded)
- * stops linearly; positions outside the stop range take the end stops. */
-function colorTable(stops: readonly GradientStop[]): Uint8ClampedArray {
-  const table = new Uint8ClampedArray((LUT_STEPS + 1) * 4);
-  const parsed = stops.map(stop => ({ position: stop.position, rgba: rgbaChannels(stop.color) }));
-  let index = 0;
-  for (let i = 0; i <= LUT_STEPS; i++) {
-    const t = i / LUT_STEPS;
-    while (index < parsed.length - 1 && parsed[index + 1].position < t) index++;
-    const low = parsed[Math.max(0, Math.min(index, parsed.length - 1))];
-    const high = parsed[Math.min(index + 1, parsed.length - 1)];
-    const span = high.position - low.position;
-    const a = t <= low.position ? 0 : t >= high.position || span <= 0 ? 1 : (t - low.position) / span;
-    for (let k = 0; k < 4; k++) table[i * 4 + k] = low.rgba[k] + a * (high.rgba[k] - low.rgba[k]);
+/** O(n) vertex clustering of a closed polygon in raster pixels: consecutive
+ * vertices sharing one cell of the given size collapse to the first, so the
+ * outline moves by at most the cell diagonal. */
+function cluster(polygon: Point[], cell: number): Point[] {
+  const out: Point[] = [];
+  let lastX = Number.NaN; let lastY = Number.NaN;
+  for (const p of polygon) {
+    const cx = Math.floor(p[0] / cell); const cy = Math.floor(p[1] / cell);
+    if (cx === lastX && cy === lastY) continue;
+    out.push(p); lastX = cx; lastY = cy;
   }
-  return table;
+  return out.length >= 3 ? out : polygon.slice(0, 3);
+}
+
+/** Linear stop lookup sampled from a native Canvas ramp, so interpolation
+ * (including translucent stops) matches the linear and circle gradients. */
+function colorTable(ctx: CanvasRenderingContext2D, stops: readonly GradientStop[]): Uint8ClampedArray | null {
+  const ramp = createAuxCanvasForContext(ctx, 1024, 1);
+  const rampCtx = ramp?.getContext('2d') as CanvasRenderingContext2D | null | undefined;
+  if (!ramp || !rampCtx) return null;
+  const gradient = rampCtx.createLinearGradient(0, 0, 1024, 0);
+  for (const stop of stops) {
+    const hex = stop.color.replace(/^#/, '');
+    gradient.addColorStop(Math.max(0, Math.min(1, stop.position)), `#${hex}`);
+  }
+  rampCtx.fillStyle = gradient;
+  rampCtx.fillRect(0, 0, 1024, 1);
+  return rampCtx.getImageData(0, 0, 1024, 1).data;
+}
+
+function rgba(color: string): [number, number, number, number] {
+  const hex = color.replace(/^#/, '');
+  const value = (offset: number) => Number.parseInt(hex.slice(offset, offset + 2), 16);
+  return [value(0), value(2), value(4), hex.length >= 8 ? value(6) : 255];
+}
+
+/** Gradient position of point (u, v) in the band of edge a→b, or -1. The band
+ * joins the edge to its image in the focus rectangle; its contour at position
+ * s is the edge under M_s(q) = (s + (1-s)k)∘q + (1-s)o. Solved exactly. */
+function bandPosition(u: number, v: number, ax: number, ay: number, ex: number, ey: number,
+  ox: number, oy: number, kx: number, ky: number): number {
+  // Per axis: (a + t e)·g(s) = p - h(s), g = k + s(1-k), h = (1-s)o.
+  const x0 = u - ox - ax * kx; const x1 = ox - ax * (1 - kx);
+  const y0 = v - oy - ay * ky; const y1 = oy - ay * (1 - ky);
+  const gx0 = kx; const gx1 = 1 - kx; const gy0 = ky; const gy1 = 1 - ky;
+  const c2 = ey * x1 * gy1 - ex * y1 * gx1;
+  const c1 = ey * (x0 * gy1 + x1 * gy0) - ex * (y0 * gx1 + y1 * gx0);
+  const c0 = ey * x0 * gy0 - ex * y0 * gx0;
+  const roots: number[] = [];
+  if (Math.abs(c2) < 1e-12) {
+    if (Math.abs(c1) > 1e-12) roots.push(-c0 / c1);
+  } else {
+    const disc = c1 * c1 - 4 * c2 * c0;
+    if (disc >= 0) {
+      const root = Math.sqrt(disc);
+      roots.push((-c1 - root) / (2 * c2), (-c1 + root) / (2 * c2));
+    }
+  }
+  let best = -1;
+  const length2 = ex * ex + ey * ey;
+  // A degenerate (segment or point) focus: the s = 0 contour is the edge's
+  // image A(a + t e) itself, where the general solve divides by zero.
+  if (kx <= 1e-12 || ky <= 1e-12) {
+    const along = kx > 1e-12 && Math.abs(ex) > 1e-12 ? ((u - ox) / kx - ax) / ex
+      : ky > 1e-12 && Math.abs(ey) > 1e-12 ? ((v - oy) / ky - ay) / ey : 0;
+    if (along >= -1e-9 && along <= 1 + 1e-9
+      && Math.abs(ox + kx * (ax + along * ex) - u) <= 1e-9
+      && Math.abs(oy + ky * (ay + along * ey) - v) <= 1e-9) return 0;
+  }
+  for (const s of roots) {
+    if (!(s >= -1e-9 && s <= 1 + 1e-9)) continue;
+    const gx = gx0 + gx1 * s; const gy = gy0 + gy1 * s;
+    if (gx <= 1e-12 || gy <= 1e-12) continue;
+    const qx = (u - (1 - s) * ox) / gx; const qy = (v - (1 - s) * oy) / gy;
+    const t = ((qx - ax) * ex + (qy - ay) * ey) / length2;
+    if (t < -1e-9 || t > 1 + 1e-9) continue;
+    const clamped = Math.min(1, Math.max(0, s));
+    if (best < 0 || clamped < best) best = clamped;
+  }
+  return best;
 }
 
 /**
- * Gradient position of the focus fan: the last edge (in path order) whose
- * triangle (focus, a, b) contains the point gives 1 - λ(focus), the homothety
- * ratio toward the focus; uncovered points are 1. Candidate edges are bucketed
- * by angle around the focus, so a point tests only edges spanning its angle.
- */
-function fanField(polygons: Point[][], focus: Point): (x: number, y: number) => number {
-  const edges: Array<{ ax: number; ay: number; bx: number; by: number; inverse: number }> = [];
-  for (const polygon of polygons) {
-    for (let i = 0; i < polygon.length; i++) {
-      const a = polygon[i]; const b = polygon[(i + 1) % polygon.length];
-      const ax = a[0] - focus[0]; const ay = a[1] - focus[1];
-      const bx = b[0] - focus[0]; const by = b[1] - focus[1];
-      const det = ax * by - ay * bx;
-      // A triangle without area (focus on the edge's line) shades nothing.
-      if (!(Math.abs(det) > 1e-9 * Math.max(1, Math.hypot(ax, ay) * Math.hypot(bx, by)))) continue;
-      edges.push({ ax, ay, bx, by, inverse: 1 / det });
-    }
-  }
-  const bins = Math.min(4096, Math.max(64, edges.length * 4));
-  const binOf = (angle: number) => Math.min(bins - 1, Math.max(0,
-    Math.floor(((angle + Math.PI) / (Math.PI * 2)) * bins)));
-  const buckets: number[][] = Array.from({ length: bins }, () => []);
-  edges.forEach((edge, index) => {
-    // Each triangle spans less than π around the focus; walk its bins from a
-    // to b the short way, inclusive of both partial end bins.
-    const start = Math.atan2(edge.ay, edge.ax);
-    let sweep = Math.atan2(edge.by, edge.bx) - start;
-    if (sweep > Math.PI) sweep -= Math.PI * 2;
-    if (sweep < -Math.PI) sweep += Math.PI * 2;
-    let low = sweep >= 0 ? start : start + sweep;
-    if (low < -Math.PI) low += Math.PI * 2;
-    const from = binOf(low);
-    const count = Math.ceil(Math.abs(sweep) / (Math.PI * 2) * bins) + 1;
-    for (let k = 0; k <= count; k++) buckets[(from + k) % bins].push(index);
-  });
-  return (x: number, y: number) => {
-    const px = x - focus[0]; const py = y - focus[1];
-    if (px === 0 && py === 0) return 0;
-    const bucket = buckets[binOf(Math.atan2(py, px))];
-    for (let k = bucket.length - 1; k >= 0; k--) {
-      const e = edges[bucket[k]];
-      const la = (px * e.by - py * e.bx) * e.inverse;
-      const lb = (e.ax * py - e.ay * px) * e.inverse;
-      if (la >= -1e-12 && lb >= -1e-12 && la + lb <= 1 + 1e-12) return la + lb;
-    }
-    return 1;
-  };
-}
-
-/**
- * Path shade for `path="rect"` and `path="shape"` (ECMA-376 §20.1.8.46). The
- * standard requires shape-following contours but defines no interpolation;
- * this is the Office model measured from PowerPoint's own rasters (#1599):
+ * Path shade for `path="rect"` and `path="shape"` (ECMA-376 §20.1.8.46).
  *
- * - The field is a fan of triangles from the focus to every outline edge,
- *   painted in path order (a later triangle wins). Inside a triangle the
- *   gradient position is the homothety ratio toward the focus: 0 at the
- *   focus, 1 on that edge. For an outline star-shaped about the focus this is
- *   exactly "contours are scaled copies of the outline".
- * - `path="rect"` uses the frame rectangle as outline (box isolines) and
- *   `path="shape"` the fill-bearing geometry outline.
- * - The focus is {@link pathShadeFocus}; there is no flat first-stop area,
- *   unlike §20.1.8.31 and [MS-OE376] §2.1.1377.
- * - rotWithShape=false: the frame is the axis-aligned device bounding box of
- *   the transformed outline, unmirrored.
+ * Normative/documented model: the center shade (first stop) fills the focus
+ * rectangle — in Office, the gradient path inscribed in fillToRect relative to
+ * the shape box ([MS-OE376] §2.1.1377 a/b) — and the shade runs to the last
+ * stop at the outline. Contour s is the outline under the affine blend
+ * M_s = s·I + (1-s)·A, A mapping the frame onto the focus rectangle, so the
+ * band between each outline edge and its inscribed image is shaded exactly.
+ * `path="rect"` uses the frame rectangle (the inscribed copy is fillToRect).
  *
- * Returns 'circle' for a shape outline that is not strictly star-shaped about
- * its box center: Office substitutes the circle path for those geometries.
+ * Office observation (#1599, PowerPoint 16.113 screen/print preview and its
+ * point-focus rasters): an explicit all-zero fillToRect is solid first stop;
+ * an inset area is flat; a degenerate segment/point focus shades toward it.
+ * Where contours are not nested (focus outside the outline's kernel) Office's
+ * point-focus rasters paint edge bands in path order, the later band winning;
+ * this generalizes the same way to area foci.
+ *
+ * Outlines that are not strictly star-shaped about the box center (arrows,
+ * chevron, donut, concave custom paths) are shaded by PowerPoint as a circle
+ * about the fixed point of the frame→fillToRect scaling with no flat area,
+ * reaching the farthest frame corner (screen controls with zero, corner,
+ * edge, center and area foci; exported radius for centered foci). Which
+ * outlines Office classes this way is measured only for those geometries.
+ *
+ * rotWithShape=false frames the shade by the axis-aligned device bounds of
+ * the transformed outline, unmirrored (PowerPoint point-focus rasters).
  * Returns null when the host cannot allocate the shade raster.
  */
 export function resolvePathShade(
   fill: GradientFill, ctx: CanvasRenderingContext2D,
   frame: ShadeBox, shapeBox: ShadeBox, outline?: FillOutline,
-  focusOverride?: Point,
-): CanvasPattern | 'circle' | null {
+  focusOverride?: { origin: Point; size: Point },
+): CanvasPattern | null {
   if (![frame, shapeBox].every(box => [box.x, box.y, box.w, box.h].every(Number.isFinite)
     && box.w > 0 && box.h > 0)) return null;
+  if (typeof ctx.getTransform !== 'function' || fill.stops.length === 0) return null;
   const outlinePolygons = outline ? flattenFillOutline(outline, ctx, shapeBox) : [];
   const coverage = outlinePolygons.length > 0 ? outlinePolygons : [rectangle(shapeBox)];
-  if (fill.path === 'shape' && !isStrictlyStarShaped(
+  const circular = fill.path === 'shape' && !isStrictlyStarShaped(
     coverage, [shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2], shapeBox,
-  )) return 'circle';
-  if (typeof ctx.getTransform !== 'function') return null;
+  );
 
   const t = ctx.getTransform();
   const user: Matrix = [t.a, t.b, t.c, t.d, t.e, t.f];
   const userInverse = user.every(Number.isFinite) ? invert(user) : null;
   if (!userInverse) return null;
   const fixed = fill.rotWithShape === false;
-  // Field space is user space, or device space when the shade neither rotates
-  // nor mirrors with the shape.
   const toField = (p: Point): Point => (fixed ? apply(user, p[0], p[1]) : p);
   const coverageField = coverage.map(polygon => polygon.map(toField));
   const fieldFrame = fixed
     ? boundsOf(outlinePolygons.length > 0 ? coverageField.flat() : rectangle(frame).map(toField))
     : frame;
   if (!(fieldFrame.w > 0 && fieldFrame.h > 0)) return null;
-  const field = fill.path === 'shape' ? coverageField : [rectangle(fieldFrame)];
-  const [fx, fy] = focusOverride ?? pathShadeFocus(fill);
-  const focus: Point = [fieldFrame.x + fieldFrame.w * fx, fieldFrame.y + fieldFrame.h * fy];
-  if (!focus.every(Number.isFinite)) return null;
 
-  // Allocate for everything the fill may paint (callout tails, custom paths
-  // outside the xfrm box) plus the frame itself.
+  // Raster bounds: everything the fill may paint, the frame, and a stroke
+  // allowance from the current line state (half width scaled by the miter
+  // limit or line-end size), because uncovered pattern pixels are transparent.
   const toDevice = (p: Point): Point => (fixed ? p : apply(user, p[0], p[1]));
-  const device = boundsOf([...coverageField.flat(), ...rectangle(fieldFrame)].map(toDevice));
+  const lineWidth = Number.isFinite(ctx.lineWidth) ? Math.max(0, ctx.lineWidth) : 0;
+  const miter = Number.isFinite(ctx.miterLimit) ? ctx.miterLimit : 10;
+  const userScale = Math.sqrt(Math.abs(user[0] * user[3] - user[1] * user[2]));
+  const outset = lineWidth * Math.max(miter, 5) / 2 * userScale + 1;
+  const painted = boundsOf([...coverageField.flat(), ...rectangle(fieldFrame)].map(toDevice));
+  const device = { x: painted.x - outset, y: painted.y - outset, w: painted.w + 2 * outset, h: painted.h + 2 * outset };
   if (![device.x, device.y, device.w, device.h].every(Number.isFinite)) return null;
   const k = Math.min(1, (MAX_EDGE - 2 * MARGIN - 1) / Math.max(device.w, 1e-9),
     (MAX_EDGE - 2 * MARGIN - 1) / Math.max(device.h, 1e-9));
-  // At full resolution the raster is aligned to the device pixel grid, so the
-  // pattern is sampled without resampling blur.
   const originX = k === 1 ? Math.floor(device.x) : device.x;
   const originY = k === 1 ? Math.floor(device.y) : device.y;
   const inner = MAX_EDGE - 2 * MARGIN;
@@ -347,21 +377,138 @@ export function resolvePathShade(
   const deviceToAux = invert(auxToDevice);
   if (!deviceToAux) return null;
   const fieldToAux = fixed ? deviceToAux : multiply(deviceToAux, user);
+  const auxToField = invert(fieldToAux);
+  if (!auxToField) return null;
+  const normToField: Matrix = [fieldFrame.w, 0, 0, fieldFrame.h, fieldFrame.x, fieldFrame.y];
+  const normToAux = multiply(fieldToAux, normToField);
+  const auxToNorm = invert(normToAux);
+  if (!auxToNorm) return null;
 
-  const stops = officeGradientStops([...fill.stops].sort((a, b) => a.position - b.position));
   const surface = createAuxCanvasForContext(ctx, bw, bh);
   const target = surface?.getContext('2d') as CanvasRenderingContext2D | null | undefined;
-  if (!surface || !target || typeof target.createImageData !== 'function') return null;
-  const lut = colorTable(stops);
-  const shade = fanField(field.map(polygon => polygon.map(p => apply(fieldToAux, p[0], p[1]))),
-    apply(fieldToAux, focus[0], focus[1]));
+  const stops = [...fill.stops].sort((a, b) => a.position - b.position);
+  const ramp = colorTable(ctx, stops);
+  if (!surface || !target || !ramp || typeof target.createImageData !== 'function') return null;
+  const first = rgba(stops[0].color);
+  const last = rgba(stops[stops.length - 1].color);
+  const shade = new Float32Array(bw * bh).fill(Number.NaN);
+
+  if (circular) {
+    const [fx, fy] = pathShadeFocus(fill);
+    const cx = fieldFrame.x + fieldFrame.w * fx; const cy = fieldFrame.y + fieldFrame.h * fy;
+    const radius = Math.max(...rectangle(fieldFrame).map(([x, y]) => Math.hypot(x - cx, y - cy)));
+    for (let row = 0; row < bh; row++) {
+      for (let col = 0; col < bw; col++) {
+        const [x, y] = apply(auxToField, col + .5, row + .5);
+        shade[row * bw + col] = radius > 0 ? Math.hypot(x - cx, y - cy) / radius : 0;
+      }
+    }
+  } else {
+    const { origin: [ox, oy], size: [kx, ky] } = focusOverride ?? pathShadeFocusRect(fill);
+    // Normalized outline. Beyond EDGE_LIMIT edges, cluster vertices on a
+    // doubling raster grid (one O(n) pass each) until the limit holds; the
+    // outline then deviates by at most √2 × the final cell size in pixels.
+    const toNorm = (p: Point): Point => [(p[0] - fieldFrame.x) / fieldFrame.w, (p[1] - fieldFrame.y) / fieldFrame.h];
+    let polygons = fill.path === 'shape' ? coverageField.map(polygon => polygon.map(toNorm)) : [rectangle({ x: 0, y: 0, w: 1, h: 1 })];
+    const edgeCount = () => polygons.reduce((sum, polygon) => sum + polygon.length, 0);
+    for (let cell = .5; edgeCount() > EDGE_LIMIT && cell <= 2 * MAX_EDGE; cell *= 2) {
+      polygons = polygons.map(polygon => cluster(
+        polygon.map(p => apply(normToAux, p[0], p[1])), cell,
+      ).map(p => apply(auxToNorm, p[0], p[1])));
+    }
+    // Row-wise "next unfilled column" links: each pixel is evaluated once.
+    const next = new Int32Array(bh * (bw + 1));
+    for (let row = 0; row < bh; row++) for (let col = 0; col <= bw; col++) next[row * (bw + 1) + col] = col;
+    const find = (row: number, col: number): number => {
+      const base = row * (bw + 1);
+      let root = col;
+      while (next[base + root] !== root) root = next[base + root];
+      while (next[base + col] !== root) { const up = next[base + col]; next[base + col] = root; col = up; }
+      return root;
+    };
+    const edges: Array<[Point, Point]> = [];
+    for (const polygon of polygons) {
+      for (let i = 0; i < polygon.length; i++) edges.push([polygon[i], polygon[(i + 1) % polygon.length]]);
+    }
+    const inset = (p: Point): Point => [ox + kx * p[0], oy + ky * p[1]];
+    // Later bands win: visit bands in reverse path order, first visit fixes a pixel.
+    for (let index = edges.length - 1; index >= 0; index--) {
+      const [a, b] = edges[index];
+      const ex = b[0] - a[0]; const ey = b[1] - a[1];
+      if (ex === 0 && ey === 0) continue;
+      const corners = [inset(a), inset(b), b, a].map(p => apply(normToAux, p[0], p[1]));
+      let area = 0;
+      for (let i = 0; i < 4; i++) {
+        const p = corners[i]; const q = corners[(i + 1) % 4];
+        area += p[0] * q[1] - q[0] * p[1];
+      }
+      if (!(Math.abs(area) > 1e-9)) continue;
+      const ys = corners.map(p => p[1]);
+      const rowStart = Math.max(0, Math.ceil(Math.min(...ys) - .5));
+      const rowEnd = Math.min(bh - 1, Math.floor(Math.max(...ys) - .5));
+      for (let row = rowStart; row <= rowEnd; row++) {
+        const y = row + .5;
+        let low = Infinity; let high = -Infinity;
+        for (let i = 0; i < 4; i++) {
+          const p = corners[i]; const q = corners[(i + 1) % 4];
+          if ((p[1] <= y && q[1] >= y) || (q[1] <= y && p[1] >= y)) {
+            if (p[1] === q[1]) { low = Math.min(low, p[0], q[0]); high = Math.max(high, p[0], q[0]); continue; }
+            const x = p[0] + (y - p[1]) / (q[1] - p[1]) * (q[0] - p[0]);
+            low = Math.min(low, x); high = Math.max(high, x);
+          }
+        }
+        if (!(high >= low)) continue;
+        const colEnd = Math.min(bw - 1, Math.floor(high - .5));
+        let col = find(row, Math.max(0, Math.ceil(low - .5)));
+        while (col <= colEnd) {
+          const [u, v] = apply(auxToNorm, col + .5, row + .5);
+          const s = bandPosition(u, v, a[0], a[1], ex, ey, ox, oy, kx, ky);
+          if (s >= 0) {
+            shade[row * bw + col] = s;
+            next[row * (bw + 1) + col] = col + 1;
+          }
+          col = find(row, col + 1);
+        }
+      }
+    }
+    // Uncovered pixels: the inscribed focus region (nonzero rule) is first stop.
+    if (kx > 0 && ky > 0) {
+      const innerEdges = edges.map(([a, b]) => [inset(a), inset(b)].map(p => apply(normToAux, p[0], p[1])));
+      for (let row = 0; row < bh; row++) {
+        const y = row + .5;
+        const crossings: Array<[number, number]> = [];
+        for (const [p, q] of innerEdges) {
+          if ((p[1] <= y) !== (q[1] <= y)) {
+            crossings.push([p[0] + (y - p[1]) / (q[1] - p[1]) * (q[0] - p[0]), q[1] > p[1] ? 1 : -1]);
+          }
+        }
+        crossings.sort((m, n) => m[0] - n[0]);
+        let winding = 0;
+        for (let i = 0; i < crossings.length - 1; i++) {
+          winding += crossings[i][1];
+          if (winding === 0) continue;
+          const start = Math.max(0, Math.ceil(crossings[i][0] - .5));
+          const end = Math.min(bw - 1, Math.floor(crossings[i + 1][0] - .5));
+          for (let col = start; col <= end; col++) {
+            if (Number.isNaN(shade[row * bw + col])) shade[row * bw + col] = 0;
+          }
+        }
+      }
+    }
+  }
+
   const pixels = target.createImageData(bw, bh);
   const data = pixels.data;
-  for (let row = 0, offset = 0; row < bh; row++) {
-    for (let col = 0; col < bw; col++, offset += 4) {
-      const entry = Math.round(Math.min(1, Math.max(0, shade(col + .5, row + .5))) * LUT_STEPS) * 4;
-      data[offset] = lut[entry]; data[offset + 1] = lut[entry + 1];
-      data[offset + 2] = lut[entry + 2]; data[offset + 3] = lut[entry + 3];
+  for (let i = 0, offset = 0; i < shade.length; i++, offset += 4) {
+    const s = Number.isNaN(shade[i]) ? 1 : shade[i];
+    const color = s <= 0 ? first : s >= 1 ? last : undefined;
+    if (color) {
+      data[offset] = color[0]; data[offset + 1] = color[1]; data[offset + 2] = color[2]; data[offset + 3] = color[3];
+    } else {
+      // Canvas samples the ramp at texel centers.
+      const entry = Math.min(1023, Math.floor(s * 1024)) * 4;
+      data[offset] = ramp[entry]; data[offset + 1] = ramp[entry + 1];
+      data[offset + 2] = ramp[entry + 2]; data[offset + 3] = ramp[entry + 3];
     }
   }
   target.putImageData(pixels, 0, 0);
