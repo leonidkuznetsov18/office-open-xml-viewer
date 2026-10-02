@@ -159,6 +159,17 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
         None if os2 is None
         else [int(os2.panose.bFamilyType), int(os2.panose.bSerifStyle)]
     )
+    # Whether the face's Unicode cmap maps any CJK Unified Ideograph
+    # (U+4E00-U+9FFF) to a glyph. PowerPoint's empty-EA fallback (#1689
+    # controls) keeps a Far-East face's own script chain only when the face
+    # really draws basic CJK: SimSun-ExtB and MingLiU-ExtB declare Far-East
+    # code pages but map no BMP ideograph, and fall back by PANOSE instead.
+    # Null means the face has no Unicode cmap.
+    cmap = font.getBestCmap() if "cmap" in font else None
+    profile["cjkUnifiedIdeographs"] = (
+        None if cmap is None
+        else any(0x4E00 <= code <= 0x9FFF and glyph != ".notdef" for code, glyph in cmap.items())
+    )
     # OS/2 typo metrics, recorded only when fsSelection USE_TYPO_METRICS (bit 7,
     # OS/2 v4+) asks layout to use them (#1604: Gabriola in Excel).
     if os2 is not None and (os2_version or 0) >= 4 and (fs_selection or 0) & 0x80:
@@ -168,7 +179,7 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
     # the runtime profile. The identity still covers that raw OS/2 value.
     identity_profile = {
         **{key: value for key, value in profile.items()
-           if key not in {"farEastCodePage", "win", "typoMetrics", "panose"}},
+           if key not in {"farEastCodePage", "win", "typoMetrics", "panose", "cjkUnifiedIdeographs"}},
         "os2": None if os2 is None else {
             "codePageRange1": provenance_code_page_range1,
         },

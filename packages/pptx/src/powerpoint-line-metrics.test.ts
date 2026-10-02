@@ -213,9 +213,30 @@ describe('PowerPoint text-box line metrics (#1610)', () => {
     expect(units(n.map((y) => y - 3.6))).toEqual([43, 97, 151, 205]);
   });
 
-  it('keeps the ordinary line model when any run has an unresolved face', () => {
+  it('sizes a line by its known faces when one run has an unresolved face (#1689)', () => {
+    // An unresolved face adds no face to its line; the line keeps the metric
+    // model of its known faces (Arial's usWin share), not the 0.8 split.
     const ys = baselines([paragraph([{ text: 'H', font: 'Arial', size: 20 }, { text: 'g', font: 'Avenir', size: 20 }])]);
-    expect(ys[0]).toBeCloseTo(20 * 1.2 * 0.8, 5);
+    expect(ys[0]).toBeCloseTo(20 * 1.2 * (1854 / (1854 + 434)), 5);
+  });
+
+  it('keeps only a line with no known face on the ordinary model (#1689 line scope)', () => {
+    // fallback.win.pdf: an unmodelled face moves only its own line. A body
+    // whose middle line has no known face keeps the metric baselines of the
+    // other lines exactly.
+    const known = baselines([
+      paragraph([{ text: 'A', font: 'Arial', size: 20 }]),
+      paragraph([{ text: 'B', font: 'Arial', size: 20 }]),
+      paragraph([{ text: 'C', font: 'Arial', size: 20 }]),
+    ]);
+    const mixed = baselines([
+      paragraph([{ text: 'A', font: 'Arial', size: 20 }]),
+      paragraph([{ text: 'B', font: 'Avenir', size: 20 }]),
+      paragraph([{ text: 'C', font: 'Arial', size: 20 }]),
+    ]);
+    expect(mixed[0]).toBeCloseTo(known[0], 9);
+    expect(mixed[2]).toBeCloseTo(known[2], 9);
+    expect(mixed[1] - known[0] - (known[1] - known[0])).toBeCloseTo(20 * 1.2 * (0.8 - 1854 / 2288), 5);
   });
 });
 

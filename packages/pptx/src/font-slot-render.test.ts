@@ -166,10 +166,14 @@ describe('PPTX language-dependent font slots through the renderer', () => {
       body([run('A§B', 'en-US', { letterSpacing: 3 })]), 35, 0, 0, SCALE, RC)).toBe(true);
   });
 
-  it('uses the existing application-default tiers for newly selected ea punctuation', () => {
-    expect(segments([run('§°±×÷“”', 'ja-JP', { fontFamilyEa: undefined })])[0].face).toBe('MS Gothic');
-    expect(segments([run('§°±×÷“”', 'ja-JP', { fontFamily: 'Perpetua', fontFamilyEa: undefined })])[0].face)
-      .toBe('MS Mincho');
+  it('draws newly selected ea punctuation in the selected face of an empty ea slot', () => {
+    // #1689 emptyea E07/E16: the named cs face draws the neutral symbols; with
+    // no cs face (emptyea3 H02) the Latin face does. Language plays no part.
+    expect(segments([run('§°±×÷“”', 'ja-JP', { fontFamilyEa: undefined })])[0].face)
+      .toBe('Microsoft Sans Serif');
+    expect(segments([run('§°±×÷“”', 'ja-JP', {
+      fontFamily: 'Perpetua', fontFamilyEa: undefined, fontFamilyCs: undefined,
+    })])[0].face).toBe('Perpetua');
   });
 
   it('maps Japanese backslash before measuring, without changing its Latin slot', () => {

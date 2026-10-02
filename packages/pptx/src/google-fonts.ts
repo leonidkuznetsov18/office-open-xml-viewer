@@ -63,8 +63,10 @@ function* textBodyFontFamilies(body: TextBody | null | undefined, minorFont: str
       // Noto fallback rather than every regional tail in the CSS safety net.
       const eaText = eastAsianText[index];
       if (eaText) {
+        // An empty ea slot selects the named cs face, else the Latin face
+        // (#1689); its CJK fallback follows that selected face.
         const eaFace = run.fontFamilyEa ?? eastAsianDefaultFaces(
-          run.fontFamily ?? paragraph.defFontFamily ?? minorFont, eaText,
+          run.fontFamilyCs ?? run.fontFamily ?? paragraph.defFontFamily ?? minorFont, eaText,
         )[0];
         const lang = classifyCjkFont(eaFace);
         const variant = classifyFontGeneric(eaFace) === 'serif' ? 'serif' : 'sans';

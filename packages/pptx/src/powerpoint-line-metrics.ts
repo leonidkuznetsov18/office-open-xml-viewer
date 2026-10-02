@@ -1,4 +1,4 @@
-import { findReferenceFontMetrics } from '@silurus/ooxml-core';
+import { findReferenceFontMetrics, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 
 /**
@@ -90,6 +90,18 @@ function chosenProfiles(family: string, bold: boolean, italic: boolean): Profile
     // Calibri Light title embedded Calibri-Light itself (#1435 deck).
     const named = findReferenceFontMetrics(name, { style });
     if (named.length > 0 && named.every((p) => p.weight === named[0].weight)) profiles = named;
+  }
+  // A catalogued family with no italic face at any weight is drawn by
+  // PowerPoint as its upright face with a synthetic slant (#1689: MS Gothic,
+  // Tahoma and Microsoft Sans Serif italics embed the regular resource under a
+  // [1 0 0.3333 1] text matrix). A shear leaves the vertical OS/2 metrics
+  // intact, so the upright resource's metrics apply. The catalogue lists every
+  // installed static face, so a missing italic profile is a missing resource,
+  // not a gap in the data. Painting keeps the browser's own oblique for the
+  // missing style: an accepted platform difference (owner decision (c) for
+  // #1689), not an emulated 0.3333 shear.
+  if (profiles.length === 0 && italic && findReferenceFontMetrics(name, { style: 'italic' }).length === 0) {
+    return chosenProfiles(family, bold, false);
   }
   const supplemental = profiles.filter((p) => p.source === 'macos-supplemental');
   return supplemental.length > 0 ? supplemental : profiles.filter((p) => p.source === 'office-mac');
@@ -201,8 +213,9 @@ const faceCache = new Map<string, PowerPointFaceMetrics | null>();
 
 /**
  * The line metrics of a face, or undefined when its share is unresolvable
- * (the caller then keeps the ordinary line model for the whole body). Bounded
- * LRU like the share cache.
+ * (the face then adds nothing to its line's metric model; a line with no
+ * known face keeps the ordinary model, #1689). Bounded LRU like the share
+ * cache.
  */
 export function powerPointFaceMetrics(
   family: string,
@@ -227,6 +240,33 @@ export function powerPointFaceMetrics(
     if (oldest !== undefined) faceCache.delete(oldest);
   }
   return metrics ?? undefined;
+}
+
+/**
+ * Line metrics of a concrete font resource from its own OS/2 tables (#1689:
+ * PowerPoint sizes a line by the embedded resource's usWinAscent /
+ * usWinDescent, or its typo metrics plus line gap under USE_TYPO_METRICS),
+ * the same rule as the reference catalogue. Used for a deck-embedded face,
+ * whose bytes the renderer holds. The #1604 compatLnSpc="0" box needs the
+ * face's installation source, which an embedded part does not have, so it
+ * stays undefined and that body keeps the ordinary model, as before.
+ */
+export function powerPointResourceFaceMetrics(metrics: OpenTypeLineMetrics): PowerPointFaceMetrics | undefined {
+  const upm = metrics.unitsPerEm;
+  if (!(upm > 0)) return undefined;
+  let ascent: number | undefined;
+  let descent: number | undefined;
+  if (metrics.useTypoMetrics && metrics.typoAscent !== undefined && metrics.typoDescent !== undefined) {
+    ascent = metrics.typoAscent + Math.max(0, metrics.typoLineGap ?? 0);
+    descent = -metrics.typoDescent;
+  } else if (metrics.winAscent !== undefined && metrics.winDescent !== undefined) {
+    ascent = metrics.winAscent;
+    descent = metrics.winDescent;
+  }
+  if (ascent === undefined || descent === undefined) return undefined;
+  const share = ascent / (ascent + descent);
+  if (!Number.isFinite(share) || share <= 0 || share >= 1) return undefined;
+  return Object.freeze({ share, glyph: { ascent: ascent / upm, descent: descent / upm }, excel: undefined });
 }
 
 /** One run's contribution to a line: its authored size and ascent share. */

@@ -25,6 +25,10 @@ export interface ReferenceFontMetricProfile {
   /** OS/2 PANOSE [bFamilyType, bSerifStyle]. Null means the face has no OS/2
    * table; undefined means this source did not record the field. */
   readonly panose?: readonly [familyType: number, serifStyle: number] | null;
+  /** True when the face's Unicode cmap maps a CJK Unified Ideograph
+   * (U+4E00–U+9FFF). Null means the face has no Unicode cmap; undefined means
+   * this source did not record coverage. */
+  readonly cjkUnifiedIdeographs?: boolean | null;
 }
 
 export interface FindReferenceFontMetricsOptions {

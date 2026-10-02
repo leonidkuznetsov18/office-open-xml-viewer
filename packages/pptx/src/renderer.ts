@@ -167,6 +167,7 @@ import { drawEaVertRun } from './vertical-text.js';
 import { renderStackedText, type StackedParagraphInput } from './stacked-text.js';
 import {
   COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
+  emptyEastAsianDrawingFace, emptyEastAsianSlotFaces,
 } from './east-asian-default.js';
 import { powerPointDisplayCluster, powerPointFontRouting } from './font-slot-compatibility.js';
 import {
@@ -195,6 +196,10 @@ export interface RenderContext {
   /** Isolated FontFace alias → lower-cased authored family for fallback policy. */
   embeddedFontAuthoredFamilies?: ReadonlyMap<string, string>;
   embeddedFontTuples?: ReadonlySet<string>;
+  /** Line metrics of each registered embedded face, keyed like
+   * `embeddedFontTuples` (authored family:weight:style), parsed from the
+   * font part's own OS/2 tables (#1689 selected-resource metrics). */
+  embeddedFontMetrics?: ReadonlyMap<string, PowerPointFaceMetrics>;
   /** Theme hyperlink colour as a 6-char hex (no leading #), or null. */
   themeHlinkColor?: string | null;
   /**
@@ -768,8 +773,10 @@ type LayoutSegment = {
   font: string;
   /** Inline DrawingML TAB, classified UAX#9 S during visual ordering (#916). */
   isTab?: true;
-  /** PowerPoint's line metrics for this segment's face (see
-   * powerPointFaceMetrics); undefined when the face is not resolvable. */
+  /** PowerPoint's line metrics for this segment's drawing face (see
+   * powerPointFaceMetrics); undefined when that face or its resource is not
+   * known, including a glyph left to the platform's glyph fallback (#1689).
+   * Such a segment adds no face to its line's metric model. */
   lineMetric?: PowerPointFaceMetrics;
   /** Metrics of the run's latin face. PowerPoint sizes a line by the run's
    * latin face even when an East Asian segment draws none of its glyphs
@@ -1226,9 +1233,12 @@ export function buildFont(
 
 /**
  * The PowerPoint line metrics of a resolved family (see
- * powerPointFaceMetrics). A document-embedded face has its own bytes, which
- * the reference catalog does not describe, so it has none, and neither does
- * a CSS generic family.
+ * powerPointFaceMetrics): the selected resource's own OS/2 metrics. A
+ * document-embedded face is described by its own font part (#1689), parsed
+ * when it was registered; an installed face by the reference catalogue. A
+ * missing italic or bold resource is drawn by PowerPoint from the upright /
+ * regular resource with a synthetic slant or emboldening, whose vertical
+ * metrics are that resource's. A CSS generic family has no known resource.
  */
 function lineMetricFor(
   family: string,
@@ -1237,7 +1247,17 @@ function lineMetricFor(
   rc: RenderContext,
 ): PowerPointFaceMetrics | undefined {
   if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
-  if (rc.embeddedFontAuthoredFamilies?.has(family)) return undefined;
+  const authored = rc.embeddedFontAuthoredFamilies?.get(family);
+  if (authored !== undefined) {
+    const metrics = rc.embeddedFontMetrics;
+    if (!metrics) return undefined;
+    const weight = bold ? 700 : 400;
+    const style = italic ? 'italic' : 'normal';
+    return metrics.get(`${authored}:${weight}:${style}`)
+      ?? (rc.embeddedFontTuples?.has(`${authored}:${weight}:${style}`) ? undefined
+        : metrics.get(`${authored}:${weight}:normal`) ?? metrics.get(`${authored}:400:${style}`)
+          ?? metrics.get(`${authored}:400:normal`));
+  }
   return powerPointFaceMetrics(family, bold, italic);
 }
 
@@ -1613,15 +1633,22 @@ export function paragraphInputRuns(
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
     let rawText = runTexts[sourceRunId] ?? '';
     // The parser resolves the ea/cs faces, theme script fonts included. An
-    // empty slot takes PowerPoint's application default, never the Latin
-    // face (issue #1627). The default tier is chosen from the run's whole
-    // East Asian text, before any leading cluster joins the previous seam.
-    const eaDefaults = run.fontFamilyEa ? [] : eastAsianDefaultFaces(
-      run.fontFamily ?? para.defFontFamily ?? rc.themeMinorFont ?? null,
-      eaRunTexts[sourceRunId],
-    );
-    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : eaDefaults[0];
+    // empty ea slot (none in the chain, typeface="", or a token naming an
+    // empty theme slot) selects S: the run's named cs face, else its Latin
+    // face (issue #1689, see east-asian-default.ts). S draws every East
+    // Asian-slot glyph it covers; the stack after it carries Office's
+    // measured symbol and CJK fallbacks. The CJK tier is chosen from the
+    // run's whole East Asian text, before any leading cluster joins the
+    // previous seam (issue #1627).
     const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
+    const selectedEaSource = run.fontFamilyEa ? null
+      : run.fontFamilyCs ?? run.fontFamily ?? para.defFontFamily ?? rc.themeMinorFont ?? null;
+    const eaCjkDefaults = run.fontFamilyEa ? []
+      : eastAsianDefaultFaces(selectedEaSource, eaRunTexts[sourceRunId]);
+    const eaStack = run.fontFamilyEa ? []
+      : emptyEastAsianSlotFaces(selectedEaSource, eaRunTexts[sourceRunId]);
+    const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc)
+      : normalizeFontFamily(eaStack[0] ?? null, rc);
     // Offset of rawText's first code unit in the joined paragraph text.
     let runOffset = runStarts[sourceRunId];
     const runEnd = runOffset + rawText.length;
@@ -1657,6 +1684,10 @@ export function paragraphInputRuns(
     // application default; the defaults also follow an authored cs face.
     const csFontFor = (face: string, text: string) =>
       stackFontFor(face, text, true, COMPLEX_SCRIPT_DEFAULT_FACES);
+    const emptyEastAsianFaceFor = (ch: string): string | null => {
+      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, ch);
+      return drawing === null ? null : normalizeFontFamily(drawing, rc);
+    };
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
     const color = run.color ? hexToRgba(run.color)
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
@@ -1689,7 +1720,7 @@ export function paragraphInputRuns(
     let group = '';
     let groupFont = '';
     let groupShare: PowerPointFaceMetrics | undefined;
-    let groupFamily = family;
+    let groupFamily: string | undefined = family;
     const latinShare = lineMetricFor(family, bold, italic, rc) ?? null;
     const emitGroup = () => {
       if (group) {
@@ -1717,12 +1748,20 @@ export function paragraphInputRuns(
       const eaGlyph = slot === 'ea';
       const csGlyph = slot === 'cs';
       const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
-      let font = eaGlyph ? stackFontFor(familyEa, glyph, true, eaDefaults.slice(1))
+      let font = eaGlyph ? stackFontFor(familyEa, glyph, true, eaStack.slice(1))
         : csGlyph ? csFontFor(csFace, glyph) : stackFontFor(
         family, glyph, hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
       );
-      let face = eaGlyph ? familyEa : csFace;
-      let share = lineMetricFor(face, bold, italic, rc);
+      // The face that draws the glyph owns its line metric. For an empty ea
+      // slot that is S, a CJK fallback face with a recorded repertoire, or
+      // nobody the renderer can know: a glyph left to the platform's glyph
+      // fallback (#1689 owner decisions (B) and (c)) has an unknown drawing
+      // face, so it adds no face to its line's metric model.
+      let face: string | null = eaGlyph
+        ? run.fontFamilyEa ? familyEa
+          : emptyEastAsianFaceFor(ch)
+        : csFace;
+      let share = face === null ? undefined : lineMetricFor(face, bold, italic, rc);
       if (slot === 'sym' && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         const mapped = symbolFontToUnicode(ch, symbolFamily);
@@ -1732,11 +1771,11 @@ export function paragraphInputRuns(
         share = undefined;
         face = mapped === ch ? symbolFamily : 'sans-serif';
       }
-      if (group && (font !== groupFont || share !== groupShare)) emitGroup();
+      if (group && (font !== groupFont || share !== groupShare || (face ?? undefined) !== groupFamily)) emitGroup();
       group += glyph;
       groupFont = font;
       groupShare = share;
-      groupFamily = face;
+      groupFamily = face ?? undefined;
     }
     emitGroup();
     if (emitted) {
@@ -4573,8 +4612,9 @@ export function renderTextBody(
     /** This spAutoFit line replaces an authored-font design floor with metrics
      * from the font Canvas actually resolved. */
     useResolvedFontMetrics: boolean;
-    /** PowerPoint's metric ascent of the spaced line (px), when every run of
-     * the body has a known face; undefined for the ordinary 0.8 × line model. */
+    /** PowerPoint's metric ascent of the spaced line (px), when the body is on
+     * the metric model and the line has a known face (#1689: line scope);
+     * undefined for the ordinary 0.8 × line model. */
     metricAscent?: number;
     /** The line's natural (unspaced) descent in the metric model. */
     metricNaturalDescent?: number;
@@ -4595,9 +4635,10 @@ export function renderTextBody(
   // enough to contain the last line, but must not silently become the pitch of
   // every preceding line when a:lnSpc is omitted (#1473).
   let requiredHeight = 0;
-  // Every line must resolve PowerPoint's metric split (see
-  // powerpoint-line-metrics.ts) for the body to use it; one body never mixes
-  // the two line models.
+  // Structural cases outside the #1610 controls (an equation, a marker taller
+  // than the text, compatLnSpc="0" without Excel tables, an unresolved
+  // fontAlgn offset) still take the whole body to the ordinary model. A face
+  // without known metrics does not: its scope is its own line (#1689).
   let metricOk = metric;
 
   // AutoNum counters per list level
@@ -4778,6 +4819,15 @@ export function renderTextBody(
       // spAutoFit, but PowerPoint does not repeat that box as the implicit
       // baseline pitch when `<a:lnSpc>` is omitted.
       let resolvedFontLine = 0;
+      // A glyph whose drawing face has no known metrics (a generic or
+      // unparsed embedded family, a symbol-font mapping, or a glyph left to
+      // the platform's glyph fallback: #1689 owner decisions (B)/(c)) adds no
+      // face to the line; the line keeps the metric model of its known faces.
+      // PowerPoint's own fallback scope is the line (fallback.win.pdf: an
+      // unmodelled face moves only its own line's baseline). Only a line with
+      // glyphs but no known face at all keeps the ordinary model, and only
+      // that line does.
+      let lineHasGlyphs = false;
       for (const seg of line.segments) {
         // For an equation, the line must be at least as tall as its own font
         // size (so a short label like "y"/"p"/"z" gets the normal font-ascent
@@ -4790,13 +4840,12 @@ export function renderTextBody(
         if (effSize > maxSizePx) maxSizePx = effSize;
         if (seg.math) metricOk = false;
         else if (!seg.isTab) {
-          if (seg.lineMetric === undefined) metricOk = false;
-          else metricRuns.push({ sizePx: seg.sizePx, face: seg.lineMetric });
+          if (seg.text) lineHasGlyphs = true;
+          if (seg.lineMetric !== undefined) metricRuns.push({ sizePx: seg.sizePx, face: seg.lineMetric });
           // A run's latin face sizes its line even where an East Asian or
           // symbol segment draws no latin glyph; an unused ea or cs face does
           // not (#1610 supplements 2 and 3).
-          if (seg.lineMetricLatin === null) metricOk = false;
-          else if (seg.lineMetricLatin !== undefined
+          if (seg.lineMetricLatin != null
             && seg.lineMetricLatin !== seg.lineMetric) {
             metricRuns.push({ sizePx: seg.sizePx, face: seg.lineMetricLatin });
           }
@@ -4812,6 +4861,7 @@ export function renderTextBody(
           }
         }
       }
+      const lineFacesUnknown = lineHasGlyphs && metricRuns.length === 0;
       // Break / end-of-paragraph marks after text: their face at the size of
       // the run they follow (layoutParagraph `followingMark`). A mark whose
       // face has no reference metrics (a generic or embedded family) draws
@@ -4905,7 +4955,7 @@ export function renderTextBody(
       // glyph run has no measured box in that model, and neither has a face
       // without Excel tables; either keeps the ordinary model for the body.
       const compatOff = body.compatLnSpc === false;
-      if (metric && metricOk && compatOff
+      if (metric && metricOk && compatOff && !lineFacesUnknown
         && (metricRuns.length === 0 || metricRuns.some((r) => r.face.excel === undefined))) {
         metricOk = false;
       }
@@ -4931,7 +4981,8 @@ export function renderTextBody(
           seg.fontAlgnOffsetPx = offset;
         }
       }
-      if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
+      if (metric && metricOk && !lineFacesUnknown
+        && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
         const natural = alignedLine ?? (compatOff
           ? powerPointCompatOffNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, box: r.face.excel! })))
           : metricRuns.length > 0
@@ -5021,8 +5072,9 @@ export function renderTextBody(
   return { allLines, totalHeight, requiredHeight, metricOk };
   }; // end buildLayout
 
-  // Try PowerPoint's metric line model first; a body with any face outside
-  // it is laid out again with the ordinary model.
+  // Try PowerPoint's metric line model first; a body with a structural case
+  // outside it (see `metricOk`) is laid out again with the ordinary model. An
+  // unknown face only keeps its own line on the ordinary model.
   let useMetricLines = true;
   const layoutAt = (fontScale: number) => {
     let layout = buildLayout(fontScale, useMetricLines);
@@ -7566,6 +7618,7 @@ type InternalSlideRenderOptions = SlideRenderOptions & {
   embeddedFontAliases?: ReadonlyMap<string, string>;
   embeddedFontAuthoredFamilies?: ReadonlyMap<string, string>;
   embeddedFontTuples?: ReadonlySet<string>;
+  embeddedFontMetrics?: ReadonlyMap<string, PowerPointFaceMetrics>;
   svgDecoder?: SvgBlobDecoder;
 };
 
@@ -7810,6 +7863,7 @@ async function renderSlideLeased(
     embeddedFontAliases: opts.embeddedFontAliases,
     embeddedFontAuthoredFamilies: opts.embeddedFontAuthoredFamilies,
     embeddedFontTuples: opts.embeddedFontTuples,
+    embeddedFontMetrics: opts.embeddedFontMetrics,
     officeFontRoutes: opts.officeFontRoutes,
     googleSubstitutes: opts.googleSubstitutes,
     // The backing store may have been clamped below `canvasSize × dpr`; downstream
