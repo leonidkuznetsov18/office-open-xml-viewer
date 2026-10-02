@@ -154,7 +154,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   });
 
-  it('retains authored tile flips with a shape-relative focus', () => {
+  it('retains main authored tile flips with a tile-local native focus', () => {
     const { ctx } = canvas();
     paint({ ...fill, tileRect: { r: .5 }, flip: 'x', fillToRect: { l: 0, r: 1, t: 0, b: 1 } }, ctx, 240, 120);
     expect(pixel(ctx, 3, 3)[0]).toBeLessThan(12);
@@ -163,9 +163,17 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     const inset = canvas().ctx;
     paint({ ...fill, tileRect: { l: .25, t: .25, r: .25, b: .25 },
       fillToRect: { l: .25, t: .25, r: .75, b: .75 } }, inset, 240, 120);
-    // Box focus (60, 30) is the tile's top-left corner, not its quarter point.
-    expect(pixel(inset, 62, 32)[0]).toBeLessThan(12);
-    expect(Math.abs(pixel(inset, 120, 60)[0] - 128)).toBeLessThanOrEqual(3);
+    // Main puts this tile's quarter-point focus at (90,45) in the host.
+    expect(pixel(inset, 90, 45)[0]).toBeLessThan(4);
+    const expected = canvas().ctx;
+    const tile = canvas(120, 60).ctx;
+    const native = tile.createRadialGradient(30, 15, 0, 30, 15, 90);
+    native.addColorStop(0, '#000000'); native.addColorStop(.5, '#808080'); native.addColorStop(1, '#FFFFFF');
+    tile.fillStyle = native; tile.fillRect(0, 0, 120, 60);
+    const pattern = expected.createPattern(tile.canvas, 'repeat') as CanvasPattern;
+    pattern.setTransform({ a: 1, b: 0, c: 0, d: 1, e: 60, f: 30 });
+    expected.fillStyle = pattern; expected.fillRect(0, 0, 240, 120);
+    expect(inset.getImageData(0, 0, 240, 120).data).toEqual(expected.getImageData(0, 0, 240, 120).data);
   });
 
   it('keeps out-of-box rect shading opaque without moving the authored gradient frame', () => {
@@ -287,7 +295,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
 
   it('bounds band solves by raster pixels for corner and nonnested area foci', () => {
     const { ctx } = canvas(512, 512);
-    for (const edges of [720, 20000]) {
+    for (const path of ['rect', 'shape'] as const) for (const edges of [720, 20000, 32768, 32769]) {
       const outline = (target: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) => {
         for (let i = 0; i < edges; i++) {
           const angle = i / edges * Math.PI * 2; const r = i % 2 ? .5 : .03;
@@ -298,16 +306,21 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       for (const focus of [{ l: 0, t: 0, r: 1, b: 1 }, { l: 1, t: 1, r: -.5, b: -.5 }]) {
         const work: ShadeWork = { edgeRows: 0, solves: 0, rejected: 0, pixels: 0 };
         const box = { x: 0, y: 0, w: 512, h: 512 };
-        const paint = resolvePathShade({ ...fill, path: 'shape', fillToRect: focus }, ctx, box, box,
-          outline, undefined, undefined, work);
+        const paint = resolvePathShade({ ...fill, path, fillToRect: focus }, ctx, box, box,
+          outline, undefined, work);
+        if (edges > 32768) {
+          expect(paint).toBeNull();
+          expect(work).toEqual({ edgeRows: 0, solves: 0, rejected: 0, pixels: 0 });
+          continue;
+        }
         expect(paint).not.toBeNull();
         expect(work.edgeRows).toBeLessThanOrEqual((edges + 1) * 512);
-        expect(work.solves, JSON.stringify({ edges, focus, work })).toBeLessThanOrEqual(work.pixels);
+        expect(work.solves, JSON.stringify({ path, edges, focus, work })).toBeLessThanOrEqual(work.pixels);
         expect(work.rejected).toBe(0);
         expect(work.pixels).toBeLessThanOrEqual(512 * 512);
       }
     }
-  }, 20000);
+  }, 60000);
 
   it.each(['rect', 'shape'] as const)('preserves main %s fallback bytes for edge limits and unavailable allocation', path => {
     const outline = (target: CanvasRenderingContext2D) => {
@@ -318,9 +331,6 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       target.closePath();
     };
     for (const reason of ['edge budget', 'allocation'] as const) for (const tiled of [false, true]) {
-      // Rect tiles shade their box without traversing a supplied outline, so
-      // there is no outline-edge budget to reject in this production path.
-      if (tiled && reason === 'edge budget' && path === 'rect') continue;
       const actual = canvas(300, 200).ctx; const expected = canvas(300, 200).ctx;
       for (const ctx of [actual, expected]) { ctx.translate(70, 30); ctx.rotate(.3); }
       const recipe = { ...fill, path, fillToRect: { l: .1, r: .5, t: .4, b: .1 },
@@ -408,14 +418,60 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(pixel(ctx, 83, 86).slice(0, 3)).toEqual([0, 0, 0]);
   });
 
-  it('keeps rect and shape tile foci in the host box', () => {
-    const contexts = [canvas().ctx, canvas().ctx];
-    for (const [i, ctx] of contexts.entries()) {
-      paint({ ...fill, path: i ? 'shape' : 'rect', tileRect: { r: .5 },
-        fillToRect: { l: .25, r: .5, t: .25, b: .25 } }, ctx, 240, 120);
-      expect(pixel(ctx, 90, 60)).toEqual([0, 0, 0, 255]);
+  it.each(['rect', 'shape'] as const)('retains main %s native paint for zero and degenerate tile rectangles', path => {
+    for (const [tileRect, cx, cy, rx, ry] of [
+      [{}, 60, 65, 140, 65],
+      [{ l: 0, r: 0, t: 0, b: 0 }, 60, 65, 140, 65],
+      [{ l: .5, r: .5 }, 100, 65, 0, 65],
+    ] as const) {
+      const actual = canvas(200, 100).ctx; const expected = canvas(200, 100).ctx;
+      paint({ ...fill, path, tileRect, fillToRect: { l: .1, r: .5, t: .4, b: .1 } }, actual, 200, 100);
+      const native = expected.createRadialGradient(cx, cy, 0, cx, cy,
+        path === 'rect' ? Math.max(rx, ry) : Math.sqrt(rx * rx + ry * ry));
+      native.addColorStop(0, '#000000'); native.addColorStop(.5, '#808080'); native.addColorStop(1, '#FFFFFF');
+      expected.fillStyle = native; expected.fillRect(0, 0, 200, 100);
+      expect(actual.getImageData(0, 0, 200, 100).data, JSON.stringify(tileRect))
+        .toEqual(expected.getImageData(0, 0, 200, 100).data);
     }
-    expect(contexts[1].getImageData(0, 0, 240, 120).data).toEqual(contexts[0].getImageData(0, 0, 240, 120).data);
+  });
+
+  it('does no outline or raster pixel work for tiled rect/shape paints, including slow outlines', () => {
+    const Canvas = (skia as NonNullable<typeof skia>).Canvas;
+    const work = { surfaces: 0, readbacks: 0, writes: 0, outlines: 0 };
+    vi.stubGlobal('OffscreenCanvas', class extends Canvas {
+      constructor(w: number, h: number) { super(w, h); work.surfaces++; }
+      getContext(type: '2d') {
+        const ctx = super.getContext(type);
+        for (const method of ['getImageData', 'putImageData'] as const) {
+          const original = ctx[method].bind(ctx);
+          vi.spyOn(ctx, method).mockImplementation((...args: unknown[]) => {
+            if (method === 'getImageData') work.readbacks++; else work.writes++;
+            return Reflect.apply(original, ctx, args);
+          });
+        }
+        return ctx;
+      }
+    });
+    try {
+      for (const path of ['rect', 'shape'] as const) for (const edges of [720, 20000, 32768]) {
+        const ctx = canvas(512, 512).ctx;
+        const outline = (target: CanvasRenderingContext2D) => {
+          work.outlines++;
+          for (let i = 0; i < edges; i++) {
+            const angle = i / edges * Math.PI * 2; const r = i % 2 ? 256 : 15.36;
+            target[i ? 'lineTo' : 'moveTo'](256 + r * Math.cos(angle), 256 + r * Math.sin(angle));
+          }
+          target.closePath();
+        };
+        const before = { ...work };
+        const paint = resolveFill({ ...fill, path, tileRect: { r: .5 }, flip: 'xy',
+          fillToRect: { l: 1, t: 1, r: -.5, b: -.5 } }, ctx, 0, 0, 512, 512, 0,
+          undefined, undefined, outline);
+        expect(paint).not.toBeNull();
+        // Main's exact work: one native base tile and one flip repeat surface.
+        expect(work).toEqual({ ...before, surfaces: before.surfaces + 2 });
+      }
+    } finally { vi.unstubAllGlobals(); vi.restoreAllMocks(); }
   });
 
   it('covers affine strokes and large line decorations from their painted geometry', () => {
@@ -488,7 +544,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       expect(contexts[1].ctx.getImageData(0, 0, 300, 300).data, JSON.stringify({ geometry, lineCap }))
         .toEqual(contexts[0].ctx.getImageData(0, 0, 300, 300).data);
     }
-  });
+    // Multiple native/raster paints run under full-suite CPU contention.
+    // Pixel equality is the contract; the default 5s runner timeout is not.
+  }, 30000);
 
   it('covers square dash tangents under nonuniform scale and shear', () => {
     const contexts = [canvas(400, 300).ctx, canvas(400, 300).ctx];

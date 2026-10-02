@@ -92,6 +92,10 @@ export function drawArrowHead(
 
   const hostTransform = typeof ctx.getTransform === 'function' ? ctx.getTransform() : undefined;
   const anchorPaint = () => {
+    // Tiled brushes keep the previous decoration-local pattern frame. Live
+    // tiled geometry is outside the new path-shade evidence (#1599), so the
+    // untiled raster anchoring must not change their inherited pixels.
+    if (stroke.fill?.fillType === 'gradient' && stroke.fill.tileRect != null) return;
     // Canvas patterns follow the paint-time CTM; native gradients retain their
     // creation frame. The path has already captured the decoration transform.
     // Paint a host-box pattern at the host CTM so rotating/translating the
@@ -153,7 +157,8 @@ export function resolveArrowPaint(
 ): string | CanvasGradient | CanvasPattern | undefined {
   if (!stroke.fill || end.type === 'none') return undefined;
   if (stroke.fill.fillType !== 'gradient' || stroke.fill.gradType !== 'radial'
-    || (stroke.fill.path !== 'rect' && stroke.fill.path !== 'shape') || typeof ctx.getTransform !== 'function') {
+    || stroke.fill.tileRect != null || (stroke.fill.path !== 'rect' && stroke.fill.path !== 'shape')
+    || typeof ctx.getTransform !== 'function') {
     return resolveFill(stroke.fill, ctx, frame.x, frame.y, frame.w, frame.h, rotation, ptUnits) ?? undefined;
   }
   const { lw, halfW, len } = arrowGeom(end, stroke, scale);

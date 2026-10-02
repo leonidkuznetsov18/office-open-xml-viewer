@@ -20,6 +20,14 @@ type Matrix = [number, number, number, number, number, number];
 // Each band has constant-degree row extrema, and successor links remove
 // assigned pixels. Geometry memory is O(N + P); no shade geometry is
 // clustered or cached. Stop sorting/ramp construction is separate.
+// This is an inherent additive cost over main's native point-focus brush,
+// not a constant-factor latency promise. A sequential Node/Skia resolve-only
+// probe at 512px with 32768 alternating-radius edges measured medians of
+// 1.03s (center), 2.29s (corner), 2.37s (outside-area focus); at 20000 edges
+// the corresponding medians were 0.62s/1.47s/1.46s. Hardware-dependent times
+// include outline traversal and raster generation, not the subsequent paint.
+// Work guards cover the maximum supported edge count and reject larger inputs
+// before raster allocation. Tiled paints retain the native brush entirely.
 const MAX_EDGE = 512;
 const EDGE_LIMIT = 32768;
 const MARGIN = 2;
@@ -342,7 +350,7 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
 }
 
 /**
- * Path shade for `path="rect"` and `path="shape"` (ECMA-376 §20.1.8.46).
+ * Untiled path shade for `path="rect"` and `path="shape"` (ECMA-376 §20.1.8.46).
  *
  * Normative/documented model: the center shade (first stop) fills the focus
  * rectangle — in Office, the gradient path inscribed in fillToRect relative to
@@ -367,11 +375,10 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
 export function resolvePathShade(
   fill: GradientFill, ctx: CanvasRenderingContext2D,
   frame: ShadeBox, shapeBox: ShadeBox, outline?: FillOutline,
-  focusOverride?: { origin: Point; size: Point },
   paintBounds?: ShadeBox,
   work?: ShadeWork,
 ): CanvasPattern | null {
-  if (hasInvertedPathShadeFocus(fill) || focusOverride?.size.some(size => size < 0)) return null;
+  if (hasInvertedPathShadeFocus(fill)) return null;
   if (![frame, shapeBox].every(box => [box.x, box.y, box.w, box.h].every(Number.isFinite)
     && box.w > 0 && box.h > 0)) return null;
   if (typeof ctx.getTransform !== 'function' || fill.stops.length === 0) return null;
@@ -425,7 +432,7 @@ export function resolvePathShade(
 
   if (work) { work.edgeRows = 0; work.solves = 0; work.rejected = 0; work.pixels = bw * bh; }
   {
-    const { origin: [ox, oy], size: [kx, ky] } = focusOverride ?? pathShadeFocusRect(fill);
+    const { origin: [ox, oy], size: [kx, ky] } = pathShadeFocusRect(fill);
     const toNorm = (p: Point): Point => [(p[0] - fieldFrame.x) / fieldFrame.w, (p[1] - fieldFrame.y) / fieldFrame.h];
     const polygons = fill.path === 'shape' ? coverageField.map(polygon => polygon.map(toNorm)) : [rectangle({ x: 0, y: 0, w: 1, h: 1 })];
     let solveCount = 0;

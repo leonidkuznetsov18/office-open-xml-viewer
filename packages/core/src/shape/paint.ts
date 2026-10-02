@@ -2,7 +2,7 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolvePathShade, pathShadeFocusRect, hasInvertedPathShadeFocus, type FillOutline, type ShadeBox } from './path-gradient';
+import { resolvePathShade, type FillOutline, type ShadeBox } from './path-gradient';
 import { hostStrokeBounds, paintPathSource } from './paint-bounds';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
@@ -15,7 +15,6 @@ function tiledGradient(
   w: number,
   h: number,
   shapeRotationDeg: number,
-  outline?: FillOutline,
 ): CanvasPattern | null {
   const tile = fill.tileRect;
   if (!tile) return null;
@@ -42,33 +41,14 @@ function tiledGradient(
   const baseCtx = base?.getContext('2d');
   if (!base || !baseCtx) return null;
   const tileFill = { ...fill, tileRect: undefined, flip: undefined };
-  // [MS-OE376] §2.1.1377(b): both path types keep the focus relative
-  // to the shape box. Export point controls cannot establish live tile flips;
-  // retain the previous authored-flip policy pending live area controls.
-  const pathShade = fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')
-    && !hasInvertedPathShadeFocus(fill);
-  let basePaint: string | CanvasGradient | CanvasPattern | null;
-  if (pathShade) {
-    const box = pathShadeFocusRect(fill);
-    const focus = {
-      origin: [(box.origin[0] * w + x - tileX) / tileW, (box.origin[1] * h + y - tileY) / tileH] as [number, number],
-      size: [box.size[0] * w / tileW, box.size[1] * h / tileH] as [number, number],
-    };
-    const baseBox = { x: 0, y: 0, w: baseW, h: baseH };
-    basePaint = resolvePathShade(tileFill, baseCtx as CanvasRenderingContext2D, baseBox, baseBox,
-      fill.path === 'shape' ? outline : undefined, focus);
-    if (!basePaint) {
-      // Raster rejection (resource/allocation or unsupported geometry) keeps
-      // the previous tile-local native approximation byte-for-byte. The
-      // shape-relative focus correction applies only to supported raster paths.
-      basePaint = nativeRadialFill(tileFill, baseCtx as CanvasRenderingContext2D, baseBox);
-    }
-  } else {
-    basePaint = resolveFill(
-      tileFill, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg,
-      undefined, undefined, outline,
-    );
-  }
+  // Tiled rect/shape shades are outside the measured untiled model (#1599).
+  // ECMA-376 §20.1.8.31 and [MS-OE376] §2.1.1377 differ on the focus frame;
+  // point-focus exports do not settle live tiled inscribed-area geometry.
+  // Preserve main's native tile paint exactly, without rebuilding a silhouette
+  // at the tile aspect ratio or changing the host's support classification.
+  const basePaint = fill.gradType === 'radial'
+    ? nativeRadialFill(tileFill, baseCtx as CanvasRenderingContext2D, { x: 0, y: 0, w: baseW, h: baseH })
+    : resolveFill(tileFill, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg);
   if (!basePaint) return null;
   baseCtx.fillStyle = basePaint;
   baseCtx.fillRect(0, 0, baseW, baseH);
@@ -234,7 +214,7 @@ export function resolveFill(
     if (stops.length === 0) return null;
     if (stops.length === 1) return hexToRgba(stops[0].color);
 
-    const repeated = tiledGradient(fill, ctx, x, y, w, h, shapeRotationDeg, outline);
+    const repeated = tiledGradient(fill, ctx, x, y, w, h, shapeRotationDeg);
     if (repeated) return repeated;
 
     let gradient: CanvasGradient;
@@ -243,17 +223,20 @@ export function resolveFill(
     const tileY = y + h * (tile?.t ?? 0);
     const tileW = w * (1 - (tile?.l ?? 0) - (tile?.r ?? 0));
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
-    if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
+    if (fill.gradType === 'radial' && fill.tileRect == null && (fill.path === 'rect' || fill.path === 'shape')) {
       // Canvas has no shape-following shade; resolvePathShade rasterizes it.
       // Unsupported topology, resource limits and allocation-unavailable
       // hosts retain main's path-specific native approximation. Its midpoint focus
       // is unchanged: the Office fallback classifier is outside this feature.
       return resolvePathShade(
         fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, { x, y, w, h }, outline,
-        undefined, paintBounds ?? hostStrokeBounds(ctx, { x, y, w, h }),
+        paintBounds ?? hostStrokeBounds(ctx, { x, y, w, h }),
       ) ?? nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
     }
     if (fill.gradType === 'radial') {
+      // Any authored tileRect stays on main's native path, even an explicit
+      // zero rectangle, invalid tile extents or unavailable tile allocation.
+      // Tiling is out of scope; failure to build a repeat is not raster support.
       return nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
     } else {
       const authoredAngle = fill.rotWithShape === false
