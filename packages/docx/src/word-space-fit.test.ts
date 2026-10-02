@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+  mixedSpaceSummaryWork,
+  setMixedSpaceSummaryAssertions,
+} from './line-breaker/mixed-space-fit.js';
 import {
   BAND_DEFICIT_PT, FONTS, VARIANTS, advancePt, layoutStubParagraph, type Variant,
 } from './test-support/word-space-fit.test-support.js';
@@ -46,6 +50,11 @@ function lineCount(variant: Variant, widthTwips: number) {
 }
 
 const inScope = VARIANTS.filter((variant) => variant.outOfScope === null);
+
+// Every query and finalization compares the running line summary with a full
+// recomputation from the committed items (throws on drift).
+beforeAll(() => setMixedSpaceSummaryAssertions(true));
+afterAll(() => setMixedSpaceSummaryAssertions(false));
 const BIZ = { ascii: 'BIZ UDGothic', eastAsia: 'BIZ UDGothic', sizePt: 8.5, bold: true } as const;
 const MODE_14 = { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' } as const;
 
@@ -249,6 +258,40 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT properties', () => {
       const inner = first.filter((segment) => segment.compression > 0);
       expect(inner).toHaveLength(4);
       for (const segment of inner) expect(segment.compression).toBeCloseTo(1.0625, 9);
+    }
+  });
+});
+
+describe('WORD_COMPRESSED_SPACE_LINE_FIT work', () => {
+  it('reads the committed line a bounded number of times per commit', () => {
+    // Review round 3 stress shape: `甲 ` + n × `AB ` + `AB` on one line whose
+    // band is the natural advance minus 85% of the quarter-em space capacity,
+    // so every late candidate is admitted by shrinking.
+    setMixedSpaceSummaryAssertions(false);
+    try {
+      const run = { ascii: 'BIZ UDGothic', eastAsia: 'BIZ UDGothic', sizePt: 8.5, bold: true } as const;
+      const work = (count: number) => {
+        const text = `甲 ${'AB '.repeat(count)}AB`;
+        const runs = [{ ...run, text }];
+        const environment = { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' };
+        const natural = layoutStubParagraph({ runs, environment, bandPt: 1e7, justification: 'left' })[0]!
+          .reduce((sum, segment) => sum + segment.width, 0);
+        const capacity = (count + 1) * (4.25 - 8.5 / 4);
+        mixedSpaceSummaryWork(true);
+        const lines = layoutStubParagraph({
+          runs, environment, bandPt: natural - 0.85 * capacity, justification: 'left',
+        });
+        expect(lines).toHaveLength(1);
+        return mixedSpaceSummaryWork(true);
+      };
+      const small = work(250);
+      const large = work(1000);
+      // Linear: 4n words need about 4x the reads (a full rescan per query
+      // would need about 16x).
+      expect(large / small).toBeLessThan(5);
+      expect(large).toBeLessThan(40 * 1000);
+    } finally {
+      setMixedSpaceSummaryAssertions(true);
     }
   });
 });

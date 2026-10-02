@@ -23,14 +23,172 @@ import { COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION } from './text-runs.js';
 import type { LayoutSeg, LayoutTextSeg } from './model.js';
 import type { PassOperationState } from './pass-operations.js';
 
+/** One committed line item's contribution to the running summary. */
+interface Contribution {
+  readonly item: LayoutSeg;
+  readonly inkless: boolean;
+  readonly eastAsian: boolean;
+  /** Content this projection was not observed with (ends it for the line). */
+  readonly invalid: boolean;
+  /** Shrinkable trailing U+0020 carried by the item (0 when none). */
+  readonly gapCount: number;
+  readonly capacity: number;
+  /** The gap differs in face or floor from the line's first gap. */
+  readonly mismatched: boolean;
+}
+
+/**
+ * Running summary of the committed line, O(1) per commit. It is maintained
+ * only through commitMixedLineItem / popMixedLineItem / replaceLastMixedLineItem,
+ * which also perform the matching `currentLine` mutation, and is reset with
+ * the line. `contributions` mirrors `currentLine` item for item; the totals
+ * equal a full recomputation (scanLine) by construction, which tests assert.
+ */
 export interface MixedSpaceState {
   /** The current line was admitted by shrinking its U+0020; its natural
    * advance may exceed the band until the line is finalized. */
   compressed: boolean;
+  contributions: Contribution[];
+  eastAsianItems: number;
+  invalidItems: number;
+  mismatchedGaps: number;
+  spaceCount: number;
+  /** Index into `contributions` of the line's first gap, or -1. */
+  firstGap: number;
 }
 
 export function createMixedSpaceState(): MixedSpaceState {
-  return { compressed: false };
+  return {
+    compressed: false,
+    contributions: [],
+    eastAsianItems: 0,
+    invalidItems: 0,
+    mismatchedGaps: 0,
+    spaceCount: 0,
+    firstGap: -1,
+  };
+}
+
+let summaryAssertions = false;
+let summaryWork = 0;
+
+/** Test hook: compare the running summary with a full recomputation on every
+ * query and at finalization, throwing on any difference. */
+export function setMixedSpaceSummaryAssertions(enabled: boolean): void {
+  summaryAssertions = enabled;
+}
+
+/** Test hook: summary items read since the last reset (work, not time). */
+export function mixedSpaceSummaryWork(reset = false): number {
+  const value = summaryWork;
+  if (reset) summaryWork = 0;
+  return value;
+}
+
+function contributionOf(state: MixedSpaceState, item: LayoutSeg, scale: number): Contribution {
+  summaryWork += 1;
+  if (inkless(item)) {
+    return { item, inkless: true, eastAsian: false, invalid: false, gapCount: 0, capacity: 0, mismatched: false };
+  }
+  if (!('text' in item)) {
+    return { item, inkless: false, eastAsian: false, invalid: true, gapCount: 0, capacity: 0, mismatched: false };
+  }
+  const eastAsian = EAST_ASIAN_RE.test(item.text);
+  const spaces = trailingSpaceCount(item.text);
+  if (
+    item.mixedNaturalTrailingSpacePx !== undefined &&
+    spaces > 0 &&
+    spaces === item.mixedNaturalTrailingSpaceCount &&
+    !item.text.slice(0, item.text.length - spaces).includes(' ')
+  ) {
+    const capacity = perSpaceCapacity(item, spaces, scale);
+    const first = state.firstGap >= 0 ? state.contributions[state.firstGap]! : undefined;
+    const mismatched = first !== undefined && (
+      !sameSpaceFace(item, first.item as LayoutTextSeg) || Math.abs(capacity - first.capacity) > 1e-6
+    );
+    return { item, inkless: false, eastAsian, invalid: false, gapCount: spaces, capacity, mismatched };
+  }
+  return {
+    item, inkless: false, eastAsian, invalid: !neutral(item, item.text),
+    gapCount: 0, capacity: 0, mismatched: false,
+  };
+}
+
+function addContribution(state: MixedSpaceState, contribution: Contribution): void {
+  if (contribution.gapCount > 0 && state.firstGap < 0) state.firstGap = state.contributions.length;
+  state.contributions.push(contribution);
+  if (contribution.eastAsian) state.eastAsianItems += 1;
+  if (contribution.invalid) state.invalidItems += 1;
+  if (contribution.mismatched) state.mismatchedGaps += 1;
+  state.spaceCount += contribution.gapCount;
+}
+
+function removeContribution(state: MixedSpaceState): void {
+  const contribution = state.contributions.pop();
+  if (!contribution) return;
+  if (contribution.eastAsian) state.eastAsianItems -= 1;
+  if (contribution.invalid) state.invalidItems -= 1;
+  if (contribution.mismatched) state.mismatchedGaps -= 1;
+  state.spaceCount -= contribution.gapCount;
+  if (state.firstGap === state.contributions.length) state.firstGap = -1;
+}
+
+type BreakerState = PassOperationState['breakerState'];
+
+/** Append a committed item to the line and its summary. */
+type LineItem = BreakerState['currentLine'][number];
+
+export function commitMixedLineItem(breakerState: BreakerState, item: LineItem, scale: number): void {
+  breakerState.currentLine.push(item);
+  addContribution(breakerState.mixedSpace, contributionOf(breakerState.mixedSpace, item, scale));
+}
+
+/** Remove the last committed item from the line and its summary. */
+export function popMixedLineItem(breakerState: BreakerState): void {
+  breakerState.currentLine.pop();
+  removeContribution(breakerState.mixedSpace);
+}
+
+/** Replace the last committed item (a kinsoku-retracted head) in both. */
+export function replaceLastMixedLineItem(
+  breakerState: BreakerState,
+  item: LineItem,
+  scale: number,
+): void {
+  popMixedLineItem(breakerState);
+  commitMixedLineItem(breakerState, item, scale);
+}
+
+/** Line facts from the running summary; O(1). */
+function summaryLine(state: MixedSpaceState): Omit<LineSpaces, 'gaps'> {
+  const first = state.firstGap >= 0 ? state.contributions[state.firstGap]! : undefined;
+  const valid = state.invalidItems === 0 && state.mismatchedGaps === 0;
+  return {
+    valid,
+    eastAsian: state.eastAsianItems > 0,
+    face: valid ? first?.item as LayoutTextSeg | undefined : undefined,
+    perSpaceCapacity: valid ? first?.capacity ?? 0 : 0,
+    count: valid ? state.spaceCount : 0,
+  };
+}
+
+function assertSummary(breakerState: BreakerState, scale: number): void {
+  if (!summaryAssertions) return;
+  const state = breakerState.mixedSpace;
+  const full = scanLine(breakerState.currentLine, scale);
+  const summary = summaryLine(state);
+  const same = state.contributions.length === breakerState.currentLine.length
+    && state.contributions.every((contribution, index) => contribution.item === breakerState.currentLine[index])
+    && full.valid === summary.valid
+    && (!full.valid || (
+      full.eastAsian === summary.eastAsian
+      && full.face === summary.face
+      && full.count === summary.count
+      && Math.abs(full.perSpaceCapacity - summary.perSpaceCapacity) <= 1e-9
+    ));
+  if (!same) {
+    throw new Error('WORD_COMPRESSED_SPACE_LINE_FIT line summary drifted from its committed items');
+  }
 }
 
 /** One candidate unit: consecutive pieces of text that must share a line
@@ -102,6 +260,7 @@ function scanLine(line: readonly LayoutSeg[], scale: number): LineSpaces {
     valid: false, eastAsian, face, perSpaceCapacity: 0, gaps: [], count: 0,
   });
   for (const item of line) {
+    summaryWork += 1;
     if (inkless(item)) continue;
     if (!('text' in item)) return invalid();
     if (EAST_ASIAN_RE.test(item.text)) eastAsian = true;
@@ -153,7 +312,8 @@ export function performMixedSpaceRequirement(
     breakerState.currentLine.length === 0
   )
     return undefined;
-  const line = scanLine(breakerState.currentLine, scale);
+  assertSummary(breakerState, scale);
+  const line = summaryLine(breakerState.mixedSpace);
   if (!line.valid || line.count === 0 || !line.face) return undefined;
   // Only mixed East Asian / Latin lines; Latin-only lines keep their own rule.
   if (!line.eastAsian && !pieces.some((piece) => EAST_ASIAN_RE.test(piece.text))) return undefined;
@@ -194,7 +354,7 @@ export function performMixedSpaceRequirement(
   }
   const lastCharacter = last >= 0
     ? cores[last]!.at(-1)
-    : lastVisibleLineCharacter(breakerState.currentLine);
+    : lastVisibleLineCharacter(breakerState.mixedSpace);
   const limitSegment = last >= 0 ? pieces[last]!.segment : pieces[0]!.segment;
   const limit = wordCompressedSpaceEastAsianOverflowLimit(
     lastCharacter !== undefined && EAST_ASIAN_RE.test(lastCharacter),
@@ -210,9 +370,10 @@ export function performMixedSpaceRequirement(
   return required;
 }
 
-function lastVisibleLineCharacter(line: readonly LayoutSeg[]): string | undefined {
-  for (let index = line.length - 1; index >= 0; index -= 1) {
-    const item = line[index]!;
+function lastVisibleLineCharacter(state: MixedSpaceState): string | undefined {
+  for (let index = state.contributions.length - 1; index >= 0; index -= 1) {
+    summaryWork += 1;
+    const item = state.contributions[index]!.item;
     if (inkless(item)) continue;
     if (!('text' in item)) return undefined;
     const visible = item.text.replace(/ +$/u, '');
@@ -232,10 +393,17 @@ export function performMarkMixedSpacesCompressed(operationState: PassOperationSt
 export function performSettleMixedSpaces(operationState: PassOperationState): void {
   const { breakerState, availW, scale } = operationState;
   if (breakerState.mixedSpace.compressed) {
-    const line = scanLine(breakerState.currentLine, scale);
+    assertSummary(breakerState, scale);
+    const line = summaryLine(breakerState.mixedSpace);
+    // Finalization walks the line once; every gap is written exactly once.
+    const gaps = breakerState.mixedSpace.contributions.flatMap((contribution) => {
+      summaryWork += 1;
+      return contribution.gapCount > 0
+        ? [{ segment: contribution.item as LayoutTextSeg, count: contribution.gapCount }]
+        : [];
+    });
     // Spaces ending the line are not gaps: like every fit decision, the line
     // end is judged without them (they keep their natural advance).
-    const gaps = [...line.gaps];
     let lineEndSpacePx = 0;
     for (let index = breakerState.currentLine.length - 1; index >= 0; index -= 1) {
       const item = breakerState.currentLine[index]!;

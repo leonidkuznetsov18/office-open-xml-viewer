@@ -20,6 +20,7 @@ import {
 } from './model.js';
 import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
 import {
+  commitMixedLineItem,
   createMixedSpaceState,
   performSettleMixedSpaces,
   type MixedSpaceCandidate,
@@ -912,7 +913,7 @@ export function performAddToLine(
   } else {
     breakerState.snapBlock = null;
   }
-  breakerState.currentLine.push(s);
+  commitMixedLineItem(breakerState, s, scale);
   breakerState.currentWidth += committedWidth;
   if (
     'text' in s &&
@@ -1604,6 +1605,7 @@ export function performRetractCurrentLineForLeadingKinsoku(
     materializeLatinSpaceCompression,
     strAdvance,
     next,
+    operationState.scale,
   );
 }
 
