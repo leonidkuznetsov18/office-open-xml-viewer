@@ -618,6 +618,11 @@ export interface LineLayoutEnvironment {
   /** `w:compatSetting` compatibilityMode; absent when not authored. Gates
    * WORD_COMPRESSED_SPACE_LINE_FIT. */
   readonly compatibilityMode?: number;
+  /** Paragraph §17.3.1.2-3 automatic East Asian/Latin and East Asian/number
+   * spacing (absent means on). The renderer does not model that spacing;
+   * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
+  readonly autoSpaceDE?: boolean;
+  readonly autoSpaceDN?: boolean;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;

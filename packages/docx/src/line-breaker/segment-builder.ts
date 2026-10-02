@@ -794,8 +794,61 @@ export function buildSegments(
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
   finalizeBuiltSegments(runs, environment, segs);
+  withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
 
   return segs;
+}
+
+const AUTO_SPACE_EAST_ASIAN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+const AUTO_SPACE_LATIN = /\p{Script=Latin}/u;
+const AUTO_SPACE_DIGIT = /[0-9]/u;
+
+/**
+ * Scope of WORD_COMPRESSED_SPACE_LINE_FIT (see its registered description):
+ * the paragraph keeps the unchanged line breaker when
+ * - §17.3.1.2-3 automatic spacing applies (enabled, with an ideograph or kana
+ *   directly beside a Latin letter or ASCII digit), which the renderer does
+ *   not model, or
+ * - a compressible closing mark is directly followed by U+0020, where the
+ *   registered rule records a full retained cell that
+ *   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL does not reproduce.
+ * Adjacency is read on the paragraph's joined text, so run seams cannot
+ * change the decision.
+ */
+function withdrawMixedSpaceEligibilityOutsideScope(
+  environment: LineLayoutEnvironment,
+  segs: LayoutSeg[],
+): void {
+  if (!segs.some((segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined)) {
+    return;
+  }
+  let previous: string | undefined;
+  let outside = false;
+  const pair = (left: string, right: string): boolean => {
+    if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ') return true;
+    const eastAsian = AUTO_SPACE_EAST_ASIAN.test(left) ? right : AUTO_SPACE_EAST_ASIAN.test(right) ? left : undefined;
+    if (eastAsian === undefined) return false;
+    return (environment.autoSpaceDE !== false && AUTO_SPACE_LATIN.test(eastAsian))
+      || (environment.autoSpaceDN !== false && AUTO_SPACE_DIGIT.test(eastAsian));
+  };
+  for (const segment of segs) {
+    if (!('text' in segment)) {
+      previous = undefined;
+      continue;
+    }
+    for (const character of segment.text) {
+      if (previous !== undefined && pair(previous, character)) {
+        outside = true;
+        break;
+      }
+      previous = character;
+    }
+    if (outside) break;
+  }
+  if (!outside) return;
+  for (const segment of segs) {
+    if ('text' in segment) segment.mixedSpaceAverageWidthRatio = undefined;
+  }
 }
 
 interface SegmentEmissionState {

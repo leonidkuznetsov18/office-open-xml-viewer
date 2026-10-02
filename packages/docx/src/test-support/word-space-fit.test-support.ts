@@ -23,6 +23,8 @@ export interface Variant {
   readonly justification: 'left' | 'both' | 'distribute';
   readonly sourceRuns: string;
   readonly kern: string;
+  readonly autoSpaceDE: boolean;
+  readonly autoSpaceDN: boolean;
   readonly borderEighths: number;
   readonly outOfScope: string | null;
   readonly widthsTwips: readonly number[];
@@ -185,7 +187,10 @@ export function layoutStubParagraph(paragraph: StubParagraph) {
     lang: 'en-US', langEastAsia: 'ja-JP',
   })) as unknown as DocRun[];
   const segments = buildSegments(runs, {
-    pageIndex: 0, totalPages: 1, layoutServices: paragraph.freshServices ? services(families) : cachedServices(families), ...paragraph.environment,
+    pageIndex: 0, totalPages: 1, layoutServices: paragraph.freshServices ? services(families) : cachedServices(families),
+    // The Word controls author both automatic-spacing flags off; stub
+    // paragraphs follow them unless a test sets the flags.
+    autoSpaceDE: false, autoSpaceDN: false, ...paragraph.environment,
   });
   const justified = paragraph.justification === 'both' || paragraph.justification === 'distribute';
   return layoutLines(canvas, segments, paragraph.bandPt, 0, 1, [], undefined, {}, 0, undefined,

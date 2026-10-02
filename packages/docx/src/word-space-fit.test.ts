@@ -43,6 +43,8 @@ function lineCount(variant: Variant, widthTwips: number) {
         ? { characterSpacingControl: variant.characterSpacingControl } : {}),
       enableOpenTypeFeatures: variant.enableOpenTypeFeatures,
       lineWrapLikeWord6: false,
+      autoSpaceDE: variant.autoSpaceDE,
+      autoSpaceDN: variant.autoSpaceDN,
     },
     bandPt: widthTwips / 20 - BAND_DEFICIT_PT[variant.borderEighths]!,
     justification: variant.justification,
@@ -164,6 +166,8 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT properties', () => {
         ...(variant.characterSpacingControl
           ? { characterSpacingControl: variant.characterSpacingControl } : {}),
         enableOpenTypeFeatures: variant.enableOpenTypeFeatures,
+        autoSpaceDE: variant.autoSpaceDE,
+        autoSpaceDN: variant.autoSpaceDN,
       },
       bandPt: widthTwips / 20 - BAND_DEFICIT_PT[variant.borderEighths]!,
       justification: variant.justification,
@@ -480,6 +484,32 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT and U+3000', () => {
       line.map((segment) => segment.text).join(''),
       Number(line.reduce((sum, segment) => sum + segment.width, 0).toFixed(4)),
     ])).toEqual(item.main);
+    expect(lines.every((line) => line.every((segment) => segment.compression === 0))).toBe(true);
+  });
+});
+
+describe('WORD_COMPRESSED_SPACE_LINE_FIT outside its measured inputs', () => {
+  // Targeted VRT: the 25 out-of-scope cells where the rule moved away from
+  // Word. With autospace enabled beside an ideograph, or a closing mark
+  // before U+0020, the paragraph keeps main's line breaker; Word and main
+  // both wrap every one of these cells.
+  const CELLS: readonly (readonly [string, string, string, readonly number[]])[] = [
+    ['coarse', 'controls-1660-c14-coarse.docx', 'punct-medial-close', [2082, 2125]],
+    ['coarse', 'controls-1660-c14-coarse.docx', 'latin-adjacent-on', [2082]],
+    ['coarse', 'controls-1660-c14-coarse.docx', 'digit-adjacent-on', [2082]],
+    ['fine', 'controls-1660-c14-fine-compressPunctuation.docx', 'latin-adjacent-on',
+      Array.from({ length: 21 }, (_, index) => 2082 + index)],
+  ];
+  it.each(CELLS.flatMap(([stage, document, name, widths]) => widths.map((width) => [
+    `${stage} ${name} ${width}`, stage, document, name, width,
+  ] as const)))('%s wraps like main and Word', (_label, stage, document, name, width) => {
+    const variant = VARIANTS.find((item) =>
+      item.stage === stage && item.document === document && item.variant === name)!;
+    const index = variant.widthsTwips.indexOf(width);
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(variant.wordWraps[index]).toBe('1');
+    const lines = lineCount(variant, width);
+    expect(lines.length).toBeGreaterThan(1);
     expect(lines.every((line) => line.every((segment) => segment.compression === 0))).toBe(true);
   });
 });

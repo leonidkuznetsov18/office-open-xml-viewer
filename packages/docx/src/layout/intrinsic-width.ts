@@ -526,6 +526,8 @@ export function measureParagraphIntrinsicWidths(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    autoSpaceDE: paragraph.autoSpaceDE,
+    autoSpaceDN: paragraph.autoSpaceDN,
   }));
   const paragraphWidthPt = Math.max(
     1,

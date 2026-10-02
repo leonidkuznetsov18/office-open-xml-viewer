@@ -249,6 +249,8 @@ export function measureParagraph(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    autoSpaceDE: paragraph.autoSpaceDE,
+    autoSpaceDN: paragraph.autoSpaceDN,
   });
   if (segments.length === 0) return measureMarkOnly();
 
