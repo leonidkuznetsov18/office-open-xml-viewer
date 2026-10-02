@@ -220,6 +220,22 @@ describe('PowerPoint text-box line metrics (#1610)', () => {
     expect(ys[0]).toBeCloseTo(20 * 1.2 * (1854 / (1854 + 434)), 5);
   });
 
+  it('preserves a larger unknown run size without inventing an ascent share (#1689)', () => {
+    for (const spaceLine of [null, { type: 'pct' as const, val: 150000 }]) {
+      const ys = baselines([
+        paragraph([{ text: 'A', font: 'Arial', size: 20 }], { spaceLine }),
+        paragraph([{ text: 'B', font: 'Arial', size: 20 }, { text: 'D', font: 'Avenir', size: 72 }], { spaceLine }),
+        paragraph([{ text: 'C', font: 'Arial', size: 20 }], { spaceLine }),
+      ]);
+      const spacing = spaceLine ? 1.5 : 1;
+      const share = 1854 / 2288;
+      const spacedShare = spaceLine ? 0.75 : share;
+      expect(ys[0]).toBeCloseTo(24 * spacing * spacedShare, 9);
+      expect(ys[1]).toBeCloseTo((24 + 86.4 * spacedShare) * spacing, 9);
+      expect(ys[2]).toBeCloseTo((24 + 86.4 + 24 * spacedShare) * spacing, 9);
+    }
+  });
+
   it('keeps only a line with no known face on the ordinary model (#1689 line scope)', () => {
     // fallback.win.pdf: an unmodelled face moves only its own line. A body
     // whose middle line has no known face keeps the metric baselines of the

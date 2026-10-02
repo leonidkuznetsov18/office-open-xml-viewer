@@ -1237,9 +1237,10 @@ export function buildFont(
  * powerPointFaceMetrics): the selected resource's own OS/2 metrics. A
  * document-embedded face is described by its own font part (#1689), parsed
  * when it was registered; an installed face by the reference catalogue. A
- * missing italic or bold resource is drawn by PowerPoint from the upright /
- * regular resource with a synthetic slant or emboldening, whose vertical
- * metrics are that resource's. A CSS generic family has no known resource.
+ * missing cut of an embedded family follows CSS style-then-weight matching;
+ * synthetic slant or emboldening keeps the selected resource's vertical metrics.
+ * Installed-face compatibility remains in powerPointFaceMetrics. A CSS generic
+ * family has no known resource.
  */
 function lineMetricFor(
   family: string,
@@ -1252,12 +1253,20 @@ function lineMetricFor(
   if (authored !== undefined) {
     const metrics = rc.embeddedFontMetrics;
     if (!metrics) return undefined;
+    // CSS Fonts §5.2: narrow by style before matching weight. Only four
+    // static slots are registered (§19.2.1.9), so the opposite weight in the
+    // requested style precedes either cut of the other style. Registration,
+    // not readable metrics, determines ownership: an unreadable selected cut
+    // must not silently borrow another resource's metrics or cmap.
     const weight = bold ? 700 : 400;
+    const otherWeight = bold ? 400 : 700;
     const style = italic ? 'italic' : 'normal';
-    return metrics.get(`${authored}:${weight}:${style}`)
-      ?? (rc.embeddedFontTuples?.has(`${authored}:${weight}:${style}`) ? undefined
-        : metrics.get(`${authored}:${weight}:normal`) ?? metrics.get(`${authored}:400:${style}`)
-          ?? metrics.get(`${authored}:400:normal`));
+    const otherStyle = italic ? 'normal' : 'italic';
+    for (const [w, st] of [[weight, style], [otherWeight, style], [weight, otherStyle], [otherWeight, otherStyle]]) {
+      const key = `${authored}:${w}:${st}`;
+      if (rc.embeddedFontTuples?.has(key) || metrics.has(key)) return metrics.get(key);
+    }
+    return undefined;
   }
   return powerPointFaceMetrics(family, bold, italic);
 }
@@ -5008,7 +5017,7 @@ export function renderTextBody(
         const natural = alignedLine ?? (compatOff
           ? powerPointCompatOffNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, box: r.face.excel! })))
           : metricRuns.length > 0
-            ? powerPointNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, share: r.face.share })))
+            ? powerPointNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, share: r.face.share })), maxSizePx)
             : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 });
         if (compatOff) pctSpacingUnit = natural.ascent + natural.descent;
         const spacing = para.spaceLine?.type === 'pts'

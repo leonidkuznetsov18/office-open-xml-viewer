@@ -40,7 +40,7 @@ const bytes = () => new Uint8Array([0, 1, 0, 0, 1]);
 
 // A table-directory fixture with a real Unicode format-12 cmap and OS/2
 // design metrics. FontFace registration is the only browser boundary mocked.
-function cjkResource(): Uint8Array {
+function cjkResource(codePoint = 0x6f22): Uint8Array {
   const bytes = new Uint8Array(284);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x00010000);
@@ -65,9 +65,45 @@ function cjkResource(): Uint8Array {
   view.setUint16(256, 12);
   view.setUint32(260, 28);
   view.setUint32(268, 1);
-  view.setUint32(272, 0x6f22); // 漢 is covered, 한 is missing.
-  view.setUint32(276, 0x6f22);
+  view.setUint32(272, codePoint); // Default repertoire: 漢 is covered, 한 is missing.
+  view.setUint32(276, codePoint);
   view.setUint32(280, 1);
+  return bytes;
+}
+
+// The full-Unicode cmap adds a BMP glyph absent from the BMP-only map,
+// as permitted by OpenType cmap “Encoding records and encodings”.
+function supersetCjkResource(): Uint8Array {
+  const bytes = new Uint8Array(336);
+  bytes.set(cjkResource().subarray(0, 244));
+  const view = new DataView(bytes.buffer);
+  view.setUint32(72, 92); // cmap table length
+  view.setUint16(246, 2);
+  for (const [index, encoding, offset] of [[0, 1, 20], [1, 10, 52]]) {
+    const record = 248 + index * 8;
+    view.setUint16(record, 3);
+    view.setUint16(record + 2, encoding);
+    view.setUint32(record + 4, offset);
+  }
+  const bmp = 264;
+  view.setUint16(bmp, 4);
+  view.setUint16(bmp + 2, 32);
+  view.setUint16(bmp + 6, 4);
+  view.setUint16(bmp + 14, 0x41);
+  view.setUint16(bmp + 16, 0xffff);
+  view.setUint16(bmp + 20, 0x41);
+  view.setUint16(bmp + 22, 0xffff);
+  view.setInt16(bmp + 24, 1 - 0x41);
+  view.setInt16(bmp + 26, 1);
+  const full = 296;
+  view.setUint16(full, 12);
+  view.setUint32(full + 4, 40);
+  view.setUint32(full + 12, 2);
+  for (const [index, cp] of [[0, 0x41], [1, 0x6f22]]) {
+    view.setUint32(full + 16 + index * 12, cp);
+    view.setUint32(full + 20 + index * 12, cp);
+    view.setUint32(full + 24 + index * 12, index + 1);
+  }
   return bytes;
 }
 
@@ -99,6 +135,54 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
         expect(hangul?.style.lineMetric?.share).not.toBe(0.7);
       }
     }
+  });
+
+  it('stops CJK fallback attribution when embedded BMP and full-Unicode cmaps disagree', async () => {
+    installFontFaceSet();
+    for (const fontName of ['Deck CJK', 'DengXian']) {
+      const loaded = await loadEmbeddedFonts([{
+        fontName, style: 'regular', partPath: 'font', contentType: 'application/x-font-ttf',
+      }], async () => supersetCjkResource());
+      const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+        embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+        embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+      const para = { runs: [{ type: 'text', text: '漢', fontFamily: 'Avenir', fontFamilyCs: fontName,
+        lang: 'en-US', fontSize: 22 }], tabStops: [] } as unknown as Paragraph;
+      const item = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+        .input.find((item) => item.type === 'text');
+      expect(item?.style.font).toContain(`"${loaded.aliases.get(fontName.toLowerCase())}"`);
+      expect(item?.style.faceFamily).toBeUndefined();
+      expect(item?.style.lineMetric).toBeUndefined();
+    }
+  });
+
+  it('matches style before weight for a missing embedded bold-italic cut', async () => {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts([
+      { fontName: 'Deck Serif', style: 'bold', partPath: 'bold', contentType: 'application/x-font-ttf' },
+      { fontName: 'Deck Serif', style: 'italic', partPath: 'italic', contentType: 'application/x-font-ttf' },
+    ], async (path) => cjkResource(path === 'italic' ? 0xa7 : 0x41));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    const para = { runs: [{ type: 'text', text: '§', fontFamily: 'Avenir', fontFamilyCs: 'Deck Serif',
+      lang: 'en-US', fontSize: 22, bold: true, italic: true }], tabStops: [] } as unknown as Paragraph;
+    const item = paragraphInputRuns(para, 22, '#000', 1 / 12700, true, true, 1, undefined, rc)
+      .input.find((item) => item.type === 'text');
+    expect(item?.style.faceFamily).toBe(loaded.aliases.get('deck serif'));
+    expect(item?.style.lineMetric?.share).toBe(0.7);
+    // A registered italic cut with unreadable metrics still owns the glyph;
+    // the readable bold cut cannot stand in for the face Canvas selected.
+    const unreadable = await loadEmbeddedFonts([
+      { fontName: 'Deck Serif', style: 'bold', partPath: 'bold', contentType: 'application/x-font-ttf' },
+      { fontName: 'Deck Serif', style: 'italic', partPath: 'italic', contentType: 'application/x-font-ttf' },
+    ], async (path) => path === 'italic' ? bytes() : cjkResource(0x41));
+    const unknownRc = { ...rc, embeddedFontAliases: unreadable.aliases,
+      embeddedFontAuthoredFamilies: unreadable.authoredFamilies,
+      embeddedFontTuples: unreadable.tuples, embeddedFontMetrics: unreadable.metrics };
+    const unknown = paragraphInputRuns(para, 22, '#000', 1 / 12700, true, true, 1, undefined, unknownRc)
+      .input.find((item) => item.type === 'text');
+    expect(unknown?.style.lineMetric).toBeUndefined();
   });
 
   it('maps all four PresentationML slots to CSS weight and style', async () => {

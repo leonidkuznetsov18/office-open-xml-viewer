@@ -242,6 +242,7 @@ export interface PowerPointFaceMetrics {
   /** Proven scalar coverage of a registered embedded resource. Parsed once,
    * bounded by core's cmap budgets; no font bytes or glyph-query cache retained. */
   readonly unicodeRanges?: OpenTypeLineMetrics['unicodeRanges'];
+  readonly unicodePossibleRanges?: OpenTypeLineMetrics['unicodePossibleRanges'];
 }
 
 const faceCache = new Map<string, PowerPointFaceMetrics | null>();
@@ -302,7 +303,7 @@ export function powerPointResourceFaceMetrics(metrics: OpenTypeLineMetrics): Pow
   const share = ascent / (ascent + descent);
   if (!Number.isFinite(share) || share <= 0 || share >= 1) return undefined;
   return Object.freeze({ share, glyph: { ascent: ascent / upm, descent: descent / upm }, excel: undefined,
-    unicodeRanges: metrics.unicodeRanges });
+    unicodeRanges: metrics.unicodeRanges, unicodePossibleRanges: metrics.unicodePossibleRanges });
 }
 
 /** One run's contribution to a line: its authored size and ascent share. */
@@ -321,8 +322,13 @@ export interface PowerPointLineRun {
  * Taking the largest descent instead is off by up to 5 px (1/100 in), and the
  * largest ascent by 13 px.
  */
-export function powerPointNaturalLine(runs: readonly PowerPointLineRun[]): { ascent: number; descent: number } {
-  let maxSize = 0;
+export function powerPointNaturalLine(
+  runs: readonly PowerPointLineRun[],
+  largestSizePx = 0,
+): { ascent: number; descent: number } {
+  // ECMA-376 §21.1.2.2.5/.11: even an unresolved face contributes its authored
+  // size. Known faces alone determine the split; never invent an unknown share.
+  let maxSize = largestSizePx;
   let ascent = 0;
   let descent = 0;
   for (const run of runs) {

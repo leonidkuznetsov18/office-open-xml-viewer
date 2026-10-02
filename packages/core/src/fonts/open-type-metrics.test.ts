@@ -317,6 +317,20 @@ describe('opt-in OpenType resource coverage', () => {
       view.setInt16(subtable + 24, index === 0 ? -64 : -65);
     }
     expect(parseOpenTypeResourceMetrics(bytes)?.unicodeRanges).toEqual([[0x42, 0x42]]);
+    const metrics = parseOpenTypeResourceMetrics(bytes) ?? undefined;
+    expect(openTypeResourceCoversCodePoint(metrics, 0x42)).toBe(true);
+    expect(openTypeResourceCoversCodePoint(metrics, 0x41)).toBeUndefined();
+    expect(openTypeResourceCoversCodePoint(metrics, 0x43)).toBe(false);
+    // Disjoint maps still prove absence outside their union. An empty positive
+    // proof must not discard the distinction between disagreement and absence.
+    view.setUint16(cmapOffset + 20 + 14, 0x41);
+    view.setUint16(cmapOffset + 20 + 32 + 20, 0x42);
+    view.setInt16(cmapOffset + 20 + 24, -64);
+    view.setInt16(cmapOffset + 20 + 32 + 24, -64);
+    const disjoint = parseOpenTypeResourceMetrics(bytes) ?? undefined;
+    expect(openTypeResourceCoversCodePoint(disjoint, 0x41)).toBeUndefined();
+    expect(openTypeResourceCoversCodePoint(disjoint, 0x42)).toBeUndefined();
+    expect(openTypeResourceCoversCodePoint(disjoint, 0x43)).toBe(false);
     // An unreadable eligible base map cannot simply be omitted from the proof.
     view.setUint16(cmapOffset + 20 + 32, 6);
     expect(parseOpenTypeResourceMetrics(bytes)?.unicodeRanges).toEqual([]);
