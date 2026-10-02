@@ -121,8 +121,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         return [w * (.5 + r * Math.cos(angle)), h * (.5 + r * Math.sin(angle))];
       });
       const ox = random() * 1.5 - .25; const oy = random() * 1.5 - .25;
-      const kx = trial % 6 < 2 ? 0 : random() * .8;
-      const ky = trial % 6 === 0 || trial % 6 === 2 ? 0 : random() * .8;
+      // Raster support covers areas and shape point foci; segments are native.
+      const kx = trial % 6 === 0 ? 0 : .01 + random() * .79;
+      const ky = trial % 6 === 0 ? 0 : .01 + random() * .79;
       const { ctx } = canvas(240, 240);
       ctx.translate(trial % 2 ? 200 : 35, 35);
       ctx.transform((trial % 2 ? -1 : 1) * (.6 + random() * .4), random() * .2, random() * .2, .6 + random() * .4, 0, 0);
@@ -132,7 +133,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       };
       // A discontinuous final stop makes only s=1 (including an unassigned
       // pixel) white. Every assigned interior shade must remain opaque black.
-      const recipe: GradientFill = { ...fill, path: trial % 3 ? 'shape' : 'rect',
+      const recipe: GradientFill = { ...fill, path: trial % 6 === 0 || trial % 3 ? 'shape' : 'rect',
         fillToRect: { l: ox, r: 1 - ox - kx, t: oy, b: 1 - oy - ky },
         stops: [{ position: 0, color: '000000' }, { position: 1, color: '000000' },
           { position: 1, color: 'FFFFFF' }],
@@ -168,9 +169,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(checked).toBeGreaterThan(50000);
   });
 
-  it('shades rect paths with box isolines toward the focus', () => {
+  it('shades a rectangular host outline with shape-path box isolines', () => {
     const { ctx } = canvas();
-    paint(fill, ctx, 240, 120);
+    paint({ ...fill, path: 'shape' }, ctx, 240, 120);
     // Horizontal, vertical and diagonal half-box points share one isoline.
     for (const [x, y] of [[60, 60], [120, 30], [60, 30], [180, 90]]) {
       expect(Math.abs(pixel(ctx, x, y)[0] - 128)).toBeLessThanOrEqual(3);
@@ -200,10 +201,6 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     const zero = canvas().ctx;
     paint({ ...fill, fillToRect: { l: 0, t: 0, r: 0, b: 0 } }, zero, 240, 120);
     for (const [x, y] of [[2, 2], [120, 60], [237, 117]]) expect(pixel(zero, x, y)).toEqual([0, 0, 0, 255]);
-    const segment = canvas().ctx;
-    paint({ ...fill, fillToRect: { l: .2, r: .2, t: .5, b: .5 } }, segment, 240, 120);
-    for (const x of [50, 120, 190]) expect(pixel(segment, x, 60)[0]).toBeLessThan(6);
-    expect(Math.abs(pixel(segment, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
     const omitted = canvas().ctx;
     paint({ ...fill, fillToRect: undefined }, omitted, 240, 120);
     expect(pixel(omitted, 120, 60)[0]).toBeLessThan(6);
@@ -314,12 +311,12 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         { cmd: 'moveTo', x: 0, y: 0 }, { cmd: 'lineTo', x: 2, y: 1 },
         { cmd: 'lineTo', x: 0, y: 1 }, { cmd: 'close' },
       ]] },
-      fill, stroke: null,
+      fill: { ...fill, fillToRect: { l: .25, r: .25, t: .25, b: .25 } }, stroke: null,
       transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
     expect(pixel(ctx, 180, 105)).toEqual([255, 255, 255, 255]);
     expect(pixel(ctx, 60, 60)[0]).toBeLessThan(6);
-    expect(Math.abs(pixel(ctx, 90, 90)[0] - 128)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(ctx, 105, 105)[0] - 132)).toBeLessThanOrEqual(3);
   });
 
   it('observes coverage without changing the caller path or canvas state', () => {
@@ -347,7 +344,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
 
   it('interpolates translucent stops once', () => {
     const { ctx } = canvas();
-    paint({ ...fill, stops: [{ position: 0, color: 'FF0000FF' }, { position: .5, color: 'FF000080' },
+    paint({ ...fill, path: 'shape', stops: [{ position: 0, color: 'FF0000FF' }, { position: .5, color: 'FF000080' },
       { position: 1, color: 'FF000000' }] }, ctx, 240, 120);
     expect(pixel(ctx, 120, 60)[3]).toBeGreaterThan(250);
     expect(Math.abs(pixel(ctx, 60, 60)[3] - 128)).toBeLessThanOrEqual(3);
@@ -378,7 +375,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       }
     });
     try {
-      paint(fill, ctx, 1e9, 1e9);
+      paint({ ...fill, path: 'shape' }, ctx, 1e9, 1e9);
       expect(pixel(ctx, 0, 0)[3]).toBe(255);
       expect(allocations.some(([w, h]) => w > 500 && h > 500)).toBe(true);
     } finally { vi.unstubAllGlobals(); }
@@ -442,7 +439,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
           stops: [{ position: 0, color: '000000' }, { position: 1, color: '000000' },
             { position: 1, color: 'FFFFFF' }],
         }, ctx, box, box, outline, undefined, work);
-        if (edges > 32768) {
+        if (edges > 32768 || (path === 'rect' && focus.r === 1)) {
           expect(paint).toBeNull();
           expect(work).toEqual({ edgeRows: 0, solves: 0, rejected: 0, pixels: 0 });
           continue;
@@ -633,14 +630,14 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
   it('covers affine strokes and large line decorations from their painted geometry', () => {
     const affine = canvas(512, 200).ctx;
     affine.scale(100, 1); affine.lineWidth = 1; affine.miterLimit = 1;
-    affine.strokeStyle = resolveFill(fill, affine, 2, 50, 2, 100) as CanvasPattern;
+    affine.strokeStyle = resolveFill({ ...fill, path: 'shape' }, affine, 2, 50, 2, 100) as CanvasPattern;
     affine.strokeRect(2, 50, 2, 100);
     expect(pixel(affine, 160, 100)).toEqual([255, 255, 255, 255]);
     const decorated = canvas(500, 400).ctx;
     paintDrawingMLShape(decorated, {
       rect: { x: 200, y: 200, w: 50, h: 1 },
       geometry: { kind: 'preset', name: 'line', adjustments: [] }, fill: null,
-      stroke: { color: 'FFFFFF', width: 20, fill, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+      stroke: { color: 'FFFFFF', width: 20, fill: { ...fill, path: 'shape' }, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
       transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
     expect(pixel(decorated, 150, 190)).toEqual([255, 255, 255, 255]);
@@ -723,14 +720,14 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     const px = (n: number) => n * 9525;
     const shape = { type: 'shape', x: px(200), y: px(200), width: px(50), height: px(1),
       rotation: 0, flipH: false, flipV: false, geometry: 'line', fill: null, textBody: null, custGeom: null,
-      stroke: { color: 'FFFFFF', width: px(20), fill: { ...fill, tileRect: {} }, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+      stroke: { color: 'FFFFFF', width: px(20), fill: { ...fill, path: 'shape', tileRect: {} }, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
     } as ShapeElement;
     const presentation = { slideWidth: px(400), slideHeight: px(400),
       slides: [{ index: 0, slideNumber: 1, background: { fillType: 'solid', color: '00FF00' }, elements: [shape] }],
       defaultTextColor: null, majorFont: null, minorFont: null } as Presentation;
     await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
     expect(pixel(ctx, 150, 190)).toEqual([255, 255, 255, 255]);
-    shape.stroke = { color: 'FFFFFF', width: px(20), fill: { ...fill, tileRect: {} }, cmpd: 'dbl' };
+    shape.stroke = { color: 'FFFFFF', width: px(20), fill: { ...fill, path: 'shape', tileRect: {} }, cmpd: 'dbl' };
     await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
     for (const y of [193, 207]) expect(pixel(ctx, 225, y)).toEqual([255, 255, 255, 255]);
   });
@@ -740,10 +737,10 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     paintDrawingMLShape(ctx, {
       rect: { x: 0, y: 0, w: 240, h: 120 },
       geometry: { kind: 'preset', name: 'triangle', adjustments: [] },
-      fill: { ...fill, tileRect: {} }, stroke: { color: '000000', width: 8, fill: { ...fill, path: 'shape', tileRect: {} } },
+      fill: { ...fill, tileRect: {}, fillToRect: { l: .25, r: .25, t: .25, b: .25 } }, stroke: { color: '000000', width: 8, fill: { ...fill, path: 'shape', tileRect: {} } },
       transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
-    expect(Math.abs(pixel(ctx, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(ctx, 120, 15)[0] - 123)).toBeLessThanOrEqual(3);
     expect(Math.abs(pixel(ctx, 120, 117)[0] - 242)).toBeLessThanOrEqual(3);
   });
 
@@ -753,7 +750,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     const shape = {
       type: 'shape', x: 0, y: 0, width: px(240), height: px(120),
       rotation: 0, flipH: false, flipV: false, geometry: 'triangle',
-      fill: { ...fill, tileRect: {} }, stroke: { color: '000000', width: px(8), fill: { ...fill, path: 'shape', tileRect: {} } }, textBody: null,
+      fill: { ...fill, tileRect: {}, fillToRect: { l: .25, r: .25, t: .25, b: .25 } }, stroke: { color: '000000', width: px(8), fill: { ...fill, path: 'shape', tileRect: {} } }, textBody: null,
       custGeom: null, shadow: null,
     } as ShapeElement;
     const presentation = {
@@ -762,7 +759,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       defaultTextColor: null, majorFont: null, minorFont: null,
     } as Presentation;
     await renderSlideNode(c, presentation, 0, { width: 240, dpr: 1 });
-    expect(Math.abs(pixel(ctx, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(ctx, 120, 15)[0] - 123)).toBeLessThanOrEqual(3);
     // Shape-path strokes have no fill silhouette: every format shades the
     // host box, whose rectangle is star-shaped (box isolines, s = .95).
     expect(Math.abs(pixel(ctx, 120, 117)[0] - 242)).toBeLessThanOrEqual(3);
@@ -784,7 +781,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         nativeExtCx: 240 * 9525, nativeExtCy: 120 * 9525,
         shapes: [{ x: 0, y: 0, w: 1, h: 1, rot: 0, strokeColor: '000000', strokeWidth: 8 * 9525,
           strokeFill: { ...fill, path: 'shape', tileRect: {} },
-          fill: { ...fill, tileRect: {} }, geom: { type: 'custom', paths: [
+          fill: { ...fill, tileRect: {}, fillToRect: { l: .25, r: .25, t: .25, b: .25 } }, geom: { type: 'custom', paths: [
             { w: 240, h: 120, commands: triangle },
             { w: 240, h: 120, fill: 'none', stroke: false, commands: [
               { op: 'moveTo', x: 0, y: 0 }, { op: 'lineTo', x: 240, y: 0 },
@@ -795,7 +792,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     } as Worksheet;
     const styles = { fonts: [], fills: [], borders: [], cellXfs: [], numFmts: [], dxfs: [] } as Styles;
     renderViewport(ctx, worksheet, styles, { row: 1, col: 1, rows: 1, cols: 1 });
-    expect(Math.abs(pixel(ctx, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixel(ctx, 120, 15)[0] - 123)).toBeLessThanOrEqual(3);
     // Shape-path strokes have no fill silhouette: every format shades the
     // host box, whose rectangle is star-shaped (box isolines, s = .95).
     expect(Math.abs(pixel(ctx, 120, 117)[0] - 242)).toBeLessThanOrEqual(3);

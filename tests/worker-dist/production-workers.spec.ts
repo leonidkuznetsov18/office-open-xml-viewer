@@ -155,18 +155,19 @@ async function viewerPathShadeSamples(
   }, { source, width, slide, points });
 }
 
-test('published PPTX viewer shades explicit whole-shape rect/shape tiles in main and worker modes', async ({ page }) => {
+test('published PPTX viewer retains rect point paint and shades shape tiles in main and worker modes', async ({ page }) => {
   const samples = await viewerPathShadeSamples(page, '/consumer/path-gradient.pptx', 480, 0,
     [[60, 120], [60, 70], [300, 120], [300, 70]]);
-  for (const modeSamples of samples) for (const pixel of modeSamples) {
-    expect(pixel[0]).toBeGreaterThanOrEqual(124);
-    expect(pixel[0]).toBeLessThanOrEqual(132);
+  // Rect point foci retain main's radial field: its diagonal half-box sample
+  // is ~180. Shape point foci still use box isolines (~128 at both samples).
+  const expected = [128, 180, 128, 128];
+  for (const modeSamples of samples) for (const [index, pixel] of modeSamples.entries()) {
+    expect(pixel[0]).toBeGreaterThanOrEqual(expected[index] - 4);
+    expect(pixel[0]).toBeLessThanOrEqual(expected[index] + 4);
     expect(pixel.slice(1)).toEqual([pixel[0], pixel[0], 255]);
   }
   expect(samples[1]).toEqual(samples[0]);
-  // Main's point-radius approximation gives ~180 at the first rect's corner,
-  // and ~90 at the second shape's axial sample. The box isoline is ~128 at both.
-  expect(Math.abs(samples[0][1][0] - 180)).toBeGreaterThan(30);
+  expect(Math.abs(samples[0][1][0] - 128)).toBeGreaterThan(30);
   expect(Math.abs(samples[0][2][0] - 90)).toBeGreaterThan(30);
 });
 

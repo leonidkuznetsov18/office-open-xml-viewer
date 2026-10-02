@@ -64,7 +64,31 @@ export function flattenFillOutline(
   let current: Point[] = [];
   let matrix: Matrix = [1, 0, 0, 1, 0, 0];
   const stack: Matrix[] = [];
-  const finish = () => { if (current.length >= 3) polygons.push(current); current = []; };
+  const finish = () => {
+    // Duplicate joins and straight subdivisions carry no fill geometry. Remove
+    // only exact, forward collinearity (never a reversing edge): this preserves
+    // winding and avoids zero-length/collinear bands, in linear input work.
+    const straight = (a: Point, b: Point, c: Point) =>
+      (b[0] - a[0]) * (c[1] - b[1]) === (b[1] - a[1]) * (c[0] - b[0])
+      && (b[0] - a[0]) * (c[0] - b[0]) + (b[1] - a[1]) * (c[1] - b[1]) >= 0;
+    const clean: Point[] = [];
+    for (const p of current) {
+      const last = clean[clean.length - 1];
+      if (last && p[0] === last[0] && p[1] === last[1]) continue;
+      while (clean.length >= 2 && straight(clean[clean.length - 2], clean[clean.length - 1], p)) clean.pop();
+      clean.push(p);
+    }
+    if (clean.length > 1 && clean[0][0] === clean[clean.length - 1][0]
+      && clean[0][1] === clean[clean.length - 1][1]) clean.pop();
+    let start = 0;
+    while (clean.length - start >= 3) {
+      if (straight(clean[clean.length - 2], clean[clean.length - 1], clean[start])) clean.pop();
+      else if (straight(clean[clean.length - 1], clean[start], clean[start + 1])) start++;
+      else break;
+    }
+    if (clean.length - start >= 3) polygons.push(clean.slice(start));
+    current = [];
+  };
   const lastRaw = (): Point | undefined => {
     const last = current[current.length - 1];
     const inverse = last ? invert(matrix) : null;
@@ -318,7 +342,7 @@ function convexBand(corners: Point[]): Point[] | null {
     if (sign && Math.sign(cross) !== sign) return null;
     sign = Math.sign(cross);
   }
-  return polygon;
+  return sign ? polygon : [];
 }
 
 function convexRowSpan(polygon: Point[], y: number): Array<[number, number]> {
@@ -423,12 +447,14 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
  *
  * Office observation (#1599, PowerPoint 16.113 screen/print preview and its
  * point-focus rasters): an explicit all-zero fillToRect is solid first stop;
- * an inset area is flat; a degenerate segment/point focus shades toward it.
+ * an inset area is flat; supported shape point foci shade toward the point.
  * For degenerate point foci, measured export bands paint in path order,
  * later bands winning. For area foci the complete inscribed copy is painted
  * last: point-focus export order cannot override the center-shade contract.
- * The center-kernel predicate is a library support boundary, not an Office
- * brush classifier. Unsupported outlines keep the previous circle resolver;
+ * Rect point foci and one-axis segment foci retain native paint (see the
+ * support gate below). The center-kernel predicate applies to both path types
+ * and is a library support boundary, not an Office brush classifier.
+ * Unsupported outlines keep the previous path-specific native resolver;
  * adjustment/aspect/topology boundaries lack live Office evidence (#1599).
  * Rotation framing also keeps the previous local frame pending live evidence.
  * Returns null when the host cannot allocate the shade raster.
@@ -440,6 +466,20 @@ export function resolvePathShade(
   work?: ShadeWork,
 ): CanvasPattern | null {
   if (hasInvertedPathShadeFocus(fill)) return null;
+  const focus = pathShadeFocusRect(fill);
+  // Compatibility support policy (#1599), not an inferred Office formula:
+  // rect point/default foci mapped to box isolines regress centered, quarter
+  // and corner foci on plus/star outlines and translucent ellipse controls.
+  // ECMA-376 §20.1.8.31 specifies a point focus but does not settle the band
+  // mapping for those hosts. Retain the previous native brush for ALL rect
+  // point foci rather than fitting individual outlines or stop colours.
+  // A one-axis segment has a singular affine image: collinear bands can
+  // compete at its collapsed contour. The area evidence does not establish
+  // segment shading (rect/roundRect shape paths and plus/star rect paths).
+  // Keep the previous midpoint brush for both segment orientations until
+  // Office boundary evidence settles the mapping; no partial segment shader.
+  const [fw, fh] = focus.size;
+  if ((fw === 0) !== (fh === 0) || (fill.path === 'rect' && fw === 0 && fh === 0)) return null;
   if (![frame, shapeBox].every(box => [box.x, box.y, box.w, box.h].every(Number.isFinite)
     && box.w > 0 && box.h > 0)) return null;
   if (typeof ctx.getTransform !== 'function' || fill.stops.length === 0) return null;
@@ -448,7 +488,12 @@ export function resolvePathShade(
   // circle approximation. Never cluster geometry or silently alter its shape.
   if (outlinePolygons.reduce((n, polygon) => n + polygon.length, 0) > EDGE_LIMIT) return null;
   const coverage = outlinePolygons.length > 0 ? outlinePolygons : [rectangle(shapeBox)];
-  if (fill.path === 'shape' && !isStrictlyStarShaped(
+  // Host topology constrains rect shades too: rect only changes the field,
+  // not the evidence boundary. Non-kernel outlines (arrows, chevrons, holes,
+  // L-shaped custom paths) retain main's bytes. Live right-arrow captures do
+  // not establish the rule for other focus/aspect/transform combinations;
+  // all fallback hosts remain out of scope, with no shape-name exceptions.
+  if (!isStrictlyStarShaped(
     coverage, [shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2], shapeBox,
   )) return null;
 
@@ -563,6 +608,7 @@ export function resolvePathShade(
       if (ex === 0 && ey === 0) continue;
       const corners = [inset(a), inset(b), b, a].map(p => apply(normToAux, p[0], p[1]));
       const convex = convexBand(corners);
+      if (convex?.length === 0) continue;
       const ys = corners.map(p => p[1]);
       const rowStart = Math.max(0, Math.ceil(Math.min(...ys) - .5));
       const rowEnd = Math.min(bh - 1, Math.floor(Math.max(...ys) - .5));
