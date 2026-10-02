@@ -17,7 +17,8 @@ export interface ReferenceFontMetricProfile {
    * OS/2 table; undefined means this source did not record the field. */
   readonly win?: readonly [ascent: number, descent: number] | null;
   /** OS/2 [sTypoAscender, sTypoDescender, sTypoLineGap], present only when the
-   * face sets fsSelection USE_TYPO_METRICS (OS/2 v4+). */
+   * face sets fsSelection USE_TYPO_METRICS, including older tables that set
+   * the bit in practice (same rule as the resource parser). */
   readonly typoMetrics?: readonly [ascender: number, descender: number, lineGap: number];
   /** Derived OS/2 code-page class. Null means this source did not provide the
    * code-page field needed to classify Word's auto-line allocation. */
@@ -29,6 +30,10 @@ export interface ReferenceFontMetricProfile {
    * (U+4E00–U+9FFF). Null means the face has no Unicode cmap; undefined means
    * this source did not record coverage. */
   readonly cjkUnifiedIdeographs?: boolean | null;
+  /** Unicode cmap presence within the catalogue's bounded symbol domain.
+   * Sorted inclusive endpoint pairs, interned across faces. Empty means no
+   * mapped symbols; null/undefined means unknown. Not installed-face detection. */
+  readonly symbolCoverage?: readonly number[] | null;
 }
 
 export interface FindReferenceFontMetricsOptions {
@@ -43,6 +48,7 @@ function freezeProfile(profile: ReferenceFontMetricProfile): ReferenceFontMetric
   if (profile.win) Object.freeze(profile.win);
   if (profile.typoMetrics) Object.freeze(profile.typoMetrics);
   if (profile.panose) Object.freeze(profile.panose);
+  if (profile.symbolCoverage) Object.freeze(profile.symbolCoverage);
   return Object.freeze(profile);
 }
 
@@ -54,7 +60,11 @@ function getProfiles(): readonly ReferenceFontMetricProfile[] {
   // The JSON payload is statically imported and parsed with the module. Only
   // profile freezing and the alias index are deferred until the first lookup.
   return profiles ??= Object.freeze(
-    [...referenceData.profiles as unknown as ReferenceFontMetricProfile[],
+    [...referenceData.profiles.map((profile) => ({
+      ...profile,
+      symbolCoverage: profile.symbolCoverage === null ? null
+        : referenceData.symbolCoverages[profile.symbolCoverage],
+    })) as unknown as ReferenceFontMetricProfile[],
       ...OPEN_FONT_REFERENCE_PROFILES].map(freezeProfile),
   );
 }
@@ -119,4 +129,30 @@ export function findReferenceFontMetrics(
   const query = normalizeFamilyName(familyOrAlias);
   if (!query) return EMPTY_RESULTS;
   return getAliasIndex().get(query)?.get(optionKey(options)) ?? EMPTY_RESULTS;
+}
+
+/** A cmap fact, not proof of the drawing resource. Outside the recorded
+ * #1653/#1689 symbol sweep domain, or for a source without coverage, return
+ * undefined rather than confuse an unrecorded scalar with a missing glyph. */
+export function referenceFontCoversSymbol(
+  profile: ReferenceFontMetricProfile,
+  codePoint: number,
+): boolean | undefined {
+  if (!isReferenceSymbolCodePoint(codePoint) || profile.symbolCoverage == null) return undefined;
+  const ranges = profile.symbolCoverage;
+  let lo = 0;
+  let hi = ranges.length / 2 - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (codePoint < ranges[mid * 2]) hi = mid - 1;
+    else if (codePoint > ranges[mid * 2 + 1]) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+/** Whether a scalar lies in the cmap domain recorded by the generator. */
+export function isReferenceSymbolCodePoint(codePoint: number): boolean {
+  return Number.isInteger(codePoint)
+    && referenceData.symbolCoverageRanges.some(([lo, hi]) => codePoint >= lo && codePoint <= hi);
 }

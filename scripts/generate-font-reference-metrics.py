@@ -2,9 +2,9 @@
 """Generate metadata-only reference font metrics for deterministic layout fallbacks.
 
 The generated profiles are reference facts, not proof of the font face selected by
-Canvas, the operating system, or Office. No outlines, glyph maps, or per-glyph
-advances are written to the output. OS/2 xAvgCharWidth is a scalar font
-metric, not a shaped text advance.
+Canvas, the operating system, or Office. No outlines, glyph IDs, or per-glyph
+advances are written to the output. Symbol coverage records cmap presence only.
+OS/2 xAvgCharWidth is a scalar font metric, not a shaped text advance.
 """
 
 from __future__ import annotations
@@ -28,6 +28,29 @@ MACOS_ROOT = Path("/System/Library/Fonts/Supplemental")
 MACOS_PRIMARY_ROOT = Path("/System/Library/Fonts")
 DATA_OUTPUT = Path("packages/core/src/fonts/reference-font-metrics-data.json")
 PROVENANCE_OUTPUT = Path("scripts/reference-font-metrics-provenance.json")
+
+# Bounded symbol domain from the #1653/#1689 slot sweeps, not all Unicode:
+# Latin-1 symbols; General Punctuation; Letterlike/Number Forms, Arrows, Math,
+# Misc Technical; Enclosed, Box/Block/Geometric, Misc Symbols and Dingbats.
+# Presence is a font fact, independent of which language routes it to ea.
+SYMBOL_COVERAGE_RANGES = ((0x00A0, 0x00FF), (0x2000, 0x206F),
+                          (0x2100, 0x23FF), (0x2460, 0x27BF))
+
+
+def symbol_coverage(cmap: dict[int, str] | None) -> list[int] | None:
+    """Sorted inclusive endpoint pairs; None is unknown, [] is known empty."""
+    if cmap is None:
+        return None
+    ranges: list[int] = []
+    for start, end in SYMBOL_COVERAGE_RANGES:
+        for code in range(start, end + 1):
+            if code not in cmap or cmap[code] == ".notdef":
+                continue
+            if ranges and ranges[-1] == code - 1:
+                ranges[-1] = code
+            else:
+                ranges.extend((code, code))
+    return ranges
 
 
 @dataclass(frozen=True)
@@ -170,16 +193,19 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
         None if cmap is None
         else any(0x4E00 <= code <= 0x9FFF and glyph != ".notdef" for code, glyph in cmap.items())
     )
-    # OS/2 typo metrics, recorded only when fsSelection USE_TYPO_METRICS (bit 7,
-    # OS/2 v4+) asks layout to use them (#1604: Gabriola in Excel).
-    if os2 is not None and (os2_version or 0) >= 4 and (fs_selection or 0) & 0x80:
+    profile["symbolCoverage"] = symbol_coverage(cmap)
+    # Honor fsSelection USE_TYPO_METRICS (bit 7), like the resource parser.
+    # Although introduced in OS/2 v4, installed v3 resources also set it;
+    # #1689 exported symbol resources confirm their typo+gap line metrics.
+    # Requiring v4 silently discards the font's declared selection.
+    if os2 is not None and (fs_selection or 0) & 0x80:
         profile["typoMetrics"] = [integer(os2, "sTypoAscender"), integer(os2, "sTypoDescender"),
                                   integer(os2, "sTypoLineGap")]
     # Keep provenance identifiers stable when a source fact stops shipping in
     # the runtime profile. The identity still covers that raw OS/2 value.
     identity_profile = {
         **{key: value for key, value in profile.items()
-           if key not in {"farEastCodePage", "win", "typoMetrics", "panose", "cjkUnifiedIdeographs"}},
+           if key not in {"farEastCodePage", "win", "typoMetrics", "panose", "cjkUnifiedIdeographs", "symbolCoverage"}},
         "os2": None if os2 is None else {
             "codePageRange1": provenance_code_page_range1,
         },
@@ -190,7 +216,7 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
     profile["_provenanceMetrics"] = None if os2 is None else {
         "typo": [integer(os2, "sTypoAscender"), integer(os2, "sTypoDescender"), integer(os2, "sTypoLineGap")],
         "win": [integer(os2, "usWinAscent"), integer(os2, "usWinDescent")],
-        "useTypoMetrics": bool((os2_version or 0) >= 4 and (fs_selection or 0) & 0x80),
+        "useTypoMetrics": bool((fs_selection or 0) & 0x80),
     }
     profile["_provenanceCodePageRange1"] = provenance_code_page_range1
     return profile
@@ -262,9 +288,19 @@ def main() -> None:
     )
     provenance.sort(key=lambda item: (item["source"], item["file"].casefold(), item["file"], item["faceIndex"]))
     exclusions.sort(key=lambda item: (item["source"], item["file"].casefold(), item["file"], item["faceIndex"]))
+    # Intern identical repertoires across cuts and sources, including empty
+    # cmaps. Runtime shares the frozen arrays; no per-glyph cache is needed.
+    repertoires = sorted({tuple(p["symbolCoverage"]) for p in profiles
+                          if p["symbolCoverage"] is not None})
+    coverage_ids = {r: i for i, r in enumerate(repertoires)}
+    for profile in profiles:
+        coverage = profile["symbolCoverage"]
+        profile["symbolCoverage"] = None if coverage is None else coverage_ids[tuple(coverage)]
     data = {
         "schemaVersion": 2,
         "notice": "Reference metrics are not proof of the face selected by Canvas, macOS, or Office.",
+        "symbolCoverageRanges": SYMBOL_COVERAGE_RANGES,
+        "symbolCoverages": repertoires,
         "profiles": profiles,
     }
     manifest = {

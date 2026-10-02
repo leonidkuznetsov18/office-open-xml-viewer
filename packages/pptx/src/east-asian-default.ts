@@ -1,4 +1,5 @@
-import { classifyCjkFont, findReferenceFontMetrics } from '@silurus/ooxml-core';
+import { powerPointSymbolCoverage } from './powerpoint-line-metrics.js';
+import { classifyCjkFont, findReferenceFontMetrics, isReferenceSymbolCodePoint } from '@silurus/ooxml-core';
 import {
   EAST_ASIAN_SLOT_RANGES,
   MICROSOFT_JHENGHEI_RANGES,
@@ -224,9 +225,13 @@ export function emptyEastAsianSlotFaces(selectedFace: string | null, text: strin
  * (decision B, and owner decision (c): the browser does not report which
  * installed face draws a fallback glyph).
  *
- * - A non-CJK glyph is attributed to S. The catalogue does not record symbol
- *   coverage, so a symbol S lacks (drawn by the symbol fallback) cannot be
- *   detected; S is the selected resource.
+ * - A recorded symbol belongs to the first face in the painting stack whose
+ *   real/synthetic cut's cmap covers it. Stop at unknown coverage: that face
+ *   might draw it. Missing symbols continue through Calibri, Cambria Math and
+ *   the CJK faces, just as painting does. The catalogue's Cambria Math lacks
+ *   U+25C6 although the #1689 PDF resource drew it; no cmap presence is invented
+ *   to emulate that different resource. Unrecorded scalars keep the existing
+ *   selected-face model. This is font-data routing, not a new Office heuristic.
  * - A CJK glyph is S's when S maps basic CJK (and, for a face whose
  *   repertoire is recorded, maps this glyph: CS MS Mincho sends 简 to
  *   Microsoft JhengHei, emptyea4 K04); otherwise it belongs to the
@@ -239,8 +244,24 @@ export function emptyEastAsianDrawingFace(
   selectedFace: string | null,
   cjkFaces: readonly string[],
   ch: string,
+  bold = false,
+  italic = false,
+  symbolCoverage = powerPointSymbolCoverage,
 ): string | null {
-  if (!isCjkFallbackGlyph(ch)) return selectedFace;
+  if (!isCjkFallbackGlyph(ch)) {
+    const cp = ch.codePointAt(0) ?? 0;
+    // Coverage outside the sweep domain is unknown for every resource. Keep
+    // the previous model there; within the domain an unknown S is decision c.
+    if (!isReferenceSymbolCodePoint(cp)) return selectedFace;
+    const stack = [selectedFace, ...EAST_ASIAN_SYMBOL_FALLBACK_FACES, ...cjkFaces];
+    for (const face of stack) {
+      if (!face) continue;
+      const coverage = symbolCoverage(face, bold, italic, cp);
+      if (coverage === undefined) return null;
+      if (coverage) return face;
+    }
+    return null;
+  }
   if (selectedFace && coversCjkIdeographs(selectedFace) === true
     && (!hasRecordedRepertoire(selectedFace) || covers(selectedFace, ch))) return selectedFace;
   for (const face of cjkFaces) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findReferenceFontMetrics } from './reference-font-metrics.js';
+import { findReferenceFontMetrics, referenceFontCoversSymbol } from './reference-font-metrics.js';
 
 describe('findReferenceFontMetrics', () => {
   it('preserves conflicting source profiles instead of choosing a same-name winner', () => {
@@ -59,6 +59,19 @@ describe('findReferenceFontMetrics', () => {
       }
       expect(findReferenceFontMetrics(japanese, { style: 'italic' })).toHaveLength(0);
     }
+  });
+
+  it('distinguishes cmap presence, absence and unrecorded symbols in a concrete cut', () => {
+    const tahoma = findReferenceFontMetrics('Tahoma', { source: 'office-mac', weight: 400, style: 'normal' })[0];
+    const extB = findReferenceFontMetrics('SimSun-ExtB', { source: 'office-mac', weight: 400, style: 'normal' })[0];
+    expect(referenceFontCoversSymbol(tahoma, 0x25A0)).toBe(true);
+    expect(referenceFontCoversSymbol(tahoma, 0x25C6)).toBe(false);
+    expect(referenceFontCoversSymbol(extB, 0x00A7)).toBe(false);
+    expect(referenceFontCoversSymbol(tahoma, 0x4E00)).toBeUndefined();
+    expect(referenceFontCoversSymbol(tahoma, 0x25A0 + 0.5)).toBeUndefined();
+    const open = findReferenceFontMetrics('BIZ UDMincho', { weight: 400, style: 'normal' })[0];
+    expect(referenceFontCoversSymbol(open, 0x25A0)).toBeUndefined();
+    expect(Object.isFrozen(tahoma.symbolCoverage)).toBe(true);
   });
 
   it('does not let callers mutate shared generated profiles', () => {

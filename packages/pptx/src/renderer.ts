@@ -160,7 +160,7 @@ import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-f
 import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
 import {
   powerPointCompatOffNaturalLine, powerPointExactLinePoints, powerPointFaceMetrics,
-  powerPointNaturalLine, type PowerPointFaceMetrics,
+  powerPointNaturalLine, powerPointSymbolCoverage, type PowerPointFaceMetrics,
   POWERPOINT_FONT_ALGN_UNIT_PT, powerPointFontAlgnOffset, powerPointFontAlgnReference,
 } from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
@@ -1684,8 +1684,15 @@ export function paragraphInputRuns(
     // application default; the defaults also follow an authored cs face.
     const csFontFor = (face: string, text: string) =>
       stackFontFor(face, text, true, COMPLEX_SCRIPT_DEFAULT_FACES);
+    // A deck part can replace a same-name catalogue resource. Its OS/2 tables
+    // are known, but per-glyph cmap coverage is not retained here; do not use
+    // an installed copy's repertoire as proof of that embedded drawing face.
+    // Until embedded coverage is wired, symbol attribution stays unknown (c).
+    const symbolCoverage: typeof powerPointSymbolCoverage = (face, b, i, cp) =>
+      rc.embeddedFontAliases?.has(face.trim().toLowerCase()) ? undefined
+        : powerPointSymbolCoverage(face, b, i, cp);
     const emptyEastAsianFaceFor = (ch: string): string | null => {
-      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, ch);
+      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, ch, bold, italic, symbolCoverage);
       return drawing === null ? null : normalizeFontFamily(drawing, rc);
     };
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;

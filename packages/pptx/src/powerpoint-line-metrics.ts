@@ -1,4 +1,4 @@
-import { findReferenceFontMetrics, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
+import { findReferenceFontMetrics, referenceFontCoversSymbol, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 
 /**
@@ -76,7 +76,7 @@ export function powerPointAscentShare(
 type Profile = ReturnType<typeof findReferenceFontMetrics>[number];
 
 /** The profiles of the copy PowerPoint lays the face out with (see above). */
-function chosenProfiles(family: string, bold: boolean, italic: boolean): Profile[] {
+function chosenProfiles(family: string, bold: boolean, italic: boolean, repertoire = false): Profile[] {
   const trimmed = family.trim();
   if (!trimmed) return [];
   const name = OBSERVED_SUBSTITUTES[trimmed.toLocaleLowerCase('en-US')] ?? trimmed;
@@ -101,10 +101,31 @@ function chosenProfiles(family: string, bold: boolean, italic: boolean): Profile
   // missing style: an accepted platform difference (owner decision (c) for
   // #1689), not an emulated 0.3333 shear.
   if (profiles.length === 0 && italic && findReferenceFontMetrics(name, { style: 'italic' }).length === 0) {
-    return chosenProfiles(family, bold, false);
+    return chosenProfiles(family, bold, false, repertoire);
+  }
+  // Empty-slot repertoire evidence is from Office's resources (#1689), as
+  // is the existing CJK coverage catalogue. Prefer that source for cmap facts;
+  // same-name system copies can omit symbols despite identical line tables.
+  // Metric source precedence remains the independently measured #1610 rule.
+  if (repertoire) {
+    const office = profiles.filter((p) => p.source === 'office-mac');
+    if (office.length > 0) return office;
   }
   const supplemental = profiles.filter((p) => p.source === 'macos-supplemental');
   return supplemental.length > 0 ? supplemental : profiles.filter((p) => p.source === 'office-mac');
+}
+
+/** Symbol presence in the Office repertoire's real/synthetic cut (see source
+ * precedence above). Conflicting profiles and unrecorded faces stay unknown;
+ * unioning cuts would wrongly attribute a missing italic glyph to its regular. */
+export function powerPointSymbolCoverage(
+  family: string, bold: boolean, italic: boolean, codePoint: number,
+): boolean | undefined {
+  const chosen = chosenProfiles(family, bold, italic, true);
+  if (chosen.length === 0) return undefined;
+  const first = referenceFontCoversSymbol(chosen[0], codePoint);
+  return first !== undefined && chosen.every((p) => referenceFontCoversSymbol(p, codePoint) === first)
+    ? first : undefined;
 }
 
 function resolveShare(family: string, bold: boolean, italic: boolean): number | undefined {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { TextRunData } from '@silurus/ooxml-core';
 import { paragraphInputRuns, renderTextBody } from './renderer.js';
-import { powerPointFaceMetrics, powerPointResourceFaceMetrics } from './powerpoint-line-metrics.js';
+import { powerPointFaceMetrics, powerPointResourceFaceMetrics, powerPointSymbolCoverage } from './powerpoint-line-metrics.js';
 import type { Paragraph, TextBody } from './types.js';
 
 // Issue #1689: an empty East Asian slot. Expected values are independent
@@ -74,7 +74,7 @@ function probeBaselines(f: Faces, target: string, control: boolean, targetSize =
     translate: () => {}, rotate: () => {}, scale: () => {}, beginPath: () => {},
     moveTo: () => {}, lineTo: () => {}, stroke: () => {}, clip: () => {}, rect: () => {},
   } as unknown as CanvasRenderingContext2D;
-  renderTextBody(ctx, body, 0, 0, 408 * 12700, 400 * 12700, SCALE);
+  renderTextBody(ctx, body, 0, 0, 408, 400, SCALE);
   return ys;
 }
 
@@ -144,6 +144,24 @@ describe('empty East Asian slot face resolution (#1689)', () => {
     }
   });
 
+  it('attributes covered and missing symbols per glyph to the drawing resource', () => {
+    // The installed cmap distinguishes a covered ■ from a missing ◆ in
+    // Tahoma, and a missing § from a covered § in the two ExtB resources.
+    expect(faces(' §■3', { latin: 'Arial', cs: 'SimSun-ExtB' }))
+      .toEqual({ '§': 'Calibri', '■': 'Cambria Math' });
+    expect(faces(' §■3', { latin: 'MingLiU-ExtB' }))
+      .toEqual({ '§': 'MingLiU-ExtB', '■': 'Cambria Math' });
+    expect(faces(' ■3', { latin: 'Calibri', cs: 'Tahoma' })['■']).toBe('Tahoma');
+    expect(faces(' ■3', { latin: 'Calibri' })['■']).toBe('Cambria Math');
+    // ◆ is absent in the installed Cambria Math cmap. The known next face
+    // in this painting stack is MS Mincho; the PDF's different resource is
+    // outside this catalogue's compatibility claim.
+    expect(faces(' ◆3', { latin: 'Calibri', cs: 'Courier New' })['◆']).toBe('MS Mincho');
+    expect(powerPointSymbolCoverage('Cambria Math', false, true, 0x25C6)).toBe(false);
+    // Unknown S might cover the glyph: do not claim a later catalogue face.
+    expect(faces(' ■3', { latin: 'Uncatalogued Face' })['■']).toBeUndefined();
+  });
+
   it('stacks the selected face, the symbol fallback and the CJK fallback in Office order', () => {
     // emptyea2 G01/G06, emptyea3 H01: § the cs face lacks → Calibri; ◆ ■ →
     // Cambria Math; CJK → the PANOSE tier face. Coverage picks within the stack.
@@ -164,6 +182,17 @@ describe('selected-resource line metrics (#1689)', () => {
     expect(powerPointFaceMetrics('Times New Roman', false, true)?.share).toBeCloseTo(1825 / 2268, 12);
   });
 
+  it('honors USE_TYPO_METRICS on older tables for a known symbol fallback', () => {
+    // The installed OS/2 v3 table and the exported resource both set bit 7.
+    const metric = powerPointFaceMetrics('Cambria Math', false, true);
+    expect(metric?.share).toBeCloseTo(1946 / 2401, 12);
+    expect(metric?.glyph).toEqual({ ascent: 1946 / 2048, descent: 455 / 2048 });
+    const { input } = paragraphInputRuns(para([textRun('■', { latin: 'Calibri' }, undefined)]),
+      22, '#000', SCALE, false, true, 1, undefined, RC);
+    const segment = input.find((i) => i.type === 'text');
+    expect(segment?.type === 'text' && segment.style.lineMetric).toBe(metric);
+  });
+
   it('moves only the target line, by the measured amount (emptyea, emptyea2, emptyea3)', () => {
     const cases: Array<[string, Faces, string, number]> = [
       ['E01', { latin: 'Calibri', cs: 'Tahoma' }, '§', -0.72],
@@ -181,6 +210,10 @@ describe('selected-resource line metrics (#1689)', () => {
       ['G06', { latin: 'Calibri', cs: 'SimSun-ExtB' }, '§◆■、漢か', 0],
       ['G07', { latin: 'Calibri' }, '§◆■、漢か', 0],
       ['H05', { latin: 'Arial', cs: 'Courier New' }, '§◆■、漢か', -1.44],
+      ['H01', { latin: 'Arial', cs: 'SimSun-ExtB' }, '§◆■、漢か', 0],
+      // K01's first row has no secondary CJK miss: its § drawing resource
+      // changes the line metric even though the Latin face lacks that symbol.
+      ['K01 first row', { latin: 'SimSun-ExtB' }, '§、漢か', -2.16],
     ];
     for (const [id, f, target, pdf] of cases) {
       const d = deltas(f, target);
@@ -209,6 +242,16 @@ describe('embedded selected-resource metrics (#1689)', () => {
     expect(powerPointResourceFaceMetrics({
       unitsPerEm: 0, hheaAscent: 0, hheaDescent: 0, hheaLineGap: 0, hasEastAsianCmap: false,
     })).toBeUndefined();
+  });
+
+  it('does not substitute installed cmap facts for a same-name embedded resource', () => {
+    const rc = { ...RC, embeddedFontAliases: new Map([['calibri', '__deck_calibri']]),
+      embeddedFontAuthoredFamilies: new Map([['__deck_calibri', 'calibri']]) };
+    const { input } = paragraphInputRuns(para([textRun('§', { latin: 'Calibri' }, undefined)]),
+      22, '#000', SCALE, false, true, 1, undefined, rc);
+    const segment = input.find((i) => i.type === 'text');
+    expect(segment?.type === 'text' && segment.style.faceFamily).toBeUndefined();
+    expect(segment?.type === 'text' && segment.style.lineMetric).toBeUndefined();
   });
 
   it('sizes an embedded face by its own resource, a missing style by the upright one', () => {
@@ -257,7 +300,7 @@ describe('fallback controls: line scope (#1689 fallback.win.pdf)', () => {
       translate: () => {}, rotate: () => {}, scale: () => {}, beginPath: () => {},
       moveTo: () => {}, lineTo: () => {}, stroke: () => {}, clip: () => {}, rect: () => {},
     } as unknown as CanvasRenderingContext2D;
-    renderTextBody(ctx, body, 0, 0, 408 * 12700, 360 * 12700, SCALE);
+    renderTextBody(ctx, body, 0, 0, 408, 360, SCALE);
     expect(ys).toHaveLength(8);
     return ys;
   }

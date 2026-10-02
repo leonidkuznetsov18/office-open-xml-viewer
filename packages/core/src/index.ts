@@ -765,6 +765,8 @@ export {
 } from './fonts/resource-metrics';
 export {
   findReferenceFontMetrics,
+  referenceFontCoversSymbol,
+  isReferenceSymbolCodePoint,
   type FindReferenceFontMetricsOptions,
   type ReferenceFontMetricProfile,
   type ReferenceFontSource,

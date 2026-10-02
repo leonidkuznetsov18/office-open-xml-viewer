@@ -70,9 +70,29 @@ verification artifacts, not redistributable baselines.
     model.
   - Synthetic italic uses the browser's own oblique, not PowerPoint's 0.3333
     shear.
-  - The catalogue does not record symbol coverage. A symbol that S lacks is
-    therefore still sized by S, while the browser draws it with the symbol
-    fallback where those fonts are installed.
+  - Symbol coverage is recorded from each concrete cut's Unicode cmap in a
+    bounded domain derived from the slot sweeps: Latin-1 symbols, General
+    Punctuation, Letterlike and Number Forms, Arrows, Math, Misc Technical,
+    Enclosed, Box/Block/Geometric Shapes, Misc Symbols and Dingbats. Identical
+    repertoires share inclusive ranges. Outside this domain the previous
+    selected-face model remains.
+  - Within the domain the first covering face in the painting stack owns the
+    metric, including Calibri, Cambria Math and the CJK tier. Unknown coverage
+    stops attribution: an earlier unknown face might draw the glyph.
+  - Office repertoire profiles take precedence over same-name system cmaps,
+    following the existing CJK coverage policy. Real and synthetic cuts use
+    the same style resolution as line metrics; metric-source precedence keeps
+    the separately measured line-table rule.
+  - The installed Cambria Math cmap omits U+25C6 although the exported PDF
+    resource draws it. The catalogue does not invent coverage for that resource
+    difference. The next covering CJK face owns the installed stack's metric;
+    the PDF comparison remains a resource mismatch.
+  - Deck-embedded fonts are distinct resources even when a catalogue name
+    matches. Their per-glyph coverage is not retained in the current adapter;
+    symbol attribution stays unknown rather than borrow installed cmap facts.
+  - Lines containing secondary CJK misses can still differ from Office because
+    those drawing resources are intentionally unknown under (B). Recording a
+    symbol fallback does not establish the missing CJK resource's metrics.
 
 ## Implementation
 
@@ -82,6 +102,10 @@ also names the drawing face when the renderer can know it.
 
 `renderer.ts` uses that stack for measuring, wrapping, painting and stacked or
 vertical text. It sizes each line from its known faces only.
+
+The catalogue honors the font's USE_TYPO_METRICS bit even when its OS/2 table
+predates version 4, matching the resource parser and the measured symbol
+resources. A version gate previously discarded the declared typo metrics.
 
 Deck-embedded fonts are sized from their own font parts' OS/2 tables. These
 are parsed when the font is registered, in the window and in the render worker.
