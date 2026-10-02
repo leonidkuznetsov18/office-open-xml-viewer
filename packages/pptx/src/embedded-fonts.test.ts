@@ -4,6 +4,7 @@ import { unregisterEmbeddedFonts } from '@silurus/ooxml-core';
 import { paragraphInputRuns, renderTextBody } from './renderer.js';
 import type { Paragraph, TextBody } from './types.js';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
+import { canonicalClusterPairs } from '../../core/src/test-fixtures/canonical-clusters.js';
 
 const globals = globalThis as Record<string, unknown>;
 const original = { document: globals.document, self: globals.self, FontFace: globals.FontFace };
@@ -308,7 +309,7 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
           })), tabStops: [] } as unknown as Paragraph;
           const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
             .input.filter((item) => item.type === 'text');
-          expect(items.map((item) => item.text).join('')).toBe(text);
+          expect(items.map((item) => item.text).join('')).toBe(text.normalize('NFC'));
           expect(items.map((item) => item.style.lineMetric?.share), `${slot} ${text} seam=${seam}`).toEqual([0.85]);
           if (slot === 'latin') expect(items[0].style.lineMetricLatin?.share).toBe(0.85);
           if (text === '§\u0301' && slot === 'cs' && !seam) {
@@ -330,6 +331,89 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
     }
   });
 
+  it('keeps generated canonical equivalents with remaining marks on the same loaded resource', async () => {
+    installFontFaceSet();
+    const pairs = canonicalClusterPairs();
+    const loaded = await loadEmbeddedFonts(['decomposed', 'composed'].map((partPath) => ({
+      fontName: 'Canonical Family', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
+    })), async (path) => clusterResource(pairs.map(([a, b]) =>
+      path === 'composed' ? a.normalize('NFC') : b).join(''), path === 'composed' ? 750 : 850));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    for (const pair of pairs) {
+      for (const text of pair) {
+        const para = { runs: [{ type: 'text', text, fontFamily: 'Canonical Family',
+          fontFamilyCs: 'Canonical Family', fontFamilyEa: 'Canonical Family', lang: 'en-US', fontSize: 22 }],
+          tabStops: [] } as unknown as Paragraph;
+        const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+          .input.filter((item) => item.type === 'text');
+        expect(items.map((item) => item.text).join('')).toBe(text.normalize('NFC'));
+        expect(items.map((item) => [item.style.lineMetric?.share, item.style.lineMetricLatin?.share]), text)
+          .toEqual([[0.75, 0.75]]);
+      }
+    }
+    unregisterEmbeddedFonts(loaded.faces);
+  });
+
+  it('uses canonical resource metrics through seams, measurement and all text modes in window and worker', async () => {
+    for (const worker of [false, true]) {
+      installFontFaceSet();
+      if (worker) {
+        globals.self = { fonts: (globals.document as { fonts: unknown }).fonts };
+        delete globals.document;
+      }
+      const pairs = [['A\u0301\u0307', 'Á\u0307'], ['\u1100\u1161\u11a8\u0307', '각\u0307'],
+        ['A\u0301\u0323', 'A\u0323\u0301'], ['\u212b', 'Å'], ['\u2126', 'Ω'],
+        ['A\u030a\u0301\u0307', 'Ǻ\u0307']];
+      const loaded = await loadEmbeddedFonts(['decomposed', 'composed', 'singletons'].map((partPath) => ({
+        fontName: 'Canonical Modes', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
+      })), async (path) => clusterResource(path === 'singletons' ? '\u212b\u2126'
+        : pairs.map(([a]) => a.normalize(path === 'composed' ? 'NFC' : 'NFD'))
+          .join('').replace('Ǻ', 'Å\u0301'), path === 'composed' ? 750 : 850));
+      const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+        embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+        embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+      for (const pair of pairs) {
+        for (const slot of ['ea', 'empty'] as const) {
+          for (const vert of ['horz', 'vert', 'vert270', 'eaVert', 'wordArtVert', 'wordArtVertRtl'] as const) {
+            for (const seam of [false, true]) {
+              const outcomes = pair.map((text) => {
+                const para = { runs: (seam ? [...text] : [text]).map((text) => ({
+                  type: 'text', text, fontFamily: 'Canonical Modes', fontFamilyCs: 'Canonical Modes',
+                  fontFamilyEa: slot === 'ea' ? 'Canonical Modes' : undefined, lang: 'en-US', fontSize: 22,
+                })), tabStops: [], alignment: 'l', marL: 0, marR: 0, indent: 0,
+                bullet: { type: 'none' } } as unknown as Paragraph;
+                const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+                  .input.filter((item) => item.type === 'text');
+                expect(items.map((item) => [item.style.lineMetric?.share, item.style.lineMetricLatin?.share]))
+                  .toEqual([[0.75, 0.75]]);
+                const calls: [string, number, number][] = [];
+                const ctx = { font: '', measureText: () => ({ width: 10,
+                  fontBoundingBoxAscent: 16.5, fontBoundingBoxDescent: 5.5 }), save() {}, restore() {},
+                  translate() {}, rotate() {}, scale() {},
+                  fillText: (text: string, x: number, y: number) => calls.push([text, x, y]),
+                } as unknown as CanvasRenderingContext2D;
+                const body = { paragraphs: [para], defaultFontSize: 22, verticalAnchor: 't',
+                  lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'square', vert, autoFit: 'none' } as TextBody;
+                // An overwide cluster must survive wrapping intact in every mode.
+                renderTextBody(ctx, body, 0, 0, 5, 100, 1 / 12700,
+                  undefined, 0, false, false, undefined, undefined, rc);
+                expect(calls.map(([text]) => text).join('')).toBe(text.normalize('NFC'));
+                if (vert === 'horz') expect(calls[0][2]).toBeCloseTo(19.8, 10);
+                const height = renderTextBody(ctx, body, 0, 0, 5, 100, 1 / 12700,
+                  undefined, 0, false, false, undefined, undefined, rc, undefined, true, undefined, false, true);
+                return { positions: calls.map(([, x, y]) => [x, y]), height };
+              });
+              expect(outcomes[0], `${pair[0]} ${slot} ${vert} seam=${seam}`).toEqual(outcomes[1]);
+            }
+          }
+        }
+      }
+      unregisterEmbeddedFonts(loaded.faces);
+    }
+  });
+
   it('does not lend a base-only resource metrics to an unresolved modified cluster', async () => {
     installFontFaceSet();
     const loaded = await loadEmbeddedFonts([{
@@ -338,12 +422,13 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
     const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
       embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
       embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
-    for (const text of ['§\u0301', 'A\u0301', '§\ufe0e', '§\ufe0f', '👩\u200d💻']) {
+    for (const text of ['§\u0301', 'A\u0301', 'Á', 'Á\ufe0e', 'A\u0301\ufe0e',
+      'Á\ufe0f', 'A\u0301\ufe0f', '§\ufe0e', '§\ufe0f', '👩\u200d💻']) {
       const para = { runs: [{ type: 'text', text, fontFamily: 'Base Only', lang: 'en-US', fontSize: 22 }],
         tabStops: [] } as unknown as Paragraph;
       const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
         .input.filter((item) => item.type === 'text');
-      expect(items.map((item) => item.text).join('')).toBe(text);
+      expect(items.map((item) => item.text).join('')).toBe(text.normalize('NFC'));
       expect(items[0].style.lineMetric, text).toBeUndefined();
       expect(items[0].style.lineMetricLatin, text).toBeNull();
     }

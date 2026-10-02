@@ -1,7 +1,7 @@
 import type { PptxEmbeddedFontMetrics } from './embedded-fonts.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import { openTypeResourceCoversCodePoint } from '@silurus/ooxml-core';
-import { fontResourceCoversCluster } from '@silurus/ooxml-core/internal/font-cluster-coverage';
+import { canonicalFontClusterText, fontResourceCoversCluster } from '@silurus/ooxml-core/internal/font-cluster-coverage';
 import type { CjkLang } from '@silurus/ooxml-core';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type {
@@ -1747,10 +1747,9 @@ export function paragraphInputRuns(
     // search: an earlier embedded face might paint the glyph. Never borrow
     // an installed same-name resource's cmap (ECMA-376 §19.2.1.9 / §15.2.13).
     const resourceCoverage = (catalogue: typeof powerPointSymbolCoverage, cluster: string): typeof powerPointSymbolCoverage =>
-      (face, b, i, cp) => {
+      (face, b, i, _cp) => {
         if (!rc.embeddedFontAliases?.has(face.trim().toLowerCase())) {
-          return cluster === String.fromCodePoint(cp) ? catalogue(face, b, i, cp)
-            : fontResourceCoversCluster(cluster, (point) => catalogue(face, b, i, point));
+          return fontResourceCoversCluster(cluster, (point) => catalogue(face, b, i, point));
         }
         return embeddedResourceFor(normalizeFontFamily(face, rc), b, i, rc, cluster).coverage;
       };
@@ -1823,7 +1822,10 @@ export function paragraphInputRuns(
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
       // Slot choice precedes measurement, wrapping and every paint flow. It
       // is independent of core's CJK line-break predicate (issue #1653).
-      let glyph = powerPointDisplayCluster(cluster, run.lang);
+      // Canonical display units enter the one shared layout/paint pipeline.
+      // Measuring, line breaking, stacked/vertical painting and both workers
+      // therefore use the same spelling as the resource-ownership decision.
+      let glyph = canonicalFontClusterText(powerPointDisplayCluster(cluster, run.lang));
       const slot = fontUnits[boundIndex].slot;
       const eaGlyph = slot === 'ea';
       const csGlyph = slot === 'cs';
@@ -1851,10 +1853,10 @@ export function paragraphInputRuns(
         share = undefined;
         face = mapped === ch ? symbolFamily : 'sans-serif';
       }
-      // A modified cluster whose owner is unresolved must not borrow the
-      // base-only Latin resource through the secondary line contribution.
+      // Embedded Latin contributions use the same cluster resolver, even for
+      // canonically composed singletons. Otherwise a decomposed spelling can
+      // gain a secondary resource contribution that its NFC spelling lacks.
       const clusterLatinShare = rc.embeddedFontAuthoredFamilies?.has(family)
-        && glyph !== String.fromCodePoint(glyph.codePointAt(0) as number)
         ? lineMetricFor(family, bold, italic, rc, glyph) ?? null : latinShare;
       if (group && (font !== groupFont || share !== groupShare || clusterLatinShare !== groupLatinShare
         || (face ?? undefined) !== groupFamily)) emitGroup();
