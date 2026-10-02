@@ -43,14 +43,28 @@ export function wordPositionalTabReferenceBox(
     : { start: referenceStart, end: referenceEnd };
 }
 
-export const WORD_OPENTYPE_FEATURES_COMPAT_KERNING = defineCompatibilityRule({
-  id: 'word-opentype-features-compat-kerning',
+export const WORD_KERN_THRESHOLD_AUTHORITY = defineCompatibilityRule({
+  id: 'word-kern-threshold-authority',
   evidence: {
-    kind: 'regression-test',
-    reference: 'packages/docx/src/run-char-metrics-render.test.ts#enables absent-threshold kerning only under enableOpenTypeFeatures',
+    kind: 'office-observation',
+    syntheticFixtureId: 'kern-threshold-and-general-punctuation-slots',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
   },
-  description: '[MS-DOCX] §2.3.3 stores enableOpenTypeFeatures as a named compatibility setting. When enabled, an unqualified run enables OpenType kerning; an explicit or style-resolved w:kern threshold remains authoritative. Both line measurement and paint use the same resolved threshold.',
+  description: 'ECMA-376 §17.3.2.19 makes the resolved style-cascade w:kern threshold authoritative: absence at every level disables kerning and size below the threshold disables it. In 56 informative mode-15 controls (42 boundary rows and 14 calibrations), Word additionally disables a zero threshold; positive thresholds below/equal/above 8–20pt run sizes follow the size comparison, independently of enableOpenTypeFeatures. Twelve null-adjustment controls cannot identify the switch. Same-face T + U+0020 across identically formatted source runs retains the font pair adjustment. Direct letter-pair splits, changed formatting/fonts, explicit w:spacing, other compatibility modes, and unadjusted positive-threshold flag comparisons are evidence gaps; their existing shaping boundaries remain unchanged. Three fit contradictions and one flag-dependent break do not establish a different kerning switch or a shaping-table preference. The zero-disables extension is library compatibility policy beyond the normative positive-threshold rule; no font-specific amount is inferred.',
 });
+
+/** Threshold is already resolved by the parser (including explicit zero).
+ * WORD_KERN_THRESHOLD_AUTHORITY supplies the zero-disables extension; the
+ * positive size comparison and absence default are ECMA-376 §17.3.2.19.
+ * Compare declared size, before small-caps/super/subscript paint transforms. */
+export function wordKerningApplies(
+  fontSizePt: number,
+  thresholdPt: number | null | undefined,
+): boolean {
+  return thresholdPt != null && thresholdPt > 0 && fontSizePt >= thresholdPt;
+}
 
 export const WORD_NUMBERING_MARKER_FIRST_LINE_UNION = defineCompatibilityRule({
   id: 'word-numbering-marker-first-line-union',

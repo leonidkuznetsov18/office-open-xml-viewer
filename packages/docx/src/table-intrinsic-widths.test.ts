@@ -654,6 +654,19 @@ describe('table intrinsic content widths', () => {
     expect(retainedNested.flowBounds.widthPt).toBe(120);
   });
 
+  it.each([undefined, 0, 8, 10, 12])('uses threshold %s in AutoFit intrinsic widths', (kerning) => {
+    const ctx = measuringContext((text) => [...text].length * 10
+      - (ctx.fontKerning === 'normal' && text.includes('AV') ? 2 : 0));
+    const run = { ...textRun('AV'), kerning };
+    const source = paragraph([run]);
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const widths = measureParagraphIntrinsicWidths(source, intrinsicContext(), 200,
+      { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, layoutServices: services, enableOpenTypeFeatures: true });
+    expect(widths).toEqual(kerning === 8 || kerning === 10
+      ? { minWidthPt: 18, maxWidthPt: 18 } : { minWidthPt: 20, maxWidthPt: 20 });
+  });
+
   it('shapes identical formatting across a run seam as one proportional atom', () => {
     const ctx = measuringContext((text) => text === 'AV' ? 15 : [...text].length * 10);
     const source = table([row([cell([

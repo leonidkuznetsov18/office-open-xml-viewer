@@ -1,3 +1,4 @@
+import { wordKerningApplies } from './line-compatibility.js';
 import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
@@ -1439,7 +1440,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning,
+    kerning: wordKerningApplies(segment.fontSize, segment.kerning),
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1513,9 +1514,7 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: segment.kerning === undefined
-        ? 'none'
-        : segment.fontSize >= segment.kerning ? 'normal' : 'none',
+      kerning: wordKerningApplies(segment.fontSize, segment.kerning) ? 'normal' : 'none',
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),

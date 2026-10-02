@@ -1,3 +1,4 @@
+import { wordKerningApplies } from './layout/line-compatibility.js';
 import type {
   BodyElement,
   DocParagraph,
@@ -1369,7 +1370,7 @@ export function numberingMarkerShapeInput(
     complexScript,
     fontHint: facts?.fontHint,
     eastAsiaLanguage: facts?.langEastAsia,
-    kerning: facts?.kerning == null ? undefined : fontSizePt >= facts.kerning,
+    kerning: wordKerningApplies(fontSizePt, facts?.kerning),
   });
 }
 
@@ -1427,7 +1428,7 @@ export function paragraphMarkShapeInput(
     complexScript,
     fontHint: facts.fontHint,
     eastAsiaLanguage: facts.langEastAsia,
-    kerning: facts.kerning == null ? undefined : fontSizePt >= facts.kerning,
+    kerning: wordKerningApplies(fontSizePt, facts.kerning),
   });
 }
 

@@ -24,6 +24,7 @@ import {
   referenceFontLineMetrics,
 } from '../reference-font-line-metrics.js';
 import {
+  wordKerningApplies,
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
   wordCompressedSpaceLineFitApplies,
@@ -192,12 +193,9 @@ export function appendTextPiece(
   const documentCharacterCompressionApplies =
     wordDocumentCharacterCompressionApplies(effectiveCharacterSpacing);
   const effectiveCharacterScale = acquiredTypography?.characterScale ?? r.charScale;
-  // WORD_OPENTYPE_FEATURES_COMPAT_KERNING: the exact compatSetting enables
-  // kerning for unqualified runs. Authored/style-resolved w:kern wins.
-  const effectiveKerningThreshold =
-    acquiredTypography?.kerningThresholdPt ??
-    r.kerning ??
-    (environment.enableOpenTypeFeatures ? 0 : undefined);
+  // WORD_KERN_THRESHOLD_AUTHORITY: keep the resolved value, including zero,
+  // so every measurement/paint consumer uses the same threshold decision.
+  const effectiveKerningThreshold = acquiredTypography?.kerningThresholdPt ?? r.kerning;
   const effectiveSnapToGrid = acquiredTypography?.snapToGrid ?? r.snapToGrid;
   // §17.3.2.33 small caps are sized per character: lowercase LETTERS render two
   // points smaller, uppercase letters and non-alphabetic characters at the full
@@ -1030,8 +1028,7 @@ function pushSegmentPiece(
     fontHint: r.fontHint,
     eastAsiaLanguage: r.langEastAsia,
     kerning:
-      effectiveKerningThreshold != null &&
-      (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
+      wordKerningApplies(cs ? csFontSize : base.fontSize, effectiveKerningThreshold),
     measure: false,
   });
   const shaped = authoritativeSpan
@@ -1322,6 +1319,9 @@ function emitResolvedTextSegment(
     effectiveVertAlign == null &&
     (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
     (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
+    // WORD_LATIN_INTERWORD_XAVG_FLOOR retains its existing OpenType gate;
+    // threshold authority must not widen this separate fit policy's scope.
+    environment.enableOpenTypeFeatures !== true &&
     effectiveKerningThreshold == null;
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)

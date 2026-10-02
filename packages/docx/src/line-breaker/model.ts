@@ -623,7 +623,7 @@ export interface LineLayoutEnvironment {
    * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
   readonly autoSpaceDE?: boolean;
   readonly autoSpaceDN?: boolean;
-  /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
+  /** See WORD_KERN_THRESHOLD_AUTHORITY for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;
    * the authored frame height remains authoritative even when glyph paint is

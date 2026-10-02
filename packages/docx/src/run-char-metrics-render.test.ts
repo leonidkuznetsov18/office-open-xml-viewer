@@ -45,7 +45,8 @@ function makeRecordingCanvas(): { canvas: HTMLCanvasElement; fills: FillCall[] }
     set fontKerning(v: string) { fontKerning = v; },
     measureText: (s: string) => {
       const p = px();
-      const w = [...s].length * p;
+      const w = [...s].length * p - (fontKerning === 'normal' ?
+        (s.includes('AV') ? 2 : 0) + (s.includes('T ') ? 1 : 0) : 0);
       return {
         width: w,
         fontBoundingBoxAscent: p * 0.8,
@@ -225,18 +226,6 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     ).toBeCloseTo(4, 5);
   });
 
-  it('w:kern (§17.3.2.19) enables ctx.fontKerning when the run size ≥ the threshold', async () => {
-    // fontSize FONT_PX=20pt, threshold 14pt ⇒ 20 ≥ 14 ⇒ kerning normal.
-    const { fills } = await render([textRun('WORD', { kerning: 14 })]);
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('normal');
-  });
-
-  it('w:kern disables kerning when the run size is below the threshold', async () => {
-    // threshold 28pt > 20pt run ⇒ kerning none.
-    const { fills } = await render([textRun('WORD', { kerning: 28 })]);
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
-  });
-
   it('keeps authored w:kern thresholds authoritative for complex-script runs', async () => {
     const { fills } = await render([
       textRun('نص', { rtl: true, cs: true, fontSizeCs: FONT_PX, kerning: 14 }),
@@ -247,22 +236,26 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     expect(drawOf(fills, 'عنوان').fontKerning).toBe('none');
   });
 
-  it('disables kerning when w:kern is absent from the resolved style hierarchy', async () => {
-    const { fills } = await render([textRun('WORD')]);
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
+  // CAL-K measured sizes/thresholds plus K1/K4 boundaries. Both flag values
+  // accept positive qualifying thresholds and reject absent/zero/too-large.
+  it.each([
+    { size: 8, threshold: undefined, expected: 'none' },
+    { size: 8, threshold: 0, expected: 'none' },
+    { size: 8, threshold: 8, expected: 'normal' },
+    { size: 12, threshold: 8, expected: 'normal' },
+    { size: 18, threshold: 18, expected: 'normal' },
+    { size: 18, threshold: 20, expected: 'none' },
+    { size: 20, threshold: 20, expected: 'normal' },
+    { size: 18, threshold: 8, expected: 'normal' },
+    { size: 18, threshold: undefined, expected: 'none' },
+  ])('keeps size $size threshold $threshold authoritative for measurement and paint', async ({ size, threshold, expected }) => {
+    for (const enableOpenTypeFeatures of [false, true]) {
+      const { fills, runs } = await render([textRun('AV', { fontSize: size, kerning: threshold })], {
+        compatibilityMode: 15, enableOpenTypeFeatures,
+      });
+      expect(drawOf(fills, 'AV').fontKerning).toBe(expected);
+      expect(runs[0].w).toBe(expected === 'normal' ? 2 * size - 2 : 2 * size);
+    }
   });
 
-  it('enables absent-threshold kerning only under enableOpenTypeFeatures', async () => {
-    const enabled = await render([textRun('WORD')], { enableOpenTypeFeatures: true });
-    const disabled = await render([textRun('WORD')], { enableOpenTypeFeatures: false });
-    expect(drawOf(enabled.fills, 'WORD').fontKerning).toBe('normal');
-    expect(drawOf(disabled.fills, 'WORD').fontKerning).toBe('none');
-  });
-
-  it('keeps an authored w:kern threshold authoritative over enableOpenTypeFeatures', async () => {
-    const { fills } = await render([textRun('WORD', { kerning: 28 })], {
-      enableOpenTypeFeatures: true,
-    });
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
-  });
 });

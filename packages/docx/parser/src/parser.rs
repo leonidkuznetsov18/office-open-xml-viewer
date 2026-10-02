@@ -187,6 +187,59 @@ mod private_typography_wire_tests {
     }
 
     #[test]
+    fn kern_threshold_resolves_cascade_and_preserves_explicit_zero() {
+        // ECMA-376 §§17.3.2.19, 17.7: resolved values, never a renderer guess.
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{W_NS}">
+          <w:docDefaults><w:rPrDefault><w:rPr><w:kern w:val="16"/></w:rPr></w:rPrDefault></w:docDefaults>
+          <w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:kern w:val="24"/></w:rPr></w:style>
+          <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Base"/></w:style>
+          <w:style w:type="character" w:styleId="Char"><w:rPr><w:kern w:val="36"/></w:rPr></w:style>
+        </w:styles>"#
+        ));
+        for (ppr, rpr, expected) in [
+            ("", "", 8.0),
+            (r#"<w:pStyle w:val="Child"/>"#, "", 12.0),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:rStyle w:val="Char"/>"#,
+                18.0,
+            ),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:kern w:val="40"/>"#,
+                20.0,
+            ),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:kern w:val="0"/>"#,
+                0.0,
+            ),
+        ] {
+            let p = parse_p(
+                &format!(
+                    r#"<w:pPr>{ppr}<w:rPr><w:kern w:val="28"/></w:rPr></w:pPr>
+              <w:r><w:rPr>{rpr}<w:sz w:val="36"/></w:rPr><w:t>AV</w:t></w:r>"#
+                ),
+                &styles,
+            );
+            let wire = first_run_json(&p, "text");
+            assert_eq!(wire["kerning"], expected);
+            assert_eq!(
+                wire["__typographyAcquisition"]["kerningThresholdPt"],
+                expected
+            );
+            // Direct paragraph-mark rPr does not become a content default.
+            assert_eq!(
+                p.paragraph_mark_font_facts.as_ref().unwrap().kerning,
+                Some(14.0)
+            );
+        }
+        let p = parse_p(r#"<w:r><w:t>AV</w:t></w:r>"#, &StyleMap::default());
+        assert!(first_run_json(&p, "text")["kerning"].is_null());
+    }
+
+    #[test]
     fn private_run_typography_is_identical_for_text_and_field_results() {
         let rpr = r#"<w:rPr>
           <w:u w:val="words" w:color="FF0000" w:themeColor="accent2" w:themeTint="20"/>
@@ -26940,6 +26993,38 @@ mod numbering_marker_font_tests {
             TablePositioningContext::Normal,
             LogicalTableSequenceContext::standalone(doc.root_element()),
         )
+    }
+
+    #[test]
+    fn table_kern_threshold_reaches_content_and_mark_with_direct_override() {
+        // ECMA-376 §17.7.6 table formatting feeds the same resolved rPr facts.
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{W_NS}">
+          <w:style w:type="table" w:styleId="Kern"><w:rPr><w:kern w:val="24"/></w:rPr></w:style>
+        </w:styles>"#
+        ));
+        let table = parse_tbl_styled(
+            r#"<w:tblPr><w:tblStyle w:val="Kern"/></w:tblPr>
+          <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>
+          <w:p><w:r><w:t>AV</w:t></w:r><w:r><w:rPr><w:kern w:val="0"/></w:rPr><w:t>To</w:t></w:r></w:p>
+          </w:tc></w:tr>"#,
+            &styles,
+        );
+        let CellElement::Paragraph(p) = &table.rows[0].cells[0].content[0] else {
+            panic!("paragraph")
+        };
+        let DocRun::Text(first) = &p.runs[0] else {
+            panic!("text")
+        };
+        let DocRun::Text(second) = &p.runs[1] else {
+            panic!("text")
+        };
+        assert_eq!(first.kerning, Some(12.0));
+        assert_eq!(second.kerning, Some(0.0));
+        assert_eq!(
+            p.paragraph_mark_font_facts.as_ref().unwrap().kerning,
+            Some(12.0)
+        );
     }
 
     fn cell_text_color(cell: &DocTableCell) -> Option<String> {

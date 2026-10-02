@@ -159,10 +159,11 @@ pub struct RunFmt {
     /// ECMA-376 §17.3.2.19 `<w:kern w:val>` — the SMALLEST font size (threshold)
     /// that has automatic font kerning applied; a run whose `sz` is below this
     /// value is not kerned. Stored in POINTS (source is ST_HpsMeasure =
-    /// half-points). Presence itself enables kerning (subject to the threshold);
+    /// half-points). Positive presence enables kerning (subject to the threshold);
     /// `None` = inherit, and "never set in the hierarchy" ⇒ no kerning at all
     /// (Word's default is OFF, unlike Canvas's default `fontKerning='auto'`).
-    /// `Some(0.0)` = kern at every size.
+    /// `Some(0.0)` preserves an explicit override: DOCX layout applies the
+    /// WORD_KERN_THRESHOLD_AUTHORITY zero-disables compatibility extension.
     pub kerning: Option<f64>,
     /// ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — "Horizontal in Vertical
     /// (Rotate Text)" (縦中横 / tate-chū-yoko). When `Some(true)`, in a VERTICAL
@@ -2249,9 +2250,10 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
     }
 
     // Font kerning threshold (ECMA-376 §17.3.2.19 `<w:kern w:val>`). ST_HpsMeasure
-    // (half-points) — the SMALLEST font size that has kerning applied. The mere
-    // presence of the element turns kerning on (subject to the threshold); Word's
-    // hierarchy default is OFF. `w:val="0"` = kern at all sizes. Stored in points.
+    // (half-points) — the SMALLEST font size that has kerning applied. A
+    // positive threshold enables kerning when size qualifies; absence inherits.
+    // Preserve zero, which overrides inheritance; layout owns its compatibility
+    // interpretation (WORD_KERN_THRESHOLD_AUTHORITY). Stored in points.
     if let Some(kern) = child_w(rpr, "kern") {
         if let Some(v) = attr_w(kern, "val") {
             fmt.kerning = half_pt_to_pt(&v);
@@ -3822,8 +3824,7 @@ mod tests {
         // size that gets kerning. Spec example `<w:kern w:val="28"/>` == 14 pt.
         let f = run_fmt_from(r#"<w:kern w:val="28"/>"#);
         assert_eq!(f.kerning, Some(14.0));
-        // val="0" (common in Word documents) = kern at every size — presence,
-        // not absence, so it must be Some(0.0) to keep kerning enabled.
+        // Explicit zero must survive parsing to override an inherited threshold.
         let f = run_fmt_from(r#"<w:kern w:val="0"/>"#);
         assert_eq!(f.kerning, Some(0.0));
         let f = run_fmt_from(r#"<w:kern w:val="12pt"/>"#);

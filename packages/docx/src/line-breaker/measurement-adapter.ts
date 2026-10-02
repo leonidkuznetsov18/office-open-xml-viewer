@@ -1,3 +1,4 @@
+import { wordKerningApplies } from '../layout/line-compatibility.js';
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
 import { calcEffectiveFontPx } from '../layout/text.js';
@@ -38,7 +39,7 @@ export class LineMeasurementAdapter {
     // ECMA-376 §17.3.2.19: an absent w:kern disables pair kerning even when
     // Canvas would otherwise choose its automatic kerning behavior.
     const previous = this.selectedKerning;
-    const selected = segment.kerning != null && segment.fontSize >= segment.kerning
+    const selected = wordKerningApplies(segment.fontSize, segment.kerning)
       ? 'normal'
       : 'none';
     this.context.fontKerning = selected;

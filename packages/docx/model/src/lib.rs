@@ -2577,8 +2577,9 @@ pub struct TextRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<f64>,
     /// ECMA-376 §17.3.2.19 `<w:kern w:val>` — font-kerning threshold in POINTS
-    /// (the smallest font size that is kerned). Presence enables kerning; `None`
-    /// = kerning off (the hierarchy default). `Some(0.0)` = kern at all sizes.
+    /// (the smallest font size that is kerned). Preserve the resolved threshold,
+    /// including explicit zero, to override inherited values. DOCX layout owns
+    /// the WORD_KERN_THRESHOLD_AUTHORITY zero-disables compatibility extension.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kerning: Option<f64>,
     /// ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
