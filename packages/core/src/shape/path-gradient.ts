@@ -23,9 +23,11 @@ type Matrix = [number, number, number, number, number, number];
 // This is an inherent additive cost over main's native point-focus brush,
 // not a constant-factor latency promise. A sequential Node/Skia resolve-only
 // probe at 512px with 32768 alternating-radius edges measured medians of
-// 1.03s (center), 2.29s (corner), 2.37s (outside-area focus); at 20000 edges
-// the corresponding medians were 0.62s/1.47s/1.46s. Hardware-dependent times
-// include outline traversal and raster generation, not the subsequent paint.
+// 0.14s (center), 0.35s (corner), 0.45s (outside-area focus) after replacing
+// rational extrema with shared-edge scans for convex bands. The previous
+// renderer measured 1.00s/2.20s/2.25s in the same three-run comparison.
+// Hardware-dependent times include outline traversal and raster generation,
+// not the subsequent paint; folded bands still require rational extrema.
 // Work guards cover the maximum supported edge count and reject larger inputs
 // before raster allocation. Tiled paints retain the native brush entirely.
 const MAX_EDGE = 512;
@@ -291,6 +293,49 @@ function bandPosition(u: number, v: number, ax: number, ay: number, ex: number, 
   return best;
 }
 
+/** Shared edges must produce the identical row coordinate in either path
+ * direction. Closed x intervals then share pixel-center seams; successor sets
+ * give each pixel to the last band exactly once, without a raster tolerance. */
+function rowCrossing(p: Point, q: Point, y: number): number {
+  if (p[1] > q[1]) [p, q] = [q, p];
+  if (y === p[1]) return p[0];
+  if (y === q[1]) return q[0];
+  return p[0] + (y - p[1]) / (q[1] - p[1]) * (q[0] - p[0]);
+}
+
+/** A bilinear band with a convex boundary fills that polygon. Point foci
+ * reduce to triangles. Only folded/concave bands need rational extrema. */
+function convexBand(corners: Point[]): Point[] | null {
+  const polygon = corners.filter((p, i) => {
+    const q = corners[(i + 1) % corners.length];
+    return p[0] !== q[0] || p[1] !== q[1];
+  });
+  let sign = 0;
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i]; const b = polygon[(i + 1) % polygon.length]; const c = polygon[(i + 2) % polygon.length];
+    const cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    if (cross === 0) continue;
+    if (sign && Math.sign(cross) !== sign) return null;
+    sign = Math.sign(cross);
+  }
+  return polygon;
+}
+
+function convexRowSpan(polygon: Point[], y: number): Array<[number, number]> {
+  let low = Infinity; let high = -Infinity;
+  for (let i = 0; i < polygon.length; i++) {
+    const p = polygon[i]; const q = polygon[(i + 1) % polygon.length];
+    if (y < Math.min(p[1], q[1]) || y > Math.max(p[1], q[1])) continue;
+    if (p[1] === q[1]) {
+      low = Math.min(low, p[0], q[0]); high = Math.max(high, p[0], q[0]);
+    } else {
+      const x = rowCrossing(p, q, y);
+      low = Math.min(low, x); high = Math.max(high, x);
+    }
+  }
+  return low <= high ? [[low, high]] : [];
+}
+
 /** Exact horizontal range(s) of a bilinear edge band. Its four corners
  * are A(a), A(b), b, a. For contour s, endpoints a(s), b(s) are linear.
  * Intersecting y gives x(s) = quadratic / linear. Split at endpoint/row
@@ -306,14 +351,23 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
   if (by === 0 && dy === 0 && ay !== 0) {
     const s = cy / ay;
     if (s < 0 || s > 1) return [];
-    const x = a[0] + ax * s; const end = x + bx + dx * s;
+    const x = rowCrossing(a, outerA, y); const end = rowCrossing(b, outerB, y);
     return [[Math.min(x, end), Math.max(x, end)]];
   }
-  const cuts = [0, 1];
-  for (const [constant, slope] of [[-cy, ay], [by - cy, ay + dy], [by, dy]]) {
-    if (slope !== 0) { const s = -constant / slope; if (s > 0 && s < 1) cuts.push(s); }
+  // Carry the endpoint coordinate with each cut. Re-evaluating x(s) as a
+  // quadratic/linear quotient introduces cancellation on shared connectors,
+  // allowing both neighbours to round a pixel center out of their spans.
+  const cuts: Array<{ s: number; x?: number }> = [{ s: 0 }, { s: 1 }];
+  for (const [p, q] of [[a, outerA], [b, outerB]]) {
+    if (p[1] === q[1]) continue;
+    const s = (y - p[1]) / (q[1] - p[1]);
+    if (s > 0 && s < 1) cuts.push({ s, x: rowCrossing(p, q, y) });
   }
-  cuts.sort((m, n) => m - n);
+  if (dy !== 0) {
+    const s = -by / dy;
+    if (s > 0 && s < 1) cuts.push({ s });
+  }
+  cuts.sort((m, n) => m.s - n.s);
   const n0 = a[0] * by + bx * cy;
   const n1 = a[0] * dy + ax * by + dx * cy - bx * ay;
   const n2 = ax * dy - dx * ay;
@@ -332,7 +386,7 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
   };
   const spans: Array<[number, number]> = [];
   for (let i = 0; i < cuts.length - 1; i++) {
-    const lo = cuts[i]; const hi = cuts[i + 1]; const mid = (lo + hi) / 2;
+    const lo = cuts[i].s; const hi = cuts[i + 1].s; const mid = (lo + hi) / 2;
     const denominator = by + dy * mid;
     if (Math.abs(denominator) <= 1e-12) {
       if (Math.abs(cy - ay * mid) <= 1e-12) {
@@ -343,7 +397,14 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
     }
     const t = (cy - ay * mid) / denominator;
     if (t < 0 || t > 1) continue;
-    const xs = [lo, hi, ...extrema.filter(s => s > lo && s < hi)].map(at);
+    const endpoint = (cut: { s: number; x?: number }) => {
+      if (cut.x !== undefined) return cut.x;
+      if (cut.s === 0 && a[1] !== b[1]) return rowCrossing(a, b, y);
+      if (cut.s === 1 && outerA[1] !== outerB[1]) return rowCrossing(outerA, outerB, y);
+      return at(cut.s);
+    };
+    const xs = [endpoint(cuts[i]), endpoint(cuts[i + 1]),
+      ...extrema.filter(s => s > lo && s < hi).map(at)];
     spans.push([Math.min(...xs), Math.max(...xs)]);
   }
   return spans;
@@ -428,7 +489,10 @@ export function resolvePathShade(
   if (!surface || !target || !ramp || typeof target.createImageData !== 'function') return null;
   const first = rgba(stops[0].color);
   const last = rgba(stops[stops.length - 1].color);
-  const shade = new Float32Array(bw * bh).fill(Number.NaN);
+  // Keep the solver's double precision: Float32 can round s<1 to exactly 1
+  // near a thin band's outline, turning an interior pixel into the final stop
+  // (visible with a discontinuous final stop). This adds at most 512²·4 bytes.
+  const shade = new Float64Array(bw * bh).fill(Number.NaN);
 
   if (work) { work.edgeRows = 0; work.solves = 0; work.rejected = 0; work.pixels = bw * bh; }
   {
@@ -474,7 +538,7 @@ export function resolvePathShade(
         const crossings: Array<[number, number]> = [];
         for (const [p, q] of innerEdges) {
           if ((p[1] <= y) !== (q[1] <= y)) {
-            crossings.push([p[0] + (y - p[1]) / (q[1] - p[1]) * (q[0] - p[0]), q[1] > p[1] ? 1 : -1]);
+            crossings.push([rowCrossing(p, q, y), q[1] > p[1] ? 1 : -1]);
           }
         }
         crossings.sort((m, n) => m[0] - n[0]);
@@ -484,7 +548,8 @@ export function resolvePathShade(
           if (winding === 0) continue;
           const start = Math.max(0, Math.ceil(crossings[i][0] - .5));
           const end = Math.min(bw - 1, Math.floor(crossings[i + 1][0] - .5));
-          for (let col = start; col <= end; col++) {
+          if (start > end) continue;
+          for (let col = find(row, start); col <= end; col = find(row, col)) {
             shade[row * bw + col] = 0;
             erase(row, col);
           }
@@ -497,12 +562,15 @@ export function resolvePathShade(
       const ex = b[0] - a[0]; const ey = b[1] - a[1];
       if (ex === 0 && ey === 0) continue;
       const corners = [inset(a), inset(b), b, a].map(p => apply(normToAux, p[0], p[1]));
+      const convex = convexBand(corners);
       const ys = corners.map(p => p[1]);
       const rowStart = Math.max(0, Math.ceil(Math.min(...ys) - .5));
       const rowEnd = Math.min(bh - 1, Math.floor(Math.max(...ys) - .5));
       for (let row = rowStart; row <= rowEnd; row++) {
         if (work) work.edgeRows++;
-        for (const [low, high] of bandRowSpans(corners, row + .5)) {
+        for (const [low, high] of convex ? convexRowSpan(convex, row + .5) : bandRowSpans(corners, row + .5)) {
+          // Both ends are closed and shared crossings are computed identically.
+          // The successor set supplies ownership, so rounding cannot leave a seam.
           const colEnd = Math.min(bw - 1, Math.floor(high - .5));
           const colStart = Math.max(0, Math.ceil(low - .5));
           if (colStart > colEnd) continue;
@@ -532,6 +600,8 @@ export function resolvePathShade(
   const pixels = target.createImageData(bw, bh);
   const data = pixels.data;
   for (let i = 0, offset = 0; i < shade.length; i++, offset += 4) {
+    // Bands and the reserved focus copy cover the outline; only its exterior
+    // uses the last stop (including the host stroke/paint coverage margin).
     const s = Number.isNaN(shade[i]) ? 1 : shade[i];
     const color = s <= 0 ? first : s >= 1 ? last : undefined;
     if (color) {

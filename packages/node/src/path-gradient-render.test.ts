@@ -49,6 +49,125 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     ctx.fillRect(0, 0, w, h);
   }
 
+  it.each(['docx', 'pptx', 'xlsx'] as const)('assigns centered ellipse seam pixels through %s painting', async format => {
+    const { c, ctx } = canvas(500, 500);
+    const recipe: GradientFill = { ...fill, path: 'shape', tileRect: { l: 0, t: 0, r: 0, b: 0 } };
+    if (format === 'docx') paintDrawingMLShape(ctx, {
+      rect: { x: 0, y: 0, w: 500, h: 500 }, geometry: { kind: 'preset', name: 'ellipse', adjustments: [] },
+      fill: recipe, stroke: null, transform: { rotationDeg: 0, flipH: false, flipV: false },
+    }, 1);
+    if (format === 'pptx') await renderSlideNode(c, {
+      slideWidth: 500 * 9525, slideHeight: 500 * 9525,
+      slides: [{ index: 0, slideNumber: 1, background: null, elements: [{
+        type: 'shape', x: 0, y: 0, width: 500 * 9525, height: 500 * 9525,
+        rotation: 0, flipH: false, flipV: false, geometry: 'ellipse', fill: recipe,
+        stroke: null, textBody: null, custGeom: null,
+      } as ShapeElement] }], defaultTextColor: null, majorFont: null, minorFont: null,
+    } as Presentation, 0, { width: 500, dpr: 1 });
+    if (format === 'xlsx') renderViewport(ctx, {
+      name: 'Sheet1', isChartSheet: true, rows: [], colWidths: {}, rowHeights: {}, freezeRows: 0, freezeCols: 0,
+      defaultColWidth: 8.43, defaultRowHeight: 15, mergeCells: [], conditionalFormats: [], images: [], charts: [],
+      defaultFontFamily: 'Calibri', defaultFontSize: 11,
+      shapeGroups: [{ fromCol: 0, fromRow: 0, fromColOff: 0, fromRowOff: 0, toCol: 1, toRow: 1,
+        toColOff: 0, toRowOff: 0, editAs: 'oneCell', nativeExtCx: 500 * 9525, nativeExtCy: 500 * 9525,
+        shapes: [{ x: 0, y: 0, w: 1, h: 1, rot: 0, strokeColor: undefined, strokeWidth: 0,
+          fill: recipe, geom: { type: 'preset', name: 'ellipse', adj: [] } }],
+      }],
+    } as Worksheet, { fonts: [], fills: [], borders: [], cellXfs: [], numFmts: [], dxfs: [] } as Styles,
+    { row: 1, col: 1, rows: 1, cols: 1 });
+    expect(Math.abs(pixel(ctx, 245, 245)[0] - 255 * Math.hypot(4.5, 4.5) / 250)).toBeLessThanOrEqual(1);
+    expect(pixel(ctx, 245, 245)[3]).toBe(255);
+    const data = ctx.getImageData(0, 0, 500, 500).data;
+    let speckles = 0;
+    for (let y = 0; y < 500; y++) for (let x = 0; x < 500; x++) {
+      if (Math.hypot(x + .5 - 250, y + .5 - 250) < 212.5 && data[(y * 500 + x) * 4] === 255) speckles++;
+    }
+    expect(speckles).toBe(0);
+  });
+
+  it.each([170, 340, 1000])('keeps ellipse seams shaded at size %i under reflected/sheared raster scaling', size => {
+    const { ctx } = canvas(800, 800);
+    ctx.translate(700, 50); ctx.transform(-.6, .05, .08, .6, 0, 0);
+    const inverse = ctx.getTransform().inverse();
+    paintDrawingMLShape(ctx, {
+      rect: { x: 0, y: 0, w: size, h: size }, geometry: { kind: 'preset', name: 'ellipse', adjustments: [] },
+      fill: { ...fill, path: 'shape' }, stroke: null,
+      transform: { rotationDeg: 0, flipH: false, flipV: false },
+    }, 1);
+    const data = ctx.getImageData(0, 0, 800, 800).data;
+    let checked = 0; let speckles = 0;
+    for (let y = 0; y < 800; y++) for (let x = 0; x < 800; x++) {
+      const u = inverse.a * (x + .5) + inverse.c * (y + .5) + inverse.e;
+      const v = inverse.b * (x + .5) + inverse.d * (y + .5) + inverse.f;
+      if (Math.hypot(u - size / 2, v - size / 2) >= size * .4) continue;
+      checked++;
+      if (data[(y * 800 + x) * 4] === 255 || data[(y * 800 + x) * 4 + 3] !== 255) speckles++;
+    }
+    expect(checked).toBeGreaterThan(1000);
+    expect(speckles).toBe(0);
+  });
+
+  it('assigns all interior pixels for seeded random outlines, sizes, foci and affine raster frames', () => {
+    let seed = 1599;
+    const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
+    let checked = 0;
+    for (let trial = 0; trial < 96; trial++) {
+      const w = 30 + random() * 130; const h = 30 + random() * 130;
+      const n = 4 + Math.floor(random() * 24);
+      // Alternating radii exercise concave center-kernel polygons as well as convex outlines.
+      const polygon = Array.from({ length: n }, (_, i) => {
+        const angle = i / n * 2 * Math.PI;
+        const r = trial % 2 && i % 2 ? .2 : .5;
+        return [w * (.5 + r * Math.cos(angle)), h * (.5 + r * Math.sin(angle))];
+      });
+      const ox = random() * 1.5 - .25; const oy = random() * 1.5 - .25;
+      const kx = trial % 6 < 2 ? 0 : random() * .8;
+      const ky = trial % 6 === 0 || trial % 6 === 2 ? 0 : random() * .8;
+      const { ctx } = canvas(240, 240);
+      ctx.translate(trial % 2 ? 200 : 35, 35);
+      ctx.transform((trial % 2 ? -1 : 1) * (.6 + random() * .4), random() * .2, random() * .2, .6 + random() * .4, 0, 0);
+      const inverse = ctx.getTransform().inverse();
+      const outline = (target: CanvasRenderingContext2D) => {
+        polygon.forEach(([x, y], i) => target[i ? 'lineTo' : 'moveTo'](x, y)); target.closePath();
+      };
+      // A discontinuous final stop makes only s=1 (including an unassigned
+      // pixel) white. Every assigned interior shade must remain opaque black.
+      const recipe: GradientFill = { ...fill, path: trial % 3 ? 'shape' : 'rect',
+        fillToRect: { l: ox, r: 1 - ox - kx, t: oy, b: 1 - oy - ky },
+        stops: [{ position: 0, color: '000000' }, { position: 1, color: '000000' },
+          { position: 1, color: 'FFFFFF' }],
+      };
+      const work: ShadeWork = { edgeRows: 0, solves: 0, rejected: 0, pixels: 0 };
+      const box = { x: 0, y: 0, w, h };
+      const shade = resolvePathShade(recipe, ctx, box, box, outline, undefined, work);
+      expect(shade, `trial ${trial}`).not.toBeNull();
+      ctx.fillStyle = shade as CanvasPattern; ctx.fillRect(-1000, -1000, 2000, 2000);
+      const data = ctx.getImageData(0, 0, 240, 240).data;
+      const contains = (x: number, y: number) => {
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+          const a = polygon[i]; const b = polygon[j];
+          if ((a[1] > y) !== (b[1] > y) && x < a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1])) inside = !inside;
+        }
+        return inside;
+      };
+      const holes: number[][] = [];
+      for (let y = 0; y < 240; y++) for (let x = 0; x < 240; x++) {
+        // Test every pixel center inside the outline and host box, with an
+        // independent ray-crossing test rather than the band's row intervals.
+        const u = inverse.a * (x + .5) + inverse.c * (y + .5) + inverse.e;
+        const v = inverse.b * (x + .5) + inverse.d * (y + .5) + inverse.f;
+        if (!(u > 0 && u < w && v > 0 && v < h && contains(u, v))) continue;
+        checked++;
+        const offset = (y * 240 + x) * 4;
+        if (data[offset] !== 0 || data[offset + 3] !== 255) holes.push([x, y, ...data.slice(offset, offset + 4)]);
+      }
+      expect(holes.slice(0, 10), JSON.stringify({ trial, w, h, ox, oy, kx, ky, work, count: holes.length })).toEqual([]);
+      expect(work.solves).toBeLessThanOrEqual(work.pixels);
+    }
+    expect(checked).toBeGreaterThan(50000);
+  });
+
   it('shades rect paths with box isolines toward the focus', () => {
     const { ctx } = canvas();
     paint(fill, ctx, 240, 120);
@@ -304,7 +423,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     } finally { vi.unstubAllGlobals(); vi.restoreAllMocks(); }
   });
 
-  it('bounds band solves by raster pixels for corner and nonnested area foci', () => {
+  it('bounds band solves and covers interiors for corner and nonnested area foci', () => {
     const { ctx } = canvas(512, 512);
     for (const path of ['rect', 'shape'] as const) for (const edges of [720, 20000, 32768, 32769]) {
       const outline = (target: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) => {
@@ -316,9 +435,13 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       };
       for (const focus of [{ l: 0, t: 0, r: 1, b: 1 }, { l: 1, t: 1, r: -.5, b: -.5 }]) {
         const work: ShadeWork = { edgeRows: 0, solves: 0, rejected: 0, pixels: 0 };
-        const box = { x: 0, y: 0, w: 512, h: 512 };
-        const paint = resolvePathShade({ ...fill, path, fillToRect: focus }, ctx, box, box,
-          outline, undefined, work);
+        // Keep device pixels aligned with raster pixels; no downsampling.
+        const size = 507;
+        const box = { x: 0, y: 0, w: size, h: size };
+        const paint = resolvePathShade({ ...fill, path, fillToRect: focus,
+          stops: [{ position: 0, color: '000000' }, { position: 1, color: '000000' },
+            { position: 1, color: 'FFFFFF' }],
+        }, ctx, box, box, outline, undefined, work);
         if (edges > 32768) {
           expect(paint).toBeNull();
           expect(work).toEqual({ edgeRows: 0, solves: 0, rejected: 0, pixels: 0 });
@@ -329,6 +452,30 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         expect(work.solves, JSON.stringify({ path, edges, focus, work })).toBeLessThanOrEqual(work.pixels);
         expect(work.rejected).toBe(0);
         expect(work.pixels).toBeLessThanOrEqual(512 * 512);
+        if (path === 'shape' && edges === 32768) {
+          ctx.fillStyle = paint as CanvasPattern; ctx.fillRect(0, 0, size, size);
+          const data = ctx.getImageData(0, 0, size, size).data;
+          let checked = 0; let holes = 0;
+          // Independent radial intersection with the authored polygon edge:
+          // angle selects an edge; its cross product gives the outline radius.
+          // This avoids repeating the shader's band/row/solve implementation.
+          for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+            const px = (x + .5) / size - .5; const py = (y + .5) / size - .5;
+            const angle = (Math.atan2(py, px) + 2 * Math.PI) % (2 * Math.PI);
+            const i = Math.floor(angle / (2 * Math.PI) * edges);
+            const a = i / edges * 2 * Math.PI; const b = (i + 1) / edges * 2 * Math.PI;
+            const r1 = i % 2 ? .5 : .03; const r2 = (i + 1) % 2 ? .5 : .03;
+            const ax = r1 * Math.cos(a); const ay = r1 * Math.sin(a);
+            const bx = r2 * Math.cos(b); const by = r2 * Math.sin(b);
+            const radius = (ax * by - ay * bx) / (Math.cos(angle) * (by - ay) - Math.sin(angle) * (bx - ax));
+            if (Math.hypot(px, py) >= radius) continue;
+            checked++;
+            const offset = (y * size + x) * 4;
+            if (data[offset] !== 0 || data[offset + 3] !== 255) holes++;
+          }
+          expect(checked).toBeGreaterThan(10000);
+          expect(holes, JSON.stringify({ focus, work })).toBe(0);
+        }
       }
     }
   }, 60000);
