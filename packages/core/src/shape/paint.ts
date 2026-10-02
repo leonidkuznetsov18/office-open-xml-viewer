@@ -7,6 +7,20 @@ import { hostStrokeBounds, paintPathSource } from './paint-bounds';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
+/** ECMA-376 §20.1.8.59: tileRect offsets are relative to the shape box;
+ * CT_RelativeRect defaults each omitted edge to zero. An empty/all-zero
+ * rectangle therefore covers the entire shape, just like an omitted tileRect.
+ * Only a different tile frame needs the native tiling compatibility path. */
+export function usesPathShade(
+  fill: Readonly<Pick<GradientFill, 'fillType' | 'gradType' | 'path' | 'tileRect'>>
+    | { readonly fillType: Exclude<Fill['fillType'], 'gradient'> } | null | undefined,
+): boolean {
+  return fill?.fillType === 'gradient' && fill.gradType === 'radial'
+    && (fill.path === 'rect' || fill.path === 'shape')
+    && (fill.tileRect?.l ?? 0) === 0 && (fill.tileRect?.t ?? 0) === 0
+    && (fill.tileRect?.r ?? 0) === 0 && (fill.tileRect?.b ?? 0) === 0;
+}
+
 function tiledGradient(
   fill: GradientFill,
   ctx: CanvasRenderingContext2D,
@@ -198,6 +212,21 @@ export function resolveFill(
   outline?: FillOutline,
   paintBounds?: ShadeBox,
 ): string | CanvasGradient | CanvasPattern | null {
+  return resolveFillImpl(fill, ctx, x, y, w, h, shapeRotationDeg,
+    patternPtToUserUnits, patternCoordinateTransform, outline, paintBounds, true);
+}
+
+function resolveFillImpl(
+  fill: Fill | null,
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number,
+  shapeRotationDeg = 0,
+  patternPtToUserUnits?: number,
+  patternCoordinateTransform?: DOMMatrix2DInit,
+  outline?: FillOutline,
+  paintBounds?: ShadeBox,
+  pathShading = true,
+): string | CanvasGradient | CanvasPattern | null {
   if (!fill || fill.fillType === 'none') return null;
   if (fill.fillType === 'solid') return hexToRgba(fill.color);
   if (fill.fillType === 'pattern') {
@@ -223,7 +252,7 @@ export function resolveFill(
     const tileY = y + h * (tile?.t ?? 0);
     const tileW = w * (1 - (tile?.l ?? 0) - (tile?.r ?? 0));
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
-    if (fill.gradType === 'radial' && fill.tileRect == null && (fill.path === 'rect' || fill.path === 'shape')) {
+    if (pathShading && usesPathShade(fill)) {
       // Canvas has no shape-following shade; resolvePathShade rasterizes it.
       // Unsupported topology, resource limits and allocation-unavailable
       // hosts retain main's path-specific native approximation. Its midpoint focus
@@ -234,8 +263,7 @@ export function resolveFill(
       ) ?? nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
     }
     if (fill.gradType === 'radial') {
-      // Any authored tileRect stays on main's native path, even an explicit
-      // zero rectangle, invalid tile extents or unavailable tile allocation.
+      // Different tile frames, invalid tile extents and charts stay native.
       // Tiling is out of scope; failure to build a repeat is not raster support.
       return nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
     } else {
@@ -273,6 +301,18 @@ export function resolveFill(
     return gradient;
   }
   return null;
+}
+
+/** Chart geometry has its own paint frames (series marks, outlines, labels,
+ * legends and projected faces). The shape-outline evidence for §20.1.8.46
+ * does not establish their path-shade behavior; classic bar/column outline
+ * controls show that applying the shape raster can move away from Office.
+ * Preserve the previous native chart paint until chart-specific geometry is
+ * established. Explicit dispatch also covers effect canvases and direct
+ * family painters without ambient context state or model mutation. */
+export function resolveNativeFill(...args: Parameters<typeof resolveFill>): ReturnType<typeof resolveFill> {
+  const [fill, ctx, x, y, w, h, rotation, units, transform, outline, bounds] = args;
+  return resolveFillImpl(fill, ctx, x, y, w, h, rotation, units, transform, outline, bounds, false);
 }
 
 // Chart families resolve fills through many shared painters. A chart installs

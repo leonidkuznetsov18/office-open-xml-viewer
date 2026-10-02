@@ -1,5 +1,5 @@
 import type { ArrowEnd, Stroke } from '../types/common';
-import { hexToRgba, resolveFill } from './paint';
+import { hexToRgba, resolveFill, usesPathShade } from './paint';
 
 /** A 2D point in canvas pixels. */
 export interface Point {
@@ -94,8 +94,7 @@ export function drawArrowHead(
   // Ordinary patterns and tiled gradients retain main's decoration-local CTM;
   // native solid/linear/circle paints also keep their existing frames. A
   // CanvasPattern alone cannot distinguish those brushes from a path raster.
-  const hostTransform = stroke.fill?.fillType === 'gradient' && stroke.fill.gradType === 'radial'
-    && stroke.fill.tileRect == null && (stroke.fill.path === 'rect' || stroke.fill.path === 'shape')
+  const hostTransform = usesPathShade(stroke.fill)
     && typeof ctx.getTransform === 'function' ? ctx.getTransform() : undefined;
   const anchorPaint = () => {
     // Canvas patterns follow the paint-time CTM; native gradients retain their
@@ -158,8 +157,7 @@ export function resolveArrowPaint(
   frame: { x: number; y: number; w: number; h: number }, rotation: number, ptUnits: number,
 ): string | CanvasGradient | CanvasPattern | undefined {
   if (!stroke.fill || end.type === 'none') return undefined;
-  if (stroke.fill.fillType !== 'gradient' || stroke.fill.gradType !== 'radial'
-    || stroke.fill.tileRect != null || (stroke.fill.path !== 'rect' && stroke.fill.path !== 'shape')
+  if (!usesPathShade(stroke.fill)
     || typeof ctx.getTransform !== 'function') {
     return resolveFill(stroke.fill, ctx, frame.x, frame.y, frame.w, frame.h, rotation, ptUnits) ?? undefined;
   }

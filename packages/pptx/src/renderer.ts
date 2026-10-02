@@ -26,6 +26,7 @@ import type {
 } from './types';
 import { asBullet } from './types';
 import {
+  usesPathShade,
   trackPaintPath,
   currentStrokeBounds,
   resolveArrowPaint,
@@ -3449,8 +3450,7 @@ export function shapeTextRotation(vert: string, rotation: number, flipH: boolean
 }
 
 function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: number, themeDefaultColor = '#000000', slideNumber?: number, rc: RenderContext = { themeMajorFont: null, themeMinorFont: null, dpr: 1 }, onTextRun?: TextRunCallback, fetchImage?: FetchImage) {
-  if (el.stroke?.fill?.fillType === 'gradient' && el.stroke.fill.gradType === 'radial' && el.stroke.fill.tileRect == null
-    && (el.stroke.fill.path === 'rect' || el.stroke.fill.path === 'shape')) ctx = trackPaintPath(ctx);
+  if (usesPathShade(el.stroke?.fill)) ctx = trackPaintPath(ctx);
   const x = emuToPx(el.x, scale);
   const y = emuToPx(el.y, scale);
   const w = emuToPx(el.width, scale);
@@ -3745,8 +3745,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     silhouette?: string,
     bounds: { x: number; y: number; w: number; h: number } = { x, y, w, h },
   ): void => {
-    if (el.stroke?.fill?.fillType === 'gradient' && el.stroke.fill.gradType === 'radial' && el.stroke.fill.tileRect == null
-      && (el.stroke.fill.path === 'rect' || el.stroke.fill.path === 'shape')) target = trackPaintPath(target);
+    if (usesPathShade(el.stroke?.fill)) target = trackPaintPath(target);
     const { x: bx, y: by, w: bw, h: bh } = bounds;
     const tFill = silhouette ??
       (target === ctx && bx === x && by === y && bw === w && bh === h
@@ -3934,8 +3933,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     : [];
   const flatBevelEdgePadCss = (el.stroke ? (el.stroke.width * scale) / 2 : 0) + 2;
   const paintLineDecorations = (target: CanvasRenderingContext2D): void => {
-    if (el.stroke?.fill?.fillType === 'gradient' && el.stroke.fill.gradType === 'radial' && el.stroke.fill.tileRect == null
-      && (el.stroke.fill.path === 'rect' || el.stroke.fill.path === 'shape')) target = trackPaintPath(target);
+    if (usesPathShade(el.stroke?.fill)) target = trackPaintPath(target);
     if (el.stroke && (CONNECTOR_GEOMS.has(geom) || CALLOUT_GEOMS.has(geom))) {
       // The preset body deliberately suppresses retractable leader strokes. Paint
       // the shortened leader and its line ends into the same target as the body
@@ -6508,8 +6506,7 @@ function paintResolvedPicture(
       // the Canvas default — PowerPoint draws the picture frame straddling
       // the silhouette edge.
       if (el.stroke) {
-        if (el.stroke?.fill?.fillType === 'gradient' && el.stroke.fill.gradType === 'radial' && el.stroke.fill.tileRect == null
-      && (el.stroke.fill.path === 'rect' || el.stroke.fill.path === 'shape')) target = trackPaintPath(target);
+        if (usesPathShade(el.stroke?.fill)) target = trackPaintPath(target);
         target.save();
         tracePictureSilhouette(target, ox, oy, ow, oh);
         applyStroke(target, el.stroke, scale, { x: ox, y: oy, w: ow, h: oh }, el.rotation);
@@ -6973,8 +6970,7 @@ function drawCompoundLine(
     ctx.beginPath();
     ctx.moveTo(start.x + ox, start.y + oy);
     ctx.lineTo(end.x + ox, end.y + oy);
-    if (stroke.fill?.fillType === 'gradient' && stroke.fill.gradType === 'radial' && stroke.fill.tileRect == null
-      && (stroke.fill.path === 'rect' || stroke.fill.path === 'shape')) {
+    if (stroke.fill && usesPathShade(stroke.fill)) {
       // Parallel compound segments have different offsets and widths. Resolve
       // after building each real segment, with the common authored shade frame.
       const paint = resolveShapeFill(stroke.fill, ctx,

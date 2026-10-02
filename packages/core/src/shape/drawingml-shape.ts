@@ -3,7 +3,7 @@ import { resolveArrowPaint, drawArrowHead, lineEndRetract, retractLineEndpoint }
 import { trackPaintPath, currentStrokeBounds } from './paint-bounds';
 import { buildCustomPath } from './custGeom';
 import { getCustGeomEndpoints } from './custgeom-endpoints';
-import { applyStroke, resolveFill } from './paint';
+import { applyStroke, resolveFill, usesPathShade } from './paint';
 import { buildShapePath } from './preset';
 import {
   buildPresetGeometryFillPath,
@@ -279,8 +279,7 @@ export function paintDrawingMLShape(
   plan: DrawingMLShapePaintPlan,
   unitToDevice: number,
 ): void {
-  if (plan.stroke?.fill?.fillType === 'gradient' && plan.stroke.fill.gradType === 'radial' && plan.stroke.fill.tileRect == null
-    && (plan.stroke.fill.path === 'rect' || plan.stroke.fill.path === 'shape')) ctx = trackPaintPath(ctx);
+  if (usesPathShade(plan.stroke?.fill)) ctx = trackPaintPath(ctx);
   const { x, y, w, h } = plan.rect;
   withDrawingMLShapeTransform(ctx, plan, () => {
     // Shared fill resolution is observational; retained plans keep gradient

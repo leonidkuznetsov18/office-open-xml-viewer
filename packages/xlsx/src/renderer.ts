@@ -23,7 +23,7 @@ import type {
   ChartRegionMapRenderer,
   ChartExRenderer,
 } from '@silurus/ooxml-core';
-import { trackPaintPath, currentStrokeBounds, chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
+import { usesPathShade, trackPaintPath, currentStrokeBounds, chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
@@ -4592,8 +4592,7 @@ function drawShape(
   loadedImages?: Map<string, CanvasImageSource | null>,
   cjkFallback?: CjkLang,
 ): void {
-  if (shape.strokeFill?.fillType === 'gradient' && shape.strokeFill.gradType === 'radial' && shape.strokeFill.tileRect == null
-    && (shape.strokeFill.path === 'rect' || shape.strokeFill.path === 'shape')) ctx = trackPaintPath(ctx);
+  if (usesPathShade(shape.strokeFill)) ctx = trackPaintPath(ctx);
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {
     ctx.translate(sx + sw / 2, sy + sh / 2);

@@ -58,6 +58,17 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   });
 
+  it.each(['rect', 'shape'] as const)('%s shades explicit whole-shape tile rectangles like omitted tiles', path => {
+    const expected = canvas().ctx;
+    paint({ ...fill, path }, expected, 240, 120);
+    for (const tileRect of [{}, { l: 0, t: 0, r: 0, b: 0 }]) {
+      const actual = canvas().ctx;
+      paint({ ...fill, path, tileRect }, actual, 240, 120);
+      expect(Buffer.from(actual.getImageData(0, 0, 240, 120).data)
+        .equals(Buffer.from(expected.getImageData(0, 0, 240, 120).data))).toBe(true);
+    }
+  });
+
   it('fills the inscribed focus area with the first stop and shades the band to the outline', () => {
     const area = canvas().ctx;
     paint({ ...fill, fillToRect: { l: .2, r: .4, t: .25, b: .25 } }, area, 240, 120);
@@ -418,10 +429,8 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(pixel(ctx, 83, 86).slice(0, 3)).toEqual([0, 0, 0]);
   });
 
-  it.each(['rect', 'shape'] as const)('retains main %s native paint for zero and degenerate tile rectangles', path => {
+  it.each(['rect', 'shape'] as const)('retains main %s native paint for degenerate tile rectangles', path => {
     for (const [tileRect, cx, cy, rx, ry] of [
-      [{}, 60, 65, 140, 65],
-      [{ l: 0, r: 0, t: 0, b: 0 }, 60, 65, 140, 65],
       [{ l: .5, r: .5 }, 100, 65, 0, 65],
     ] as const) {
       const actual = canvas(200, 100).ctx; const expected = canvas(200, 100).ctx;
@@ -567,14 +576,14 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     const px = (n: number) => n * 9525;
     const shape = { type: 'shape', x: px(200), y: px(200), width: px(50), height: px(1),
       rotation: 0, flipH: false, flipV: false, geometry: 'line', fill: null, textBody: null, custGeom: null,
-      stroke: { color: 'FFFFFF', width: px(20), fill, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+      stroke: { color: 'FFFFFF', width: px(20), fill: { ...fill, tileRect: {} }, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
     } as ShapeElement;
     const presentation = { slideWidth: px(400), slideHeight: px(400),
       slides: [{ index: 0, slideNumber: 1, background: { fillType: 'solid', color: '00FF00' }, elements: [shape] }],
       defaultTextColor: null, majorFont: null, minorFont: null } as Presentation;
     await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
     expect(pixel(ctx, 150, 190)).toEqual([255, 255, 255, 255]);
-    shape.stroke = { color: 'FFFFFF', width: px(20), fill, cmpd: 'dbl' };
+    shape.stroke = { color: 'FFFFFF', width: px(20), fill: { ...fill, tileRect: {} }, cmpd: 'dbl' };
     await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
     for (const y of [193, 207]) expect(pixel(ctx, 225, y)).toEqual([255, 255, 255, 255]);
   });
@@ -584,7 +593,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     paintDrawingMLShape(ctx, {
       rect: { x: 0, y: 0, w: 240, h: 120 },
       geometry: { kind: 'preset', name: 'triangle', adjustments: [] },
-      fill, stroke: { color: '000000', width: 8, fill: { ...fill, path: 'shape' } },
+      fill: { ...fill, tileRect: {} }, stroke: { color: '000000', width: 8, fill: { ...fill, path: 'shape', tileRect: {} } },
       transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
     expect(Math.abs(pixel(ctx, 120, 30)[0] - 128)).toBeLessThanOrEqual(3);
@@ -597,7 +606,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     const shape = {
       type: 'shape', x: 0, y: 0, width: px(240), height: px(120),
       rotation: 0, flipH: false, flipV: false, geometry: 'triangle',
-      fill, stroke: { color: '000000', width: px(8), fill: { ...fill, path: 'shape' } }, textBody: null,
+      fill: { ...fill, tileRect: {} }, stroke: { color: '000000', width: px(8), fill: { ...fill, path: 'shape', tileRect: {} } }, textBody: null,
       custGeom: null, shadow: null,
     } as ShapeElement;
     const presentation = {
@@ -627,8 +636,8 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         toCol: 1, toRow: 1, toColOff: 0, toRowOff: 0, editAs: 'oneCell',
         nativeExtCx: 240 * 9525, nativeExtCy: 120 * 9525,
         shapes: [{ x: 0, y: 0, w: 1, h: 1, rot: 0, strokeColor: '000000', strokeWidth: 8 * 9525,
-          strokeFill: { ...fill, path: 'shape' },
-          fill, geom: { type: 'custom', paths: [
+          strokeFill: { ...fill, path: 'shape', tileRect: {} },
+          fill: { ...fill, tileRect: {} }, geom: { type: 'custom', paths: [
             { w: 240, h: 120, commands: triangle },
             { w: 240, h: 120, fill: 'none', stroke: false, commands: [
               { op: 'moveTo', x: 0, y: 0 }, { op: 'lineTo', x: 240, y: 0 },
