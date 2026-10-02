@@ -1,3 +1,4 @@
+import type { PptxEmbeddedFontMetrics } from './embedded-fonts.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import { openTypeResourceCoversCodePoint } from '@silurus/ooxml-core';
 import type { CjkLang } from '@silurus/ooxml-core';
@@ -197,10 +198,9 @@ export interface RenderContext {
   /** Isolated FontFace alias → lower-cased authored family for fallback policy. */
   embeddedFontAuthoredFamilies?: ReadonlyMap<string, string>;
   embeddedFontTuples?: ReadonlySet<string>;
-  /** Line metrics of each registered embedded face, keyed like
-   * `embeddedFontTuples` (authored family:weight:style), parsed from the
-   * font part's own OS/2 tables and bounded cmap (#1689 resource attribution). */
-  embeddedFontMetrics?: ReadonlyMap<string, PowerPointFaceMetrics>;
+  /** Registered embedded resources per authored family:weight:style tuple,
+   * in insertion order, each with its own OS/2 tables and bounded cmap. */
+  embeddedFontMetrics?: PptxEmbeddedFontMetrics;
   /** Theme hyperlink colour as a 6-char hex (no leading #), or null. */
   themeHlinkColor?: string | null;
   /**
@@ -1247,28 +1247,57 @@ function lineMetricFor(
   bold: boolean,
   italic: boolean,
   rc: RenderContext,
+  codePoint?: number,
 ): PowerPointFaceMetrics | undefined {
   if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
-  const authored = rc.embeddedFontAuthoredFamilies?.get(family);
-  if (authored !== undefined) {
-    const metrics = rc.embeddedFontMetrics;
-    if (!metrics) return undefined;
-    // CSS Fonts §5.2: narrow by style before matching weight. Only four
-    // static slots are registered (§19.2.1.9), so the opposite weight in the
-    // requested style precedes either cut of the other style. Registration,
-    // not readable metrics, determines ownership: an unreadable selected cut
-    // must not silently borrow another resource's metrics or cmap.
-    const weight = bold ? 700 : 400;
-    const otherWeight = bold ? 400 : 700;
-    const style = italic ? 'italic' : 'normal';
-    const otherStyle = italic ? 'normal' : 'italic';
-    for (const [w, st] of [[weight, style], [otherWeight, style], [weight, otherStyle], [otherWeight, otherStyle]]) {
-      const key = `${authored}:${w}:${st}`;
-      if (rc.embeddedFontTuples?.has(key) || metrics.has(key)) return metrics.get(key);
-    }
-    return undefined;
+  if (rc.embeddedFontAuthoredFamilies?.has(family)) {
+    return embeddedResourceFor(family, bold, italic, rc, codePoint).metrics;
   }
   return powerPointFaceMetrics(family, bold, italic);
+}
+
+/** Resolve the actual composite resource before lending its metrics. CSS
+ * Fonts §5.2 matches style before weight, then tests a same-slot composite
+ * face's cmaps in reverse insertion order (§4.6); Font Loading §4.2 puts
+ * non-CSS-connected faces after CSS faces in their insertion order. A repeated
+ * registry retain does not reinsert a face. Unknown tables/cmap stop ownership
+ * inference, just as for a single part; never union distinct resources' cmaps
+ * and attach one part's metrics to that union. Library policy: without a
+ * glyph (a mark or unused Latin slot), a composite has no unique resource
+ * authority, so keep it unresolved. No glyph-result cache is kept.
+ */
+function embeddedResourceFor(
+  family: string,
+  bold: boolean,
+  italic: boolean,
+  rc: RenderContext,
+  codePoint?: number,
+): { metrics: PowerPointFaceMetrics | undefined; coverage: boolean | undefined } {
+  const authored = rc.embeddedFontAuthoredFamilies?.get(family);
+  const metrics = rc.embeddedFontMetrics;
+  const unknown = { metrics: undefined, coverage: undefined };
+  if (authored === undefined || !metrics) return unknown;
+  const weight = bold ? 700 : 400;
+  const otherWeight = bold ? 400 : 700;
+  const style = italic ? 'italic' : 'normal';
+  const otherStyle = italic ? 'normal' : 'italic';
+  for (const [w, st] of [[weight, style], [otherWeight, style], [weight, otherStyle], [otherWeight, otherStyle]]) {
+    const key = `${authored}:${w}:${st}`;
+    if (!rc.embeddedFontTuples?.has(key) && !metrics.has(key)) continue;
+    const resources = metrics.get(key);
+    if (!resources) return unknown;
+    if (codePoint === undefined && resources.length !== 1) return unknown;
+    for (let index = resources.length - 1; index >= 0; index--) {
+      const entry = resources[index];
+      if (codePoint === undefined) return { metrics: entry, coverage: undefined };
+      const coverage = openTypeResourceCoversCodePoint(entry, codePoint);
+      if (coverage !== false) return { metrics: coverage ? entry : undefined, coverage };
+    }
+    // Glyph absence in the matched style slot moves to the next CSS family,
+    // not a different style slot of this family (CSS Fonts §5.2, step 5).
+    return { metrics: undefined, coverage: false };
+  }
+  return unknown;
 }
 
 /**
@@ -1702,7 +1731,7 @@ export function paragraphInputRuns(
     const resourceCoverage = (catalogue: typeof powerPointSymbolCoverage): typeof powerPointSymbolCoverage =>
       (face, b, i, cp) => {
         if (!rc.embeddedFontAliases?.has(face.trim().toLowerCase())) return catalogue(face, b, i, cp);
-        return openTypeResourceCoversCodePoint(lineMetricFor(normalizeFontFamily(face, rc), b, i, rc), cp);
+        return embeddedResourceFor(normalizeFontFamily(face, rc), b, i, rc, cp).coverage;
       };
     const symbolCoverage = resourceCoverage(powerPointSymbolCoverage);
     const cjkCoverage = resourceCoverage(powerPointCjkCoverage);
@@ -1749,7 +1778,11 @@ export function paragraphInputRuns(
       if (group) {
         input.push({ type: 'text', text: group,
           style: { ...baseStyle, font: groupFont, lineMetric: groupShare,
-            lineMetricLatin: latinShare, faceFamily: groupFamily, faceFamilyLatin: family } });
+            // When Latin itself paints this glyph, its concrete resource owns
+            // both contributions. A composite family's unused Latin slot has
+            // no single resource; latinShare stays unresolved in that case.
+            lineMetricLatin: groupFamily === family ? groupShare ?? null : latinShare,
+            faceFamily: groupFamily, faceFamilyLatin: family } });
       }
       group = '';
     };
@@ -1784,7 +1817,7 @@ export function paragraphInputRuns(
         ? run.fontFamilyEa ? familyEa
           : emptyEastAsianFaceFor(ch)
         : csFace;
-      let share = face === null ? undefined : lineMetricFor(face, bold, italic, rc);
+      let share = face === null ? undefined : lineMetricFor(face, bold, italic, rc, glyph.codePointAt(0));
       if (slot === 'sym' && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         const mapped = symbolFontToUnicode(ch, symbolFamily);
@@ -7649,7 +7682,7 @@ type InternalSlideRenderOptions = SlideRenderOptions & {
   embeddedFontAliases?: ReadonlyMap<string, string>;
   embeddedFontAuthoredFamilies?: ReadonlyMap<string, string>;
   embeddedFontTuples?: ReadonlySet<string>;
-  embeddedFontMetrics?: ReadonlyMap<string, PowerPointFaceMetrics>;
+  embeddedFontMetrics?: PptxEmbeddedFontMetrics;
   svgDecoder?: SvgBlobDecoder;
 };
 

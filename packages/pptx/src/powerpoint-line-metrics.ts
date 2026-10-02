@@ -227,9 +227,10 @@ export interface ExcelLineBox {
 }
 
 /**
- * Everything PowerPoint's two line models need from one face. Instances are
- * interned per face/weight/style, so two segments compare equal exactly when
- * they size a line with the same face.
+ * Everything PowerPoint's two line models need from one resource. Installed
+ * instances are interned per family/weight/style. Embedded instances belong
+ * to one registered FontFace, so same-tuple subsets cannot lend one another
+ * their metrics or be merged as the same line contribution.
  */
 export interface PowerPointFaceMetrics {
   /** #1610 ascent share of the 1.2 × size line box. */

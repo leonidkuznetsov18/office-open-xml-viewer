@@ -8,6 +8,11 @@ import {
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 import { powerPointResourceFaceMetrics, type PowerPointFaceMetrics } from './powerpoint-line-metrics.js';
 
+/** A style slot may contain several subset resources (§19.2.1.9/.10).
+ * Entries follow FontFaceSet insertion order, including unreadable resources;
+ * undefined is an ownership barrier, not permission to borrow another part. */
+export type PptxEmbeddedFontMetrics = ReadonlyMap<string, readonly (PowerPointFaceMetrics | undefined)[]>;
+
 export interface LoadedPptxEmbeddedFonts {
   readonly faces: FontFace[];
   /** Lower-cased authored family → presentation-scoped FontFace family. */
@@ -16,12 +21,9 @@ export interface LoadedPptxEmbeddedFonts {
   readonly authoredFamilies: ReadonlyMap<string, string>;
   /** Successfully registered authored family/style slots (§19.2.1.9). */
   readonly tuples: ReadonlySet<string>;
-  /** Line metrics of each registered face, keyed like `tuples`, from the
-   * font part's own OS/2 tables, with bounded scalar cmap coverage retained
-   * for drawing-resource attribution. A part whose tables do not parse (EOT, an
-   * unsupported collection) has no entry: its lines keep the metric model of
-   * their other faces (#1689). */
-  readonly metrics: ReadonlyMap<string, PowerPointFaceMetrics>;
+  /** Resource metrics/cmaps per authored tuple, in successful insertion order.
+   * An unsupported part (e.g. EOT) retains an undefined entry when it loads. */
+  readonly metrics: PptxEmbeddedFontMetrics;
 }
 
 /** Only an actually registered PresentationML face occupies its style slot. */
@@ -67,11 +69,10 @@ export async function loadEmbeddedFonts(
   // batch is copied into FontFace storage before the next extraction begins.
   const loaded: FontFace[] = [];
   const held = new Set<FontFace>();
-  // Parsed before registration hands the bytes to FontFace storage; only a
-  // registered face's entry is kept below. One small record per font part.
-  const parsed = new Map<string, PowerPointFaceMetrics>();
-  const slotKey = (family: string, weight: string, style: string) =>
-    `${normalizedFamily(family)}:${weight === 'bold' || weight === '700' ? 700 : 400}:${style === 'italic' ? 'italic' : 'normal'}`;
+  // FontFace identity, rather than family/style, binds each successful
+  // registration to its own tables. CT_EmbeddedFontList has no uniqueness
+  // constraint; distinct same-slot parts can cover different glyph subsets.
+  const parsed = new Map<FontFace, PowerPointFaceMetrics | undefined>();
   const batchSize = 2;
   for (let offset = 0; offset < refs.length; offset += batchSize) {
     const faces = await Promise.all(refs.slice(offset, offset + batchSize).map(
@@ -91,21 +92,25 @@ export async function loadEmbeddedFonts(
     ));
     const loadable = faces.filter((face): face is EmbeddedFontFace => face !== null);
     if (loadable.length === 0) continue;
-    for (const face of loadable) {
-      const key = slotKey(face.family, String(face.weight ?? 'normal'), String(face.style ?? 'normal'));
-      if (parsed.has(key)) continue;
-      const tables = parseOpenTypeResourceMetrics(face.bytes);
+    const registrations = await Promise.all(loadable.map(async (resource) => {
+      const tables = parseOpenTypeResourceMetrics(resource.bytes);
       const metrics = tables ? powerPointResourceFaceMetrics(tables) : undefined;
-      if (metrics) parsed.set(key, metrics);
-    }
-    for (const face of await registerEmbeddedFonts(loadable)) {
-      if (held.has(face)) {
-        // A content-identical face retained by an earlier batch needs no second
-        // holder from this presentation. Balance that registry retain now.
-        unregisterEmbeddedFonts([face]);
-      } else {
-        held.add(face);
-        loaded.push(face);
+      // Register separately to retain the input-resource → FontFace binding
+      // even when a sibling fails. Calls add synchronously in input order;
+      // only their load/readiness waits run concurrently (at most two).
+      return { faces: await registerEmbeddedFonts([resource]), metrics };
+    }));
+    for (const registration of registrations) {
+      for (const face of registration.faces) {
+        if (held.has(face)) {
+          // A reused face was not reinserted into FontFaceSet. Preserve its
+          // original position/metrics and balance this batch's extra retain.
+          unregisterEmbeddedFonts([face]);
+        } else {
+          held.add(face);
+          loaded.push(face);
+          parsed.set(face, registration.metrics);
+        }
       }
     }
   }
@@ -123,12 +128,13 @@ export async function loadEmbeddedFonts(
     const authored = authoredFamilies.get(face.family) as string;
     return `${authored}:${face.weight === 'bold' || face.weight === '700' ? 700 : 400}:${face.style === 'italic' ? 'italic' : 'normal'}`;
   }));
-  const metrics = new Map<string, PowerPointFaceMetrics>();
+  const metrics = new Map<string, (PowerPointFaceMetrics | undefined)[]>();
   for (const face of loaded) {
-    const entry = parsed.get(slotKey(face.family, face.weight, face.style));
-    if (!entry) continue;
     const authored = authoredFamilies.get(face.family) as string;
-    metrics.set(`${authored}:${face.weight === 'bold' || face.weight === '700' ? 700 : 400}:${face.style === 'italic' ? 'italic' : 'normal'}`, entry);
+    const key = `${authored}:${face.weight === 'bold' || face.weight === '700' ? 700 : 400}:${face.style === 'italic' ? 'italic' : 'normal'}`;
+    const resources = metrics.get(key) ?? [];
+    resources.push(parsed.get(face));
+    metrics.set(key, resources);
   }
   return { faces: loaded, aliases, authoredFamilies, tuples, metrics };
 }

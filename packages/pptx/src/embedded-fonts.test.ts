@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { excludeEmbeddedFontFamilies, loadEmbeddedFonts, uncoveredOfficeFontRequests } from './embedded-fonts.js';
-import { paragraphInputRuns } from './renderer.js';
-import type { Paragraph } from './types.js';
+import { unregisterEmbeddedFonts } from '@silurus/ooxml-core';
+import { paragraphInputRuns, renderTextBody } from './renderer.js';
+import type { Paragraph, TextBody } from './types.js';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 
 const globals = globalThis as Record<string, unknown>;
@@ -14,7 +15,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function installFontFaceSet(failLoad = false) {
+function installFontFaceSet(failLoad: boolean | ((source: ArrayBuffer) => boolean) = false) {
   const added: Array<{ family: string; source: ArrayBuffer; descriptors: FontFaceDescriptors }> = [];
   class FakeFontFace {
     constructor(
@@ -25,13 +26,13 @@ function installFontFaceSet(failLoad = false) {
     get weight() { return this.descriptors.weight; }
     get style() { return this.descriptors.style; }
     load() {
-      return failLoad
+      return (typeof failLoad === 'function' ? failLoad(this.source) : failLoad)
         ? Promise.reject(new Error('load failed'))
         : Promise.resolve(this);
     }
   }
   globals.FontFace = FakeFontFace;
-  globals.document = { fonts: { add: (face: typeof added[number]) => added.push(face), ready: Promise.resolve() } };
+  globals.document = { fonts: { add: (face: typeof added[number]) => added.push(face), delete: vi.fn(), ready: Promise.resolve() } };
   delete globals.self;
   return added;
 }
@@ -40,7 +41,7 @@ const bytes = () => new Uint8Array([0, 1, 0, 0, 1]);
 
 // A table-directory fixture with a real Unicode format-12 cmap and OS/2
 // design metrics. FontFace registration is the only browser boundary mocked.
-function cjkResource(codePoint = 0x6f22): Uint8Array {
+function cjkResource(codePoint = 0x6f22, ascent = 700): Uint8Array {
   const bytes = new Uint8Array(284);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x00010000);
@@ -56,8 +57,8 @@ function cjkResource(codePoint = 0x6f22): Uint8Array {
   view.setUint16(94, 1000);
   view.setInt16(134, 700);
   view.setInt16(136, -300);
-  view.setUint16(240, 700);
-  view.setUint16(242, 300);
+  view.setUint16(240, ascent);
+  view.setUint16(242, 1000 - ascent);
   view.setUint16(246, 1);
   view.setUint16(248, 3);
   view.setUint16(250, 10);
@@ -153,6 +154,7 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
       expect(item?.style.font).toContain(`"${loaded.aliases.get(fontName.toLowerCase())}"`);
       expect(item?.style.faceFamily).toBeUndefined();
       expect(item?.style.lineMetric).toBeUndefined();
+      unregisterEmbeddedFonts(loaded.faces);
     }
   });
 
@@ -183,6 +185,122 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
     const unknown = paragraphInputRuns(para, 22, '#000', 1 / 12700, true, true, 1, undefined, unknownRc)
       .input.find((item) => item.type === 'text');
     expect(unknown?.style.lineMetric).toBeUndefined();
+  });
+
+  it.each(['window', 'worker'])('attributes duplicate-slot glyphs to their registered resource in the %s', async (realm) => {
+    const added = installFontFaceSet();
+    const remove = (globals.document as { fonts: { delete: ReturnType<typeof vi.fn> } }).fonts.delete;
+    if (realm === 'worker') {
+      globals.self = { fonts: (globals.document as { fonts: unknown }).fonts };
+      delete globals.document;
+    }
+    const ref = (partPath: string): PptxEmbeddedFontRef => ({
+      fontName: 'Duplicate Family', style: 'regular', partPath, contentType: 'application/x-font-ttf',
+    });
+    // Two distinct resources in one tuple, followed in another batch by an
+    // identical retain of the first. Reusing a face does not reinsert it into
+    // FontFaceSet, so it must not displace the second resource's priority.
+    const loaded = await loadEmbeddedFonts([ref('first'), ref('second'), ref('first')],
+      async (path) => cjkResource(path === 'first' ? 0x6f22 : 0xa7, path === 'first' ? 700 : 850));
+    expect(added).toHaveLength(2);
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    for (const ea of [undefined, 'Duplicate Family']) {
+      const para = { runs: [{ type: 'text', text: '§漢', fontFamily: 'Avenir',
+        fontFamilyCs: 'Duplicate Family', fontFamilyEa: ea, lang: 'en-US', fontSize: 22 }],
+        tabStops: [] } as unknown as Paragraph;
+      const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+        .input.filter((item) => item.type === 'text');
+      expect(items.map((item) => [item.text, item.style.faceFamily, item.style.lineMetric?.share]))
+        .toEqual([['§', loaded.aliases.get('duplicate family'), 0.85],
+          ['漢', loaded.aliases.get('duplicate family'), 0.7]]);
+      const ys: number[] = [];
+      const ctx = {
+        font: '', measureText: () => ({ width: 10, actualBoundingBoxAscent: 7, actualBoundingBoxDescent: 2 }),
+        fillText: (_text: string, _x: number, y: number) => ys.push(y),
+        save() {}, restore() {}, translate() {}, rotate() {}, scale() {}, fillRect() {},
+      } as unknown as CanvasRenderingContext2D;
+      const body = { paragraphs: [{ ...para, runs: [{ ...para.runs[0], text: '§' }],
+        alignment: 'l', marL: 0, marR: 0, indent: 0, bullet: { type: 'none' } }],
+        defaultFontSize: 22, verticalAnchor: 't', lIns: 0, rIns: 0, tIns: 0, bIns: 0,
+        wrap: 'none', vert: 'horz', autoFit: 'none' } as TextBody;
+      renderTextBody(ctx, body, 0, 0, 400, 100, 1 / 12700,
+        undefined, 0, false, false, undefined, undefined, rc);
+      expect(ys).toHaveLength(1);
+      expect(ys[0]).toBeCloseTo(22 * 1.2 * 0.85, 10);
+    }
+    // Overlapping cmaps use the last *inserted* resource, for Latin too; the
+    // glyph loop's font-stack cache must not collapse distinct metric owners.
+    const overlap = await loadEmbeddedFonts([ref('first'), ref('second')],
+      async (path) => cjkResource(0x41, path === 'first' ? 700 : 850));
+    const overlapRc = { ...rc, embeddedFontAliases: overlap.aliases,
+      embeddedFontAuthoredFamilies: overlap.authoredFamilies, embeddedFontTuples: overlap.tuples,
+      embeddedFontMetrics: overlap.metrics };
+    const para = { runs: [{ type: 'text', text: 'AA', fontFamily: 'Duplicate Family', fontSize: 22 }],
+      tabStops: [] } as unknown as Paragraph;
+    const item = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, overlapRc)
+      .input.find((item) => item.type === 'text');
+    expect(item?.style.lineMetric?.share).toBe(0.85);
+    unregisterEmbeddedFonts(loaded.faces);
+    expect(remove).toHaveBeenCalledTimes(2);
+    unregisterEmbeddedFonts(overlap.faces);
+    expect(remove).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps the Latin metric contribution with its glyph resource inside a composite family', async () => {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts(['latin', 'symbol'].map((partPath) => ({
+      fontName: 'Composite Family', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
+    })), async (path) => cjkResource(path === 'latin' ? 0x41 : 0xa7, path === 'latin' ? 700 : 850));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    const para = { runs: [{ type: 'text', text: 'A§', fontFamily: 'Composite Family',
+      lang: 'en-US', fontSize: 22 }], tabStops: [] } as unknown as Paragraph;
+    const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+      .input.filter((item) => item.type === 'text');
+    expect(items.map((item) => [item.text, item.style.lineMetric?.share, item.style.lineMetricLatin?.share]))
+      .toEqual([['A', 0.7, 0.7], ['§', 0.85, 0.85]]);
+    unregisterEmbeddedFonts(loaded.faces);
+  });
+
+  it('excludes a failed same-slot resource without losing its successful sibling', async () => {
+    installFontFaceSet((source) => new DataView(source).getUint16(240) === 850);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const loaded = await loadEmbeddedFonts(['good', 'failed'].map((partPath) => ({
+      fontName: 'Duplicate Family', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
+    })), async (path) => cjkResource(0xa7, path === 'good' ? 700 : 850));
+    expect(loaded.faces).toHaveLength(1);
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    const para = { runs: [{ type: 'text', text: '§', fontFamily: 'Avenir',
+      fontFamilyCs: 'Duplicate Family', lang: 'en-US', fontSize: 22 }],
+      tabStops: [] } as unknown as Paragraph;
+    const item = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+      .input.find((item) => item.type === 'text');
+    expect(item?.style.lineMetric?.share).toBe(0.7);
+    unregisterEmbeddedFonts(loaded.faces);
+  });
+
+  it('does not borrow readable duplicate-slot metrics through an indeterminate later resource', async () => {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts(['readable', 'unreadable'].map((partPath) => ({
+      fontName: 'Duplicate Family', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
+    })), async (path) => path === 'readable' ? cjkResource(0xa7) : bytes());
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    for (const ea of [undefined, 'Duplicate Family']) {
+      const para = { runs: [{ type: 'text', text: '§', fontFamily: 'Avenir',
+        fontFamilyCs: 'Duplicate Family', fontFamilyEa: ea, lang: 'en-US', fontSize: 22 }],
+        tabStops: [] } as unknown as Paragraph;
+      const item = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+        .input.find((item) => item.type === 'text');
+      expect(item?.style.lineMetric).toBeUndefined();
+    }
+    unregisterEmbeddedFonts(loaded.faces);
   });
 
   it('maps all four PresentationML slots to CSS weight and style', async () => {
