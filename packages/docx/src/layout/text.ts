@@ -660,6 +660,8 @@ function scriptSlot(
   else if (codePoint >= 0x1e00 && codePoint <= 0x1eff) {
     tableSlot = hintedEastAsia && chinese ? 'eastAsia' : 'highAnsi';
   } else if (
+    // §17.3.2.26 General Punctuation: U+2014 follows hint, not language
+    // alone. Omitted/default hint selects highAnsi; eastAsia selects eastAsia.
     (codePoint >= 0x2000 && codePoint <= 0x27bf)
     || (codePoint >= 0xe000 && codePoint <= 0xf8ff)
     || (codePoint >= 0xfb00 && codePoint <= 0xfb1c)

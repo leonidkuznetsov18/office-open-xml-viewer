@@ -434,6 +434,29 @@ describe('font layout services', () => {
     expect(service.fingerprint).toBe(fingerprint);
   });
 
+  it.each([
+    { hint: undefined, language: undefined, slot: 'highAnsi' },
+    { hint: 'default' as const, language: undefined, slot: 'highAnsi' },
+    { hint: 'eastAsia' as const, language: undefined, slot: 'eastAsia' },
+    { hint: 'eastAsia' as const, language: 'ja-JP', slot: 'eastAsia' },
+    { hint: 'eastAsia' as const, language: 'zh-CN', slot: 'eastAsia' },
+    { hint: 'default' as const, language: 'ja-JP', slot: 'highAnsi' },
+  ])('routes the measured em dash with hint=$hint language=$language', ({ hint, language, slot }) => {
+    const service = createTextLayoutService({
+      fonts: createFontResolver(faces),
+      measurer: {
+        fingerprint: 'dash-slots-v1',
+        measure: (request) => ({ advancePt: request.text.length, ascentPt: 1, descentPt: 0 }),
+      },
+    });
+    const result = service.shape({ text: '—', fontSizePt: 12,
+      fonts: { highAnsi: 'Calibri', eastAsia: 'Meiryo' },
+      fontHint: hint, eastAsiaLanguage: language,
+    });
+    expect(result.spans[0]?.script).toBe(slot);
+    expect(result.spans[0]?.font.requestedFamily).toBe(slot === 'eastAsia' ? 'Meiryo' : 'Calibri');
+  });
+
   it('canonicalizes exact face tuples independently of inventory order', () => {
     const inventory: FontInventoryFace[] = [
       { requestedFamily: 'Tuple Face', resolvedFamily: 'Tuple Face', source: 'embedded', weight: 700, style: 'italic' },
