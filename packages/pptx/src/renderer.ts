@@ -26,6 +26,10 @@ import type {
 } from './types';
 import { asBullet } from './types';
 import {
+  usesPathShade,
+  trackPaintPath,
+  currentStrokeBounds,
+  resolveArrowPaint,
   renderChart,
   crispOffset,
   buildCustomPath as buildCustomPathCore,
@@ -675,8 +679,10 @@ export function resolveShapeFill(
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
   patternPtToUserUnits = 4 / 3,
+  outline?: import('@silurus/ooxml-core').FillOutline,
+  paintBounds?: { x: number; y: number; w: number; h: number },
 ): string | CanvasGradient | CanvasPattern | null {
-  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
+  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits, undefined, outline, paintBounds);
 }
 
 // ===== Text layout helpers =====
@@ -3493,6 +3499,7 @@ export function shapeTextRotation(vert: string, rotation: number, flipH: boolean
 }
 
 function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: number, themeDefaultColor = '#000000', slideNumber?: number, rc: RenderContext = { themeMajorFont: null, themeMinorFont: null, dpr: 1 }, onTextRun?: TextRunCallback, fetchImage?: FetchImage) {
+  if (usesPathShade(el.stroke?.fill)) ctx = trackPaintPath(ctx);
   const x = emuToPx(el.x, scale);
   const y = emuToPx(el.y, scale);
   const w = emuToPx(el.width, scale);
@@ -3506,10 +3513,10 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   if (h === 0 && el.textBody?.verticalAnchor === 'b') {
     if (el.stroke) {
       ctx.save();
-      applyStroke(ctx, el.stroke, scale, { x, y, w, h: 1 }, el.rotation);
       ctx.beginPath();
       ctx.moveTo(x, y);
       ctx.lineTo(x + w, y);
+      applyStroke(ctx, el.stroke, scale, { x, y, w, h: 1 }, el.rotation);
       ctx.stroke();
       ctx.restore();
     }
@@ -3704,9 +3711,20 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   }
 
   const geom = el.geometry.toLowerCase();
+  const fillOutline: import('@silurus/ooxml-core').FillOutline = (target, bx, by, bw, bh) => {
+    if (el.custGeom) {
+      const paths = el.custGeomPaint?.length === el.custGeom.length
+        ? el.custGeom.filter((_, index) => el.custGeomPaint?.[index].fill !== 'none')
+        : el.custGeom;
+      buildCustomPath(target, paths, bx, by, bw, bh);
+    } else if (!buildPresetGeometryFillPath(target, geom, bx, by, bw, bh,
+      [el.adj, el.adj2, el.adj3, el.adj4, el.adj5, el.adj6, el.adj7, el.adj8])) {
+      buildShapePath(target, geom, bx, by, bw, bh, el.adj, el.adj2, el.adj3, el.adj4);
+    }
+  };
   // The slide may render at any requested width. Convert the PDF-measured
   // one-point pattern cell through this render's EMU-to-canvas scale.
-  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
+  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU, fillOutline);
   const imageFill = el.fill?.fillType === 'image' && shapeImageFillModeIsPaintable(el.fill)
     ? el.fill
     : null;
@@ -3776,11 +3794,12 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     silhouette?: string,
     bounds: { x: number; y: number; w: number; h: number } = { x, y, w, h },
   ): void => {
+    if (usesPathShade(el.stroke?.fill)) target = trackPaintPath(target);
     const { x: bx, y: by, w: bw, h: bh } = bounds;
     const tFill = silhouette ??
       (target === ctx && bx === x && by === y && bw === w && bh === h
         ? fillStyle
-        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU));
+        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU, fillOutline));
     const tStroke = silhouette
       ? null
       : el.stroke
@@ -3963,9 +3982,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     : [];
   const flatBevelEdgePadCss = (el.stroke ? (el.stroke.width * scale) / 2 : 0) + 2;
   const paintLineDecorations = (target: CanvasRenderingContext2D): void => {
-    const effectivePaint = el.stroke?.fill
-      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation, scale * PT_TO_EMU) ?? undefined
-      : undefined;
+    if (usesPathShade(el.stroke?.fill)) target = trackPaintPath(target);
     if (el.stroke && (CONNECTOR_GEOMS.has(geom) || CALLOUT_GEOMS.has(geom))) {
       // The preset body deliberately suppresses retractable leader strokes. Paint
       // the shortened leader and its line ends into the same target as the body
@@ -3995,10 +4012,10 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           const retract = lineEndRetract(el.stroke.headEnd, el.stroke, scale);
           pts[0] = retractLineEndpoint(pts[0], pts[1], retract);
         }
-        applyStroke(target, el.stroke, scale, { x, y, w, h }, el.rotation);
         target.beginPath();
         target.moveTo(pts[0].x, pts[0].y);
         for (let i = 1; i < pts.length; i++) target.lineTo(pts[i].x, pts[i].y);
+        applyStroke(target, el.stroke, scale, { x, y, w, h }, el.rotation);
         target.stroke();
       }
       if (cmpd && isStraight) {
@@ -4021,7 +4038,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           el.stroke.tailEnd,
           el.stroke,
           scale,
-          effectivePaint,
+          resolveArrowPaint(target, el.stroke, scale, anchors.end.x, anchors.end.y, anchors.end.angle,
+            el.stroke.tailEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
         );
       }
       if (el.stroke.headEnd) {
@@ -4033,7 +4051,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           el.stroke.headEnd,
           el.stroke,
           scale,
-          effectivePaint,
+          resolveArrowPaint(target, el.stroke, scale, anchors.start.x, anchors.start.y, anchors.start.angle,
+            el.stroke.headEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
         );
       }
       return;
@@ -4057,7 +4076,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         el.stroke.headEnd,
         el.stroke,
         scale,
-        effectivePaint,
+        resolveArrowPaint(target, el.stroke, scale, x + start.x * w, y + start.y * h,
+          Math.atan2(start.dy * h, start.dx * w), el.stroke.headEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
       );
     }
     if (end && el.stroke.tailEnd && el.stroke.tailEnd.type !== 'none') {
@@ -4069,7 +4089,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         el.stroke.tailEnd,
         el.stroke,
         scale,
-        effectivePaint,
+        resolveArrowPaint(target, el.stroke, scale, x + end.x * w, y + end.y * h,
+          Math.atan2(end.dy * h, end.dx * w), el.stroke.tailEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
       );
     }
   };
@@ -6545,9 +6566,10 @@ function paintResolvedPicture(
       // the Canvas default — PowerPoint draws the picture frame straddling
       // the silhouette edge.
       if (el.stroke) {
+        if (usesPathShade(el.stroke?.fill)) target = trackPaintPath(target);
         target.save();
-        applyStroke(target, el.stroke, scale, { x: ox, y: oy, w: ow, h: oh }, el.rotation);
         tracePictureSilhouette(target, ox, oy, ow, oh);
+        applyStroke(target, el.stroke, scale, { x: ox, y: oy, w: ow, h: oh }, el.rotation);
         target.stroke();
         target.restore();
       }
@@ -6614,7 +6636,7 @@ function paintResolvedPicture(
       // visible through transparent pixels. Image fills need their own decode
       // and are not painted here.
       const backing = el.fill && el.fill.fillType !== 'none' && el.fill.fillType !== 'image'
-        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU)
+        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU, tracePictureSilhouetteSubpath)
         : null;
       if (backing) {
         target.save();
@@ -7008,6 +7030,15 @@ function drawCompoundLine(
     ctx.beginPath();
     ctx.moveTo(start.x + ox, start.y + oy);
     ctx.lineTo(end.x + ox, end.y + oy);
+    if (stroke.fill && usesPathShade(stroke.fill)) {
+      // Parallel compound segments have different offsets and widths. Resolve
+      // after building each real segment, with the common authored shade frame.
+      const paint = resolveShapeFill(stroke.fill, ctx,
+        Math.min(start.x, end.x), Math.min(start.y, end.y),
+        Math.max(1, Math.abs(end.x - start.x)), Math.max(1, Math.abs(end.y - start.y)),
+        shapeRotationDeg, scale * PT_TO_EMU, undefined, currentStrokeBounds(ctx));
+      if (paint) ctx.strokeStyle = paint;
+    }
     ctx.stroke();
   }
   ctx.restore();
@@ -7032,6 +7063,7 @@ export function applyStroke(
       bounds.h,
       shapeRotationDeg,
       scale * PT_TO_EMU,
+      undefined, currentStrokeBounds(ctx),
     );
     if (paint) ctx.strokeStyle = paint;
   }

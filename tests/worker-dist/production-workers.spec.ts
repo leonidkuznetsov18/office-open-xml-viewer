@@ -112,3 +112,81 @@ test('published dist starts all three render workers with optional renderers', a
 test('Vite consumer bundle preserves all three render workers', async ({ page }) => {
   await expectWorkerBitmaps(page, '/consumer/index.html');
 });
+
+// Pixel contracts through the public viewer, not a helper-only Canvas test.
+// No corpus snapshots or Office fidelity thresholds are used here.
+async function viewerPathShadeSamples(
+  page: import('@playwright/test').Page,
+  source: string,
+  width: number,
+  slide: number,
+  points: number[][],
+) {
+  await page.route('**/path-shade-viewer', route => route.fulfill({
+    contentType: 'text/html', body: '<!doctype html><body></body>',
+  }));
+  await page.goto('/path-shade-viewer');
+  return page.evaluate(async ({ source, width, slide, points }) => {
+    const entry = '/dist/pptx.mjs';
+    const { PptxViewer } = await import(entry);
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`Control load failed: ${response.status}`);
+    const bytes = await response.arrayBuffer();
+    const samples = [];
+    for (const mode of ['main', 'worker']) {
+      const canvas = document.createElement('canvas');
+      document.body.append(canvas);
+      const viewer = new PptxViewer(canvas, { mode, width, dpr: 1, useGoogleFonts: false });
+      try {
+        await viewer.load(bytes.slice(0));
+        if (slide !== 0) await viewer.goToSlide(slide);
+        const copy = document.createElement('canvas');
+        copy.width = canvas.width;
+        copy.height = canvas.height;
+        const ctx = copy.getContext('2d') as CanvasRenderingContext2D;
+        ctx.drawImage(canvas, 0, 0);
+        samples.push(points.map(([x, y]) => [...ctx.getImageData(x, y, 1, 1).data]));
+      } finally {
+        viewer.destroy();
+        canvas.remove();
+      }
+    }
+    return samples;
+  }, { source, width, slide, points });
+}
+
+test('published PPTX viewer retains rect point paint and shades shape tiles in main and worker modes', async ({ page }) => {
+  const samples = await viewerPathShadeSamples(page, '/consumer/path-gradient.pptx', 480, 0,
+    [[60, 120], [60, 70], [300, 120], [300, 70]]);
+  // Rect point foci retain main's radial field: its diagonal half-box sample
+  // is ~180. Shape point foci still use box isolines (~128 at both samples).
+  const expected = [128, 180, 128, 128];
+  for (const modeSamples of samples) for (const [index, pixel] of modeSamples.entries()) {
+    expect(pixel[0]).toBeGreaterThanOrEqual(expected[index] - 4);
+    expect(pixel[0]).toBeLessThanOrEqual(expected[index] + 4);
+    expect(pixel.slice(1)).toEqual([pixel[0], pixel[0], 255]);
+  }
+  expect(samples[1]).toEqual(samples[0]);
+  expect(Math.abs(samples[0][1][0] - 128)).toBeGreaterThan(30);
+  expect(Math.abs(samples[0][2][0] - 90)).toBeGreaterThan(30);
+});
+
+test('local shape-path control slide reaches the published PPTX viewer in both modes', async ({ page }) => {
+  const { existsSync } = await import('node:fs');
+  const file = 'packages/pptx/public/private/pptx/controls-1599/shape-paths.pptx';
+  test.skip(!existsSync(file), 'Local-only Office control deck is absent');
+  // Slide 4, three-stop RGB rect, centered point focus. Coordinates belong to
+  // the control manifest; they sample its axial and diagonal half-box isoline.
+  const samples = await viewerPathShadeSamples(page, `/${file}`, 1920, 3,
+    [[337, 764], [337, 721]]);
+  for (const modeSamples of samples) for (const pixel of modeSamples) {
+    expect(pixel[0]).toBeLessThan(12);
+    expect(pixel[1]).toBeGreaterThan(243);
+    expect(pixel[2]).toBeLessThan(12);
+    expect(pixel[3]).toBe(255);
+  }
+  expect(samples[1]).toEqual(samples[0]);
+  // The previous shape brush's half-diagonal radius puts the axial point at
+  // s≈.353, between red and green (~75,180,0), not at the green middle stop.
+  expect(samples[0][0][1] - 180).toBeGreaterThan(60);
+});

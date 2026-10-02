@@ -16,7 +16,7 @@ import type {
   CfRule, CfStop, CfValue, Dxf, Hyperlink, DefinedName,
   Run, GradientFillSpec, ShapeInfo, ShapeAnchor, ImageAnchor, ChartAnchor,
   SlicerItem, SlicerStyle, SlicerElementStyle,
-  PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone,
+  PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone, PathInfo,
 } from './types.js';
 import type {
   Stroke,
@@ -24,7 +24,7 @@ import type {
   ChartRegionMapRenderer,
   ChartExRenderer,
 } from '@silurus/ooxml-core';
-import { chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform } from '@silurus/ooxml-core';
+import { usesPathShade, trackPaintPath, currentStrokeBounds, chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
@@ -4505,6 +4505,86 @@ function renderShapeGroups(
   ctx.restore();
 }
 
+// XLSX custom coordinates remain path-local until this format boundary.
+// Both ordinary painting and gradient outlines use the same arc/Bezier rules.
+function appendSpreadsheetCustomPath(
+  ctx: CanvasRenderingContext2D, path: PathInfo,
+  x: number, y: number, w: number, h: number,
+): void {
+  if (path.w <= 0 || path.h <= 0) return;
+  const kx = w / path.w;
+  const ky = h / path.h;
+  // Track pen position for arcTo center computation.
+  let penX = x, penY = y;
+  // Track subpath start for close lineTo.
+  let subX = x, subY = y;
+  for (const cmd of path.commands) {
+    switch (cmd.op) {
+      case 'moveTo': {
+        const px = x + cmd.x * kx, py = y + cmd.y * ky;
+        ctx.moveTo(px, py);
+        penX = subX = px; penY = subY = py;
+        break;
+      }
+      case 'lineTo': {
+        const px = x + cmd.x * kx, py = y + cmd.y * ky;
+        ctx.lineTo(px, py);
+        penX = px; penY = py;
+        break;
+      }
+      case 'cubicBezTo': {
+        const ex = x + cmd.x3 * kx, ey = y + cmd.y3 * ky;
+        ctx.bezierCurveTo(
+          x + cmd.x1 * kx, y + cmd.y1 * ky,
+          x + cmd.x2 * kx, y + cmd.y2 * ky,
+          ex, ey,
+        );
+        penX = ex; penY = ey;
+        break;
+      }
+      case 'quadBezTo': {
+        const ex = x + cmd.x2 * kx, ey = y + cmd.y2 * ky;
+        ctx.quadraticCurveTo(x + cmd.x1 * kx, y + cmd.y1 * ky, ex, ey);
+        penX = ex; penY = ey;
+        break;
+      }
+      case 'arcTo': {
+        // ECMA-376 §20.1.9.3: pen lies on ellipse at stAng;
+        // derive center from pen + stAng, then sweep swAng.
+        const rx = cmd.wr * kx, ry = cmd.hr * ky;
+        if (rx <= 0 || ry <= 0) break;
+        const stRad = (cmd.stAng / 60000) * (Math.PI / 180);
+        const swRad = (cmd.swAng / 60000) * (Math.PI / 180);
+        const cx = penX - Math.cos(stRad) * rx;
+        const cy = penY - Math.sin(stRad) * ry;
+        const endRad = stRad + swRad;
+        ctx.ellipse(cx, cy, rx, ry, 0, stRad, endRad, swRad < 0);
+        penX = cx + Math.cos(endRad) * rx;
+        penY = cy + Math.sin(endRad) * ry;
+        break;
+      }
+      case 'close':
+        ctx.closePath();
+        penX = subX; penY = subY;
+        break;
+    }
+  }
+}
+
+function appendSpreadsheetShapeOutline(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  x: number, y: number, w: number, h: number,
+): void {
+  if (shape.geom.type === 'custom') {
+    for (const path of shape.geom.paths) {
+      if (path.fill !== 'none') appendSpreadsheetCustomPath(ctx, path, x, y, w, h);
+    }
+  } else if (shape.geom.type !== 'preset'
+    || !buildPresetGeometryFillPath(ctx, shape.geom.name, x, y, w, h, shape.geom.adj ?? [])) {
+    ctx.rect(x, y, w, h);
+  }
+}
+
 function drawShape(
   ctx: CanvasRenderingContext2D,
   shape: ShapeInfo,
@@ -4513,6 +4593,7 @@ function drawShape(
   loadedImages?: Map<string, CanvasImageSource | null>,
   cjkFallback?: CjkLang,
 ): void {
+  if (usesPathShade(shape.strokeFill)) ctx = trackPaintPath(ctx);
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {
     ctx.translate(sx + sw / 2, sy + sh / 2);
@@ -4524,71 +4605,16 @@ function drawShape(
   }
 
   if (shape.geom.type === 'custom') {
+    const fill = resolveSpreadsheetShapeFill(ctx, shape, sw, sh, cs);
     for (const path of shape.geom.paths) {
       if (path.w <= 0 || path.h <= 0) continue;
-      const kx = sw / path.w;
-      const ky = sh / path.h;
       ctx.beginPath();
-      // Track pen position for arcTo center computation.
-      let penX = 0, penY = 0;
-      // Track subpath start for close lineTo.
-      let subX = 0, subY = 0;
-      for (const cmd of path.commands) {
-        switch (cmd.op) {
-          case 'moveTo': {
-            const px = cmd.x * kx, py = cmd.y * ky;
-            ctx.moveTo(px, py);
-            penX = subX = px; penY = subY = py;
-            break;
-          }
-          case 'lineTo': {
-            const px = cmd.x * kx, py = cmd.y * ky;
-            ctx.lineTo(px, py);
-            penX = px; penY = py;
-            break;
-          }
-          case 'cubicBezTo': {
-            const ex = cmd.x3 * kx, ey = cmd.y3 * ky;
-            ctx.bezierCurveTo(
-              cmd.x1 * kx, cmd.y1 * ky,
-              cmd.x2 * kx, cmd.y2 * ky,
-              ex, ey,
-            );
-            penX = ex; penY = ey;
-            break;
-          }
-          case 'quadBezTo': {
-            const ex = cmd.x2 * kx, ey = cmd.y2 * ky;
-            ctx.quadraticCurveTo(cmd.x1 * kx, cmd.y1 * ky, ex, ey);
-            penX = ex; penY = ey;
-            break;
-          }
-          case 'arcTo': {
-            // ECMA-376 §20.1.9.3: pen lies on ellipse at stAng;
-            // derive center from pen + stAng, then sweep swAng.
-            const rx = cmd.wr * kx, ry = cmd.hr * ky;
-            if (rx <= 0 || ry <= 0) break;
-            const stRad = (cmd.stAng / 60000) * (Math.PI / 180);
-            const swRad = (cmd.swAng / 60000) * (Math.PI / 180);
-            const cx = penX - Math.cos(stRad) * rx;
-            const cy = penY - Math.sin(stRad) * ry;
-            const endRad = stRad + swRad;
-            ctx.ellipse(cx, cy, rx, ry, 0, stRad, endRad, swRad < 0);
-            penX = cx + Math.cos(endRad) * rx;
-            penY = cy + Math.sin(endRad) * ry;
-            break;
-          }
-          case 'close':
-            ctx.closePath();
-            penX = subX; penY = subY;
-            break;
-        }
-      }
+      appendSpreadsheetCustomPath(ctx, path, 0, 0, sw, sh);
       // ECMA-376 §20.1.9.15: each custom path carries its own fill mode and
       // stroke flag. `fill="none"` leaves the path unfilled and `stroke="0"`
       // unstroked. The lighten/darken modes shade the fill by the amounts
       // measured from PowerPoint's output (shared with the preset engine).
-      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh, cs)) {
+      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh, cs, fill)) {
         const overlay = pathFillModeOverlay(path.fill);
         if (overlay) {
           ctx.fillStyle = overlay;
@@ -4604,19 +4630,7 @@ function drawShape(
     // renders with its true outline instead of the old rect fallback. The
     // engine returns false for presets it doesn't carry; only then do we fall
     // back to a plain rectangle.
-    const baseFill = resolveFill(
-      shape.fill ?? (shape.fillColor
-        ? { fillType: 'solid' as const, color: shape.fillColor }
-        : null),
-      ctx,
-      0,
-      0,
-      sw,
-      sh,
-      shape.rot,
-      PT_TO_PX * cs,
-      axisAlignedPatternTransform(shape, sw, sh),
-    );
+    const baseFill = resolveSpreadsheetShapeFill(ctx, shape, sw, sh, cs);
     const applyAndStroke = shape.strokeColor && shape.strokeWidth > 0
       ? () => strokeShapePath(ctx, shape, sw, sh, cs)
       : null;
@@ -5278,14 +5292,14 @@ function axisAlignedPatternTransform(
   return { a, b, c, d, e: cx - a * cx - c * cy, f: cy - b * cx - d * cy };
 }
 
-/** Fill the current path with the shape fill; returns whether it painted. */
-function fillShape(
+/** Resolve once per shape, including all fill-bearing custom subpaths. */
+function resolveSpreadsheetShapeFill(
   ctx: CanvasRenderingContext2D,
   shape: ShapeInfo,
   width: number,
   height: number,
   cs: number,
-): boolean {
+): ReturnType<typeof resolveFill> {
   const fill = shape.fill ?? (shape.fillColor
     ? { fillType: 'solid' as const, color: shape.fillColor }
     : null);
@@ -5295,10 +5309,19 @@ function fillShape(
   // print-page origin, so its phase is anchored to this local shape frame.
   // One point is 4/3 CSS pixels at native zoom; cellScale changes the sheet
   // coordinate system without an additional canvas scale for shape painting.
-  const paint = resolveFill(
+  return resolveFill(
     fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
     axisAlignedPatternTransform(shape, width, height),
+    (target, x, y, w, h) => appendSpreadsheetShapeOutline(target, shape, x, y, w, h),
   );
+}
+
+/** Fill the current path; reuse one raster across a custom shape's subpaths. */
+function fillShape(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  width: number, height: number, cs: number,
+  paint = resolveSpreadsheetShapeFill(ctx, shape, width, height, cs),
+): boolean {
   if (!paint) return false;
   ctx.fillStyle = paint;
   ctx.fill();
@@ -5333,10 +5356,15 @@ function strokeShapePath(
   const stroke = shapeStroke(shape);
   if (!stroke) return;
   applyStroke(ctx, stroke, 1 / EMU_PER_PX);
+  // Match DOCX/PPTX stroke hosts: use the authored box, not the fill-bearing
+  // silhouette (which excludes decorative paths that may still be stroked).
+  // Shade coordinates use that host box; raster coverage comes from the
+  // recorded stroke path, including its actual transformed caps and joins.
   if (stroke.fill) {
     const paint = resolveFill(
       stroke.fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
       axisAlignedPatternTransform(shape, width, height),
+      undefined, currentStrokeBounds(ctx),
     );
     if (paint) ctx.strokeStyle = paint;
   }
