@@ -192,9 +192,9 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     ]);
 
     expect(uniformlyRaised.runs[0].h).toBeCloseTo(FONT_PX + 6, 5);
-    expect(drawOf(uniformlyRaised.fills, 'A').y - drawOf(plain.fills, 'N').y)
+    expect(drawOf(uniformlyRaised.fills, 'AB').y - drawOf(plain.fills, 'N').y)
       .toBeCloseTo(3, 5);
-    expect(drawOf(uniformlyRaised.fills, 'B').y - drawOf(plain.fills, 'N').y)
+    expect(drawOf(uniformlyRaised.fills, 'AB').y - drawOf(plain.fills, 'N').y)
       .toBeCloseTo(3, 5);
   });
 
@@ -258,17 +258,18 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     }
   });
 
-  it('retains the measured T-space advance across matching source runs', async () => {
+  it('paints same-format letter and space seams as their concatenated sequence', async () => {
     const settings = { compatibilityMode: 15 };
-    const { fills } = await render([textRun('T', { kerning: 8 }), textRun(' beyond', { kerning: 8 })], settings);
-    expect(drawOf(fills, ' ').x - drawOf(fills, 'T').x).toBe(FONT_PX - 1);
+    for (const parts of [['T', ' beyond'], ['A', 'V']]) {
+      const split = await render(parts.map(text => textRun(text, { kerning: 8 })), settings);
+      const whole = await render([textRun(parts.join(''), { kerning: 8 })], settings);
+      expect(split.fills).toEqual(whole.fills);
+    }
     const changed = await render([textRun('T', { kerning: 8 }), textRun(' beyond', { kerning: 8, charSpacing: 1 })], settings);
     expect(drawOf(changed.fills, ' ').x - drawOf(changed.fills, 'T').x).toBe(FONT_PX);
-    const letters = await render([textRun('A', { kerning: 8 }), textRun('V', { kerning: 8 })], settings);
-    expect(drawOf(letters.fills, 'V').x - drawOf(letters.fills, 'A').x).toBe(FONT_PX);
     for (const kerning of [undefined, 0, 28]) {
-      const { fills } = await render([textRun('T', { kerning }), textRun(' beyond', { kerning })], settings);
-      expect(drawOf(fills, ' ').x - drawOf(fills, 'T').x).toBe(FONT_PX);
+      const split = await render([textRun('T', { kerning }), textRun(' beyond', { kerning })], settings);
+      expect(split.fills).toEqual((await render([textRun('T beyond', { kerning })], settings)).fills);
     }
   });
 
@@ -279,20 +280,20 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     const settings = { compatibilityMode: 15 };
     const ordinary = await render([first, second], settings, alignment);
     const reordered = await render([first, reversed], settings, alignment);
-    expect(drawOf(ordinary.fills, ' ').x - drawOf(ordinary.fills, 'T').x).toBe(FONT_PX - 1);
+    expect(ordinary.fills).toEqual((await render([textRun('T X', { kerning: 8 })], settings, alignment)).fills);
     expect(reordered.runs).toEqual(ordinary.runs);
     expect(reordered.fills).toEqual(ordinary.fills);
     const changed = await render([first, { ...reversed, italic: true }], settings, alignment);
     expect(drawOf(changed.fills, ' ').x - drawOf(changed.fills, 'T').x).toBe(FONT_PX);
   });
 
-  it.each([14, undefined, 16, 15])('bounds zero and source-space observations to mode 15 (mode %s)', async (compatibilityMode) => {
+  it.each([14, undefined, 16, 15])('bounds zero to mode 15 while source splits stay transparent (mode %s)', async (compatibilityMode) => {
     const settings = { compatibilityMode, enableOpenTypeFeatures: true };
     const zero = await render([textRun('AV', { kerning: 0 })], settings);
     expect(drawOf(zero.fills, 'AV').fontKerning).toBe(compatibilityMode === 15 ? 'none' : 'normal');
     expect(zero.runs[0].w).toBe(compatibilityMode === 15 ? 2 * FONT_PX : 2 * FONT_PX - 2);
     const seam = await render([textRun('T', { kerning: 8 }), textRun(' X', { kerning: 8 })], settings);
-    expect(drawOf(seam.fills, ' ').x - drawOf(seam.fills, 'T').x).toBe(compatibilityMode === 15 ? FONT_PX - 1 : FONT_PX);
+    expect(seam.fills).toEqual((await render([textRun('T X', { kerning: 8 })], settings)).fills);
     // Absence and positive size boundaries are normative in every mode.
     for (const kerning of [undefined, FONT_PX, FONT_PX + 1]) {
       const result = await render([textRun('AV', { kerning })], settings);

@@ -465,13 +465,7 @@ describe('noBreakHyphen (§17.3.3.18) and softHyphen (§17.3.3.29)', () => {
     const drawn = fills.map((c) => c.text).join('');
     expect(drawn).not.toContain('-');
     expect(drawn.replace(/[^a-z]/g, '')).toBe('breaking');
-    // No gap: the two pieces are adjacent glyph runs, not separated by a
-    // dropped-but-still-spaced placeholder. "eaking" must start exactly where
-    // "br" ends (2 glyphs * FS), not further right.
-    const br = fills.find((c) => c.text === 'br');
-    const eaking = fills.find((c) => c.text === 'eaking');
-    expect(br, '"br" must be drawn').toBeDefined();
-    expect(eaking, '"eaking" must be drawn').toBeDefined();
-    expect(eaking!.x).toBeCloseTo(br!.x + 2 * 10, 3);
+    const whole = await render([para([textRun('breaking')])]);
+    expect(fills).toEqual(whole);
   });
 });

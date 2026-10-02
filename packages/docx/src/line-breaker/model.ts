@@ -25,6 +25,9 @@ export interface LayoutSegSource {
    * objects. Unlike `src.segIndex` (the flattened segment stream), this remains
    * the original paragraph run index through line splitting. */
   sourceRunIndex?: number;
+  /** Original ownership is independent of the canonical text sequence. */
+  sourceTextSequence?: readonly import('./text-sequence.js').TextSequenceSource[];
+  sourceTextOffset?: number;
 }
 
 

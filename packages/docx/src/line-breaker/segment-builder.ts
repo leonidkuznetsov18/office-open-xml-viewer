@@ -1,4 +1,5 @@
 import type { DocxTextRun, FieldRun } from '../types';
+import { acquireTextSequences } from './text-sequence.js';
 import type { HyperlinkTarget, ResolvedFontMetric } from '@silurus/ooxml-core';
 import {
   DEFAULT_KINSOKU_RULES,
@@ -699,42 +700,6 @@ export function finalizeBuiltSegments(
   retainHorizontalPunctuationInkClearance(segs);
 }
 
-/** Preserve only the measured identical-property source seam before U+0020.
- * Direct letter-pair seams, font/property changes and authored spacing keep
- * their existing shaping boundaries (WORD_KERN_THRESHOLD_AUTHORITY gaps).
- * One property key per run and one segment sweep keep acquisition linear. */
-function retainSourceSpaceKerning(runs: readonly ParagraphLayoutRun[], segs: LayoutSeg[], compatibilityMode?: number): void {
-  // Only mode 15 has measured seam evidence. Missing/future/older modes keep
-  // their previous shaping boundaries, including public-model input.
-  if (compatibilityMode !== 15) return;
-  const keys = runs.map((run) => {
-    if (run.type !== 'text' || run.charSpacing != null || run.charScale != null
-      || run.fitTextVal != null || run.ruby || run.rtl || run.cs || run.smallCaps
-      || run.vertAlign || run.eastAsianVert || run.noteRef) return undefined;
-    // Plain run metadata is bounded independently of text length. Do not
-    // serialize complete source text once per word/segment.
-    const { text: _text, ...properties } = run;
-    // Formatting is a value, not the insertion order used by the parser or a
-    // public-model caller. Canonicalize nested records as well as the run.
-    return JSON.stringify(properties, (_key, value: unknown) =>
-      value && typeof value === 'object' && !Array.isArray(value)
-        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))
-        : value);
-  });
-  for (let index = 1; index < segs.length; index += 1) {
-    const previous = segs[index - 1];
-    const next = segs[index];
-    if ('isTab' in previous || 'isTab' in next || !('text' in previous) || !('text' in next)
-      || previous.sourceRunIndex == null || next.sourceRunIndex == null
-      || previous.sourceRunIndex === next.sourceRunIndex || !next.text.startsWith(' ')
-      || previous.text.endsWith(' ') || !previous.textShapeRequest?.kerning
-      || previous.fontRoute?.fingerprint !== next.fontRoute?.fingerprint
-      || keys[previous.sourceRunIndex] === undefined
-      || keys[previous.sourceRunIndex] !== keys[next.sourceRunIndex]) continue;
-    previous.textShapeRequest = Object.freeze({ ...previous.textShapeRequest, kerningSpaceAfter: true });
-  }
-}
-
 export function buildSegments(
   runs: readonly ParagraphLayoutRun[],
   environment: LineLayoutEnvironment,
@@ -827,7 +792,6 @@ export function buildSegments(
 
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
-  retainSourceSpaceKerning(runs, segs, environment.compatibilityMode);
   finalizeBuiltSegments(runs, environment, segs);
   withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
 
@@ -1535,8 +1499,14 @@ function appendRunsToSegments(
   segmentBuildContext: SegmentBuildContext,
   selectedMetric: SegmentBuildContext['selectedMetric'],
 ): void {
+  const sequences = acquireTextSequences(runs, environment, (text, run) => transformedRunText(text, run, environment));
+  let sequenceEnd = -1;
   let joinNextVisibleText = false;
-  for (const [runIndex, run] of runs.entries()) {
+  for (const [runIndex, sourceRun] of runs.entries()) {
+    if (runIndex <= sequenceEnd) continue;
+    const sequence = sequences.get(runIndex);
+    const run = sequence?.run ?? sourceRun;
+    if (sequence) sequenceEnd = sequence.sources.at(-1)!.runIndex;
     // ECMA-376 §17.13.5 final view (the default): deleted (`w:del`,
     // §17.13.5.14) and moved-away (`w:moveFrom`, §17.13.5.22) content is not
     // part of the document's final state, so no segment is produced and line
@@ -1621,6 +1591,7 @@ function appendRunsToSegments(
             bold: t.bold,
             italic: t.italic,
             sourceRunIndex: runIndex,
+            ...(sequence ? { sourceTextOffset: displayOffset - 1 } : {}),
           });
         }
       }
@@ -1840,7 +1811,14 @@ function appendRunsToSegments(
       });
     }
     for (let index = emittedStart; index < segs.length; index += 1) {
-      segs[index].sourceRunIndex = runIndex;
+      const segment = segs[index];
+      segment.sourceRunIndex = runIndex;
+      if (sequence) {
+        segment.sourceTextSequence = sequence.sources;
+        segment.sourceTextOffset = 'text' in segment
+          ? segment.textShapeRequest?.substituteContext?.offset ?? 0
+          : segment.sourceTextOffset ?? 0;
+      }
     }
   }
 }

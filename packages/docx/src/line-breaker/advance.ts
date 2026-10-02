@@ -209,9 +209,10 @@ export function slicedTextMetadata(
   start: number,
   end: number,
 ): Pick<LayoutTextSeg,
-  'punctuationCompressions' | 'noBreakRanges' | 'externalLinkBreakOffsets' | 'textShapeRequest'
+  'punctuationCompressions' | 'noBreakRanges' | 'externalLinkBreakOffsets' | 'textShapeRequest' | 'sourceTextOffset'
 > {
   return {
+    ...(seg.sourceTextOffset === undefined ? {} : { sourceTextOffset: seg.sourceTextOffset + start }),
     ...(seg.textShapeRequest
       ? { textShapeRequest: sliceTextShapeRequest(seg.textShapeRequest, start, end) }
       : {}),

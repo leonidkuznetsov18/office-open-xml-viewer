@@ -1864,6 +1864,7 @@ function textPlanSegment(
     anchorOccurrenceId?: string;
   }>,
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
+  sourceRuns?: TextPlacement['sourceRuns'],
 ): MeasuredTextPlanSegment | MeasuredAnchorHostPlanSegment {
   if (segment.metricOnly) {
     const sourceMetrics = selectedFaceSourceMetrics(segment);
@@ -1876,7 +1877,8 @@ function textPlanSegment(
         : {}),
     };
   }
-  const projected = textPlacement(segment, paragraph, sourceOffset, 0, 0, 0, 0);
+  const projected = { ...textPlacement(segment, paragraph, sourceOffset, 0, 0, 0, 0),
+    ...(sourceRuns ? { sourceRuns } : {}) };
   if (projected.kind !== 'text') throw new Error('Visible text segment projected as anchor host');
   const pitchPt = segLetterSpacingPx(segment, characterGrid, 1);
   const scaleX = segment.charScale ?? 1;
@@ -2231,8 +2233,16 @@ function logicalOccurrenceMap(
   measured: MeasuredParagraph,
 ): LogicalOccurrenceMap {
   const measuredLengths = new Map<number, number>();
+  const sequences = new Set<NonNullable<LayoutTextSeg['sourceTextSequence']>>();
   for (const line of measured.lines) {
     for (const segment of line.layout.segments) {
+      if (segment.sourceTextSequence) {
+        if (!sequences.has(segment.sourceTextSequence)) {
+          sequences.add(segment.sourceTextSequence);
+          for (const owner of segment.sourceTextSequence) measuredLengths.set(owner.runIndex, owner.end - owner.start);
+        }
+        continue;
+      }
       const runIndex = sourceRunIndex(segment);
       if (runIndex === undefined) continue;
       const length = 'text' in segment
@@ -2283,6 +2293,7 @@ function planMeasuredLines(
 ): readonly LineLayout[] {
   let sourceOffset = 0;
   const consumedByRun = new Map<number, number>();
+  const sequenceOwners = new Map<NonNullable<LayoutTextSeg['sourceTextSequence']>, number>();
   const hasExplicitTab = measured.lines.some((line) => line.layout.segments.some((segment) => 'isTab' in segment));
   const earliestTab = paragraph.tabStops?.reduce<(typeof paragraph.tabStops)[number] | undefined>(
     (earliest, stop) => !earliest || stop.pos < earliest.pos ? stop : earliest,
@@ -2313,10 +2324,13 @@ function planMeasuredLines(
       const runIndex = sourceRunIndex(segment);
       const sourceRun = runIndex === undefined ? undefined : paragraph.runs[runIndex];
       const occurrenceLength = segmentOccurrenceLength(segment);
-      const segmentOffset = runIndex === undefined
+      const sequence = segment.sourceTextSequence;
+      const segmentOffset = sequence
+        ? (occurrences.runStarts[sequence[0]!.runIndex] ?? sourceOffset) + (segment.sourceTextOffset ?? 0)
+        : runIndex === undefined
         ? sourceOffset
         : (occurrences.runStarts[runIndex] ?? sourceOffset) + (consumedByRun.get(runIndex) ?? 0);
-      if (runIndex !== undefined) {
+      if (runIndex !== undefined && !sequence) {
         consumedByRun.set(runIndex, (consumedByRun.get(runIndex) ?? 0) + occurrenceLength);
       }
       lineStartOffset = Math.min(lineStartOffset, segmentOffset);
@@ -2462,11 +2476,31 @@ function planMeasuredLines(
           heightPt: math.mathAscent + math.mathDescent, topOffsetPt: -math.mathAscent,
         });
       } else {
+        let sourceRuns: TextPlacement['sourceRuns'];
+        if (sequence) {
+          const localStart = segment.sourceTextOffset ?? 0;
+          const localEnd = localStart + occurrenceLength;
+          let index = sequenceOwners.get(sequence) ?? 0;
+          while (index < sequence.length && sequence[index]!.end <= localStart) index++;
+          sequenceOwners.set(sequence, index);
+          const owners: NonNullable<TextPlacement['sourceRuns']>[number][] = [];
+          for (; index < sequence.length && sequence[index]!.start < localEnd; index++) {
+            const owner = sequence[index]!;
+            const original = paragraph.runs[owner.runIndex];
+            owners.push({ sourceRunIndex: owner.runIndex,
+              range: { start: segmentOffset + Math.max(owner.start, localStart) - localStart,
+                end: segmentOffset + Math.min(owner.end, localEnd) - localStart },
+              ...(original?.type === 'field' ? { role: 'field-result' as const, dependency: fieldDependency(original) } : {}),
+            });
+          }
+          sourceRuns = owners;
+        }
         segments.push(textPlanSegment(
           segment as LayoutTextSeg, paragraph, segmentOffset,
           paragraphCharacterGrid(context),
           sourceRun,
           verticalGlyphMeasurement,
+          sourceRuns,
         ));
       }
       sourceOffset = Math.max(sourceOffset, segmentOffset + occurrenceLength);
@@ -2570,6 +2604,9 @@ function rebaseMeasuredLineRanges(
       return {
         ...placement,
         range,
+        ...(placement.sourceRuns ? { sourceRuns: placement.sourceRuns.map(owner => ({
+          ...owner, range: offsetRange(owner.range, delta),
+        })) } : {}),
         clusters: placement.clusters.map((cluster) => ({
           ...cluster,
           range: offsetRange(cluster.range, delta),

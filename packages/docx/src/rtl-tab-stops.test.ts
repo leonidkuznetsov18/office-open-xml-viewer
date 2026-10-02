@@ -366,7 +366,7 @@ describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () 
     await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
 
     const pageNum = fills.find((f) => f.text === '9');
-    const chapter = fills.find((f) => f.text === 'AB');
+    const chapter = fills.find((f) => f.text.trim() === 'AB');
     expect(pageNum, 'page number drawn').toBeDefined();
     expect(chapter, 'chapter number drawn').toBeDefined();
     // Page number on the visual LEFT (near x=20), chapter number on the visual
@@ -418,7 +418,7 @@ describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () 
     await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
     const pageNum = fills.find((f) => f.text === '9');
     const title = fills.find((f) => f.text === 'TITLE');
-    const chapter = fills.find((f) => f.text === 'AB');
+    const chapter = fills.find((f) => f.text.trim() === 'AB');
     expect(pageNum).toBeDefined();
     expect(title).toBeDefined();
     expect(chapter).toBeDefined();
@@ -446,7 +446,7 @@ describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () 
       { indentLeft: 36 },
     );
     await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
-    const chapter = fills.find((f) => f.text === 'AB');
+    const chapter = fills.find((f) => f.text.trim() === 'AB');
     const title = fills.find((f) => f.text === 'TITLE');
     expect(chapter).toBeDefined();
     expect(title).toBeDefined();

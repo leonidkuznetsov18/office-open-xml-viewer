@@ -141,8 +141,6 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
       request.genericFamily ?? null,
       request.letterSpacingPt ?? null,
       request.kerning ?? null,
-      // kerningSpaceAfter describes the following range, not effective
-      // formatting. It must not turn identical text into separate atoms.
     ] : null,
     segment.bold,
     segment.italic,
@@ -225,9 +223,6 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
           : undefined,
         textShapeRequest: previous.textShapeRequest
           ? { ...previous.textShapeRequest, text,
-              // The former external separator is now inside the merged text.
-              // Only the last piece can still own an external space pair.
-              kerningSpaceAfter: segment.textShapeRequest?.kerningSpaceAfter,
               substituteContext: previous.substituteScope !== undefined || segment.substituteScope !== undefined
                 ? previous.textShapeRequest.substituteContext : { text, offset: 0 } }
           : undefined,
@@ -277,16 +272,7 @@ function measureTextRange(
       ...piece.segment,
       text,
       ...(piece.segment.textShapeRequest
-        ? { textShapeRequest: {
-            ...sliceTextShapeRequest(piece.segment.textShapeRequest, localStart, localEnd),
-            // §17.18.87's minimum-content probe includes possible line breaks.
-            // A terminal source-space pair belongs only to a range that still
-            // includes that space; trimming the separator removes its pair too.
-            // Keep the ordinary retained-layout slicer's terminal context intact.
-            kerningSpaceAfter: localEnd === piece.segment.text.length
-              && overlapEnd < end && joinedText[overlapEnd] === ' '
-                ? piece.segment.textShapeRequest.kerningSpaceAfter : undefined,
-          } } : {}),
+        ? { textShapeRequest: sliceTextShapeRequest(piece.segment.textShapeRequest, localStart, localEnd) } : {}),
       punctuationCompressions: slicedPunctuationCompressions(
         piece.segment,
         localStart,

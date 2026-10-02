@@ -352,6 +352,14 @@ export interface TextPlacement {
   readonly text: string;
   /** Parsed run occurrence retained for destination-page field convergence. */
   readonly sourceRunIndex?: number;
+  /** Formatting-only runs share one glyph sequence. Ownership ranges stay
+   * separate so overlays/fields can address every original source occurrence. */
+  readonly sourceRuns?: readonly Readonly<{
+    range: TextRange;
+    sourceRunIndex: number;
+    role?: 'field-result';
+    dependency?: TextPlacement['dependency'];
+  }>[];
   readonly role?: 'content' | 'numbering-marker' | 'field-result';
   readonly dependency?: 'page' | 'total-pages' | 'date' | 'time' | 'document';
   readonly noteReference?: Readonly<{ kind: 'footnote' | 'endnote'; id: string }>;
