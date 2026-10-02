@@ -169,13 +169,13 @@ beforeAll(async () => {
 // Feed the complete WASM wire graph to the production source-store adapter.
 // Extracting public runs here would discard the retained typography inputs and
 // would miss a content-dependent acquisition key (the r4 regression).
-function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTextRun> = {}): DocxDocumentModel {
+function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTextRun> = {}, runProperties: string[] = []): DocxDocumentModel {
   const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
   const O = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
   const escape = (text: string) => text.replace(/&/gu, '&amp;').replace(/</gu, '&lt;');
   const runs = parts.map((text, index) => {
     const content = text.split('\t').map(piece => `<w:t xml:space="preserve">${escape(piece)}</w:t>`).join('<w:tab/>');
-    const run = `<w:r w:rsidR="0000000${index % 8}">${content}</w:r>`;
+    const run = `<w:r w:rsidR="0000000${index % 8}">${runProperties[index] ? `<w:rPr>${runProperties[index]}</w:rPr>` : ''}${content}</w:r>`;
     if (wrapper === 'smart-tags') return `<w:smartTag w:uri="urn:test" w:element="word">${run}</w:smartTag>`;
     if (wrapper === 'revisions') return `<w:ins w:id="${index}" w:author="Reviewer">${run}</w:ins>`;
     if (wrapper === 'hyperlinks') return `<w:hyperlink w:anchor="Destination">${run}</w:hyperlink>`;
@@ -220,6 +220,25 @@ function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed
 }
 
 describe('complete DOCX parser inputs preserve formatting-only split invariance', () => {
+  it('keeps Latin source seams transparent beside ideographic spaces in every story', () => {
+    const whole = acquireParsed(['T i\u3000'], 'rsid');
+    const split = acquireParsed(['T', ' i\u3000'], 'rsid');
+    expect(geometry(split)).toEqual(geometry(whole));
+  });
+  it.each([
+    ['shadow', '0', '1'], ['frame', '0', '1'], ['themeColor', 'accent1', 'accent2'],
+    ['themeTint', '33', '66'], ['themeShade', '33', '66'],
+  ])('preserves distinct retained border %s when adjacent public borders match', (attribute, first, second) => {
+    const border = (value: string) => `<w:bdr w:val="single" w:sz="8" w:color="000000" w:${attribute}="${value}"/>`;
+    const doc = parsedDocument(['A', 'V'], 'rsid', {}, [border(first), border(second)]);
+    const layout = layoutDocument(doc, createLayoutServices(doc, { measureContext: context() }));
+    const line = paragraphs(layout).find(p => p.source.story === 'body')?.lines[0];
+    const facts = line?.placements.flatMap(p => p.kind === 'text' && p.runBorder ? [p.runBorder] : []);
+    expect(facts?.map(f => f[attribute as keyof typeof f])).toEqual(
+      attribute === 'shadow' || attribute === 'frame' ? [false, true] : [first, second]);
+    // ECMA-376 §17.3.2.4: unlike attributes form separate border groups.
+    expect(line?.placements.flatMap(p => p.kind === 'text' ? p.runBorderFragments ?? [] : [])).toHaveLength(8);
+  });
   it.each(['rsid', 'smart-tags', 'revisions', 'hyperlinks', 'simple-fields', 'complex-fields', 'bookmarks', 'comments', 'proofing'])(
     '%s preserves all story/container geometry with inherited formatting', wrapper => {
       const layout = acquireParsed(['T i'], wrapper);

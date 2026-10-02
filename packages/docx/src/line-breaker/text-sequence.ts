@@ -62,7 +62,17 @@ function formattingKey(run: SequenceRun, environment: LineLayoutEnvironment): st
     underline: run.underline, underlineStyle: run.underlineStyle, underlineColor: run.underlineColor,
     strikethrough: run.strikethrough, doubleStrikethrough: run.doubleStrikethrough,
     color: run.color, colorAuto: run.colorAuto, background: run.background,
-    highlight: run.highlight, emphasisMark: run.emphasisMark, border: run.border,
+    highlight: run.highlight, emphasisMark: run.emphasisMark,
+    // ECMA-376 §17.3.2.4 groups borders only when every attribute agrees.
+    // Public borders omit theme/shadow/frame facts retained by the parser.
+    border: run.border ? {
+      ...run.border, val: input?.border?.val.value ?? run.border.style,
+      themeColor: input?.border?.themeColor.value || undefined,
+      themeTint: input?.border?.themeTint.value || undefined,
+      themeShade: input?.border?.themeShade.value || undefined,
+      shadow: effective(input?.border?.shadow, undefined),
+      frame: effective(input?.border?.frame, undefined),
+    } : undefined,
     hyperlink: run.hyperlink, hyperlinkAnchor: run.hyperlinkAnchor,
     // Markup colors/decorations depend on kind and effective author color, not
     // revision identity. Final view does not paint revision markup.
@@ -99,16 +109,6 @@ export function acquireTextSequences(
   displayText: (text: string, run: Extract<ParagraphTextBearingRun, { type: 'text' }>) => string,
 ): ReadonlyMap<number, TextSequence> {
   const sequences = new Map<number, TextSequence>();
-  // Evidence gap: U+3000 hanging and source-split fitting are not settled by
-  // WORD_COMPRESSED_SPACE_LINE_FIT. Its prior-behavior gate is paragraph-wide,
-  // so unrelated earlier seams must not change that paragraph's fitting either.
-  if (runs.some(run => {
-    if (run.type !== 'text' && run.type !== 'field') return false;
-    // Final-view omissions are not acquisition input, including field results.
-    if (environment.showTrackedChanges !== true
-      && (run.revision?.kind === 'deletion' || run.revision?.kind === 'moveFrom')) return false;
-    return (run.type === 'text' ? run.text : resolveFieldText(run as FieldRun, environment)).includes('\u3000');
-  })) return sequences;
   let start = -1;
   let key: string | undefined;
   let first: SequenceRun | undefined;
