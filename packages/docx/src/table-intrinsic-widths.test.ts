@@ -662,7 +662,8 @@ describe('table intrinsic content widths', () => {
     const services = createLayoutServices(model([]), { measureContext: ctx });
     const widths = measureParagraphIntrinsicWidths(source, intrinsicContext(), 200,
       { context: ctx, fontFamilyClasses: {} },
-      { pageIndex: 0, totalPages: 1, layoutServices: services, enableOpenTypeFeatures: true });
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, layoutServices: services, enableOpenTypeFeatures: true });
     expect(widths).toEqual(kerning === 8 || kerning === 10
       ? { minWidthPt: 18, maxWidthPt: 18 } : { minWidthPt: 20, maxWidthPt: 20 });
   });
