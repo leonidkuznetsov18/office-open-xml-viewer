@@ -9,10 +9,12 @@
  *
  * Every decision is a pure function of the candidate line's content: while a
  * line is built `currentWidth` stays the natural advance of its committed
- * items, and the shrinkable spaces (count, natural advance and floor) are
- * re-derived from those items on every query. The only state is whether the
- * line was admitted by shrinking. The reduction is materialized once, when the
- * line is finalized, onto each space-bearing segment.
+ * items, and the line facts (shrinkable space count and floor, East Asian
+ * presence, unsupported content, visible-text tail) come from a reversible
+ * running summary that mirrors `currentLine` item for item. The summary is
+ * updated O(1) per commit through the same helpers that mutate the line, and
+ * tests assert it equals a full recomputation. The reduction is materialized
+ * once, when the line is finalized, onto each space-bearing segment.
  */
 import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
 import {
@@ -27,6 +29,10 @@ import type { PassOperationState } from './pass-operations.js';
 interface Contribution {
   readonly item: LayoutSeg;
   readonly inkless: boolean;
+  /** Last non-space character of a visible text item. */
+  readonly lastVisible: string | undefined;
+  /** The item is text holding a non-whitespace character. */
+  readonly visibleText: boolean;
   readonly eastAsian: boolean;
   /** Content this projection was not observed with (ends it for the line). */
   readonly invalid: boolean;
@@ -55,6 +61,12 @@ export interface MixedSpaceState {
   spaceCount: number;
   /** Index into `contributions` of the line's first gap, or -1. */
   firstGap: number;
+  /** Indices of contributions with visible text, in line order. */
+  visibleIndices: number[];
+  /** Indices of text contributions with a character other than U+0020. */
+  nonSpaceIndices: number[];
+  /** Indices of non-inkless, non-text contributions. */
+  lastNonText: number[];
 }
 
 export function createMixedSpaceState(): MixedSpaceState {
@@ -66,6 +78,9 @@ export function createMixedSpaceState(): MixedSpaceState {
     mismatchedGaps: 0,
     spaceCount: 0,
     firstGap: -1,
+    visibleIndices: [],
+    nonSpaceIndices: [],
+    lastNonText: [],
   };
 }
 
@@ -88,12 +103,23 @@ export function mixedSpaceSummaryWork(reset = false): number {
 function contributionOf(state: MixedSpaceState, item: LayoutSeg, scale: number): Contribution {
   summaryWork += 1;
   if (inkless(item)) {
-    return { item, inkless: true, eastAsian: false, invalid: false, gapCount: 0, capacity: 0, mismatched: false };
+    return {
+      item, inkless: true, lastVisible: undefined,
+      // The visible-content predicate counts every text item, as before.
+      visibleText: 'text' in item && /\S/u.test(item.text), eastAsian: false,
+      invalid: false, gapCount: 0, capacity: 0, mismatched: false,
+    };
   }
   if (!('text' in item)) {
-    return { item, inkless: false, eastAsian: false, invalid: true, gapCount: 0, capacity: 0, mismatched: false };
+    return {
+      item, inkless: false, lastVisible: undefined, visibleText: false, eastAsian: false,
+      invalid: true, gapCount: 0, capacity: 0, mismatched: false,
+    };
   }
   const eastAsian = EAST_ASIAN_RE.test(item.text);
+  const visible = item.text.replace(/ +$/u, '');
+  const lastVisible = visible.length > 0 ? visible.at(-1) : undefined;
+  const visibleText = /\S/u.test(item.text);
   const spaces = trailingSpaceCount(item.text);
   if (
     item.mixedNaturalTrailingSpacePx !== undefined &&
@@ -106,17 +132,24 @@ function contributionOf(state: MixedSpaceState, item: LayoutSeg, scale: number):
     const mismatched = first !== undefined && (
       !sameSpaceFace(item, first.item as LayoutTextSeg) || Math.abs(capacity - first.capacity) > 1e-6
     );
-    return { item, inkless: false, eastAsian, invalid: false, gapCount: spaces, capacity, mismatched };
+    return {
+      item, inkless: false, lastVisible, visibleText, eastAsian, invalid: false,
+      gapCount: spaces, capacity, mismatched,
+    };
   }
   return {
-    item, inkless: false, eastAsian, invalid: !neutral(item, item.text),
+    item, inkless: false, lastVisible, visibleText, eastAsian, invalid: !neutral(item, item.text),
     gapCount: 0, capacity: 0, mismatched: false,
   };
 }
 
 function addContribution(state: MixedSpaceState, contribution: Contribution): void {
   if (contribution.gapCount > 0 && state.firstGap < 0) state.firstGap = state.contributions.length;
+  const index = state.contributions.length;
   state.contributions.push(contribution);
+  if (contribution.visibleText) state.visibleIndices.push(index);
+  if (contribution.lastVisible !== undefined) state.nonSpaceIndices.push(index);
+  if (!contribution.inkless && !('text' in contribution.item)) state.lastNonText.push(index);
   if (contribution.eastAsian) state.eastAsianItems += 1;
   if (contribution.invalid) state.invalidItems += 1;
   if (contribution.mismatched) state.mismatchedGaps += 1;
@@ -126,6 +159,10 @@ function addContribution(state: MixedSpaceState, contribution: Contribution): vo
 function removeContribution(state: MixedSpaceState): void {
   const contribution = state.contributions.pop();
   if (!contribution) return;
+  const index = state.contributions.length;
+  if (state.visibleIndices.at(-1) === index) state.visibleIndices.pop();
+  if (state.nonSpaceIndices.at(-1) === index) state.nonSpaceIndices.pop();
+  if (state.lastNonText.at(-1) === index) state.lastNonText.pop();
   if (contribution.eastAsian) state.eastAsianItems -= 1;
   if (contribution.invalid) state.invalidItems -= 1;
   if (contribution.mismatched) state.mismatchedGaps -= 1;
@@ -159,6 +196,12 @@ export function replaceLastMixedLineItem(
   commitMixedLineItem(breakerState, item, scale);
 }
 
+/** The committed line holds visible (non-whitespace) text; O(1). */
+export function mixedLineHasVisibleText(breakerState: BreakerState): boolean {
+  summaryWork += 1;
+  return breakerState.mixedSpace.visibleIndices.length > 0;
+}
+
 /** Line facts from the running summary; O(1). */
 function summaryLine(state: MixedSpaceState): Omit<LineSpaces, 'gaps'> {
   const first = state.firstGap >= 0 ? state.contributions[state.firstGap]! : undefined;
@@ -177,7 +220,16 @@ function assertSummary(breakerState: BreakerState, scale: number): void {
   const state = breakerState.mixedSpace;
   const full = scanLine(breakerState.currentLine, scale);
   const summary = summaryLine(state);
+  const line = breakerState.currentLine;
+  const indices = (predicate: (item: LayoutSeg) => boolean) =>
+    line.flatMap((item, index) => (predicate(item) ? [index] : []));
+  const sameIndices = (left: readonly number[], right: readonly number[]) =>
+    left.length === right.length && left.every((value, index) => value === right[index]);
   const same = state.contributions.length === breakerState.currentLine.length
+    && sameIndices(state.visibleIndices, indices((item) => 'text' in item && /\S/u.test(item.text)))
+    && sameIndices(state.nonSpaceIndices, indices((item) => !inkless(item) && 'text' in item
+      && item.text.replace(/ +$/u, '').length > 0))
+    && sameIndices(state.lastNonText, indices((item) => !inkless(item) && !('text' in item)))
     && state.contributions.every((contribution, index) => contribution.item === breakerState.currentLine[index])
     && full.valid === summary.valid
     && (!full.valid || (
@@ -371,15 +423,13 @@ export function performMixedSpaceRequirement(
 }
 
 function lastVisibleLineCharacter(state: MixedSpaceState): string | undefined {
-  for (let index = state.contributions.length - 1; index >= 0; index -= 1) {
-    summaryWork += 1;
-    const item = state.contributions[index]!.item;
-    if (inkless(item)) continue;
-    if (!('text' in item)) return undefined;
-    const visible = item.text.replace(/ +$/u, '');
-    if (visible.length > 0) return visible.at(-1);
-  }
-  return undefined;
+  // The last visible character of the committed line, unless a non-text item
+  // (tab, object) follows it. Text items holding only spaces are skipped.
+  summaryWork += 1;
+  const visible = state.nonSpaceIndices.at(-1);
+  const nonText = state.lastNonText.at(-1);
+  if (visible === undefined || (nonText !== undefined && nonText > visible)) return undefined;
+  return state.contributions[visible]!.lastVisible;
 }
 
 /** Record that the line was admitted by shrinking its spaces. */

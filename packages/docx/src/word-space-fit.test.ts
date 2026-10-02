@@ -290,6 +290,49 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT work', () => {
       // would need about 16x).
       expect(large / small).toBeLessThan(5);
       expect(large).toBeLessThan(40 * 1000);
+
+      // Review round 4: whitespace-heavy lines of separate space-only runs,
+      // with and without East Asian text, fitting naturally or by shrinking.
+      const spaced = (count: number, lead: string, shrink: boolean) => {
+        const runs = [
+          ...(lead ? [{ ...run, text: lead }] : []),
+          ...Array.from({ length: count }, (_, index) => ({ ...run, text: index % 2 ? ' ' : 'AB' })),
+          { ...run, text: 'AB' },
+        ];
+        const environment = { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' };
+        const natural = layoutStubParagraph({ runs, environment, bandPt: 1e7, justification: 'left' })[0]!
+          .reduce((sum, segment) => sum + segment.width, 0);
+        mixedSpaceSummaryWork(true);
+        layoutStubParagraph({
+          runs, environment, justification: 'left',
+          bandPt: shrink ? natural - 0.85 * (count / 2) * (4.25 - 8.5 / 4) : natural + 10,
+        });
+        return mixedSpaceSummaryWork(true);
+      };
+      // Leading whitespace: a line holding only separate space runs.
+      const leading = (count: number, lead: string) => {
+        const runs = [
+          ...Array.from({ length: count }, () => ({ ...run, text: ' ' })),
+          { ...run, text: `${lead}AB` },
+        ];
+        mixedSpaceSummaryWork(true);
+        layoutStubParagraph({
+          runs, justification: 'left', bandPt: 50,
+          environment: { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' },
+        });
+        return mixedSpaceSummaryWork(true);
+      };
+      for (const lead of ['甲', '']) {
+        expect(leading(2000, lead) / leading(500, lead), `leading ${lead || 'latin'}`).toBeLessThan(5);
+      }
+      for (const lead of ['甲', '']) {
+        for (const shrink of [true, false]) {
+          const n = spaced(500, lead, shrink);
+          const n4 = spaced(2000, lead, shrink);
+          expect(n4 / n, `${lead || 'latin'} shrink=${shrink}`).toBeLessThan(5);
+          expect(n4, `${lead || 'latin'} shrink=${shrink}`).toBeLessThan(20 * 2000);
+        }
+      }
     } finally {
       setMixedSpaceSummaryAssertions(true);
     }

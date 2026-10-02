@@ -33,6 +33,7 @@ import {
 import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
 import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
+import { mixedLineHasVisibleText } from './mixed-space-fit.js';
 import {
   COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION,
   extendThroughTrailingIdeographicSpaces,
@@ -347,7 +348,8 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
     trailingSpaceW > 0 &&
     !trimmed.includes(' ') &&
     (trimmed.length > 0 ||
-      breakerState.currentLine.some((item) => 'text' in item && /\S/u.test(item.text)));
+      // O(1) from the reversible line summary (no per-segment line scan).
+      mixedLineHasVisibleText(breakerState));
   s.mixedNaturalTrailingSpacePx = mixedSpaces ? trailingSpaceW : undefined;
   s.mixedNaturalTrailingSpaceCount = mixedSpaces ? s.text.length - trimmed.length : undefined;
   // Library containment policy: an RTL line is anchored at its right edge,
