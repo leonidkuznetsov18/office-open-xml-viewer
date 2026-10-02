@@ -36,8 +36,15 @@ export function measureFitTextUnit(
 export function measureJoinedTextUnit(
   s: LayoutTextSeg, following: Iterable<LayoutSeg>, measurement: AtomicTextMeasurement,
   w = measurement.segAdvance(s), trailingSpaceW = 0, startIndex = 0, atLineStart = false,
-): Readonly<{ width: number; trailingSpace: number; next: LayoutSeg | undefined }> {
+): Readonly<{
+  width: number;
+  trailingSpace: number;
+  next: LayoutSeg | undefined;
+  /** The joined text, piece by piece (the leader first). */
+  pieces: readonly Readonly<{ segment: LayoutTextSeg; text: string }>[];
+}> {
   const { segAdvance, strAdvance } = measurement;
+  const pieces: { segment: LayoutTextSeg; text: string }[] = [{ segment: s, text: s.text }];
   let groupW = w;
   let groupTrail = s.fitTextRegionIndex === undefined ? trailingSpaceW : 0;
   let index = 0;
@@ -61,6 +68,7 @@ export function measureJoinedTextUnit(
       }
     }
     const prefix = f.text.slice(0, end);
+    pieces.push({ segment: f, text: prefix });
     const fw = end === f.text.length ? segAdvance(f) : strAdvance(f, prefix);
     groupW += fw;
     const trimmed = prefix.replace(/ +$/, '');
@@ -70,5 +78,5 @@ export function measureJoinedTextUnit(
     if (end < f.text.length || !fixedCell && externalEnd !== undefined && hardEnd === undefined) break;
     next = undefined;
   }
-  return { width: groupW, trailingSpace: groupTrail, next };
+  return { width: groupW, trailingSpace: groupTrail, next, pieces };
 }

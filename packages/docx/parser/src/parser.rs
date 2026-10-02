@@ -5537,6 +5537,10 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
         widow_control: base_para.widow_control.unwrap_or(true),
         // ECMA-376 §17.3.1.21: omission is explicitly equivalent to true.
         overflow_punct: base_para.overflow_punct.unwrap_or(true),
+        // ECMA-376 §17.3.1.2-3: omission means automatic spacing is on; only a
+        // resolved `false` is carried so default paragraphs serialize unchanged.
+        auto_space_de: base_para.auto_space_de.filter(|enabled| !enabled),
+        auto_space_dn: base_para.auto_space_dn.filter(|enabled| !enabled),
         // ECMA-376 §17.3.1.1: omission resolves through the paragraph style
         // hierarchy and ultimately defaults to true.
         adjust_right_ind: base_para.adjust_right_ind.unwrap_or(true),

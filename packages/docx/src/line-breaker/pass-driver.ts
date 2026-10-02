@@ -26,6 +26,11 @@ import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
 import {
+  performMarkMixedSpacesCompressed,
+  performMixedSpaceRequirement,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
+import {
   performLineHeadRequirement,
   performForcedPlacement,
   performMinimalLegalTextWidth,
@@ -123,6 +128,14 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const { probeHeights, preparedFloatWrap } = passContext;
   const probeFloors = passContext.probeFloors ?? probeHeights;
   const breakerState = createLineBreakerState(maxWidth, wrapCtx);
+  // WORD_COMPRESSED_SPACE_LINE_FIT scope, fixed for the paragraph: only
+  // segments acquired under its document gate carry the eligibility. No
+  // Word control measured U+3000, whose hanging and paragraph-final rules
+  // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) the observed rule does not
+  // define; a paragraph holding U+3000 keeps the unchanged line breaker.
+  breakerState.mixedSpaceEnabled = segs.some(
+    (segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined,
+  ) && !segs.some((segment) => 'text' in segment && segment.text.includes('\u3000'));
 
   let operationState: PassOperationState;
   const sameLatinSpaceFace = performSameLatinSpaceFace;
@@ -258,6 +271,9 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * setting excludes the fit projection at segment acquisition. */
   const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
     performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
+  const mixedSpaceRequirement = (candidate: MixedSpaceCandidate): number | undefined =>
+    performMixedSpaceRequirement(operationState, candidate);
+  const markMixedSpacesCompressed = (): void => performMarkMixedSpacesCompressed(operationState);
 
   /** Measure one text segment's canonical advance and vertical contribution.
    * Every path that commits a complete text segment to a line must use this
@@ -383,6 +399,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     eastAsianSnapCellCount,
     strAdvance,
     fitHomogeneousLatinSpaces,
+    mixedSpaceRequirement,
+    markMixedSpacesCompressed,
     textSegmentBox,
     appendQueuedIdeographicSpaceSegment,
     tabFollowWidth,

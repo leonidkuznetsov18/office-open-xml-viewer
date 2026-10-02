@@ -19,6 +19,12 @@ import {
   type LineBoundary,
 } from './model.js';
 import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
+import {
+  commitMixedLineItem,
+  createMixedSpaceState,
+  performSettleMixedSpaces,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -105,6 +111,9 @@ export interface PassOperationState extends LineBreakerPassInput {
     retainTrailingPunctuationCompression?: boolean,
   ) => number;
   readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
+  /** WORD_COMPRESSED_SPACE_LINE_FIT (mixed-script lines); see mixed-space-fit.ts. */
+  readonly mixedSpaceRequirement: (candidate: MixedSpaceCandidate) => number | undefined;
+  readonly markMixedSpacesCompressed: () => void;
   readonly textSegmentBox: (
     s: LayoutTextSeg,
   ) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
@@ -548,6 +557,7 @@ export function performRejectGap(
   breakerState.queue.restore(snapshot.queue);
   breakerState.currentLine = [];
   breakerState.latinLineGaps = [];
+  breakerState.mixedSpace = createMixedSpaceState();
   breakerState.inHand = undefined;
   // A replay ends the fragment before the forced unit. If the replay cannot
   // reach that source boundary, the whole fragment is rejected instead.
@@ -632,6 +642,7 @@ export function performFlush(
     operationState.forcedPlacement(followingUnit);
   }
   materializeLatinSpaceCompression();
+  performSettleMixedSpaces(operationState);
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
     currentLine: breakerState.currentLine,
@@ -902,7 +913,7 @@ export function performAddToLine(
   } else {
     breakerState.snapBlock = null;
   }
-  breakerState.currentLine.push(s);
+  commitMixedLineItem(breakerState, s, scale);
   breakerState.currentWidth += committedWidth;
   if (
     'text' in s &&
@@ -1594,6 +1605,7 @@ export function performRetractCurrentLineForLeadingKinsoku(
     materializeLatinSpaceCompression,
     strAdvance,
     next,
+    operationState.scale,
   );
 }
 

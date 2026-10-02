@@ -1097,6 +1097,8 @@ export interface DocParagraph {
     markVanish?: boolean;
     widowControl?: boolean;
     overflowPunct?: boolean;
+    autoSpaceDE?: boolean;
+    autoSpaceDN?: boolean;
     adjustRightInd?: boolean;
     borders?: ParagraphBorders | null;
     styleId?: string | null;

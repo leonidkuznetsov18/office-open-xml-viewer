@@ -1,3 +1,4 @@
+import { createMixedSpaceState } from './mixed-space-fit.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { KinsokuRules } from '@silurus/ooxml-core';
 import { containsSeaScript, seaMixedBreakOffsets } from '@silurus/ooxml-core';
@@ -206,6 +207,11 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     latinLineFace: undefined as LayoutTextSeg | undefined,
     latinLineHomogeneous: true,
     latinLineGaps: [] as LayoutTextSeg[],
+    /** WORD_COMPRESSED_SPACE_LINE_FIT state of the current line. */
+    mixedSpace: createMixedSpaceState(),
+    /** Some segment of the paragraph carries the rule's eligibility; when
+     * false the projection does no work at all. */
+    mixedSpaceEnabled: false,
     latinUniformGapCapacity: undefined as number | undefined,
     latinAppliedGapCount: 0,
     latinAppliedPerGap: 0,

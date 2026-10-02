@@ -109,6 +109,14 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Retained paint advance is shorter than the natural space by this amount. */
   latinSpaceCompressionPx?: number;
   latinNaturalTrailingSpacePx?: number;
+  /** Selected-face OS/2 xAvgCharWidth / unitsPerEm, set only where
+   * WORD_COMPRESSED_SPACE_LINE_FIT may shrink this segment's U+0020 on a mixed
+   * East Asian / Latin line. Independent of the Latin-only projection. */
+  mixedSpaceAverageWidthRatio?: number;
+  /** Natural advance and count of this segment's shrinkable trailing U+0020
+   * under WORD_COMPRESSED_SPACE_LINE_FIT. */
+  mixedNaturalTrailingSpacePx?: number;
+  mixedNaturalTrailingSpaceCount?: number;
   vertAlign: 'super' | 'sub' | null;
   measuredWidth: number;  // px (set during layout)
   /** A2 text authority captured during segmentation; production text width and
@@ -607,6 +615,14 @@ export interface LineLayoutEnvironment {
   readonly characterSpacingControl?: string;
   /** §17.15.3.31: use full character width when deciding line fit. */
   readonly lineWrapLikeWord6?: boolean;
+  /** `w:compatSetting` compatibilityMode; absent when not authored. Gates
+   * WORD_COMPRESSED_SPACE_LINE_FIT. */
+  readonly compatibilityMode?: number;
+  /** Paragraph §17.3.1.2-3 automatic East Asian/Latin and East Asian/number
+   * spacing (absent means on). The renderer does not model that spacing;
+   * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
+  readonly autoSpaceDE?: boolean;
+  readonly autoSpaceDN?: boolean;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;

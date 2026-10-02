@@ -107,6 +107,7 @@ export function segmentEnvironmentOf(
 ): LineLayoutEnvironment {
   if (!state.verticalAllRotated
     && state.layoutSettings.characterSpacingControl === undefined
+    && state.layoutSettings.compat.compatibilityMode === undefined
     && !state.layoutSettings.compat.lineWrapLikeWord6
     && !state.layoutSettings.compat.enableOpenTypeFeatures
     && !state.layoutSettings.compat.balanceSingleByteDoubleByteWidth) return state;
@@ -118,6 +119,9 @@ export function segmentEnvironmentOf(
     enableOpenTypeFeatures: state.layoutSettings.compat.enableOpenTypeFeatures,
     balanceSingleByteDoubleByteWidth:
       state.layoutSettings.compat.balanceSingleByteDoubleByteWidth,
+    ...(state.layoutSettings.compat.compatibilityMode === undefined
+      ? {}
+      : { compatibilityMode: state.layoutSettings.compat.compatibilityMode }),
   };
 }
 

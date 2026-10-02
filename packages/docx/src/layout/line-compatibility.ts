@@ -436,6 +436,47 @@ export const WORD_LATIN_INTERWORD_XAVG_FLOOR = defineCompatibilityRule({
   description: 'For left-aligned homogeneous Latin words using one U+0020 separator and characterSpacingControl=compressPunctuation, Word reduces each natural inter-word space only as far as half the selected static face\'s positive OS/2 xAvgCharWidth. First-fit and beta-origin controls varied only U+0020 hmtx, then only xAvg, with fixed outlines and non-space advances at 8/11/16pt; a distinct Carlito outline provided a counterexample where natural U+0020 was narrower than the floor. Two-gap controls showed equal required-deficit allocation. A one-twip linesAndChars control preserved the xAvg-dependent deficit while moving both control and natural boundaries by the separate character-grid pitch. [MS-OE376] §2.1.472 documents lineWrapLikeWord6 as an explicit uncompressed-fit override. Mixed faces, explicit run spacing or scaling, justification, and snapToChars remain outside the observed scope.',
 });
 
+export const WORD_COMPRESSED_SPACE_LINE_FIT = defineCompatibilityRule({
+  id: 'word-compressed-space-line-fit',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'mixed-script-space-fit-1660-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'Issue #1660 controls (1773 Word-exported fixed-cell lines: 576 coarse, 595 fine one-twip, 602 hypothesis-targeted) establish U+0020 fitting on lines mixing East Asian and Latin text, which WORD_LATIN_INTERWORD_XAVG_FLOOR (homogeneous Latin lines, unchanged) never compresses. In compatibility modes 12 and 14 with characterSpacingControl compressPunctuation or compressPunctuationAndJapaneseKana, every U+0020 on such a line shrinks by the same amount (single, consecutive and source-run-split spaces alike) while ideographs, kana and other glyphs keep their natural advances; enableOpenTypeFeatures and explicit w:kern thresholds do not gate it, and left, both and distribute alignment behave alike. Each space keeps at least min(xAvgCharWidth / 2, font size / 4) of its own face: Arial and Times New Roman spaces follow half their OS/2 xAvgCharWidth, while BIZ UDGothic, Meiryo and Yu Gothic (xAvgCharWidth 0.84-0.96 em) and BIZ derivatives with only post.isFixedPitch or only the far-east code-page bits changed all stop at a quarter em, rejecting fixed-pitch, code-page and weighted-lowercase-average selectors. A candidate whose last character before trailing closing punctuation is East Asian is admitted only while its natural overflow, measured without that trailing punctuation, is at most half the font size: a final ideograph or half-width kana admits 0.5 em of overflow at 8.5/10.5/16 pt, a final kana followed by a full-width closing parenthesis keeps that limit before the parenthesis (which keeps half its cell at the line end), and a final Latin word has no limit beyond the space floors. characterSpacingControl omitted or doNotCompress and compatibility mode 15 keep natural spaces on mixed lines; lineWrapLikeWord6 ([MS-OE376] §2.1.472) and an omitted compatibility mode are outside the projection. Mode-15 justified mixed lines (Word admits 2.60pt of overflow over four 4.25pt spaces but not 2.65pt) are unexplained and keep natural fitting. No control contains U+3000, whose line-end hanging (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) this observation does not define, so a paragraph holding U+3000 keeps the unchanged line breaker. Two measured inputs the renderer does not reproduce also keep it, paragraph-wide and read on the joined text: §17.3.1.2-3 automatic spacing enabled beside an ideograph or kana (Word adds 2.125pt between it and a Latin letter or digit; the renderer has no autospace), and a compressible closing mark directly followed by U+0020 (Word keeps the full cell; the renderer compresses it under WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL).',
+});
+
+/** Document gate of {@link WORD_COMPRESSED_SPACE_LINE_FIT}: an authored
+ * compatibility mode below 15 (12 and 14 measured) with a compressing
+ * characterSpacingControl. The line breaker further restricts it to lines
+ * holding East Asian text. */
+export function wordCompressedSpaceLineFitApplies(
+  compatibilityMode: number | undefined,
+  characterSpacingControl: string | undefined,
+): boolean {
+  return compatibilityMode !== undefined && compatibilityMode < 15
+    && (characterSpacingControl === 'compressPunctuation'
+      || characterSpacingControl === 'compressPunctuationAndJapaneseKana');
+}
+
+/** Per-space minimum advance of {@link WORD_COMPRESSED_SPACE_LINE_FIT} and
+ * {@link WORD_LATIN_INTERWORD_XAVG_FLOOR}, in the caller's unit. */
+export function wordCompressedSpaceFloor(fontSize: number, averageWidthRatio: number): number {
+  return Math.min((fontSize * averageWidthRatio) / 2, fontSize / 4);
+}
+
+/** Natural-overflow limit of {@link WORD_COMPRESSED_SPACE_LINE_FIT} for a
+ * candidate ending (before trailing closing punctuation) in an East Asian
+ * character; undefined means no limit beyond the space floors. */
+export function wordCompressedSpaceEastAsianOverflowLimit(
+  lastCharacterIsEastAsian: boolean,
+  fontSize: number,
+): number | undefined {
+  return lastCharacterIsEastAsian ? fontSize / 2 : undefined;
+}
+
 export const WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE = defineCompatibilityRule({
   id: 'word-ideographic-space-line-end-allowance',
   evidence: {

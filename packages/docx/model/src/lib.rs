@@ -983,6 +983,21 @@ pub struct DocParagraph {
     /// ECMA-376 §17.3.1.21 `w:overflowPunct` — permit one punctuation
     /// character beyond paragraph extents. Omission defaults to true.
     pub overflow_punct: bool,
+    /// ECMA-376 §17.3.1.2 `w:autoSpaceDE` resolved through the style cascade:
+    /// `Some(false)` when disabled; omitted (`None`) means the spec default, on.
+    #[serde(
+        rename = "autoSpaceDE",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub auto_space_de: Option<bool>,
+    /// ECMA-376 §17.3.1.3 `w:autoSpaceDN`, with the same encoding.
+    #[serde(
+        rename = "autoSpaceDN",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub auto_space_dn: Option<bool>,
     /// ECMA-376 §17.3.1.1 `w:adjustRightInd` — permit automatic right-indent
     /// adjustment when a document grid is active. The style-hierarchy default
     /// is true; true is omitted from JSON and the TypeScript model therefore
