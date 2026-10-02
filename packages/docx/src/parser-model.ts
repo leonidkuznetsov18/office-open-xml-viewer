@@ -1536,6 +1536,9 @@ export function paragraphAcquisitionInput(
       const internal = run as Partial<InternalMathRun>;
       return Object.freeze({
         type: 'math',
+        // §17.13.5 revision containers also wrap OMML. Resource acquisition
+        // must preserve omission/markup ownership independently of math content.
+        ...(run.revision ? { revision: Object.freeze({ ...run.revision }) } : {}),
         display: run.display,
         fontSize: run.fontSize,
         ...(run.jc === undefined ? {} : { jc: run.jc }),

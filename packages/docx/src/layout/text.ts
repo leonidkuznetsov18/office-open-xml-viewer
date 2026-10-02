@@ -165,6 +165,7 @@ export type ParagraphTextBearingRun =
 
 export type ParagraphMathRun = Readonly<{
   type: 'math';
+  revision?: DeepReadonly<DocRun['revision']>;
   display: boolean;
   fontSize: number;
   jc?: string;
