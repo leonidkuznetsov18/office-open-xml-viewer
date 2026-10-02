@@ -6,31 +6,14 @@
  * Unsupported mechanisms and budget exits remain unknown. No font bytes,
  * lookup graph or glyph arrays survive this bounded parse.
  */
-export interface FontSupportFacts {
-  readonly schema: 'ot-definedness-1';
-  readonly glyphCount: number | undefined;
-  readonly nonzeroPreserved: boolean | undefined;
-  readonly missingIsolated: boolean | undefined;
-  readonly noErasure?: boolean;
-  readonly anyIndic3ScriptPresent?: boolean;
-  readonly gsubLookupCount?: number;
-  /** Unicode presence whose default glyph cannot reach any deletion, intersected
-   * over all eligible cmaps. Unsafe is unknown, never known absence. */
-  readonly erasureSafeRanges?: readonly (readonly [number, number])[];
-  readonly gsubDisposition?: 'identity' | 'active-open-type' | 'profile-inactive-major';
-  readonly profile?: 'canonical-static-v1';
-  readonly reason?: 'glyph-domain' | 'unsupported' | 'malformed' | 'budget' | 'cycle';
-}
-export type FontTable = Readonly<{ offset: number; length: number }>;
-const facts = new WeakMap<object, FontSupportFacts>();
+import type { FontSupportFacts, FontTable } from './font-support-registry.js';
+export type { FontSupportFacts, FontTable } from './font-support-registry.js';
+export { fontSupportFacts, retainFontSupportFacts } from './font-support-registry.js';
+import { readFontGlyphCount } from './font-glyph-domain.js';
 const erasureGlyphs = new WeakMap<FontSupportFacts, ReadonlySet<number>>();
 /** Consume transient glyph-domain analysis before retaining parser facts. */
 export function takeFontErasureGlyphs(value: FontSupportFacts): ReadonlySet<number> | undefined {
   const glyphs = erasureGlyphs.get(value); erasureGlyphs.delete(value); return glyphs;
-}
-export function retainFontSupportFacts(owner: object, value: FontSupportFacts): void { facts.set(owner, value); }
-export function fontSupportFacts(owner: object | undefined): FontSupportFacts | undefined {
-  return owner ? facts.get(owner) : undefined;
 }
 const tag = (value: string) => [...value].reduce((n, c) => (n * 256 + c.charCodeAt(0)) >>> 0, 0);
 // The admitted domain D=[0,numGlyphs) comes from validated maxp/cmap.
@@ -129,11 +112,7 @@ export function parseFontSupportFacts(view: DataView, tables: ReadonlyMap<number
     return result;
   };
   try {
-    const maxp = tables.get(tag('maxp'));
-    if (!maxp || maxp.length < 6) stop('glyph-domain');
-    const version = u32(maxp as FontTable, (maxp as FontTable).offset);
-    if (version !== 0x00005000 && version !== 0x00010000) stop('glyph-domain');
-    glyphCount = u16(maxp as FontTable, (maxp as FontTable).offset + 4);
+    glyphCount = readFontGlyphCount(view, tables);
     if (!glyphCount) stop('glyph-domain');
     if (tables.has(tag('morx')) || tables.has(tag('mort')) || tables.has(tag('fvar'))) stop('unsupported');
     let zeroClass = 0;

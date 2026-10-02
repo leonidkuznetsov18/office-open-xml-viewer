@@ -3,7 +3,7 @@ import { canonicalCombiningClass } from './canonical-combining-class.js';
 import { CANONICAL_UNICODE_VERSION } from './canonical-font-data.js';
 import { canonicalComposition, canonicalDecomposition, canonicalFontClusterText, canonicalOrder,
   canonicalUnicodeAssigned, canonicalUnicodeIgnorable, canonicalUnicodeMark } from './canonical-font-text.js';
-import { fontSupportFacts, type FontSupportFacts } from './font-support-facts.js';
+import { fontSupportFacts, type FontSupportFacts } from './font-support-registry.js';
 export { canonicalFontClusterText, fontSupportFacts };
 export type { FontSupportFacts };
 

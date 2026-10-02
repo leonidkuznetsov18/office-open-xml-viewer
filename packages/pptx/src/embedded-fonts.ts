@@ -1,6 +1,6 @@
-import { fontSupportFacts, type FontSupportFacts } from '@silurus/ooxml-core/internal/font-cluster-coverage';
+import { parseOpenTypeResourceWithSupport } from '@silurus/ooxml-core/internal/open-type-resource-support';
+import { fontSupportFacts, type FontSupportFacts } from '@silurus/ooxml-core/internal/font-support-registry';
 import {
-  parseOpenTypeResourceMetrics,
   registerEmbeddedFonts,
   unregisterEmbeddedFonts,
   type EmbeddedFontFace,
@@ -101,7 +101,7 @@ export async function loadEmbeddedFonts(
     const loadable = faces.filter((face): face is EmbeddedFontFace => face !== null);
     if (loadable.length === 0) continue;
     const registrations = await Promise.all(loadable.map(async (resource) => {
-      const tables = parseOpenTypeResourceMetrics(resource.bytes);
+      const tables = parseOpenTypeResourceWithSupport(resource.bytes);
       const metrics = tables ? powerPointResourceFaceMetrics(tables) : undefined;
       // Register separately to retain the input-resource → FontFace binding
       // even when a sibling fails. Calls add synchronously in input order;

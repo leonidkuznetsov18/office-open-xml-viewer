@@ -69,6 +69,11 @@
     "./internal/scroll-load-controller": "./src/internal/scroll-load-controller.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
+    "./internal/font-support-registry": "./src/internal/font-support-registry.ts",
+    "./internal/open-type-resource-support": "./src/internal/open-type-resource-support.ts",
+    "./internal/reference-font-metrics": "./src/fonts/reference-font-metrics.ts",
+    "./internal/reference-font-identity": "./src/fonts/reference-font-identity.ts",
+    "./internal/font-data-codec": "./src/internal/font-data-codec.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"
   },
   "scripts": {

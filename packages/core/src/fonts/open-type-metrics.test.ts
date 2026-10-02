@@ -1,8 +1,15 @@
 import { withGlyphDomain } from '../test-fixtures/sfnt-table.js';
 import { describe, expect, it } from 'vitest';
 import { parseOpenTypeLineMetrics, parseOpenTypeResourceMetrics as parseResourceMetrics, openTypeResourceCoversCodePoint } from './open-type-metrics.js';
+import { fontSupportFacts } from '../internal/font-support-facts.js';
 
 function parseOpenTypeResourceMetrics(bytes: Uint8Array) { return parseResourceMetrics(withGlyphDomain(bytes)); }
+
+it('keeps metric-only resource parsing independent of shaping certificates', () => {
+  const parsed = parseOpenTypeResourceMetrics(syntheticSfntWithCmapFormat(12));
+  expect(openTypeResourceCoversCodePoint(parsed ?? undefined, 0x56fd)).toBe(true);
+  expect(fontSupportFacts(parsed ?? undefined)).toBeUndefined();
+});
 
 function syntheticSfnt(baseOffset = 0, eastAsianCmap = false): Uint8Array {
   const tableCount = eastAsianCmap ? 4 : 3;

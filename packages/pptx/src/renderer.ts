@@ -1,3 +1,4 @@
+import { emptyEastAsianDrawingFace } from './east-asian-drawing-face.js';
 import type { PptxEmbeddedFontMetrics } from './embedded-fonts.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import { openTypeResourceCoversCodePoint } from '@silurus/ooxml-core';
@@ -175,7 +176,7 @@ import { drawEaVertRun } from './vertical-text.js';
 import { renderStackedText, type StackedParagraphInput } from './stacked-text.js';
 import {
   COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
-  emptyEastAsianDrawingFace, emptyEastAsianSlotFaces,
+  emptyEastAsianSlotFaces,
 } from './east-asian-default.js';
 import { powerPointDisplayCluster, powerPointFontRouting } from './font-slot-compatibility.js';
 import {

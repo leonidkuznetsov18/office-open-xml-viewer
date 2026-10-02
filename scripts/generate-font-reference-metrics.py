@@ -264,6 +264,76 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
     return profile
 
 
+def packed_ranges(ranges: Iterable[int]) -> str:
+    """Lossless unsigned varint (gap, length) pairs; no repertoire reduction."""
+    packed = bytearray()
+    previous = -1
+    def append(value: int) -> None:
+        while value >= 128:
+            packed.append((value & 127) | 128)
+            value >>= 7
+        packed.append(value)
+    values = list(ranges)
+    for lo, hi in zip(values[::2], values[1::2]):
+        append(lo - previous - 1)
+        append(hi - lo)
+        previous = hi
+    return base64.b64encode(packed).decode("ascii")
+
+
+def split_catalogue(profiles: list[dict[str, Any]], coverages: dict[str, Any], routes: Any) -> tuple[dict, dict, dict]:
+    """Preserve physical row order even when projected metrics become equal.
+
+    Only PPTX rendering owns per-cut support; shared metrics and parse/preload
+    routing must not import it. A generated identity binds every companion.
+    Empty, false, missing and unknown remain distinct in fixed tuples.
+    """
+    resource_fields = {"symbolCoverage", "symbolPossibleCoverage", "cjkCoverage", "cjkPossibleCoverage", "supportFacts", "cjkUnifiedIdeographs"}
+    metrics = [{k: v for k, v in p.items() if k not in resource_fields} for p in profiles]
+    generation = hashlib.sha256(json.dumps(profiles, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    templates, template_ids, erasures, erasure_ids, rows = [], {}, [], {}, []
+    ternary = lambda value: 0 if value is None else 2 if value else 1
+    dispositions = [None, "identity", "active-open-type", "profile-inactive-major"]
+    reasons = [None, "glyph-domain", "unsupported", "malformed", "budget", "cycle"]
+    for profile in profiles:
+        support = profile.get("supportFacts")
+        template_id = None
+        if support is not None:
+            erased = support.get("erasureSafeRanges")
+            erasure_id = None
+            if erased is not None:
+                packed = packed_ranges(n for pair in erased for n in pair)
+                if packed not in erasure_ids:
+                    erasure_ids[packed] = len(erasures); erasures.append(packed)
+                erasure_id = erasure_ids[packed]
+            template = [ternary(support.get(k)) for k in ("nonzeroPreserved", "missingIsolated", "noErasure", "anyIndic3ScriptPresent")]
+            template += [support.get("gsubLookupCount"), dispositions.index(support.get("gsubDisposition")), reasons.index(support.get("reason")), erasure_id, int(support.get("profile") is not None)]
+            key = tuple(template)
+            if key not in template_ids:
+                template_ids[key] = len(templates); templates.append(template)
+            template_id = template_ids[key]
+        rows.append([profile.get(k) for k in ("symbolCoverage", "symbolPossibleCoverage", "cjkCoverage", "cjkPossibleCoverage")]
+                    + [template_id, support.get("glyphCount") if support else None, ternary(profile.get("cjkUnifiedIdeographs"))])
+    # Six unsigned 16-bit fields plus one ternary byte per physical row.
+    # Index zero denotes missing; actual glyph counts stay unshifted. Fixed
+    # records avoid per-row emitted JavaScript syntax without changing identity.
+    encoded_rows = bytearray()
+    for row in rows:
+        for index, value in enumerate(row[:6]):
+            encoded = 0 if value is None else value + (index < 5)
+            if not 0 <= encoded <= 65535:
+                raise ValueError("catalogue field exceeds fixed record domain")
+            encoded_rows.extend(encoded.to_bytes(2, "big"))
+        encoded_rows.append(row[6])
+    identity = {"schemaVersion": 1, "generation": generation}
+    return ({**identity, "profiles": metrics},
+            {**identity, "supportSchema": "ot-definedness-1", "supportProfile": "canonical-static-v1", "unicode": "17.0.0",
+             "symbolCoverageRanges": SYMBOL_COVERAGE_RANGES, "cjkCoverageRanges": CJK_COVERAGE_RANGES,
+             "symbolCoverages": [packed_ranges(r) for r in coverages["symbolCoverages"]], "cjkCoverages": coverages["cjkCoverages"],
+             "templates": templates, "erasureRanges": erasures, "rowCount": len(rows), "rowsEncoded": base64.b64encode(encoded_rows).decode("ascii")},
+            {**identity, "routes": routes})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--office-root", type=Path, default=OFFICE_ROOT)
@@ -271,6 +341,8 @@ def main() -> None:
     parser.add_argument("--macos-primary-root", type=Path, default=MACOS_PRIMARY_ROOT)
     parser.add_argument("--data-output", type=Path, default=DATA_OUTPUT)
     parser.add_argument("--provenance-output", type=Path, default=PROVENANCE_OUTPUT)
+    parser.add_argument("--resource-output", type=Path, default=Path("packages/pptx/src/font-resource-catalogue-data.json"))
+    parser.add_argument("--route-output", type=Path, default=Path("packages/pptx/src/font-route-data.json"))
     args = parser.parse_args()
 
     office_version = read_plist_version(args.office_root.parent / "Info.plist", ("CFBundleShortVersionString", "CFBundleVersion"))
@@ -336,9 +408,6 @@ def main() -> None:
                 else:
                     fonts[0].close()
 
-    support_process.stdin.close()
-    if support_process.wait() != 0:
-        raise RuntimeError('Font support certificate generation failed')
     source_order = {source.id: index for index, source in enumerate(sources)}
     profiles = sorted(
         profiles_by_canonical.values(),
@@ -363,15 +432,14 @@ def main() -> None:
                 profile[k] = None if coverage is None else coverage_ids[tuple(coverage)]
         coverages[field + "s"] = ([packed_cjk_bitmap(r) for r in repertoires]
                                    if field == "cjkCoverage" else repertoires)
-    data = {
-        "schemaVersion": 4,
-        "supportAnalysisSchema": "ot-definedness-1",
-        "notice": "Reference metrics are not proof of the face selected by Canvas, macOS, or Office.",
-        "symbolCoverageRanges": SYMBOL_COVERAGE_RANGES,
-        "cjkCoverageRanges": CJK_COVERAGE_RANGES,
-        **coverages,
-        "profiles": profiles,
-    }
+    # The same JavaScript alias/source reducer serves generation and tests.
+    support_process.stdin.write(json.dumps({"profiles": profiles}) + "\n")
+    support_process.stdin.flush()
+    routes = json.loads(support_process.stdout.readline())
+    support_process.stdin.close()
+    if support_process.wait() != 0:
+        raise RuntimeError('Font support certificate generation failed')
+    data, resources, routing = split_catalogue(profiles, coverages, routes)
     manifest = {
         "schemaVersion": 2,
         "notice": "Development provenance only; this file is not imported by the runtime metrics lookup.",
@@ -381,7 +449,9 @@ def main() -> None:
     }
     args.data_output.parent.mkdir(parents=True, exist_ok=True)
     args.provenance_output.parent.mkdir(parents=True, exist_ok=True)
-    args.data_output.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
+    for output, payload in [(args.data_output, data), (args.resource_output, resources), (args.route_output, routing)]:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
     args.provenance_output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
 
 

@@ -1,5 +1,5 @@
-import { powerPointSymbolCoverage, powerPointCjkCoverage } from './powerpoint-line-metrics.js';
-import { classifyCjkFont, findReferenceFontMetrics, isReferenceSymbolCodePoint } from '@silurus/ooxml-core';
+import { classifyCjkFont } from '@silurus/ooxml-core';
+import { referenceFontRoute } from './font-route.js';
 import {
   EAST_ASIAN_SLOT_RANGES,
   MICROSOFT_JHENGHEI_RANGES,
@@ -135,35 +135,14 @@ function covers(face: string, text: string): boolean {
   return true;
 }
 
-function profilesOf(face: string) {
-  const office = findReferenceFontMetrics(face, { source: 'office-mac' });
-  return office.length > 0 ? office : findReferenceFontMetrics(face);
-}
-
-/** True when the installed face declares an OS/2 Far-East code page. */
-export function isEastAsianFace(face: string): boolean {
-  return profilesOf(face).some((p) => p.farEastCodePage === true);
-}
-
-/** PANOSE serif class of the installed face; unknown faces are sans. Serif
- * styles 1-10 are serif (#1627: 2-10; #1689: SimSun-ExtB's 1 "no fit" took
- * MS Mincho), 11-15 sans. Style 0 ("any") and non-Latin-text family kinds are
- * unmeasured and keep the unknown-face (sans) default. */
-export function isSerifLatinFace(face: string): boolean {
-  return profilesOf(face).some((p) => {
-    const panose = p.panose;
-    return !!panose && panose[0] === 2 && panose[1] >= 1 && panose[1] <= 10;
-  });
-}
-
-/** Whether the installed face maps basic CJK (a CJK Unified Ideograph in its
- * cmap). This existing family-level fallback classification is separate from
- * selected-cut ownership. Per-cut presence/possible facts require all-map
- * agreement; unreadable/disagreeing cuts cannot establish known absence. */
+/** Shared preflight/render routing reads the compact exhaustive projection,
+ * not full metric profiles, per-cut cmaps or shaping certificates. It preserves
+ * the former Office-first alias/source aggregation and unknown-name defaults. */
+export function isEastAsianFace(face: string): boolean { return !!(referenceFontRoute(face) & 1); }
+export function isSerifLatinFace(face: string): boolean { return !!(referenceFontRoute(face) & 2); }
 export function coversCjkIdeographs(face: string): boolean | undefined {
-  const profiles = profilesOf(face);
-  if (profiles.some((p) => p.cjkUnifiedIdeographs === true)) return true;
-  return profiles.length > 0 && profiles.every((p) => p.cjkUnifiedIdeographs === false) ? false : undefined;
+  const cjk = referenceFontRoute(face) >> 2;
+  return cjk === 0 ? undefined : cjk === 2;
 }
 
 const CJK_CLASS_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Bopomofo}\u3000-\u303F\uFF00-\uFFEF]/u;
@@ -213,48 +192,4 @@ export function emptyEastAsianSlotFaces(selectedFace: string | null, text: strin
   for (const face of EAST_ASIAN_SYMBOL_FALLBACK_FACES) add(face);
   for (const face of eastAsianDefaultFaces(selectedFace, text)) add(face);
   return faces;
-}
-
-/**
- * The face that draws one East Asian-slot glyph of an empty-slot run, when
- * the renderer can know it; null when only the platform's glyph fallback can
- * (decision B, and owner decision (c): the browser does not report which
- * installed face draws a fallback glyph).
- *
- * - A recorded symbol belongs to the first face in the painting stack whose
- *   real/synthetic cut's cmap covers it. Stop at unknown coverage: that face
- *   might draw it. Missing symbols continue through Calibri, Cambria Math and
- *   the CJK faces, just as painting does. The catalogue's Cambria Math lacks
- *   U+25C6 although the #1689 PDF resource drew it; no cmap presence is invented
- *   to emulate that different resource. Unrecorded scalars keep the existing
- *   selected-face model. This is font-data routing, not a new Office heuristic.
- * - CJK uses the same per-glyph rule, including S and the symbol faces
- *   before the CJK tiers. An OS/2 Far-East code page or some basic Han in
- *   a family's cmap selects a fallback chain; neither proves that this cut
- *   paints a particular glyph. Unknown earlier coverage stops attribution
- *   (decision c), and a missing glyph after decision B's first fallback
- *   remains unknown. This changes attribution only, not the painting stack.
- */
-export function emptyEastAsianDrawingFace(
-  selectedFace: string | null,
-  cjkFaces: readonly string[],
-  ch: string,
-  bold = false,
-  italic = false,
-  symbolCoverage = powerPointSymbolCoverage,
-  cjkCoverage = powerPointCjkCoverage,
-): string | null {
-  const cp = ch.codePointAt(0) ?? 0;
-  const cjk = isCjkFallbackGlyph(ch);
-  // Coverage outside the symbol sweep is unknown for every resource. Keep
-  // the previous model there; CJK outside its catalogue domain stays unknown.
-  if (!cjk && !isReferenceSymbolCodePoint(cp)) return selectedFace;
-  const coverageFor = cjk ? cjkCoverage : symbolCoverage;
-  for (const face of [selectedFace, ...EAST_ASIAN_SYMBOL_FALLBACK_FACES, ...cjkFaces]) {
-    if (!face) continue;
-    const coverage = coverageFor(face, bold, italic, cp);
-    if (coverage === undefined) return null;
-    if (coverage) return face;
-  }
-  return null;
 }

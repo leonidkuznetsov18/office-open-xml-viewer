@@ -1,4 +1,5 @@
-import { parseFontSupportFacts, retainFontSupportFacts, takeFontErasureGlyphs } from '../internal/font-support-facts.js';
+import { readFontGlyphCount } from '../internal/font-glyph-domain.js';
+import type { FontTable } from '../internal/font-support-registry.js';
 /** Raw line metrics read from one OpenType face. Values remain in design units;
  * format consumers decide which table and compatibility rule governs layout. */
 export interface OpenTypeLineMetrics {
@@ -476,10 +477,16 @@ export function parseOpenTypeResourceMetrics(
   return readOpenTypeLineMetrics(bytes, faceIndex, true);
 }
 
-function readOpenTypeLineMetrics(
+/** Internal synchronous extension point: only the resource-support owner
+ * supplies an audit. The public metric/cmap parsers have no GSUB dependency.
+ * Transient view/table access never escapes the call or enters a global hook. */
+export function readOpenTypeLineMetrics(
   bytes: Uint8Array,
   faceIndex: number | undefined,
   resourceCoverage: boolean,
+  analyze?: (view: DataView, tables: ReadonlyMap<number, FontTable>,
+    safeCoverage: (erasing: ReadonlySet<number>) => readonly (readonly [number, number])[] | undefined)
+    => (owner: OpenTypeLineMetrics) => void,
 ): OpenTypeLineMetrics | null {
   if ((faceIndex !== undefined && (!Number.isSafeInteger(faceIndex) || faceIndex < 0))
     || bytes.byteLength < 12) return null;
@@ -537,14 +544,13 @@ function readOpenTypeLineMetrics(
   const hasWindowsMetrics = os2 !== undefined && os2.length >= 78;
   const hasCodePageRanges = os2 !== undefined && os2.length >= 86
     && view.getUint16(os2.offset) >= 1;
-  let support = resourceCoverage ? parseFontSupportFacts(view, tables) : undefined;
-  const coverage = resourceCoverage ? cmapUnicodeCoverage(view, tables.get(CMAP), support?.glyphCount) : undefined;
+  const glyphCount = resourceCoverage ? readFontGlyphCount(view, tables) : undefined;
+  const coverage = resourceCoverage ? cmapUnicodeCoverage(view, tables.get(CMAP), glyphCount) : undefined;
   const unicodeRanges = coverage?.unicodeRanges;
-  const erasing = support && takeFontErasureGlyphs(support);
-  if (support && erasing) {
-    const safe = cmapUnicodeCoverage(view, tables.get(CMAP), support.glyphCount, erasing);
-    support = Object.freeze({ ...support, erasureSafeRanges: safe.unicodePossibleRanges ? safe.unicodeRanges : undefined });
-  }
+  const attach = analyze?.(view, tables, erasing => {
+    const safe = cmapUnicodeCoverage(view, tables.get(CMAP), glyphCount, erasing);
+    return safe.unicodePossibleRanges ? safe.unicodeRanges : undefined;
+  });
   const result = Object.freeze({
     unitsPerEm,
     ...(averageCharWidth > 0
@@ -569,6 +575,6 @@ function readOpenTypeLineMetrics(
       useTypoMetrics: (view.getUint16(os2.offset + 62) & 0x0080) !== 0,
     } : {}),
   });
-  if (support) retainFontSupportFacts(result, support);
+  attach?.(result);
   return result;
 }

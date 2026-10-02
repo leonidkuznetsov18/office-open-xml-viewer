@@ -1,5 +1,6 @@
-import { analyzeFontResourceSupport, fontSupportFacts, type ResourceSupport } from '@silurus/ooxml-core/internal/font-cluster-coverage';
-import { findReferenceFontMetrics, referenceFontCoversSymbol, referenceFontCoversCjk, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
+import { referenceFontCoversSymbol, referenceFontCoversCjk, referenceFontSupportFacts } from './font-resource-catalogue.js';
+import { analyzeFontResourceSupport, type ResourceSupport } from '@silurus/ooxml-core/internal/font-cluster-coverage';
+import { findReferenceFontMetrics, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 
 /**
@@ -140,7 +141,7 @@ export function powerPointCatalogueSupport(
   if (!profiles.length) return { kind: 'unknown', reason: 'font-transform' };
   let result: ResourceSupport | undefined;
   for (const profile of profiles) {
-    const support = analyzeFontResourceSupport(display, (cp) => coverage(family, bold, italic, cp), fontSupportFacts(profile));
+    const support = analyzeFontResourceSupport(display, (cp) => coverage(family, bold, italic, cp), referenceFontSupportFacts(profile));
     if (support.kind === 'unknown' || (result && result.kind !== support.kind)) return { kind: 'unknown', reason: 'font-transform' };
     result = support;
   }
