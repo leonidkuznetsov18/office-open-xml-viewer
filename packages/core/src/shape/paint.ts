@@ -2,7 +2,7 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolvePathShade, pathShadeFocusRect, type FillOutline, type ShadeBox } from './path-gradient';
+import { resolvePathShade, pathShadeFocusRect, hasInvertedPathShadeFocus, type FillOutline, type ShadeBox } from './path-gradient';
 import { hostStrokeBounds, paintPathSource } from './paint-bounds';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
@@ -45,7 +45,8 @@ function tiledGradient(
   // [MS-OE376] §2.1.1377(b): both path types keep the focus relative
   // to the shape box. Export point controls cannot establish live tile flips;
   // retain the previous authored-flip policy pending live area controls.
-  const pathShade = fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape');
+  const pathShade = fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')
+    && !hasInvertedPathShadeFocus(fill);
   let basePaint: string | CanvasGradient | CanvasPattern | null;
   if (pathShade) {
     const box = pathShadeFocusRect(fill);
@@ -57,16 +58,10 @@ function tiledGradient(
     basePaint = resolvePathShade(tileFill, baseCtx as CanvasRenderingContext2D, baseBox, baseBox,
       fill.path === 'shape' ? outline : undefined, focus);
     if (!basePaint) {
-      // Keep main's circle/midpoint fallback; its authored focus still belongs
-      // to the host shape, like the supported rect/shape path (§2.1.1377 b).
-      const authored = fill.fillToRect;
-      const left = ((authored?.l ?? 0) * w + x - tileX) / tileW;
-      const top = ((authored?.t ?? 0) * h + y - tileY) / tileH;
-      const width = w * (1 - (authored?.l ?? 0) - (authored?.r ?? 0)) / tileW;
-      const height = h * (1 - (authored?.t ?? 0) - (authored?.b ?? 0)) / tileH;
-      basePaint = resolveFill({ ...tileFill, path: 'circle', fillToRect: {
-        l: left, t: top, r: 1 - left - width, b: 1 - top - height,
-      } }, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg);
+      // Raster rejection (resource/allocation or unsupported geometry) keeps
+      // the previous tile-local native approximation byte-for-byte. The
+      // shape-relative focus correction applies only to supported raster paths.
+      basePaint = nativeRadialFill(tileFill, baseCtx as CanvasRenderingContext2D, baseBox);
     }
   } else {
     basePaint = resolveFill(
@@ -109,6 +104,31 @@ function tiledGradient(
     f: tileY,
   });
   return pattern;
+}
+
+/** Compatibility fallback, deliberately identical to the previous native
+ * radial resolver: authored midpoint and max-axis radius for rect, diagonal
+ * radius for circle/shape. Resource/allocation rejection must preserve these
+ * bytes rather than recursively changing the authored path type.
+ * ECMA-376 §20.1.8.31 defines the center-shade rectangle. Native Canvas has
+ * only a point focus, so this approximation uses its authored midpoint.
+ * Concentric PowerPoint PDF exports do not establish a general live circle
+ * focus rule; retain the previous local-frame reading pending evidence. */
+function nativeRadialFill(fill: GradientFill, ctx: CanvasRenderingContext2D, box: ShadeBox): CanvasGradient {
+  const focus = fill.fillToRect;
+  const focusX = box.x + box.w * (focus?.l ?? 0);
+  const focusY = box.y + box.h * (focus?.t ?? 0);
+  const focusW = box.w * (1 - (focus?.l ?? 0) - (focus?.r ?? 0));
+  const focusH = box.h * (1 - (focus?.t ?? 0) - (focus?.b ?? 0));
+  const cx = focusX + focusW / 2; const cy = focusY + focusH / 2;
+  const rx = Math.max(Math.abs(cx - box.x), Math.abs(box.x + box.w - cx));
+  const ry = Math.max(Math.abs(cy - box.y), Math.abs(box.y + box.h - cy));
+  const radius = fill.path === 'rect' ? Math.max(rx, ry) : Math.sqrt(rx * rx + ry * ry);
+  const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(radius, 1e-9));
+  for (const stop of fill.stops) {
+    gradient.addColorStop(Math.min(1, Math.max(0, stop.position)), hexToRgba(stop.color));
+  }
+  return gradient;
 }
 
 /**
@@ -226,30 +246,15 @@ export function resolveFill(
     if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
       // Canvas has no shape-following shade; resolvePathShade rasterizes it.
       // Unsupported topology, resource limits and allocation-unavailable
-      // hosts retain main's native circle approximation. Its midpoint focus
+      // hosts retain main's path-specific native approximation. Its midpoint focus
       // is unchanged: the Office fallback classifier is outside this feature.
       return resolvePathShade(
         fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, { x, y, w, h }, outline,
         undefined, paintBounds ?? hostStrokeBounds(ctx, { x, y, w, h }),
-      ) ?? resolveFill({ ...fill, path: 'circle' }, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
+      ) ?? nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
     }
     if (fill.gradType === 'radial') {
-      // §20.1.8.31: fillToRect is the center-shade (focus) rectangle inside
-      // the gradient tile. Canvas has a point focus rather than a rectangular
-      // focus, so use its authored centre. PowerPoint's PDF export emits every
-      // circle shade concentric, even for corner presets, so its controls do
-      // not establish Office's circle focus; this ECMA reading is retained.
-      const focus = fill.fillToRect;
-      const focusX = tileX + tileW * (focus?.l ?? 0);
-      const focusY = tileY + tileH * (focus?.t ?? 0);
-      const focusW = tileW * (1 - (focus?.l ?? 0) - (focus?.r ?? 0));
-      const focusH = tileH * (1 - (focus?.t ?? 0) - (focus?.b ?? 0));
-      const cx = focusX + focusW / 2;
-      const cy = focusY + focusH / 2;
-      const rx = Math.max(Math.abs(cx - tileX), Math.abs(tileX + tileW - cx));
-      const ry = Math.max(Math.abs(cy - tileY), Math.abs(tileY + tileH - cy));
-      const r = Math.sqrt(rx * rx + ry * ry);
-      gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(r, 1e-9));
+      return nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
     } else {
       const authoredAngle = fill.rotWithShape === false
         ? fill.angle - shapeRotationDeg

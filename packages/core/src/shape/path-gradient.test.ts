@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { flattenFillOutline, isStrictlyStarShaped, pathShadeFocus, pathShadeFocusRect } from './path-gradient';
+import { flattenFillOutline, isStrictlyStarShaped, pathShadeFocusRect } from './path-gradient';
 import type { GradientFill } from '../types/common';
 
 const box = { x: 0, y: 0, w: 100, h: 100 };
@@ -7,19 +7,8 @@ const fill = (fillToRect?: GradientFill['fillToRect']): GradientFill =>
   ({ fillType: 'gradient', gradType: 'radial', path: 'shape', angle: 0, stops: [], fillToRect });
 const stub = {} as CanvasRenderingContext2D;
 
-describe('path shade focus', () => {
-  it('is the fixed point of the frame→fillToRect mapping', () => {
-    expect(pathShadeFocus(fill())).toEqual([.5, .5]);
-    expect(pathShadeFocus(fill({ l: 0, t: 0, r: 0, b: 0 }))).toEqual([0, 0]);
-    expect(pathShadeFocus(fill({ l: .2, t: 0, r: 0, b: 0 }))).toEqual([1, 0]);
-    expect(pathShadeFocus(fill({ l: .25, t: .25, r: .75, b: .75 }))).toEqual([.25, .25]);
-    const [x, y] = pathShadeFocus(fill({ l: .2, t: .25, r: .4, b: .25 }));
-    expect(x).toBeCloseTo(1 / 3); expect(y).toBeCloseTo(.5);
-  });
-});
-
 describe('path shade focus rectangle', () => {
-  it('is the inset fillToRect area, or its fixed point when degenerate', () => {
+  it('retains the authored inset area and degenerate axes', () => {
     expect(pathShadeFocusRect(fill())).toEqual({ origin: [.5, .5], size: [0, 0] });
     expect(pathShadeFocusRect(fill({ l: 0, t: 0, r: 0, b: 0 }))).toEqual({ origin: [0, 0], size: [1, 1] });
     const area = pathShadeFocusRect(fill({ l: .2, t: .5, r: .2, b: .5 }));

@@ -183,33 +183,24 @@ export function isStrictlyStarShaped(polygons: Point[][], center: Point, box: Sh
   return sign !== 0 && Math.abs(Math.abs(turning) - Math.PI * 2) < 1e-6;
 }
 
-/** Fixed point of the frame→fillToRect scaling, normalized to the frame:
- * l/(l+r), t/(t+b). Omitted fillToRect centers it; the identity mapping (all
- * zero) has no fixed point and uses the frame origin. */
-export function pathShadeFocus(fill: GradientFill): Point {
+/** Crossed focus edges are outside the measured area/segment/point model.
+ * ECMA-376 §20.1.8.31 and [MS-OE376] §2.1.1377 define offsets and inscribed
+ * regions, but do not determine a replacement region for negative extents.
+ * Preserve the previous native midpoint approximation for this input class;
+ * choosing a collapse point requires new Office boundary evidence (#1599). */
+export function hasInvertedPathShadeFocus(fill: GradientFill): boolean {
   const rect = fill.fillToRect;
-  if (!rect) return [0.5, 0.5];
-  const axis = (low = 0, high = 0) => {
-    const sum = low + high;
-    return Number.isFinite(sum) && sum !== 0 ? low / sum : 0;
-  };
-  return [axis(rect.l, rect.r), axis(rect.t, rect.b)];
+  return !!rect && ((rect.l ?? 0) + (rect.r ?? 0) > 1 || (rect.t ?? 0) + (rect.b ?? 0) > 1);
 }
 
-/** The focus (center-shade) rectangle normalized to the frame: origin and
- * size. Omitted fillToRect is the frame center point; an inverted axis
- * collapses to its fixed point. */
+/** Authored focus rectangle, normalized to its frame. Keep signed extents:
+ * the raster support gate rejects inversion rather than inventing a collapse.
+ * Omitted fillToRect uses the measured frame center point. */
 export function pathShadeFocusRect(fill: GradientFill): { origin: Point; size: Point } {
   const rect = fill.fillToRect;
   if (!rect) return { origin: [0.5, 0.5], size: [0, 0] };
-  const [fx, fy] = pathShadeFocus(fill);
-  const axis = (low = 0, high = 0, fixed: number): [number, number] => {
-    const size = 1 - low - high;
-    return Number.isFinite(size) && size > 0 ? [low, size] : [fixed, 0];
-  };
-  const [ox, kx] = axis(rect.l, rect.r, fx);
-  const [oy, ky] = axis(rect.t, rect.b, fy);
-  return { origin: [ox, oy], size: [kx, ky] };
+  return { origin: [rect.l ?? 0, rect.t ?? 0],
+    size: [1 - ((rect.l ?? 0) + (rect.r ?? 0)), 1 - ((rect.t ?? 0) + (rect.b ?? 0))] };
 }
 
 const rectangle = (box: ShadeBox): Point[] =>
@@ -380,6 +371,7 @@ export function resolvePathShade(
   paintBounds?: ShadeBox,
   work?: ShadeWork,
 ): CanvasPattern | null {
+  if (hasInvertedPathShadeFocus(fill) || focusOverride?.size.some(size => size < 0)) return null;
   if (![frame, shapeBox].every(box => [box.x, box.y, box.w, box.h].every(Number.isFinite)
     && box.w > 0 && box.h > 0)) return null;
   if (typeof ctx.getTransform !== 'function' || fill.stops.length === 0) return null;

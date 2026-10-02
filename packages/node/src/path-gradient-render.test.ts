@@ -309,22 +309,72 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   }, 20000);
 
-  it('uses the previous native resolver above the explicit edge budget', () => {
-    const contexts = [canvas(64, 64).ctx, canvas(64, 64).ctx];
-    const recipe = { ...fill, path: 'shape' as const, fillToRect: { l: .1, r: .5, t: .4, b: .1 } };
+  it.each(['rect', 'shape'] as const)('preserves main %s fallback bytes for edge limits and unavailable allocation', path => {
     const outline = (target: CanvasRenderingContext2D) => {
       for (let i = 0; i < 32769; i++) {
         const angle = i / 32769 * Math.PI * 2;
-        target[i ? 'lineTo' : 'moveTo'](32 + 32 * Math.cos(angle), 32 + 32 * Math.sin(angle));
+        target[i ? 'lineTo' : 'moveTo'](100 + 100 * Math.cos(angle), 50 + 50 * Math.sin(angle));
       }
       target.closePath();
     };
-    for (const [i, ctx] of contexts.entries()) {
-      ctx.fillStyle = resolveFill({ ...recipe, path: i ? 'circle' : 'shape' }, ctx, 0, 0, 64, 64,
-        0, undefined, undefined, i ? undefined : outline) as CanvasPattern;
-      ctx.fillRect(0, 0, 64, 64);
+    for (const reason of ['edge budget', 'allocation'] as const) for (const tiled of [false, true]) {
+      // Rect tiles shade their box without traversing a supplied outline, so
+      // there is no outline-edge budget to reject in this production path.
+      if (tiled && reason === 'edge budget' && path === 'rect') continue;
+      const actual = canvas(300, 200).ctx; const expected = canvas(300, 200).ctx;
+      for (const ctx of [actual, expected]) { ctx.translate(70, 30); ctx.rotate(.3); }
+      const recipe = { ...fill, path, fillToRect: { l: .1, r: .5, t: .4, b: .1 },
+        tileRect: tiled ? { r: .5 } : undefined };
+      const unavailable = new Proxy(actual, {
+        get(target, key) {
+          if (key === 'canvas') return { constructor: null };
+          const value = Reflect.get(target, key, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      actual.fillStyle = resolveFill(recipe, reason === 'allocation' ? unavailable : actual,
+        0, 0, 200, 100, 0, undefined, undefined, reason === 'edge budget' ? outline : undefined) as CanvasGradient;
+      // Independent native Canvas oracle from main: midpoint (60,65),
+      // farthest axis distances (140,65), rect uses max; shape uses diagonal.
+      // A half-width tile halves x distances. If allocation is unavailable,
+      // main paints the same native field directly instead of repeating it.
+      const reference = tiled && reason === 'edge budget' ? canvas(100, 100).ctx : expected;
+      const cx = tiled ? 30 : 60; const rx = tiled ? 70 : 140;
+      const gradient = reference.createRadialGradient(cx, 65, 0, cx, 65,
+        path === 'rect' ? Math.max(rx, 65) : Math.sqrt(rx ** 2 + 65 ** 2));
+      gradient.addColorStop(0, '#000000'); gradient.addColorStop(.5, '#808080'); gradient.addColorStop(1, '#FFFFFF');
+      reference.fillStyle = gradient;
+      if (reference !== expected) {
+        reference.fillRect(0, 0, 100, 100);
+        expected.fillStyle = expected.createPattern(reference.canvas, 'repeat') as CanvasPattern;
+      }
+      for (const ctx of [actual, expected]) ctx.fillRect(0, 0, 200, 100);
+      expect(actual.getImageData(0, 0, 300, 200).data, JSON.stringify({ reason, tiled }))
+        .toEqual(expected.getImageData(0, 0, 300, 200).data);
     }
-    expect(contexts[0].getImageData(0, 0, 64, 64).data).toEqual(contexts[1].getImageData(0, 0, 64, 64).data);
+  });
+
+  it.each(['rect', 'shape'] as const)('retains main %s midpoint behavior for inverted focus axes, including tiles', path => {
+    for (const focus of [
+      { l: .8, r: .4, t: .2, b: .2 },
+      { l: .8, r: .8, t: .2, b: .2 },
+      { l: .8, r: .4, t: .9, b: .3 },
+    ]) for (const tiled of [false, true]) {
+      const actual = canvas(200, 100).ctx; const expected = canvas(200, 100).ctx;
+      const recipe = { ...fill, path, fillToRect: focus, tileRect: tiled ? { r: .5 } : undefined };
+      paint(recipe, actual, 200, 100);
+      const reference = tiled ? canvas(100, 100).ctx : expected;
+      const width = tiled ? 100 : 200;
+      const cx = width * (1 + focus.l - focus.r) / 2;
+      const cy = 100 * (1 + focus.t - focus.b) / 2;
+      const rx = Math.max(cx, width - cx); const ry = Math.max(cy, 100 - cy);
+      const gradient = reference.createRadialGradient(cx, cy, 0, cx, cy,
+        path === 'rect' ? Math.max(rx, ry) : Math.sqrt(rx * rx + ry * ry));
+      gradient.addColorStop(0, '#000000'); gradient.addColorStop(.5, '#808080'); gradient.addColorStop(1, '#FFFFFF');
+      reference.fillStyle = gradient; reference.fillRect(0, 0, width, 100);
+      if (tiled) { expected.fillStyle = expected.createPattern(reference.canvas, 'repeat') as CanvasPattern; expected.fillRect(0, 0, 200, 100); }
+      expect(actual.getImageData(0, 0, 200, 100).data, JSON.stringify({ focus, tiled })).toEqual(expected.getImageData(0, 0, 200, 100).data);
+    }
   });
 
   it('preserves every interior pixel of a displaced concave focus copy', () => {
@@ -402,6 +452,56 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
     const alpha = (ctx: CanvasRenderingContext2D) => ctx.getImageData(0, 0, 500, 350).data.filter((_, i) => i % 4 === 3);
     expect(alpha(contexts[1])).toEqual(alpha(contexts[0]));
+  });
+
+  it.each(['docx', 'pptx', 'xlsx'] as const)('covers curved dashed strokes with every cap through %s painting', async format => {
+    const red: GradientFill = { ...fill, stops: [0, .5, 1].map(position => ({ position, color: 'FF0000' })) };
+    for (const geometry of ['ellipse', 'roundRect']) for (const lineCap of ['square', 'round', 'butt'] as const) {
+      const contexts = [canvas(300, 300), canvas(300, 300)];
+      for (const [i, { c, ctx }] of contexts.entries()) {
+        const stroke = { color: 'FF0000', width: 80, lineCap, dashStyle: 'sysDot', ...(i ? { fill: red } : {}) };
+        if (format === 'docx') paintDrawingMLShape(ctx, {
+          rect: { x: 130, y: 130, w: 40, h: 40 }, geometry: { kind: 'preset', name: geometry, adjustments: [] },
+          fill: null, stroke, transform: { rotationDeg: 0, flipH: false, flipV: false },
+        }, 1);
+        if (format === 'pptx') await renderSlideNode(c, {
+          slideWidth: 300 * 9525, slideHeight: 300 * 9525,
+          slides: [{ index: 0, slideNumber: 1, background: null, elements: [{
+            type: 'shape', x: 130 * 9525, y: 130 * 9525, width: 40 * 9525, height: 40 * 9525,
+            rotation: 0, flipH: false, flipV: false, geometry, fill: null,
+            stroke: { ...stroke, width: 80 * 9525 }, textBody: null, custGeom: null,
+          } as ShapeElement] }], defaultTextColor: null, majorFont: null, minorFont: null,
+        } as Presentation, 0, { width: 300, dpr: 1 });
+        if (format === 'xlsx') renderViewport(ctx, {
+          name: 'Sheet1', isChartSheet: true, rows: [], colWidths: {}, rowHeights: {}, freezeRows: 0, freezeCols: 0,
+          defaultColWidth: 8.43, defaultRowHeight: 15, mergeCells: [], conditionalFormats: [], images: [], charts: [],
+          defaultFontFamily: 'Calibri', defaultFontSize: 11,
+          shapeGroups: [{ fromCol: 0, fromRow: 0, fromColOff: 0, fromRowOff: 0, toCol: 1, toRow: 1,
+            toColOff: 0, toRowOff: 0, editAs: 'oneCell', nativeExtCx: 300 * 9525, nativeExtCy: 300 * 9525,
+            shapes: [{ x: 130 / 300, y: 130 / 300, w: 40 / 300, h: 40 / 300, rot: 0,
+              strokeColor: 'FF0000', strokeWidth: 80 * 9525, strokeLineCap: lineCap, strokeDashStyle: 'sysDot',
+              strokeFill: i ? red : undefined, fill: undefined, geom: { type: 'preset', name: geometry, adj: [] } }],
+          }],
+        } as Worksheet, { fonts: [], fills: [], borders: [], cellXfs: [], numFmts: [], dxfs: [] } as Styles,
+        { row: 1, col: 1, rows: 1, cols: 1 });
+      }
+      expect(contexts[1].ctx.getImageData(0, 0, 300, 300).data, JSON.stringify({ geometry, lineCap }))
+        .toEqual(contexts[0].ctx.getImageData(0, 0, 300, 300).data);
+    }
+  });
+
+  it('covers square dash tangents under nonuniform scale and shear', () => {
+    const contexts = [canvas(400, 300).ctx, canvas(400, 300).ctx];
+    for (const [i, ctx] of contexts.entries()) {
+      ctx.translate(180, 120); ctx.transform(1.7, .3, .6, .7, 0, 0);
+      paintDrawingMLShape(ctx, {
+        rect: { x: 0, y: 0, w: 40, h: 40 }, geometry: { kind: 'preset', name: 'ellipse', adjustments: [] },
+        fill: null, stroke: { color: 'FF0000', width: 80, lineCap: 'square', dashStyle: 'sysDot',
+          ...(i ? { fill: { ...fill, stops: [0, .5, 1].map(position => ({ position, color: 'FF0000' })) } } : {}) },
+        transform: { rotationDeg: 0, flipH: false, flipV: false },
+      }, 1);
+    }
+    expect(contexts[1].getImageData(0, 0, 400, 300).data).toEqual(contexts[0].getImageData(0, 0, 400, 300).data);
   });
 
   it('covers PPTX gradient line decorations through the complete slide painter', async () => {

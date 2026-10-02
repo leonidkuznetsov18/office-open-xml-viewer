@@ -67,7 +67,11 @@ export function trackPaintPath(ctx: CanvasRenderingContext2D): CanvasRenderingCo
         // A round rectangle is contained by the rectangle; its smooth corners
         // cannot add miters. Keeping the rectangle is conservative for both.
         move(point(a[0], a[1])); line(point(a[0] + a[2], a[1]));
-        line(point(a[0] + a[2], a[1] + a[3])); line(point(a[0], a[1] + a[3])); close(); break;
+        line(point(a[0] + a[2], a[1] + a[3])); line(point(a[0], a[1] + a[3])); close();
+        if (name === 'roundRect' && state.current) {
+          for (const segment of state.current.segments) segment.curved = true;
+        }
+        break;
       case 'quadraticCurveTo':
       case 'bezierCurveTo': {
         const controls: Point[] = [];
@@ -103,9 +107,14 @@ export function trackPaintPath(ctx: CanvasRenderingContext2D): CanvasRenderingCo
   return proxy;
 }
 
-/** Conservative device bounds of the recorded path's actual stroke. Dash
- * gaps only remove coverage. Affine pen support is computed per device axis,
- * rather than from determinant/uniform scale. */
+/** Conservative device bounds of the recorded path's stroked outline.
+ * Every dash has caps, including interior dashes on closed curves. A square
+ * cap's corners are p + r(±t ±n), with unit tangent t and normal n. For a
+ * device-axis row v of the affine transform, their support is
+ * r(|v·t| + |v·n|) <= r sqrt(2) |v|. This envelopes every possible end tangent
+ * on a curved control hull without flattening or approximating dash lengths.
+ * Straight segments use their exact tangent. Round caps use circular support;
+ * flat caps add no tangent extension. Neither envelope changes the shade frame. */
 export function currentStrokeBounds(ctx: CanvasRenderingContext2D): ShadeBox | undefined {
   const state = states.get(ctx);
   if (!state || state.paths.length === 0) return undefined;
@@ -114,6 +123,8 @@ export function currentStrokeBounds(ctx: CanvasRenderingContext2D): ShadeBox | u
   if (!Number.isFinite(det) || det === 0) return undefined;
   const r = ctx.lineWidth / 2;
   const hx = r * Math.hypot(m.a, m.c); const hy = r * Math.hypot(m.b, m.d);
+  const dashed = typeof ctx.getLineDash === 'function' && ctx.getLineDash().some(length => length > 0);
+  const squareDash = dashed && ctx.lineCap === 'square';
   let left = Infinity; let right = -Infinity; let top = Infinity; let bottom = -Infinity;
   const add = (p: Point, x = 0, y = 0) => {
     left = Math.min(left, p[0] - x); right = Math.max(right, p[0] + x);
@@ -132,10 +143,20 @@ export function currentStrokeBounds(ctx: CanvasRenderingContext2D): ShadeBox | u
       add(path.origin, hx, hy);
     }
     for (const segment of segments) {
-      if (segment.curved) { for (const p of segment.points) add(p, hx, hy); }
+      if (segment.curved) {
+        for (const p of segment.points) add(p, squareDash ? Math.SQRT2 * hx : hx, squareDash ? Math.SQRT2 * hy : hy);
+      }
       else {
         const [x, y] = localUnit(segment.start);
-        for (const p of segment.points) { offset(p, -y * r, x * r); offset(p, y * r, -x * r); }
+        for (const p of segment.points) {
+          offset(p, -y * r, x * r); offset(p, y * r, -x * r);
+          if (squareDash) {
+            for (const direction of [-1, 1]) {
+              offset(p, r * (direction * x - y), r * (direction * y + x));
+              offset(p, r * (direction * x + y), r * (direction * y - x));
+            }
+          } else if (dashed && ctx.lineCap === 'round') add(p, hx, hy);
+        }
       }
     }
     for (let i = 0; i < segments.length; i++) {
