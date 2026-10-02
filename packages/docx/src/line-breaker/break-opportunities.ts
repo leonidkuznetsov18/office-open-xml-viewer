@@ -297,15 +297,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
         if (!('text' in candidate) || candidate.paragraphFinalIdeographicSpaceTail !== true) break;
         trailingTailWidth += segAdvance(candidate);
       }
-      if (
-        breakerState.currentWidth + trailingTailWidth > availW() &&
-        // WORD_COMPRESSED_SPACE_LINE_FIT: a shrinking line decides the tail
-        // with the same predicate as the joined text would.
-        !(mixedCandidateMayShrink(breakerState, s.text) && context.mixedSpaceRequirement({
-          pieces: [{ segment: s, text: s.text }],
-          fitWidth: trailingTailWidth,
-        }) !== undefined)
-      ) {
+      if (breakerState.currentWidth + trailingTailWidth > availW()) {
         flush(undefined, false, s.src);
         breakerState.queue.unshift(s);
         return;
@@ -1322,7 +1314,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     // Galloping bound, then binary search: every measured prefix is at most
     // twice the admitted extension past the natural break.
     // Start from the natural break as the ordinary pipeline resolves it
-    // (including a hanging line-end U+3000), so an allowance that needs no
+    // (including its hanging allowances), so an allowance that needs no
     // reduction is not turned into one by a source-run seam.
     const naturalHead = [...proposedPrefixFor(naturalRawSplit, true)].length;
     let low = Math.max(naturalRawSplit, naturalHead);
@@ -1369,7 +1361,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   let prefix = proposedPrefixFor(rawSplit, true);
   if (mixedSpaceExtended) {
     // Every fit decision on a shrinking line goes through the one predicate:
-    // the final head (after punctuation hanging, U+3000 extension and source
+    // the final head (after punctuation hanging and source
     // protection) must itself be admitted. Otherwise keep the checked
     // kinsoku-legal head, and failing that the natural break.
     const needsShrink = (head: string): boolean =>

@@ -64,27 +64,12 @@ export type MixedSpaceMeasure = (segment: LayoutTextSeg, text: string) => number
 /** Split `text` into its core and terminal cluster (U+0020, then closing marks). */
 function clusterCore(text: string): string {
   let core = text.replace(/ +$/u, '');
-  while (
-    core.length > 0 &&
-    (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(core.at(-1)!) || core.at(-1) === IDEOGRAPHIC_SPACE)
-  ) {
+  while (core.length > 0 && COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(core.at(-1)!)) {
     core = core.slice(0, -1);
   }
   return core;
 }
 
-const IDEOGRAPHIC_SPACE = '\u3000';
-
-/** Trailing U+3000 of a candidate or line hang past the band under
- * WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE; the ordinary pipeline never
- * counts them toward fit, so this projection does not either (a paragraph-
- * final tail keeps its own width-bearing count rule). */
-function hangingIdeographicSpaceText(segment: LayoutTextSeg, text: string): string | undefined {
-  // A paragraph-final tail is width-bearing unless its visible text was forced
-  // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE); an admitted line is not forced.
-  if (!text.endsWith(IDEOGRAPHIC_SPACE) || segment.paragraphFinalIdeographicSpaceTail === true) return undefined;
-  return text.replace(/\u3000+$/u, '');
-}
 
 /**
  * Running summary of the committed line, O(1) per commit. It is maintained
@@ -478,12 +463,7 @@ export function performMixedSpaceRequirement(
   const capacity = line.perSpaceCapacity * line.count;
   if (!(capacity > 0)) return undefined;
   const naturalWidth = breakerState.currentWidth;
-  const lastPiece = pieces.at(-1)!;
-  const hungBefore = hangingIdeographicSpaceText(lastPiece.segment, lastPiece.text);
-  const fitWidth = hungBefore === undefined
-    ? candidate.fitWidth
-    : candidate.fitWidth - (operationState.strAdvance(lastPiece.segment, lastPiece.text)
-      - operationState.strAdvance(lastPiece.segment, hungBefore));
+  const fitWidth = candidate.fitWidth;
   const required = Math.max(0, naturalWidth + fitWidth - availW());
   if (required > capacity || !fitsMeasuredWidth(naturalWidth + fitWidth - required, availW())) {
     return undefined;
@@ -551,14 +531,6 @@ export function performSettleMixedSpaces(operationState: PassOperationState): vo
       gaps.pop();
       lineEndSpacePx += gap.segment.mixedNaturalTrailingSpacePx!;
       if (gap.segment.text.trim().length > 0) break;
-    }
-    // A hanging line-end U+3000 is not fitted either.
-    const lastItem = breakerState.currentLine.at(-1);
-    if (lastItem && 'text' in lastItem && lineEndSpacePx === 0) {
-      const hungBefore = hangingIdeographicSpaceText(lastItem, lastItem.text);
-      if (hungBefore !== undefined) {
-        lineEndSpacePx += lastItem.measuredWidth - strNaturalAdvance(lastItem, hungBefore);
-      }
     }
     const count = gaps.reduce((sum, gap) => sum + gap.count, 0);
     const needed = Math.max(0, breakerState.currentWidth - lineEndSpacePx - availW());
