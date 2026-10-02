@@ -175,9 +175,10 @@ function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTe
   const runs = parts.map((text, index) => {
     const content = text.split('\t').map(piece => `<w:t xml:space="preserve">${escape(piece)}</w:t>`).join('<w:tab/>');
     const run = `<w:r w:rsidR="0000000${index % 8}">${runProperties[index] ? `<w:rPr>${runProperties[index]}</w:rPr>` : ''}${content}</w:r>`;
-    if (wrapper === 'deletion-seam' || wrapper === 'moveFrom-seam') {
-      const tag = wrapper === 'deletion-seam' ? 'del' : 'moveFrom';
-      return `${index ? `<w:${tag} w:id="${index}" w:author="Reviewer"><w:r><w:delText>X</w:delText></w:r></w:${tag}>` : ''}${run}`;
+    if (['deletion-seam', 'moveFrom-seam', 'deleted-break-seam', 'deleted-tab-seam'].includes(wrapper)) {
+      const tag = wrapper === 'moveFrom-seam' ? 'moveFrom' : 'del';
+      const boundary = wrapper === 'deleted-break-seam' ? '<w:br/>' : wrapper === 'deleted-tab-seam' ? '<w:tab/>' : '';
+      return `${index ? `<w:${tag} w:id="${index}" w:author="Reviewer"><w:r><w:delText>X</w:delText>${boundary}</w:r></w:${tag}>` : ''}${run}`;
     }
     if (wrapper === 'smart-tags') return `<w:smartTag w:uri="urn:test" w:element="word">${run}</w:smartTag>`;
     if (wrapper === 'revisions') return `<w:ins w:id="${index}" w:author="Reviewer">${run}</w:ins>`;
@@ -223,7 +224,7 @@ function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed
 }
 
 describe('complete DOCX parser inputs preserve formatting-only split invariance', () => {
-  it.each(['deletion-seam', 'moveFrom-seam'])('keeps omitted %s content out of final-view shaping boundaries', wrapper => {
+  it.each(['deletion-seam', 'moveFrom-seam', 'deleted-break-seam', 'deleted-tab-seam'])('keeps omitted %s content out of final-view shaping boundaries', wrapper => {
     const whole = acquireParsed(['T i'], wrapper);
     const doc = parsedDocument(['T', ' i'], wrapper);
     const services = createLayoutServices(doc, { measureContext: context() });

@@ -18,8 +18,6 @@ export interface TextSequence {
 function visibleTextRun(run: ParagraphLayoutRun, environment: LineLayoutEnvironment) {
   if (run.type !== 'text' && run.type !== 'field') return undefined;
   const r: ParagraphTextBearingRun = run;
-  if (environment.showTrackedChanges !== true
-    && (r.revision?.kind === 'deletion' || r.revision?.kind === 'moveFrom')) return undefined;
   // These are authored units, rather than formatting-only seams: a ruby base,
   // note marker, fitText unit, noBreakHyphen owner or upright tate-chu-yoko cell.
   if (r.ruby || r.noteRef || r.fitTextVal != null || r.noBreakRanges?.length
@@ -134,11 +132,12 @@ export function acquireTextSequences(
     offset = 0;
   };
   for (const [runIndex, run] of runs.entries()) {
-    // ECMA-376 §17.13.5: deleted/moved-away text has no final-view glyphs.
+    // ECMA-376 §17.13.5: deleted/moved-away content has no final-view glyphs or breaks.
     // It contributes neither formatting nor a shaping seam to visible neighbors;
     // markup view retains its own revision formatting and source ownership.
-    if (environment.showTrackedChanges !== true && (run.type === 'text' || run.type === 'field')
-      && (run.revision?.kind === 'deletion' || run.revision?.kind === 'moveFrom')) continue;
+    const revisionKind = (run as { revision?: { kind?: string } }).revision?.kind;
+    if (environment.showTrackedChanges !== true
+      && (revisionKind === 'deletion' || revisionKind === 'moveFrom')) continue;
     const visible = visibleTextRun(run, environment);
     const scopeKey = visible ? environment.layoutServices?.text.sourceScopeKey?.({
       text: displayText(visible.text, visible), fontSizePt: visible.fontSize,
