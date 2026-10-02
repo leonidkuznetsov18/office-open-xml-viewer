@@ -2,6 +2,7 @@ import { wordKerningApplies } from '../layout/line-compatibility.js';
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
 import { calcEffectiveFontPx } from '../layout/text.js';
+import { charScaleFactor } from './advance.js';
 import { verticalRunInkExtra } from './vertical-text.js';
 
 /** Owns the Canvas state used by one line-breaking pass. The state recorded here
@@ -105,6 +106,42 @@ export class LineMeasurementAdapter {
     } finally {
       this.restoreKerning(previous);
     }
+  }
+
+  /** Browser pair-context repair at an actual ordinary word boundary. This
+   * is native geometry, not an Office fitting allowance (§17.3.2.19).
+   * Same-source, same-face horizontal non-complex text is measured as two
+   * adjacent tokens and their concatenation; the difference belongs to the
+   * next token's origin/advance. Each token is visited at most twice, without
+   * a line-prefix cache. This does not promise arbitrary multi-token contextual
+   * GSUB equivalence; RTL/complex and authored atomic units retain their own
+   * shaping/placement contracts. Callers commit the result only on that line.
+   */
+  wordBoundaryAdvance(left: LayoutTextSeg | undefined, right: LayoutTextSeg): number {
+    const l = left?.textShapeRequest;
+    const r = right.textShapeRequest;
+    const service = right.textLayoutService;
+    if (!left || !l || !r || !service || service !== left.textLayoutService
+      || !left.text.endsWith(' ') || right.text.startsWith(' ') || !right.text
+      || left.metricOnly || right.metricOnly || left.ruby || right.ruby
+      || left.fitTextRegionIndex !== undefined || right.fitTextRegionIndex !== undefined
+      || left.verticalRun || right.verticalRun || left.rtl || right.rtl
+      || l.complexScript || r.complexScript || l.kerning !== true
+      || (left.script !== 'ascii' && left.script !== 'highAnsi')
+      || left.script !== right.script
+      || left.fontRoute?.fingerprint !== right.fontRoute?.fingerprint
+      || calcEffectiveFontPx(left, this.scale) !== calcEffectiveFontPx(right, this.scale)
+      || l.weight !== r.weight || l.style !== r.style || l.kerning !== r.kerning
+      || charScaleFactor(left) !== charScaleFactor(right)
+      || left.sourceRunIndex === undefined || left.sourceRunIndex !== right.sourceRunIndex
+      || left.sourceTextSequence !== right.sourceTextSequence) return 0;
+    const lc = l.substituteContext;
+    const rc = r.substituteContext;
+    if (!lc || !rc || lc.text !== rc.text || lc.offset + left.text.length !== rc.offset) return 0;
+    const measure = (request: typeof r) => service.shape({ ...request,
+      fontSizePt: calcEffectiveFontPx(right, this.scale), measure: true, clusterGeometry: false }).advancePt;
+    const joined = { ...l, text: left.text + right.text };
+    return (measure(joined) - measure(l) - measure(r)) * charScaleFactor(right);
   }
 
   measureRunText(segment: LayoutTextSeg, text: string): TextMetrics {

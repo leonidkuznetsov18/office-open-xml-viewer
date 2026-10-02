@@ -8,6 +8,7 @@ import { type DocGridCtx, type LayoutSeg, type LayoutTextSeg } from './model.js'
  * segment split for wrapping must not retain geometry from the parent slice;
  * measurement and addToLine recompute these facts from the new text. */
 export const RESET_SLICED_TEXT_MEASUREMENT = {
+  leadingWordBoundaryPx: undefined,
   shapedClusters: undefined,
   shapedSpaceClusters: undefined,
   selectedFaceInkBounds: undefined,

@@ -135,6 +135,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
     offsetPt: number;
     advancePt: number;
   }>[];
+  /** Same-line native boundary advance; also shifts retained glyph origins. */
+  leadingWordBoundaryPx?: number;
   /** Sparse, contextual U+0020 cluster geometry used only during gap fitting. */
   shapedSpaceClusters?: LayoutTextSeg['shapedClusters'];
   /** Tight selected-face ink retained by the authoritative shape call that

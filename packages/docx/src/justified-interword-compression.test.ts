@@ -16,7 +16,7 @@ const GEORGIA: Record<string, number> = {
 };
 const GEORGIA_ITALIC: Record<string, number> = {" ":494,"'":441,",":552,".":552,"F":1227,"Q":1496,"T":1267,"a":1173,"b":1134,"c":929,"d":1178,"e":966,"f":673,"g":1173,"h":1152,"i":609,"k":1081,"l":584,"m":1801,"n":1208,"o":1100,"p":1184,"r":945,"s":883,"t":711,"u":1178,"v":1102,"w":1684,"y":1146,"z":909};
 
-function georgiaCanvas(): HTMLCanvasElement {
+function georgiaCanvas(spacePairUnits = 0, painted?: { text: string; x: number }[]): HTMLCanvasElement {
   let font = '11px Georgia';
   const advance = (text: string): number => {
     const px = Number(/([\d.]+)px/.exec(font)?.[1] ?? 11);
@@ -29,7 +29,10 @@ function georgiaCanvas(): HTMLCanvasElement {
     }
     // Synthetic pair kerning between adjacent letters, so every kerned word
     // measures differently from its unkerned advance.
-    if (ctx.fontKerning === 'normal') units -= 10 * (text.match(/[A-Za-z](?=[A-Za-z])/g)?.length ?? 0);
+    if (ctx.fontKerning === 'normal') {
+      units -= 10 * (text.match(/[A-Za-z](?=[A-Za-z])/g)?.length ?? 0);
+      units -= spacePairUnits * (text.match(/ T/g)?.length ?? 0);
+    }
     return (units * px) / 2048;
   };
   const ctx = {
@@ -54,7 +57,7 @@ function georgiaCanvas(): HTMLCanvasElement {
     strokeRect() {}, clip() {}, rect() {}, scale() {}, translate() {}, setTransform() {},
     setLineDash() {}, drawImage() {}, clearRect() {}, arc() {}, quadraticCurveTo() {},
     bezierCurveTo() {}, createLinearGradient() { return { addColorStop() {} }; },
-    fillText() {}, strokeText() {},
+    fillText(text: string, x: number) { painted?.push({ text, x }); }, strokeText() {},
     fillStyle: '#000', strokeStyle: '#000', lineWidth: 1,
     textAlign: 'left' as CanvasTextAlign, direction: 'ltr' as CanvasDirection,
     globalAlpha: 1, lineCap: 'butt' as CanvasLineCap, lineJoin: 'miter' as CanvasLineJoin,
@@ -90,6 +93,7 @@ async function renderLines(
   widthPt: number,
   settings: Record<string, unknown> = { compatibilityMode: 15, characterSpacingControl: 'compressPunctuation' },
   sectionExtra: Partial<SectionProps> = {},
+  canvas = georgiaCanvas(),
 ): Promise<DocxTextRunInfo[][]> {
   const section = {
     pageWidth: widthPt, pageHeight: 400,
@@ -103,7 +107,7 @@ async function renderLines(
     footers: { default: null, first: null, even: null },
   } as unknown as DocxDocumentModel;
   const runs: DocxTextRunInfo[] = [];
-  await renderDocumentToCanvas(doc, georgiaCanvas(), 0, {
+  await renderDocumentToCanvas(doc, canvas, 0, {
     dpr: 1,
     width: widthPt,
     onTextRun: (run) => { if (run.text) runs.push(run); },
@@ -124,6 +128,54 @@ const CONTROL = 'Quiet rivers carry morning light across the valley beyond the d
 const MANY_GAPS = `${Array.from({ length: 24 }, () => 'a').join(' ')} beyond the distant hills today`;
 
 describe('WORD_JUSTIFIED_INTERWORD_COMPRESSION', () => {
+  it('preserves a native space-to-letter pair only when its tokens share a line', async () => {
+    // An independent whole-string measure owns this boundary: the stub adds
+    // a 200/2048 em space-T pair, in addition to its ordinary letter pairs.
+    // Token sums exceed the quarter-space bound; continuous text does not.
+    const prefix = 'Quiet To rivers';
+    const nativeAdvance = (GEORGIA_SUM(prefix) - 10 * 10 - 200) * 11 / 2048;
+    const width = nativeAdvance - 1;
+    const element = paragraph(`${prefix} beyond the valley`, 'both', 11, false, { kerning: 8 });
+    const painted: { text: string; x: number }[] = [];
+    const [first] = await renderLines(element, width, undefined, {}, georgiaCanvas(200, painted));
+    expect(words(first)).toEqual(['Quiet', 'To', 'rivers']);
+    const toOnFirst = painted.find(run => run.text.trim() === 'To')!;
+    const quietAdvance = (GEORGIA_SUM('Quiet') - 40) * 11 / 2048;
+    const spaceAdvance = 494 * 11 / 2048;
+    expect(toOnFirst.x).toBeCloseTo(quietAdvance + spaceAdvance - 0.5 - 200 * 11 / 2048, 6);
+    const last = first.at(-1)!;
+    const lastBareAdvance = (GEORGIA_SUM(last.text.trimEnd()) - 10 * 5) * 11 / 2048;
+    expect(last.x + lastBareAdvance).toBeCloseTo(width, 6);
+
+    const runs = (element as DocParagraph).runs;
+    const original = runs[0];
+    const split = { ...element, runs: ['Quiet ', 'To ', 'rivers beyond the valley']
+      .map(text => ({ ...original, text })) } as BodyElement;
+    const [splitFirst] = await renderLines(split, width, undefined, {}, georgiaCanvas(200));
+    expect(splitFirst.map(run => ({ text: run.text, x: run.x })))
+      .toEqual(first.map(run => ({ text: run.text, x: run.x })));
+
+    // Rejected candidates start with their independent origin: the previous
+    // line's separator must not move the first glyph of the next line.
+    const narrow = (GEORGIA_SUM('Quiet') - 40) * 11 / 2048 + 0.1;
+    const narrowPaint: { text: string; x: number }[] = [];
+    await renderLines(element, narrow, undefined, {}, georgiaCanvas(200, narrowPaint));
+    const to = narrowPaint.find(run => run.text.trim() === 'To')!;
+    expect(to.x).toBeCloseTo(0, 6);
+  });
+
+
+  it('rejects a positive native boundary advance before isolated fit can override it', async () => {
+    // Without the positive pair, the complete visible candidate fits naturally.
+    // With it, overflow exceeds one quarter of the genuine interword space.
+    const independentWidth = (GEORGIA_SUM('Quiet To') - 50) * 11 / 2048;
+    const painted: { text: string; x: number }[] = [];
+    const [first] = await renderLines(paragraph('Quiet To beyond', 'both', 11, false, { kerning: 8 }),
+      independentWidth + 0.3, undefined, {}, georgiaCanvas(-200, painted));
+    expect(words(first)).toEqual(['Quiet']);
+    expect(painted.find(run => run.text.trim() === 'To')?.x).toBeCloseTo(0, 6);
+  });
+
   it('pulls a word onto a justified line by shrinking its gaps, and paints those gaps', async () => {
     // Word keeps `valley` on line one at 233.30pt (natural 236.31pt) and
     // draws seven equal gaps of about 2.21pt instead of the 2.65pt space.

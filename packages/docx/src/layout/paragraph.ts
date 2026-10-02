@@ -1958,6 +1958,7 @@ function textPlanSegment(
       offset: {
         xPt:
           cluster.offsetPt * scaleX
+          + (segment.leadingWordBoundaryPx ?? 0)
           + precedingScalars * pitchPt
           + precedingWidthBalanceAdjustment
           + precedingPunctuationCompression,
@@ -2199,6 +2200,8 @@ function textPlanSegment(
     clusters,
     basePaintOps: basePaintOps.map((operation) => ({
       ...operation,
+      offset: { ...operation.offset,
+        xPt: operation.offset.xPt + (segment.leadingWordBoundaryPx ?? 0) },
       // Measurement resolves w:spacing, docGrid character pitch, and w:fitText
       // into one authoritative per-scalar pitch. A planned vertical upright or
       // rotate cell already owns that pitch in its retained origin and advance;

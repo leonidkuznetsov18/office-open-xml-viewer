@@ -1320,7 +1320,7 @@ function gapSegment(state: Pick<PassOperationState, 'strAdvance' | 'scale' | 'ch
  * for paint. Advances are never shortened here; compression is line-owned. */
 export function fitJustifiedCompression(state: Pick<PassOperationState,
   'justifiedCompression' | 'baseRtl' | 'widthPolicy' | 'characterGrid' | 'breakerState'
-  | 'segAdvance' | 'strAdvance' | 'availW' | 'textSegmentBox' | 'addToLine' | 'scale'>, first: LayoutTextSeg): boolean {
+  | 'segAdvance' | 'strAdvance' | 'availW' | 'textSegmentBox' | 'addToLine' | 'scale' | 'measurement' | 'flush'>, first: LayoutTextSeg): boolean {
   if (!justifiedCompressionApplies(state) || first.fitTextRegionIndex !== undefined) return false;
   const { breakerState: breaker } = state;
   if (breaker.justifiedUnitEnd) {
@@ -1331,10 +1331,16 @@ export function fitJustifiedCompression(state: Pick<PassOperationState,
   // Opaque successors stay with their own placement path. Ruby is itself an
   // opaque, measured text unit and participates without opening adjacent gaps.
   if (members.some(member => !('text' in member))) return false;
+  let previousText = breaker.currentLine.at(-1);
+  const boundaries: number[] = [];
   const boxes = members.map(member => {
     if (!('text' in member)) throw new Error('A text candidate lost its placement unit');
     const box = state.textSegmentBox(member);
-    member.measuredWidth = box.width;
+    const boundary = state.measurement.wordBoundaryAdvance(
+      previousText && 'text' in previousText ? previousText : undefined, member);
+    boundaries.push(boundary);
+    member.measuredWidth = box.width + boundary;
+    previousText = member;
     return box;
   });
   if (!breaker.justifiedGapModel || breaker.justifiedGapModel.segmentCount !== breaker.currentLine.length) {
@@ -1350,6 +1356,14 @@ export function fitJustifiedCompression(state: Pick<PassOperationState,
     expansionWithoutCandidate: state.availW() - previous.visibleWidthPx,
   }) : 0;
   if (factor === undefined) {
+    for (const [index, member] of members.entries()) member.measuredWidth = boxes[index].width;
+    // An adjusted candidate that was refused must be reconsidered at a fresh
+    // line origin; the ordinary isolated-width path cannot override this fit.
+    if (boundaries.some(delta => delta !== 0) && breaker.currentLine.length > 0) {
+      state.flush(undefined, false, first.src);
+      breaker.queue.unshift(first);
+      return true;
+    }
     if (members.length > 1) breaker.justifiedUnitEnd = members.at(-1);
     return false;
   }
@@ -1357,6 +1371,7 @@ export function fitJustifiedCompression(state: Pick<PassOperationState,
     if (member !== first) breaker.queue.shift();
     if (!('text' in member)) throw new Error('A text candidate lost its placement unit');
     const box = boxes[index];
+    member.leadingWordBoundaryPx = boundaries[index];
     state.addToLine(member, member.measuredWidth, box.height, box.ascent, box.descent);
   }
   breaker.justifiedCompressionPx = Math.max(0, overflow);
@@ -1383,6 +1398,7 @@ export function performTextSegmentBox(
     characterGrid,
   } = operationState;
 
+  s.leadingWordBoundaryPx = undefined;
   // Fitting needs the spaces' contextual advances, not every prefix of a
   // possibly overlong word. Full cluster acquisition belongs to final slices.
   const measured = justifiedCompressionApplies(operationState) && s.text.includes(' ') && !s.ruby
