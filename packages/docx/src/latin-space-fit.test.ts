@@ -49,13 +49,9 @@ describe('selected-face Latin inter-word space fit', () => {
     expect(lay([word('A ', 1), word('B', 1)], 6)).toHaveLength(2);
   });
 
-  it('admits a candidate without spaces in another face but declines mixed-face spaces', () => {
-    // WORD_COMPRESSED_SPACE_LINE_FIT: text without U+0020 keeps its natural
-    // advance in any face; only the line's spaces must share one floor.
-    const otherRoute = createCanvasFontRoute('Other', 'registered');
-    expect(lay([word('A '), { ...word('B'), fontRoute: otherRoute }], 6)).toHaveLength(1);
-    expect(lay([word('A '), { ...word('B '), fontRoute: otherRoute }, word('C')], 10))
-      .toHaveLength(2);
+  it('declines a mixed-face line', () => {
+    const other = { ...word('B'), fontRoute: createCanvasFontRoute('Other', 'registered') };
+    expect(lay([word('A '), other], 6)).toHaveLength(2);
   });
 
   it('does not apply horizontal U+0020 fitting to upright vertical runs', () => {

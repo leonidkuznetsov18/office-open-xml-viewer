@@ -25,6 +25,7 @@ import { buildFont } from './font-routes.js';
 import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
+import { performApplyMixedSpaces, performMixedSpaceRequirement } from './mixed-space-fit.js';
 import {
   performLineHeadRequirement,
   performForcedPlacement,
@@ -32,8 +33,6 @@ import {
   performRejectGap,
   performCaptureGapSnapshot,
   performSameLatinSpaceFace,
-  performCompressedSpaceRequirement,
-  performApplyCompressedSpaces,
   performMaterializeLatinSpaceCompression,
   performStartLine,
   performAvailW,
@@ -260,10 +259,10 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * setting excludes the fit projection at segment acquisition. */
   const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
     performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
-  const compressedSpaceRequirement = (next: LayoutTextSeg, nextFitWidth: number): number | undefined =>
-    performCompressedSpaceRequirement(operationState, next, nextFitWidth);
-  const applyCompressedSpaces = (required: number): void =>
-    performApplyCompressedSpaces(operationState, required);
+  const mixedSpaceRequirement = (next: LayoutTextSeg, nextFitWidth: number): number | undefined =>
+    performMixedSpaceRequirement(operationState, next, nextFitWidth);
+  const applyMixedSpaces = (required: number): void =>
+    performApplyMixedSpaces(operationState, required);
 
   /** Measure one text segment's canonical advance and vertical contribution.
    * Every path that commits a complete text segment to a line must use this
@@ -389,8 +388,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     eastAsianSnapCellCount,
     strAdvance,
     fitHomogeneousLatinSpaces,
-    compressedSpaceRequirement,
-    applyCompressedSpaces,
+    mixedSpaceRequirement,
+    applyMixedSpaces,
     textSegmentBox,
     appendQueuedIdeographicSpaceSegment,
     tabFollowWidth,

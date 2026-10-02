@@ -109,9 +109,14 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Retained paint advance is shorter than the natural space by this amount. */
   latinSpaceCompressionPx?: number;
   latinNaturalTrailingSpacePx?: number;
-  /** Number of trailing U+0020 in `latinNaturalTrailingSpacePx`
-   * (WORD_COMPRESSED_SPACE_LINE_FIT shrinks every space alike). */
-  latinNaturalTrailingSpaceCount?: number;
+  /** Selected-face OS/2 xAvgCharWidth / unitsPerEm, set only where
+   * WORD_COMPRESSED_SPACE_LINE_FIT may shrink this segment's U+0020 on a mixed
+   * East Asian / Latin line. Independent of the Latin-only projection. */
+  mixedSpaceAverageWidthRatio?: number;
+  /** Natural advance and count of this segment's shrinkable trailing U+0020
+   * under WORD_COMPRESSED_SPACE_LINE_FIT. */
+  mixedNaturalTrailingSpacePx?: number;
+  mixedNaturalTrailingSpaceCount?: number;
   vertAlign: 'super' | 'sub' | null;
   measuredWidth: number;  // px (set during layout)
   /** A2 text authority captured during segmentation; production text width and

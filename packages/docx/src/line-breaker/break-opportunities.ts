@@ -1,4 +1,3 @@
-import { COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION } from './text-runs.js';
 import { measureFitTextUnit, measureJoinedTextUnit } from './atomic-units.js';
 import { justifiedCandidateFitWidth } from './justify-fit.js';
 import {
@@ -35,6 +34,7 @@ import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTab
 import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
 import {
+  COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION,
   extendThroughTrailingIdeographicSpaces,
   hasCJKBreakOpportunity,
   rebaseSeaBreaks,
@@ -78,8 +78,8 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'sameLatinSpaceFace'
   | 'fitsMeasuredWidth'
   | 'fitHomogeneousLatinSpaces'
-  | 'compressedSpaceRequirement'
-  | 'applyCompressedSpaces'
+  | 'mixedSpaceRequirement'
+  | 'applyMixedSpaces'
   | 'appendQueuedIdeographicSpaceSegment'
   | 'emergencyTextSplit'
   | 'effectiveFontPx'
@@ -335,19 +335,21 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
     : s.text.endsWith(' ')
       ? w - strAdvance(s, trimmed)
       : 0;
-  // WORD_COMPRESSED_SPACE_LINE_FIT: every trailing U+0020 of a word, and a
-  // space-only run between visible content, is one shrinkable space. A
-  // space-only run at a line head is not a gap.
-  const trailingSpaceCount = s.text.length - trimmed.length;
-  const compressibleSpaces =
-    s.latinSpaceCompressionEligible === true &&
+  s.latinNaturalTrailingSpacePx =
+    s.latinSpaceCompressionEligible === true && /^[^ ]+ $/u.test(s.text) && trailingSpaceW > 0
+      ? trailingSpaceW
+      : undefined;
+  s.latinSpaceCompressionPx = undefined;
+  // WORD_COMPRESSED_SPACE_LINE_FIT: the trailing U+0020 of a word, or a
+  // space-only run after visible content, are shrinkable spaces of a mixed line.
+  const mixedSpaces =
+    s.mixedSpaceAverageWidthRatio !== undefined &&
     trailingSpaceW > 0 &&
     !trimmed.includes(' ') &&
     (trimmed.length > 0 ||
       breakerState.currentLine.some((item) => 'text' in item && /\S/u.test(item.text)));
-  s.latinNaturalTrailingSpacePx = compressibleSpaces ? trailingSpaceW : undefined;
-  s.latinNaturalTrailingSpaceCount = compressibleSpaces ? trailingSpaceCount : undefined;
-  s.latinSpaceCompressionPx = undefined;
+  s.mixedNaturalTrailingSpacePx = mixedSpaces ? trailingSpaceW : undefined;
+  s.mixedNaturalTrailingSpaceCount = mixedSpaces ? s.text.length - trimmed.length : undefined;
   // Library containment policy: an RTL line is anchored at its right edge,
   // so even an invisible trailing-space advance shifts visible LTR cells left.
   // Count that advance during fitting instead of admitting glyphs past the band.
@@ -423,6 +425,20 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       s.overflowPunctuationBidiLanguage,
     ) &&
     breakerState.currentWidth + strAdvance(s, textBeforeTrailingOverflow) <= availW();
+
+  // WORD_COMPRESSED_SPACE_LINE_FIT: once a mixed line's spaces are shrunk, a
+  // following unit (such as a closing mark split into its own source run) is
+  // judged by the same reduction rule; joined and split runs must agree.
+  if (breakerState.mixedSpace.appliedPerSpace > 0) {
+    const required = context.mixedSpaceRequirement(s, wForFit);
+    if (required !== undefined) {
+      context.applyMixedSpaces(required);
+      s.measuredWidth = w;
+      addToLine(s, w, h, asc, desc);
+      context.appendQueuedIdeographicSpaceSegment(s);
+      return;
+    }
+  }
 
   // A line already admitted using this homogeneous-face rule cannot lend
   // that prior compression to a later mixed-face candidate. Its allocation
@@ -833,6 +849,19 @@ interface TextFitFrame {
   readonly admitsTrailingOverflowPunctuation: boolean | undefined;
 }
 
+/** WORD_COMPRESSED_SPACE_LINE_FIT admission of a whole segment. */
+function fitMixedSpaces(
+  context: BreakOpportunityIteratorContext,
+  segment: LayoutTextSeg,
+  fitWidth: number,
+): boolean {
+  if (context.breakerState.mixedSpace.spaceCount === 0) return false;
+  const required = context.mixedSpaceRequirement(segment, fitWidth);
+  if (required === undefined) return false;
+  context.applyMixedSpaces(required);
+  return true;
+}
+
 function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextFitFrame): void {
   const {
     breakerState,
@@ -861,6 +890,7 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     (fitsMeasuredWidth(breakerState.currentWidth + wForFit, availW()) &&
       breakerState.latinAppliedPerGap === 0) ||
     fitHomogeneousLatinSpaces(s, wForFit) ||
+    fitMixedSpaces(context, s, wForFit) ||
     fitsMeasuredWidth(breakerState.currentWidth + wForFit, availW())
   ) {
     // Fits on current line as-is
@@ -1157,27 +1187,24 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
       });
     }
   }
-  // WORD_COMPRESSED_SPACE_LINE_FIT: the line's U+0020 may shrink to admit
-  // further characters of this run. Extend the natural prefix while Word's
-  // space floors and East Asian overflow limit admit it; kinsoku below may
-  // still retract the break.
-  let compressedSpaceRequired: number | undefined;
-  if (breakerState.latinLineSpaceCount > 0 && breakerState.currentLine.length > 0) {
+  // WORD_COMPRESSED_SPACE_LINE_FIT: a mixed line's U+0020 may shrink to admit
+  // further characters of this run. Extend the natural prefix while the space
+  // floors and the East Asian overflow limit admit it; kinsoku below may still
+  // retract the break.
+  let mixedSpaceExtended = false;
+  if (breakerState.mixedSpace.spaceCount > 0 && breakerState.currentLine.length > 0) {
     const characters = [...s.text];
     for (let count = [...rawPrefix].length + 1; count <= characters.length; count += 1) {
       const candidate = characters.slice(0, count).join('');
       if (candidate.endsWith(' ')) break;
-      const required = context.compressedSpaceRequirement(
-        { ...s, text: candidate },
-        strAdvance(s, candidate),
-      );
+      const required = context.mixedSpaceRequirement({ ...s, text: candidate }, strAdvance(s, candidate));
       if (required === undefined) {
-        // A trailing closing punctuation mark is judged with its predecessor.
+        // A trailing closing mark is judged together with its predecessor.
         if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(characters[count - 1]!)) continue;
         break;
       }
       rawPrefix = candidate;
-      compressedSpaceRequired = required;
+      mixedSpaceExtended = true;
     }
   }
   // Apply kinsoku to the break position: retract leftwards so the tail
@@ -1229,13 +1256,10 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     }
   }
   if (prefix.length > 0) {
-    if (compressedSpaceRequired !== undefined) {
-      // Kinsoku may have retracted the extended break; commit the reduction the
-      // retained head still needs (none when it fits naturally).
-      const required = breakerState.currentWidth + strAdvance(s, prefix) > availW()
-        ? context.compressedSpaceRequirement({ ...s, text: prefix }, strAdvance(s, prefix))
-        : undefined;
-      if (required !== undefined) context.applyCompressedSpaces(required);
+    if (mixedSpaceExtended && breakerState.currentWidth + strAdvance(s, prefix) > availW()) {
+      // Commit the reduction the retained (possibly kinsoku-retracted) head needs.
+      const required = context.mixedSpaceRequirement({ ...s, text: prefix }, strAdvance(s, prefix));
+      if (required !== undefined) context.applyMixedSpaces(required);
     }
     // Grid advance for the head piece — the same model as the line box / draw.
     const pw = strNaturalAdvance(s, prefix);

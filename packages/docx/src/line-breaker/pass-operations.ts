@@ -9,8 +9,6 @@ import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceT
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
-  wordCompressedSpaceFloor,
-  wordCompressedSpaceEastAsianOverflowLimit,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -21,6 +19,11 @@ import {
   type LineBoundary,
 } from './model.js';
 import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
+import {
+  createMixedSpaceState,
+  performSettleMixedSpaces,
+  performTrackMixedSpaces,
+} from './mixed-space-fit.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -48,11 +51,7 @@ import {
 } from './font-routes.js';
 import { rubyAscentReservePx } from './ruby-metrics.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import {
-  rebaseSeaBreaks,
-  hasCJKBreakOpportunity,
-  COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION,
-} from './text-runs.js';
+import { rebaseSeaBreaks, hasCJKBreakOpportunity } from './text-runs.js';
 import {
   keepLeadingKinsoku,
   retractLeadingKinsoku,
@@ -111,8 +110,9 @@ export interface PassOperationState extends LineBreakerPassInput {
     retainTrailingPunctuationCompression?: boolean,
   ) => number;
   readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
-  readonly compressedSpaceRequirement: (next: LayoutTextSeg, nextFitWidth: number) => number | undefined;
-  readonly applyCompressedSpaces: (required: number) => void;
+  /** WORD_COMPRESSED_SPACE_LINE_FIT (mixed-script lines); see mixed-space-fit.ts. */
+  readonly mixedSpaceRequirement: (next: LayoutTextSeg, nextFitWidth: number) => number | undefined;
+  readonly applyMixedSpaces: (required: number) => void;
   readonly textSegmentBox: (
     s: LayoutTextSeg,
   ) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
@@ -167,33 +167,15 @@ export function performSameLatinSpaceFace(
   );
 }
 
-/** WORD_COMPRESSED_SPACE_LINE_FIT: text without U+0020 keeps its natural
- * advance and neither forms nor interrupts the line's shrinkable spaces,
- * whatever its script or face. Spaces Word was not observed to shrink (other
- * faces, authored spacing, grids, tabs and objects) end the projection. */
-function compressedSpaceNeutral(s: LayoutSeg): boolean {
-  return 'text' in s
-    && !('isTab' in s)
-    && !s.text.includes(' ')
-    && !s.verticalRun
-    && !s.tateChuYoko
-    && !s.rtl
-    && s.fitTextRegionIndex === undefined;
-}
-
 export function performMaterializeLatinSpaceCompression(operationState: PassOperationState): void {
   const { breakerState } = operationState;
 
-  // latinAppliedPerGap is the reduction of each U+0020; a gap segment carries
-  // latinNaturalTrailingSpaceCount of them (WORD_COMPRESSED_SPACE_LINE_FIT).
   for (let index = 0; index < breakerState.latinAppliedGapCount; index += 1) {
     const gap = breakerState.latinLineGaps[index];
-    const reduction = breakerState.latinAppliedPerGap * (gap.latinNaturalTrailingSpaceCount ?? 1);
-    gap.measuredWidth -= reduction;
-    gap.latinSpaceCompressionPx = reduction;
+    gap.measuredWidth -= breakerState.latinAppliedPerGap;
+    gap.latinSpaceCompressionPx = breakerState.latinAppliedPerGap;
   }
   breakerState.latinAppliedGapCount = 0;
-  breakerState.latinAppliedSpaceCount = 0;
   breakerState.latinAppliedPerGap = 0;
 }
 
@@ -574,7 +556,7 @@ export function performRejectGap(
   breakerState.queue.restore(snapshot.queue);
   breakerState.currentLine = [];
   breakerState.latinLineGaps = [];
-  breakerState.latinLineSpaceCount = 0;
+  breakerState.mixedSpace = createMixedSpaceState();
   breakerState.inHand = undefined;
   // A replay ends the fragment before the forced unit. If the replay cannot
   // reach that source boundary, the whole fragment is rejected instead.
@@ -659,6 +641,7 @@ export function performFlush(
     operationState.forcedPlacement(followingUnit);
   }
   materializeLatinSpaceCompression();
+  performSettleMixedSpaces(operationState);
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
     currentLine: breakerState.currentLine,
@@ -812,7 +795,6 @@ export function performFlush(
   breakerState.latinLineFace = undefined;
   breakerState.latinLineHomogeneous = true;
   breakerState.latinLineGaps = [];
-  breakerState.latinLineSpaceCount = 0;
   breakerState.latinUniformGapCapacity = undefined;
   breakerState.isFirst = false;
   startLine(lineHeadRequirement(nextStart));
@@ -936,24 +918,18 @@ export function performAddToLine(
     'text' in s &&
     s.latinSpaceCompressionEligible === true &&
     s.latinSpaceAverageWidthRatio != null &&
-    s.fontRoute &&
-    s.latinNaturalTrailingSpacePx !== undefined
+    s.fontRoute
   ) {
-    // WORD_COMPRESSED_SPACE_LINE_FIT: every U+0020 on the line shrinks alike,
-    // so every space-bearing segment must share one face, size and floor.
     if (breakerState.latinLineFace && !sameLatinSpaceFace(s, breakerState.latinLineFace)) {
       materializeLatinSpaceCompression();
       breakerState.latinLineHomogeneous = false;
     }
     breakerState.latinLineFace ??= s;
-    {
-      const spaceCount = s.latinNaturalTrailingSpaceCount ?? 1;
+    if (s.latinNaturalTrailingSpacePx !== undefined) {
       const floor =
-        wordCompressedSpaceFloor(calcEffectiveFontPx(s, scale), s.latinSpaceAverageWidthRatio) *
-          charScaleFactor(s) +
+        ((calcEffectiveFontPx(s, scale) * s.latinSpaceAverageWidthRatio) / 2) * charScaleFactor(s) +
         segmentCharacterGridDeltaPx(s, characterGrid, scale);
-      // Per-space capacity; the line total multiplies by its space count.
-      const capacity = Math.max(0, s.latinNaturalTrailingSpacePx / spaceCount - floor);
+      const capacity = Math.max(0, s.latinNaturalTrailingSpacePx - floor);
       if (
         breakerState.latinUniformGapCapacity !== undefined &&
         Math.abs(capacity - breakerState.latinUniformGapCapacity) > 1e-6
@@ -963,12 +939,12 @@ export function performAddToLine(
       }
       breakerState.latinUniformGapCapacity ??= capacity;
       breakerState.latinLineGaps.push(s);
-      breakerState.latinLineSpaceCount += spaceCount;
     }
-  } else if (!compressedSpaceNeutral(s)) {
+  } else {
     materializeLatinSpaceCompression();
     breakerState.latinLineHomogeneous = false;
   }
+  performTrackMixedSpaces(operationState, s);
   if (h > breakerState.lineHeight) breakerState.lineHeight = h;
   if ('imagePath' in s && s.inlinePicture === true) {
     breakerState.lineHasInlinePicture = true;
@@ -1209,15 +1185,11 @@ export function performStrAdvance(
   );
 }
 
-/** Shrinkable-space requirement of WORD_COMPRESSED_SPACE_LINE_FIT (and the
- * Latin projection WORD_LATIN_INTERWORD_XAVG_FLOOR) for appending `next`
- * with fit width `nextFitWidth`: the total U+0020 reduction, or undefined when
- * the candidate belongs on the next line. Pure: the breaker state is not changed. */
-export function performCompressedSpaceRequirement(
+export function performFitHomogeneousLatinSpaces(
   operationState: PassOperationState,
   next: LayoutTextSeg,
   nextFitWidth: number,
-): number | undefined {
+): boolean {
   const {
     breakerState,
     sameLatinSpaceFace,
@@ -1225,101 +1197,45 @@ export function performCompressedSpaceRequirement(
     fitsMeasuredWidth,
     characterGrid,
     baseRtl,
+    isJustified,
     widthPolicy,
-    strNaturalAdvance,
-    scale,
   } = operationState;
 
-  const gapFace = breakerState.latinLineFace;
   if (
+    isJustified ||
     baseRtl ||
     widthPolicy !== 'bounded' ||
     characterGrid?.type === 'snapToChars' ||
+    (characterGrid?.type === 'linesAndChars' && next.widthBalanceGridDeltaFactor !== 0.5) ||
+    next.latinSpaceCompressionEligible !== true ||
+    next.latinSpaceAverageWidthRatio == null ||
     !next.fontRoute ||
     next.rtl ||
     next.verticalRun ||
     next.tateChuYoko ||
     next.fitTextRegionIndex !== undefined ||
     !breakerState.latinLineHomogeneous ||
-    !gapFace ||
-    breakerState.latinLineSpaceCount === 0
+    !breakerState.latinLineFace ||
+    !sameLatinSpaceFace(next, breakerState.latinLineFace) ||
+    breakerState.latinLineGaps.length === 0
   )
-    return undefined;
-  // A candidate holding U+0020 must share the line's space face; text without
-  // spaces keeps its natural advance in any face or script.
-  if (next.text.includes(' ')) {
-    if (next.latinSpaceCompressionEligible !== true || !sameLatinSpaceFace(next, gapFace)) {
-      return undefined;
-    }
-  } else if (!compressedSpaceNeutral(next)) {
-    return undefined;
-  }
-  if (characterGrid?.type === 'linesAndChars') {
-    if (next.widthBalanceGridDeltaFactor !== 0.5) return undefined;
-  }
-  const totalCapacity = (breakerState.latinUniformGapCapacity ?? 0) * breakerState.latinLineSpaceCount;
-  if (totalCapacity <= 0) return undefined;
-  const naturalWidth =
-    breakerState.currentWidth + breakerState.latinAppliedPerGap * breakerState.latinAppliedSpaceCount;
-  const required = Math.max(0, naturalWidth + nextFitWidth - availW());
+    return false;
+  const totalCapacity =
+    (breakerState.latinUniformGapCapacity ?? 0) * breakerState.latinLineGaps.length;
+  if (totalCapacity <= 0) return false;
+  const restored = breakerState.latinAppliedPerGap * breakerState.latinAppliedGapCount;
+  const required = Math.max(0, breakerState.currentWidth + restored + nextFitWidth - availW());
   if (
     required > totalCapacity ||
-    !fitsMeasuredWidth(naturalWidth + nextFitWidth - required, availW())
+    !fitsMeasuredWidth(breakerState.currentWidth + restored + nextFitWidth - required, availW())
   ) {
-    return undefined;
+    return false;
   }
-  // An East Asian final character may overflow by at most half its font
-  // size, measured naturally and without trailing closing punctuation
-  // (which keeps its own line-end compression).
-  const visible = next.text.replace(/ +$/u, '');
-  let core = visible;
-  while (core.length > 0 && COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(core.at(-1)!)) {
-    core = core.slice(0, -1);
-  }
-  const lastCharacter = core.at(-1) ?? lastVisibleLineCharacter(breakerState.currentLine);
-  const limit = wordCompressedSpaceEastAsianOverflowLimit(
-    lastCharacter !== undefined && EAST_ASIAN_RE.test(lastCharacter),
-    calcEffectiveFontPx(next, scale),
-  );
-  if (limit !== undefined) {
-    const coreWidth = core.length > 0 ? strNaturalAdvance(next, core) : 0;
-    if (naturalWidth + coreWidth - availW() > limit + 1e-9) return undefined;
-  }
-  return required;
-}
-
-function lastVisibleLineCharacter(line: readonly LayoutSeg[]): string | undefined {
-  for (let index = line.length - 1; index >= 0; index -= 1) {
-    const item = line[index]!;
-    if (!('text' in item)) return undefined;
-    const visible = item.text.replace(/ +$/u, '');
-    if (visible.length > 0) return visible.at(-1);
-  }
-  return undefined;
-}
-
-/** Commit a requirement returned by performCompressedSpaceRequirement. Each
- * retained space is written once when the line is finalized. */
-export function performApplyCompressedSpaces(
-  operationState: PassOperationState,
-  required: number,
-): void {
-  const { breakerState } = operationState;
-  const restored = breakerState.latinAppliedPerGap * breakerState.latinAppliedSpaceCount;
+  // Keep aggregate fit width current. Write each retained gap exactly once
+  // when the line is finalized, avoiding quadratic work on long lines.
   breakerState.currentWidth += restored - required;
   breakerState.latinAppliedGapCount = breakerState.latinLineGaps.length;
-  breakerState.latinAppliedSpaceCount = breakerState.latinLineSpaceCount;
-  breakerState.latinAppliedPerGap = required / breakerState.latinLineSpaceCount;
-}
-
-export function performFitHomogeneousLatinSpaces(
-  operationState: PassOperationState,
-  next: LayoutTextSeg,
-  nextFitWidth: number,
-): boolean {
-  const required = performCompressedSpaceRequirement(operationState, next, nextFitWidth);
-  if (required === undefined) return false;
-  performApplyCompressedSpaces(operationState, required);
+  breakerState.latinAppliedPerGap = required / breakerState.latinAppliedGapCount;
   return true;
 }
 

@@ -1253,14 +1253,8 @@ function emitResolvedTextSegment(
     resolvedSpan?.script ??
     authoritativeSpan?.script ??
     (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
-  // WORD_COMPRESSED_SPACE_LINE_FIT: compatibility modes below 15 with a
-  // compressing characterSpacingControl. Mode-15 justified lines belong to
-  // WORD_JUSTIFIED_INTERWORD_COMPRESSION; mode-15 left lines keep natural spaces.
   const latinSpaceCompressionEligible =
-    wordCompressedSpaceLineFitApplies(
-      environment.compatibilityMode,
-      environment.characterSpacingControl,
-    ) &&
+    environment.characterSpacingControl === 'compressPunctuation' &&
     // MS-OE376 §2.1.472 requires full advance for fit with this
     // compatibility switch, even if display uses compression. This gate
     // covers the measured Latin fit behavior; display-space placement
@@ -1274,11 +1268,29 @@ function emitResolvedTextSegment(
     !emissionState.reduced &&
     effectiveVertAlign == null &&
     (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
-    // The w:kern threshold and enableOpenTypeFeatures do not gate the space
-    // projection (WORD_COMPRESSED_SPACE_LINE_FIT kern/OpenType controls).
-    (effectiveCharacterScale == null || effectiveCharacterScale === 1);
+    (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
+    effectiveKerningThreshold == null;
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)
+    : undefined;
+  // WORD_COMPRESSED_SPACE_LINE_FIT: U+0020 on mixed East Asian / Latin lines.
+  // The line breaker applies it only once its line holds East Asian text;
+  // OpenType features and explicit kerning thresholds do not gate it.
+  const mixedSpaceCompressionEligible =
+    wordCompressedSpaceLineFitApplies(
+      environment.compatibilityMode,
+      environment.characterSpacingControl,
+    ) &&
+    environment.lineWrapLikeWord6 !== true &&
+    environment.verticalCJK !== true &&
+    documentCharacterCompressionApplies &&
+    (resolvedScript === 'ascii' || resolvedScript === 'highAnsi') &&
+    !emissionState.reduced &&
+    effectiveVertAlign == null &&
+    (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
+    (effectiveCharacterScale == null || effectiveCharacterScale === 1);
+  const mixedSpaceAverageWidthRatio = mixedSpaceCompressionEligible
+    ? latinSpaceAverageWidthRatio ?? selectedAverageWidth(resolvedSpan?.font, text)
     : undefined;
   const widthBalanceGridDeltaFactor = environment.balanceSingleByteDoubleByteWidth
     ? wordBalancedLinesAndCharsGridDeltaFactor(text, resolvedScript)
@@ -1331,6 +1343,9 @@ function emitResolvedTextSegment(
     resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
     ...(latinSpaceAverageWidthRatio != null && latinSpaceAverageWidthRatio > 0
       ? { latinSpaceAverageWidthRatio, latinSpaceCompressionEligible: true as const }
+      : {}),
+    ...(mixedSpaceAverageWidthRatio != null && mixedSpaceAverageWidthRatio > 0
+      ? { mixedSpaceAverageWidthRatio }
       : {}),
     vertAlign: effectiveVertAlign,
     measuredWidth: 0,
