@@ -2,6 +2,7 @@ import type { ParagraphLayoutRun, ParagraphTextBearingRun } from '../layout/text
 import type { LineLayoutEnvironment } from './model.js';
 import { resolveFieldText } from './text-runs.js';
 import type { FieldRun } from '../types.js';
+import type { RunTypographyAcquisitionInput, TypographyValueInput } from '../layout/typography-input.js';
 
 export interface TextSequenceSource {
   readonly runIndex: number;
@@ -31,15 +32,47 @@ function visibleTextRun(run: ParagraphLayoutRun, environment: LineLayoutEnvironm
   return projected as Extract<ParagraphTextBearingRun, { type: 'text' }>;
 }
 
-function formattingKey(run: Extract<ParagraphTextBearingRun, { type: 'text' }>, environment: LineLayoutEnvironment): string {
-  const { text: _text, type: _type, isLink: _isLink, ...properties } = run;
-  const record = properties as Record<string, unknown>;
-  // A field's instruction/result and revision provenance are source ownership,
-  // not text formatting. Markup-view revisions still own their painted style.
-  delete record.fieldType;
-  delete record.instruction;
-  delete record.fallbackText;
-  if (environment.showTrackedChanges !== true) delete record.revision;
+type SequenceRun = Extract<ParagraphTextBearingRun, { type: 'text' }> & Readonly<{
+  typographyInput?: RunTypographyAcquisitionInput;
+}>;
+
+function formattingKey(run: SequenceRun, environment: LineLayoutEnvironment): string {
+  const input = run.typographyInput;
+  const effective = <T>(value: TypographyValueInput<T> | undefined, fallback: T | undefined) =>
+    value?.status === 'valid' && value.value !== null ? value.value : fallback;
+  // Closed projection of resolved layout/paint facts. Never serialize a source
+  // run wholesale: parser sidecars also carry sourceText, field instructions,
+  // revision ids and lexical spellings that must not partition glyph streams.
+  // Paint differences still delimit sequences; changed-format shaping is not
+  // established by the identical-format invariant.
+  const record = {
+    fontSize: run.fontSize, fontFamily: run.fontFamily,
+    fontFamilyHighAnsi: run.fontFamilyHighAnsi, fontFamilyEastAsia: run.fontFamilyEastAsia,
+    fontFamilyCs: run.fontFamilyCs, fontSlots: run.fontSlots, fontHint: run.fontHint,
+    fontSizeCs: run.fontSizeCs, bold: run.bold, italic: run.italic,
+    boldCs: run.boldCs, italicCs: run.italicCs, rtl: run.rtl, cs: run.cs,
+    langBidi: run.langBidi, langEastAsia: run.langEastAsia,
+    vertAlign: effective(input?.verticalAlign, run.vertAlign ?? undefined),
+    position: effective(input?.positionPt, run.position),
+    charSpacing: input?.characterSpacingPt ?? run.charSpacing,
+    charScale: input?.characterScale ?? run.charScale,
+    kerning: input?.kerningThresholdPt ?? run.kerning,
+    snapToGrid: input?.snapToGrid ?? run.snapToGrid,
+    allCaps: run.allCaps, smallCaps: run.smallCaps,
+    underline: run.underline, underlineStyle: run.underlineStyle, underlineColor: run.underlineColor,
+    strikethrough: run.strikethrough, doubleStrikethrough: run.doubleStrikethrough,
+    color: run.color, colorAuto: run.colorAuto, background: run.background,
+    highlight: run.highlight, emphasisMark: run.emphasisMark, border: run.border,
+    hyperlink: run.hyperlink, hyperlinkAnchor: run.hyperlinkAnchor,
+    // Markup colors/decorations depend on kind and effective author color, not
+    // revision identity. Final view does not paint revision markup.
+    revision: environment.showTrackedChanges === true && run.revision ? {
+      kind: run.revision.kind,
+      color: environment.revisionAuthorColor?.(run.revision.author) ?? '#C00000',
+    } : undefined,
+    textBoxLineFloor: (run as SequenceRun & { textBoxLineFloor?: boolean }).textBoxLineFloor,
+    textBoxVertical: (run as SequenceRun & { textBoxVertical?: boolean }).textBoxVertical,
+  };
   return JSON.stringify(record, (_key, value: unknown) =>
     value && typeof value === 'object' && !Array.isArray(value)
       ? Object.fromEntries(Object.entries(value).filter(([, v]) => v != null)
@@ -78,15 +111,22 @@ export function acquireTextSequences(
   })) return sequences;
   let start = -1;
   let key: string | undefined;
-  let first: Extract<ParagraphTextBearingRun, { type: 'text' }> | undefined;
+  let first: SequenceRun | undefined;
   let texts: string[] = [];
   let sources: TextSequenceSource[] = [];
   let offset = 0;
   const finish = () => {
-    if (first && sources.length > 1) sequences.set(start, {
-      run: Object.freeze({ ...first, text: texts.join('') }),
-      sources: Object.freeze(sources),
-    });
+    if (first && sources.length > 1) {
+      const text = texts.join('');
+      sequences.set(start, {
+        run: Object.freeze({ ...first, text,
+          ...(first.typographyInput ? { typographyInput: Object.freeze({
+            ...first.typographyInput, sourceText: text,
+          }) } : {}),
+        }),
+        sources: Object.freeze(sources),
+      });
+    }
     start = -1;
     first = undefined;
     texts = [];

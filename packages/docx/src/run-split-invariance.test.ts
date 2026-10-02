@@ -3,7 +3,6 @@ import { createTextLayoutService } from './layout/text.js';
 import { readFile } from 'node:fs/promises';
 import init, { DocxArchive } from './wasm/docx_parser.js';
 import { storeZip } from './conformance/generate.js';
-import { normalizeInternalDocumentModel } from './parser-model.js';
 import { measureParagraphIntrinsicWidths } from './layout/intrinsic-width.js';
 import { acquireShapeTextBoxLayout } from './layout/paragraph.js';
 import type { ParagraphLayoutContext } from './layout-context.js';
@@ -81,7 +80,7 @@ function paragraphs(layout: DocumentLayout): ParagraphLayout[] {
   const visit = (value: unknown): void => {
     if (!value || typeof value !== 'object' || seen.has(value)) return;
     seen.add(value);
-    if ('kind' in value && value.kind === 'paragraph') {
+    if ('kind' in value && value.kind === 'paragraph' && 'lines' in value && 'textBoxes' in value) {
       const p = value as ParagraphLayout;
       result.push(p);
       p.textBoxes.forEach(visit);
@@ -167,60 +166,83 @@ beforeAll(async () => {
   await init({ module_or_path: await readFile(new URL('./wasm/docx_parser_bg.wasm', import.meta.url)) });
 });
 
-function parsedRuns(parts: string[], wrapper: string): DocParagraph['runs'] {
+// Feed the complete WASM wire graph to the production source-store adapter.
+// Extracting public runs here would discard the retained typography inputs and
+// would miss a content-dependent acquisition key (the r4 regression).
+function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTextRun> = {}): DocxDocumentModel {
   const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-  const prop = '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="36"/><w:kern w:val="16"/></w:rPr>';
-  const runs = parts.map((text, index) => `<w:r w:rsidR="0000000${index % 8}">${prop}<w:t xml:space="preserve">${text}</w:t></w:r>`);
-  const wrap = (run: string, index: number) => {
+  const O = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const escape = (text: string) => text.replace(/&/gu, '&amp;').replace(/</gu, '&lt;');
+  const runs = parts.map((text, index) => {
+    const content = text.split('\t').map(piece => `<w:t xml:space="preserve">${escape(piece)}</w:t>`).join('<w:tab/>');
+    const run = `<w:r w:rsidR="0000000${index % 8}">${content}</w:r>`;
     if (wrapper === 'smart-tags') return `<w:smartTag w:uri="urn:test" w:element="word">${run}</w:smartTag>`;
     if (wrapper === 'revisions') return `<w:ins w:id="${index}" w:author="Reviewer">${run}</w:ins>`;
     if (wrapper === 'hyperlinks') return `<w:hyperlink w:anchor="Destination">${run}</w:hyperlink>`;
     if (wrapper === 'simple-fields') return `<w:fldSimple w:instr="AUTHOR">${run}</w:fldSimple>`;
     if (wrapper === 'bookmarks') return `<w:bookmarkStart w:id="${index}" w:name="B${index}"/>${run}<w:bookmarkEnd w:id="${index}"/>`;
+    if (wrapper === 'comments') return `<w:commentRangeStart w:id="${index}"/>${run}<w:commentRangeEnd w:id="${index}"/>`;
     if (wrapper === 'proofing') return `<w:proofErr w:type="spellStart"/>${run}<w:proofErr w:type="spellEnd"/>`;
     if (wrapper === 'complex-fields') return `<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>AUTHOR</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>${run}<w:r><w:fldChar w:fldCharType="end"/></w:r>`;
     return run;
-  };
-  const wrapped = runs.map(wrap).join('');
-  const content = wrapper === 'textbox'
-    ? `<w:r><w:pict><v:shape id="box" type="#_x0000_t202" style="width:10.8pt;height:100pt"><v:textbox inset="0,0,0,0"><w:txbxContent><w:p><w:pPr><w:jc w:val="right"/></w:pPr>${wrapped}</w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>`
-    : wrapped;
-  const archive = new DocxArchive(storeZip(new Map([
-    ['[Content_Types].xml', new TextEncoder().encode('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')],
-    ['_rels/.rels', new TextEncoder().encode('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')],
-    ['word/document.xml', new TextEncoder().encode(`<w:document xmlns:w="${W}" xmlns:v="urn:schemas-microsoft-com:vml"><w:body><w:p>${content}</w:p><w:sectPr/></w:body></w:document>`)],
-  ])));
-  try {
-    const doc = normalizeInternalDocumentModel(JSON.parse(new TextDecoder().decode(archive.parse()))).document;
-    const p = doc.body.find(b => b.type === 'paragraph');
-    if (!p || p.type !== 'paragraph') throw new Error('Expected parsed paragraph');
-    return p.runs;
-  } finally { archive.free(); }
+  }).join('');
+  const p = (indented = false) => `<w:p><w:pPr><w:jc w:val="right"/><w:spacing w:before="0" w:after="0"/>${indented ? '<w:ind w:right="3604"/>' : ''}</w:pPr>${runs}</w:p>`;
+  const table = (kind: 'fixed' | 'autofit') => `<w:tbl><w:tblPr><w:tblLayout w:type="${kind}"/><w:tblW w:w="396" w:type="dxa"/><w:tblCellMar><w:top w:w="0"/><w:left w:w="0"/><w:bottom w:w="0"/><w:right w:w="0"/></w:tblCellMar></w:tblPr><w:tblGrid><w:gridCol w:w="396"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="396" w:type="dxa"/></w:tcPr>${p()}</w:tc></w:tr></w:tbl>`;
+  const box = `<w:p><w:r><w:pict><v:shape id="box" type="#_x0000_t202" style="width:19.8pt;height:100pt"><v:textbox inset="0,0,0,0"><w:txbxContent>${p()}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>`;
+  const body = p(true) + table('fixed') + table('autofit') + box + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>';
+  const files = new Map<string, string>([
+    ['word/document.xml', `<w:document xmlns:w="${W}" xmlns:r="${O}" xmlns:v="urn:schemas-microsoft-com:vml"><w:body>${body}<w:sectPr><w:headerReference w:type="default" r:id="hdr"/><w:footerReference w:type="default" r:id="ftr"/><w:pgSz w:w="4000" w:h="20000"/><w:pgMar w:top="2400" w:right="0" w:bottom="2400" w:left="0" w:header="300" w:footer="300"/></w:sectPr></w:body></w:document>`],
+    ['word/styles.xml', `<w:styles xmlns:w="${W}"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${format.fontFamily ?? 'Arial'}" w:hAnsi="${format.fontFamily ?? 'Arial'}"/><w:sz w:val="${2 * (format.fontSize ?? 18)}"/><w:kern w:val="${2 * (format.kerning ?? 8)}"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>`],
+    ['word/settings.xml', `<w:settings xmlns:w="${W}"><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`],
+    ['word/header1.xml', `<w:hdr xmlns:w="${W}">${table('fixed')}</w:hdr>`],
+    ['word/footer1.xml', `<w:ftr xmlns:w="${W}">${table('fixed')}</w:ftr>`],
+    ['word/footnotes.xml', `<w:footnotes xmlns:w="${W}"><w:footnote w:id="1">${table('fixed')}</w:footnote></w:footnotes>`],
+  ]);
+  const relationships = [['hdr', 'header', 'header1.xml'], ['ftr', 'footer', 'footer1.xml'],
+    ['styles', 'styles', 'styles.xml'], ['settings', 'settings', 'settings.xml'], ['notes', 'footnotes', 'footnotes.xml']];
+  files.set('word/_rels/document.xml.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${relationships.map(([id, type, file]) => `<Relationship Id="${id}" Type="${O}/${type}" Target="${file}"/>`).join('')}</Relationships>`);
+  files.set('_rels/.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="doc" Type="${O}/officeDocument" Target="word/document.xml"/></Relationships>`);
+  const partTypes = [['document.xml', 'document.main'], ['header1.xml', 'header'], ['footer1.xml', 'footer'],
+    ['styles.xml', 'styles'], ['settings.xml', 'settings'], ['footnotes.xml', 'footnotes']];
+  files.set('[Content_Types].xml', `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/>${partTypes.map(([file, type]) => `<Override PartName="/word/${file}" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.${type}+xml"/>`).join('')}</Types>`);
+  const archive = new DocxArchive(storeZip(new Map([...files].map(([name, xml]) => [name, new TextEncoder().encode(xml)]))));
+  try { return JSON.parse(new TextDecoder().decode(archive.parse())) as DocxDocumentModel; }
+  finally { archive.free(); }
 }
-
-function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed' | 'autofit') {
-  const p = { ...paragraph([], {}, 'right'), runs };
-  const doc = model(p, 10.8, container);
+function acquireParsed(parts: string[], wrapper: string, format?: Partial<DocxTextRun>) {
+  const doc = parsedDocument(parts, wrapper, format);
   return layoutDocument(doc, createLayoutServices(doc, { measureContext: context() }));
 }
 
-describe('parsed structural splits feed the same production text sequence', () => {
-  it.each(['rsid', 'smart-tags', 'revisions', 'hyperlinks', 'simple-fields', 'complex-fields', 'bookmarks', 'proofing', 'textbox'])(
-    '%s preserves glyph geometry across split result runs', wrapper => {
-      const whole = parsedRuns(['T i'], wrapper);
-      if (wrapper === 'textbox') {
-        const boxes = geometry(acquireRuns(whole, 'paragraph'));
-        expect(boxes).toHaveLength(2);
-        expect(boxes[1]?.lines.map(line => line.text)).toEqual(['T', ' i']);
-      }
-      for (const container of ['paragraph', 'fixed', 'autofit'] as const) {
-        const expected = geometry(acquireRuns(whole, container));
-        for (const parts of partitions('T i')) {
-          expect(geometry(acquireRuns(parsedRuns(parts, wrapper), container)), `${container}/${parts.join('|')}`).toEqual(expected);
-        }
+function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed' | 'autofit') {
+  const doc = model({ ...paragraph([], {}, 'right'), runs }, 10.8, container);
+  return layoutDocument(doc, createLayoutServices(doc, { measureContext: context() }));
+}
+
+describe('complete DOCX parser inputs preserve formatting-only split invariance', () => {
+  it.each(['rsid', 'smart-tags', 'revisions', 'hyperlinks', 'simple-fields', 'complex-fields', 'bookmarks', 'comments', 'proofing'])(
+    '%s preserves all story/container geometry with inherited formatting', wrapper => {
+      const layout = acquireParsed(['T i'], wrapper);
+      expect(new Set(paragraphs(layout).map(p => p.source.story))).toEqual(new Set(['body', 'header', 'footer', 'footnote', 'textbox']));
+      const expected = JSON.stringify(geometry(layout));
+      // An independent accepted boundary for the native Arial T-space pair.
+      expect(geometry(layout).some(p => p.lines.length === 1 && p.lines[0]?.text === 'T i')).toBe(true);
+      for (const parts of partitions('T i')) {
+        expect(JSON.stringify(geometry(acquireParsed(parts, wrapper))), parts.join('|')).toBe(expected);
       }
     },
   );
+  it.each([
+    { text: 'AVAT i-AV T i', fontFamily: 'Arial', fontSize: 18, kerning: 8 },
+    { text: ' T i AV-T  i ', fontFamily: 'Times New Roman', fontSize: 10, kerning: 10 },
+    { text: 'AV T i\tAV-T i', fontFamily: 'Georgia', fontSize: 24, kerning: 24.5 },
+    { text: 'AV-T i T  i', fontFamily: 'Arial', fontSize: 18, kerning: 0 },
+  ])('keeps parser-backed threshold and separator boundaries for $fontFamily / $kerning', ({ text, ...format }) => {
+    const expected = JSON.stringify(geometry(acquireParsed([text], 'proofing', format)));
+    for (const parts of partitions(text)) {
+      expect(JSON.stringify(geometry(acquireParsed(parts, 'proofing', format))), parts.join('|')).toBe(expected);
+    }
+  }, 15000);
 });
 
 const contextPt: ParagraphLayoutContext = {
