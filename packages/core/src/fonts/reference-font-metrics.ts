@@ -1,3 +1,4 @@
+import { retainFontSupportFacts, type FontSupportFacts } from '../internal/font-support-facts.js';
 import referenceData from './reference-font-metrics-data.json';
 import { OPEN_FONT_REFERENCE_PROFILES } from './reference-font-metrics-open.js';
 
@@ -27,7 +28,7 @@ export interface ReferenceFontMetricProfile {
    * table; undefined means this source did not record the field. */
   readonly panose?: readonly [familyType: number, serifStyle: number] | null;
   /** True when the face's Unicode cmap maps a CJK Unified Ideograph
-   * (U+4E00–U+9FFF). Null means the face has no Unicode cmap; undefined means
+   * (U+4E00–U+9FFF). Null includes unreadable/disagreeing maps; undefined means
    * this source did not record coverage. */
   readonly cjkUnifiedIdeographs?: boolean | null;
   /** Unicode cmap presence within the catalogue's bounded symbol domain.
@@ -45,6 +46,8 @@ export interface FindReferenceFontMetricsOptions {
   readonly style?: ReferenceFontStyle;
 }
 
+type ParsedReferenceCoverage = Readonly<{ symbol: readonly number[] | null; cjk: number | null }>;
+const parsedCoverage = new WeakMap<ReferenceFontMetricProfile, ParsedReferenceCoverage>();
 function freezeProfile(profile: ReferenceFontMetricProfile): ReferenceFontMetricProfile {
   Object.freeze(profile.aliases);
   Object.freeze(profile.hhea);
@@ -52,6 +55,18 @@ function freezeProfile(profile: ReferenceFontMetricProfile): ReferenceFontMetric
   if (profile.typoMetrics) Object.freeze(profile.typoMetrics);
   if (profile.panose) Object.freeze(profile.panose);
   if (profile.symbolCoverage) Object.freeze(profile.symbolCoverage);
+  // Private certificate association survives projection/freezing without
+  // widening the public catalogue metric contract. Missing facts stay unknown.
+  const support = (profile as ReferenceFontMetricProfile & { supportFacts?: FontSupportFacts }).supportFacts;
+  if (support) {
+    if (support.erasureSafeRanges) { support.erasureSafeRanges.forEach(Object.freeze); Object.freeze(support.erasureSafeRanges); }
+    retainFontSupportFacts(profile, Object.freeze(support));
+  }
+  const scalar = profile as ReferenceFontMetricProfile & { symbolPossibleCoverage?: readonly number[] | null; cjkPossibleCoverage?: number | null };
+  if ('symbolPossibleCoverage' in scalar) {
+    if (scalar.symbolPossibleCoverage) Object.freeze(scalar.symbolPossibleCoverage);
+    parsedCoverage.set(profile, Object.freeze({ symbol: scalar.symbolPossibleCoverage ?? null, cjk: scalar.cjkPossibleCoverage ?? null }));
+  }
   return Object.freeze(profile);
 }
 
@@ -65,6 +80,8 @@ function getProfiles(): readonly ReferenceFontMetricProfile[] {
   return profiles ??= Object.freeze(
     [...referenceData.profiles.map((profile) => ({
       ...profile,
+      symbolPossibleCoverage: profile.symbolPossibleCoverage === null ? null
+        : referenceData.symbolCoverages[profile.symbolPossibleCoverage],
       symbolCoverage: profile.symbolCoverage === null ? null
         : referenceData.symbolCoverages[profile.symbolCoverage],
     })) as unknown as ReferenceFontMetricProfile[],
@@ -142,7 +159,9 @@ export function referenceFontCoversSymbol(
   codePoint: number,
 ): boolean | undefined {
   if (!isReferenceSymbolCodePoint(codePoint) || profile.symbolCoverage == null) return undefined;
-  return coverageIncludes(profile.symbolCoverage, codePoint);
+  if (coverageIncludes(profile.symbolCoverage, codePoint)) return true;
+  const parsed = parsedCoverage.get(profile);
+  return !parsed ? false : parsed.symbol === null || coverageIncludes(parsed.symbol, codePoint) ? undefined : false;
 }
 
 /** Per-cut CJK cmap coverage; outside the generated domain stays unknown. */
@@ -158,7 +177,11 @@ export function referenceFontCoversCjk(
   for (const [lo, hi] of referenceData.cjkCoverageRanges) {
     if (codePoint >= lo && codePoint <= hi) {
       const index = offset + codePoint - lo;
-      return (bits[index >>> 3] & (1 << (index & 7))) !== 0;
+      if ((bits[index >>> 3] & (1 << (index & 7))) !== 0) return true;
+      const parsed = parsedCoverage.get(profile);
+      if (!parsed) return false;
+      const possible = parsed.cjk === null ? undefined : cjkBitmap(parsed.cjk);
+      return !possible || (possible[index >>> 3] & (1 << (index & 7))) !== 0 ? undefined : false;
     }
     offset += hi - lo + 1;
   }

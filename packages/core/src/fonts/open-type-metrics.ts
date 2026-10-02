@@ -1,3 +1,4 @@
+import { parseFontSupportFacts, retainFontSupportFacts, takeFontErasureGlyphs } from '../internal/font-support-facts.js';
 /** Raw line metrics read from one OpenType face. Values remain in design units;
  * format consumers decide which table and compatibility rule governs layout. */
 export interface OpenTypeLineMetrics {
@@ -21,6 +22,8 @@ export interface OpenTypeLineMetrics {
   readonly farEastCodePage?: boolean | null;
   /** True only when a Unicode cmap maps at least one East Asian code point to
    * a non-zero glyph in this face. */
+  // Compatibility classification for legacy line allocation, not an absence
+  // certificate. Resource fallback uses unicodeRanges/unicodePossibleRanges.
   readonly hasEastAsianCmap: boolean;
   /** Scalar ranges proven by the caller-resource parser; omitted by the legacy
    * line-metric API so its existing embedded-font policy remains unchanged. */
@@ -229,6 +232,8 @@ function format4UnicodeCoverage(
   offset: number,
   availableLength: number,
   budget: CoverageWorkBudget,
+  glyphCount: number,
+  erasing?: ReadonlySet<number>,
 ): Array<readonly [number, number]> | null {
   if (availableLength < 16) return null;
   const length = view.getUint16(offset + 2);
@@ -271,11 +276,12 @@ function format4UnicodeCoverage(
         ? (codePoint + delta) & 0xffff
         : (() => {
             const glyphPosition = rangeOffsetPosition + rangeOffset + (codePoint - start) * 2;
-            if (glyphPosition + 2 > offset + length) return 0;
+            if (glyphPosition + 2 > offset + length) return Number.NaN;
             const raw = view.getUint16(glyphPosition);
             return raw === 0 ? 0 : (raw + delta) & 0xffff;
           })();
-      if (glyph !== 0) append(codePoint);
+      if (!Number.isInteger(glyph) || glyph >= glyphCount) return null;
+      if (glyph !== 0 && !erasing?.has(glyph)) append(codePoint);
       if (covered.length > MAX_CMAP_COVERAGE_RANGES) return null;
     }
   }
@@ -288,6 +294,8 @@ function format12Or13UnicodeCoverage(
   availableLength: number,
   constantGlyph: boolean,
   budget: CoverageWorkBudget,
+  glyphCount: number,
+  erasing?: ReadonlySet<number>,
 ): Array<readonly [number, number]> | null {
   if (availableLength < 16) return null;
   const length = view.getUint32(offset + 4);
@@ -304,11 +312,22 @@ function format12Or13UnicodeCoverage(
     const startGlyph = view.getUint32(group + 8);
     if (start > end || end > 0x10ffff || start <= previousEnd) return null;
     previousEnd = end;
+    if (startGlyph >= glyphCount || (!constantGlyph && startGlyph + end - start >= glyphCount)) return null;
     if (constantGlyph) {
-      if (startGlyph !== 0) covered.push([start, end]);
+      if (startGlyph !== 0 && !erasing?.has(startGlyph)) covered.push([start, end]);
     } else {
       const mappedStart = startGlyph === 0 ? start + 1 : start;
-      if (mappedStart <= end) covered.push([mappedStart, end]);
+      if (!erasing) { if (mappedStart <= end) covered.push([mappedStart, end]); }
+      else {
+        let from = -1;
+        for (let cp = mappedStart; cp <= end; cp++) {
+          if (--budget.remaining < 0) return null;
+          const safe = !erasing.has(startGlyph + cp - start);
+          if (safe && from < 0) from = cp;
+          if (from >= 0 && (!safe || cp === end)) { covered.push([from, safe ? cp : cp - 1]); from = -1; }
+          if (covered.length > MAX_CMAP_COVERAGE_RANGES) return null;
+        }
+      }
     }
   }
   return covered;
@@ -323,8 +342,10 @@ function format12Or13UnicodeCoverage(
 function cmapUnicodeCoverage(
   view: DataView,
   table: Readonly<{ offset: number; length: number }> | undefined,
+  glyphCount: number | undefined,
+  erasing?: ReadonlySet<number>,
 ): Pick<OpenTypeLineMetrics, 'unicodeRanges' | 'unicodePossibleRanges'> {
-  if (!table || table.length < 4) return { unicodeRanges: [] };
+  if (!glyphCount || !table || table.length < 4) return { unicodeRanges: [] };
   const recordCount = view.getUint16(table.offset + 2);
   if (recordCount > MAX_CMAP_ENCODING_RECORDS || 4 + recordCount * 8 > table.length) return { unicodeRanges: [] };
   const seenOffsets = new Set<number>();
@@ -359,9 +380,9 @@ function cmapUnicodeCoverage(
   const unionBudget: CoverageWorkBudget = { remaining: MAX_CMAP_COVERAGE_WORK };
   for (const candidate of candidates) {
     const parsed = candidate.format === 4
-      ? format4UnicodeCoverage(view, candidate.subtable, candidate.availableLength, budget)
+      ? format4UnicodeCoverage(view, candidate.subtable, candidate.availableLength, budget, glyphCount, erasing)
       : format12Or13UnicodeCoverage(
-          view, candidate.subtable, candidate.availableLength, candidate.format === 13, budget,
+          view, candidate.subtable, candidate.availableLength, candidate.format === 13, budget, glyphCount, erasing,
         );
     if (!parsed) return { unicodeRanges: [] };
     // Linear merge keeps both retained coverage sets under the same range limits,
@@ -516,9 +537,15 @@ function readOpenTypeLineMetrics(
   const hasWindowsMetrics = os2 !== undefined && os2.length >= 78;
   const hasCodePageRanges = os2 !== undefined && os2.length >= 86
     && view.getUint16(os2.offset) >= 1;
-  const coverage = resourceCoverage ? cmapUnicodeCoverage(view, tables.get(CMAP)) : undefined;
+  let support = resourceCoverage ? parseFontSupportFacts(view, tables) : undefined;
+  const coverage = resourceCoverage ? cmapUnicodeCoverage(view, tables.get(CMAP), support?.glyphCount) : undefined;
   const unicodeRanges = coverage?.unicodeRanges;
-  return Object.freeze({
+  const erasing = support && takeFontErasureGlyphs(support);
+  if (support && erasing) {
+    const safe = cmapUnicodeCoverage(view, tables.get(CMAP), support.glyphCount, erasing);
+    support = Object.freeze({ ...support, erasureSafeRanges: safe.unicodePossibleRanges ? safe.unicodeRanges : undefined });
+  }
+  const result = Object.freeze({
     unitsPerEm,
     ...(averageCharWidth > 0
       ? { averageCharWidthRatio: averageCharWidth / unitsPerEm }
@@ -529,8 +556,8 @@ function readOpenTypeLineMetrics(
     farEastCodePage: hasCodePageRanges
       ? (view.getUint32(os2.offset + 78) & 0x001e0000) !== 0
       : null,
-    hasEastAsianCmap: unicodeRanges
-      ? rangesContainEastAsianGlyph(unicodeRanges)
+    hasEastAsianCmap: coverage?.unicodePossibleRanges
+      ? rangesContainEastAsianGlyph(unicodeRanges as readonly (readonly [number, number])[])
       : cmapHasEastAsianGlyph(view, tables.get(CMAP)),
     ...coverage,
     ...(hasWindowsMetrics ? {
@@ -542,4 +569,6 @@ function readOpenTypeLineMetrics(
       useTypoMetrics: (view.getUint16(os2.offset + 62) & 0x0080) !== 0,
     } : {}),
   });
+  if (support) retainFontSupportFacts(result, support);
+  return result;
 }

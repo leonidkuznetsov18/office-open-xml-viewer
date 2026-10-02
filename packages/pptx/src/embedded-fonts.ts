@@ -1,9 +1,11 @@
+import { fontSupportFacts, type FontSupportFacts } from '@silurus/ooxml-core/internal/font-cluster-coverage';
 import {
   parseOpenTypeResourceMetrics,
   registerEmbeddedFonts,
   unregisterEmbeddedFonts,
   type EmbeddedFontFace,
   type OfficeFontFallbackRequest,
+  type OpenTypeLineMetrics,
 } from '@silurus/ooxml-core';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 import { powerPointResourceFaceMetrics, type PowerPointFaceMetrics } from './powerpoint-line-metrics.js';
@@ -11,7 +13,13 @@ import { powerPointResourceFaceMetrics, type PowerPointFaceMetrics } from './pow
 /** A style slot may contain several subset resources (§19.2.1.9/.10).
  * Entries follow FontFaceSet insertion order, including unreadable resources;
  * undefined is an ownership barrier, not permission to borrow another part. */
-export type PptxEmbeddedFontMetrics = ReadonlyMap<string, readonly (PowerPointFaceMetrics | undefined)[]>;
+export interface PptxEmbeddedFontResource {
+  readonly identity: string;
+  readonly metrics: PowerPointFaceMetrics | undefined;
+  readonly tables: OpenTypeLineMetrics | undefined;
+  readonly support: FontSupportFacts | undefined;
+}
+export type PptxEmbeddedFontMetrics = ReadonlyMap<string, readonly PptxEmbeddedFontResource[]>;
 
 export interface LoadedPptxEmbeddedFonts {
   readonly faces: FontFace[];
@@ -72,7 +80,7 @@ export async function loadEmbeddedFonts(
   // FontFace identity, rather than family/style, binds each successful
   // registration to its own tables. CT_EmbeddedFontList has no uniqueness
   // constraint; distinct same-slot parts can cover different glyph subsets.
-  const parsed = new Map<FontFace, PowerPointFaceMetrics | undefined>();
+  const parsed = new Map<FontFace, PptxEmbeddedFontResource>();
   const batchSize = 2;
   for (let offset = 0; offset < refs.length; offset += batchSize) {
     const faces = await Promise.all(refs.slice(offset, offset + batchSize).map(
@@ -98,7 +106,7 @@ export async function loadEmbeddedFonts(
       // Register separately to retain the input-resource → FontFace binding
       // even when a sibling fails. Calls add synchronously in input order;
       // only their load/readiness waits run concurrently (at most two).
-      return { faces: await registerEmbeddedFonts([resource]), metrics };
+      return { faces: await registerEmbeddedFonts([resource]), metrics, tables: tables ?? undefined, support: fontSupportFacts(tables ?? undefined) };
     }));
     for (const registration of registrations) {
       for (const face of registration.faces) {
@@ -109,7 +117,8 @@ export async function loadEmbeddedFonts(
         } else {
           held.add(face);
           loaded.push(face);
-          parsed.set(face, registration.metrics);
+          parsed.set(face, Object.freeze({ identity: `pptx:${scope}:${loaded.length}`,
+            metrics: registration.metrics, tables: registration.tables, support: registration.support }));
         }
       }
     }
@@ -128,12 +137,12 @@ export async function loadEmbeddedFonts(
     const authored = authoredFamilies.get(face.family) as string;
     return `${authored}:${face.weight === 'bold' || face.weight === '700' ? 700 : 400}:${face.style === 'italic' ? 'italic' : 'normal'}`;
   }));
-  const metrics = new Map<string, (PowerPointFaceMetrics | undefined)[]>();
+  const metrics = new Map<string, PptxEmbeddedFontResource[]>();
   for (const face of loaded) {
     const authored = authoredFamilies.get(face.family) as string;
     const key = `${authored}:${face.weight === 'bold' || face.weight === '700' ? 700 : 400}:${face.style === 'italic' ? 'italic' : 'normal'}`;
     const resources = metrics.get(key) ?? [];
-    resources.push(parsed.get(face));
+    resources.push(parsed.get(face) as PptxEmbeddedFontResource);
     metrics.set(key, resources);
   }
   return { faces: loaded, aliases, authoredFamilies, tuples, metrics };

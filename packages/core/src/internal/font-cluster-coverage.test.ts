@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { fontResourceCoversCluster } from './font-cluster-coverage.js';
+import { analyzeFontResourceSupport, fontResourceCoversCluster } from './font-cluster-coverage.js';
 import { canonicalClusterPairs } from '../test-fixtures/canonical-clusters.js';
 
 it('requires all marks or a supported canonical equivalent from the same resource', () => {
@@ -40,7 +40,8 @@ it('accepts resource-supported intermediate compositions and respects canonical 
   // Acute and ring have the same class; acute blocks A+ring composition.
   expect(fontResourceCoversCluster('A\u0301\u030a', (cp) => covered.has(cp))).toBe(false);
   // A lower-class retained mark allows composition across it.
-  expect(fontResourceCoversCluster('A\u0323\u030a', (cp) => cp === 0xc5 || cp === 0x323)).toBe(true);
+  expect(fontResourceCoversCluster('A\u0323\u030a', (cp) => cp === 0xc5 || cp === 0x323)).toBe(false);
+  expect(fontResourceCoversCluster('A\u0323\u030a', (cp) => cp === 0x41 || cp === 0xc5 || cp === 0x323)).toBe(true);
   // Bengali class-zero spacing marks compose with one another, not the base.
   expect(fontResourceCoversCluster('ক\u09c7\u09be', (cp) => cp === 0x995 || cp === 0x9cb)).toBe(true);
 });
@@ -50,4 +51,37 @@ it('keeps sequence-only ownership unknown even if every scalar has a cmap entry'
     expect(fontResourceCoversCluster(cluster, () => true)).toBeUndefined();
     expect(fontResourceCoversCluster(cluster, () => false)).toBeUndefined();
   }
+});
+
+// Independent browser resources distinguish the recursive cut from a full-NFD
+// search: the supported parent is reachable without its unsupported child.
+it('reaches a directly supported Greek decomposition cut from actual NFC', () => {
+  const points = new Set([0x1f0c, 0x345]);
+  for (const text of ['Α\u0313\u0301\u0345', '\u1f8c', '\u1f0c\u0345']) {
+    expect(fontResourceCoversCluster(text, (cp) => points.has(cp))).toBe(true);
+  }
+});
+
+it('does not certify a multi-atom Hangul grapheme as an absent resource', () => {
+  expect(fontResourceCoversCluster('각ᆨ', (cp) => cp === 0xac01)).toBeUndefined();
+  expect(fontResourceCoversCluster('각ᆨ', (cp) => cp === 0x11a8)).toBeUndefined();
+});
+
+it('admits pinned simple syllables while declining unimplemented script preprocessing', () => {
+  for (const text of ['कि', 'ကေ', 'কো']) expect(fontResourceCoversCluster(text, () => true)).toBe(true);
+  for (const text of ['กํา', 'កេ', 'කි', 'ש', 'क्', 'क्क', 'က\u1039က', 'अा']) {
+    expect(fontResourceCoversCluster(text, () => true), text).toBeUndefined();
+  }
+  expect(fontResourceCoversCluster('\ud800', () => true)).toBeUndefined();
+});
+
+it('requires erasure safety for an inserted dotted circle without turning uncertainty into absence', () => {
+  const facts = { schema: 'ot-definedness-1' as const, glyphCount: 8, nonzeroPreserved: true,
+    missingIsolated: true, noErasure: false, anyIndic3ScriptPresent: false,
+    erasureSafeRanges: [[0x301, 0x301]] as const };
+  expect(analyzeFontResourceSupport('\u0301', cp => cp === 0x301, facts).kind).toBe('complete');
+  expect(analyzeFontResourceSupport('\u0301', cp => cp === 0x301 || cp === 0x25cc, facts).kind).toBe('unknown');
+  expect(analyzeFontResourceSupport('\u0301', cp => cp === 0x25cc,
+    { ...facts, erasureSafeRanges: [[0x25cc, 0x25cc]] }).kind).toBe('absent');
+  expect(analyzeFontResourceSupport('क', () => true, { ...facts, noErasure: true, anyIndic3ScriptPresent: true }).kind).toBe('unknown');
 });

@@ -157,11 +157,13 @@ export function isSerifLatinFace(face: string): boolean {
 }
 
 /** Whether the installed face maps basic CJK (a CJK Unified Ideograph in its
- * cmap). Undefined when the reference catalogue does not describe the face. */
+ * cmap). This existing family-level fallback classification is separate from
+ * selected-cut ownership. Per-cut presence/possible facts require all-map
+ * agreement; unreadable/disagreeing cuts cannot establish known absence. */
 export function coversCjkIdeographs(face: string): boolean | undefined {
-  const profiles = profilesOf(face).filter((p) => typeof p.cjkUnifiedIdeographs === 'boolean');
-  if (profiles.length === 0) return undefined;
-  return profiles.some((p) => p.cjkUnifiedIdeographs === true);
+  const profiles = profilesOf(face);
+  if (profiles.some((p) => p.cjkUnifiedIdeographs === true)) return true;
+  return profiles.length > 0 && profiles.every((p) => p.cjkUnifiedIdeographs === false) ? false : undefined;
 }
 
 const CJK_CLASS_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Bopomofo}\u3000-\u303F\uFF00-\uFFEF]/u;

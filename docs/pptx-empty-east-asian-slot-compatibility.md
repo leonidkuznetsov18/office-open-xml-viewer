@@ -94,8 +94,33 @@ verification artifacts, not redistributable baselines.
   - Deck-embedded fonts are distinct resources even when a catalogue name
     matches. Their own bounded cmap coverage is retained at registration and
     follows the same real/synthetic resource selection as their OS/2 metrics.
-    Unsupported or malformed coverage stays unknown; installed same-name
-    cmap facts cannot replace it.
+    Attribution is `complete`, `absent`, `partial`, or `unknown` under the
+    fixed internal `canonical-static-v1` library profile. This adopts pinned
+    canonical normalization, modern Hangul fallback units, and bounded simple
+    Indic/Myanmar syllables; it does not detect the host's shaping engine or
+    guarantee arbitrary Canvas font-resource identity. A partial resource
+    stops sole-owner attribution to an older subset.
+  - Scalar presence requires agreement across every eligible Unicode cmap;
+    absence requires exclusion from their union. GSUB/GDEF analysis separately
+    proves nonzero outputs, missing-glyph isolation, and freedom from direct or
+    transitive erasure for the normalized glyphs. Unsupported mechanisms,
+    malformed tables, exhausted budgets, and unsupported script preprocessing
+    stay unknown. Context uncertainty invalidates the actual shaping span,
+    including authored run seams, without creating extra paint boundaries.
+    Installed same-name facts cannot replace embedded-resource uncertainty.
+    Established installed named-slot metrics retain their catalogue policy
+    and its provenance limits.
+  - Metric contributions remain attached to their source ranges on each
+    wrapped line. Horizontal measurement and paint share one shaping policy:
+    visual style plus the established installed named-family route when every
+    unit in the original CSS span has a resolved installed route and its paint
+    stack contains no embedded candidate. An unresolved or embedded unit
+    disables that extra boundary for the whole span; resource metrics never
+    create shaping boundaries. Here "installed" denotes the established named
+    slot compatibility route, not proof of host installation or complete cmap
+    coverage. Stacked text retains its grapheme-cell model. Explicit
+    `fontAlgn` uses the existing fallback when resource fragments inside one
+    paint span require different or unknown baseline offsets.
   - Lines containing secondary CJK misses can still differ from Office because
     those drawing resources are intentionally unknown under (B). Recording a
     symbol fallback does not establish the missing CJK resource's metrics.

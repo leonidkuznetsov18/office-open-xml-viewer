@@ -1,3 +1,4 @@
+import { analyzeFontResourceSupport, fontSupportFacts, type ResourceSupport } from '@silurus/ooxml-core/internal/font-cluster-coverage';
 import { findReferenceFontMetrics, referenceFontCoversSymbol, referenceFontCoversCjk, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 
@@ -126,6 +127,24 @@ export function powerPointSymbolCoverage(
   const first = referenceFontCoversSymbol(chosen[0], codePoint);
   return first !== undefined && chosen.every((p) => referenceFontCoversSymbol(p, codePoint) === first)
     ? first : undefined;
+}
+
+/** Empty-EA attribution uses the same bounded parsed certificates as
+ * embedded resources. Named installed slots retain the established catalogue
+ * metric policy; this is not detection of a runtime installed FontFace. */
+export function powerPointCatalogueSupport(
+  family: string, bold: boolean, italic: boolean, display: string,
+  coverage: typeof powerPointSymbolCoverage,
+): ResourceSupport {
+  const profiles = chosenProfiles(family, bold, italic, true);
+  if (!profiles.length) return { kind: 'unknown', reason: 'font-transform' };
+  let result: ResourceSupport | undefined;
+  for (const profile of profiles) {
+    const support = analyzeFontResourceSupport(display, (cp) => coverage(family, bold, italic, cp), fontSupportFacts(profile));
+    if (support.kind === 'unknown' || (result && result.kind !== support.kind)) return { kind: 'unknown', reason: 'font-transform' };
+    result = support;
+  }
+  return result as ResourceSupport;
 }
 
 /** CJK presence in the same real/synthetic resource cut used for metrics. */

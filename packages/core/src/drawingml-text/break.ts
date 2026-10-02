@@ -68,9 +68,19 @@ export interface DrawingMlBreakOptions<T> {
 }
 
 type Atom<T> =
-  | { type: 'text'; text: string; style: T; run: number }
+  | { type: 'text'; text: string; style: T; run: number; start: number; end: number }
   | { type: 'tab'; style: T; run: number }
   | { type: 'object'; style: T; run: number; width: number; payload?: unknown };
+
+/** Internal source provenance for format-specific line metrics. It never
+ * participates in measurement or visual coalescing. Only emitted segments
+ * retain ranges; prefix-fit probes allocate no provenance. Offsets are UTF-16
+ * within the input run's display text, before trimming and wrapping. */
+export type DrawingMlSourceRange = Readonly<{ run: number; start: number; end: number }>;
+const sourceRanges = new WeakMap<object, readonly DrawingMlSourceRange[]>();
+export function drawingMlSegmentSourceRanges(segment: object): readonly DrawingMlSourceRange[] {
+  return sourceRanges.get(segment) ?? [];
+}
 
 const latin = /^\p{Script_Extensions=Latin}$/u;
 const isSpace = <T>(atom: Atom<T>): boolean => atom.type === 'text' && atom.text === ' ';
@@ -138,7 +148,7 @@ export function breakDrawingMlText<T>(
         regionLineFeedRun.push(runIndex);
       }
       else if (text === '\t') regions.at(-1)!.push({ type: 'tab', style: run.style, run: runIndex });
-      else if (text !== '\r') regions.at(-1)!.push({ type: 'text', text, style: run.style, run: runIndex });
+      else if (text !== '\r') regions.at(-1)!.push({ type: 'text', text, style: run.style, run: runIndex, start: offsets[i], end: offsets[i + 1] });
     }
     runIndex++;
   }
@@ -184,11 +194,11 @@ export function breakDrawingMlText<T>(
         let from = offset;
         while (paragraphBounds[bound] < stop) {
           const to = paragraphBounds[bound++];
-          if (atom.type === 'text') splitAtoms.push({ ...atom, text: atom.text.slice(from - offset, to - offset) });
+          if (atom.type === 'text') splitAtoms.push({ ...atom, text: atom.text.slice(from - offset, to - offset), start: atom.start + from - offset, end: atom.start + to - offset });
           from = to;
         }
         splitAtoms.push(atom.type === 'text' && from > offset
-          ? { ...atom, text: atom.text.slice(from - offset) } : atom);
+          ? { ...atom, text: atom.text.slice(from - offset), start: atom.start + from - offset } : atom);
         offset = stop;
       }
       atoms = regions[regionIndex] = splitAtoms;
@@ -373,14 +383,33 @@ export function breakDrawingMlText<T>(
       return segments.reduce((sum, seg) => sum + seg.width, 0);
     };
 
-    const makeSegments = (start: number, stop: number, lineIndex: number): DrawingMlBrokenLine<T> => {
+    const makeSegments = (start: number, stop: number, lineIndex: number, retainSources = false): DrawingMlBrokenLine<T> => {
+      const retain = (segments: DrawingMlLineSegment<T>[]) => {
+        if (!retainSources) return;
+        let segmentIndex = 0, length = 0;
+        let ranges: DrawingMlSourceRange[] = [];
+        for (let i = start; i < stop; i++) {
+          const atom = atoms[i], segment = segments[segmentIndex];
+          if (atom.type !== 'text') { segmentIndex++; continue; }
+          const previous = ranges.at(-1);
+          if (previous?.run === atom.run && previous.end === atom.start) ranges[ranges.length - 1] = { ...previous, end: atom.end };
+          else ranges.push({ run: atom.run, start: atom.start, end: atom.end });
+          length += atom.text.length;
+          if (segment.type === 'text' && length === segment.text.length) {
+            sourceRanges.set(segment, ranges); ranges = []; length = 0; segmentIndex++;
+          }
+        }
+      };
       if (plainText !== null && plainOffsets && plainStyle !== undefined) {
         const text = plainText.slice(plainOffsets[start], plainOffsets[stop]);
         const width = options.measureText(text, plainStyle);
-        return { segments: [{ type: 'text', text, style: plainStyle, width }], width };
+        const segments: DrawingMlLineSegment<T>[] = [{ type: 'text', text, style: atoms[start].style, width }];
+        retain(segments);
+        return { segments, width };
       }
       const segments: DrawingMlLineSegment<T>[] = [];
       for (let i = start; i < stop; i++) appendAtom(segments, atoms[i]);
+      retain(segments);
       return { segments, width: measureSegments(segments, lineIndex) };
     };
 
@@ -788,7 +817,7 @@ export function breakDrawingMlText<T>(
         fit = graphemeStops[lo];
       }
       if (fit >= end) {
-        const line = makeSegments(start, end, lineIndex);
+        const line = makeSegments(start, end, lineIndex, true);
         if (regionIndex + 1 < regions.length) line.endsWithBreak = true;
         lines.push(line);
         markLine(start, end);
@@ -858,7 +887,7 @@ export function breakDrawingMlText<T>(
       // Keep authored spaces on the closed line. The controlled PDFs establish
       // the visible word break, but cannot identify the advance of invisible
       // trailing spaces; retaining them preserves that unresolved paint detail.
-      lines.push(makeSegments(start, split, lineIndex));
+      lines.push(makeSegments(start, split, lineIndex, true));
       markLine(start, split);
       start = split;
       while (start < end && isSpace(atoms[start]) && graphemeBoundary[start + 1]) start++;

@@ -1,14 +1,13 @@
-/** Derive canonical pairs from the runtime's Unicode normalization data, the
- * same Unicode source available to the renderer. No copied decomposition table
- * or font-specific list. Appending another combining mark exercises multi-scalar
- * NFC as well as singleton decompositions and algorithmic Hangul composition. */
+/** Representative canonical pairs: Latin/Greek composition, algorithmic
+ * Hangul, and excluded singleton decompositions with a retained mark. Whole
+ * Unicode scalar sweeps only repeated the full-NFC resource case; the recursive
+ * and opposite resource cuts have distinct regressions at the support boundary. */
 export function canonicalClusterPairs(): [string, string][] {
-  const pairs: [string, string][] = [];
-  for (let cp = 0; cp <= 0x10ffff; cp++) {
-    if (cp >= 0xd800 && cp <= 0xdfff) continue;
-    const scalar = String.fromCodePoint(cp);
-    const decomposed = scalar.normalize('NFD');
-    if (scalar !== decomposed) pairs.push([scalar + '\u0307', decomposed + '\u0307']);
-  }
-  return pairs;
+  return [
+    ['À\u0307', 'A\u0300\u0307'],
+    ['Ὄ\u0307', 'Ο\u0313\u0301\u0307'],
+    ['가\u0307', '\u1100\u1161\u0307'],
+    ['Ω\u0307', 'Ω\u0307'],
+    ['Å\u0307', 'A\u030a\u0307'],
+  ];
 }

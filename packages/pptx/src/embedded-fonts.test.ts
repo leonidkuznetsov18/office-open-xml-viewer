@@ -1,7 +1,8 @@
+import { addSfntTable, withGlyphDomain } from '../../core/src/test-fixtures/sfnt-table.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { excludeEmbeddedFontFamilies, loadEmbeddedFonts, uncoveredOfficeFontRequests } from './embedded-fonts.js';
 import { unregisterEmbeddedFonts } from '@silurus/ooxml-core';
-import { paragraphInputRuns, renderTextBody } from './renderer.js';
+import { paragraphInputRuns, renderTextBody, layoutParagraph, naturalWidthExceedsBbox } from './renderer.js';
 import type { Paragraph, TextBody } from './types.js';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 import { canonicalClusterPairs } from '../../core/src/test-fixtures/canonical-clusters.js';
@@ -42,7 +43,7 @@ const bytes = () => new Uint8Array([0, 1, 0, 0, 1]);
 
 // A table-directory fixture with a real Unicode format-12 cmap and OS/2
 // design metrics. FontFace registration is the only browser boundary mocked.
-function cjkResource(codePoint = 0x6f22, ascent = 700): Uint8Array {
+function cjkResourceRaw(codePoint = 0x6f22, ascent = 700): Uint8Array {
   const bytes = new Uint8Array(284);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x00010000);
@@ -73,11 +74,15 @@ function cjkResource(codePoint = 0x6f22, ascent = 700): Uint8Array {
   return bytes;
 }
 
+function cjkResource(codePoint = 0x6f22, ascent = 700): Uint8Array {
+  return withGlyphDomain(cjkResourceRaw(codePoint, ascent), 2);
+}
+
 // Distinct single-glyph groups make subset ownership independent of metrics.
 function clusterResource(text: string, ascent: number): Uint8Array {
   const points = [...new Set([...text].map((ch) => ch.codePointAt(0) as number))].sort((a, b) => a - b);
   const bytes = new Uint8Array(272 + points.length * 12);
-  bytes.set(cjkResource().subarray(0, 272));
+  bytes.set(cjkResourceRaw().subarray(0, 272));
   const view = new DataView(bytes.buffer);
   view.setUint32(72, 28 + points.length * 12);
   view.setUint32(260, 16 + points.length * 12);
@@ -89,14 +94,14 @@ function clusterResource(text: string, ascent: number): Uint8Array {
     view.setUint32(276 + index * 12, cp);
     view.setUint32(280 + index * 12, index + 1);
   }
-  return bytes;
+  return withGlyphDomain(bytes, points.length + 1);
 }
 
 // The full-Unicode cmap adds a BMP glyph absent from the BMP-only map,
 // as permitted by OpenType cmap “Encoding records and encodings”.
 function supersetCjkResource(): Uint8Array {
   const bytes = new Uint8Array(336);
-  bytes.set(cjkResource().subarray(0, 244));
+  bytes.set(cjkResourceRaw().subarray(0, 244));
   const view = new DataView(bytes.buffer);
   view.setUint32(72, 92); // cmap table length
   view.setUint16(246, 2);
@@ -125,7 +130,7 @@ function supersetCjkResource(): Uint8Array {
     view.setUint32(full + 20 + index * 12, cp);
     view.setUint32(full + 24 + index * 12, index + 1);
   }
-  return bytes;
+  return withGlyphDomain(bytes, 3);
 }
 
 describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
@@ -436,7 +441,7 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
   });
 
   it('excludes a failed same-slot resource without losing its successful sibling', async () => {
-    installFontFaceSet((source) => new DataView(source).getUint16(240) === 850);
+    installFontFaceSet((source) => new DataView(source).getUint16(256) === 850);
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const loaded = await loadEmbeddedFonts(['good', 'failed'].map((partPath) => ({
       fontName: 'Duplicate Family', style: 'regular' as const, partPath, contentType: 'application/x-font-ttf',
@@ -590,4 +595,235 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
       { family: 'Calibri', weight: 700, style: 'normal' },
     ]);
   });
+});
+
+// Focused resources whose independently observed browser outcomes distinguish
+// reachable normalization paths, atomic rejection and genuinely mixed units.
+it('keeps structural ownership results through the production loader and adapter', async () => {
+  for (const [display, sparse, expected] of [
+    ['Α\u0313\u0301\u0345', '\u1f0c\u0345', 0.75],
+    ['\u1f8c', '\u1f0c\u0345', 0.75],
+    ['\u1f0c\u0345', '\u1f0c\u0345', 0.75],
+    ['A\u0323\u030a', 'Å\u0323', 0.85],
+    ['\u1ea0\u030a', 'AÅ\u0323', 0.75],
+    ['A\u0301', 'A', 0.85], ['A', 'A', 0.75],
+    ['각ᆨ', '각', undefined], ['각ᆨ', 'ᆨ', undefined],
+    ['각\u0301', '각\u0301', 0.75],
+  ] as const) {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts(['full', 'sparse'].map(partPath => ({
+      fontName: 'Structural Family', style: 'regular', partPath,
+    } as PptxEmbeddedFontRef)), async path => clusterResource(path === 'sparse' ? sparse
+      : display.normalize('NFC') + display.normalize('NFD'), path === 'sparse' ? 750 : 850));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    const para = { runs: [...display].map(text => ({ type: 'text', text, fontSize: 22,
+      fontFamily: 'Structural Family', lang: 'en-US' })), tabStops: [] } as unknown as Paragraph;
+    const items = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc)
+      .input.filter(item => item.type === 'text');
+    expect(items.map(item => item.text).join('')).toBe(display.normalize('NFC'));
+    expect(items.map(item => [item.style.lineMetric?.share, item.style.lineMetricLatin?.share]), display + sparse)
+      .toEqual([[expected, expected]]);
+    expect(para.runs.map(run => run.type === 'text' ? run.text : '').join('')).toBe(display);
+    unregisterEmbeddedFonts(loaded.faces);
+  }
+});
+
+function substitutedResource(text: string, output: number, input = 1): Uint8Array {
+  const gsub = new Uint8Array(40), view = new DataView(gsub.buffer);
+  view.setUint32(0, 0x10000); view.setUint16(4, 10); view.setUint16(6, 12); view.setUint16(8, 14);
+  // One lookup, one SingleSubst format-2, then coverage format-1.
+  [1, 4, 1, 0, 1, 8, 2, 8, 1, output, 1, 1, input].forEach((n, i) => view.setUint16(14 + i * 2, n));
+  return addSfntTable(clusterResource(text, 750), 'GSUB', gsub);
+}
+
+it('retains safe substitutions and blocks unsafe or missing-repair context without singleton painting', async () => {
+  for (const [kind, text, expected] of [['safe', 'AB', 0.75], ['unsafe', 'AB', undefined],
+    ['repair', 'AB', undefined]] as const) {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts(['full', kind].map(partPath => ({ fontName: 'Shaped Family',
+      style: 'regular', partPath } as PptxEmbeddedFontRef)), async path => path === 'full' ? clusterResource('AB', 850)
+        : kind === 'repair' ? substitutedResource('A', 1, 0) : substitutedResource('AB', kind === 'safe' ? 2 : 0));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    const para = { runs: [{ type: 'text', text, fontFamily: 'Shaped Family', fontSize: 22 }], tabStops: [] } as unknown as Paragraph;
+    const adapted = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc);
+    const input = adapted.input.filter(item => item.type === 'text');
+    expect(input.every(item => item.style.lineMetric?.share === expected && item.style.lineMetricLatin?.share === expected)).toBe(true);
+    if (kind !== 'safe') expect(input.every(item => item.style.resourceIdentity === undefined)).toBe(true);
+    const ctx = { font: '', measureText: () => ({ width: 10 }) } as unknown as CanvasRenderingContext2D;
+    const lines = layoutParagraph(ctx, para, 500, 22, '#000', 1 / 12700, 0, false, false, 1, undefined, rc);
+    expect(lines[0].segments.map(item => item.text)).toEqual(['AB']);
+    unregisterEmbeddedFonts(loaded.faces);
+  }
+});
+
+it('keeps a successfully loaded resource with an exhausted GSUB budget as an ownership barrier', async () => {
+  installFontFaceSet();
+  const count = 4097, lookup = 16 + count * 2;
+  const gsub = new Uint8Array(lookup + 22), view = new DataView(gsub.buffer);
+  view.setUint32(0, 0x10000); view.setUint16(4, 10); view.setUint16(6, 12); view.setUint16(8, 14);
+  view.setUint16(14, count);
+  for (let i = 0; i < count; i++) view.setUint16(16 + i * 2, lookup - 14);
+  [1, 0, 1, 8, 2, 8, 1, 1, 1, 1, 1].forEach((n, i) => view.setUint16(lookup + i * 2, n));
+  const loaded = await loadEmbeddedFonts(['complete', 'bounded'].map(partPath => ({
+    fontName: 'Bounded Family', style: 'regular', partPath,
+  } as PptxEmbeddedFontRef)), async path => path === 'complete' ? clusterResource('A', 850)
+    : addSfntTable(clusterResource('A', 750), 'GSUB', gsub));
+  expect(loaded.faces).toHaveLength(2);
+  const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+    embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+    embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+  const para = { runs: [{ type: 'text', text: 'A', fontFamily: 'Bounded Family', fontSize: 22 }], tabStops: [] } as unknown as Paragraph;
+  const text = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc).input.filter(item => item.type === 'text');
+  expect(text[0].style.lineMetric).toBeUndefined();
+  expect(text[0].style.lineMetricLatin).toBeNull();
+  unregisterEmbeddedFonts(loaded.faces);
+});
+
+// SafeCJK shares the resource with direct/transitive/contextual erasure inputs.
+// Expectations follow substitution effects, independently of the certificate.
+function erasingResource(kind: 'direct' | 'transitive' | 'ligature' | 'context'): Uint8Array {
+  const deletion = [1, 10, 1, 8, 0, 1, 1, 2]; // glyph2 -> empty
+  const first = kind === 'transitive' ? [2, 8, 1, 2, 1, 1, 1]
+    : kind === 'ligature' ? [1, 18, 1, 8, 1, 4, 2, 2, 4, 1, 1, 1]
+    : [3, 1, 1, 12, 0, 1, 1, 1, 2];
+  const subtables = kind === 'direct' ? [deletion] : [first, deletion];
+  const types = kind === 'direct' ? [2] : [kind === 'transitive' ? 1 : kind === 'ligature' ? 4 : 5, 2];
+  const gsub = new Uint8Array(128), view = new DataView(gsub.buffer);
+  view.setUint32(0, 0x10000); view.setUint16(4, 10); view.setUint16(6, 12); view.setUint16(8, 14);
+  view.setUint16(14, types.length); let at = 16 + types.length * 2;
+  for (let i = 0; i < types.length; i++) {
+    view.setUint16(16 + i * 2, at - 14);
+    [types[i], 0, 1, 8, ...subtables[i]].forEach((n, j) => view.setUint16(at + j * 2, n));
+    at += 8 + subtables[i].length * 2;
+  }
+  // Sorted nominal glyphs: A1, B2, 漢3, 가4.
+  return addSfntTable(clusterResource('AB漢가', 750), 'GSUB', gsub.subarray(0, at));
+}
+
+it('keeps unrelated CJK and rejects direct/transitive/contextual erasure in the same loaded font', async () => {
+  for (const kind of ['direct', 'transitive', 'ligature', 'context'] as const) {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts([{ fontName: 'Erasure Family', style: 'regular', partPath: kind } as PptxEmbeddedFontRef], async () => erasingResource(kind));
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+      embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+    for (const text of ['漢', kind === 'transitive' || kind === 'ligature' ? 'A' : 'B', 'AB']) {
+      const para = { runs: [{ type: 'text', text, fontFamily: 'Erasure Family', fontFamilyEa: 'Erasure Family', fontSize: 22 }], tabStops: [] } as unknown as Paragraph;
+      const input = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc).input.filter(item => item.type === 'text');
+      expect(input.every(item => item.style.lineMetric?.share === (text === '漢' ? 0.75 : undefined)), kind + ':' + text).toBe(true);
+    }
+    unregisterEmbeddedFonts(loaded.faces);
+  }
+});
+
+it('invalidates simple-unit certainty across an unsupported same-CSS shaping span', async () => {
+  installFontFaceSet();
+  const loaded = await loadEmbeddedFonts([{ fontName: 'Script Family', style: 'regular', partPath: 'script' } as PptxEmbeddedFontRef], async () => clusterResource('क\u094d', 750));
+  const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1,
+    embeddedFontAliases: loaded.aliases, embeddedFontAuthoredFamilies: loaded.authoredFamilies,
+    embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+  const para = { runs: ['क', '\u094d'].map(text => ({ type: 'text', text, fontFamily: 'Script Family', fontFamilyCs: 'Script Family', lang: 'en-US', fontSize: 22 })), tabStops: [] } as unknown as Paragraph;
+  const input = paragraphInputRuns(para, 22, '#000', 1 / 12700, false, false, 1, undefined, rc).input.filter(item => item.type === 'text');
+  expect(input.every(item => item.style.lineMetric === undefined && item.style.lineMetricLatin == null), JSON.stringify(input.map(item => ({text:item.text,font:item.style.font,face:item.style.faceFamily,share:item.style.lineMetric?.share,latin:item.style.lineMetricLatin?.share,support:item.style.resourceSupport})))).toBe(true);
+  unregisterEmbeddedFonts(loaded.faces);
+});
+
+it('keeps contextual CSS spans intact while metric owners survive on their wrapped lines', async () => {
+  installFontFaceSet();
+  const context = [3, 0, 2, 20, 26, 1, 32, 1, 0, 1, 1, 1, 3, 1, 1, 1, 1, 1, 0];
+  const single = [2, 8, 1, 2, 1, 1, 3];
+  const gsub = new Uint8Array(128), view = new DataView(gsub.buffer);
+  view.setUint32(0, 0x10000); view.setUint16(4, 10); view.setUint16(6, 12); view.setUint16(8, 14); view.setUint16(14, 2);
+  let at = 20;
+  for (const [i, words] of [[0, [6, 0, 1, 8, ...context]], [1, [1, 0, 1, 8, ...single]]] as const) {
+    view.setUint16(16 + i * 2, at - 14);
+    words.forEach((n, j) => view.setUint16(at + j * 2, n)); at += words.length * 2;
+  }
+  // Nominal glyph order: 0345=1, 03A9=2, 1F0C=3. The zero is a read-only
+  // lookahead; the rule replaces glyph3 by defined glyph2 and preserves zero.
+  const sparse = addSfntTable(clusterResource('ᾌΩ', 750), 'GSUB', gsub.subarray(0, at));
+  const loaded = await loadEmbeddedFonts(['full', 'sparse'].map(partPath => ({ fontName: 'Context Greek', style: 'regular', partPath } as PptxEmbeddedFontRef)),
+    async path => path === 'full' ? clusterResource('ᾌΑ', 850) : sparse);
+  const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1, embeddedFontAliases: loaded.aliases,
+    embeddedFontAuthoredFamilies: loaded.authoredFamilies, embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics };
+  // Independent distinguishable-resource browser control: a safe contextual
+  // substitution yields whole advance 46.2, isolated advances 13.2 + 19.8.
+  // The measurement callback models that observed context, not owner logic.
+  const calls: [string, number, number][] = [];
+  const ctx = { font: '', measureText: (text: string) => ({ width: text === 'ᾌΑ' ? 46.2 : text === 'ᾌ' ? 13.2 : 19.8,
+    actualBoundingBoxAscent: 7, actualBoundingBoxDescent: 2 }),
+    fillText: (text: string, x: number, y: number) => calls.push([text, x, y]),
+    save() {}, restore() {}, translate() {}, rotate() {}, scale() {}, fillRect() {},
+  } as unknown as CanvasRenderingContext2D;
+  for (const seam of [false, true]) {
+    const para = { alignment: 'l', marL: 0, marR: 0, indent: 0, bullet: { type: 'none' }, tabStops: [],
+      runs: (seam ? ['ᾌ', 'Α'] : ['ᾌΑ']).map(text => ({ type: 'text', text, fontFamily: 'Context Greek', fontSize: 22 })) } as unknown as Paragraph;
+    const lines = layoutParagraph(ctx, para, 40, 22, '#000', 1 / 12700, 0, false, false, 1, undefined, rc);
+    expect(lines.map(line => line.segments.map(seg => seg.text))).toEqual([['ᾌ'], ['Α']]);
+    const body = { paragraphs: [para], defaultFontSize: 22, verticalAnchor: 't', lIns: 0, rIns: 0, tIns: 0, bIns: 0,
+      wrap: 'square', vert: 'horz', autoFit: 'none' } as TextBody;
+    calls.length = 0;
+    renderTextBody(ctx, body, 0, 0, 400, 120, 1 / 12700, undefined, 0, false, false, undefined, undefined, rc);
+    expect(calls.map(call => call[0])).toEqual(['ᾌΑ']);
+    expect(naturalWidthExceedsBbox(ctx, body, 40, 0, 0, 1 / 12700, rc)).toBe(true);
+    calls.length = 0;
+    renderTextBody(ctx, body, 0, 0, 40, 120, 1 / 12700, undefined, 0, false, false, undefined, undefined, rc);
+    expect(calls.map(call => call[2])).toEqual([22 * 1.2 * .75, 22 * 1.2 + 22 * 1.2 * .85]);
+  }
+  unregisterEmbeddedFonts(loaded.faces);
+});
+
+it('aligns a whole CSS span only when all source-owner offsets agree', async () => {
+  for (const ascent of [750, 850]) {
+    installFontFaceSet();
+    const loaded = await loadEmbeddedFonts(['a', 'b'].map(partPath => ({fontName: 'Aligned Family', style: 'regular', partPath} as PptxEmbeddedFontRef)),
+      async path => cjkResource(path === 'a' ? 0x41 : 0x42, path === 'a' ? 750 : ascent));
+    const rc = {themeMajorFont: null, themeMinorFont: null, dpr: 1, embeddedFontAliases: loaded.aliases,
+      embeddedFontAuthoredFamilies: loaded.authoredFamilies, embeddedFontTuples: loaded.tuples, embeddedFontMetrics: loaded.metrics};
+    const calls: [string, number][] = [];
+    const ctx = {font: '', measureText: () => ({width: 20, actualBoundingBoxAscent: 7, actualBoundingBoxDescent: 2}),
+      fillText: (text: string, _x: number, y: number) => calls.push([text, y]),
+      save() {}, restore() {}, translate() {}, rotate() {}, scale() {}, fillRect() {},
+    } as unknown as CanvasRenderingContext2D;
+    const para = {alignment: 'l', marL: 0, marR: 0, indent: 0, fontAlgn: 't', bullet: {type: 'none'}, tabStops: [],
+      runs: [{type: 'text', text: 'AB', fontFamily: 'Aligned Family', fontSize: 22}]} as unknown as Paragraph;
+    const body = {paragraphs: [para], defaultFontSize: 22, verticalAnchor: 't', lIns: 0, rIns: 0, tIns: 0, bIns: 0,
+      wrap: 'none', vert: 'horz', autoFit: 'none'} as TextBody;
+    renderTextBody(ctx, body, 0, 0, 400, 100, 1/12700, undefined, 0, false, false, undefined, undefined, rc);
+    expect(calls.map(call => call[0])).toEqual(['AB']);
+    if (ascent === 850) expect(calls[0][1]).toBeCloseTo(22 * 1.2 * .8, 10);
+    else expect(calls[0][1]).not.toBeCloseTo(22 * 1.2 * .8, 10);
+    unregisterEmbeddedFonts(loaded.faces);
+  }
+});
+
+it('preserves installed named-route shaping boundaries and disables them across an unresolved span', () => {
+  const rc = {themeMajorFont: null, themeMinorFont: null, dpr: 1};
+  const makePara = (text: string) => ({alignment: 'l', marL: 0, marR: 0, indent: 0,
+    bullet: {type: 'none'}, tabStops: [], runs: [{type: 'text', text,
+      fontFamily: 'Calibri', fontFamilyCs: 'Tahoma', fontSize: 22}]} as unknown as Paragraph);
+  // Same composite CSS stack, established installed Tahoma/MS Gothic routes.
+  // A nonadditive measurement distinguishes preserving the route boundaries
+  // from merely restoring the metric numbers after a merged measurement.
+  const calls: [string, number][] = [];
+  const ctx = {font: '', measureText: (text: string) => ({width: text === '§◆■' ? 90 : text.length * 10}),
+    fillText: (text: string, x: number) => calls.push([text, x]),
+    save() {}, restore() {}, translate() {}, rotate() {}, scale() {}, fillRect() {},
+  } as unknown as CanvasRenderingContext2D;
+  const admitted = makePara('§◆■');
+  const lines = layoutParagraph(ctx, admitted, 500, 22, '#000', 1 / 12700, 0, false, false, 1, undefined, rc);
+  expect(lines[0].segments.map(seg => seg.text)).toEqual(['§', '◆', '■']);
+  expect(layoutParagraph(ctx, admitted, 40, 22, '#000', 1 / 12700, 0, false, false, 1, undefined, rc)).toHaveLength(1);
+  const body = {paragraphs: [admitted], defaultFontSize: 22, verticalAnchor: 't', lIns: 0, rIns: 0, tIns: 0, bIns: 0,
+    wrap: 'square', vert: 'horz', autoFit: 'none'} as TextBody;
+  expect(naturalWidthExceedsBbox(ctx, body, 40, 0, 0, 1 / 12700, rc)).toBe(false);
+  renderTextBody(ctx, body, 0, 0, 500, 100, 1 / 12700, undefined, 0, false, false, undefined, undefined, rc);
+  expect(calls).toEqual([['§', 0], ['◆', 10], ['■', 20]]);
+  const unresolved = makePara('§◆\uFE0F■');
+  const mixed = layoutParagraph(ctx, unresolved, 500, 22, '#000', 1 / 12700, 0, false, false, 1, undefined, rc);
+  expect(mixed[0].segments.map(seg => seg.text)).toEqual(['§◆\uFE0F■']);
 });

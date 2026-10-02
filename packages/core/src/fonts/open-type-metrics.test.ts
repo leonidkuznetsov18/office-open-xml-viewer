@@ -1,5 +1,8 @@
+import { withGlyphDomain } from '../test-fixtures/sfnt-table.js';
 import { describe, expect, it } from 'vitest';
-import { parseOpenTypeLineMetrics, parseOpenTypeResourceMetrics, openTypeResourceCoversCodePoint } from './open-type-metrics.js';
+import { parseOpenTypeLineMetrics, parseOpenTypeResourceMetrics as parseResourceMetrics, openTypeResourceCoversCodePoint } from './open-type-metrics.js';
+
+function parseOpenTypeResourceMetrics(bytes: Uint8Array) { return parseResourceMetrics(withGlyphDomain(bytes)); }
 
 function syntheticSfnt(baseOffset = 0, eastAsianCmap = false): Uint8Array {
   const tableCount = eastAsianCmap ? 4 : 3;
@@ -244,7 +247,7 @@ function syntheticSfntWithRepeatedCmapRecords(recordCount: number, distinctTable
     view.setUint16(subtable + 16, 0xffff);
     view.setUint16(subtable + 20, 0x0000);
     view.setUint16(subtable + 22, 0xffff);
-    view.setInt16(subtable + 24, 1);
+    view.setInt16(subtable + 24, 0);
     view.setInt16(subtable + 26, 1);
   }
   return bytes;
@@ -338,15 +341,22 @@ describe('opt-in OpenType resource coverage', () => {
 
   it('caps cumulative coverage work across distinct broad subtables', () => {
     expect(parseOpenTypeResourceMetrics(syntheticSfntWithRepeatedCmapRecords(4, 4))?.unicodeRanges)
-      .toEqual([[0x0000, 0xfffe]]);
+      .toEqual([[0x0001, 0xfffe]]);
     expect(parseOpenTypeResourceMetrics(syntheticSfntWithRepeatedCmapRecords(5, 5))?.unicodeRanges)
       .toEqual([]);
   });
 
   it('bounds cmap alias fan-out at the accepted encoding-record boundary', () => {
     expect(parseOpenTypeResourceMetrics(syntheticSfntWithRepeatedCmapRecords(4096))?.unicodeRanges)
-      .toEqual([[0x0000, 0xfffe]]);
+      .toEqual([[0x0001, 0xfffe]]);
     expect(parseOpenTypeResourceMetrics(syntheticSfntWithRepeatedCmapRecords(4097))?.unicodeRanges)
       .toEqual([]);
   });
+});
+
+it('does not grant cmap presence outside the valid maxp glyph domain', () => {
+  const resource = syntheticSfntWithCmapFormat(12);
+  expect(openTypeResourceCoversCodePoint(parseResourceMetrics(resource) ?? undefined, 0x56fd)).toBeUndefined();
+  expect(openTypeResourceCoversCodePoint(parseResourceMetrics(withGlyphDomain(resource, 1)) ?? undefined, 0x56fd)).toBeUndefined();
+  expect(openTypeResourceCoversCodePoint(parseResourceMetrics(withGlyphDomain(resource, 2)) ?? undefined, 0x56fd)).toBe(true);
 });

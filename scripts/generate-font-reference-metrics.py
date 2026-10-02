@@ -15,6 +15,7 @@ import hashlib
 import json
 import plistlib
 import re
+import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,19 +47,17 @@ CJK_COVERAGE_RANGES = ((0x1100, 0x11FF), (0x2E80, 0x33FF), (0x3400, 0x9FFF),
                        (0x1AFF0, 0x1B16F), (0x20000, 0x323AF))
 
 
-def glyph_coverage(cmap: dict[int, str] | None, domain: tuple[tuple[int, int], ...]) -> list[int] | None:
-    """Sorted inclusive endpoint pairs; None is unknown, [] is known empty."""
-    if cmap is None:
+def bounded_coverage(ranges: list[list[int]] | None, domain: tuple[tuple[int, int], ...]) -> list[int] | None:
+    """Project production all-map presence/possible facts into fixed domains."""
+    if ranges is None:
         return None
-    ranges: list[int] = []
-    for code, glyph in sorted(cmap.items()):
-        if glyph == ".notdef" or not any(start <= code <= end for start, end in domain):
-            continue
-        if ranges and ranges[-1] == code - 1:
-            ranges[-1] = code
-        else:
-            ranges.extend((code, code))
-    return ranges
+    result: list[int] = []
+    for lo, hi in ranges:
+        for start, end in domain:
+            a, b = max(lo, start), min(hi, end)
+            if a <= b:
+                result.extend((a, b))
+    return result
 
 
 def packed_cjk_bitmap(ranges: tuple[int, ...]) -> str:
@@ -231,19 +230,12 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
         None if os2 is None
         else [int(os2.panose.bFamilyType), int(os2.panose.bSerifStyle)]
     )
-    # Whether the face's Unicode cmap maps any CJK Unified Ideograph
-    # (U+4E00-U+9FFF) to a glyph. PowerPoint's empty-EA fallback (#1689
-    # controls) keeps a Far-East face's own script chain only when the face
-    # really draws basic CJK: SimSun-ExtB and MingLiU-ExtB declare Far-East
-    # code pages but map no BMP ideograph, and fall back by PANOSE instead.
-    # Null means the face has no Unicode cmap.
-    cmap = font.getBestCmap() if "cmap" in font else None
-    profile["cjkUnifiedIdeographs"] = (
-        None if cmap is None
-        else any(0x4E00 <= code <= 0x9FFF and glyph != ".notdef" for code, glyph in cmap.items())
-    )
-    profile["symbolCoverage"] = glyph_coverage(cmap, SYMBOL_COVERAGE_RANGES)
-    profile["cjkCoverage"] = glyph_coverage(cmap, CJK_COVERAGE_RANGES)
+    # Assigned below from the production presence/possible projection. The
+    # Far-East base-CJK branch requires known presence or known absence; the
+    # preferred FontTools cmap is not authority when selectable maps disagree.
+    profile["cjkUnifiedIdeographs"] = None
+    profile["symbolCoverage"] = None
+    profile["cjkCoverage"] = None
     # Honor fsSelection USE_TYPO_METRICS (bit 7), like the resource parser.
     # Although introduced in OS/2 v4, installed v3 resources also set it;
     # #1689 exported symbol resources confirm their typo+gap line metrics.
@@ -289,6 +281,8 @@ def main() -> None:
         Source("macos-supplemental", (("Supplemental", args.macos_root),), system_version),
     )
 
+    support_process = subprocess.Popen(['node', 'scripts/generate-font-support-facts.mjs'],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     profiles_by_canonical: dict[str, dict[str, Any]] = {}
     provenance: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
@@ -306,6 +300,21 @@ def main() -> None:
                     if profile is None:
                         exclusions.append({"source": source.id, "file": relative_path, "faceIndex": face_index, "reason": "missing-head-or-hhea"})
                         continue
+                    support_process.stdin.write(json.dumps({"path": str(path), "faceIndex": face_index}) + "\n")
+                    support_process.stdin.flush()
+                    resource = json.loads(support_process.stdout.readline())
+                    profile["supportFacts"] = resource["supportFacts"]
+                    known, possible = resource["unicodeRanges"], resource["unicodePossibleRanges"]
+                    basic = lambda ranges: any(lo <= 0x9FFF and hi >= 0x4E00 for lo, hi in ranges)
+                    profile["cjkUnifiedIdeographs"] = (True if known is not None and basic(known)
+                        else False if possible is not None and not basic(possible) else None)
+
+                    # All eligible-map intersection proves presence; their union
+                    # bounds possible presence. A preferred cmap cannot certify a
+                    # resource when browser-selectable maps disagree.
+                    for field, domain in [("symbolCoverage", SYMBOL_COVERAGE_RANGES), ("cjkCoverage", CJK_COVERAGE_RANGES)]:
+                        profile[field] = bounded_coverage(resource["unicodeRanges"], domain)
+                        profile[field.replace("Coverage", "PossibleCoverage")] = bounded_coverage(resource["unicodePossibleRanges"], domain)
                     profile_id = profile.pop("_provenanceId")
                     provenance_metrics = profile.pop("_provenanceMetrics")
                     provenance_code_page_range1 = profile.pop("_provenanceCodePageRange1")
@@ -327,6 +336,9 @@ def main() -> None:
                 else:
                     fonts[0].close()
 
+    support_process.stdin.close()
+    if support_process.wait() != 0:
+        raise RuntimeError('Font support certificate generation failed')
     source_order = {source.id: index for index, source in enumerate(sources)}
     profiles = sorted(
         profiles_by_canonical.values(),
@@ -342,15 +354,18 @@ def main() -> None:
     # cmaps. Runtime shares the frozen arrays; no per-glyph cache is needed.
     coverages = {}
     for field in ("symbolCoverage", "cjkCoverage"):
-        repertoires = sorted({tuple(p[field]) for p in profiles if p[field] is not None})
+        possible_field = field.replace("Coverage", "PossibleCoverage")
+        repertoires = sorted({tuple(p[k]) for p in profiles for k in (field, possible_field) if p[k] is not None})
         coverage_ids = {r: i for i, r in enumerate(repertoires)}
         for profile in profiles:
-            coverage = profile[field]
-            profile[field] = None if coverage is None else coverage_ids[tuple(coverage)]
+            for k in (field, possible_field):
+                coverage = profile[k]
+                profile[k] = None if coverage is None else coverage_ids[tuple(coverage)]
         coverages[field + "s"] = ([packed_cjk_bitmap(r) for r in repertoires]
                                    if field == "cjkCoverage" else repertoires)
     data = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
+        "supportAnalysisSchema": "ot-definedness-1",
         "notice": "Reference metrics are not proof of the face selected by Canvas, macOS, or Office.",
         "symbolCoverageRanges": SYMBOL_COVERAGE_RANGES,
         "cjkCoverageRanges": CJK_COVERAGE_RANGES,

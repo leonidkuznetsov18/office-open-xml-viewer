@@ -8,8 +8,10 @@ is included in the npm tarball so it travels with every install.
 
 ### Unicode Character Database
 
-The canonical combining classes used for font-resource attribution are derived
-from Unicode 17.0.0 `UnicodeData.txt`, under the Unicode License V3.
+The canonical normalization, combining-class, script and syllabic-property
+tables used for font-resource attribution are derived from Unicode 17.0.0
+and the pinned Unicode 16.0.0 script-property intersection, under the Unicode
+License V3. Generated source records the input files and their SHA-256 hashes.
 
 - Source: <https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt>
 - License: <https://www.unicode.org/license.txt>
@@ -54,6 +56,36 @@ Except as contained in this notice, the name of a copyright holder shall
 not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
+```
+
+### HarfBuzz classification data
+
+The internal font-attribution profile derives bounded script and syllabic
+classifications from HarfBuzz 11.0.0's shaper categories and table generator.
+The HarfBuzz shaping engine is not bundled.
+
+- Source: <https://github.com/harfbuzz/harfbuzz/tree/11.0.0/src>
+
+```text
+Copyright © 2010,2011,2012 Google, Inc.
+
+Permission is hereby granted, without written agreement and without
+license or royalty fees, to use, copy, modify, and distribute this
+software and its documentation for any purpose, provided that the
+above copyright notice and the following two paragraphs appear in
+all copies of this software.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+DAMAGE.
+
+THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS FOR A PARTICULAR PURPOSE. THE SOFTWARE PROVIDED HEREUNDER IS
+ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 ```
 
 ### Natural Earth Admin 0 Countries, 1:110m
