@@ -11,7 +11,7 @@ import {
 } from '../style-paint.js';
 import type { Fill } from '../../types/common';
 import { rawLinkedChartStyleRole } from '../effective-style.js';
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { paintChartImageFill } from '../image-fill.js';
 import { axisLineWidthPx } from '../axis-style.js';
 import { CHARTEX_DEFAULT_PALETTE } from './palette.js';

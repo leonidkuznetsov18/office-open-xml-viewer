@@ -1,3 +1,4 @@
+import { createMixedSpaceState } from './mixed-space-fit.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { KinsokuRules } from '@silurus/ooxml-core';
 import { containsSeaScript, seaMixedBreakOffsets } from '@silurus/ooxml-core';
@@ -5,6 +6,7 @@ import { type LayoutImageSeg, type LayoutLine, type LayoutMathSeg, type LayoutSe
 import { protectedNoBreakOffsets, slicedTextMetadata } from './advance.js';
 import { rebaseSeaBreaks } from './text-runs.js';
 import { resolveFitTextSegments } from './segment-builder.js';
+import { SegmentQueue, type SegmentQueueCursor } from './segment-queue.js';
 
 /** Prepare source-anchored break opportunities and the resumable queue.
  * SEA dictionary boundaries, protected ranges, paragraph-final hanging spaces,
@@ -191,7 +193,7 @@ export interface GapTransaction {
     scalars: Readonly<Record<string, unknown>>;
     snapBlock: unknown;
     linesLength: number;
-    queue: readonly LayoutSeg[];
+    queue: SegmentQueueCursor;
   }> | null;
   /** Complete units precede a forced unit: end the fragment before this source. */
   stopBefore: LineBoundary | null;
@@ -205,6 +207,11 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     latinLineFace: undefined as LayoutTextSeg | undefined,
     latinLineHomogeneous: true,
     latinLineGaps: [] as LayoutTextSeg[],
+    /** WORD_COMPRESSED_SPACE_LINE_FIT state of the current line. */
+    mixedSpace: createMixedSpaceState(),
+    /** Some segment of the paragraph carries the rule's eligibility; when
+     * false the projection does no work at all. */
+    mixedSpaceEnabled: false,
     latinUniformGapCapacity: undefined as number | undefined,
     latinAppliedGapCount: 0,
     latinAppliedPerGap: 0,
@@ -233,10 +240,13 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     isFirst: true,
     lineMaxWidth: maxWidth,
     lineXOffset: 0,
+    /** Exclusion-free width past the paragraph's trailing indent, up to the
+     *  text margin, that an aligned tab cell on this line may allocate. */
+    lineMarginExtension: 0,
     currentLineTopY: wrapCtx?.startPageY ?? 0,
     lineHasRuby: false,
     lineEastAsian: false,
-    queue: [] as LayoutSeg[],
+    queue: new SegmentQueue(),
     trailingBreakFontSize: null as number | null,
   };
 }

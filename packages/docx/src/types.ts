@@ -537,6 +537,11 @@ export interface DocParagraph {
   /** ECMA-376 §17.3.1.21 `<w:overflowPunct>` — permit one trailing
    *  punctuation character beyond paragraph indents/margins. Omission is true. */
   overflowPunct?: boolean;
+  /** ECMA-376 §17.3.1.2 `<w:autoSpaceDE>` after the style cascade; present
+   *  only when disabled (`false`). Omission means the spec default, on. */
+  autoSpaceDE?: boolean;
+  /** ECMA-376 §17.3.1.3 `<w:autoSpaceDN>`, with the same encoding. */
+  autoSpaceDN?: boolean;
   /** ECMA-376 §17.3.1.1 `<w:adjustRightInd>` — permit automatic right-indent
    *  adjustment when a document grid is active. Absent means true after the
    *  paragraph style hierarchy and specification default are resolved. */

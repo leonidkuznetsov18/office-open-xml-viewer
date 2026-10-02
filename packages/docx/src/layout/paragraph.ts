@@ -1,3 +1,4 @@
+import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
 import {
@@ -157,6 +158,7 @@ import type {
   LayoutDiagnostic,
   LayoutRect,
   Matrix2DData,
+  NumberingMarkerShapeInput,
   ParagraphLayout,
   ParagraphPlacement,
   PointPt,
@@ -321,6 +323,8 @@ export interface MeasuredLinePlanInput {
   readonly advancePt: number;
   readonly xOffsetPt: number;
   readonly availableWidthPt: number;
+  /** Margin extension a tab cell added to this line's band (§17.3.1.37). */
+  readonly marginExtensionPt?: number;
   readonly endsWithBreak: boolean;
   readonly segments: readonly MeasuredLinePlanSegment[];
 }
@@ -733,7 +737,10 @@ export function planLine(input: PlanLineInput): LineLayout {
   );
   let naturalWidthPt = segments.reduce((sum, segment) => sum + segmentWidth(segment), 0);
   const lineLeftPt = input.paragraphXPt + line.xOffsetPt;
-  const availableWidthPt = Math.min(input.availableWidthPt, line.availableWidthPt);
+  // A margin-allocated tab cell widens this line's band past the trailing
+  // indent; alignment and justification slack use that same band.
+  const availableWidthPt = Math.min(input.availableWidthPt, line.availableWidthPt)
+    + (line.marginExtensionPt ?? 0);
   const logicalStartOffsetPt = !input.isFirstLine
     ? 0
     : input.numbering
@@ -2272,6 +2279,8 @@ function planMeasuredLines(
   textService?: import('./text.js').TextLayoutService,
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   verticalPageFrame = false,
+  compatibilityMode?: number,
+  paragraphMarkShapeInput?: NumberingMarkerShapeInput,
 ): readonly LineLayout[] {
   let sourceOffset = 0;
   const consumedByRun = new Map<number, number>();
@@ -2288,9 +2297,16 @@ function planMeasuredLines(
     && /^[+\-(]?[\d., ]+\)?%?$/u.test(visibleText)
       ? earliestTab.pos - context.physicalIndentLeftPt
       : undefined;
+  const specifiedParagraph = specifiedTextParagraphIsHomogeneous(paragraph);
   return retainPhysicalLines(measured.lines.map((measuredLine, lineIndex) => {
     const raw = measuredLine.layout;
-    const baselinePt = plannedBaselinePt(measuredLine, context);
+    const specified = specifiedParagraph && !paragraph.numbering
+      ? specifiedTextLineMetrics(raw, context, paragraph, compatibilityMode, verticalPageFrame,
+          paragraphMarkShapeInput)
+      : null;
+    const baselinePt = specified
+      ? measuredLine.topYPt + specified.baselineOffsetPt
+      : plannedBaselinePt(measuredLine, context);
     let lineStartOffset = Number.POSITIVE_INFINITY;
     let lineEndOffset = sourceOffset;
     const segments: MeasuredLinePlanSegment[] = [];
@@ -2485,6 +2501,7 @@ function planMeasuredLines(
         advancePt: measuredLine.advancePt,
         xOffsetPt: raw.xOffset,
         availableWidthPt: raw.availWidth,
+        ...(raw.marginExtension ? { marginExtensionPt: raw.marginExtension } : {}),
         endsWithBreak: raw.endsWithBreak ?? false,
         segments,
       },
@@ -5006,6 +5023,8 @@ export function paragraphLayoutFromMeasurement(
     occurrences, numberingPlan, options.environment.layoutServices?.text,
     options.environment.verticalGlyphMeasurement,
     options.environment.verticalPageFrame,
+    options.environment.compatibilityMode,
+    options.environment.paragraphMarkShapeInput,
   );
   if (options.sourceRangeStart !== undefined) {
     lines = rebaseMeasuredLineRanges(lines, options.sourceRangeStart);

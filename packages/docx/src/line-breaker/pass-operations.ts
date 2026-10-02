@@ -19,6 +19,12 @@ import {
   type LineBoundary,
 } from './model.js';
 import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
+import {
+  commitMixedLineItem,
+  createMixedSpaceState,
+  performSettleMixedSpaces,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -105,6 +111,9 @@ export interface PassOperationState extends LineBreakerPassInput {
     retainTrailingPunctuationCompression?: boolean,
   ) => number;
   readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
+  /** WORD_COMPRESSED_SPACE_LINE_FIT (mixed-script lines); see mixed-space-fit.ts. */
+  readonly mixedSpaceRequirement: (candidate: MixedSpaceCandidate) => number | undefined;
+  readonly markMixedSpacesCompressed: () => void;
   readonly textSegmentBox: (
     s: LayoutTextSeg,
   ) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
@@ -209,17 +218,21 @@ export function performLineHeadRequirement(
 ): number {
   const { wrapCtx, segs, breakerState, scale } = operationState;
   if (!wrapCtx) return 0;
-  const candidates = boundary ? segs : breakerState.queue;
   const start = boundary?.segIndex ?? 0;
+  // Source boundaries must start directly at their index: walking the already
+  // consumed prefix at every fragment would make long paragraphs quadratic.
+  function* sourceCandidates(): IterableIterator<LayoutSeg> {
+    for (let index = start; index < segs.length; index += 1) yield segs[index];
+  }
+  const candidates = boundary ? sourceCandidates() : breakerState.queue;
   let mark: LayoutTextSeg | undefined;
-  for (let index = start; index < candidates.length; index += 1) {
-    const candidate = candidates[index];
+  for (const candidate of candidates) {
     if (('text' in candidate && !candidate.metricOnly && candidate.text.length > 0)
       || ('imagePath' in candidate && !candidate.anchor) || 'math' in candidate
       || 'isTab' in candidate || 'lineBreak' in candidate) return 0;
     if ('text' in candidate && candidate.metricOnly) mark ??= candidate;
   }
-  if (start >= candidates.length) return 0;
+  if (boundary ? start >= segs.length : breakerState.queue.length === 0) return 0;
   return wrapCtx.paragraphMarkLineStartWidth ?? (mark ? mark.fontSize * scale : 0);
 }
 
@@ -301,12 +314,19 @@ function openPhysicalLine(operationState: PassOperationState): void {
   if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
 }
 
+/** Width between the paragraph's trailing indent and the text margin (zero
+ * when a negative indent already reaches past the margin). */
+function marginExtensionWidth({ marginRightPx, maxWidth }: PassOperationState): number {
+  return Math.max(0, marginRightPx - maxWidth);
+}
+
 export function performStartLine(operationState: PassOperationState, requirement: number = 0): void {
   const { breakerState, maxWidth, wrapCtx, firstIndent, probeFloors } = operationState;
 
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
   breakerState.lineMaxWidth = maxWidth;
+  breakerState.lineMarginExtension = marginExtensionWidth(operationState);
   breakerState.gapTransaction = null;
   const cursor = breakerState.fragmentCursor;
   breakerState.fragmentCursor = null;
@@ -358,8 +378,8 @@ function placeLineWindow(
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
-  const query = (topY: number, x: number, width: number, height: number) => {
-    const requiredWidth = transaction.requirement;
+  const query = (topY: number, x: number, width: number, height: number,
+    requiredWidth = transaction.requirement) => {
     if (wrapCtx.lineWindow) {
       const win = wrapCtx.lineWindow({
         topYPt: topY, minimumStartWidthPt: requiredWidth,
@@ -408,6 +428,7 @@ function placeLineWindow(
     if (probeH === undefined) {
       breakerState.lineXOffset = 0;
       breakerState.lineMaxWidth = maxWidth;
+      breakerState.lineMarginExtension = marginExtensionWidth(operationState);
       transaction.window = null;
       transaction.narrowed = false;
       transaction.endsAtExclusion = false;
@@ -434,6 +455,19 @@ function placeLineWindow(
   breakerState.currentLineTopY = accepted.topY;
   breakerState.lineXOffset = accepted.xOffset;
   breakerState.lineMaxWidth = accepted.maxWidth;
+  // A trailing-indent extension exists only beside an unnarrowed band, and
+  // only where no exclusion intersects it on this line (§20.4.2.17–.19).
+  const extension = marginExtensionWidth(operationState);
+  const extensionProbeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+  if (accepted.narrowed || extension <= 0 || baseRtl) {
+    breakerState.lineMarginExtension = 0;
+  } else if (extensionProbeH === undefined) {
+    breakerState.lineMarginExtension = extension;
+  } else {
+    const free = query(accepted.topY, wrapCtx.paraX + maxWidth, extension, extensionProbeH, extension);
+    breakerState.lineMarginExtension = free.topY === accepted.topY && free.xOffset === 0
+      && free.maxWidth >= extension ? extension : 0;
+  }
   transaction.window = accepted;
   transaction.narrowed = accepted.narrowed;
   // Absolute line-end edge versus the paragraph band edge, in reading order.
@@ -465,7 +499,7 @@ export function performCaptureGapSnapshot(
     scalars: { ...scalars },
     snapBlock: snapBlock ? { ...snapBlock } : null,
     linesLength: lines.length,
-    queue: includeInHand && inHand ? [inHand, ...queue] : queue.slice(),
+    queue: queue.snapshot(includeInHand ? inHand : undefined),
   };
 }
 
@@ -482,7 +516,13 @@ export function performForcedPlacement(
   if (!transaction?.narrowed || !transaction.snapshot) return;
   // Inkless items before the unit (anchor characters, mark metrics) travel
   // with it; only inked content can end the fragment before the unit.
-  const committed = breakerState.currentLine.slice(0, unitStart).some((item) => !isInklessLineItem(item));
+  let committed = false;
+  for (let index = 0; index < unitStart && index < breakerState.currentLine.length; index += 1) {
+    if (!isInklessLineItem(breakerState.currentLine[index])) {
+      committed = true;
+      break;
+    }
+  }
   const lead = committed ? breakerState.currentLine[unitStart] : undefined;
   throw new LineGapRejection(requiredWidth, lead?.src ? { ...lead.src } : undefined);
 }
@@ -514,9 +554,10 @@ export function performRejectGap(
     ? { ...(snapshot.snapBlock as NonNullable<typeof breakerState.snapBlock>) }
     : null;
   breakerState.lines.length = snapshot.linesLength;
-  breakerState.queue = snapshot.queue.slice();
+  breakerState.queue.restore(snapshot.queue);
   breakerState.currentLine = [];
   breakerState.latinLineGaps = [];
+  breakerState.mixedSpace = createMixedSpaceState();
   breakerState.inHand = undefined;
   // A replay ends the fragment before the forced unit. If the replay cannot
   // reach that source boundary, the whole fragment is rejected instead.
@@ -601,6 +642,7 @@ export function performFlush(
     operationState.forcedPlacement(followingUnit);
   }
   materializeLatinSpaceCompression();
+  performSettleMixedSpaces(operationState);
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
     currentLine: breakerState.currentLine,
@@ -716,11 +758,13 @@ export function performFlush(
     gridCountSingle,
     xOffset: breakerState.lineXOffset,
     availWidth: breakerState.lineMaxWidth,
+    ...(breakerState.currentLine.some((segment) => 'isTab' in segment && segment.marginAllocation)
+      ? { marginExtension: breakerState.lineMarginExtension } : {}),
     topY: wrapCtx ? breakerState.currentLineTopY : undefined,
     hasRuby: breakerState.lineHasRuby,
     eastAsian: breakerState.lineEastAsian,
     endsWithBreak: brTerminated,
-    consumedEnd: nextStart ?? breakerState.queue[0]?.src ?? endBoundary,
+    consumedEnd: nextStart ?? breakerState.queue.peek()?.src ?? endBoundary,
   });
   if (wrapCtx) {
     if (!brTerminated && nextStart !== undefined) {
@@ -869,7 +913,7 @@ export function performAddToLine(
   } else {
     breakerState.snapBlock = null;
   }
-  breakerState.currentLine.push(s);
+  commitMixedLineItem(breakerState, s, scale);
   breakerState.currentWidth += committedWidth;
   if (
     'text' in s &&
@@ -1295,7 +1339,7 @@ export function performAppendQueuedIdeographicSpaceSegment(
     source.fitTextRegionIndex !== undefined
   )
     return;
-  const follower = breakerState.queue[0];
+  const follower = breakerState.queue.peek();
   if (
     !follower ||
     !('text' in follower) ||
@@ -1561,6 +1605,7 @@ export function performRetractCurrentLineForLeadingKinsoku(
     materializeLatinSpaceCompression,
     strAdvance,
     next,
+    operationState.scale,
   );
 }
 

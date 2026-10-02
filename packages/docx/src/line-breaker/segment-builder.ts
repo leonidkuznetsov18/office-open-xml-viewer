@@ -26,6 +26,7 @@ import {
 import {
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
+  wordCompressedSpaceLineFitApplies,
   wordSourceRunSpaceContinuesSequence,
   wordBalancedConsecutiveSpaceCellApplies,
   wordBalancedLinesAndCharsGridDeltaFactor,
@@ -793,8 +794,61 @@ export function buildSegments(
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
   finalizeBuiltSegments(runs, environment, segs);
+  withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
 
   return segs;
+}
+
+const AUTO_SPACE_EAST_ASIAN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+const AUTO_SPACE_LATIN = /\p{Script=Latin}/u;
+const AUTO_SPACE_DIGIT = /[0-9]/u;
+
+/**
+ * Scope of WORD_COMPRESSED_SPACE_LINE_FIT (see its registered description):
+ * the paragraph keeps the unchanged line breaker when
+ * - §17.3.1.2-3 automatic spacing applies (enabled, with an ideograph or kana
+ *   directly beside a Latin letter or ASCII digit), which the renderer does
+ *   not model, or
+ * - a compressible closing mark is directly followed by U+0020, where the
+ *   registered rule records a full retained cell that
+ *   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL does not reproduce.
+ * Adjacency is read on the paragraph's joined text, so run seams cannot
+ * change the decision.
+ */
+function withdrawMixedSpaceEligibilityOutsideScope(
+  environment: LineLayoutEnvironment,
+  segs: LayoutSeg[],
+): void {
+  if (!segs.some((segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined)) {
+    return;
+  }
+  let previous: string | undefined;
+  let outside = false;
+  const pair = (left: string, right: string): boolean => {
+    if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ') return true;
+    const eastAsian = AUTO_SPACE_EAST_ASIAN.test(left) ? right : AUTO_SPACE_EAST_ASIAN.test(right) ? left : undefined;
+    if (eastAsian === undefined) return false;
+    return (environment.autoSpaceDE !== false && AUTO_SPACE_LATIN.test(eastAsian))
+      || (environment.autoSpaceDN !== false && AUTO_SPACE_DIGIT.test(eastAsian));
+  };
+  for (const segment of segs) {
+    if (!('text' in segment)) {
+      previous = undefined;
+      continue;
+    }
+    for (const character of segment.text) {
+      if (previous !== undefined && pair(previous, character)) {
+        outside = true;
+        break;
+      }
+      previous = character;
+    }
+    if (outside) break;
+  }
+  if (!outside) return;
+  for (const segment of segs) {
+    if ('text' in segment) segment.mixedSpaceAverageWidthRatio = undefined;
+  }
 }
 
 interface SegmentEmissionState {
@@ -1272,6 +1326,25 @@ function emitResolvedTextSegment(
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)
     : undefined;
+  // WORD_COMPRESSED_SPACE_LINE_FIT: U+0020 on mixed East Asian / Latin lines.
+  // The line breaker applies it only once its line holds East Asian text;
+  // OpenType features and explicit kerning thresholds do not gate it.
+  const mixedSpaceCompressionEligible =
+    wordCompressedSpaceLineFitApplies(
+      environment.compatibilityMode,
+      environment.characterSpacingControl,
+    ) &&
+    environment.lineWrapLikeWord6 !== true &&
+    environment.verticalCJK !== true &&
+    documentCharacterCompressionApplies &&
+    (resolvedScript === 'ascii' || resolvedScript === 'highAnsi') &&
+    !emissionState.reduced &&
+    effectiveVertAlign == null &&
+    (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
+    (effectiveCharacterScale == null || effectiveCharacterScale === 1);
+  const mixedSpaceAverageWidthRatio = mixedSpaceCompressionEligible
+    ? latinSpaceAverageWidthRatio ?? selectedAverageWidth(resolvedSpan?.font, text)
+    : undefined;
   const widthBalanceGridDeltaFactor = environment.balanceSingleByteDoubleByteWidth
     ? wordBalancedLinesAndCharsGridDeltaFactor(text, resolvedScript)
     : undefined;
@@ -1300,6 +1373,9 @@ function emitResolvedTextSegment(
     fontSize: cs ? csFontSize : base.fontSize,
     color: base.color,
     fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
+    authoredFontFamily: resolvedSpan?.font.requestedFamily ?? fontFamily,
+    fontSource: resolvedSpan?.font.source,
+    authoredReferenceMetricAllowed: mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font),
     fontRoute: resolvedSpan?.fontRoute,
     resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
     resolvedLatinGridCellAllocation: referenceLineMetric?.farEastCodePage === false,
@@ -1320,6 +1396,9 @@ function emitResolvedTextSegment(
     resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
     ...(latinSpaceAverageWidthRatio != null && latinSpaceAverageWidthRatio > 0
       ? { latinSpaceAverageWidthRatio, latinSpaceCompressionEligible: true as const }
+      : {}),
+    ...(mixedSpaceAverageWidthRatio != null && mixedSpaceAverageWidthRatio > 0
+      ? { mixedSpaceAverageWidthRatio }
       : {}),
     vertAlign: effectiveVertAlign,
     measuredWidth: 0,
@@ -1687,6 +1766,9 @@ function appendRunsToSegments(
         fontSize: run.fontSize,
         color: null,
         fontFamily: selected?.resolvedFamily ?? authoredFamily,
+        authoredFontFamily: selected?.requestedFamily ?? authoredFamily,
+        fontSource: selected?.source,
+        authoredReferenceMetricAllowed: mayUseAuthoredReferenceVerticalMetric(selected),
         fontRoute: selected?.route,
         resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
         ...(resourceMetric?.lineHeightRatio != null

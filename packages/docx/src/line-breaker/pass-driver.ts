@@ -20,10 +20,16 @@ import {
   type WrapLayoutCtx,
 } from './model.js';
 import { createLineBreakerState, prepareBreakQueue } from './break-queue.js';
+import { SegmentQueue } from './segment-queue.js';
 import { buildFont } from './font-routes.js';
 import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
+import {
+  performMarkMixedSpacesCompressed,
+  performMixedSpaceRequirement,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
 import {
   performLineHeadRequirement,
   performForcedPlacement,
@@ -122,6 +128,14 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const { probeHeights, preparedFloatWrap } = passContext;
   const probeFloors = passContext.probeFloors ?? probeHeights;
   const breakerState = createLineBreakerState(maxWidth, wrapCtx);
+  // WORD_COMPRESSED_SPACE_LINE_FIT scope, fixed for the paragraph: only
+  // segments acquired under its document gate carry the eligibility. No
+  // Word control measured U+3000, whose hanging and paragraph-final rules
+  // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) the observed rule does not
+  // define; a paragraph holding U+3000 keeps the unchanged line breaker.
+  breakerState.mixedSpaceEnabled = segs.some(
+    (segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined,
+  ) && !segs.some((segment) => 'text' in segment && segment.text.includes('\u3000'));
 
   let operationState: PassOperationState;
   const sameLatinSpaceFace = performSameLatinSpaceFace;
@@ -211,7 +225,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const setMeasureFont = (font: string): void => measurement.setFont(font);
 
   const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
-  breakerState.queue = prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement);
+  breakerState.queue = new SegmentQueue(prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement));
 
   // The segment's laid-out ADVANCE (= its measuredWidth): natural width plus the
   // character-grid delta, the §17.3.2.43 horizontal glyph scale (w:w) and the
@@ -257,6 +271,9 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * setting excludes the fit projection at segment acquisition. */
   const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
     performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
+  const mixedSpaceRequirement = (candidate: MixedSpaceCandidate): number | undefined =>
+    performMixedSpaceRequirement(operationState, candidate);
+  const markMixedSpacesCompressed = (): void => performMarkMixedSpacesCompressed(operationState);
 
   /** Measure one text segment's canonical advance and vertical contribution.
    * Every path that commits a complete text segment to a line must use this
@@ -382,6 +399,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     eastAsianSnapCellCount,
     strAdvance,
     fitHomogeneousLatinSpaces,
+    mixedSpaceRequirement,
+    markMixedSpacesCompressed,
     textSegmentBox,
     appendQueuedIdeographicSpaceSegment,
     tabFollowWidth,
@@ -418,7 +437,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     // physical union, including object leading and position ownership, to all
     // fragments; each segment is visited once, independent of gap count.
     const { segments: _segments, xOffset: _x, availWidth: _width,
-      consumedEnd: _end, endsWithBreak: _break, ...metrics } = last;
+      marginExtension: _extension, consumedEnd: _end, endsWithBreak: _break, ...metrics } = last;
     let positionReference: number | undefined;
     for (let index = start; index < end; index += 1) {
       for (const segment of breakerState.lines[index].segments) {

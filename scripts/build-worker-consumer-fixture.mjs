@@ -9,6 +9,8 @@ import {
   storedZip,
 } from '../tests/fixtures/chart-ex-packages.mjs';
 
+import { pathGradientPptxBytes } from '../tests/fixtures/path-gradient-package.mjs';
+
 const root = resolve(new URL('..', import.meta.url).pathname);
 const outDir = join(tmpdir(), 'ooxml-worker-consumer-dist');
 const entry = (name) => resolve(root, `dist/${name}.mjs`);
@@ -212,3 +214,5 @@ if (workers.length < 3 || workers.length > 6) {
   throw new Error(`Vite consumer output must contain 3 ordinary and up to 3 opt-in source render workers, found ${workers.length}`);
 }
 console.log(`Vite consumer bundle: ${workers.length} self-contained render workers`);
+
+writeFileSync(join(outDir, 'path-gradient.pptx'), pathGradientPptxBytes());

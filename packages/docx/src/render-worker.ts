@@ -320,6 +320,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // The guard mirrors main mode's `deferrable`: a fatally-unparseable
       // document is served a synthetic error page by the variant store's
       // builder, and neither previewing nor slicing may route around that.
+      let unchangedPages: number | undefined;
       if (req.progressiveLayout && source.fatalParse === null) {
         // The parsed model is the source of review data, so the first
         // publication carries it: the host has nothing else to answer
@@ -334,7 +335,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         let lastProgressMs = 0;
         const abort = new AbortController();
         layoutAbort = abort;
-        await paginateRenderWorkerDocumentProgressively(doc, source, {
+        unchangedPages = await paginateRenderWorkerDocumentProgressively(doc, source, {
           publish: (publication) => {
             post({
               type: 'layoutPartial',
@@ -369,7 +370,10 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       resourceUsage = decodeOoxmlResourceUsage(
         host.run(() => loadedArchive.resource_usage()),
       );
-      post({ type: 'parsedMeta', id, meta, usage: resourceUsage });
+      post({
+        type: 'parsedMeta', id, meta, usage: resourceUsage,
+        ...(unchangedPages === undefined ? {} : { unchangedPages }),
+      });
       return;
     }
     if (req.type === 'selectLayoutView') {

@@ -30,6 +30,14 @@ export interface LayoutSegSource {
 
 export interface LayoutTextSeg extends LayoutSegSource {
   text: string;
+  /** Authored family and selected source survive local FontFace aliases.
+   * Compatibility metadata may distinguish an installed authored face from a
+   * substitute without inspecting the CSS alias or changing its paint route. */
+  authoredFontFamily?: string | null;
+  fontSource?: import('../layout/font-service.js').FontResolutionSource;
+  /** Existing selected-face reference policy; application-provided SFNT
+   * resources are local inventory entries but are not installed Office faces. */
+  authoredReferenceMetricAllowed?: boolean;
   /** §17.3.2.26 script slot selected by the authoritative shaping service. */
   script?: FontScriptSlot;
   /** Internal §17.6.5 snapToChars allocation retained from measure to paint. */
@@ -101,6 +109,14 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Retained paint advance is shorter than the natural space by this amount. */
   latinSpaceCompressionPx?: number;
   latinNaturalTrailingSpacePx?: number;
+  /** Selected-face OS/2 xAvgCharWidth / unitsPerEm, set only where
+   * WORD_COMPRESSED_SPACE_LINE_FIT may shrink this segment's U+0020 on a mixed
+   * East Asian / Latin line. Independent of the Latin-only projection. */
+  mixedSpaceAverageWidthRatio?: number;
+  /** Natural advance and count of this segment's shrinkable trailing U+0020
+   * under WORD_COMPRESSED_SPACE_LINE_FIT. */
+  mixedNaturalTrailingSpacePx?: number;
+  mixedNaturalTrailingSpaceCount?: number;
   vertAlign: 'super' | 'sub' | null;
   measuredWidth: number;  // px (set during layout)
   /** A2 text authority captured during segmentation; production text width and
@@ -312,6 +328,9 @@ export interface LayoutTabSeg extends LayoutSegSource {
   leader?: TabStop['leader'];
   /** Alignment selected from the effective stop during layout. */
   resolvedAlignment?: TabStop['alignment'];
+  /** Set when this aligned tab's cell was admitted past the paragraph's
+   *  trailing indent into the line's exclusion-free margin extension. */
+  marginAllocation?: boolean;
   /** Bold/italic of the run carrying the tab (ECMA-376 §17.3.1.37 — the leader
    *  characters take the formatting of the tab's run, e.g. a bold TOC1 entry's
    *  dot leader is bold). Threaded so {@link drawTabLeader} can match the font. */
@@ -449,6 +468,9 @@ export interface LayoutLine {
   xOffset: number;
   /** Effective available width (px) for this line after float exclusion. */
   availWidth: number;
+  /** Width (px) past `availWidth` up to the text margin that this line's
+   *  margin-allocated tab cell occupies as part of its band. */
+  marginExtension?: number;
   /** When wrap context is active, the absolute canvas Y where this line begins. */
   topY?: number;
   /** Confirmed fixed-point allocation that owns topY, in the same units as
@@ -593,6 +615,14 @@ export interface LineLayoutEnvironment {
   readonly characterSpacingControl?: string;
   /** §17.15.3.31: use full character width when deciding line fit. */
   readonly lineWrapLikeWord6?: boolean;
+  /** `w:compatSetting` compatibilityMode; absent when not authored. Gates
+   * WORD_COMPRESSED_SPACE_LINE_FIT. */
+  readonly compatibilityMode?: number;
+  /** Paragraph §17.3.1.2-3 automatic East Asian/Latin and East Asian/number
+   * spacing (absent means on). The renderer does not model that spacing;
+   * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
+  readonly autoSpaceDE?: boolean;
+  readonly autoSpaceDN?: boolean;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;

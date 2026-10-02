@@ -1,3 +1,4 @@
+import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './layout/specified-line-spacing.js';
 import {
   paragraphGridRightAdjustmentPt,
   type ParagraphLayoutContext,
@@ -248,6 +249,8 @@ export function measureParagraph(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    autoSpaceDE: paragraph.autoSpaceDE,
+    autoSpaceDN: paragraph.autoSpaceDN,
   });
   if (segments.length === 0) return measureMarkOnly();
 
@@ -274,6 +277,7 @@ export function measureParagraph(
   // (§17.3.3.25 describes the guide above the base; §17.6.5 supplies grid cells).
   // Resolve the complete physical unions before querying floats: a per-fragment
   // reserve cannot determine either a probe band or the next physical origin.
+  const specifiedParagraph = specifiedTextParagraphIsHomogeneous(paragraph);
   const allocateLines = (lines: readonly LayoutLine[]) => {
     let uniformRubyAdvancePt = context.hasRuby
       ? snapParagraphLineToGrid(
@@ -327,7 +331,11 @@ export function measureParagraph(
       const markerNaturalPt = line.ascent + line.descent;
       const markerRaisesBox = line !== originalLine
         && markerNaturalPt > textSinglePt;
-      const advancePt = markerRaisesBox
+      const specified = specifiedParagraph && !paragraph.numbering
+        ? specifiedTextLineMetrics(line, context, paragraph, environment.compatibilityMode,
+            environment.verticalPageFrame === true, environment.paragraphMarkShapeInput)
+        : null;
+      const advancePt = specified ? specified.advancePt : markerRaisesBox
         ? markerNaturalPt + textSinglePt * ((context.lineSpacing?.value ?? 1) - 1)
         : context.hasRuby
         ? uniformRubyAdvancePt

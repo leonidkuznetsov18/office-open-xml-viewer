@@ -237,6 +237,11 @@ pub struct ParaFmt {
     /// applied when the resolved paragraph is built so style/direct `false`
     /// remains distinguishable from omission during the cascade.
     pub overflow_punct: Option<bool>,
+    /// ECMA-376 §17.3.1.2 w:autoSpaceDE / §17.3.1.3 w:autoSpaceDN — automatic
+    /// spacing between East Asian text and Latin text / numbers. Omission
+    /// inherits; the final default (`true`) is applied on the resolved paragraph.
+    pub auto_space_de: Option<bool>,
+    pub auto_space_dn: Option<bool>,
     /// ECMA-376 §17.3.1.1 w:adjustRightInd — allow the consumer to adjust the
     /// effective right indent when a document grid is active. Retained as an
     /// Option through the style cascade because omission inherits and the final
@@ -1026,6 +1031,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.overflow_punct.is_some() {
         dst.overflow_punct = src.overflow_punct;
     }
+    if src.auto_space_de.is_some() {
+        dst.auto_space_de = src.auto_space_de;
+    }
+    if src.auto_space_dn.is_some() {
+        dst.auto_space_dn = src.auto_space_dn;
+    }
     if src.adjust_right_ind.is_some() {
         dst.adjust_right_ind = src.adjust_right_ind;
     }
@@ -1459,6 +1470,10 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
     // ECMA-376 §17.3.1.21 defines omission as true; retain Option here so an
     // explicit style/direct false participates correctly in the cascade.
     fmt.overflow_punct = bool_prop(ppr, "overflowPunct");
+
+    // autoSpaceDE / autoSpaceDN — ECMA-376 §17.3.1.2-3; same cascade contract.
+    fmt.auto_space_de = bool_prop(ppr, "autoSpaceDE");
+    fmt.auto_space_dn = bool_prop(ppr, "autoSpaceDN");
 
     // adjustRightInd — ECMA-376 §17.3.1.1. The setting participates in the
     // paragraph-style hierarchy and omission ultimately defaults to true.
@@ -2608,6 +2623,28 @@ mod tests {
         let direct = vec![stop(100.0, "clear", "none")];
         let merged = merge_tab_stops(&style, &direct);
         assert_eq!(merged, vec![stop(200.0, "right", "dot")]);
+    }
+
+    #[test]
+    fn auto_space_flags_participate_in_paragraph_style_cascade() {
+        let parse = |inner: &str| {
+            let xml = format!(
+                r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{inner}</w:pPr>"#
+            );
+            let document = XmlDoc::parse(&xml).unwrap();
+            parse_para_fmt(document.root_element())
+        };
+        let mut inherited = parse(r#"<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/>"#);
+        apply_para(&mut inherited, &parse("<w:keepNext/>"));
+        assert_eq!(
+            (inherited.auto_space_de, inherited.auto_space_dn),
+            (Some(false), Some(false))
+        );
+        apply_para(&mut inherited, &parse("<w:autoSpaceDE/>"));
+        assert_eq!(
+            (inherited.auto_space_de, inherited.auto_space_dn),
+            (Some(true), Some(false))
+        );
     }
 
     #[test]
