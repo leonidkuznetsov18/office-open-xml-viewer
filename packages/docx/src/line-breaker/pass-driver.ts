@@ -132,7 +132,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   // segments acquired under its document gate carry the eligibility. No
   // Word control measured U+3000, whose hanging and paragraph-final rules
   // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) the observed rule does not
-  // define; a paragraph holding U+3000 keeps the unchanged line breaker.
+  // define; a paragraph holding U+3000 keeps this compression rule disabled.
   breakerState.mixedSpaceEnabled = segs.some(
     (segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined,
   ) && !segs.some((segment) => 'text' in segment && segment.text.includes('\u3000'));

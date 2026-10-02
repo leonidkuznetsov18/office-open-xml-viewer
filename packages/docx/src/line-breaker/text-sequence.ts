@@ -134,6 +134,11 @@ export function acquireTextSequences(
     offset = 0;
   };
   for (const [runIndex, run] of runs.entries()) {
+    // ECMA-376 §17.13.5: deleted/moved-away text has no final-view glyphs.
+    // It contributes neither formatting nor a shaping seam to visible neighbors;
+    // markup view retains its own revision formatting and source ownership.
+    if (environment.showTrackedChanges !== true && (run.type === 'text' || run.type === 'field')
+      && (run.revision?.kind === 'deletion' || run.revision?.kind === 'moveFrom')) continue;
     const visible = visibleTextRun(run, environment);
     const scopeKey = visible ? environment.layoutServices?.text.sourceScopeKey?.({
       text: displayText(visible.text, visible), fontSizePt: visible.fontSize,

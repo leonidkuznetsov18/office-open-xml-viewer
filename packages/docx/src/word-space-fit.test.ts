@@ -465,26 +465,30 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT scope cost', () => {
 
 describe('WORD_COMPRESSED_SPACE_LINE_FIT and U+3000', () => {
   // Review round 7: no Word control measured U+3000, so a paragraph holding
-  // one keeps main's line breaker exactly. Expected partitions and line widths
-  // were produced by origin/main 4a387ebcb for the same joined and split
-  // inputs (BIZ UDGothic bold 8.5pt, mode 14, compressPunctuation).
+  // one keeps compression disabled. Joined expectations were produced by
+  // origin/main 4a387ebcb (BIZ UDGothic bold 8.5pt, mode 14,
+  // compressPunctuation); formatting-only seams use that same joined input.
   const MAIN: readonly Readonly<{
     chunks: readonly string[];
     band: number;
     main: readonly (readonly [string, number])[];
   }>[] = [{"chunks": ["甲甲甲甲  + 乙乙 +  丙丙、）　　("], "band": 108.5, "main": [["甲甲甲甲  + 乙乙 +  丙", 93.5], ["丙、）　　(", 38.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙、）　", "　("], "band": 108.5, "main": [["甲甲甲甲  + 乙乙 +  丙", 93.5], ["丙、）　　(", 38.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　【ーｱ，」　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　", "【ーｱ，」　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　【", "ーｱ，」　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　【ー", "ｱ，」　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　【ーｱ", "，」　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　【ーｱ，", "」　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　(，　【ーｱ，」", "　"], "band": 109.25, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["(，　【ーｱ，」　", 55.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙．1，ｱ。　丙ゃ　"], "band": 120, "main": [["甲甲甲甲  + 乙乙 +  丙丙．1，", 114.75], ["ｱ。　丙ゃ　", 42.5]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙．1，ｱ。　", "丙ゃ　"], "band": 120, "main": [["甲甲甲甲  + 乙乙 +  丙丙．1，", 114.75], ["ｱ。　丙ゃ　", 42.5]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙．1，ｱ。　丙", "ゃ　"], "band": 120, "main": [["甲甲甲甲  + 乙乙 +  丙丙．1，", 114.75], ["ｱ。　丙ゃ　", 42.5]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙．1，ｱ。　丙ゃ", "　"], "band": 120, "main": [["甲甲甲甲  + 乙乙 +  丙丙．1，", 114.75], ["ｱ。　丙ゃ　", 42.5]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙】1　　『"], "band": 107.75, "main": [["甲甲甲甲  + 乙乙 +  丙丙】", 106.25], ["1　　『", 29.75]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙】1　", "　『"], "band": 107.75, "main": [["甲甲甲甲  + 乙乙 +  丙丙】", 106.25], ["1　　『", 29.75]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　　("], "band": 108.5, "main": [["甲甲甲甲  + 乙乙 +  丙丙　　", 119], ["(", 4.25]]}, {"chunks": ["甲甲甲甲  + 乙乙 +  丙丙　", "　("], "band": 108.5, "main": [["甲甲甲甲  + 乙乙 +  丙丙　", 110.5], ["　(", 12.75]]}];
   const run = { ascii: 'BIZ UDGothic', eastAsia: 'BIZ UDGothic', sizePt: 8.5, bold: true } as const;
-  it.each(MAIN.map((item) => [item.chunks.join('|'), item] as const))('%s matches main', (_label, item) => {
-    const lines = layoutStubParagraph({
-      runs: item.chunks.map((text) => ({ ...run, text })),
-      environment: { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' },
-      bandPt: item.band, justification: 'left',
-    });
-    expect(lines.map((line) => [
-      line.map((segment) => segment.text).join(''),
-      Number(line.reduce((sum, segment) => sum + segment.width, 0).toFixed(4)),
-    ])).toEqual(item.main);
-    expect(lines.every((line) => line.every((segment) => segment.compression === 0))).toBe(true);
+  const groups = [...new Map(MAIN.map(item => [item.chunks.join(''), item])).keys()];
+  it.each(groups)('%s keeps compression disabled with transparent source seams', text => {
+    const whole = MAIN.find(item => item.chunks.length === 1 && item.chunks[0] === text)!;
+    for (const item of MAIN.filter(item => item.chunks.join('') === text)) {
+      const lines = layoutStubParagraph({
+        runs: item.chunks.map((text) => ({ ...run, text })),
+        environment: { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' },
+        bandPt: item.band, justification: 'left',
+      });
+      expect(lines.map((line) => [
+        line.map((segment) => segment.text).join(''),
+        Number(line.reduce((sum, segment) => sum + segment.width, 0).toFixed(4)),
+      ])).toEqual(whole.main);
+      expect(lines.every((line) => line.every((segment) => segment.compression === 0))).toBe(true);
+    }
   });
 });
 

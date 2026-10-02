@@ -133,12 +133,11 @@ describe('formatting-only run boundaries are transparent to text acquisition', (
     for (const parts of partitions('T i')) expect(geometry(acquire(parts, 16, container))).toEqual(accepted);
   });
 
-  it.each([
-    { text: 'AVAT i-AV T i', fontFamily: 'Arial', fontSize: 18, kerning: 8 },
-    { text: ' T i AV-T  i ', fontFamily: 'Times New Roman', fontSize: 10, kerning: 10 },
-    { text: 'AV T i\tAV-T i', fontFamily: 'Georgia', fontSize: 24, kerning: 24.5 },
-    { text: 'AV-T i T  i', fontFamily: 'Arial', fontSize: 18, kerning: 0 },
-  ])('preserves widths, wraps, alignment and retained paint for $fontFamily / $kerning', ({ text, ...format }) => {
+  // The parser-backed matrix below owns font/threshold variation. This case
+  // separately protects intrinsic sizing and each alignment's placement path.
+  it('preserves intrinsic widths, container alignment and retained paint across source partitions', () => {
+    const text = 'AV T i\tAV-T i';
+    const format = { fontFamily: 'Arial', fontSize: 18, kerning: 8 };
     const widths = intrinsic([run(text, format)]);
     for (const parts of partitions(text)) expect(intrinsic(parts.map(text => run(text, format)))).toEqual(widths);
     for (const container of ['paragraph', 'fixed', 'autofit'] as const) {
@@ -176,6 +175,10 @@ function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTe
   const runs = parts.map((text, index) => {
     const content = text.split('\t').map(piece => `<w:t xml:space="preserve">${escape(piece)}</w:t>`).join('<w:tab/>');
     const run = `<w:r w:rsidR="0000000${index % 8}">${runProperties[index] ? `<w:rPr>${runProperties[index]}</w:rPr>` : ''}${content}</w:r>`;
+    if (wrapper === 'deletion-seam' || wrapper === 'moveFrom-seam') {
+      const tag = wrapper === 'deletion-seam' ? 'del' : 'moveFrom';
+      return `${index ? `<w:${tag} w:id="${index}" w:author="Reviewer"><w:r><w:delText>X</w:delText></w:r></w:${tag}>` : ''}${run}`;
+    }
     if (wrapper === 'smart-tags') return `<w:smartTag w:uri="urn:test" w:element="word">${run}</w:smartTag>`;
     if (wrapper === 'revisions') return `<w:ins w:id="${index}" w:author="Reviewer">${run}</w:ins>`;
     if (wrapper === 'hyperlinks') return `<w:hyperlink w:anchor="Destination">${run}</w:hyperlink>`;
@@ -220,6 +223,17 @@ function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed
 }
 
 describe('complete DOCX parser inputs preserve formatting-only split invariance', () => {
+  it.each(['deletion-seam', 'moveFrom-seam'])('keeps omitted %s content out of final-view shaping boundaries', wrapper => {
+    const whole = acquireParsed(['T i'], wrapper);
+    const doc = parsedDocument(['T', ' i'], wrapper);
+    const services = createLayoutServices(doc, { measureContext: context() });
+    const final = layoutDocument(doc, services);
+    expect(geometry(final)).toEqual(geometry(whole));
+    const marked = layoutDocument(doc, services, { showTrackedChanges: true, currentDateMs: 0 });
+    expect(geometry(marked).flatMap(p => p.lines.map(l => l.text)).some(text => text.includes('X'))).toBe(true);
+    const body = textRunsForPage(final, 0, { scale: 1 }).filter(r => r.source?.story === 'body');
+    expect(body.some(r => r.text.includes('X'))).toBe(false);
+  });
   it('keeps Latin source seams transparent beside ideographic spaces in every story', () => {
     const whole = acquireParsed(['T i\u3000'], 'rsid');
     const split = acquireParsed(['T', ' i\u3000'], 'rsid');
