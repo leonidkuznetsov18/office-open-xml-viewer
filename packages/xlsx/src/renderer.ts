@@ -23,7 +23,7 @@ import type {
   ChartRegionMapRenderer,
   ChartExRenderer,
 } from '@silurus/ooxml-core';
-import { chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
+import { trackPaintPath, currentStrokeBounds, chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
@@ -4592,6 +4592,8 @@ function drawShape(
   loadedImages?: Map<string, CanvasImageSource | null>,
   cjkFallback?: CjkLang,
 ): void {
+  if (shape.strokeFill?.fillType === 'gradient' && shape.strokeFill.gradType === 'radial'
+    && (shape.strokeFill.path === 'rect' || shape.strokeFill.path === 'shape')) ctx = trackPaintPath(ctx);
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {
     ctx.translate(sx + sw / 2, sy + sh / 2);
@@ -5318,11 +5320,13 @@ function strokeShapePath(
   applyStroke(ctx, stroke, 1 / EMU_PER_PX);
   // Match DOCX/PPTX stroke hosts: use the authored box, not the fill-bearing
   // silhouette (which excludes decorative paths that may still be stroked).
-  // Shape-path shading remains the shared legacy radial approximation.
+  // Shade coordinates use that host box; raster coverage comes from the
+  // recorded stroke path, including its actual transformed caps and joins.
   if (stroke.fill) {
     const paint = resolveFill(
       stroke.fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
       axisAlignedPatternTransform(shape, width, height),
+      undefined, currentStrokeBounds(ctx),
     );
     if (paint) ctx.strokeStyle = paint;
   }

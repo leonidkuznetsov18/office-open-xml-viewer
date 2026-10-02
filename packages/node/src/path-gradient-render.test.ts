@@ -7,6 +7,7 @@ import type { Presentation, ShapeElement } from '@silurus/ooxml-pptx';
 import type { Styles, Worksheet } from '@silurus/ooxml-xlsx';
 import { renderViewport } from '../../xlsx/src/renderer';
 import { renderSlideNode } from './render';
+import { resolvePathShade, type ShadeWork } from '../../core/src/shape/path-gradient';
 import { loadSkiaForTests } from './test-imports';
 
 const skia = await loadSkiaForTests();
@@ -107,11 +108,11 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   });
 
-  it('shades outlines not star-shaped about their center as a circle about the focus point', () => {
+  it("retains main radial fallback beyond the supported outline boundary", () => {
     const arrow: DrawingMLShapeGeometry = { kind: 'preset', name: 'rightArrow', adjustments: [] };
     for (const [fillToRect, focus] of [
-      [{ l: 0, t: 0, r: 0, b: 0 }, [0, 0]], [{ l: 0, t: 0, r: 1, b: 1 }, [0, 0]],
-      [{ l: .2, t: 0, r: 0, b: 0 }, [120, 0]], [{ l: .2, r: .2, t: .2, b: .2 }, [60, 60]], [undefined, [60, 60]],
+      [{ l: 0, t: 0, r: 0, b: 0 }, [60, 60]], [{ l: 0, t: 0, r: 1, b: 1 }, [0, 0]],
+      [{ l: .2, t: 0, r: 0, b: 0 }, [72, 60]], [{ l: .2, r: .2, t: .2, b: .2 }, [60, 60]], [undefined, [60, 60]],
     ] as const) {
       const { ctx } = canvas(120, 120);
       paintDrawingMLShape(ctx, {
@@ -153,11 +154,11 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   });
 
-  it('repeats path tiles unmirrored with a box-relative rect focus', () => {
+  it('retains authored tile flips with a shape-relative focus', () => {
     const { ctx } = canvas();
     paint({ ...fill, tileRect: { r: .5 }, flip: 'x', fillToRect: { l: 0, r: 1, t: 0, b: 1 } }, ctx, 240, 120);
     expect(pixel(ctx, 3, 3)[0]).toBeLessThan(12);
-    expect(pixel(ctx, 123, 3)[0]).toBeLessThan(12);
+    expect(pixel(ctx, 123, 3)[0]).toBeGreaterThan(243);
     expect(pixel(ctx, 117, 117)[0]).toBeGreaterThan(243);
     const inset = canvas().ctx;
     paint({ ...fill, tileRect: { l: .25, t: .25, r: .25, b: .25 },
@@ -215,18 +216,15 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(Math.abs(pixel(ctx, 120, 30)[3] - 128)).toBeLessThanOrEqual(3);
   });
 
-  it('frames a non-rotating shade by the device bounds of the rotated, mirrored host', () => {
-    const { ctx } = canvas(160, 160);
-    const recipe = { ...fill, fillToRect: { l: 0, r: 1, t: 0, b: 1 }, rotWithShape: false };
-    ctx.translate(80, 80); ctx.rotate(Math.PI / 4); ctx.scale(-1, 1); ctx.translate(-50, -50);
-    ctx.fillStyle = resolveFill(recipe, ctx, 0, 0, 100, 100, 45) as CanvasPattern;
-    ctx.fillRect(0, 0, 100, 100);
-    // The rotated square spans 80±70.7 on both device axes; the focus is the
-    // device bounding box's top-left corner, not the host's local origin.
-    const d = 70.71;
-    expect(pixel(ctx, 80, Math.round(80 - d + 3))[0]).toBeLessThan(130);
-    expect(pixel(ctx, Math.round(80 + d - 3), 80)[0]).toBeGreaterThan(240);
-    expect(Math.abs(pixel(ctx, 80, 80)[0] - 128)).toBeLessThanOrEqual(4);
+  it('keeps the previous local radial frame for rotWithShape=false', () => {
+    const recipe = { ...fill, fillToRect: { l: .1, r: .5, t: .4, b: .1 } };
+    const contexts = [canvas(160, 160).ctx, canvas(160, 160).ctx];
+    for (const [i, ctx] of contexts.entries()) {
+      ctx.translate(80, 80); ctx.rotate(Math.PI / 4); ctx.scale(-1, 1); ctx.translate(-50, -50);
+      ctx.fillStyle = resolveFill({ ...recipe, rotWithShape: i === 0 }, ctx, 0, 0, 100, 100, 45) as CanvasPattern;
+      ctx.fillRect(0, 0, 100, 100);
+    }
+    expect(contexts[1].getImageData(0, 0, 160, 160).data).toEqual(contexts[0].getImageData(0, 0, 160, 160).data);
   });
 
   it('bounds auxiliary allocation even for very large authored extents', () => {
@@ -287,28 +285,140 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     } finally { vi.unstubAllGlobals(); vi.restoreAllMocks(); }
   });
 
-  it('bounds corner-focus work on very complex star outlines', () => {
+  it('bounds band solves by raster pixels for corner and nonnested area foci', () => {
     const { ctx } = canvas(512, 512);
-    for (const edges of [20000, 200000]) {
-      let outlines = 0;
+    for (const edges of [720, 20000]) {
       const outline = (target: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) => {
-        outlines++;
         for (let i = 0; i < edges; i++) {
           const angle = i / edges * Math.PI * 2; const r = i % 2 ? .5 : .03;
           target[i ? 'lineTo' : 'moveTo'](x + w * (.5 + r * Math.cos(angle)), y + h * (.5 + r * Math.sin(angle)));
         }
         target.closePath();
       };
-      const started = performance.now();
-      ctx.fillStyle = resolveFill({ ...fill, path: 'shape', fillToRect: { l: 0, t: 0, r: 1, b: 1 } },
-        ctx, 0, 0, 512, 512, 0, undefined, undefined, outline) as CanvasPattern;
-      // O(edges × rows + pixels) with edges clustered to ≤ 32768: a generous
-      // wall-clock guard against the former O(edges × pixels) fan scan.
-      expect(performance.now() - started).toBeLessThan(2000);
-      expect(outlines).toBe(1);
-      ctx.fillRect(0, 0, 512, 512);
-      expect(pixel(ctx, 2, 2)[0]).toBeLessThan(12);
+      for (const focus of [{ l: 0, t: 0, r: 1, b: 1 }, { l: 1, t: 1, r: -.5, b: -.5 }]) {
+        const work: ShadeWork = { edgeRows: 0, solves: 0, rejected: 0, pixels: 0 };
+        const box = { x: 0, y: 0, w: 512, h: 512 };
+        const paint = resolvePathShade({ ...fill, path: 'shape', fillToRect: focus }, ctx, box, box,
+          outline, undefined, undefined, work);
+        expect(paint).not.toBeNull();
+        expect(work.edgeRows).toBeLessThanOrEqual((edges + 1) * 512);
+        expect(work.solves, JSON.stringify({ edges, focus, work })).toBeLessThanOrEqual(work.pixels);
+        expect(work.rejected).toBe(0);
+        expect(work.pixels).toBeLessThanOrEqual(512 * 512);
+      }
     }
+  }, 20000);
+
+  it('uses the previous native resolver above the explicit edge budget', () => {
+    const contexts = [canvas(64, 64).ctx, canvas(64, 64).ctx];
+    const recipe = { ...fill, path: 'shape' as const, fillToRect: { l: .1, r: .5, t: .4, b: .1 } };
+    const outline = (target: CanvasRenderingContext2D) => {
+      for (let i = 0; i < 32769; i++) {
+        const angle = i / 32769 * Math.PI * 2;
+        target[i ? 'lineTo' : 'moveTo'](32 + 32 * Math.cos(angle), 32 + 32 * Math.sin(angle));
+      }
+      target.closePath();
+    };
+    for (const [i, ctx] of contexts.entries()) {
+      ctx.fillStyle = resolveFill({ ...recipe, path: i ? 'circle' : 'shape' }, ctx, 0, 0, 64, 64,
+        0, undefined, undefined, i ? undefined : outline) as CanvasPattern;
+      ctx.fillRect(0, 0, 64, 64);
+    }
+    expect(contexts[0].getImageData(0, 0, 64, 64).data).toEqual(contexts[1].getImageData(0, 0, 64, 64).data);
+  });
+
+  it('preserves every interior pixel of a displaced concave focus copy', () => {
+    const points = [[0, 0], [100, 40], [200, 0], [160, 60], [200, 120], [100, 80], [0, 120], [40, 60]];
+    const { ctx } = canvas(200, 120);
+    const outline = (target: CanvasRenderingContext2D) => {
+      points.forEach(([x, y], i) => target[i ? 'lineTo' : 'moveTo'](x, y)); target.closePath();
+    };
+    ctx.fillStyle = resolveFill({ ...fill, path: 'shape', fillToRect: { l: .1, r: .5, t: .4, b: .1 } },
+      ctx, 0, 0, 200, 120, 0, undefined, undefined, outline) as CanvasPattern;
+    ctx.beginPath(); outline(ctx); ctx.fill();
+    const contains = (polygon: number[][], x: number, y: number) => {
+      let inside = false;
+      for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+        const a = polygon[i]; const b = polygon[j];
+        if ((a[1] > y) !== (b[1] > y) && x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]) inside = !inside;
+      }
+      return inside;
+    };
+    const focus = points.map(([x, y]) => [20 + .4 * x, 48 + .5 * y]);
+    const pixels = ctx.getImageData(0, 0, 200, 120).data;
+    let interior = 0;
+    // Exclude AA boundaries independently by requiring the four neighbouring
+    // corners to belong to both polygons; compare every remaining pixel.
+    for (let y = 0; y < 120; y++) for (let x = 0; x < 200; x++) {
+      if (![points, focus].every(p => [[x, y], [x + 1, y], [x, y + 1], [x + 1, y + 1]].every(([u, v]) => contains(p, u, v)))) continue;
+      interior++;
+      expect([...pixels.slice((y * 200 + x) * 4, (y * 200 + x) * 4 + 4)]).toEqual([0, 0, 0, 255]);
+    }
+    expect(interior).toBeGreaterThan(1500);
+    expect(pixel(ctx, 83, 86).slice(0, 3)).toEqual([0, 0, 0]);
+  });
+
+  it('keeps rect and shape tile foci in the host box', () => {
+    const contexts = [canvas().ctx, canvas().ctx];
+    for (const [i, ctx] of contexts.entries()) {
+      paint({ ...fill, path: i ? 'shape' : 'rect', tileRect: { r: .5 },
+        fillToRect: { l: .25, r: .5, t: .25, b: .25 } }, ctx, 240, 120);
+      expect(pixel(ctx, 90, 60)).toEqual([0, 0, 0, 255]);
+    }
+    expect(contexts[1].getImageData(0, 0, 240, 120).data).toEqual(contexts[0].getImageData(0, 0, 240, 120).data);
+  });
+
+  it('covers affine strokes and large line decorations from their painted geometry', () => {
+    const affine = canvas(512, 200).ctx;
+    affine.scale(100, 1); affine.lineWidth = 1; affine.miterLimit = 1;
+    affine.strokeStyle = resolveFill(fill, affine, 2, 50, 2, 100) as CanvasPattern;
+    affine.strokeRect(2, 50, 2, 100);
+    expect(pixel(affine, 160, 100)).toEqual([255, 255, 255, 255]);
+    const decorated = canvas(500, 400).ctx;
+    paintDrawingMLShape(decorated, {
+      rect: { x: 200, y: 200, w: 50, h: 1 },
+      geometry: { kind: 'preset', name: 'line', adjustments: [] }, fill: null,
+      stroke: { color: 'FFFFFF', width: 20, fill, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+      transform: { rotationDeg: 0, flipH: false, flipV: false },
+    }, 1);
+    expect(pixel(decorated, 150, 190)).toEqual([255, 255, 255, 255]);
+  });
+
+  it('covers out-of-box paths, acute miters and curved stroke hulls', () => {
+    const geometry: DrawingMLShapeGeometry = { kind: 'custom', subpaths: [[
+      { cmd: 'moveTo', x: 0, y: 1 }, { cmd: 'lineTo', x: 2, y: 0 },
+      { cmd: 'lineTo', x: 0, y: .9 },
+    ], [
+      { cmd: 'moveTo', x: 0, y: 0 }, { cmd: 'cubicBezTo', x1: -1, y1: -1, x2: 3, y2: 2, x: 1, y: 1 },
+    ]] };
+    const contexts = [canvas(500, 350).ctx, canvas(500, 350).ctx];
+    for (const [i, ctx] of contexts.entries()) {
+      ctx.translate(160, 100); ctx.transform(1.5, .1, .4, 1, 0, 0);
+      paintDrawingMLShape(ctx, { rect: { x: 0, y: 0, w: 80, h: 100 }, geometry, fill: null,
+        stroke: { color: 'FFFFFF', width: 10, lineJoin: 'miter', miterLimit: 20,
+          lineCap: 'square', ...(i ? { fill } : {}) },
+        transform: { rotationDeg: 0, flipH: false, flipV: false },
+      }, 1);
+    }
+    const alpha = (ctx: CanvasRenderingContext2D) => ctx.getImageData(0, 0, 500, 350).data.filter((_, i) => i % 4 === 3);
+    expect(alpha(contexts[1])).toEqual(alpha(contexts[0]));
+  });
+
+  it('covers PPTX gradient line decorations through the complete slide painter', async () => {
+    const { c, ctx } = canvas(400, 400);
+    const px = (n: number) => n * 9525;
+    const shape = { type: 'shape', x: px(200), y: px(200), width: px(50), height: px(1),
+      rotation: 0, flipH: false, flipV: false, geometry: 'line', fill: null, textBody: null, custGeom: null,
+      stroke: { color: 'FFFFFF', width: px(20), fill, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+    } as ShapeElement;
+    const presentation = { slideWidth: px(400), slideHeight: px(400),
+      slides: [{ index: 0, slideNumber: 1, background: { fillType: 'solid', color: '00FF00' }, elements: [shape] }],
+      defaultTextColor: null, majorFont: null, minorFont: null } as Presentation;
+    await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
+    expect(pixel(ctx, 150, 190)).toEqual([255, 255, 255, 255]);
+    shape.stroke = { color: 'FFFFFF', width: px(20), fill, cmpd: 'dbl' };
+    await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
+    for (const y of [193, 207]) expect(pixel(ctx, 225, y)).toEqual([255, 255, 255, 255]);
   });
 
   it('wires rect fills and host-box shape-path strokes through the retained DOCX painter', () => {

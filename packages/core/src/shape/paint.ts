@@ -2,7 +2,8 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolvePathShade, pathShadeFocusRect, type FillOutline } from './path-gradient';
+import { resolvePathShade, pathShadeFocusRect, type FillOutline, type ShadeBox } from './path-gradient';
+import { hostStrokeBounds, paintPathSource } from './paint-bounds';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
@@ -41,23 +42,32 @@ function tiledGradient(
   const baseCtx = base?.getContext('2d');
   if (!base || !baseCtx) return null;
   const tileFill = { ...fill, tileRect: undefined, flip: undefined };
-  // Path shades in a tile (issue #1599 PowerPoint point-focus rasters): a
-  // shape outline and its focus are scaled into the tile, whereas a rect path
-  // keeps its focus relative to the shape box ([MS-OE376] §2.1.1377 b). Tiles
-  // repeat unmirrored whatever flip is authored.
+  // [MS-OE376] §2.1.1377(b): both path types keep the focus relative
+  // to the shape box. Export point controls cannot establish live tile flips;
+  // retain the previous authored-flip policy pending live area controls.
   const pathShade = fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape');
   let basePaint: string | CanvasGradient | CanvasPattern | null;
   if (pathShade) {
     const box = pathShadeFocusRect(fill);
-    const focus = fill.path === 'rect'
-      ? {
-        origin: [(box.origin[0] * w + x - tileX) / tileW, (box.origin[1] * h + y - tileY) / tileH] as [number, number],
-        size: [box.size[0] * w / tileW, box.size[1] * h / tileH] as [number, number],
-      }
-      : undefined;
+    const focus = {
+      origin: [(box.origin[0] * w + x - tileX) / tileW, (box.origin[1] * h + y - tileY) / tileH] as [number, number],
+      size: [box.size[0] * w / tileW, box.size[1] * h / tileH] as [number, number],
+    };
     const baseBox = { x: 0, y: 0, w: baseW, h: baseH };
     basePaint = resolvePathShade(tileFill, baseCtx as CanvasRenderingContext2D, baseBox, baseBox,
       fill.path === 'shape' ? outline : undefined, focus);
+    if (!basePaint) {
+      // Keep main's circle/midpoint fallback; its authored focus still belongs
+      // to the host shape, like the supported rect/shape path (§2.1.1377 b).
+      const authored = fill.fillToRect;
+      const left = ((authored?.l ?? 0) * w + x - tileX) / tileW;
+      const top = ((authored?.t ?? 0) * h + y - tileY) / tileH;
+      const width = w * (1 - (authored?.l ?? 0) - (authored?.r ?? 0)) / tileW;
+      const height = h * (1 - (authored?.t ?? 0) - (authored?.b ?? 0)) / tileH;
+      basePaint = resolveFill({ ...tileFill, path: 'circle', fillToRect: {
+        l: left, t: top, r: 1 - left - width, b: 1 - top - height,
+      } }, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg);
+    }
   } else {
     basePaint = resolveFill(
       tileFill, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg,
@@ -68,8 +78,8 @@ function tiledGradient(
   baseCtx.fillStyle = basePaint;
   baseCtx.fillRect(0, 0, baseW, baseH);
 
-  const flipX = !pathShade && (fill.flip === 'x' || fill.flip === 'xy');
-  const flipY = !pathShade && (fill.flip === 'y' || fill.flip === 'xy');
+  const flipX = fill.flip === 'x' || fill.flip === 'xy';
+  const flipY = fill.flip === 'y' || fill.flip === 'xy';
   let patternSource = base;
   if (flipX || flipY) {
     const repeatW = baseW * (flipX ? 2 : 1);
@@ -175,7 +185,8 @@ export function autoContrastColor(bgHex: string | null): '#000000' | '#FFFFFF' {
 /**
  * Resolve a Fill to a CanvasRenderingContext2D-compatible paint.
  * Gradients require pixel bounds (x, y, w, h) to construct the CanvasGradient.
- * Returns null for noFill.
+ * Returns null for noFill. `paintBounds` is optional device-space coverage of
+ * the actual stroke/decorations; it never changes the authored gradient frame.
  */
 export function resolveFill(
   fill: Fill | null,
@@ -185,13 +196,14 @@ export function resolveFill(
   patternPtToUserUnits?: number,
   patternCoordinateTransform?: DOMMatrix2DInit,
   outline?: FillOutline,
+  paintBounds?: ShadeBox,
 ): string | CanvasGradient | CanvasPattern | null {
   if (!fill || fill.fillType === 'none') return null;
   if (fill.fillType === 'solid') return hexToRgba(fill.color);
   if (fill.fillType === 'pattern') {
-    const slideRoot = activePatternCoordinateRoot.get(ctx);
+    const slideRoot = activePatternCoordinateRoot.get(paintPathSource(ctx));
     return resolvePatternFill(
-      fill, ctx, patternPtToUserUnits ?? activePatternPointScale.get(ctx) ?? 4 / 3,
+      fill, ctx, patternPtToUserUnits ?? activePatternPointScale.get(paintPathSource(ctx)) ?? 4 / 3,
       patternCoordinateTransform ?? (slideRoot
         ? patternTransformToRoot(ctx.getTransform(), slideRoot)
         : undefined),
@@ -213,11 +225,13 @@ export function resolveFill(
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
     if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
       // Canvas has no shape-following shade; resolvePathShade rasterizes it.
-      // Allocation-unavailable hosts use the first stop as a stable flat
-      // fallback rather than inventing another geometry.
+      // Unsupported topology, resource limits and allocation-unavailable
+      // hosts retain main's native circle approximation. Its midpoint focus
+      // is unchanged: the Office fallback classifier is outside this feature.
       return resolvePathShade(
         fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, { x, y, w, h }, outline,
-      ) ?? hexToRgba(stops[0].color);
+        undefined, paintBounds ?? hostStrokeBounds(ctx, { x, y, w, h }),
+      ) ?? resolveFill({ ...fill, path: 'circle' }, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
     }
     if (fill.gradType === 'radial') {
       // §20.1.8.31: fillToRect is the center-shade (focus) rectangle inside
@@ -311,8 +325,8 @@ export function withPatternCoordinateSpace<T>(
   slideToDevice: DOMMatrix2DInit,
   paint: () => T,
 ): T {
-  const previous = activePatternCoordinateRoot.get(ctx);
-  activePatternCoordinateRoot.set(ctx, {
+  const previous = activePatternCoordinateRoot.get(paintPathSource(ctx));
+  activePatternCoordinateRoot.set(paintPathSource(ctx), {
     a: slideToDevice.a ?? 1, b: slideToDevice.b ?? 0,
     c: slideToDevice.c ?? 0, d: slideToDevice.d ?? 1,
     e: slideToDevice.e ?? 0, f: slideToDevice.f ?? 0,
@@ -320,8 +334,8 @@ export function withPatternCoordinateSpace<T>(
   try {
     return paint();
   } finally {
-    if (previous) activePatternCoordinateRoot.set(ctx, previous);
-    else activePatternCoordinateRoot.delete(ctx);
+    if (previous) activePatternCoordinateRoot.set(paintPathSource(ctx), previous);
+    else activePatternCoordinateRoot.delete(paintPathSource(ctx));
   }
 }
 
@@ -330,13 +344,13 @@ export function withPatternPointScale<T>(
   ptToUserUnits: number,
   paint: () => T,
 ): T {
-  const previous = activePatternPointScale.get(ctx);
-  activePatternPointScale.set(ctx, ptToUserUnits);
+  const previous = activePatternPointScale.get(paintPathSource(ctx));
+  activePatternPointScale.set(paintPathSource(ctx), ptToUserUnits);
   try {
     return paint();
   } finally {
-    if (previous === undefined) activePatternPointScale.delete(ctx);
-    else activePatternPointScale.set(ctx, previous);
+    if (previous === undefined) activePatternPointScale.delete(paintPathSource(ctx));
+    else activePatternPointScale.set(paintPathSource(ctx), previous);
   }
 }
 

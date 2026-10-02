@@ -1,5 +1,6 @@
 import type { Fill, PathCmd, Stroke } from '../types/common';
-import { drawArrowHead, lineEndRetract, retractLineEndpoint } from './arrow';
+import { resolveArrowPaint, drawArrowHead, lineEndRetract, retractLineEndpoint } from './arrow';
+import { trackPaintPath, currentStrokeBounds } from './paint-bounds';
 import { buildCustomPath } from './custGeom';
 import { getCustGeomEndpoints } from './custgeom-endpoints';
 import { applyStroke, resolveFill } from './paint';
@@ -169,6 +170,7 @@ function applyDrawingMLStroke(
       rect.h,
       rotationDeg,
       PATTERN_PT_TO_SHAPE_UNITS,
+      undefined, undefined, currentStrokeBounds(ctx),
     );
     if (paint) ctx.strokeStyle = paint;
   }
@@ -185,18 +187,6 @@ function paintConnectorEnds(
     return;
   }
   const { x, y, w, h } = plan.rect;
-  const effectivePaint = stroke.fill
-    ? resolveFill(
-        stroke.fill as Fill,
-        ctx,
-        x,
-        y,
-        w,
-        h,
-        plan.transform.rotationDeg,
-        PATTERN_PT_TO_SHAPE_UNITS,
-      ) ?? undefined
-    : undefined;
   const adjustments = plan.geometry.kind === 'preset' ? plan.geometry.adjustments : [];
   const anchors = getConnectorAnchors(geometry, x, y, w, h, [...adjustments]);
   if (!anchors) return;
@@ -218,26 +208,28 @@ function paintConnectorEnds(
         lineEndRetract(stroke.headEnd, stroke, unitToDevice),
       );
     }
-    applyDrawingMLStroke(ctx, stroke, unitToDevice, plan.rect, plan.transform.rotationDeg);
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
     for (let index = 1; index < points.length; index++) {
       ctx.lineTo(points[index].x, points[index].y);
     }
+    applyDrawingMLStroke(ctx, stroke, unitToDevice, plan.rect, plan.transform.rotationDeg);
     ctx.stroke();
   }
   if (stroke.tailEnd) {
     drawArrowHead(
       ctx, anchors.end.x, anchors.end.y, anchors.end.angle,
       stroke.tailEnd, stroke, unitToDevice,
-      effectivePaint,
+      resolveArrowPaint(ctx, stroke, unitToDevice, anchors.end.x, anchors.end.y, anchors.end.angle,
+        stroke.tailEnd, plan.rect, plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS),
     );
   }
   if (stroke.headEnd) {
     drawArrowHead(
       ctx, anchors.start.x, anchors.start.y, anchors.start.angle,
       stroke.headEnd, stroke, unitToDevice,
-      effectivePaint,
+      resolveArrowPaint(ctx, stroke, unitToDevice, anchors.start.x, anchors.start.y, anchors.start.angle,
+        stroke.headEnd, plan.rect, plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS),
     );
   }
 }
@@ -252,18 +244,6 @@ function paintCustomEnds(
   if (!stroke || (!stroke.headEnd && !stroke.tailEnd)) return;
   const endpoints = getCustGeomEndpoints(plan.geometry.subpaths as PathCmd[][]);
   const { x, y, w, h } = plan.rect;
-  const effectivePaint = stroke.fill
-    ? resolveFill(
-        stroke.fill as Fill,
-        ctx,
-        x,
-        y,
-        w,
-        h,
-        plan.transform.rotationDeg,
-        PATTERN_PT_TO_SHAPE_UNITS,
-      ) ?? undefined
-    : undefined;
   if (endpoints.start && stroke.headEnd) {
     drawArrowHead(
       ctx,
@@ -273,7 +253,9 @@ function paintCustomEnds(
       stroke.headEnd,
       stroke,
       unitToDevice,
-      effectivePaint,
+      resolveArrowPaint(ctx, stroke, unitToDevice, x + endpoints.start.x * w, y + endpoints.start.y * h,
+        Math.atan2(endpoints.start.dy * h, endpoints.start.dx * w), stroke.headEnd, plan.rect,
+        plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS),
     );
   }
   if (endpoints.end && stroke.tailEnd) {
@@ -285,7 +267,9 @@ function paintCustomEnds(
       stroke.tailEnd,
       stroke,
       unitToDevice,
-      effectivePaint,
+      resolveArrowPaint(ctx, stroke, unitToDevice, x + endpoints.end.x * w, y + endpoints.end.y * h,
+        Math.atan2(endpoints.end.dy * h, endpoints.end.dx * w), stroke.tailEnd, plan.rect,
+        plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS),
     );
   }
 }
@@ -295,6 +279,8 @@ export function paintDrawingMLShape(
   plan: DrawingMLShapePaintPlan,
   unitToDevice: number,
 ): void {
+  if (plan.stroke?.fill?.fillType === 'gradient' && plan.stroke.fill.gradType === 'radial'
+    && (plan.stroke.fill.path === 'rect' || plan.stroke.fill.path === 'shape')) ctx = trackPaintPath(ctx);
   const { x, y, w, h } = plan.rect;
   withDrawingMLShapeTransform(ctx, plan, () => {
     // Shared fill resolution is observational; retained plans keep gradient

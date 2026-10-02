@@ -11,17 +11,23 @@ export interface ShadeBox { x: number; y: number; w: number; h: number }
 type Point = [number, number];
 type Matrix = [number, number, number, number, number, number];
 
-// Resource policy, not an OOXML rule: the shade raster is at most 512² device
-// pixels and the outline at most EDGE_LIMIT edges (clustered beyond that with
-// a stated pixel error). Each paint scan-converts every edge's band once over
-// the rows it spans and solves every pixel at most once: O(edges × rows +
-// pixels) ≤ 32768 × 512 + 512² steps, independent of the focus position.
-// Nothing is retained between paints.
+// Resource policy, not an OOXML rule: at most 512² raster pixels. Exact
+// row intersections of bilinear bands avoid probing their bounding boxes.
+// For E flattened edges, R <= 512 rows and P <= 512² pixels, geometry work is
+// O(N + E R (log(E + 1) + alpha(P)) + P alpha(P)):
+// focus crossings are sorted per row,
+// N is input outline work; E <= 32768 after the explicit support budget.
+// Each band has constant-degree row extrema, and successor links remove
+// assigned pixels. Geometry memory is O(N + P); no shade geometry is
+// clustered or cached. Stop sorting/ramp construction is separate.
 const MAX_EDGE = 512;
+const EDGE_LIMIT = 32768;
 const MARGIN = 2;
 const BEZIER_SEGMENTS = 16;
 const ARC_STEP = Math.PI / 32;
-const EDGE_LIMIT = 32768;
+
+/** Internal deterministic work accounting, used by resource regression tests. */
+export interface ShadeWork { edgeRows: number; solves: number; rejected: number; pixels: number }
 
 const apply = (m: Matrix, x: number, y: number): Point =>
   [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
@@ -218,20 +224,6 @@ function boundsOf(points: Point[]): ShadeBox {
   return { x: left, y: top, w: right - left, h: bottom - top };
 }
 
-/** O(n) vertex clustering of a closed polygon in raster pixels: consecutive
- * vertices sharing one cell of the given size collapse to the first, so the
- * outline moves by at most the cell diagonal. */
-function cluster(polygon: Point[], cell: number): Point[] {
-  const out: Point[] = [];
-  let lastX = Number.NaN; let lastY = Number.NaN;
-  for (const p of polygon) {
-    const cx = Math.floor(p[0] / cell); const cy = Math.floor(p[1] / cell);
-    if (cx === lastX && cy === lastY) continue;
-    out.push(p); lastX = cx; lastY = cy;
-  }
-  return out.length >= 3 ? out : polygon.slice(0, 3);
-}
-
 /** Linear stop lookup sampled from a native Canvas ramp, so interpolation
  * (including translucent stops) matches the linear and circle gradients. */
 function colorTable(ctx: CanvasRenderingContext2D, stops: readonly GradientStop[]): Uint8ClampedArray | null {
@@ -300,6 +292,64 @@ function bandPosition(u: number, v: number, ax: number, ay: number, ex: number, 
   return best;
 }
 
+/** Exact horizontal range(s) of a bilinear edge band. Its four corners
+ * are A(a), A(b), b, a. For contour s, endpoints a(s), b(s) are linear.
+ * Intersecting y gives x(s) = quadratic / linear. Split at endpoint/row
+ * crossings and the denominator zero; extrema are endpoints or roots of
+ * the quadratic derivative. This includes folded bands' interior envelope,
+ * which a quadrilateral bounding-box/edge crossing scan misses. */
+export function bandRowSpans(corners: Point[], y: number): Array<[number, number]> {
+  const [a, b, outerB, outerA] = corners;
+  const ax = outerA[0] - a[0]; const ay = outerA[1] - a[1];
+  const bx = b[0] - a[0]; const by = b[1] - a[1];
+  const dx = outerB[0] - outerA[0] - bx; const dy = outerB[1] - outerA[1] - by;
+  const cy = y - a[1];
+  if (by === 0 && dy === 0 && ay !== 0) {
+    const s = cy / ay;
+    if (s < 0 || s > 1) return [];
+    const x = a[0] + ax * s; const end = x + bx + dx * s;
+    return [[Math.min(x, end), Math.max(x, end)]];
+  }
+  const cuts = [0, 1];
+  for (const [constant, slope] of [[-cy, ay], [by - cy, ay + dy], [by, dy]]) {
+    if (slope !== 0) { const s = -constant / slope; if (s > 0 && s < 1) cuts.push(s); }
+  }
+  cuts.sort((m, n) => m - n);
+  const n0 = a[0] * by + bx * cy;
+  const n1 = a[0] * dy + ax * by + dx * cy - bx * ay;
+  const n2 = ax * dy - dx * ay;
+  const extrema: number[] = [];
+  const c2 = n2 * dy; const c1 = 2 * n2 * by; const c0 = n1 * by - n0 * dy;
+  if (c2 === 0) { if (c1 !== 0) extrema.push(-c0 / c1); }
+  else {
+    const disc = c1 * c1 - 4 * c2 * c0;
+    if (disc >= 0) { const r = Math.sqrt(disc); extrema.push((-c1 - r) / (2 * c2), (-c1 + r) / (2 * c2)); }
+  }
+  const at = (s: number): number => {
+    const denominator = by + dy * s;
+    if (Math.abs(denominator) > 1e-12) return (n0 + s * (n1 + s * n2)) / denominator;
+    // Removable singularity at a collapsed contour; use the derivative ratio.
+    return dy !== 0 ? (n1 + 2 * n2 * s) / dy : a[0] + ax * s;
+  };
+  const spans: Array<[number, number]> = [];
+  for (let i = 0; i < cuts.length - 1; i++) {
+    const lo = cuts[i]; const hi = cuts[i + 1]; const mid = (lo + hi) / 2;
+    const denominator = by + dy * mid;
+    if (Math.abs(denominator) <= 1e-12) {
+      if (Math.abs(cy - ay * mid) <= 1e-12) {
+        const xs = [lo, hi].flatMap(s => [a[0] + ax * s, a[0] + ax * s + bx + dx * s]);
+        spans.push([Math.min(...xs), Math.max(...xs)]);
+      }
+      continue;
+    }
+    const t = (cy - ay * mid) / denominator;
+    if (t < 0 || t > 1) continue;
+    const xs = [lo, hi, ...extrema.filter(s => s > lo && s < hi)].map(at);
+    spans.push([Math.min(...xs), Math.max(...xs)]);
+  }
+  return spans;
+}
+
 /**
  * Path shade for `path="rect"` and `path="shape"` (ECMA-376 §20.1.8.46).
  *
@@ -314,57 +364,47 @@ function bandPosition(u: number, v: number, ax: number, ay: number, ex: number, 
  * Office observation (#1599, PowerPoint 16.113 screen/print preview and its
  * point-focus rasters): an explicit all-zero fillToRect is solid first stop;
  * an inset area is flat; a degenerate segment/point focus shades toward it.
- * Where contours are not nested (focus outside the outline's kernel) Office's
- * point-focus rasters paint edge bands in path order, the later band winning;
- * this generalizes the same way to area foci.
- *
- * Outlines that are not strictly star-shaped about the box center (arrows,
- * chevron, donut, concave custom paths) are shaded by PowerPoint as a circle
- * about the fixed point of the frame→fillToRect scaling with no flat area,
- * reaching the farthest frame corner (screen controls with zero, corner,
- * edge, center and area foci; exported radius for centered foci). Which
- * outlines Office classes this way is measured only for those geometries.
- *
- * rotWithShape=false frames the shade by the axis-aligned device bounds of
- * the transformed outline, unmirrored (PowerPoint point-focus rasters).
+ * For degenerate point foci, measured export bands paint in path order,
+ * later bands winning. For area foci the complete inscribed copy is painted
+ * last: point-focus export order cannot override the center-shade contract.
+ * The center-kernel predicate is a library support boundary, not an Office
+ * brush classifier. Unsupported outlines keep the previous circle resolver;
+ * adjustment/aspect/topology boundaries lack live Office evidence (#1599).
+ * Rotation framing also keeps the previous local frame pending live evidence.
  * Returns null when the host cannot allocate the shade raster.
  */
 export function resolvePathShade(
   fill: GradientFill, ctx: CanvasRenderingContext2D,
   frame: ShadeBox, shapeBox: ShadeBox, outline?: FillOutline,
   focusOverride?: { origin: Point; size: Point },
+  paintBounds?: ShadeBox,
+  work?: ShadeWork,
 ): CanvasPattern | null {
   if (![frame, shapeBox].every(box => [box.x, box.y, box.w, box.h].every(Number.isFinite)
     && box.w > 0 && box.h > 0)) return null;
   if (typeof ctx.getTransform !== 'function' || fill.stops.length === 0) return null;
   const outlinePolygons = outline ? flattenFillOutline(outline, ctx, shapeBox) : [];
+  // Explicit resource policy: above this edge budget retain main's native
+  // circle approximation. Never cluster geometry or silently alter its shape.
+  if (outlinePolygons.reduce((n, polygon) => n + polygon.length, 0) > EDGE_LIMIT) return null;
   const coverage = outlinePolygons.length > 0 ? outlinePolygons : [rectangle(shapeBox)];
-  const circular = fill.path === 'shape' && !isStrictlyStarShaped(
+  if (fill.path === 'shape' && !isStrictlyStarShaped(
     coverage, [shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2], shapeBox,
-  );
+  )) return null;
 
   const t = ctx.getTransform();
   const user: Matrix = [t.a, t.b, t.c, t.d, t.e, t.f];
   const userInverse = user.every(Number.isFinite) ? invert(user) : null;
   if (!userInverse) return null;
-  const fixed = fill.rotWithShape === false;
-  const toField = (p: Point): Point => (fixed ? apply(user, p[0], p[1]) : p);
-  const coverageField = coverage.map(polygon => polygon.map(toField));
-  const fieldFrame = fixed
-    ? boundsOf(outlinePolygons.length > 0 ? coverageField.flat() : rectangle(frame).map(toField))
-    : frame;
+  const coverageField = coverage;
+  const fieldFrame = frame;
   if (!(fieldFrame.w > 0 && fieldFrame.h > 0)) return null;
 
-  // Raster bounds: everything the fill may paint, the frame, and a stroke
-  // allowance from the current line state (half width scaled by the miter
-  // limit or line-end size), because uncovered pattern pixels are transparent.
-  const toDevice = (p: Point): Point => (fixed ? p : apply(user, p[0], p[1]));
-  const lineWidth = Number.isFinite(ctx.lineWidth) ? Math.max(0, ctx.lineWidth) : 0;
-  const miter = Number.isFinite(ctx.miterLimit) ? ctx.miterLimit : 10;
-  const userScale = Math.sqrt(Math.abs(user[0] * user[3] - user[1] * user[2]));
-  const outset = lineWidth * Math.max(miter, 5) / 2 * userScale + 1;
-  const painted = boundsOf([...coverageField.flat(), ...rectangle(fieldFrame)].map(toDevice));
-  const device = { x: painted.x - outset, y: painted.y - outset, w: painted.w + 2 * outset, h: painted.h + 2 * outset };
+  // Coverage is supplied in device space from the actual paint geometry.
+  // The authored shade frame stays separate from these raster bounds.
+  const painted = boundsOf([...coverageField.flat(), ...rectangle(fieldFrame)]
+    .map(p => apply(user, p[0], p[1])));
+  const device = paintBounds ? boundsOf([...rectangle(painted), ...rectangle(paintBounds)]) : painted;
   if (![device.x, device.y, device.w, device.h].every(Number.isFinite)) return null;
   const k = Math.min(1, (MAX_EDGE - 2 * MARGIN - 1) / Math.max(device.w, 1e-9),
     (MAX_EDGE - 2 * MARGIN - 1) / Math.max(device.h, 1e-9));
@@ -376,9 +416,7 @@ export function resolvePathShade(
   const auxToDevice: Matrix = [1 / k, 0, 0, 1 / k, originX - MARGIN / k, originY - MARGIN / k];
   const deviceToAux = invert(auxToDevice);
   if (!deviceToAux) return null;
-  const fieldToAux = fixed ? deviceToAux : multiply(deviceToAux, user);
-  const auxToField = invert(fieldToAux);
-  if (!auxToField) return null;
+  const fieldToAux = multiply(deviceToAux, user);
   const normToField: Matrix = [fieldFrame.w, 0, 0, fieldFrame.h, fieldFrame.x, fieldFrame.y];
   const normToAux = multiply(fieldToAux, normToField);
   const auxToNorm = invert(normToAux);
@@ -393,85 +431,43 @@ export function resolvePathShade(
   const last = rgba(stops[stops.length - 1].color);
   const shade = new Float32Array(bw * bh).fill(Number.NaN);
 
-  if (circular) {
-    const [fx, fy] = pathShadeFocus(fill);
-    const cx = fieldFrame.x + fieldFrame.w * fx; const cy = fieldFrame.y + fieldFrame.h * fy;
-    const radius = Math.max(...rectangle(fieldFrame).map(([x, y]) => Math.hypot(x - cx, y - cy)));
-    for (let row = 0; row < bh; row++) {
-      for (let col = 0; col < bw; col++) {
-        const [x, y] = apply(auxToField, col + .5, row + .5);
-        shade[row * bw + col] = radius > 0 ? Math.hypot(x - cx, y - cy) / radius : 0;
-      }
-    }
-  } else {
+  if (work) { work.edgeRows = 0; work.solves = 0; work.rejected = 0; work.pixels = bw * bh; }
+  {
     const { origin: [ox, oy], size: [kx, ky] } = focusOverride ?? pathShadeFocusRect(fill);
-    // Normalized outline. Beyond EDGE_LIMIT edges, cluster vertices on a
-    // doubling raster grid (one O(n) pass each) until the limit holds; the
-    // outline then deviates by at most √2 × the final cell size in pixels.
     const toNorm = (p: Point): Point => [(p[0] - fieldFrame.x) / fieldFrame.w, (p[1] - fieldFrame.y) / fieldFrame.h];
-    let polygons = fill.path === 'shape' ? coverageField.map(polygon => polygon.map(toNorm)) : [rectangle({ x: 0, y: 0, w: 1, h: 1 })];
-    const edgeCount = () => polygons.reduce((sum, polygon) => sum + polygon.length, 0);
-    for (let cell = .5; edgeCount() > EDGE_LIMIT && cell <= 2 * MAX_EDGE; cell *= 2) {
-      polygons = polygons.map(polygon => cluster(
-        polygon.map(p => apply(normToAux, p[0], p[1])), cell,
-      ).map(p => apply(auxToNorm, p[0], p[1])));
-    }
-    // Row-wise "next unfilled column" links: each pixel is evaluated once.
+    const polygons = fill.path === 'shape' ? coverageField.map(polygon => polygon.map(toNorm)) : [rectangle({ x: 0, y: 0, w: 1, h: 1 })];
+    let solveCount = 0;
+    // Row-wise successor sets, with rank + path compression for the stated
+    // amortized bound. The rightmost member is the next unassigned column.
     const next = new Int32Array(bh * (bw + 1));
-    for (let row = 0; row < bh; row++) for (let col = 0; col <= bw; col++) next[row * (bw + 1) + col] = col;
-    const find = (row: number, col: number): number => {
+    const rightmost = new Int32Array(next.length);
+    const rank = new Uint8Array(next.length);
+    for (let row = 0; row < bh; row++) for (let col = 0; col <= bw; col++) next[row * (bw + 1) + col] = rightmost[row * (bw + 1) + col] = col;
+    const rootOf = (row: number, col: number): number => {
       const base = row * (bw + 1);
       let root = col;
       while (next[base + root] !== root) root = next[base + root];
       while (next[base + col] !== root) { const up = next[base + col]; next[base + col] = root; col = up; }
       return root;
     };
+    const find = (row: number, col: number): number => rightmost[row * (bw + 1) + rootOf(row, col)];
+    const erase = (row: number, col: number) => {
+      const base = row * (bw + 1);
+      let a = rootOf(row, col); let b = rootOf(row, col + 1);
+      if (a === b) return;
+      if (rank[base + a] < rank[base + b]) [a, b] = [b, a];
+      next[base + b] = a;
+      rightmost[base + a] = Math.max(rightmost[base + a], rightmost[base + b]);
+      if (rank[base + a] === rank[base + b]) rank[base + a]++;
+    };
     const edges: Array<[Point, Point]> = [];
     for (const polygon of polygons) {
       for (let i = 0; i < polygon.length; i++) edges.push([polygon[i], polygon[(i + 1) % polygon.length]]);
     }
     const inset = (p: Point): Point => [ox + kx * p[0], oy + ky * p[1]];
-    // Later bands win: visit bands in reverse path order, first visit fixes a pixel.
-    for (let index = edges.length - 1; index >= 0; index--) {
-      const [a, b] = edges[index];
-      const ex = b[0] - a[0]; const ey = b[1] - a[1];
-      if (ex === 0 && ey === 0) continue;
-      const corners = [inset(a), inset(b), b, a].map(p => apply(normToAux, p[0], p[1]));
-      let area = 0;
-      for (let i = 0; i < 4; i++) {
-        const p = corners[i]; const q = corners[(i + 1) % 4];
-        area += p[0] * q[1] - q[0] * p[1];
-      }
-      if (!(Math.abs(area) > 1e-9)) continue;
-      const ys = corners.map(p => p[1]);
-      const rowStart = Math.max(0, Math.ceil(Math.min(...ys) - .5));
-      const rowEnd = Math.min(bh - 1, Math.floor(Math.max(...ys) - .5));
-      for (let row = rowStart; row <= rowEnd; row++) {
-        const y = row + .5;
-        let low = Infinity; let high = -Infinity;
-        for (let i = 0; i < 4; i++) {
-          const p = corners[i]; const q = corners[(i + 1) % 4];
-          if ((p[1] <= y && q[1] >= y) || (q[1] <= y && p[1] >= y)) {
-            if (p[1] === q[1]) { low = Math.min(low, p[0], q[0]); high = Math.max(high, p[0], q[0]); continue; }
-            const x = p[0] + (y - p[1]) / (q[1] - p[1]) * (q[0] - p[0]);
-            low = Math.min(low, x); high = Math.max(high, x);
-          }
-        }
-        if (!(high >= low)) continue;
-        const colEnd = Math.min(bw - 1, Math.floor(high - .5));
-        let col = find(row, Math.max(0, Math.ceil(low - .5)));
-        while (col <= colEnd) {
-          const [u, v] = apply(auxToNorm, col + .5, row + .5);
-          const s = bandPosition(u, v, a[0], a[1], ex, ey, ox, oy, kx, ky);
-          if (s >= 0) {
-            shade[row * bw + col] = s;
-            next[row * (bw + 1) + col] = col + 1;
-          }
-          col = find(row, col + 1);
-        }
-      }
-    }
-    // Uncovered pixels: the inscribed focus region (nonzero rule) is first stop.
+    // Reserve the entire first-stop copy. Bands are clipped to its exterior
+    // through the successor sets, equivalent to painting it last even for
+    // concave outlines. This also removes zero-area identity-band probes.
     if (kx > 0 && ky > 0) {
       const innerEdges = edges.map(([a, b]) => [inset(a), inset(b)].map(p => apply(normToAux, p[0], p[1])));
       for (let row = 0; row < bh; row++) {
@@ -490,11 +486,48 @@ export function resolvePathShade(
           const start = Math.max(0, Math.ceil(crossings[i][0] - .5));
           const end = Math.min(bw - 1, Math.floor(crossings[i + 1][0] - .5));
           for (let col = start; col <= end; col++) {
-            if (Number.isNaN(shade[row * bw + col])) shade[row * bw + col] = 0;
+            shade[row * bw + col] = 0;
+            erase(row, col);
           }
         }
       }
     }
+    // Later bands win: visit bands in reverse path order, first visit fixes a pixel.
+    for (let index = edges.length - 1; index >= 0; index--) {
+      const [a, b] = edges[index];
+      const ex = b[0] - a[0]; const ey = b[1] - a[1];
+      if (ex === 0 && ey === 0) continue;
+      const corners = [inset(a), inset(b), b, a].map(p => apply(normToAux, p[0], p[1]));
+      const ys = corners.map(p => p[1]);
+      const rowStart = Math.max(0, Math.ceil(Math.min(...ys) - .5));
+      const rowEnd = Math.min(bh - 1, Math.floor(Math.max(...ys) - .5));
+      for (let row = rowStart; row <= rowEnd; row++) {
+        if (work) work.edgeRows++;
+        for (const [low, high] of bandRowSpans(corners, row + .5)) {
+          const colEnd = Math.min(bw - 1, Math.floor(high - .5));
+          const colStart = Math.max(0, Math.ceil(low - .5));
+          if (colStart > colEnd) continue;
+          let col = find(row, colStart);
+          while (col <= colEnd) {
+            const [u, v] = apply(auxToNorm, col + .5, row + .5);
+            // Numerical degeneracies must not reintroduce E × P work. The
+            // exact spans ordinarily require no rejections; if roundoff defeats
+            // that contract, fail closed to the previous native circle resolver.
+            if (solveCount >= bw * bh) return null;
+            solveCount++;
+            if (work) work.solves++;
+            const s = bandPosition(u, v, a[0], a[1], ex, ey, ox, oy, kx, ky);
+            if (s >= 0) {
+              shade[row * bw + col] = s;
+              erase(row, col);
+            }
+            if (s < 0 && work) work.rejected++;
+            col = find(row, col + 1);
+          }
+        }
+      }
+    }
+
   }
 
   const pixels = target.createImageData(bw, bh);
