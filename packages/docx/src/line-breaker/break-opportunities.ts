@@ -33,9 +33,12 @@ import {
 import { createBidiTabCellResolver, bidiTabFrame, nextLineTabStop, positionalTabTarget, tabAlignmentRole } from './tabs.js';
 import { wordPositionalTabReferenceBox } from '../layout/line-compatibility.js';
 import { buildFont } from './font-routes.js';
-import { mixedLineHasVisibleText } from './mixed-space-fit.js';
 import {
-  COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION,
+  mixedLineHasVisibleText,
+  mixedLineMayShrink,
+  noteMixedSpaceWork,
+} from './mixed-space-fit.js';
+import {
   extendThroughTrailingIdeographicSpaces,
   hasCJKBreakOpportunity,
   rebaseSeaBreaks,
@@ -1197,22 +1200,51 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   // further characters of this run. Extend the natural prefix while the space
   // floors and the East Asian overflow limit admit it; kinsoku below may still
   // retract the break.
+  //
+  // Admission is monotone in the prefix length: a longer prefix needs at least
+  // as much reduction, and its core (closing marks excluded) overflows at
+  // least as far. The longest admitted prefix is therefore found by binary
+  // search, measuring O(log n) prefixes; lines outside the rule's scope stop
+  // at the O(1) gate before any candidate text is built.
   let mixedSpaceExtended = false;
-  if (breakerState.currentLine.length > 0) {
+  if (breakerState.currentLine.length > 0 && mixedLineMayShrink(breakerState)) {
     const characters = [...s.text];
-    for (let count = [...rawPrefix].length + 1; count <= characters.length; count += 1) {
+    const admitted = (count: number): boolean => {
       const candidate = characters.slice(0, count).join('');
-      if (candidate.endsWith(' ')) break;
-      const required = context.mixedSpaceRequirement({
+      noteMixedSpaceWork(candidate.length);
+      return !candidate.endsWith(' ') && context.mixedSpaceRequirement({
         pieces: [{ segment: s, text: candidate }],
         fitWidth: strAdvance(s, candidate),
-      });
-      if (required === undefined) {
-        // A trailing closing mark is judged together with its predecessor.
-        if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(characters[count - 1]!)) continue;
+      }) !== undefined;
+    };
+    // Galloping bound, then binary search: every measured prefix is at most
+    // twice the admitted extension past the natural break.
+    let low = [...rawPrefix].length;
+    let high = characters.length;
+    for (let step = 1; low + step <= characters.length; step *= 2) {
+      if (!admitted(low + step)) {
+        high = low + step - 1;
         break;
       }
-      rawPrefix = candidate;
+      low += step;
+    }
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (admitted(middle)) low = middle;
+      else high = middle - 1;
+    }
+    // Every shorter prefix is admitted too; keep the longest one that is also
+    // a kinsoku-legal break inside this run, so the extension never relies on
+    // kinsoku's unrestricted fallback (a seam before closing marks must
+    // resolve exactly like the joined text, by cross-run retraction).
+    const natural = [...rawPrefix].length;
+    const legal = (count: number): boolean => !kinsoku.enabled || count >= characters.length || (
+      !kinsoku.lineStartForbidden.has(characters[count]!.codePointAt(0)!) &&
+      !kinsoku.lineEndForbidden.has(characters[count - 1]!.codePointAt(0)!)
+    );
+    while (low > natural && !legal(low)) low -= 1;
+    if (low > natural) {
+      rawPrefix = characters.slice(0, low).join('');
       mixedSpaceExtended = true;
     }
   }

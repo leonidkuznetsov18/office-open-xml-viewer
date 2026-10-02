@@ -190,7 +190,36 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT properties', () => {
       }
     }
     expect(compared).toBeGreaterThan(3000);
-  });
+  }, 120_000);
+
+  it('is invariant under seams between and beside terminal closing marks', () => {
+    // Review round 5: the terminal cluster (closing marks after the final
+    // core character) is excluded alike whether committed or in the candidate.
+    const run = { ascii: 'BIZ UDGothic', eastAsia: 'BIZ UDGothic', sizePt: 8.5, bold: true } as const;
+    const lines = (chunks: readonly string[], bandPt: number) => layoutStubParagraph({
+      runs: chunks.map((text) => ({ ...run, text })),
+      environment: { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' },
+      bandPt, justification: 'left',
+    });
+    const view = (result: ReturnType<typeof lines>) => result.map((line) => ({
+      text: line.map((segment) => segment.text).join(''),
+      width: Number(line.reduce((sum, segment) => sum + segment.width, 0).toFixed(4)),
+    }));
+    let compared = 0;
+    for (const tail of ['ｱ）', 'ｱ））', 'ｱ）））', '丙）', '丙））', '丙）））']) {
+      const text = `甲甲甲甲  + 乙乙 +  丙丙${tail}`;
+      const characters = [...text];
+      for (let bandPt = 94; bandPt <= 112; bandPt += 0.25) {
+        const joined = view(lines([text], bandPt));
+        for (let cut = characters.length - tail.length - 1; cut < characters.length; cut += 1) {
+          const split = [characters.slice(0, cut).join(''), characters.slice(cut).join('')];
+          expect(view(lines(split, bandPt)), `${tail} ${bandPt} ${split.join('|')}`).toEqual(joined);
+          compared += 1;
+        }
+      }
+    }
+    expect(compared).toBeGreaterThan(1000);
+  }, 120_000);
 
   it('keeps the measured Latin-terminal control seam-invariant', () => {
     // Review round 2: `ABCD` split as `A` / `BCD` at the 106.25pt band.
@@ -227,7 +256,7 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT properties', () => {
       }
     }
     expect(compressedLines).toBeGreaterThan(300);
-  });
+  }, 120_000);
 
   it('accounts spaces committed after the line was first shrunk', () => {
     // Review round 2: a gap added after an admission must not restore a
@@ -325,6 +354,31 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT work', () => {
       for (const lead of ['甲', '']) {
         expect(leading(2000, lead) / leading(500, lead), `leading ${lead || 'latin'}`).toBeLessThan(5);
       }
+
+      // Review round 5: runs of closing punctuation. Outside the rule's scope
+      // (mode 15, omitted mode, doNotCompress) the projection does no work;
+      // inside it the extra work grows linearly with the text.
+      const closing = (count: number, lead: string, environment: Record<string, unknown>) => {
+        mixedSpaceSummaryWork(true);
+        layoutStubParagraph({
+          runs: [{ ...run, text: `${lead}AB ` }, { ...run, text: '）'.repeat(count) }],
+          environment, bandPt: 100, justification: 'left',
+        });
+        return mixedSpaceSummaryWork(true);
+      };
+      for (const environment of [
+        { compatibilityMode: 15, characterSpacingControl: 'compressPunctuation' },
+        { characterSpacingControl: 'compressPunctuation' },
+        { compatibilityMode: 14, characterSpacingControl: 'doNotCompress' },
+      ]) {
+        expect(closing(1000, '甲', environment), JSON.stringify(environment)).toBe(0);
+      }
+      for (const lead of ['甲', '']) {
+        const inScope14 = { compatibilityMode: 14, characterSpacingControl: 'compressPunctuation' };
+        const n = closing(250, lead, inScope14);
+        const n4 = closing(1000, lead, inScope14);
+        expect(n4 / n, `closing ${lead || 'latin'}`).toBeLessThan(6);
+      }
       for (const lead of ['甲', '']) {
         for (const shrink of [true, false]) {
           const n = spaced(500, lead, shrink);
@@ -336,5 +390,5 @@ describe('WORD_COMPRESSED_SPACE_LINE_FIT work', () => {
     } finally {
       setMixedSpaceSummaryAssertions(true);
     }
-  });
+  }, 120_000);
 });

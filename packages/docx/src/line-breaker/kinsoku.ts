@@ -1,4 +1,8 @@
-import { popMixedLineItem, replaceLastMixedLineItem } from './mixed-space-fit.js';
+import {
+  popMixedLineItem,
+  replaceLastMixedLineItem,
+  type MixedSpaceMeasure,
+} from './mixed-space-fit.js';
 import type { KinsokuRules } from '@silurus/ooxml-core';
 import { crossRunKinsokuRetract, graphemeClusterOffsets } from '@silurus/ooxml-core';
 import { type LayoutImageSeg, type LayoutMathSeg, type LayoutTabSeg, type LayoutTextSeg } from './model.js';
@@ -42,8 +46,10 @@ export function retractLeadingKinsoku(
     retainTrailingPunctuationCompression?: boolean,
   ) => number,
   next: LayoutTextSeg,
-  /** Layout scale for the line summary (WORD_COMPRESSED_SPACE_LINE_FIT). */
+  /** Layout scale and natural measure for the line summary
+   * (WORD_COMPRESSED_SPACE_LINE_FIT). */
   scale: number,
+  measureNatural: MixedSpaceMeasure,
 ): CrossRunKinsokuRetraction {
   const firstCp = next.text.codePointAt(0);
   const lastSeg = breakerState.currentLine[breakerState.currentLine.length - 1];
@@ -104,7 +110,7 @@ export function retractLeadingKinsoku(
       text: headText,
       measuredWidth: headW,
       ...slicedTextMetadata(lastText, 0, split),
-    }, scale);
+    }, scale, measureNatural);
   } else {
     breakerState.currentWidth -= lastText.measuredWidth;
     popMixedLineItem(breakerState);

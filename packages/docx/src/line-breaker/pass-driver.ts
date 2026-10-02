@@ -128,6 +128,11 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const { probeHeights, preparedFloatWrap } = passContext;
   const probeFloors = passContext.probeFloors ?? probeHeights;
   const breakerState = createLineBreakerState(maxWidth, wrapCtx);
+  // WORD_COMPRESSED_SPACE_LINE_FIT scope, fixed for the paragraph: only
+  // segments acquired under its document gate carry the eligibility.
+  breakerState.mixedSpaceEnabled = segs.some(
+    (segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined,
+  );
 
   let operationState: PassOperationState;
   const sameLatinSpaceFace = performSameLatinSpaceFace;
