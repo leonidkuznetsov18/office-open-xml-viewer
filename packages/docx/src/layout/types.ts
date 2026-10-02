@@ -444,6 +444,8 @@ export interface TabPlacement {
 }
 
 export interface AnchorHostPlacement {
+  /** A suppressed automatic note mark still anchors its note to this line. */
+  readonly noteReference?: TextPlacement['noteReference'];
   readonly kind: 'anchor-host';
   readonly range: TextRange;
   readonly bounds: LayoutRect;

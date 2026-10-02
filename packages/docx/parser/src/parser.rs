@@ -7609,6 +7609,13 @@ fn parse_run_inner(
                     note_ref: Some(crate::types::NoteRef {
                         kind: kind.to_string(),
                         id: id_str,
+                        custom_mark_follows: matches!(
+                            tag,
+                            "footnoteReference" | "endnoteReference"
+                        ) && attr_w(child, "customMarkFollows")
+                            .as_deref()
+                            .and_then(parse_on_off)
+                            == Some(true),
                     }),
                     typography_acquisition: typography_acquisition.clone(),
                 })));
@@ -19779,6 +19786,31 @@ mod footnote_tests {
             .expect("note_ref set");
         assert_eq!(nr.kind, "endnote");
         assert_eq!(nr.id, "2");
+    }
+
+    #[test]
+    fn custom_note_reference_preserves_suppression_without_consuming_its_authored_mark() {
+        for tag in ["footnoteReference", "endnoteReference"] {
+            for (value, expected) in [("1", true), ("true", true), ("0", false)] {
+                let p = first_para(&format!(
+                    r#"<w:p><w:r><w:{tag} w:id="7" w:customMarkFollows="{value}"/><w:t>*</w:t></w:r></w:p>"#
+                ));
+                let texts: Vec<_> = p
+                    .runs
+                    .iter()
+                    .filter_map(|r| match r {
+                        DocRun::Text(t) => Some(t),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    texts[0].note_ref.as_ref().unwrap().custom_mark_follows,
+                    expected
+                );
+                assert_eq!(texts[1].text, "*");
+                assert!(texts[1].note_ref.is_none());
+            }
+        }
     }
 
     /// ECMA-376 §17.3.1.32 — w:snapToGrid val=0 surfaces as Some(false) so the

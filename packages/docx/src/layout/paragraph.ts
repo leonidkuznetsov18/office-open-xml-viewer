@@ -303,6 +303,7 @@ export interface MeasuredInlineDrawingPlanSegment {
 }
 
 export interface MeasuredAnchorHostPlanSegment {
+  readonly noteReference?: TextPlacement['noteReference'];
   readonly kind: 'anchor-host';
   readonly measuredWidthPt: 0;
   readonly range: import('./types.js').TextRange;
@@ -908,6 +909,7 @@ export function planLine(input: PlanLineInput): LineLayout {
         baselinePt: line.baselinePt,
         ...(segment.sourceMetrics ? { sourceMetrics: segment.sourceMetrics } : {}),
         ...(segment.anchorOccurrenceId ? { anchorOccurrenceId: segment.anchorOccurrenceId } : {}),
+        ...(segment.noteReference ? { noteReference: segment.noteReference } : {}),
       });
     } else {
       const {
@@ -1347,6 +1349,8 @@ function textPlacement(
     const sourceMetrics = selectedFaceSourceMetrics(segment);
     return {
       kind: 'anchor-host',
+      ...(run?.type === 'text' && (run.noteRef?.kind === 'footnote' || run.noteRef?.kind === 'endnote')
+        ? { noteReference: { kind: run.noteRef.kind, id: run.noteRef.id } } : {}),
       range: { start: sourceOffset, end: sourceOffset },
       bounds: { xPt, yPt: topPt, widthPt: 0, heightPt },
       baselinePt,
@@ -1871,6 +1875,8 @@ function textPlanSegment(
     const sourceMetrics = selectedFaceSourceMetrics(segment);
     return {
       kind: 'anchor-host', measuredWidthPt: 0,
+      ...(sourceRun?.type === 'text' && (sourceRun.noteRef?.kind === 'footnote' || sourceRun.noteRef?.kind === 'endnote')
+        ? { noteReference: { kind: sourceRun.noteRef.kind, id: sourceRun.noteRef.id } } : {}),
       range: { start: sourceOffset, end: sourceOffset },
       ...(sourceMetrics ? { sourceMetrics } : {}),
       ...(sourceRun?.type === 'anchorHost' && sourceRun.anchorOccurrenceId

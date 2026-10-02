@@ -1612,6 +1612,29 @@ function appendRunsToSegments(
           : environment.noteReferenceNumber
         : undefined;
       if (t.noteRef) {
+        // CT_FtnEdnRef/@customMarkFollows suppresses the automatic glyph, not
+        // the note relationship. Keep an immutable zero-width host so a note
+        // remains attached to the physical line/page of this reference.
+        // Number 0 is the acquisition map's custom-note sentinel; the note's
+        // own automatic *Ref placeholder is suppressed by the same contract.
+        if (t.noteRef.customMarkFollows === true || noteText === 0) {
+          // As for an empty/anchor-only mark, a bounded Latin probe resolves
+          // the four font slots and selected-face metrics through the ordinary
+          // text service. Discard its ink/text, never its font authority.
+          appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? 'super', runIndex,
+            { text: 'x', offset: 0 });
+          for (let index = emittedStart; index < segs.length; index += 1) {
+            const segment = segs[index];
+            if (!('text' in segment)) throw new Error('A note metric probe lost its text authority');
+            segment.text = '';
+            segment.metricOnly = true;
+            segment.sourceRunIndex = runIndex;
+            if (segment.textShapeRequest) {
+              segment.textShapeRequest = Object.freeze(independentTextShapeRequest(segment.textShapeRequest, ''));
+            }
+          }
+          continue;
+        }
         const label =
           noteText != null
             ? formatNoteNumber(
