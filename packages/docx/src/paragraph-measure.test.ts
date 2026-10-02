@@ -183,6 +183,20 @@ describe('measureParagraph', () => {
     );
     expect(exact.lines[0]?.advancePt).toBeCloseTo(12);
   });
+  it('treats implicit single spacing and explicit auto1 equally for a taller text marker', () => {
+    const doc = paragraph({ runs: [{ type: 'text', ...textRun('List item') }] });
+    const marker = environment({ firstLineNumberingMarkerBox: { ascentPt: 12, descentPt: 1 } });
+    const implicit = measureParagraph(doc, layoutContext({ spaceBeforePt: 0, lineSpacing: null }),
+      placement({ startYPt: 0 }), measurer, marker);
+    const explicit = measureParagraph(doc, layoutContext({ spaceBeforePt: 0,
+      lineSpacing: { rule: 'auto', value: 1, explicit: true } }),
+      placement({ startYPt: 0 }), measurer, marker);
+    // §17.3.1.33: absent line spacing is single spacing. The glyph union is
+    // max(12, 8) + max(1, 2), without extra leading.
+    expect(implicit.lines[0]?.advancePt).toBe(14);
+    expect(implicit.contentEndYPt).toBe(explicit.contentEndYPt);
+    expect(implicit.lines[0]?.layout.ascent).toBe(explicit.lines[0]?.layout.ascent);
+  });
   it('uses the same character-grid right-edge adjustment for line partitioning', () => {
     const source = paragraph({
       runs: [{ type: 'text', ...textRun('あ'.repeat(20)) }],

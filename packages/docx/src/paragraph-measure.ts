@@ -306,8 +306,10 @@ export function measureParagraph(
     const allocations: { layout: LayoutLine; advancePt: number }[] = [];
     for (const [lineIndex, originalLine] of lines.entries()) {
       const markerBox = lineIndex === 0 && !continuation && !placement.wrap
-        && !context.lineGrid.active && context.lineSpacing?.rule === 'auto'
-        && context.lineSpacing.value >= 1 && !context.hasRuby
+        && !context.lineGrid.active
+        && (context.lineSpacing == null
+          || (context.lineSpacing.rule === 'auto' && context.lineSpacing.value >= 1))
+        && !context.hasRuby
         && !originalLine.uniformPositionAuto && !originalLine.inlinePictureTextSingle
         ? environment.firstLineNumberingMarkerBox : undefined;
       const markerAscent = markerBox?.ascentPt;
@@ -327,7 +329,9 @@ export function measureParagraph(
         originalLine.intendedSingle,
       );
       // ECMA-376 §17.9.6 supplies marker rPr and §17.3.1.33 the auto multiple,
-      // but neither specifies their line-box union. This selected-face projection
+      // No inherited line value means single spacing (§17.3.1.33 @line), so
+      // omitted spacing and explicit auto1 use the same selected glyph union.
+      // The spec does not specify that union. This selected-face projection
       // is limited to the observed auto/non-grid text-marker class; other classes
       // retain their established allocation.
       void WORD_NUMBERING_MARKER_FIRST_LINE_UNION;
