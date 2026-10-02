@@ -67,6 +67,19 @@ it('does not certify a multi-atom Hangul grapheme as an absent resource', () => 
   expect(fontResourceCoversCluster('각ᆨ', (cp) => cp === 0x11a8)).toBeUndefined();
 });
 
+it('keeps resource attribution bounded for a long mixed Hangul shaping span', () => {
+  // A mapped Latin prefix before the syllable must not be rescanned for every
+  // trailing jamo. The production paragraph path validates this whole span.
+  const text = 'A'.repeat(64_000) + '각' + '\u11a8'.repeat(64_000);
+  const started = performance.now();
+  const support = analyzeFontResourceSupport(text,
+    cp => cp === 0x41 || cp === 0xac01 || cp === 0x11a8,
+    { schema: 'ot-definedness-1', glyphCount: 4, nonzeroPreserved: true,
+      missingIsolated: true, noErasure: true, anyIndic3ScriptPresent: false });
+  expect(support.kind).toBe('complete');
+  expect(performance.now() - started).toBeLessThan(5_000);
+}, 60_000);
+
 it('admits pinned simple syllables while declining unimplemented script preprocessing', () => {
   for (const text of ['कि', 'ကေ', 'কো']) expect(fontResourceCoversCluster(text, () => true)).toBe(true);
   for (const text of ['กํา', 'កេ', 'කි', 'ש', 'क्', 'क्क', 'က\u1039က', 'अा']) {

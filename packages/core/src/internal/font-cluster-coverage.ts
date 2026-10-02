@@ -135,13 +135,16 @@ export function analyzeFontResourceSupport(display: string, covers: Covers, fact
     if (canonicalUnicodeMark(cp) && atoms.length) atoms[atoms.length - 1].push(cp);
     else atoms.push([cp]);
   }
+  // Tail admission depends on span-wide membership, not on the current atom.
+  // Resolve it once so an ordinary prefix plus many tails stays linear.
+  const hasModernHangul = atoms.some((atom) => hangul(atom[0]));
   let complete = 0, rejected = 0;
   for (const atom of atoms) {
     if (jamo(atom[0])) {
       // Modern NFC syllables followed by an extra trailing jamo are separate
       // browser fallback atoms even though Intl.Segmenter gives one EGC.
       // Only those modern tails have an admitted scalar atom here.
-      if (!(atom[0] >= 0x11a8 && atom[0] <= 0x11c2 && atoms.some((a) => hangul(a[0])))) return { kind: 'unknown', reason: 'partition' };
+      if (!(atom[0] >= 0x11a8 && atom[0] <= 0x11c2 && hasModernHangul)) return { kind: 'unknown', reason: 'partition' };
     }
     if (canonicalUnicodeMark(atom[0]) && facts.noErasure !== true) {
       const dot = covers(0x25cc);
