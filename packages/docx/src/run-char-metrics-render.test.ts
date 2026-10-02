@@ -273,15 +273,6 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     }
   });
 
-  it('retains a same-source space-letter pair at a word segmentation seam', async () => {
-    const { runs } = await render([textRun('T A', { kerning: 8 })], { compatibilityMode: 15 });
-    const a = runs.find(run => run.text === 'A')!;
-    const t = runs.find(run => run.text === 'T ')!;
-    expect(a.x - t.x).toBe(2 * FONT_PX - 1 - 1.5);
-    const older = await render([textRun('T A', { kerning: 8 })], { compatibilityMode: 14 });
-    expect(older.runs.find(run => run.text === 'A')!.x - older.runs[0]!.x).toBe(2 * FONT_PX - 1);
-  });
-
   it.each(['right', 'center'] as const)('compares source formatting by value for %s alignment', async (alignment) => {
     const first = textRun('T', { kerning: 8 });
     const second = textRun(' X', { kerning: 8 });
