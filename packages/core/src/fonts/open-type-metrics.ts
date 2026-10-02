@@ -27,6 +27,26 @@ export interface OpenTypeLineMetrics {
   readonly unicodeRanges?: readonly (readonly [number, number])[];
 }
 
+/** Scalar presence proven by a parsed resource's cmap. Empty strict-parser
+ * coverage is also its unsupported/malformed sentinel, so it cannot prove
+ * absence from a registered face. Keep that ambiguity unknown to consumers. */
+export function openTypeResourceCoversCodePoint(
+  metrics: Pick<OpenTypeLineMetrics, 'unicodeRanges'> | undefined,
+  codePoint: number,
+): boolean | undefined {
+  const ranges = metrics?.unicodeRanges;
+  if (!ranges?.length || !Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return undefined;
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (codePoint < ranges[mid]![0]) hi = mid - 1;
+    else if (codePoint > ranges[mid]![1]) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
 const tagValue = (tag: string): number => (
   ((tag.charCodeAt(0) << 24) >>> 0)
   | (tag.charCodeAt(1) << 16)

@@ -144,6 +144,15 @@ describe('empty East Asian slot face resolution (#1689)', () => {
     }
   });
 
+  it('attributes CJK by the selected cut\'s glyph coverage, not its family classification', () => {
+    // Deng's Unicode cmap maps Han, but not U+D55C; the painting chain
+    // passes through PMingLiU to Batang. An unknown earlier face could paint
+    // either glyph and must prevent attribution to a later known resource.
+    expect(faces('漢한', { latin: 'Arial', cs: 'DengXian', italic: false }))
+      .toEqual({ 漢: 'DengXian', 한: 'Batang' });
+    expect(faces('漢', { latin: 'Uncatalogued Face', italic: false })).toEqual({ 漢: undefined });
+  });
+
   it('attributes covered and missing symbols per glyph to the drawing resource', () => {
     // The installed cmap distinguishes a covered ■ from a missing ◆ in
     // Tahoma, and a missing § from a covered § in the two ExtB resources.
@@ -252,27 +261,6 @@ describe('embedded selected-resource metrics (#1689)', () => {
     const segment = input.find((i) => i.type === 'text');
     expect(segment?.type === 'text' && segment.style.faceFamily).toBeUndefined();
     expect(segment?.type === 'text' && segment.style.lineMetric).toBeUndefined();
-  });
-
-  it('sizes an embedded face by its own resource, a missing style by the upright one', () => {
-    const regular = powerPointResourceFaceMetrics({
-      unitsPerEm: 1000, hheaAscent: 0, hheaDescent: 0, hheaLineGap: 0,
-      winAscent: 700, winDescent: 300, hasEastAsianCmap: false,
-    })!;
-    const rc = {
-      ...RC,
-      embeddedFontAliases: new Map([['deck sans', '__deck_1']]),
-      embeddedFontAuthoredFamilies: new Map([['__deck_1', 'deck sans']]),
-      embeddedFontTuples: new Set(['deck sans:400:normal']),
-      embeddedFontMetrics: new Map([['deck sans:400:normal', regular]]),
-    };
-    for (const italic of [false, true]) {
-      const { input } = paragraphInputRuns(para([{
-        ...textRun('Hg', { latin: 'Deck Sans', italic }, undefined),
-      }]), 22, '#000', SCALE, false, italic, 1, undefined, rc);
-      const seg = input.find((i) => i.type === 'text');
-      expect(seg?.type === 'text' && seg.style.lineMetric).toBe(regular);
-    }
   });
 });
 

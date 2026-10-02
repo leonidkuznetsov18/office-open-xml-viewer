@@ -2,8 +2,8 @@
 
 A run whose East Asian (`a:ea`) font slot is empty now draws its East
 Asian-slot characters the way PowerPoint does. Fonts missing from the reference
-catalogue no longer switch a whole text body to the ordinary line model. No
-migration is required.
+catalogue use a line-local fallback in the ordinary baseline model; the
+structural whole-body guards below still apply. No migration is required.
 
 ## Specification boundary
 
@@ -87,9 +87,15 @@ verification artifacts, not redistributable baselines.
     resource draws it. The catalogue does not invent coverage for that resource
     difference. The next covering CJK face owns the installed stack's metric;
     the PDF comparison remains a resource mismatch.
+  - CJK attribution also checks each concrete cut's cmap per glyph in a bounded
+    CJK domain, including supplementary Han and kana. Family-wide basic Han
+    coverage selects the fallback chain but cannot establish glyph ownership.
+    Unrecorded CJK scalars and unknown earlier resources stop attribution.
   - Deck-embedded fonts are distinct resources even when a catalogue name
-    matches. Their per-glyph coverage is not retained in the current adapter;
-    symbol attribution stays unknown rather than borrow installed cmap facts.
+    matches. Their own bounded cmap coverage is retained at registration and
+    follows the same real/synthetic resource selection as their OS/2 metrics.
+    Unsupported or malformed coverage stays unknown; installed same-name
+    cmap facts cannot replace it.
   - Lines containing secondary CJK misses can still differ from Office because
     those drawing resources are intentionally unknown under (B). Recording a
     symbol fallback does not establish the missing CJK resource's metrics.
@@ -115,5 +121,6 @@ for the whole body:
 
 - equations;
 - markers taller than the text;
-- `compatLnSpc="0"` without Excel tables;
+- `compatLnSpc="0"` without Excel tables for every glyph face, including
+  unknown-only lines and unknown glyphs mixed with known faces;
 - unresolved `fontAlgn` offsets.

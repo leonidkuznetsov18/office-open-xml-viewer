@@ -254,6 +254,26 @@ describe('bodyPr compatLnSpc (#1619)', () => {
     ys.forEach((y, i) => expect(Math.abs(y / U - exported[i])).toBeLessThanOrEqual(0.5));
   };
 
+  it('retains the whole-body fallback for unknown glyph faces under compatLnSpc=0', () => {
+    for (const middle of [
+      [{ text: 'B', font: 'Avenir', size: 20 }],
+      [{ text: 'B', font: 'Avenir', size: 20 }, { text: 'D', font: 'Arial', size: 20 }],
+    ]) {
+      const p = [paragraph([{ text: 'A', font: 'Arial', size: 20 }]),
+        paragraph(middle), paragraph([{ text: 'C', font: 'Arial', size: 20 }])];
+      const ys = baselines(p, off);
+      [19.2, 43.2, 67.2].forEach((y, i) => expect(ys[i]).toBeCloseTo(y, 10));
+    }
+  });
+
+  it('retains the whole-body fontAlgn fallback for an unknown-only line', () => {
+    const p = [paragraph([{ text: 'A', font: 'Arial', size: 20 }]),
+      paragraph([{ text: 'B', font: 'Avenir', size: 20 }], { fontAlgn: 't' }),
+      paragraph([{ text: 'C', font: 'Arial', size: 20 }])];
+    const ys = baselines(p);
+    [19.2, 43.2, 67.2].forEach((y, i) => expect(ys[i]).toBeCloseTo(y, 10));
+  });
+
   it('keeps the #1610 model for compatLnSpc="1" exactly as when it is omitted', () => {
     for (const [p, exported] of [
       [lines('Times New Roman', 100, 1, null), [134]],

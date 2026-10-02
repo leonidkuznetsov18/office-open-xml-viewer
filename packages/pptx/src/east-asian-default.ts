@@ -1,4 +1,4 @@
-import { powerPointSymbolCoverage } from './powerpoint-line-metrics.js';
+import { powerPointSymbolCoverage, powerPointCjkCoverage } from './powerpoint-line-metrics.js';
 import { classifyCjkFont, findReferenceFontMetrics, isReferenceSymbolCodePoint } from '@silurus/ooxml-core';
 import {
   EAST_ASIAN_SLOT_RANGES,
@@ -122,12 +122,6 @@ function coveredByMincho(cp: number): boolean {
   return (decodeBitmap()[i >> 3] & (1 << (i & 7))) !== 0;
 }
 
-const REGIONAL_TIER_FACES: ReadonlySet<string> = new Set([SERIF_TIERS[2], SANS_TIERS[2]]);
-
-function hasRecordedRepertoire(face: string): boolean {
-  return face === 'MS Mincho' || face === 'MS Gothic' || face === 'PMingLiU' || face === 'Microsoft JhengHei';
-}
-
 function covers(face: string, text: string): boolean {
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0;
@@ -232,13 +226,12 @@ export function emptyEastAsianSlotFaces(selectedFace: string | null, text: strin
  *   U+25C6 although the #1689 PDF resource drew it; no cmap presence is invented
  *   to emulate that different resource. Unrecorded scalars keep the existing
  *   selected-face model. This is font-data routing, not a new Office heuristic.
- * - A CJK glyph is S's when S maps basic CJK (and, for a face whose
- *   repertoire is recorded, maps this glyph: CS MS Mincho sends 简 to
- *   Microsoft JhengHei, emptyea4 K04); otherwise it belongs to the
- *   first CJK fallback face, in stack order, that covers it by its recorded
- *   repertoire. A regional tier face without a recorded repertoire (Batang,
- *   Malgun Gothic: #1627's measured default for what the earlier tiers lack)
- *   takes whatever reaches it.
+ * - CJK uses the same per-glyph rule, including S and the symbol faces
+ *   before the CJK tiers. An OS/2 Far-East code page or some basic Han in
+ *   a family's cmap selects a fallback chain; neither proves that this cut
+ *   paints a particular glyph. Unknown earlier coverage stops attribution
+ *   (decision c), and a missing glyph after decision B's first fallback
+ *   remains unknown. This changes attribution only, not the painting stack.
  */
 export function emptyEastAsianDrawingFace(
   selectedFace: string | null,
@@ -247,30 +240,19 @@ export function emptyEastAsianDrawingFace(
   bold = false,
   italic = false,
   symbolCoverage = powerPointSymbolCoverage,
+  cjkCoverage = powerPointCjkCoverage,
 ): string | null {
-  if (!isCjkFallbackGlyph(ch)) {
-    const cp = ch.codePointAt(0) ?? 0;
-    // Coverage outside the sweep domain is unknown for every resource. Keep
-    // the previous model there; within the domain an unknown S is decision c.
-    if (!isReferenceSymbolCodePoint(cp)) return selectedFace;
-    const stack = [selectedFace, ...EAST_ASIAN_SYMBOL_FALLBACK_FACES, ...cjkFaces];
-    for (const face of stack) {
-      if (!face) continue;
-      const coverage = symbolCoverage(face, bold, italic, cp);
-      if (coverage === undefined) return null;
-      if (coverage) return face;
-    }
-    return null;
-  }
-  if (selectedFace && coversCjkIdeographs(selectedFace) === true
-    && (!hasRecordedRepertoire(selectedFace) || covers(selectedFace, ch))) return selectedFace;
-  for (const face of cjkFaces) {
-    if (face === selectedFace) continue;
-    if (!hasRecordedRepertoire(face)) {
-      if (REGIONAL_TIER_FACES.has(face)) return face;
-      continue;
-    }
-    if (covers(face, ch)) return face;
+  const cp = ch.codePointAt(0) ?? 0;
+  const cjk = isCjkFallbackGlyph(ch);
+  // Coverage outside the symbol sweep is unknown for every resource. Keep
+  // the previous model there; CJK outside its catalogue domain stays unknown.
+  if (!cjk && !isReferenceSymbolCodePoint(cp)) return selectedFace;
+  const coverageFor = cjk ? cjkCoverage : symbolCoverage;
+  for (const face of [selectedFace, ...EAST_ASIAN_SYMBOL_FALLBACK_FACES, ...cjkFaces]) {
+    if (!face) continue;
+    const coverage = coverageFor(face, bold, italic, cp);
+    if (coverage === undefined) return null;
+    if (coverage) return face;
   }
   return null;
 }

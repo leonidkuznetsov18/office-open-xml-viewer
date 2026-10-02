@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseOpenTypeLineMetrics, parseOpenTypeResourceMetrics } from './open-type-metrics.js';
+import { parseOpenTypeLineMetrics, parseOpenTypeResourceMetrics, openTypeResourceCoversCodePoint } from './open-type-metrics.js';
 
 function syntheticSfnt(baseOffset = 0, eastAsianCmap = false): Uint8Array {
   const tableCount = eastAsianCmap ? 4 : 3;
@@ -252,6 +252,16 @@ function syntheticSfntWithRepeatedCmapRecords(recordCount: number, distinctTable
 
 
 describe('opt-in OpenType resource coverage', () => {
+  it('proves glyph coverage from the parsed resource and preserves unsupported coverage as unknown', () => {
+    const metrics = parseOpenTypeResourceMetrics(syntheticSfntWithCmapFormat(12));
+    expect(openTypeResourceCoversCodePoint(metrics ?? undefined, 0x56fd)).toBe(true);
+    expect(openTypeResourceCoversCodePoint(metrics ?? undefined, 0xd55c)).toBe(false);
+    const unsupported = syntheticSfntWithCmapFormat(12);
+    new DataView(unsupported.buffer).setUint16(12 + 4 * 16 + 54 + 36 + 78 + 12, 6);
+    expect(openTypeResourceCoversCodePoint(parseOpenTypeResourceMetrics(unsupported) ?? undefined, 0x56fd))
+      .toBeUndefined();
+  });
+
   it('reads nonzero glyph coverage from the supported cmap encodings', () => {
     for (const bytes of [syntheticSfnt(0, true), syntheticSfntWithCmapFormat(4),
       syntheticSfntWithCmapFormat(13)]) {

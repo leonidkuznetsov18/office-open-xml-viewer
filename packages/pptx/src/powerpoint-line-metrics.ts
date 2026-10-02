@@ -1,4 +1,4 @@
-import { findReferenceFontMetrics, referenceFontCoversSymbol, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
+import { findReferenceFontMetrics, referenceFontCoversSymbol, referenceFontCoversCjk, type OpenTypeLineMetrics } from '@silurus/ooxml-core';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
 
 /**
@@ -128,6 +128,17 @@ export function powerPointSymbolCoverage(
     ? first : undefined;
 }
 
+/** CJK presence in the same real/synthetic resource cut used for metrics. */
+export function powerPointCjkCoverage(
+  family: string, bold: boolean, italic: boolean, codePoint: number,
+): boolean | undefined {
+  const chosen = chosenProfiles(family, bold, italic, true);
+  if (chosen.length === 0) return undefined;
+  const first = referenceFontCoversCjk(chosen[0], codePoint);
+  return first !== undefined && chosen.every((p) => referenceFontCoversCjk(p, codePoint) === first)
+    ? first : undefined;
+}
+
 function resolveShare(family: string, bold: boolean, italic: boolean): number | undefined {
   const chosen = chosenProfiles(family, bold, italic);
   if (chosen.length === 0) return undefined;
@@ -228,6 +239,9 @@ export interface PowerPointFaceMetrics {
   readonly glyph: ExcelLineBox | undefined;
   /** #1604 natural box, used under an explicit compatLnSpc="0". */
   readonly excel: ExcelLineBox | undefined;
+  /** Proven scalar coverage of a registered embedded resource. Parsed once,
+   * bounded by core's cmap budgets; no font bytes or glyph-query cache retained. */
+  readonly unicodeRanges?: OpenTypeLineMetrics['unicodeRanges'];
 }
 
 const faceCache = new Map<string, PowerPointFaceMetrics | null>();
@@ -268,7 +282,7 @@ export function powerPointFaceMetrics(
  * PowerPoint sizes a line by the embedded resource's usWinAscent /
  * usWinDescent, or its typo metrics plus line gap under USE_TYPO_METRICS),
  * the same rule as the reference catalogue. Used for a deck-embedded face,
- * whose bytes the renderer holds. The #1604 compatLnSpc="0" box needs the
+ * whose tables and cmap the loader retains. The #1604 compatLnSpc="0" box needs the
  * face's installation source, which an embedded part does not have, so it
  * stays undefined and that body keeps the ordinary model, as before.
  */
@@ -287,7 +301,8 @@ export function powerPointResourceFaceMetrics(metrics: OpenTypeLineMetrics): Pow
   if (ascent === undefined || descent === undefined) return undefined;
   const share = ascent / (ascent + descent);
   if (!Number.isFinite(share) || share <= 0 || share >= 1) return undefined;
-  return Object.freeze({ share, glyph: { ascent: ascent / upm, descent: descent / upm }, excel: undefined });
+  return Object.freeze({ share, glyph: { ascent: ascent / upm, descent: descent / upm }, excel: undefined,
+    unicodeRanges: metrics.unicodeRanges });
 }
 
 /** One run's contribution to a line: its authored size and ascent share. */

@@ -34,6 +34,9 @@ export interface ReferenceFontMetricProfile {
    * Sorted inclusive endpoint pairs, interned across faces. Empty means no
    * mapped symbols; null/undefined means unknown. Not installed-face detection. */
   readonly symbolCoverage?: readonly number[] | null;
+  /** Index of this concrete cut's immutable CJK cmap bitmap in the generated
+   * catalogue. Family-wide Han classification cannot prove glyph coverage. */
+  readonly cjkCoverage?: number | null;
 }
 
 export interface FindReferenceFontMetricsOptions {
@@ -139,7 +142,64 @@ export function referenceFontCoversSymbol(
   codePoint: number,
 ): boolean | undefined {
   if (!isReferenceSymbolCodePoint(codePoint) || profile.symbolCoverage == null) return undefined;
-  const ranges = profile.symbolCoverage;
+  return coverageIncludes(profile.symbolCoverage, codePoint);
+}
+
+/** Per-cut CJK cmap coverage; outside the generated domain stays unknown. */
+export function referenceFontCoversCjk(
+  profile: ReferenceFontMetricProfile,
+  codePoint: number,
+): boolean | undefined {
+  if (!Number.isInteger(codePoint) || profile.cjkCoverage == null
+    || !referenceData.cjkCoverageRanges.some(([lo, hi]) => codePoint >= lo && codePoint <= hi)) return undefined;
+  const bits = cjkBitmap(profile.cjkCoverage);
+  if (!bits) return undefined;
+  let offset = 0;
+  for (const [lo, hi] of referenceData.cjkCoverageRanges) {
+    if (codePoint >= lo && codePoint <= hi) {
+      const index = offset + codePoint - lo;
+      return (bits[index >>> 3] & (1 << (index & 7))) !== 0;
+    }
+    offset += hi - lo + 1;
+  }
+  return undefined;
+}
+
+// Decode only queried repertoires. The index is confined to the immutable
+// catalogue (one bitmap per generated repertoire); family/glyph queries never
+// create cache keys. Each decoded bitmap has the fixed scalar-domain size,
+// including its implicit trailing zeros. Neither bytes nor bitmaps escape.
+const cjkBitmaps = new Map<number, Uint8Array>();
+const CJK_BITMAP_BYTES = Math.ceil(referenceData.cjkCoverageRanges
+  .reduce((sum, [lo, hi]) => sum + hi - lo + 1, 0) / 8);
+function cjkBitmap(index: number): Uint8Array | undefined {
+  if (!Number.isInteger(index) || index < 0 || index >= referenceData.cjkCoverages.length) return undefined;
+  const cached = cjkBitmaps.get(index);
+  if (cached) return cached;
+  const packed = atob(referenceData.cjkCoverages[index]);
+  const bits = new Uint8Array(CJK_BITMAP_BYTES);
+  let out = 0;
+  // PackBits: 0..127 copies n+1 literal bytes; 129..255 repeats the next
+  // byte 257-n times; 128 is a no-op. Encoding limits, not font heuristics.
+  for (let at = 0; at < packed.length;) {
+    const control = packed.charCodeAt(at++);
+    if (control === 128) continue;
+    const count = control < 128 ? control + 1 : 257 - control;
+    if (out + count > bits.length) return undefined;
+    if (control < 128) {
+      if (at + count > packed.length) return undefined;
+      for (let end = at + count; at < end;) bits[out++] = packed.charCodeAt(at++);
+    } else {
+      if (at >= packed.length) return undefined;
+      bits.fill(packed.charCodeAt(at++), out, out + count);
+      out += count;
+    }
+  }
+  cjkBitmaps.set(index, bits);
+  return bits;
+}
+
+function coverageIncludes(ranges: readonly number[], codePoint: number): boolean {
   let lo = 0;
   let hi = ranges.length / 2 - 1;
   while (lo <= hi) {

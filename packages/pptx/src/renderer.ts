@@ -1,4 +1,5 @@
 import { pptxSlideCjkFallback } from './google-fonts.js';
+import { openTypeResourceCoversCodePoint } from '@silurus/ooxml-core';
 import type { CjkLang } from '@silurus/ooxml-core';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type {
@@ -160,7 +161,7 @@ import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-f
 import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
 import {
   powerPointCompatOffNaturalLine, powerPointExactLinePoints, powerPointFaceMetrics,
-  powerPointNaturalLine, powerPointSymbolCoverage, type PowerPointFaceMetrics,
+  powerPointNaturalLine, powerPointSymbolCoverage, powerPointCjkCoverage, type PowerPointFaceMetrics,
   POWERPOINT_FONT_ALGN_UNIT_PT, powerPointFontAlgnOffset, powerPointFontAlgnReference,
 } from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
@@ -198,7 +199,7 @@ export interface RenderContext {
   embeddedFontTuples?: ReadonlySet<string>;
   /** Line metrics of each registered embedded face, keyed like
    * `embeddedFontTuples` (authored family:weight:style), parsed from the
-   * font part's own OS/2 tables (#1689 selected-resource metrics). */
+   * font part's own OS/2 tables and bounded cmap (#1689 resource attribution). */
   embeddedFontMetrics?: ReadonlyMap<string, PowerPointFaceMetrics>;
   /** Theme hyperlink colour as a 6-char hex (no leading #), or null. */
   themeHlinkColor?: string | null;
@@ -1684,15 +1685,21 @@ export function paragraphInputRuns(
     // application default; the defaults also follow an authored cs face.
     const csFontFor = (face: string, text: string) =>
       stackFontFor(face, text, true, COMPLEX_SCRIPT_DEFAULT_FACES);
-    // A deck part can replace a same-name catalogue resource. Its OS/2 tables
-    // are known, but per-glyph cmap coverage is not retained here; do not use
-    // an installed copy's repertoire as proof of that embedded drawing face.
-    // Until embedded coverage is wired, symbol attribution stays unknown (c).
-    const symbolCoverage: typeof powerPointSymbolCoverage = (face, b, i, cp) =>
-      rc.embeddedFontAliases?.has(face.trim().toLowerCase()) ? undefined
-        : powerPointSymbolCoverage(face, b, i, cp);
+    // Embedded aliases precede every application fallback in the paint stack.
+    // Use that concrete cut's retained cmap, including the synthetic-style
+    // resource selected by lineMetricFor. Unknown coverage must stop the
+    // search: an earlier embedded face might paint the glyph. Never borrow
+    // an installed same-name resource's cmap (ECMA-376 §19.2.1.9 / §15.2.13).
+    const resourceCoverage = (catalogue: typeof powerPointSymbolCoverage): typeof powerPointSymbolCoverage =>
+      (face, b, i, cp) => {
+        if (!rc.embeddedFontAliases?.has(face.trim().toLowerCase())) return catalogue(face, b, i, cp);
+        return openTypeResourceCoversCodePoint(lineMetricFor(normalizeFontFamily(face, rc), b, i, rc), cp);
+      };
+    const symbolCoverage = resourceCoverage(powerPointSymbolCoverage);
+    const cjkCoverage = resourceCoverage(powerPointCjkCoverage);
     const emptyEastAsianFaceFor = (ch: string): string | null => {
-      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, ch, bold, italic, symbolCoverage);
+      const drawing = emptyEastAsianDrawingFace(selectedEaSource, eaCjkDefaults, ch, bold, italic,
+        symbolCoverage, cjkCoverage);
       return drawing === null ? null : normalizeFontFamily(drawing, rc);
     };
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
@@ -4835,6 +4842,7 @@ export function renderTextBody(
       // glyphs but no known face at all keeps the ordinary model, and only
       // that line does.
       let lineHasGlyphs = false;
+      let lineHasUnknownFace = false;
       for (const seg of line.segments) {
         // For an equation, the line must be at least as tall as its own font
         // size (so a short label like "y"/"p"/"z" gets the normal font-ascent
@@ -4847,7 +4855,10 @@ export function renderTextBody(
         if (effSize > maxSizePx) maxSizePx = effSize;
         if (seg.math) metricOk = false;
         else if (!seg.isTab) {
-          if (seg.text) lineHasGlyphs = true;
+          if (seg.text) {
+            lineHasGlyphs = true;
+            if (seg.lineMetric === undefined) lineHasUnknownFace = true;
+          }
           if (seg.lineMetric !== undefined) metricRuns.push({ sizePx: seg.sizePx, face: seg.lineMetric });
           // A run's latin face sizes its line even where an East Asian or
           // symbol segment draws no latin glyph; an unused ea or cs face does
@@ -4961,9 +4972,13 @@ export function renderTextBody(
       // #1610 one (the run's own face and its latin face). A line with no
       // glyph run has no measured box in that model, and neither has a face
       // without Excel tables; either keeps the ordinary model for the body.
+      // This structural rejection also applies to unknown glyphs among known
+      // runs, and unknown-only lines. The line-local unknown-face policy above
+      // is restricted to the ordinary baseline model; equations, tall markers,
+      // compatLnSpc=0 and unresolvable fontAlgn retain their whole-body gates.
       const compatOff = body.compatLnSpc === false;
-      if (metric && metricOk && compatOff && !lineFacesUnknown
-        && (metricRuns.length === 0 || metricRuns.some((r) => r.face.excel === undefined))) {
+      if (metric && metricOk && compatOff
+        && (lineHasUnknownFace || metricRuns.length === 0 || metricRuns.some((r) => r.face.excel === undefined))) {
         metricOk = false;
       }
       // pPr@fontAlgn t / ctr / b (powerPointFontAlgnReference): the line box
@@ -4972,7 +4987,7 @@ export function renderTextBody(
       // rule.
       const fontAlgn = para.fontAlgn;
       let alignedLine: { ascent: number; descent: number } | undefined;
-      if (metric && metricOk && fontAlgn && metricRuns.length > 0) {
+      if (metric && metricOk && fontAlgn && (lineHasGlyphs || metricRuns.length > 0)) {
         const unitPx = POWERPOINT_FONT_ALGN_UNIT_PT * PT_TO_EMU * scale;
         alignedLine = powerPointFontAlgnReference(fontAlgn, metricRuns, compatOff, unitPx);
         if (!alignedLine) metricOk = false;

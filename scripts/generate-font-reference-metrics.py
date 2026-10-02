@@ -3,13 +3,14 @@
 
 The generated profiles are reference facts, not proof of the font face selected by
 Canvas, the operating system, or Office. No outlines, glyph IDs, or per-glyph
-advances are written to the output. Symbol coverage records cmap presence only.
+advances are written to the output. Glyph coverage records cmap presence only.
 OS/2 xAvgCharWidth is a scalar font metric, not a shaped text advance.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import plistlib
@@ -36,21 +37,69 @@ PROVENANCE_OUTPUT = Path("scripts/reference-font-metrics-provenance.json")
 SYMBOL_COVERAGE_RANGES = ((0x00A0, 0x00FF), (0x2000, 0x206F),
                           (0x2100, 0x23FF), (0x2460, 0x27BF))
 
+# Script-bearing CJK, punctuation and width forms used by the empty-ea path.
+# A bounded scalar domain, including supplementary Han/kana; outside it the
+# runtime reports unknown rather than inferring coverage from the family.
+CJK_COVERAGE_RANGES = ((0x1100, 0x11FF), (0x2E80, 0x33FF), (0x3400, 0x9FFF),
+                       (0xA960, 0xA97F), (0xAC00, 0xD7FF), (0xF900, 0xFAFF),
+                       (0xFE30, 0xFE4F), (0xFF00, 0xFFEF), (0x16FE0, 0x18DFF),
+                       (0x1AFF0, 0x1B16F), (0x20000, 0x323AF))
 
-def symbol_coverage(cmap: dict[int, str] | None) -> list[int] | None:
+
+def glyph_coverage(cmap: dict[int, str] | None, domain: tuple[tuple[int, int], ...]) -> list[int] | None:
     """Sorted inclusive endpoint pairs; None is unknown, [] is known empty."""
     if cmap is None:
         return None
     ranges: list[int] = []
-    for start, end in SYMBOL_COVERAGE_RANGES:
-        for code in range(start, end + 1):
-            if code not in cmap or cmap[code] == ".notdef":
-                continue
-            if ranges and ranges[-1] == code - 1:
-                ranges[-1] = code
-            else:
-                ranges.extend((code, code))
+    for code, glyph in sorted(cmap.items()):
+        if glyph == ".notdef" or not any(start <= code <= end for start, end in domain):
+            continue
+        if ranges and ranges[-1] == code - 1:
+            ranges[-1] = code
+        else:
+            ranges.extend((code, code))
     return ranges
+
+
+def packed_cjk_bitmap(ranges: tuple[int, ...]) -> str:
+    """PackBits bitmap in domain order; trailing zero bytes are implicit.
+
+    Dense CJK repertoires have many one-glyph holes. A bitmap avoids thousands
+    of numeric endpoints; PackBits suppresses long absent/full byte runs without
+    needing a runtime compression dependency. 128 is the PackBits packet limit.
+    """
+    bits = bytearray((sum(end - start + 1 for start, end in CJK_COVERAGE_RANGES) + 7) // 8)
+    offset = 0
+    for start, end in CJK_COVERAGE_RANGES:
+        for lo, hi in zip(ranges[::2], ranges[1::2]):
+            for code in range(max(start, lo), min(end, hi) + 1):
+                index = offset + code - start
+                bits[index >> 3] |= 1 << (index & 7)
+        offset += end - start + 1
+    while bits and bits[-1] == 0:
+        bits.pop()
+    packed = bytearray()
+    index = 0
+    while index < len(bits):
+        run = 1
+        while index + run < len(bits) and run < 128 and bits[index + run] == bits[index]:
+            run += 1
+        if run >= 3:
+            packed.extend((257 - run, bits[index]))
+            index += run
+            continue
+        start = index
+        index += run
+        while index < len(bits) and index - start < 128:
+            run = 1
+            while index + run < len(bits) and run < 128 and bits[index + run] == bits[index]:
+                run += 1
+            if run >= 3:
+                break
+            index += min(run, 128 - (index - start))
+        packed.append(index - start - 1)
+        packed.extend(bits[start:index])
+    return base64.b64encode(packed).decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -193,7 +242,8 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
         None if cmap is None
         else any(0x4E00 <= code <= 0x9FFF and glyph != ".notdef" for code, glyph in cmap.items())
     )
-    profile["symbolCoverage"] = symbol_coverage(cmap)
+    profile["symbolCoverage"] = glyph_coverage(cmap, SYMBOL_COVERAGE_RANGES)
+    profile["cjkCoverage"] = glyph_coverage(cmap, CJK_COVERAGE_RANGES)
     # Honor fsSelection USE_TYPO_METRICS (bit 7), like the resource parser.
     # Although introduced in OS/2 v4, installed v3 resources also set it;
     # #1689 exported symbol resources confirm their typo+gap line metrics.
@@ -205,7 +255,7 @@ def face_profile(font: TTFont, source_id: str) -> dict[str, Any] | None:
     # the runtime profile. The identity still covers that raw OS/2 value.
     identity_profile = {
         **{key: value for key, value in profile.items()
-           if key not in {"farEastCodePage", "win", "typoMetrics", "panose", "cjkUnifiedIdeographs", "symbolCoverage"}},
+           if key not in {"farEastCodePage", "win", "typoMetrics", "panose", "cjkUnifiedIdeographs", "symbolCoverage", "cjkCoverage"}},
         "os2": None if os2 is None else {
             "codePageRange1": provenance_code_page_range1,
         },
@@ -290,17 +340,21 @@ def main() -> None:
     exclusions.sort(key=lambda item: (item["source"], item["file"].casefold(), item["file"], item["faceIndex"]))
     # Intern identical repertoires across cuts and sources, including empty
     # cmaps. Runtime shares the frozen arrays; no per-glyph cache is needed.
-    repertoires = sorted({tuple(p["symbolCoverage"]) for p in profiles
-                          if p["symbolCoverage"] is not None})
-    coverage_ids = {r: i for i, r in enumerate(repertoires)}
-    for profile in profiles:
-        coverage = profile["symbolCoverage"]
-        profile["symbolCoverage"] = None if coverage is None else coverage_ids[tuple(coverage)]
+    coverages = {}
+    for field in ("symbolCoverage", "cjkCoverage"):
+        repertoires = sorted({tuple(p[field]) for p in profiles if p[field] is not None})
+        coverage_ids = {r: i for i, r in enumerate(repertoires)}
+        for profile in profiles:
+            coverage = profile[field]
+            profile[field] = None if coverage is None else coverage_ids[tuple(coverage)]
+        coverages[field + "s"] = ([packed_cjk_bitmap(r) for r in repertoires]
+                                   if field == "cjkCoverage" else repertoires)
     data = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "notice": "Reference metrics are not proof of the face selected by Canvas, macOS, or Office.",
         "symbolCoverageRanges": SYMBOL_COVERAGE_RANGES,
-        "symbolCoverages": repertoires,
+        "cjkCoverageRanges": CJK_COVERAGE_RANGES,
+        **coverages,
         "profiles": profiles,
     }
     manifest = {

@@ -195,6 +195,7 @@ export { canvasFontString, createCanvasFontRoute, type CanvasFontRoute } from '.
 export {
   parseOpenTypeLineMetrics,
   parseOpenTypeResourceMetrics,
+  openTypeResourceCoversCodePoint,
   type OpenTypeLineMetrics,
 } from './fonts/open-type-metrics';
 export {
@@ -766,6 +767,7 @@ export {
 export {
   findReferenceFontMetrics,
   referenceFontCoversSymbol,
+  referenceFontCoversCjk,
   isReferenceSymbolCodePoint,
   type FindReferenceFontMetricsOptions,
   type ReferenceFontMetricProfile,

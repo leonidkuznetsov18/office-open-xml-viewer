@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findReferenceFontMetrics, referenceFontCoversSymbol } from './reference-font-metrics.js';
+import { findReferenceFontMetrics, referenceFontCoversSymbol, referenceFontCoversCjk } from './reference-font-metrics.js';
 
 describe('findReferenceFontMetrics', () => {
   it('preserves conflicting source profiles instead of choosing a same-name winner', () => {
@@ -72,6 +72,15 @@ describe('findReferenceFontMetrics', () => {
     const open = findReferenceFontMetrics('BIZ UDMincho', { weight: 400, style: 'normal' })[0];
     expect(referenceFontCoversSymbol(open, 0x25A0)).toBeUndefined();
     expect(Object.isFrozen(tahoma.symbolCoverage)).toBe(true);
+  });
+
+  it('keeps selected-cut CJK presence separate from family-wide Han coverage', () => {
+    const deng = findReferenceFontMetrics('DengXian', { source: 'office-mac', weight: 400, style: 'normal' })[0];
+    expect(referenceFontCoversCjk(deng, 0x6f22)).toBe(true);
+    expect(referenceFontCoversCjk(deng, 0xd55c)).toBe(false);
+    expect(referenceFontCoversCjk(deng, 0x41)).toBeUndefined();
+    const open = findReferenceFontMetrics('BIZ UDMincho', { weight: 400, style: 'normal' })[0];
+    expect(referenceFontCoversCjk(open, 0x6f22)).toBeUndefined();
   });
 
   it('does not let callers mutate shared generated profiles', () => {

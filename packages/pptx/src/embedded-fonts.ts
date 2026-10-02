@@ -17,7 +17,8 @@ export interface LoadedPptxEmbeddedFonts {
   /** Successfully registered authored family/style slots (§19.2.1.9). */
   readonly tuples: ReadonlySet<string>;
   /** Line metrics of each registered face, keyed like `tuples`, from the
-   * font part's own OS/2 tables. A part whose tables do not parse (EOT, an
+   * font part's own OS/2 tables, with bounded scalar cmap coverage retained
+   * for drawing-resource attribution. A part whose tables do not parse (EOT, an
    * unsupported collection) has no entry: its lines keep the metric model of
    * their other faces (#1689). */
   readonly metrics: ReadonlyMap<string, PowerPointFaceMetrics>;
