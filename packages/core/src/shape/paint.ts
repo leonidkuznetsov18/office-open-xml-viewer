@@ -2,7 +2,8 @@ import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { drawingmlLineDashArray, shapeStrokeDashArray } from '../draw/dash';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolveRectPathGradient, type FillOutline } from './path-gradient';
+import { resolvePathShade, pathShadeFocus, type FillOutline } from './path-gradient';
+import { officeGradientStops } from './gradient-transfer';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
@@ -40,8 +41,25 @@ function tiledGradient(
   const base = createAuxCanvasForContext(ctx, baseW, baseH);
   const baseCtx = base?.getContext('2d');
   if (!base || !baseCtx) return null;
-  const basePaint = resolveFill(
-    { ...fill, tileRect: undefined, flip: undefined },
+  const tileFill = { ...fill, tileRect: undefined, flip: undefined };
+  // Office path shades in a tile (issue #1599 PowerPoint controls): a shape
+  // outline and its focus are scaled into the tile, whereas a rect path keeps
+  // its focus relative to the shape box ([MS-OE376] §2.1.1377 b). Tiles repeat
+  // unmirrored whatever flip is authored.
+  const pathShade = fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape');
+  const baseBox = { x: 0, y: 0, w: baseW, h: baseH };
+  let shade: CanvasPattern | 'circle' | null = null;
+  if (pathShade) {
+    const [fx, fy] = pathShadeFocus(fill);
+    const focus: [number, number] | undefined = fill.path === 'rect'
+      ? [(fx * w + x - tileX) / tileW, (fy * h + y - tileY) / tileH]
+      : undefined;
+    shade = resolvePathShade(tileFill, baseCtx as CanvasRenderingContext2D, baseBox, baseBox,
+      fill.path === 'shape' ? outline : undefined, focus);
+  }
+  const unmirrored = pathShade && shade !== 'circle';
+  const basePaint = shade && shade !== 'circle' ? shade : resolveFill(
+    shade === 'circle' ? { ...tileFill, path: 'circle' } : tileFill,
     baseCtx as CanvasRenderingContext2D,
     0,
     0,
@@ -56,8 +74,8 @@ function tiledGradient(
   baseCtx.fillStyle = basePaint;
   baseCtx.fillRect(0, 0, baseW, baseH);
 
-  const flipX = fill.flip === 'x' || fill.flip === 'xy';
-  const flipY = fill.flip === 'y' || fill.flip === 'xy';
+  const flipX = !unmirrored && (fill.flip === 'x' || fill.flip === 'xy');
+  const flipY = !unmirrored && (fill.flip === 'y' || fill.flip === 'xy');
   let patternSource = base;
   if (flipX || flipY) {
     const repeatW = baseW * (flipX ? 2 : 1);
@@ -199,28 +217,23 @@ export function resolveFill(
     const tileY = y + h * (tile?.t ?? 0);
     const tileW = w * (1 - (tile?.l ?? 0) - (tile?.r ?? 0));
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
-    if (fill.gradType === 'radial' && fill.path === 'rect') {
-      // Canvas has no box gradient. Allocation-unavailable hosts use
-      // the first stop as a stable flat fallback, rather than inventing a
-      // circular geometry. Real browser, worker and Node canvases rasterize it.
-      return resolveRectPathGradient(fill, ctx, tileX, tileY, tileW, tileH, shapeRotationDeg, outline)
-        ?? hexToRgba(stops[0].color);
+    if (fill.gradType === 'radial' && (fill.path === 'rect' || fill.path === 'shape')) {
+      // Canvas has no shape-following shade; resolvePathShade rasterizes the
+      // Office fan model. Allocation-unavailable hosts use the first stop as a
+      // stable flat fallback rather than inventing another geometry.
+      const shade = resolvePathShade(
+        fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, { x, y, w, h }, outline,
+      );
+      if (shade !== 'circle') return shade ?? hexToRgba(stops[0].color);
     }
     if (fill.gradType === 'radial') {
-      // Keep the pre-existing shape-path radial approximation. Office-produced
-      // rect/ellipse/triangle/rightArrow/star/concave controls do not establish
-      // one contour/focus rule. Omitted and centered focus controls coincide
-      // in all six; asymmetric focus leaves ellipse/arrow/concave shading
-      // unchanged, whereas rect/triangle/star respond. ECMA §20.1.8.46 requires
-      // shape-following paths but does not define that interpolation algorithm.
-      // Neither affine outline contraction nor a boundary-clearance correction
-      // is established by those controls; defer shape-path support as a whole.
-      // Stroke hosts in all three formats also retain this box-based resolver:
-      // fill-bearing silhouettes exclude unfilled, stroked decorative paths.
+      // Circle path, also Office's substitute for shape outlines that are not
+      // star-shaped about their center (see resolvePathShade).
       // §20.1.8.31: fillToRect is the center-shade (focus) rectangle inside
       // the gradient tile. Canvas has a point focus rather than a rectangular
-      // focus, so use its authored centre and retain the full rectangle on the
-      // public model for richer hosts.
+      // focus, so use its authored centre. PowerPoint's PDF export emits every
+      // circle shade concentric, even for corner presets, so its controls do
+      // not establish Office's circle focus; this ECMA reading is retained.
       const focus = fill.fillToRect;
       const focusX = tileX + tileW * (focus?.l ?? 0);
       const focusY = tileY + tileH * (focus?.t ?? 0);
@@ -258,12 +271,9 @@ export function resolveFill(
         cx + dx * gradLen, cy + dy * gradLen,
       );
     }
-    // Interpolation remains Canvas encoded RGB. PowerPoint primary-colour
-    // controls at 0/100 produce brighter two-stop midpoints (~186), but
-    // 20/80 stops produce encoded midpoints (~127), and full-range quarter
-    // colours reject a simple gamma/linear-light rule or one implicit stop.
-    // These boundaries do not establish a general colour transfer function.
-    for (const stop of stops) {
+    // Office interpolates a two-stop 0%/100% list with its sigma/gamma
+    // transfer and every other list linearly (see gradient-transfer.ts).
+    for (const stop of officeGradientStops([...stops].sort((a, b) => a.position - b.position))) {
       gradient.addColorStop(Math.min(1, Math.max(0, stop.position)), hexToRgba(stop.color));
     }
     return gradient;

@@ -51,6 +51,15 @@ import {
 } from './resource-limits.js';
 import { withEffectiveChartStyleRoles } from './effective-style.js';
 import { applyPlotVisibleOnly } from './source-visibility.js';
+import { officeGradientStops } from '../shape/gradient-transfer';
+
+// Two-stop 0%/100% gradients expand into Office's sigma/gamma transfer curve
+// (gradient-transfer.ts); recipe plumbing is checked through its endpoints,
+// which are the authored colours, and its non-linear expansion.
+function transferEndpoints<T extends { position: number }>(stops: readonly T[] | undefined): T[] | undefined {
+  if (!stops || stops.length <= 2) return stops ? [...stops] : stops;
+  return [stops[0], stops[stops.length - 1]];
+}
 
 const testThreeD = { render: renderSimpleThreeDChart };
 const testChartEx = { render: renderChartExChart };
@@ -1789,7 +1798,7 @@ describe('chart-space background', () => {
     expect(rec.gradients).toHaveLength(1);
     const [x1, y1, x2, y2] = rec.gradients[0].args;
     expect((y2 - y1) / (x2 - x1)).toBeCloseTo(Math.sqrt(3), 5);
-    expect(rec.gradients[0].stops).toEqual([
+    expect(transferEndpoints(rec.gradients[0].stops)).toEqual([
       { position: 0, color: 'rgba(17,34,51,1)' },
       { position: 1, color: 'rgba(170,187,204,1)' },
     ]);
@@ -5427,7 +5436,8 @@ describe('classic 3-D compatibility projection', () => {
       })],
     }), RECT, 1);
     expect(rec.gradients).toHaveLength(2);
-    expect(rec.gradients.every(gradient => gradient.stops.length === 2)).toBe(true);
+    expect(rec.gradients.every(gradient => gradient.stops.length
+      === officeGradientStops([{ position: 0, color: '112233' }, { position: 1, color: 'DDEEFF' }]).length)).toBe(true);
   });
 
   it('keeps direct point marker paint authoritative over a 3-D series noFill', () => {
@@ -7039,7 +7049,7 @@ describe('bar chart authored layout and fills', () => {
     const linked = recordingCtx();
     renderChart(linked.ctx, chart, RECT, 1, 30);
     expect(linked.gradients).toHaveLength(1);
-    expect(linked.gradients[0]?.stops).toEqual([
+    expect(transferEndpoints(linked.gradients[0]?.stops)).toEqual([
       { position: 0, color: 'rgba(17,34,51,1)' },
       { position: 1, color: 'rgba(221,238,255,1)' },
     ]);
@@ -7058,7 +7068,7 @@ describe('bar chart authored layout and fills', () => {
       plotAreaFillAutomatic: true,
     }, RECT, 1, 30);
     expect(automaticHostFallback.gradients).toHaveLength(1);
-    expect(automaticHostFallback.gradients[0]?.stops).toEqual([
+    expect(transferEndpoints(automaticHostFallback.gradients[0]?.stops)).toEqual([
       { position: 0, color: 'rgba(17,34,51,1)' },
       { position: 1, color: 'rgba(221,238,255,1)' },
     ]);
@@ -11815,7 +11825,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     }), RECT, 1);
 
     expect(rec.gradients).toHaveLength(1);
-    expect(rec.gradients[0].stops).toEqual([
+    expect(transferEndpoints(rec.gradients[0].stops)).toEqual([
       { position: 0, color: 'rgba(17,34,51,1)' },
       { position: 1, color: 'rgba(221,238,255,1)' },
     ]);
@@ -12689,7 +12699,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     }), RECT, 1);
 
     expect(rec.gradients).toHaveLength(1);
-    expect(rec.gradients[0].stops).toEqual([
+    expect(transferEndpoints(rec.gradients[0].stops)).toEqual([
       { position: 0, color: 'rgba(1,2,3,1)' },
       { position: 1, color: 'rgba(253,254,255,1)' },
     ]);
@@ -12809,7 +12819,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     }), RECT, 1);
     // Point 0 is red, while the legend represents the series-level gradient.
     expect(rec.gradients).toHaveLength(1);
-    expect(rec.gradients[0].stops).toEqual([
+    expect(transferEndpoints(rec.gradients[0].stops)).toEqual([
       { position: 0, color: 'rgba(17,34,51,1)' },
       { position: 1, color: 'rgba(221,238,255,1)' },
     ]);
@@ -13617,7 +13627,8 @@ describe('CH9 — bubble scale and numeric-X trendlines', () => {
     }), RECT, 1);
 
     expect(rec.gradients).toHaveLength(2);
-    expect(rec.gradients.every(gradient => gradient.stops.length === 2)).toBe(true);
+    expect(rec.gradients.every(gradient => gradient.stops.length
+      === officeGradientStops([{ position: 0, color: '112233' }, { position: 1, color: 'DDEEFF' }]).length)).toBe(true);
   });
 
   it('uses the linked dataPoint shape role for unauthored bubbles', () => {
@@ -20498,7 +20509,7 @@ describe('CH13 — stock chart (high/low/close)', () => {
     }), RECT, 1);
 
     expect(rec.gradients).toHaveLength(1);
-    expect(rec.gradients[0].stops).toEqual([
+    expect(transferEndpoints(rec.gradients[0].stops)).toEqual([
       { position: 0, color: 'rgba(17,34,51,1)' },
       { position: 1, color: 'rgba(221,238,255,1)' },
     ]);
@@ -23538,7 +23549,7 @@ describe('CH15 — chartEx box-and-whisker', () => {
       // counter-rotates the authored 90° gradient to 60° in local coordinates.
       expect(dx).toBeGreaterThan(0);
       expect(dy / dx).toBeCloseTo(Math.sqrt(3), 5);
-      expect(gradient.stops).toEqual([
+      expect(transferEndpoints(gradient.stops)).toEqual([
         { position: 0, color: 'rgba(68,114,196,1)' },
         { position: 1, color: 'rgba(255,255,255,1)' },
       ]);

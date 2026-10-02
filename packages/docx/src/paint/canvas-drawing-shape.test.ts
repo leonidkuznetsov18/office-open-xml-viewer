@@ -275,8 +275,11 @@ describe('retained DrawingML shape painting', () => {
       fillType: 'gradient', angle: 0, gradType: 'linear',
       stops: [{ position: 0, color: '000000' }, { position: 1, color: 'FFFFFF' }],
     }), context);
+    // A two-stop 0%/100% list expands into Office's transfer curve stops.
+    const stopCount = operations.filter(operation => operation === 'addColorStop').length;
+    expect(stopCount).toBeGreaterThan(2);
     expect(operations).toEqual([
-      'createLinearGradient', 'addColorStop', 'addColorStop',
+      'createLinearGradient', ...Array(stopCount).fill('addColorStop'),
       'save', 'translate', 'translate', 'fillText', 'restore',
     ]);
   });
