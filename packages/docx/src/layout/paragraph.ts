@@ -1568,6 +1568,7 @@ interface RetainedNumberingPlan {
   readonly markerWidthPt: number;
   readonly markerShiftPt: number;
   readonly shape: NonNullable<ReturnType<typeof shapeNumberingMarkerText>>['shape'] | null;
+  readonly lineBox?: import('./numbering-marker.js').NumberingMarkerLineBox;
 }
 
 function retainedNumberingPlan(
@@ -4746,11 +4747,8 @@ export function acquireParagraphResult(
           {
             ...options.environment,
             paragraphMarkShapeInput: paragraph.paragraphMarkShapeInput,
-            ...(numberingPlan?.shape && numberingPlan.markerText ? {
-              firstLineNumberingMarkerBox: {
-                ascentPt: numberingPlan.shape.ascentPt,
-                descentPt: numberingPlan.shape.descentPt,
-              },
+            ...(numberingPlan?.lineBox && numberingPlan.markerText ? {
+              firstLineNumberingMarkerBox: numberingPlan.lineBox,
             } : {}),
           },
           continuation,

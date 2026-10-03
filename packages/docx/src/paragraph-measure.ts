@@ -39,7 +39,7 @@ export interface ParagraphMeasurementEnvironment extends LineLayoutEnvironment {
   readonly documentHasEastAsianText: boolean;
   readonly paragraphMarkShapeInput?: NumberingMarkerShapeInput;
   /** Selected-face text marker box, resolved by retained numbering before line acquisition. */
-  readonly firstLineNumberingMarkerBox?: Readonly<{ ascentPt: number; descentPt: number }>;
+  readonly firstLineNumberingMarkerBox?: Readonly<{ ascentPt: number; descentPt: number; intendedSinglePt?: number }>;
   /** Canonical section writing mode used by retained page geometry. */
   readonly pageWritingMode: WritingMode;
   /** The paragraph is acquired in a section-logical frame that paint rotates
@@ -322,6 +322,9 @@ export function measureParagraph(
             descent: Math.max(originalLine.descent, markerDescent),
             visibleAscent: Math.max(originalLine.visibleAscent ?? originalLine.ascent, markerAscent),
             visibleDescent: Math.max(originalLine.visibleDescent ?? originalLine.descent, markerDescent),
+            intendedSingle: Math.max(originalLine.intendedSingle, markerBox?.intendedSinglePt ?? 0),
+            visibleIntendedSingle: Math.max(originalLine.visibleIntendedSingle ?? originalLine.intendedSingle,
+              markerBox?.intendedSinglePt ?? 0),
           }
         : originalLine;
       const textSinglePt = Math.max(
@@ -335,7 +338,7 @@ export function measureParagraph(
       // is limited to the observed auto/non-grid text-marker class; other classes
       // retain their established allocation.
       void WORD_NUMBERING_MARKER_FIRST_LINE_UNION;
-      const markerNaturalPt = line.ascent + line.descent;
+      const markerNaturalPt = Math.max(line.ascent + line.descent, markerBox?.intendedSinglePt ?? 0);
       const markerRaisesBox = line !== originalLine
         && markerNaturalPt > textSinglePt;
       const specified = specifiedParagraph && !paragraph.numbering

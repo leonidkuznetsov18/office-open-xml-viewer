@@ -58,6 +58,7 @@ import {
   mayUseExactLocalReferenceWidthMetric,
   selectResourceAverageWidthRatio,
   selectResourceMetric,
+  selectedFontLineMetric,
   type MetricTupleIndex,
 } from './font-metrics.js';
 
@@ -1331,42 +1332,10 @@ function emitResolvedTextSegment(
   // The Word OpenType projection supplies that normal box by inference;
   // exact spacing instead suppresses it.
   const naturalMetricAllowed = environment.lineSpacing?.rule !== 'exact';
-  const resourceFamilyLineMetric =
-    (naturalMetricAllowed || localFont?.designAscentRatio == null) &&
-    (localFont?.lineHeightRatio != null ||
-      localFont?.designAscentRatio != null ||
-      localFont?.eastAsianLineHeightRatio != null)
-      ? localFont
-      : undefined;
-  const referenceLineMetric =
-    naturalMetricAllowed &&
-    !resourceFamilyLineMetric &&
-    mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font)
-      ? referenceFontLineMetrics(
-          resolvedSpan.font.requestedFamily,
-          resolvedSpan.font.weight,
-          resolvedSpan.font.style,
-        )
-      : undefined;
-  const familyLineMetric = resourceFamilyLineMetric ?? referenceLineMetric;
-  const resourceEaLineMetric =
-    (naturalMetricAllowed || localEaFloor?.designAscentRatio == null) &&
-    (localEaFloor?.lineHeightRatio != null ||
-      localEaFloor?.designAscentRatio != null ||
-      localEaFloor?.eastAsianLineHeightRatio != null)
-      ? localEaFloor
-      : undefined;
-  const referenceEaLineMetric =
-    naturalMetricAllowed &&
-    !resourceEaLineMetric &&
-    mayUseAuthoredReferenceVerticalMetric(eaResolution)
-      ? referenceFontLineMetrics(
-          eaResolution.requestedFamily,
-          eaResolution.weight,
-          eaResolution.style,
-        )
-      : undefined;
-  const eaLineMetric = resourceEaLineMetric ?? referenceEaLineMetric;
+  const { resourceMetric: resourceFamilyLineMetric, referenceMetric: referenceLineMetric,
+    lineMetric: familyLineMetric } = selectedFontLineMetric(resolvedSpan?.font, localFont, naturalMetricAllowed);
+  const { resourceMetric: resourceEaLineMetric, referenceMetric: referenceEaLineMetric,
+    lineMetric: eaLineMetric } = selectedFontLineMetric(eaResolution, localEaFloor, naturalMetricAllowed);
   const resolvedEaFloorFamily =
     eaResolution?.resolvedFamily ?? localEaFloor?.family ?? eaFontFamily;
   // WORD_USE_FE_LAYOUT_INHERITED_GRID_MINIMUM was observed for an active
