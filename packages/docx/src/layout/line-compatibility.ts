@@ -328,6 +328,24 @@ export const WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION = defineCompatibilityRu
   description: 'Keep leading whitespace used as a first-line text indent fixed while distributing justified-line slack across content in a left-to-right line.',
 });
 
+export const WORD_COLLAPSIBLE_LINE_EDGE_VISIBLE_FIT = defineCompatibilityRule({
+  id: 'word-collapsible-line-edge-visible-fit',
+  evidence: {
+    kind: 'regression-test',
+    reference: 'packages/docx/src/run-split-invariance.test.ts#fits the visible justified prefix across a real formatting boundary in mode 14',
+  },
+  description: 'Library fitting uses the visible prefix, excluding a collapsible U+0020 edge separator. ST_Jc (§17.18.44) defines inter-word justification, not an edge-space admission charge. Word mode-14 mixed-format Latin output retains a naturally fitting prefix when only its edge separator exceeds the band; mode-15 compression controls use the same visible prefix. Canonical joining must not turn formatting-only source seams into different admission decisions. This replaces an unsupported separator-charge policy, without adding compression to older modes. RTL separately retains the complete advance because its right-edge origin can otherwise move visible LTR cells outside the band. Other glyphs and authored fixed-width/atomic units retain their existing fit contracts.',
+});
+
+/** Visible-prefix projection of {@link WORD_COLLAPSIBLE_LINE_EDGE_VISIBLE_FIT}. */
+export function wordVisiblePrefixFitWidthPx(
+  widthPx: number,
+  trailingSpacePx: number,
+  baseRtl: boolean,
+): number {
+  return widthPx - (baseRtl ? 0 : trailingSpacePx);
+}
+
 export const WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS = defineCompatibilityRule({
   id: 'word-overflow-punctuation-language-sets',
   evidence: {
