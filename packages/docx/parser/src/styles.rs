@@ -1351,7 +1351,10 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         fmt.alignment = attr_w(jc, "val");
     }
 
-    // Spacing
+    // Spacing. §17.3.1.33 gives an active automatic flag priority over both
+    // absolute and line-unit margins. Inactive beforeLines/afterLines spacing
+    // remains unsupported: retain the existing absolute-value fallback instead
+    // of guessing a line-height conversion here.
     if let Some(sp) = child_w(ppr, "spacing") {
         fmt.before_autospacing = on_off_attr(sp, "beforeAutospacing");
         fmt.after_autospacing = on_off_attr(sp, "afterAutospacing");

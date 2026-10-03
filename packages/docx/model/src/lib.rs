@@ -2725,6 +2725,9 @@ pub struct ShapeTextRun {
 pub struct ShapeText {
     pub text: String,
     pub font_size_pt: f64,
+    /// Paragraph base/mark size is independent of the first content run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_font_size: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// Resolved run color of the paragraph mark. Kept separate from `color`,

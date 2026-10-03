@@ -12,10 +12,11 @@ function document(fixed = false, containers = false): DocxDocumentModel {
   const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
   const p = (props = '') => `<w:p><w:pPr><w:pStyle w:val="Auto"/>${props}</w:pPr><w:r><w:rPr><w:sz w:val="48"/></w:rPr><w:t>text</w:t></w:r></w:p>`;
   const table = `<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc>${p()}</w:tc></w:tr></w:tbl>`;
-  const body = (containers ? table : '') + p() + p('<w:spacing w:beforeAutospacing="0" w:afterAutospacing="0"/>')
+  const box = `<w:p><w:r><w:pict><v:shape id="box" type="#_x0000_t202" style="width:100pt;height:100pt"><v:textbox inset="0,0,0,0"><w:txbxContent>${p()}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>`;
+  const body = (containers ? table + box : '') + p() + p('<w:spacing w:beforeAutospacing="0" w:afterAutospacing="0"/>')
     + p('<w:spacing w:before="800" w:beforeLines="500"/>');
   const files = new Map([
-    ['word/document.xml', `<w:document xmlns:w="${W}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>${body}<w:sectPr>${containers ? '<w:headerReference w:type="default" r:id="header"/><w:footerReference w:type="default" r:id="footer"/>' : ''}<w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>`],
+    ['word/document.xml', `<w:document xmlns:w="${W}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:v="urn:schemas-microsoft-com:vml"><w:body>${body}<w:sectPr>${containers ? '<w:headerReference w:type="default" r:id="header"/><w:footerReference w:type="default" r:id="footer"/>' : ''}<w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>`],
     ['word/styles.xml', `<w:styles xmlns:w="${W}"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:styleId="Auto"><w:pPr><w:spacing w:before="100" w:after="100" w:beforeAutospacing="1" w:afterAutospacing="1"/></w:pPr></w:style></w:styles>`],
     ['word/settings.xml', `<w:settings xmlns:w="${W}"><w:compat>${fixed ? '<w:doNotUseHTMLParagraphAutoSpacing/>' : ''}</w:compat></w:settings>`],
     ['[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>'],
@@ -64,4 +65,15 @@ it('resolves the same inherited margin in parsed cell and story paragraphs', () 
     expect(paragraph?.type).toBe('paragraph');
     if (paragraph?.type === 'paragraph') expect([paragraph.spaceBefore, paragraph.spaceAfter]).toEqual([11, 11]);
   }
+});
+
+it('keeps parsed compatibility text-box margins independent of the first inline font', () => {
+  const raw = document(false, true);
+  const normalized = normalizeDocxDocumentModel(raw);
+  const shapes = normalized.body.flatMap(e => e.type === 'paragraph' ? e.runs.filter(run => run.type === 'shape') : []);
+  expect(shapes).toHaveLength(1);
+  const block = shapes[0]?.type === 'shape' ? shapes[0].textBlocks?.[0] : undefined;
+  expect(block?.fontSizePt).toBe(24);
+  expect([block?.spaceBefore, block?.spaceAfter]).toEqual([11, 11]);
+  expect(normalizeDocxDocumentModel(normalized).body).toEqual(normalized.body);
 });

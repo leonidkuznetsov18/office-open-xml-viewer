@@ -1083,6 +1083,8 @@ export interface DocParagraph {
     indentFirst: number;
     spaceBefore: number;
     spaceAfter: number;
+    beforeAutospacing?: boolean;
+    afterAutospacing?: boolean;
     lineSpacing: LineSpacing | null;
     numbering: NumberingInfo | null;
     tabStops: TabStop[];
@@ -1145,6 +1147,7 @@ type DocRunContent = ({
     type: 'ptab';
 } & PTabRun);
 export interface DocSettings {
+    doNotUseHtmlParagraphAutoSpacing?: boolean;
     kinsoku?: boolean;
     noLineBreaksBefore?: string;
     noLineBreaksAfter?: string;
@@ -2376,6 +2379,7 @@ export type ShapeStrokeFill = {
 export interface ShapeText {
     text: string;
     fontSizePt: number;
+    defaultFontSize?: number;
     color?: string | null;
     paragraphMarkColor?: string | null;
     fontFamily?: string | null;
@@ -2386,6 +2390,8 @@ export interface ShapeText {
     alignment: string;
     spaceBefore?: number;
     spaceAfter?: number;
+    beforeAutospacing?: boolean;
+    afterAutospacing?: boolean;
     lineSpacingVal?: number;
     lineSpacingRule?: string;
     indentLeft?: number;

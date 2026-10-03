@@ -1731,7 +1731,7 @@ function normalizeInternalDocumentModelWithOwnership(
         if (shape.textBlocks?.some(block => block.beforeAutospacing === true || block.afterAutospacing === true)) {
           const textBlocks = shape.textBlocks.map(block => {
             const spacing = resolveAutomaticParagraphMarginsPt(
-              block, block.fontSizePt, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true,
+              block, block.defaultFontSize ?? block.fontSizePt, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true,
             );
             return spacing.spaceBefore === block.spaceBefore && spacing.spaceAfter === block.spaceAfter
               ? block : { ...block, ...spacing };

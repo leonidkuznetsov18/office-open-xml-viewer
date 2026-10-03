@@ -1040,6 +1040,8 @@ export interface ShapeTextRun {
 export interface ShapeText {
   text: string;
   fontSizePt: number;
+  /** Paragraph base/mark size; fontSizePt remains the first-run compatibility field. */
+  defaultFontSize?: number;
   color?: string | null;
   /** Resolved paragraph-mark run color used by compatibility rule
    *  `word-numbering-marker-paragraph-mark-fallback` when the numbering level

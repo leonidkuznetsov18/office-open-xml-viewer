@@ -10950,6 +10950,7 @@ fn extract_simple_paragraph_text(
     Some(ShapeText {
         text,
         font_size_pt,
+        default_font_size: Some(mark_run.font_size.unwrap_or(DEFAULT_FONT_SIZE)),
         color,
         paragraph_mark_color: mark_run.color.clone(),
         font_family,
