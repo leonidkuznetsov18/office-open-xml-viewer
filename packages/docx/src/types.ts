@@ -89,6 +89,8 @@ export interface EmbeddedFontRef {
 }
 
 export interface DocSettings {
+  /** ECMA-376 Part 4 §14.8.3.15 fixed HTML automatic paragraph margins. */
+  doNotUseHtmlParagraphAutoSpacing?: boolean;
   /** §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `undefined`
    *  means the element is absent; the spec default is ON (treated as `true`). */
   kinsoku?: boolean;
@@ -496,6 +498,9 @@ export interface DocParagraph {
   indentFirst: number;  // pt
   spaceBefore: number;  // pt
   spaceAfter: number;   // pt
+  /** §17.3.1.33 automatic margin flags resolved through paragraph styles. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   lineSpacing: LineSpacing | null;
   numbering: NumberingInfo | null;
   tabStops: TabStop[];
@@ -1061,6 +1066,9 @@ export interface ShapeText {
   /** ECMA-376 §17.3.1.33 `<w:spacing w:after>` of this text-box paragraph, in
    *  pt — reserved BELOW the paragraph. Absent/0 ⇒ no offset. */
   spaceAfter?: number;
+  /** §17.3.1.33 automatic margins; the compatibility text-box adapter resolves them. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   /** ECMA-376 §17.3.1.33 line spacing value (style-chain resolved). Encoded per
    *  {@link lineSpacingRule}: "auto" ⇒ a MULTIPLIER on the natural line box
    *  (1.15 = 276/240), "exact"/"atLeast" ⇒ pt. Absent ⇒ single (natural). */

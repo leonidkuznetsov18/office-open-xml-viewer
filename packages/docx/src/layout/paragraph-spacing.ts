@@ -41,3 +41,37 @@ export function paragraphGapAdjustment(
     overlap: previousAfterPt + (suppressBefore ? 0 : currentBeforePt) - gapPt,
   };
 }
+
+/**
+ * ECMA-376 §17.3.1.33 delegates automatic margins to the consumer's HTML
+ * paragraph policy and gives an active automatic flag priority over stored
+ * before/after values (including line-unit values). The library uses the
+ * standard HTML p margin of 1em on each side, with the paragraph's resolved
+ * base/mark font size as the em; changing an inline run must not change its
+ * parent paragraph's margin. This is a consumer policy, not a fitted Office
+ * amount or a font-dependent correction. Explicit false retains stored values.
+ *
+ * Part 4 §14.8.3.15 overrides that policy with 5pt before and 10pt after when
+ * doNotUseHTMLParagraphAutoSpacing is true. Keep those normative values even
+ * when a producer displays its stored explicit spacing instead.
+ * Resolve at the immutable model boundary, before both pagination and line
+ * acquisition consume the same pair; paint and paragraph-gap folding do not
+ * need to know about automatic flags.
+ */
+export function resolveAutomaticParagraphMarginsPt(
+  paragraph: Readonly<{
+    spaceBefore?: number;
+    spaceAfter?: number;
+    beforeAutospacing?: boolean;
+    afterAutospacing?: boolean;
+  }>,
+  baseFontSizePt: number,
+  fixed: boolean,
+): Readonly<{ spaceBefore: number; spaceAfter: number }> {
+  return {
+    spaceBefore: paragraph.beforeAutospacing === true
+      ? (fixed ? 5 : baseFontSizePt) : paragraph.spaceBefore ?? 0,
+    spaceAfter: paragraph.afterAutospacing === true
+      ? (fixed ? 10 : baseFontSizePt) : paragraph.spaceAfter ?? 0,
+  };
+}

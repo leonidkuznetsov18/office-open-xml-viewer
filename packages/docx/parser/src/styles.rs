@@ -206,6 +206,10 @@ pub struct ParaFmt {
     pub indent_first: Option<f64>, // pt
     pub space_before: Option<f64>, // pt
     pub space_after: Option<f64>,  // pt
+    /// ECMA-376 §17.3.1.33: per-side automatic margin toggles inherit independently;
+    /// an explicit false clears an inherited true without discarding stored twips.
+    pub before_autospacing: Option<bool>,
+    pub after_autospacing: Option<bool>,
     pub line_spacing_val: Option<f64>,
     pub line_spacing_rule: Option<String>,
     /// True when `w:spacing/@w:line` was declared on the paragraph's own pPr
@@ -986,6 +990,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.space_after.is_some() {
         dst.space_after = src.space_after;
     }
+    if src.before_autospacing.is_some() {
+        dst.before_autospacing = src.before_autospacing;
+    }
+    if src.after_autospacing.is_some() {
+        dst.after_autospacing = src.after_autospacing;
+    }
     if src.line_spacing_val.is_some() {
         dst.line_spacing_val = src.line_spacing_val;
     }
@@ -1343,6 +1353,8 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
 
     // Spacing
     if let Some(sp) = child_w(ppr, "spacing") {
+        fmt.before_autospacing = on_off_attr(sp, "beforeAutospacing");
+        fmt.after_autospacing = on_off_attr(sp, "afterAutospacing");
         if let Some(v) = attr_w(sp, "before") {
             fmt.space_before = Some(twips_to_pt(&v));
         }

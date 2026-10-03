@@ -2716,6 +2716,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         .find(|n| n.is_element() && n.tag_name().name() == "compat");
     let compat_bool = |name: &str| -> Option<bool> { bool_prop(compat?, name) };
     let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
+    let do_not_use_html_paragraph_auto_spacing = compat_bool("doNotUseHTMLParagraphAutoSpacing");
     // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
     // direct `w:compat` boolean. The setting is off when absent.
     let word_compat_setting = |name: &str| -> Option<String> {
@@ -2767,6 +2768,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && default_tab_stop.is_none()
         && character_spacing_control.is_none()
         && line_wrap_like_word6.is_none()
+        && do_not_use_html_paragraph_auto_spacing.is_none()
         && enable_open_type_features.is_none()
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
@@ -2783,6 +2785,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         default_tab_stop,
         character_spacing_control,
         line_wrap_like_word6,
+        do_not_use_html_paragraph_auto_spacing,
         enable_open_type_features,
         use_fe_layout,
         balance_single_byte_double_byte_width,
@@ -5560,6 +5563,8 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
         indent_first,
         space_before,
         space_after,
+        before_autospacing: base_para.before_autospacing,
+        after_autospacing: base_para.after_autospacing,
         line_spacing,
         numbering,
         tab_stops,
@@ -10955,6 +10960,8 @@ fn extract_simple_paragraph_text(
         alignment: normalize_align(&alignment).to_string(),
         space_before,
         space_after,
+        before_autospacing: direct_ind.before_autospacing.or(style_para.before_autospacing),
+        after_autospacing: direct_ind.after_autospacing.or(style_para.after_autospacing),
         line_spacing_val,
         line_spacing_rule,
         indent_left,
