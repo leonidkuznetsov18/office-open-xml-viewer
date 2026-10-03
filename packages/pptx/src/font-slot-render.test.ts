@@ -109,34 +109,32 @@ describe('PPTX language-dependent font slots through the renderer', () => {
     expect(segments([run('×÷', 'fa-IR')])[0].face).toBe('Meiryo UI');
   });
 
-  it('routes all measured split Myanmar marks within runs and across seams', () => {
+  it('keeps nonseparable Myanmar marks with their base and resumes scalar routing afterward', () => {
     expect(segments([run('\u1000\ua9e0\uaa60', 'my-MM')]).map(({ text, face }) => [text, face]))
       .toEqual([['\u1000', 'Microsoft Sans Serif'], ['\ua9e0\uaa60', 'Meiryo UI']]);
-    for (const lang of ['en-US', 'my-MM', 'ja-JP']) {
-      for (const mark of '\ua9e5\uaa7b\uaa7c\uaa7d') {
-        for (const runs of [[run(`\u1000${mark}`, lang)], [run('\u1000', lang), run(mark, lang)]]) {
-          expect(segments(runs).map(({ text, face }) => [text, face]))
-            .toEqual([['\u1000', 'Microsoft Sans Serif'], [mark, 'Meiryo UI']]);
-          const { ctx, calls } = context();
-          renderTextBody(ctx, body(runs), 0, 0, 300, 100, SCALE);
-          expect(calls.find((c) => c.text.includes(mark))?.font).toContain('"Meiryo UI"');
-          expect(calls.find((c) => c.text.includes('\u1000'))?.font).toContain('"Microsoft Sans Serif"');
-        }
-      }
+    for (const [lang, mark, seam] of [['en-US', '\ua9e5', false],
+      ['my-MM', '\uaa7c', true], ['ja-JP', '\ua9e5', true]] as const) {
+      const runs = seam ? [run('\u1000', lang), run(`${mark}B`, lang)] : [run(`\u1000${mark}B`, lang)];
+      expect(segments(runs).map(({ text, face }) => [text, face]))
+        .toEqual([[`\u1000${mark}`, 'Microsoft Sans Serif'], ['B', 'Corbel']]);
+      const { ctx, calls } = context();
+      renderTextBody(ctx, body(runs), 0, 0, 300, 100, SCALE);
+      expect(calls.find((c) => c.text.includes(mark))?.text).toBe(`\u1000${mark}`);
+      expect(calls.find((c) => c.text.includes(mark))?.font).toContain('"Microsoft Sans Serif"');
     }
     expect(segments([run('\u1000\ua9e5', 'fr-FR')])[0].text).toBe('\u1000\ua9e5');
     expect(segments([run('\u1001\ua9e5', 'my-MM')])[0].text).toBe('\u1001\ua9e5');
     for (const mark of '\ua9e5\uaa7b\uaa7c\uaa7d') {
-      for (const lang of ['en-US', 'my-MM', 'ja-JP']) {
-        expect(segments([run(mark, lang)])[0].face).toBe('Meiryo UI');
-      }
+      expect(segments([run(mark, 'my-MM')])[0].face).toBe('Meiryo UI');
     }
-    expect(naturalWidthExceedsBbox(context().ctx, body([run('\u1000\ua9e5', 'my-MM')]),
-      32, 0, 0, SCALE, RC)).toBe(true);
+    for (const mark of '\uaa7b\uaa7d') {
+      expect(segments([run(`\u1000${mark}`, 'my-MM')]).map(({ text, face }) => [text, face]))
+        .toEqual([['\u1000', 'Microsoft Sans Serif'], [mark, 'Meiryo UI']]);
+    }
     expect(segments([run('\u1000', 'my-MM'), run('\ua9e5', 'en-US')])[0].text).toBe('\u1000\ua9e5');
   });
 
-  it('keeps split font units within the original grapheme in an overwide box', () => {
+  it('wraps only at original grapheme boundaries, independent of the recorded font slots', () => {
     const ctx = context().ctx;
     ctx.measureText = (text) => ({ width: [...text].reduce((sum, ch) => sum + (ch === '\u1000' ? 20 : 0), 0),
       actualBoundingBoxAscent: 16, actualBoundingBoxDescent: 4,
@@ -147,7 +145,7 @@ describe('PPTX language-dependent font slots through the renderer', () => {
         const result = layoutParagraph(ctx, paragraph(runs), 10, 20, '#000', SCALE, 0);
         expect(result.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(expected);
         expect(result[0].segments[0].faceFamily).toBe('Microsoft Sans Serif');
-        expect(result.at(-1)?.segments.at(-1)?.faceFamily).toBe('Meiryo UI');
+        expect(result.at(-1)?.segments.at(-1)?.faceFamily).toBe(mark === '\ua9e5' || mark === '\uaa7c' ? 'Microsoft Sans Serif' : 'Meiryo UI');
       }
     }
   });

@@ -121,6 +121,14 @@ verification artifacts, not redistributable baselines.
     coverage. Stacked text retains its grapheme-cell model. Explicit
     `fontAlgn` uses the existing fallback when resource fragments inside one
     paint span require different or unknown baseline offsets.
+  - A font-slot boundary inside one original grapheme remains attribution
+    metadata. Canvas cannot attach a combining mark across separate calls with
+    different fonts, so the complete grapheme keeps its base run's paint style
+    for measurement, wrapping and painting, including authored run seams.
+    Observed Office cross-resource mark selection remains recorded; this
+    backend policy does not claim to reproduce its cross-font attachment.
+    Separate-grapheme spacing marks retain their existing routing. This does
+    not infer a larger script-syllable boundary.
   - Lines containing secondary CJK misses can still differ from Office because
     those drawing resources are intentionally unknown under (B). Recording a
     symbol fallback does not establish the missing CJK resource's metrics.

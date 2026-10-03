@@ -240,9 +240,12 @@ interface PowerPointFontUnit {
  * Extenders normally inherit the base run's slot/format. The measured exception
  * is precisely U+1000 plus one of U+A9E5/U+AA7B–AA7D under en-US/my-MM/ja-JP:
  * all 24 single-run/seam cycles select cs for the base and ea for the mark.
- * Split those two-scalar clusters into font units, preserving authored styles
- * at a seam. Standalone marks use their independently measured ea slot. Other
- * bases, longer clusters and language-changing seams retain previous inheritance:
+ * Record those two-scalar clusters as separate slot units. This is attribution
+ * metadata, not permission to split a Canvas shaping call: Canvas cannot attach
+ * a mark across calls with different fonts. `graphemeEnds` preserves the original
+ * paint boundaries independently of these units. Standalone marks use their
+ * independently measured ea slot. Other bases, longer clusters and
+ * language-changing seams retain previous inheritance:
  * they have no complete split-font evidence.
  * Font units do not redefine Unicode graphemes or core's line-break policy.
  */
@@ -250,6 +253,7 @@ export function powerPointFontRouting(runs: readonly { text: string | null; lang
   text: string;
   starts: number[];
   units: PowerPointFontUnit[];
+  graphemeEnds: readonly number[];
   eastAsianText: string[];
 } {
   const starts: number[] = [];
@@ -305,5 +309,5 @@ export function powerPointFontRouting(runs: readonly { text: string | null; lang
       offset = end;
     }
   }
-  return { text, starts, units, eastAsianText };
+  return { text, starts, units, graphemeEnds: bounds, eastAsianText };
 }

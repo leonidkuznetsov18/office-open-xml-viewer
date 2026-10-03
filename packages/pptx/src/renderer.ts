@@ -1639,8 +1639,8 @@ export function paragraphInputRuns(
   // Grapheme clusters are segmented once over the paragraph's text, not per
   // run, so an extender (combining mark, variation selector, ZWJ, trailing
   // jamo) that opens a run joins its base in the previous run's last segment.
-  // Except for measured split-font units, carried extenders take the base
-  // run's formatting (font slot, colour, link, spacing). A line break or equation (an LF in the joined text) ends a
+  // Carried extenders take the base run's formatting (font slot, colour, link,
+  // spacing). A line break or equation (an LF in the joined text) ends a
   // cluster. The boundary list is walked with one forward pointer, so the
   // phase stays linear in the paragraph length however the runs are cut.
   const runTexts = para.runs.map((run) => {
@@ -1648,11 +1648,12 @@ export function paragraphInputRuns(
     const text = run.fieldType === 'slidenum' && slideNumber !== undefined ? String(slideNumber) : run.text;
     return run.caps === 'all' || run.caps === 'small' ? text.toUpperCase() : text;
   });
-  const { starts: runStarts, text: joinedText, units: fontUnits, eastAsianText: eaRunTexts } = powerPointFontRouting(
+  const { starts: runStarts, text: joinedText, units: fontUnits, graphemeEnds: clusterBounds,
+    eastAsianText: eaRunTexts } = powerPointFontRouting(
     para.runs.map((run, i) => ({ text: runTexts[i], lang: run.type === 'text' ? run.lang : undefined })),
   );
-  const clusterBounds = fontUnits.map((unit) => unit.end);
   let boundIndex = 0;
+  let fontUnitIndex = 0;
   /** The first cluster boundary at or after `pos`; the pointer only moves forward. */
   const boundaryFrom = (pos: number): number => {
     while (boundIndex < clusterBounds.length && clusterBounds[boundIndex] < pos) boundIndex++;
@@ -1863,18 +1864,24 @@ export function paragraphInputRuns(
       }
       group = '';
     };
-    // Most font units are whole grapheme clusters; routing records the measured
-    // Myanmar cs/ea split before this adapter carries extenders across seams.
-    // The same selected units feed measurement, wrapping and every paint mode.
+    // Library Canvas capability policy: a slot boundary inside one original
+    // grapheme cannot preserve cross-font mark attachment with separate fillText
+    // calls. Keep its base style for the complete cluster, including run seams,
+    // as for ordinary extenders. Routing retains the measured scalar slots for
+    // preloading/attribution; this does not reclassify the mark as CS or claim
+    // Office's cross-resource shaping. Separate-grapheme spacing marks retain
+    // their existing routing; no broader script-syllable inference is made.
+    // Measurement, wrapping and all paint modes consume the same whole cluster.
     let clusterStart = 0;
     let emitted = false;
     while (clusterStart < rawText.length) {
       const clusterEnd = Math.min(boundaryFrom(runOffset + clusterStart + 1), runEnd) - runOffset;
       // Resolve the complete unit before borrowing metrics, even when an
       // extender starts a subsequent authored run. It takes the base style;
-      // the next run skips it above. Measured Myanmar slot splits remain font
-      // units, as specified by powerPointFontRouting, rather than new breaks.
+      // the next run skips it above.
       const cluster = joinedText.slice(runOffset + clusterStart, boundaryFrom(runOffset + clusterStart + 1));
+      const unitOffset = runOffset + clusterStart;
+      while (fontUnitIndex + 1 < fontUnits.length && fontUnits[fontUnitIndex].end <= unitOffset) fontUnitIndex++;
       clusterStart = clusterEnd;
       emitted = true;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
@@ -1884,7 +1891,7 @@ export function paragraphInputRuns(
       // Measuring, line breaking, stacked/vertical painting and both workers
       // therefore use the same spelling as the resource-ownership decision.
       let glyph = canonicalFontClusterText(powerPointDisplayCluster(cluster, run.lang));
-      const slot = fontUnits[boundIndex].slot;
+      const slot = fontUnits[fontUnitIndex].slot;
       const eaGlyph = slot === 'ea';
       const csGlyph = slot === 'cs';
       const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
