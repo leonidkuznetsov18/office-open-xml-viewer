@@ -334,8 +334,10 @@ export function measureParagraph(
       // ECMA-376 §17.9.6 supplies marker rPr and §17.3.1.33 the auto multiple,
       // No inherited line value means single spacing (§17.3.1.33 @line), so
       // omitted spacing and explicit auto1 use the same selected glyph union.
-      // The spec does not specify that union. This selected-face projection
-      // is limited to the observed auto/non-grid text-marker class; other classes
+      // The spec does not specify that union. Controlled Word omitted/auto1
+      // pairs independently agree, including a different marker face. Pagination
+      // uses the same allocation, including at keepNext boundaries.
+      // This selected-face projection is limited to non-grid text markers; other classes
       // retain their established allocation.
       void WORD_NUMBERING_MARKER_FIRST_LINE_UNION;
       const markerNaturalPt = Math.max(line.ascent + line.descent, markerBox?.intendedSinglePt ?? 0);
