@@ -10961,8 +10961,12 @@ fn extract_simple_paragraph_text(
         alignment: normalize_align(&alignment).to_string(),
         space_before,
         space_after,
-        before_autospacing: direct_ind.before_autospacing.or(style_para.before_autospacing),
-        after_autospacing: direct_ind.after_autospacing.or(style_para.after_autospacing),
+        before_autospacing: direct_ind
+            .before_autospacing
+            .or(style_para.before_autospacing),
+        after_autospacing: direct_ind
+            .after_autospacing
+            .or(style_para.after_autospacing),
         line_spacing_val,
         line_spacing_rule,
         indent_left,
