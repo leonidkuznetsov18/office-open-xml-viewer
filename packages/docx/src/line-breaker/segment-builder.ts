@@ -1,3 +1,4 @@
+import { revisionIsOmitted } from '../layout/revision-visibility.js';
 import { type TextBreakWindow } from './text-break-window.js';
 import type { DocxTextRun, FieldRun } from '../types';
 import { acquireTextSequences } from './text-sequence.js';
@@ -1592,10 +1593,7 @@ function appendRunsToSegments(
     // decorated. Insertions/moveTo render in both views, and revision metadata
     // remains available through the parsed model for consumer-owned review UI.
     const runRevisionKind = (run as { revision?: { kind?: string } }).revision?.kind;
-    if (
-      environment.showTrackedChanges !== true &&
-      (runRevisionKind === 'deletion' || runRevisionKind === 'moveFrom')
-    ) {
+    if (revisionIsOmitted(runRevisionKind, environment.showTrackedChanges)) {
       continue;
     }
     const joinFromPreviousNoBreakHyphen = joinNextVisibleText;

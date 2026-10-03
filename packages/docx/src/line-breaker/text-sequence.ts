@@ -1,3 +1,4 @@
+import { revisionIsOmitted } from '../layout/revision-visibility.js';
 import type { ParagraphLayoutRun, ParagraphTextBearingRun } from '../layout/text.js';
 import type { LineLayoutEnvironment } from './model.js';
 import { resolveFieldText } from './text-runs.js';
@@ -136,8 +137,7 @@ export function acquireTextSequences(
     // It contributes neither formatting nor a shaping seam to visible neighbors;
     // markup view retains its own revision formatting and source ownership.
     const revisionKind = (run as { revision?: { kind?: string } }).revision?.kind;
-    if (environment.showTrackedChanges !== true
-      && (revisionKind === 'deletion' || revisionKind === 'moveFrom')) continue;
+    if (revisionIsOmitted(revisionKind, environment.showTrackedChanges)) continue;
     const visible = visibleTextRun(run, environment);
     const scopeKey = visible ? environment.layoutServices?.text.sourceScopeKey?.({
       text: displayText(visible.text, visible), fontSizePt: visible.fontSize,

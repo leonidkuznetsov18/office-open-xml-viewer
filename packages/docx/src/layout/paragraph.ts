@@ -1,3 +1,4 @@
+import { revisionIsOmitted } from './revision-visibility.js';
 import { wordKerningApplies } from './line-compatibility.js';
 import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
@@ -2231,6 +2232,7 @@ interface LogicalOccurrenceMap {
 function logicalOccurrenceMap(
   paragraph: ParagraphAcquisitionInput,
   measured: MeasuredParagraph,
+  showTrackedChanges: boolean | undefined,
 ): LogicalOccurrenceMap {
   const measuredLengths = new Map<number, number>();
   const sequences = new Set<NonNullable<LayoutTextSeg['sourceTextSequence']>>();
@@ -2253,6 +2255,11 @@ function logicalOccurrenceMap(
     }
   }
   const runLengths = paragraph.runs.map((run, runIndex) => {
+    // Canonical sequence offsets cover displayed text only. Falling back to
+    // omitted source lengths would shift a later real-format sequence when
+    // the preceding visible text is partitioned into different source runs.
+    const kind = (run as { revision?: { kind?: string } }).revision?.kind;
+    if (revisionIsOmitted(kind, showTrackedChanges)) return 0;
     const measuredLength = measuredLengths.get(runIndex);
     if (measuredLength !== undefined) return measuredLength;
     if (run.type === 'text') return run.text.length;
@@ -5052,7 +5059,7 @@ export function paragraphLayoutFromMeasurement(
     - planningContext.physicalIndentLeftPt
     - planningContext.physicalIndentRightPt
     - rightGridAdjustmentPt;
-  const occurrences = logicalOccurrenceMap(paragraph, measured);
+  const occurrences = logicalOccurrenceMap(paragraph, measured, options.environment.showTrackedChanges);
   const numberingPlan = options.continuesFromPrevious
     ? undefined
     : retainedNumberingPlan(paragraph, planningContext, options);

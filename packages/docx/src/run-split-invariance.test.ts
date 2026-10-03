@@ -344,6 +344,26 @@ describe('complete DOCX parser inputs preserve formatting-only split invariance'
     const body = textRunsForPage(final, 0, { scale: 1 }).filter(r => r.source?.story === 'body');
     expect(body.some(r => r.text.includes('X'))).toBe(false);
   });
+  it.each(['deletion-seam', 'moveFrom-seam'])('retains one displayed coordinate domain after omitted %s and a real format change', wrapper => {
+    const acquire = (parts: string[], properties: string[]) => {
+      const doc = parsedDocument(parts, wrapper, {}, properties, { alignment: 'left', widthPt: 100 });
+      return geometry(paragraphs(layoutDocument(doc, createLayoutServices(doc, { measureContext: context() })))
+        .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0];
+    };
+    const whole = acquire(['AV', 'B'], ['', '<w:b/>']);
+    expect(whole?.lines[0]?.text).toBe('AVB');
+    expect(whole?.lines[0]?.range).toEqual({ start: 0, end: 3 });
+    expect(acquire(['A', 'V', 'B'], ['', '', '<w:b/>'])).toEqual(whole);
+    expect(acquire(['A', 'V', 'B'], ['', '', ''])?.lines[0]?.range).toEqual({ start: 0, end: 3 });
+    const markedDoc = parsedDocument(['A', 'V', 'B'], wrapper, {}, ['', '', '<w:b/>'],
+      { alignment: 'left', widthPt: 100 });
+    const marked = geometry(paragraphs(layoutDocument(markedDoc,
+      createLayoutServices(markedDoc, { measureContext: context() }),
+      { showTrackedChanges: true, currentDateMs: 0 }))
+      .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0];
+    expect(marked?.lines[0]?.text).toBe('AXVXB');
+    expect(marked?.lines[0]?.range).toEqual({ start: 0, end: 5 });
+  });
   it('keeps Latin source seams transparent beside ideographic spaces in every story', () => {
     const whole = acquireParsed(['T i\u3000'], 'rsid');
     const split = acquireParsed(['T', ' i\u3000'], 'rsid');
