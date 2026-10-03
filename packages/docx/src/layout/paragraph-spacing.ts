@@ -1,3 +1,4 @@
+import { WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS } from './line-compatibility.js';
 export interface ParagraphSpacingParticipant {
   readonly contextualSpacing?: boolean;
   readonly styleId?: string | null;
@@ -51,9 +52,10 @@ export function paragraphGapAdjustment(
  * parent paragraph's margin. This is a consumer policy, not a fitted Office
  * amount or a font-dependent correction. Explicit false retains stored values.
  *
- * Part 4 §14.8.3.15 overrides that policy with 5pt before and 10pt after when
- * doNotUseHTMLParagraphAutoSpacing is true. Keep those normative values even
- * when a producer displays its stored explicit spacing instead.
+ * Part 4 §14.8.3.15 specifies 5pt/10pt under the fixed compatibility setting.
+ * WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS records the approved Word
+ * deviation: that setting preserves the stored resolved pair. Missing values
+ * remain zero; line-unit interpretation stays at its existing parser owner.
  * Resolve at the immutable model boundary, before both pagination and line
  * acquisition consume the same pair; paint and paragraph-gap folding do not
  * need to know about automatic flags.
@@ -68,10 +70,12 @@ export function resolveAutomaticParagraphMarginsPt(
   baseFontSizePt: number,
   fixed: boolean,
 ): Readonly<{ spaceBefore: number; spaceAfter: number }> {
+  void WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS;
+  if (fixed) return { spaceBefore: paragraph.spaceBefore ?? 0, spaceAfter: paragraph.spaceAfter ?? 0 };
   return {
     spaceBefore: paragraph.beforeAutospacing === true
-      ? (fixed ? 5 : baseFontSizePt) : paragraph.spaceBefore ?? 0,
+      ? baseFontSizePt : paragraph.spaceBefore ?? 0,
     spaceAfter: paragraph.afterAutospacing === true
-      ? (fixed ? 10 : baseFontSizePt) : paragraph.spaceAfter ?? 0,
+      ? baseFontSizePt : paragraph.spaceAfter ?? 0,
   };
 }

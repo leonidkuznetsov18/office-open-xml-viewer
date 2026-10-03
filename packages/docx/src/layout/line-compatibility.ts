@@ -43,6 +43,18 @@ export function wordPositionalTabReferenceBox(
     : { start: referenceStart, end: referenceEnd };
 }
 
+export const WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS = defineCompatibilityRule({
+  id: 'word-fixed-paragraph-auto-spacing-stored-margins',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'paragraph-auto-spacing-stored-margin-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'With doNotUseHTMLParagraphAutoSpacing enabled, Word for Mac retains stored paragraph before/after spacing instead of imposing Part 4 §14.8.3.15 fixed 5pt/10pt automatic margins. Eighteen fixed-setting documents and eighteen HTML-setting counterexamples cover direct and inherited automatic flags, explicit false, missing/zero/5pt/20pt stored values, line-unit conflicts, adjacent automatic paragraphs and page edges. Three faces at 8/12/24pt and a separate 6/18/36pt Normal-style-size sweep show no face- or inline-size-dependent amount. The fixed-setting projection preserves the already resolved stored numerical margins; it does not invent a second line-unit interpreter. Without that setting, the separate consumer HTML-em policy remains unchanged. This is an approved Word compatibility choice, not the normative fixed-pair rule or a claim that other Office versions/HTML consumers share this behavior.',
+});
+
 export const WORD_KERN_THRESHOLD_AUTHORITY = defineCompatibilityRule({
   id: 'word-kern-threshold-authority',
   evidence: {

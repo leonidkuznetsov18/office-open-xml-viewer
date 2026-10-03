@@ -1,9 +1,11 @@
+import { type TextBreakWindow } from './text-break-window.js';
 import type { DocxTextRun, FieldRun } from '../types';
 import { acquireTextSequences } from './text-sequence.js';
 import type { HyperlinkTarget, ResolvedFontMetric } from '@silurus/ooxml-core';
 import {
   DEFAULT_KINSOKU_RULES,
   isUax14NoBreakPair,
+  lineBreakClass,
   containsSeaScript,
   graphemeClusterOffsets,
   isSymbolFontFamily,
@@ -424,6 +426,27 @@ export function appendTextPiece(
 
 /** Resolve source-level no-break ownership and adjacent UAX14/fitText seams
  * after every display segment has been emitted. */
+/** Linear projection onto immutable offset windows. A real source/font seam
+ * is breakable only when the complete text proved that boundary legal. */
+function projectTextBreakOffsets(group: readonly LayoutTextSeg[], offsets: readonly number[]): void {
+  let cursor = 0, index = 0;
+  for (const segment of group) {
+    const end = cursor + segment.text.length;
+    if (offsets[index] === cursor) {
+      segment.joinPrev = undefined;
+      segment.explicitBreakBefore = true;
+      index++;
+    }
+    const start = index;
+    while (index < offsets.length && offsets[index]! < end) index++;
+    if (index > start) {
+      const window: TextBreakWindow = { offsets, start, end: index, origin: cursor };
+      segment.explicitBreaks = window;
+    }
+    cursor = end;
+  }
+}
+
 export function finalizeBuiltSegments(
   runs: readonly ParagraphLayoutRun[],
   environment: LineLayoutEnvironment,
@@ -432,6 +455,77 @@ export function finalizeBuiltSegments(
   // Project acquisition-owned no-break ranges through the display case
   // transform and onto the single-font layout segments produced above.
   projectNoBreakRanges(runs, segs);
+
+  // ECMA-376 §17.3.3.18 permits ordinary U+002D breaks, including numeric
+  // identifiers. This DOCX tailoring overrides LB25 only inside a word:
+  // signed numbers after an opening bracket/start and LB21a's Hebrew-to-other
+  // boundary retain their Unicode protection. LB9 combining bases and grapheme
+  // boundaries use the complete displayed text, irrespective of font/run seams.
+  // This acquires opportunities, without splitting or merging shaped segments.
+  // Atomic cells and external-link syntax have their own owners below.
+  const rubyOwnedRuns = new Set(segs.filter(segment => 'text' in segment && segment.ruby)
+    .map(segment => segment.sourceRunIndex));
+  for (let start = 0; start < segs.length;) {
+    const ordinary = (s: LayoutSeg): s is LayoutTextSeg => 'text' in s
+      && s.hyperlink?.kind !== 'external' && s.fitTextRegionIndex === undefined
+      && !s.ruby && !s.tateChuYoko && !rubyOwnedRuns.has(s.sourceRunIndex);
+    if (!ordinary(segs[start]!)) { start++; continue; }
+    let end = start;
+    const group: LayoutTextSeg[] = [];
+    while (end < segs.length && ordinary(segs[end]!)) group.push(segs[end++] as LayoutTextSeg);
+    const text = group.map(segment => segment.text).join('');
+    if (text.includes('-')) {
+      const boundaries = [...graphemeClusterOffsets(text), text.length];
+      let boundaryIndex = 0;
+      // Authored noBreakHyphen owns its whole extended grapheme. Its XML
+      // range can end at HY before a following mark, so test that original
+      // edge as well as the displayed cluster end below.
+      const protectedOffsets = new Set<number>();
+      let origin = 0;
+      for (const segment of group) {
+        for (const range of segment.noBreakRanges ?? []) {
+          protectedOffsets.add(origin + range.start);
+          protectedOffsets.add(origin + range.end);
+        }
+        if (segment.hardJoinPrev) protectedOffsets.add(origin);
+        origin += segment.text.length;
+      }
+      const offsets: number[] = [];
+      const prohibitedHyphenEnds = new Set<number>();
+      let cursor = 0;
+      let baseClass: ReturnType<typeof lineBreakClass> | undefined;
+      const wordClass = (c: typeof baseClass) => c === 'AL' || c === 'HL' || c === 'NU';
+      for (const scalar of text) {
+        const cls = lineBreakClass(scalar.codePointAt(0)!);
+        const offset = cursor + scalar.length;
+        while (boundaries[boundaryIndex]! <= cursor) boundaryIndex++;
+        const clusterEnd = boundaries[boundaryIndex]!;
+        if (scalar === '-' && clusterEnd < text.length) {
+          prohibitedHyphenEnds.add(clusterEnd);
+          const rightClass = lineBreakClass(text.codePointAt(clusterEnd)!);
+          if (wordClass(baseClass) && wordClass(rightClass) && !(baseClass === 'HL' && rightClass !== 'HL')
+            && text.codePointAt(clusterEnd - 1) !== 0x200d
+            && !protectedOffsets.has(offset) && !protectedOffsets.has(clusterEnd)) {
+            offsets.push(clusterEnd);
+            prohibitedHyphenEnds.delete(clusterEnd);
+          }
+        }
+        // LB9: CM/ZWJ inherit a preceding base; the grapheme check above still
+        // places any hyphen opportunity after its complete extended grapheme.
+        if (cls !== 'CM' && cls !== 'ZWJ') baseClass = cls;
+        cursor = offset;
+      }
+      projectTextBreakOffsets(group, Object.freeze(offsets));
+      // A rendering seam after a rejected hyphen is not an alternate route
+      // around the complete-text classifier (including Hebrew and signs).
+      let seam = 0;
+      for (const segment of group) {
+        if (prohibitedHyphenEnds.has(seam)) segment.joinPrev = true;
+        seam += segment.text.length;
+      }
+    }
+    start = end;
+  }
 
   // Project the registered `word-external-link-syntax-breaks` opportunities
   // across the complete semantic link and all formatting seams first, then
@@ -495,24 +589,7 @@ export function finalizeBuiltSegments(
       groupStart = groupEnd;
       continue;
     }
-    cursor = 0;
-    for (let index = 0; index < group.length; index += 1) {
-      const segment = group[index]!;
-      const segmentStart = cursor;
-      const segmentEnd = segmentStart + segment.text.length;
-      const localBreaks = [...legalOffsets]
-        .filter((offset) => offset > segmentStart && offset < segmentEnd)
-        .map((offset) => offset - segmentStart)
-        .sort((a, b) => a - b);
-      if (localBreaks.length > 0) {
-        segment.externalLinkBreakOffsets = Object.freeze(localBreaks);
-      }
-      if (index > 0 && legalOffsets.has(segmentStart)) {
-        segment.joinPrev = undefined;
-        segment.externalLinkBreakBefore = true;
-      }
-      cursor = segmentEnd;
-    }
+    projectTextBreakOffsets(group, Object.freeze([...legalOffsets].sort((a, b) => a - b)));
     groupStart = groupEnd;
   }
 
@@ -655,7 +732,7 @@ export function finalizeBuiltSegments(
   // false means unsupported/deferred, never "break allowed".
   for (let i = 1; i < segs.length; i++) {
     const cur = segs[i];
-    if (!('text' in cur) || cur.joinPrev || cur.externalLinkBreakBefore || cur.text.length === 0)
+    if (!('text' in cur) || cur.joinPrev || cur.explicitBreakBefore || cur.text.length === 0)
       continue;
     const prev = segs[i - 1];
     if (!('text' in prev) || prev.text.length === 0) continue;

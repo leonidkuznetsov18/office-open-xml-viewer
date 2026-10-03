@@ -1,3 +1,4 @@
+import { textBreakOffsetAt, textBreakOffsets } from './text-break-window.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import { graphemeClusterOffsets, kinsokuAdjustedSplit } from '@silurus/ooxml-core';
 import {
@@ -62,6 +63,7 @@ import {
 import type { LineBreakerPassInput } from './pass-driver.js';
 
 export interface PassOperationState extends LineBreakerPassInput {
+  readonly reservePrefixWork: (utf16Units: number) => void;
   readonly breakerState: ReturnType<typeof createLineBreakerState>;
   readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
   readonly materializeLatinSpaceCompression: () => void;
@@ -129,7 +131,7 @@ export interface PassOperationState extends LineBreakerPassInput {
     available: number,
     forceAtLeastOne?: boolean,
   ) => number;
-  readonly externalLinkSyntaxSplit: (segment: LayoutTextSeg, available: number) => number;
+  readonly explicitTextSplit: (segment: LayoutTextSeg, available: number) => number;
   readonly queueEmergencyTail: (segment: LayoutTextSeg, split: number) => void;
   readonly retractCurrentLineForLeadingKinsoku: (next: LayoutTextSeg) => CrossRunKinsokuRetraction;
   readonly keepLeadingKinsokuWithCurrentLine: (
@@ -265,7 +267,7 @@ export function performMinimalLegalTextWidth(
         }
       }
     } else {
-      end = segment.externalLinkBreakOffsets?.find((offset) =>
+      end = [...textBreakOffsets(segment.explicitBreaks)].find((offset) =>
         offset > 0 && offset < text.length && !protectedOffsets.has(offset)) ?? text.length;
     }
   }
@@ -1470,6 +1472,24 @@ export function performTabFollowingMetrics(operationState: PassOperationState): 
   return decimalPrefixWidth === undefined ? { totalWidth } : { totalWidth, decimalPrefixWidth };
 }
 
+/** Bracket close to the line band; probing a whole suffix midpoint on
+ * every queued line repeats long measurements for dense sparse breaks. */
+function lastFittingMonotoneIndex(count: number, fits: (index: number) => boolean): number {
+  if (!count || !fits(0)) return -1;
+  let lower = 0, upper = 1;
+  while (upper < count && fits(upper)) {
+    lower = upper;
+    upper = upper * 2 + 1;
+  }
+  upper = Math.min(upper, count);
+  while (lower + 1 < upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    if (fits(middle)) lower = middle;
+    else upper = middle;
+  }
+  return lower;
+}
+
 export function performEmergencyTextSplit(
   operationState: PassOperationState,
   segment: LayoutTextSeg,
@@ -1490,10 +1510,9 @@ export function performEmergencyTextSplit(
     verticalGlyphMeasurement,
   } = operationState;
 
+  operationState.reservePrefixWork(segment.text.length);
   const protectedOffsets = protectedNoBreakOffsets(segment);
-  const graphemeOffsets = [0, ...graphemeClusterOffsets(segment.text), segment.text.length].filter(
-    (offset, index, all) => all.indexOf(offset) === index,
-  );
+  const graphemeOffsets = [...new Set([0, ...graphemeClusterOffsets(segment.text), segment.text.length])];
   let split = 0;
   if (available > 0) {
     const monotoneAllocation =
@@ -1520,20 +1539,35 @@ export function performEmergencyTextSplit(
           charSpacingDeltaPx(segment, scale),
           segment.verticalRun === true,
           verticalGlyphMeasurement,
-          (prefix) => strAdvance(segment, prefix),
+          (prefix) => {
+            operationState.reservePrefixWork(prefix.length);
+            return strAdvance(segment, prefix);
+          },
         ).length;
         split =
           graphemeOffsets
             .filter((offset) => offset <= fitted && !protectedOffsets.has(offset))
             .at(-1) ?? 0;
       });
+    } else if (charSpacingDeltaPx(segment, scale) >= 0) {
+      // A Latin block's ceil((activeNatural + prefixNatural) / pitch) * pitch
+      // minus its fixed allocation is monotone in the retained natural width.
+      // Use that exact active-block allocator, rather than standalone rounding.
+      const legal = graphemeOffsets.filter(offset => offset > 0 && !protectedOffsets.has(offset));
+      const index = lastFittingMonotoneIndex(legal.length, i => {
+        operationState.reservePrefixWork(legal[i]!);
+        const natural = strNaturalAdvance(segment, segment.text.slice(0, legal[i]!));
+        return prospectiveSnapAdvance(segment, natural) <= available + 1e-9;
+      });
+      if (index >= 0) split = legal[index]!;
     } else {
-      // Signed spacing and a Latin snap block can make prefix advances
+      // Signed spacing can make prefix advances
       // non-monotone. Evaluate every legal retained candidate against the
       // exact prospective line block rather than binary-searching a
       // standalone approximation.
       for (const offset of graphemeOffsets) {
         if (offset <= 0 || protectedOffsets.has(offset)) continue;
+        operationState.reservePrefixWork(offset);
         const natural = strNaturalAdvance(segment, segment.text.slice(0, offset));
         if (prospectiveSnapAdvance(segment, natural) <= available + 1e-9) split = offset;
       }
@@ -1550,22 +1584,32 @@ export function performEmergencyTextSplit(
   return split;
 }
 
-export function performExternalLinkSyntaxSplit(
+export function performExplicitTextSplit(
   operationState: PassOperationState,
   segment: LayoutTextSeg,
   available: number,
 ): number {
-  const { prospectiveSnapAdvance, strNaturalAdvance } = operationState;
-
-  if (!(available > 0) || !segment.externalLinkBreakOffsets?.length) return 0;
-  let selected = 0;
-  for (const offset of segment.externalLinkBreakOffsets) {
-    if (offset <= 0 || offset >= segment.text.length) continue;
-    const naturalAdvance = strNaturalAdvance(segment, segment.text.slice(0, offset));
-    const prospectiveAdvance = prospectiveSnapAdvance(segment, naturalAdvance);
-    if (prospectiveAdvance <= available + 1e-9) selected = offset;
+  const { prospectiveSnapAdvance, strNaturalAdvance, scale } = operationState;
+  const window = segment.explicitBreaks;
+  if (!(available > 0) || !window) return 0;
+  const count = window.end - window.start;
+  const fits = (index: number): boolean => {
+    const offset = textBreakOffsetAt(window, index);
+    operationState.reservePrefixWork(offset);
+    const natural = strNaturalAdvance(segment, segment.text.slice(0, offset));
+    return prospectiveSnapAdvance(segment, natural) <= available + 1e-9;
+  };
+  // Use the emergency splitter's existing monotone-allocation contract. Signed
+  // spacing retains exact candidate evaluation. Positive Latin snap allocation
+  // is a monotone ceil map of the same natural-prefix authority, even with an
+  // existing block; fits() uses its actual prospective allocation.
+  if (charSpacingDeltaPx(segment, scale) < 0) {
+    let selected = 0;
+    for (let i = 0; i < count; i++) if (fits(i)) selected = textBreakOffsetAt(window, i);
+    return selected;
   }
-  return selected;
+  const index = lastFittingMonotoneIndex(count, fits);
+  return index < 0 ? 0 : textBreakOffsetAt(window, index);
 }
 
 export function performQueueEmergencyTail(

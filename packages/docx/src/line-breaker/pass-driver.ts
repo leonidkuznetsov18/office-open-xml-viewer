@@ -1,3 +1,4 @@
+import { createPrefixWorkBudget } from './prefix-work-budget.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { TabStop } from '../types';
 import type { KinsokuRules } from '@silurus/ooxml-core';
@@ -58,7 +59,7 @@ import {
   performDecimalAlignmentPrefixWidth,
   performTabFollowingMetrics,
   performEmergencyTextSplit,
-  performExternalLinkSyntaxSplit,
+  performExplicitTextSplit,
   performQueueEmergencyTail,
   performRetractCurrentLineForLeadingKinsoku,
   performKeepLeadingKinsokuWithCurrentLine,
@@ -335,8 +336,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * Every candidate is evaluated independently: signed character spacing can
    * make prefix advances non-monotone, and snapToChars must include the current
    * line's active script block rather than treating the prefix in isolation. */
-  const externalLinkSyntaxSplit = (segment: LayoutTextSeg, available: number): number =>
-    performExternalLinkSyntaxSplit(operationState, segment, available);
+  const explicitTextSplit = (segment: LayoutTextSeg, available: number): number =>
+    performExplicitTextSplit(operationState, segment, available);
 
   const queueEmergencyTail = (segment: LayoutTextSeg, split: number): void =>
     performQueueEmergencyTail(operationState, segment, split);
@@ -368,6 +369,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
 
   operationState = {
     ...input,
+    reservePrefixWork: createPrefixWorkBudget(),
     probeHeights,
     probeFloors,
     preparedFloatWrap,
@@ -408,7 +410,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     decimalAlignmentPrefixWidth,
     tabFollowingMetrics,
     emergencyTextSplit,
-    externalLinkSyntaxSplit,
+    explicitTextSplit,
     queueEmergencyTail,
     retractCurrentLineForLeadingKinsoku,
     keepLeadingKinsokuWithCurrentLine,

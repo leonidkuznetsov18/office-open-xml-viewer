@@ -174,7 +174,11 @@ function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTe
   const O = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
   const escape = (text: string) => text.replace(/&/gu, '&amp;').replace(/</gu, '&lt;');
   const runs = parts.map((text, index) => {
-    const content = text.split('\t').map(piece => `<w:t xml:space="preserve">${escape(piece)}</w:t>`).join('<w:tab/>');
+    // U+2011 is this fixture's marker for the authored OOXML element, which
+    // the parser displays as U+002D while retaining its no-break ownership.
+    const content = text.split('\t').map(piece => piece.split('\u2011')
+      .map(part => `<w:t xml:space="preserve">${escape(part)}</w:t>`)
+      .join('<w:noBreakHyphen/>')).join('<w:tab/>');
     const run = `<w:r w:rsidR="0000000${index % 8}">${runProperties[index] ? `<w:rPr>${runProperties[index]}</w:rPr>` : ''}${content}</w:r>`;
     if (['deletion-seam', 'moveFrom-seam', 'deleted-break-seam', 'deleted-tab-seam', 'deleted-math-seam'].includes(wrapper)) {
       const tag = wrapper === 'moveFrom-seam' ? 'moveFrom' : 'del';
@@ -182,6 +186,7 @@ function parsedDocument(parts: string[], wrapper: string, format: Partial<DocxTe
       const boundary = wrapper === 'deleted-break-seam' ? '<w:br/>' : wrapper === 'deleted-tab-seam' ? '<w:tab/>' : '';
       return `${index ? `<w:${tag} w:id="${index}" w:author="Reviewer"><w:r><w:delText>X</w:delText>${boundary}</w:r>${math}</w:${tag}>` : ''}${run}`;
     }
+    if (wrapper === 'ruby-tail' && index === parts.length - 1) return `<w:r><w:ruby><w:rubyPr><w:hps w:val="12"/><w:hpsRaise w:val="6"/><w:hpsBaseText w:val="36"/></w:rubyPr><w:rt><w:r><w:t>hint</w:t></w:r></w:rt><w:rubyBase>${run}</w:rubyBase></w:ruby></w:r>`;
     if (wrapper === 'smart-tags') return `<w:smartTag w:uri="urn:test" w:element="word">${run}</w:smartTag>`;
     if (wrapper === 'revisions') return `<w:ins w:id="${index}" w:author="Reviewer">${run}</w:ins>`;
     if (wrapper === 'hyperlinks') return `<w:hyperlink w:anchor="Destination">${run}</w:hyperlink>`;
@@ -226,6 +231,94 @@ function acquireRuns(runs: DocParagraph['runs'], container: 'paragraph' | 'fixed
 }
 
 describe('complete DOCX parser inputs preserve formatting-only split invariance', () => {
+  it('wraps at an ordinary numeric hyphen without depending on source splits', () => {
+    const acquire = (parts: string[], properties: string[] = []) => {
+      const doc = parsedDocument(parts, 'rsid', {}, properties,
+        { alignment: 'left', compatibilityMode: 14, widthPt: 86 });
+      return geometry(paragraphs(layoutDocument(doc,
+        createLayoutServices(doc, { measureContext: context() })))
+        .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0];
+    };
+    // §17.3.3.18 explicitly contrasts a numeric U+002D break with
+    // noBreakHyphen. The visible first prefix advances 85pt in these metrics.
+    const whole = acquire(['AAAA 166-67']);
+    expect(whole?.lines.map(l => l.text.trim())).toEqual(['AAAA 166-', '67']);
+    expect(acquire(['AAAA 166-', '67'])).toEqual(whole);
+    expect(acquire(['AAAA 166-', '67'], ['', '<w:b/>'])?.lines.map(l => l.text.trim()))
+      .toEqual(['AAAA 166-', '67']);
+    expect(acquire(['AAAA 166\u201167'])?.lines.map(l => l.text.trim()))
+      .toEqual(['AAAA', '166-67']);
+    const ordinary = intrinsic([run('166-67')]);
+    const protectedRun = { ...run('166-67'), noBreakRanges: [{ start: 3, end: 4 }] };
+    expect(ordinary.minWidthPt).toBeCloseTo(intrinsic([run('166-')]).maxWidthPt, 8);
+    expect(ordinary.maxWidthPt).toBeCloseTo(intrinsic([protectedRun]).maxWidthPt, 8);
+    expect(intrinsic([protectedRun]).minWidthPt)
+      .toBeCloseTo(ordinary.maxWidthPt, 8);
+  });
+  it('uses the combining base before an ordinary hyphen and keeps a hyphen extension attached', () => {
+    const lines = (parts: string[], properties: string[] = []) => {
+      const doc = parsedDocument(parts, 'rsid', {}, properties,
+        { alignment: 'left', widthPt: 76 });
+      return geometry(paragraphs(layoutDocument(doc, createLayoutServices(doc, { measureContext: context() })))
+        .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0]?.lines.map(l => l.text.trim());
+    };
+    // The independent metrics give the complete first prefix 75pt. A mark on
+    // the Latin base must not remove its hyphen opportunity; a mark attached
+    // to the hyphen stays on its complete extended grapheme.
+    expect(lines(['AAAA a\u0301-b'])).toEqual(['AAAA a\u0301-', 'b']);
+    expect(lines(['AAAA a', '\u0301-', 'b'], ['', '<w:b/>', '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>']))
+      .toEqual(['AAAA a\u0301-', 'b']);
+    expect(lines(['AAAA a-\u0301b'])).toEqual(['AAAA a-\u0301', 'b']);
+    expect(lines(['AAAA a-', '\u0301b'], ['', '<w:b/>'])).toEqual(['AAAA a-\u0301', 'b']);
+    expect(lines(['AAAA a\u2011\u0301b'])).toEqual(['AAAA', 'a-\u0301b']);
+    expect(lines(['AAAA a\u2011', '\u0301b'], ['', '<w:b/>'])).toEqual(['AAAA', 'a-\u0301b']);
+  });
+  it('keeps a parenthesized signed number intact across a genuine formatting seam', () => {
+    const doc = parsedDocument(['AA (-', '123)'], 'rsid', {}, ['', '<w:b/>'],
+      { alignment: 'left', widthPt: 66 });
+    const body = geometry(paragraphs(layoutDocument(doc, createLayoutServices(doc, { measureContext: context() })))
+      .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0];
+    expect(body?.lines.map(l => l.text.trim())).toEqual(['AA', '(-123)']);
+    const hebrew = parsedDocument(['AA א-', 'b'], 'rsid', {}, ['', '<w:b/>'],
+      { alignment: 'left', widthPt: 46 });
+    const hebrewBody = geometry(paragraphs(layoutDocument(hebrew,
+      createLayoutServices(hebrew, { measureContext: context() })))
+      .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0];
+    expect(hebrewBody?.lines.map(l => l.text.trim())).toEqual(['AA', 'א-b']);
+  });
+  it('keeps ruby base ownership when script or small-caps splitting emits an unannotated tail', () => {
+    const lines = (text: string, properties: string = '') => {
+      const doc = parsedDocument(['AAAA ', text], 'ruby-tail', {}, ['', properties], { alignment: 'left', widthPt: 76 });
+      return geometry(paragraphs(layoutDocument(doc, createLayoutServices(doc, { measureContext: context() })))
+        .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0]?.lines.map(l => l.text.trim());
+    };
+    // Ruby paints its annotation on the owning piece; existing script/case
+    // breaks remain unchanged. The ordinary policy must not add an internal
+    // hyphen break to an unannotated tail of that same authored base.
+    expect(lines('a\u0301-b')).toEqual(['AAAA a\u0301', '-b']);
+    expect(lines('aB-c', '<w:smallCaps/>')).toEqual(['AAAA', 'AB-C']);
+  });
+  it('admits the same legal hyphen prefix when its tail changes font', () => {
+    const lines = (parts: string[], properties: string[] = []) => {
+      const doc = parsedDocument(parts, 'rsid', {}, properties,
+        { alignment: 'left', widthPt: 86 });
+      return geometry(paragraphs(layoutDocument(doc, createLayoutServices(doc, { measureContext: context() })))
+        .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0]?.lines.map(l => l.text.trim());
+    };
+    expect(lines(['AAAA ab-cd'])).toEqual(['AAAA ab-', 'cd']);
+    expect(lines(['AAAA ab-c', 'd'], ['', '<w:b/>'])).toEqual(['AAAA ab-', 'cd']);
+  });
+  it('prefers the CJK to whole-word boundary across actual Latin formatting changes', () => {
+    const lines = (parts: string[], properties: string[]) => {
+      const doc = parsedDocument(parts, 'rsid', {}, properties,
+        { alignment: 'left', widthPt: 65 });
+      return geometry(paragraphs(layoutDocument(doc, createLayoutServices(doc, { measureContext: context() })))
+        .filter(p => p.source.story === 'body' && p.source.path.length === 1))[0]?.lines.map(l => l.text.trim());
+    };
+    expect(lines(['日日E-mail'], [])).toEqual(['日日', 'E-mail']);
+    expect(lines(['日日', 'E-', 'mail'], ['', '<w:b/>', '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>']))
+      .toEqual(['日日', 'E-mail']);
+  });
   it('fits the visible justified prefix across a real formatting boundary in mode 14', () => {
     const acquire = (parts: string[], properties: string[]) => {
       const doc = parsedDocument(parts, 'rsid', {}, properties,

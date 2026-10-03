@@ -214,10 +214,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Parser-independent UTF-16 ranges occupied by authored
    * `<w:noBreakHyphen/>` glyphs. Neither edge is a legal line boundary. */
   noBreakRanges?: readonly Readonly<{ start: number; end: number }>[];
-  /** Registered external-URL syntax breaks, as segment-local UTF-16 offsets. */
-  externalLinkBreakOffsets?: readonly number[];
-  /** This segment starts after a registered external-URL syntax break. */
-  externalLinkBreakBefore?: true;
+  /** Legal ordinary-hyphen and registered URL breaks, as segment-local UTF-16 offsets. */
+  explicitBreaks?: import('./text-break-window.js').TextBreakWindow;
+  /** This source seam follows a legal ordinary-hyphen or URL break. */
+  explicitBreakBefore?: true;
   /** ECMA-376 §17.3.2.34 `<w:snapToGrid>` — false opts this run out of the
    *  section character grid without changing paragraph line-grid policy. */
   snapToCharacterGrid?: boolean;

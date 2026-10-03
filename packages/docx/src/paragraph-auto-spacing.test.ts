@@ -50,10 +50,10 @@ it('uses an HTML paragraph em for inherited automatic margins while explicit fal
   expect(sequence.filter(e => e.kind === 'body-block').map(e => e.kind === 'body-block' && e.block.kind === 'paragraph' ? [e.block.spaceBeforePt, e.block.spaceAfterPt] : null)).toEqual([[11, 11], [5, 5], [11, 11]]);
 });
 
-it('uses the normative fixed pair only when the document enables fixed HTML automatic spacing', () => {
+it('retains stored margins under Word fixed automatic-spacing compatibility', () => {
   const normalized = normalizeDocxDocumentModel(document(true));
   const paragraphs = normalized.body.filter((e): e is DocParagraph & { type: 'paragraph' } => e.type === 'paragraph');
-  expect(paragraphs.map(p => [p.spaceBefore, p.spaceAfter])).toEqual([[5, 10], [5, 5], [5, 10]]);
+  expect(paragraphs.map(p => [p.spaceBefore, p.spaceAfter])).toEqual([[5, 5], [5, 5], [40, 5]]);
 });
 
 it('resolves the same inherited margin in parsed cell and story paragraphs', () => {
