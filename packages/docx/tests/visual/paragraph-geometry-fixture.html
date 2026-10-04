@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en"><body><script type="module">
+import { DocxDocument } from '/src/index.ts';
+try {
+  const response = await fetch('/paragraph-geometry.docx');
+  if (!response.ok) throw new Error('Fixture unavailable');
+  const bytes = await response.arrayBuffer();
+  const read = async mode => {
+    const doc = await DocxDocument.load(bytes.slice(0), { mode, useGoogleFonts: false });
+    try {
+      const pages = [];
+      for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex++) {
+        pages.push(await doc.collectPageParagraphs(pageIndex, { width: 816 }));
+      }
+      return pages;
+    } finally { doc.destroy(); }
+  };
+  const main = await read('main');
+  const worker = await read('worker');
+  document.body.dataset.main = JSON.stringify(main);
+  document.body.dataset.worker = JSON.stringify(worker);
+  const paragraphs = main.flat();
+  const empty = paragraphs.filter(paragraph => paragraph.lines.some(line => line.markOnly));
+  if (empty.length !== 3) throw new Error(`Expected three empty paragraphs, found ${empty.length}`);
+  for (const paragraph of empty) {
+    const line = paragraph.lines.find(line => line.markOnly);
+    if (line.range.start !== 0 || line.range.end !== 0 || line.bounds.height <= 0
+      || line.baseline.y <= line.bounds.y || line.baseline.y > line.bounds.y + line.bounds.height)
+      throw new Error('Invalid native empty-line caret geometry');
+  }
+  if (!empty.some(paragraph => paragraph.source.path.length >= 3))
+    throw new Error('Missing empty table paragraph source');
+  const right = paragraphs.find(paragraph => paragraph.paragraphId === 'AA000001');
+  if (!right || right.lines[0].baseline.x < 600) throw new Error('Empty right alignment lost');
+  const next = paragraphs.find(paragraph => paragraph.paragraphId === 'AA000003');
+  if (!next || next.pageIndex !== 1) throw new Error('Page-break empty line lost');
+  document.body.dataset.status = 'ready';
+} catch (error) {
+  document.body.dataset.status = 'error';
+  document.body.dataset.error = error instanceof Error ? error.message : String(error);
+}
+</script></body></html>
