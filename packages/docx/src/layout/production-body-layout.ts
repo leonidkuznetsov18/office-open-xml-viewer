@@ -2082,12 +2082,14 @@ function openConcreteBodyLayoutSession(
       ...buildNoteNumberMap(
         sourceFootnotes,
         noteReferenceIdsInDocumentOrder(source.blocks.body, 'footnote'),
+        new Set(noteReferenceIdsInDocumentOrder(source.blocks.body, 'footnote', true)),
       ),
     ].map(([id, number]) => [`footnote:${id}`, number] as const),
     ...[
       ...buildNoteNumberMap(
         sourceEndnotes,
         noteReferenceIdsInDocumentOrder(source.blocks.body, 'endnote'),
+        new Set(noteReferenceIdsInDocumentOrder(source.blocks.body, 'endnote', true)),
       ),
     ].map(([id, number]) => [`endnote:${id}`, number] as const),
   ]);

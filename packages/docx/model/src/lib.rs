@@ -2636,6 +2636,11 @@ pub struct NoteRef {
     pub kind: String,
     /// The `@w:id` linking the marker to its note in footnotes.xml / endnotes.xml.
     pub id: String,
+    /// CT_FtnEdnRef/@customMarkFollows suppresses the automatic mark and
+    /// excludes this note from the numbering sequence. The authored mark is
+    /// ordinary following run text; retain the reference even without ink.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub custom_mark_follows: bool,
 }
 
 #[derive(Serialize, Debug, Clone)]

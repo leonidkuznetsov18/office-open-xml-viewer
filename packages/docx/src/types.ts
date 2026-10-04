@@ -1342,6 +1342,10 @@ export interface NoteRef {
   /** `@w:id` linking the marker to its note. Empty for the in-note
    *  `<w:footnoteRef/>` placeholder (the renderer uses the enclosing note). */
   id: string;
+  /** CT_FtnEdnRef/@customMarkFollows: suppress the automatic reference mark
+   * and leave this note out of sequential numbering. Following run text owns
+   * the authored mark; the reference still owns its note's placement. */
+  customMarkFollows?: boolean;
 }
 
 export interface RunRevision {

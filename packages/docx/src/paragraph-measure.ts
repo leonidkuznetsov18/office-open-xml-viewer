@@ -24,7 +24,10 @@ import type { DocParagraph } from './types.js';
 import type { WrapOracle } from './layout/float-wrap-oracle.js';
 import type { NumberingMarkerShapeInput, WritingMode } from './layout/types.js';
 import { wordEmptyMarkMinimumStartWidthPx } from './layout/compatibility.js';
-import { WORD_NUMBERING_MARKER_FIRST_LINE_UNION } from './layout/line-compatibility.js';
+import {
+  WORD_NUMBERING_MARKER_FIRST_LINE_UNION,
+  wordJustifiedInterwordCompressionApplies,
+} from './layout/line-compatibility.js';
 import { LayoutInvariantError } from './layout/diagnostics.js';
 import type { MeasurementTextContext } from './layout/measurement-capabilities.js';
 
@@ -36,7 +39,7 @@ export interface ParagraphMeasurementEnvironment extends LineLayoutEnvironment {
   readonly documentHasEastAsianText: boolean;
   readonly paragraphMarkShapeInput?: NumberingMarkerShapeInput;
   /** Selected-face text marker box, resolved by retained numbering before line acquisition. */
-  readonly firstLineNumberingMarkerBox?: Readonly<{ ascentPt: number; descentPt: number }>;
+  readonly firstLineNumberingMarkerBox?: Readonly<{ ascentPt: number; descentPt: number; intendedSinglePt?: number }>;
   /** Canonical section writing mode used by retained page geometry. */
   readonly pageWritingMode: WritingMode;
   /** The paragraph is acquired in a section-logical frame that paint rotates
@@ -303,8 +306,10 @@ export function measureParagraph(
     const allocations: { layout: LayoutLine; advancePt: number }[] = [];
     for (const [lineIndex, originalLine] of lines.entries()) {
       const markerBox = lineIndex === 0 && !continuation && !placement.wrap
-        && !context.lineGrid.active && context.lineSpacing?.rule === 'auto'
-        && context.lineSpacing.value >= 1 && !context.hasRuby
+        && !context.lineGrid.active
+        && (context.lineSpacing == null
+          || (context.lineSpacing.rule === 'auto' && context.lineSpacing.value >= 1))
+        && !context.hasRuby
         && !originalLine.uniformPositionAuto && !originalLine.inlinePictureTextSingle
         ? environment.firstLineNumberingMarkerBox : undefined;
       const markerAscent = markerBox?.ascentPt;
@@ -317,6 +322,9 @@ export function measureParagraph(
             descent: Math.max(originalLine.descent, markerDescent),
             visibleAscent: Math.max(originalLine.visibleAscent ?? originalLine.ascent, markerAscent),
             visibleDescent: Math.max(originalLine.visibleDescent ?? originalLine.descent, markerDescent),
+            intendedSingle: Math.max(originalLine.intendedSingle, markerBox?.intendedSinglePt ?? 0),
+            visibleIntendedSingle: Math.max(originalLine.visibleIntendedSingle ?? originalLine.intendedSingle,
+              markerBox?.intendedSinglePt ?? 0),
           }
         : originalLine;
       const textSinglePt = Math.max(
@@ -324,11 +332,15 @@ export function measureParagraph(
         originalLine.intendedSingle,
       );
       // ECMA-376 §17.9.6 supplies marker rPr and §17.3.1.33 the auto multiple,
-      // but neither specifies their line-box union. This selected-face projection
-      // is limited to the observed auto/non-grid text-marker class; other classes
+      // No inherited line value means single spacing (§17.3.1.33 @line), so
+      // omitted spacing and explicit auto1 use the same selected glyph union.
+      // The spec does not specify that union. Controlled Word omitted/auto1
+      // pairs independently agree, including a different marker face. Pagination
+      // uses the same allocation, including at keepNext boundaries.
+      // This selected-face projection is limited to non-grid text markers; other classes
       // retain their established allocation.
       void WORD_NUMBERING_MARKER_FIRST_LINE_UNION;
-      const markerNaturalPt = line.ascent + line.descent;
+      const markerNaturalPt = Math.max(line.ascent + line.descent, markerBox?.intendedSinglePt ?? 0);
       const markerRaisesBox = line !== originalLine
         && markerNaturalPt > textSinglePt;
       const specified = specifiedParagraph && !paragraph.numbering
@@ -421,6 +433,9 @@ export function measureParagraph(
     placement.noWrap ? 'unwrapped' : undefined,
     environment.verticalGlyphMeasurement,
     context.overflowPunct !== false,
+    wordJustifiedInterwordCompressionApplies(
+      paragraph.alignment, environment.compatibilityMode, environment.lineWrapLikeWord6,
+    ) && environment.verticalCJK !== true,
   );
   if (lines.length === 0) return measureMarkOnly();
 

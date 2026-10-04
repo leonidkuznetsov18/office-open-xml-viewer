@@ -1906,6 +1906,7 @@ export interface NoFill {
 export interface NoteRef {
     kind: 'footnote' | 'endnote' | string;
     id: string;
+    customMarkFollows?: boolean;
 }
 export function noteText(note: DocNote): string;
 export interface NumberingInfo {

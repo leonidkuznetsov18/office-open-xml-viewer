@@ -39,6 +39,7 @@ export function layoutLines(
   widthPolicy?: 'bounded' | 'intrinsic' | 'unwrapped',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct?: boolean,
+  justifiedCompression?: boolean,
 ): LayoutLine[];
 
 export function layoutLines(
@@ -88,6 +89,7 @@ export function layoutLines(
   widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped' = 'bounded',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct = false,
+  justifiedCompression = false,
   passContext?: Readonly<{
     probeHeights: readonly number[] | null;
     probeFloors?: readonly number[] | null;
@@ -126,6 +128,7 @@ export function layoutLines(
       widthPolicy,
       verticalGlyphMeasurement,
       overflowPunct,
+      justifiedCompression,
       { probeHeights, probeFloors, preparedFloatWrap },
     );
     if (!wrapCtx || widthPolicy !== 'bounded') return runPass(null);
@@ -167,6 +170,6 @@ export function layoutLines(
     ctx, segs, maxWidth, firstIndent, scale, tabStops, wrapCtx,
     fontFamilyClasses, tabOriginPx, kinsoku, characterGrid, defaultTabPt,
     marginRightPx, baseRtl, isJustified, stretchLastLine, startBoundary,
-    widthPolicy, verticalGlyphMeasurement, overflowPunct, passContext,
+    widthPolicy, verticalGlyphMeasurement, overflowPunct, justifiedCompression, passContext,
   });
 }

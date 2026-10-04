@@ -6,6 +6,7 @@ import { type LayoutImageSeg, type LayoutLine, type LayoutMathSeg, type LayoutSe
 import { protectedNoBreakOffsets, slicedTextMetadata } from './advance.js';
 import { rebaseSeaBreaks } from './text-runs.js';
 import { resolveFitTextSegments } from './segment-builder.js';
+import type { LineGapModel } from './line-gaps.js';
 import { SegmentQueue, type SegmentQueueCursor } from './segment-queue.js';
 
 /** Prepare source-anchored break opportunities and the resumable queue.
@@ -204,6 +205,9 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     lines: [] as LayoutLine[],
     currentLine: [] as (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[],
     currentWidth: 0,
+    justifiedGapModel: undefined as LineGapModel | undefined,
+    justifiedCompressionPx: 0,
+    justifiedUnitEnd: undefined as LayoutSeg | undefined,
     latinLineFace: undefined as LayoutTextSeg | undefined,
     latinLineHomogeneous: true,
     latinLineGaps: [] as LayoutTextSeg[],

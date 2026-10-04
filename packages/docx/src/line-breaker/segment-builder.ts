@@ -58,6 +58,7 @@ import {
   mayUseExactLocalReferenceWidthMetric,
   selectResourceAverageWidthRatio,
   selectResourceMetric,
+  selectedFontLineMetric,
   type MetricTupleIndex,
 } from './font-metrics.js';
 
@@ -1331,42 +1332,10 @@ function emitResolvedTextSegment(
   // The Word OpenType projection supplies that normal box by inference;
   // exact spacing instead suppresses it.
   const naturalMetricAllowed = environment.lineSpacing?.rule !== 'exact';
-  const resourceFamilyLineMetric =
-    (naturalMetricAllowed || localFont?.designAscentRatio == null) &&
-    (localFont?.lineHeightRatio != null ||
-      localFont?.designAscentRatio != null ||
-      localFont?.eastAsianLineHeightRatio != null)
-      ? localFont
-      : undefined;
-  const referenceLineMetric =
-    naturalMetricAllowed &&
-    !resourceFamilyLineMetric &&
-    mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font)
-      ? referenceFontLineMetrics(
-          resolvedSpan.font.requestedFamily,
-          resolvedSpan.font.weight,
-          resolvedSpan.font.style,
-        )
-      : undefined;
-  const familyLineMetric = resourceFamilyLineMetric ?? referenceLineMetric;
-  const resourceEaLineMetric =
-    (naturalMetricAllowed || localEaFloor?.designAscentRatio == null) &&
-    (localEaFloor?.lineHeightRatio != null ||
-      localEaFloor?.designAscentRatio != null ||
-      localEaFloor?.eastAsianLineHeightRatio != null)
-      ? localEaFloor
-      : undefined;
-  const referenceEaLineMetric =
-    naturalMetricAllowed &&
-    !resourceEaLineMetric &&
-    mayUseAuthoredReferenceVerticalMetric(eaResolution)
-      ? referenceFontLineMetrics(
-          eaResolution.requestedFamily,
-          eaResolution.weight,
-          eaResolution.style,
-        )
-      : undefined;
-  const eaLineMetric = resourceEaLineMetric ?? referenceEaLineMetric;
+  const { resourceMetric: resourceFamilyLineMetric, referenceMetric: referenceLineMetric,
+    lineMetric: familyLineMetric } = selectedFontLineMetric(resolvedSpan?.font, localFont, naturalMetricAllowed);
+  const { resourceMetric: resourceEaLineMetric, referenceMetric: referenceEaLineMetric,
+    lineMetric: eaLineMetric } = selectedFontLineMetric(eaResolution, localEaFloor, naturalMetricAllowed);
   const resolvedEaFloorFamily =
     eaResolution?.resolvedFamily ?? localEaFloor?.family ?? eaFontFamily;
   // WORD_USE_FE_LAYOUT_INHERITED_GRID_MINIMUM was observed for an active
@@ -1612,6 +1581,29 @@ function appendRunsToSegments(
           : environment.noteReferenceNumber
         : undefined;
       if (t.noteRef) {
+        // CT_FtnEdnRef/@customMarkFollows suppresses the automatic glyph, not
+        // the note relationship. Keep an immutable zero-width host so a note
+        // remains attached to the physical line/page of this reference.
+        // Number 0 is the acquisition map's custom-note sentinel; the note's
+        // own automatic *Ref placeholder is suppressed by the same contract.
+        if (t.noteRef.customMarkFollows === true || noteText === 0) {
+          // As for an empty/anchor-only mark, a bounded Latin probe resolves
+          // the four font slots and selected-face metrics through the ordinary
+          // text service. Discard its ink/text, never its font authority.
+          appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? 'super', runIndex,
+            { text: 'x', offset: 0 });
+          for (let index = emittedStart; index < segs.length; index += 1) {
+            const segment = segs[index];
+            if (!('text' in segment)) throw new Error('A note metric probe lost its text authority');
+            segment.text = '';
+            segment.metricOnly = true;
+            segment.sourceRunIndex = runIndex;
+            if (segment.textShapeRequest) {
+              segment.textShapeRequest = Object.freeze(independentTextShapeRequest(segment.textShapeRequest, ''));
+            }
+          }
+          continue;
+        }
         const label =
           noteText != null
             ? formatNoteNumber(
