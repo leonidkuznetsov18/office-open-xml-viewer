@@ -1,3 +1,4 @@
+import { sliceTextBreakWindow } from './text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import { EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
 import { wordBalancedSpaceCellAdjustmentApplies } from '../layout/line-compatibility.js';
@@ -209,28 +210,17 @@ export function slicedTextMetadata(
   start: number,
   end: number,
 ): Pick<LayoutTextSeg,
-  'punctuationCompressions' | 'noBreakRanges' | 'externalLinkBreakOffsets' | 'textShapeRequest'
+  'punctuationCompressions' | 'noBreakRanges' | 'explicitBreaks' | 'textShapeRequest' | 'sourceTextOffset'
 > {
   return {
+    ...(seg.sourceTextOffset === undefined ? {} : { sourceTextOffset: seg.sourceTextOffset + start }),
     ...(seg.textShapeRequest
       ? { textShapeRequest: sliceTextShapeRequest(seg.textShapeRequest, start, end) }
       : {}),
     punctuationCompressions: slicedPunctuationCompressions(seg, start, end),
     noBreakRanges: slicedNoBreakRanges(seg, start, end),
-    externalLinkBreakOffsets: slicedExternalLinkBreakOffsets(seg, start, end),
+    explicitBreaks: sliceTextBreakWindow(seg.explicitBreaks, start, end),
   };
-}
-
-
-export function slicedExternalLinkBreakOffsets(
-  seg: LayoutTextSeg,
-  start: number,
-  end: number,
-): readonly number[] | undefined {
-  const sliced = seg.externalLinkBreakOffsets
-    ?.filter((offset) => offset > start && offset < end)
-    .map((offset) => offset - start);
-  return sliced && sliced.length > 0 ? Object.freeze(sliced) : undefined;
 }
 
 

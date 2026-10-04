@@ -25,6 +25,9 @@ export interface LayoutSegSource {
    * objects. Unlike `src.segIndex` (the flattened segment stream), this remains
    * the original paragraph run index through line splitting. */
   sourceRunIndex?: number;
+  /** Original ownership is independent of the canonical text sequence. */
+  sourceTextSequence?: readonly import('./text-sequence.js').TextSequenceSource[];
+  sourceTextOffset?: number;
 }
 
 
@@ -211,10 +214,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Parser-independent UTF-16 ranges occupied by authored
    * `<w:noBreakHyphen/>` glyphs. Neither edge is a legal line boundary. */
   noBreakRanges?: readonly Readonly<{ start: number; end: number }>[];
-  /** Registered external-URL syntax breaks, as segment-local UTF-16 offsets. */
-  externalLinkBreakOffsets?: readonly number[];
-  /** This segment starts after a registered external-URL syntax break. */
-  externalLinkBreakBefore?: true;
+  /** Legal ordinary-hyphen and registered URL breaks, as segment-local UTF-16 offsets. */
+  explicitBreaks?: import('./text-break-window.js').TextBreakWindow;
+  /** This source seam follows a legal ordinary-hyphen or URL break. */
+  explicitBreakBefore?: true;
   /** ECMA-376 §17.3.2.34 `<w:snapToGrid>` — false opts this run out of the
    *  section character grid without changing paragraph line-grid policy. */
   snapToCharacterGrid?: boolean;
@@ -277,8 +280,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
    *  font size ≥ the threshold. Absent at every style level disables kerning
-   *  unless `enableOpenTypeFeatures` explicitly enables it for the
-   *  document; Canvas `auto` is not the WordprocessingML default. */
+   *  regardless of `enableOpenTypeFeatures`. WORD_KERN_THRESHOLD_AUTHORITY
+   *  additionally disables zero in mode 15; unmeasured modes retain the previous
+   *  zero size comparison. Canvas `auto` is not the WordprocessingML default. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横). Set by {@link buildSegments} ONLY when the run declares `w:vert`
@@ -623,7 +627,7 @@ export interface LineLayoutEnvironment {
    * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
   readonly autoSpaceDE?: boolean;
   readonly autoSpaceDN?: boolean;
-  /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
+  /** See WORD_KERN_THRESHOLD_AUTHORITY for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;
    * the authored frame height remains authoritative even when glyph paint is

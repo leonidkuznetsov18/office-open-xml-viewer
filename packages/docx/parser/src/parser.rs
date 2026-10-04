@@ -187,6 +187,59 @@ mod private_typography_wire_tests {
     }
 
     #[test]
+    fn kern_threshold_resolves_cascade_and_preserves_explicit_zero() {
+        // ECMA-376 §§17.3.2.19, 17.7: resolved values, never a renderer guess.
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{W_NS}">
+          <w:docDefaults><w:rPrDefault><w:rPr><w:kern w:val="16"/></w:rPr></w:rPrDefault></w:docDefaults>
+          <w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:kern w:val="24"/></w:rPr></w:style>
+          <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Base"/></w:style>
+          <w:style w:type="character" w:styleId="Char"><w:rPr><w:kern w:val="36"/></w:rPr></w:style>
+        </w:styles>"#
+        ));
+        for (ppr, rpr, expected) in [
+            ("", "", 8.0),
+            (r#"<w:pStyle w:val="Child"/>"#, "", 12.0),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:rStyle w:val="Char"/>"#,
+                18.0,
+            ),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:kern w:val="40"/>"#,
+                20.0,
+            ),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:kern w:val="0"/>"#,
+                0.0,
+            ),
+        ] {
+            let p = parse_p(
+                &format!(
+                    r#"<w:pPr>{ppr}<w:rPr><w:kern w:val="28"/></w:rPr></w:pPr>
+              <w:r><w:rPr>{rpr}<w:sz w:val="36"/></w:rPr><w:t>AV</w:t></w:r>"#
+                ),
+                &styles,
+            );
+            let wire = first_run_json(&p, "text");
+            assert_eq!(wire["kerning"], expected);
+            assert_eq!(
+                wire["__typographyAcquisition"]["kerningThresholdPt"],
+                expected
+            );
+            // Direct paragraph-mark rPr does not become a content default.
+            assert_eq!(
+                p.paragraph_mark_font_facts.as_ref().unwrap().kerning,
+                Some(14.0)
+            );
+        }
+        let p = parse_p(r#"<w:r><w:t>AV</w:t></w:r>"#, &StyleMap::default());
+        assert!(first_run_json(&p, "text")["kerning"].is_null());
+    }
+
+    #[test]
     fn private_run_typography_is_identical_for_text_and_field_results() {
         let rpr = r#"<w:rPr>
           <w:u w:val="words" w:color="FF0000" w:themeColor="accent2" w:themeTint="20"/>
@@ -2663,6 +2716,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         .find(|n| n.is_element() && n.tag_name().name() == "compat");
     let compat_bool = |name: &str| -> Option<bool> { bool_prop(compat?, name) };
     let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
+    let do_not_use_html_paragraph_auto_spacing = compat_bool("doNotUseHTMLParagraphAutoSpacing");
     // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
     // direct `w:compat` boolean. The setting is off when absent.
     let word_compat_setting = |name: &str| -> Option<String> {
@@ -2714,6 +2768,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && default_tab_stop.is_none()
         && character_spacing_control.is_none()
         && line_wrap_like_word6.is_none()
+        && do_not_use_html_paragraph_auto_spacing.is_none()
         && enable_open_type_features.is_none()
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
@@ -2730,6 +2785,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         default_tab_stop,
         character_spacing_control,
         line_wrap_like_word6,
+        do_not_use_html_paragraph_auto_spacing,
         enable_open_type_features,
         use_fe_layout,
         balance_single_byte_double_byte_width,
@@ -5507,6 +5563,8 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
         indent_first,
         space_before,
         space_after,
+        before_autospacing: base_para.before_autospacing,
+        after_autospacing: base_para.after_autospacing,
         line_spacing,
         numbering,
         tab_stops,
@@ -10892,6 +10950,7 @@ fn extract_simple_paragraph_text(
     Some(ShapeText {
         text,
         font_size_pt,
+        default_font_size: Some(mark_run.font_size.unwrap_or(DEFAULT_FONT_SIZE)),
         color,
         paragraph_mark_color: mark_run.color.clone(),
         font_family,
@@ -10902,6 +10961,12 @@ fn extract_simple_paragraph_text(
         alignment: normalize_align(&alignment).to_string(),
         space_before,
         space_after,
+        before_autospacing: direct_ind
+            .before_autospacing
+            .or(style_para.before_autospacing),
+        after_autospacing: direct_ind
+            .after_autospacing
+            .or(style_para.after_autospacing),
         line_spacing_val,
         line_spacing_rule,
         indent_left,
@@ -26940,6 +27005,38 @@ mod numbering_marker_font_tests {
             TablePositioningContext::Normal,
             LogicalTableSequenceContext::standalone(doc.root_element()),
         )
+    }
+
+    #[test]
+    fn table_kern_threshold_reaches_content_and_mark_with_direct_override() {
+        // ECMA-376 §17.7.6 table formatting feeds the same resolved rPr facts.
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{W_NS}">
+          <w:style w:type="table" w:styleId="Kern"><w:rPr><w:kern w:val="24"/></w:rPr></w:style>
+        </w:styles>"#
+        ));
+        let table = parse_tbl_styled(
+            r#"<w:tblPr><w:tblStyle w:val="Kern"/></w:tblPr>
+          <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>
+          <w:p><w:r><w:t>AV</w:t></w:r><w:r><w:rPr><w:kern w:val="0"/></w:rPr><w:t>To</w:t></w:r></w:p>
+          </w:tc></w:tr>"#,
+            &styles,
+        );
+        let CellElement::Paragraph(p) = &table.rows[0].cells[0].content[0] else {
+            panic!("paragraph")
+        };
+        let DocRun::Text(first) = &p.runs[0] else {
+            panic!("text")
+        };
+        let DocRun::Text(second) = &p.runs[1] else {
+            panic!("text")
+        };
+        assert_eq!(first.kerning, Some(12.0));
+        assert_eq!(second.kerning, Some(0.0));
+        assert_eq!(
+            p.paragraph_mark_font_facts.as_ref().unwrap().kerning,
+            Some(12.0)
+        );
     }
 
     fn cell_text_color(cell: &DocTableCell) -> Option<String> {

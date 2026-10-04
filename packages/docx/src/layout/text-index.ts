@@ -1,3 +1,4 @@
+import { sourceOwnedTextPlacements, type SourceOwnedTextGeometry } from './text-source-ownership.js';
 import {
   composeAffine,
   quarterTurnAffine,
@@ -20,11 +21,10 @@ import type {
   SourceRef,
   TableLayout,
   TextBoxLayout,
-  TextPlacement,
 } from './types.js';
 
 export interface TextRunGeometry {
-  readonly placement: TextPlacement;
+  readonly placement: SourceOwnedTextGeometry;
   readonly pointToPage: Matrix2DData;
   /** Canonical structural source of the owning paragraph. */
   readonly source: ParagraphLayout['source'];
@@ -381,8 +381,8 @@ function visitParagraph(
   }
   if (context.collectTextRuns || context.collectTextRunSources) {
     for (const line of paragraph.lines) {
-      for (const placement of line.placements) {
-        if (placement.kind === 'text') {
+      for (const retained of line.placements) {
+        if (retained.kind === 'text') for (const placement of sourceOwnedTextPlacements(retained)) {
           if (context.collectTextRuns) {
             context.runs.push(Object.freeze({
               placement,

@@ -285,6 +285,9 @@ pub struct EmbeddedFont {
 #[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSettings {
+    /// ECMA-376 Part 4 §14.8.3.15: fixed 5pt/10pt automatic paragraph margins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub do_not_use_html_paragraph_auto_spacing: Option<bool>,
     /// §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `None` means
     /// the element is absent; the spec default is ON, so the renderer treats
     /// `None` and `Some(true)` identically. `Some(false)` disables kinsoku.
@@ -909,6 +912,11 @@ pub struct DocParagraph {
     pub space_before: f64,
     /// pt
     pub space_after: f64,
+    /// ECMA-376 §17.3.1.33: resolved automatic margin toggle; false clears inheritance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_autospacing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_autospacing: Option<bool>,
     /// None = single (1.0), Some(LineSpacing)
     pub line_spacing: Option<LineSpacing>,
     /// Boxed: `NumberingInfo` carries several resolved strings (text + marker
@@ -2577,8 +2585,9 @@ pub struct TextRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<f64>,
     /// ECMA-376 §17.3.2.19 `<w:kern w:val>` — font-kerning threshold in POINTS
-    /// (the smallest font size that is kerned). Presence enables kerning; `None`
-    /// = kerning off (the hierarchy default). `Some(0.0)` = kern at all sizes.
+    /// (the smallest font size that is kerned). Preserve the resolved threshold,
+    /// including explicit zero, to override inherited values. DOCX layout owns
+    /// the WORD_KERN_THRESHOLD_AUTHORITY zero-disables compatibility extension.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kerning: Option<f64>,
     /// ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
@@ -2716,6 +2725,9 @@ pub struct ShapeTextRun {
 pub struct ShapeText {
     pub text: String,
     pub font_size_pt: f64,
+    /// Paragraph base/mark size is independent of the first content run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_font_size: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// Resolved run color of the paragraph mark. Kept separate from `color`,
@@ -2755,6 +2767,11 @@ pub struct ShapeText {
     /// pt — reserved below the paragraph. 0 when absent.
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub space_after: f64,
+    /// ECMA-376 §17.3.1.33: resolved automatic margin toggle; false clears inheritance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_autospacing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_autospacing: Option<bool>,
     /// ECMA-376 §17.3.1.33 `<w:spacing w:line>` line-spacing value, resolved
     /// through the style chain (incl. docDefaults). Encoded per `line_spacing_rule`:
     /// "auto" ⇒ a MULTIPLIER on the natural line box (276/240 = 1.15); "exact" /

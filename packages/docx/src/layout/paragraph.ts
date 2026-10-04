@@ -1,3 +1,5 @@
+import { revisionIsOmitted } from './revision-visibility.js';
+import { wordKerningApplies } from './line-compatibility.js';
 import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
@@ -1439,7 +1441,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning,
+    kerning: segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning),
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1513,9 +1515,7 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: segment.kerning === undefined
-        ? 'none'
-        : segment.fontSize >= segment.kerning ? 'normal' : 'none',
+      kerning: (segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning)) ? 'normal' : 'none',
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),
@@ -1865,6 +1865,7 @@ function textPlanSegment(
     anchorOccurrenceId?: string;
   }>,
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
+  sourceRuns?: TextPlacement['sourceRuns'],
 ): MeasuredTextPlanSegment | MeasuredAnchorHostPlanSegment {
   if (segment.metricOnly) {
     const sourceMetrics = selectedFaceSourceMetrics(segment);
@@ -1877,7 +1878,8 @@ function textPlanSegment(
         : {}),
     };
   }
-  const projected = textPlacement(segment, paragraph, sourceOffset, 0, 0, 0, 0);
+  const projected = { ...textPlacement(segment, paragraph, sourceOffset, 0, 0, 0, 0),
+    ...(sourceRuns ? { sourceRuns } : {}) };
   if (projected.kind !== 'text') throw new Error('Visible text segment projected as anchor host');
   const pitchPt = segLetterSpacingPx(segment, characterGrid, 1);
   const scaleX = segment.charScale ?? 1;
@@ -2230,10 +2232,19 @@ interface LogicalOccurrenceMap {
 function logicalOccurrenceMap(
   paragraph: ParagraphAcquisitionInput,
   measured: MeasuredParagraph,
+  showTrackedChanges: boolean | undefined,
 ): LogicalOccurrenceMap {
   const measuredLengths = new Map<number, number>();
+  const sequences = new Set<NonNullable<LayoutTextSeg['sourceTextSequence']>>();
   for (const line of measured.lines) {
     for (const segment of line.layout.segments) {
+      if (segment.sourceTextSequence) {
+        if (!sequences.has(segment.sourceTextSequence)) {
+          sequences.add(segment.sourceTextSequence);
+          for (const owner of segment.sourceTextSequence) measuredLengths.set(owner.runIndex, owner.end - owner.start);
+        }
+        continue;
+      }
       const runIndex = sourceRunIndex(segment);
       if (runIndex === undefined) continue;
       const length = 'text' in segment
@@ -2244,6 +2255,11 @@ function logicalOccurrenceMap(
     }
   }
   const runLengths = paragraph.runs.map((run, runIndex) => {
+    // Canonical sequence offsets cover displayed text only. Falling back to
+    // omitted source lengths would shift a later real-format sequence when
+    // the preceding visible text is partitioned into different source runs.
+    const kind = (run as { revision?: { kind?: string } }).revision?.kind;
+    if (revisionIsOmitted(kind, showTrackedChanges)) return 0;
     const measuredLength = measuredLengths.get(runIndex);
     if (measuredLength !== undefined) return measuredLength;
     if (run.type === 'text') return run.text.length;
@@ -2284,6 +2300,7 @@ function planMeasuredLines(
 ): readonly LineLayout[] {
   let sourceOffset = 0;
   const consumedByRun = new Map<number, number>();
+  const sequenceOwners = new Map<NonNullable<LayoutTextSeg['sourceTextSequence']>, number>();
   const hasExplicitTab = measured.lines.some((line) => line.layout.segments.some((segment) => 'isTab' in segment));
   const earliestTab = paragraph.tabStops?.reduce<(typeof paragraph.tabStops)[number] | undefined>(
     (earliest, stop) => !earliest || stop.pos < earliest.pos ? stop : earliest,
@@ -2314,10 +2331,13 @@ function planMeasuredLines(
       const runIndex = sourceRunIndex(segment);
       const sourceRun = runIndex === undefined ? undefined : paragraph.runs[runIndex];
       const occurrenceLength = segmentOccurrenceLength(segment);
-      const segmentOffset = runIndex === undefined
+      const sequence = segment.sourceTextSequence;
+      const segmentOffset = sequence
+        ? (occurrences.runStarts[sequence[0]!.runIndex] ?? sourceOffset) + (segment.sourceTextOffset ?? 0)
+        : runIndex === undefined
         ? sourceOffset
         : (occurrences.runStarts[runIndex] ?? sourceOffset) + (consumedByRun.get(runIndex) ?? 0);
-      if (runIndex !== undefined) {
+      if (runIndex !== undefined && !sequence) {
         consumedByRun.set(runIndex, (consumedByRun.get(runIndex) ?? 0) + occurrenceLength);
       }
       lineStartOffset = Math.min(lineStartOffset, segmentOffset);
@@ -2463,11 +2483,31 @@ function planMeasuredLines(
           heightPt: math.mathAscent + math.mathDescent, topOffsetPt: -math.mathAscent,
         });
       } else {
+        let sourceRuns: TextPlacement['sourceRuns'];
+        if (sequence) {
+          const localStart = segment.sourceTextOffset ?? 0;
+          const localEnd = localStart + occurrenceLength;
+          let index = sequenceOwners.get(sequence) ?? 0;
+          while (index < sequence.length && sequence[index]!.end <= localStart) index++;
+          sequenceOwners.set(sequence, index);
+          const owners: NonNullable<TextPlacement['sourceRuns']>[number][] = [];
+          for (; index < sequence.length && sequence[index]!.start < localEnd; index++) {
+            const owner = sequence[index]!;
+            const original = paragraph.runs[owner.runIndex];
+            owners.push({ sourceRunIndex: owner.runIndex,
+              range: { start: segmentOffset + Math.max(owner.start, localStart) - localStart,
+                end: segmentOffset + Math.min(owner.end, localEnd) - localStart },
+              ...(original?.type === 'field' ? { role: 'field-result' as const, dependency: fieldDependency(original) } : {}),
+            });
+          }
+          sourceRuns = owners;
+        }
         segments.push(textPlanSegment(
           segment as LayoutTextSeg, paragraph, segmentOffset,
           paragraphCharacterGrid(context),
           sourceRun,
           verticalGlyphMeasurement,
+          sourceRuns,
         ));
       }
       sourceOffset = Math.max(sourceOffset, segmentOffset + occurrenceLength);
@@ -2571,6 +2611,9 @@ function rebaseMeasuredLineRanges(
       return {
         ...placement,
         range,
+        ...(placement.sourceRuns ? { sourceRuns: placement.sourceRuns.map(owner => ({
+          ...owner, range: offsetRange(owner.range, delta),
+        })) } : {}),
         clusters: placement.clusters.map((cluster) => ({
           ...cluster,
           range: offsetRange(cluster.range, delta),
@@ -4413,7 +4456,9 @@ function paragraphAcquisitionKey(
       lineOnly ? null : environment.pageWritingMode,
       environment.verticalCJK ?? null,
       lineOnly ? null : environment.verticalPageFrame ?? null,
-      lineOnly ? null : environment.compatibilityMode ?? null,
+      // Mode changes the acquired zero-threshold and source-space shaping
+      // decisions even when no retained placement is requested.
+      environment.compatibilityMode ?? null,
       environment.documentHasEastAsianText,
       environment.useFeLayout ?? null,
       environment.balanceSingleByteDoubleByteWidth ?? null,
@@ -5014,7 +5059,7 @@ export function paragraphLayoutFromMeasurement(
     - planningContext.physicalIndentLeftPt
     - planningContext.physicalIndentRightPt
     - rightGridAdjustmentPt;
-  const occurrences = logicalOccurrenceMap(paragraph, measured);
+  const occurrences = logicalOccurrenceMap(paragraph, measured, options.environment.showTrackedChanges);
   const numberingPlan = options.continuesFromPrevious
     ? undefined
     : retainedNumberingPlan(paragraph, planningContext, options);

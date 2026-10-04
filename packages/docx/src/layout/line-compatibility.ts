@@ -43,14 +43,44 @@ export function wordPositionalTabReferenceBox(
     : { start: referenceStart, end: referenceEnd };
 }
 
-export const WORD_OPENTYPE_FEATURES_COMPAT_KERNING = defineCompatibilityRule({
-  id: 'word-opentype-features-compat-kerning',
+export const WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS = defineCompatibilityRule({
+  id: 'word-fixed-paragraph-auto-spacing-stored-margins',
   evidence: {
-    kind: 'regression-test',
-    reference: 'packages/docx/src/run-char-metrics-render.test.ts#enables absent-threshold kerning only under enableOpenTypeFeatures',
+    kind: 'office-observation',
+    syntheticFixtureId: 'paragraph-auto-spacing-stored-margin-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
   },
-  description: '[MS-DOCX] §2.3.3 stores enableOpenTypeFeatures as a named compatibility setting. When enabled, an unqualified run enables OpenType kerning; an explicit or style-resolved w:kern threshold remains authoritative. Both line measurement and paint use the same resolved threshold.',
+  description: 'With doNotUseHTMLParagraphAutoSpacing enabled, Word for Mac retains stored paragraph before/after spacing instead of imposing Part 4 §14.8.3.15 fixed 5pt/10pt automatic margins. Eighteen fixed-setting documents and eighteen HTML-setting counterexamples cover direct and inherited automatic flags, explicit false, missing/zero/5pt/20pt stored values, line-unit conflicts, adjacent automatic paragraphs and page edges. Three faces at 8/12/24pt and a separate 6/18/36pt Normal-style-size sweep show no face- or inline-size-dependent amount. The fixed-setting projection preserves the already resolved stored numerical margins; it does not invent a second line-unit interpreter. Without that setting, the separate consumer HTML-em policy remains unchanged. This is an approved Word compatibility choice, not the normative fixed-pair rule or a claim that other Office versions/HTML consumers share this behavior.',
 });
+
+export const WORD_KERN_THRESHOLD_AUTHORITY = defineCompatibilityRule({
+  id: 'word-kern-threshold-authority',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'kern-threshold-and-general-punctuation-slots',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'ECMA-376 §17.3.2.19 makes the resolved style-cascade w:kern threshold authoritative: absence at every level disables kerning and size below the threshold disables it. In 56 informative mode-15 controls (42 boundary rows and 14 calibrations), Word additionally disables a zero threshold; positive thresholds below/equal/above 8–20pt run sizes follow the size comparison, independently of enableOpenTypeFeatures. Twelve null-adjustment controls cannot identify the switch. In mode 15, same-face T + U+0020 across identically formatted source runs retains the font pair adjustment. Zero thresholds in other or omitted modes preserve the previous size comparison; no evidence supports extending the zero-disables observation. Numbering glyphs and paragraph marks have no measured zero-threshold evidence and retain the previous comparison in every mode. There is no new Office observation for direct letter-pair splits, changed formatting/fonts, explicit w:spacing, other compatibility modes, or unadjusted positive-threshold flag comparisons. Separately, library policy acquires formatting-only source splits as one text sequence in every mode (run-split-invariance.test.ts), preserving semantic run units and independently scoped substitute faces; this invariance is not a broader Office compatibility claim. Three fit contradictions and one flag-dependent break do not establish a different kerning switch or a shaping-table preference. The zero-disables extension is library compatibility policy beyond the normative positive-threshold rule; no font-specific amount is inferred.',
+});
+
+/** Threshold is already resolved by the parser (including explicit zero).
+ * WORD_KERN_THRESHOLD_AUTHORITY supplies the mode-15 zero-disables extension;
+ * zero in other/omitted modes retains the previous size comparison because
+ * those modes have no measured zero-threshold boundary/counterexample evidence.
+ * The positive size comparison and absence default are ECMA-376 §17.3.2.19.
+ * Compare declared size, before small-caps/super/subscript paint transforms. */
+export function wordKerningApplies(
+  fontSizePt: number,
+  thresholdPt: number | null | undefined,
+  compatibilityMode?: number,
+): boolean {
+  return thresholdPt != null && fontSizePt >= thresholdPt
+    && (thresholdPt > 0 || (thresholdPt === 0 && compatibilityMode !== 15));
+}
 
 export const WORD_NUMBERING_MARKER_FIRST_LINE_UNION = defineCompatibilityRule({
   id: 'word-numbering-marker-first-line-union',
@@ -310,14 +340,23 @@ export const WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION = defineCompatibilityRu
   description: 'Keep leading whitespace used as a first-line text indent fixed while distributing justified-line slack across content in a left-to-right line.',
 });
 
-export const WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT = defineCompatibilityRule({
-  id: 'word-justified-candidate-separator-fit',
+export const WORD_COLLAPSIBLE_LINE_EDGE_VISIBLE_FIT = defineCompatibilityRule({
+  id: 'word-collapsible-line-edge-visible-fit',
   evidence: {
     kind: 'regression-test',
-    reference: 'packages/docx/src/justify-shrink-overshoot.test.ts#counts a candidate trailing space when the prospective line will justify',
+    reference: 'packages/docx/src/run-split-invariance.test.ts#fits the visible justified prefix across a real formatting boundary in mode 14',
   },
-  description: 'On a full paragraph-width line that will be fully justified, include the candidate word separator in its wrap-fit width; lines narrowed by DrawingML wrap exclusions retain collapsible line-end separator fit behavior.',
+  description: 'Library fitting uses the visible prefix, excluding a collapsible U+0020 edge separator. ST_Jc (§17.18.44) defines inter-word justification, not an edge-space admission charge. Word mode-14 mixed-format Latin output retains a naturally fitting prefix when only its edge separator exceeds the band; mode-15 compression controls use the same visible prefix. Canonical joining must not turn formatting-only source seams into different admission decisions. This replaces an unsupported separator-charge policy, without adding compression to older modes. RTL separately retains the complete advance because its right-edge origin can otherwise move visible LTR cells outside the band. Other glyphs and authored fixed-width/atomic units retain their existing fit contracts.',
 });
+
+/** Visible-prefix projection of {@link WORD_COLLAPSIBLE_LINE_EDGE_VISIBLE_FIT}. */
+export function wordVisiblePrefixFitWidthPx(
+  widthPx: number,
+  trailingSpacePx: number,
+  baseRtl: boolean,
+): number {
+  return widthPx - (baseRtl ? 0 : trailingSpacePx);
+}
 
 export const WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS = defineCompatibilityRule({
   id: 'word-overflow-punctuation-language-sets',
@@ -445,7 +484,7 @@ export const WORD_COMPRESSED_SPACE_LINE_FIT = defineCompatibilityRule({
     version: '16.113.3',
     platform: 'macOS 27.0',
   },
-  description: 'Issue #1660 controls (1773 Word-exported fixed-cell lines: 576 coarse, 595 fine one-twip, 602 hypothesis-targeted) establish U+0020 fitting on lines mixing East Asian and Latin text, which WORD_LATIN_INTERWORD_XAVG_FLOOR (homogeneous Latin lines, unchanged) never compresses. In compatibility modes 12 and 14 with characterSpacingControl compressPunctuation or compressPunctuationAndJapaneseKana, every U+0020 on such a line shrinks by the same amount (single, consecutive and source-run-split spaces alike) while ideographs, kana and other glyphs keep their natural advances; enableOpenTypeFeatures and explicit w:kern thresholds do not gate it, and left, both and distribute alignment behave alike. Each space keeps at least min(xAvgCharWidth / 2, font size / 4) of its own face: Arial and Times New Roman spaces follow half their OS/2 xAvgCharWidth, while BIZ UDGothic, Meiryo and Yu Gothic (xAvgCharWidth 0.84-0.96 em) and BIZ derivatives with only post.isFixedPitch or only the far-east code-page bits changed all stop at a quarter em, rejecting fixed-pitch, code-page and weighted-lowercase-average selectors. A candidate whose last character before trailing closing punctuation is East Asian is admitted only while its natural overflow, measured without that trailing punctuation, is at most half the font size: a final ideograph or half-width kana admits 0.5 em of overflow at 8.5/10.5/16 pt, a final kana followed by a full-width closing parenthesis keeps that limit before the parenthesis (which keeps half its cell at the line end), and a final Latin word has no limit beyond the space floors. characterSpacingControl omitted or doNotCompress and compatibility mode 15 keep natural spaces on mixed lines; lineWrapLikeWord6 ([MS-OE376] §2.1.472) and an omitted compatibility mode are outside the projection. Mode-15 justified mixed lines (Word admits 2.60pt of overflow over four 4.25pt spaces but not 2.65pt) are unexplained and keep natural fitting. No control contains U+3000, whose line-end hanging (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) this observation does not define, so a paragraph holding U+3000 keeps the unchanged line breaker. Two measured inputs the renderer does not reproduce also keep it, paragraph-wide and read on the joined text: §17.3.1.2-3 automatic spacing enabled beside an ideograph or kana (Word adds 2.125pt between it and a Latin letter or digit; the renderer has no autospace), and a compressible closing mark directly followed by U+0020 (Word keeps the full cell; the renderer compresses it under WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL).',
+  description: 'Issue #1660 controls (1773 Word-exported fixed-cell lines: 576 coarse, 595 fine one-twip, 602 hypothesis-targeted) establish U+0020 fitting on lines mixing East Asian and Latin text, which WORD_LATIN_INTERWORD_XAVG_FLOOR (homogeneous Latin lines, unchanged) never compresses. In compatibility modes 12 and 14 with characterSpacingControl compressPunctuation or compressPunctuationAndJapaneseKana, every U+0020 on such a line shrinks by the same amount (single, consecutive and source-run-split spaces alike) while ideographs, kana and other glyphs keep their natural advances; enableOpenTypeFeatures and explicit w:kern thresholds do not gate it, and left, both and distribute alignment behave alike. Each space keeps at least min(xAvgCharWidth / 2, font size / 4) of its own face: Arial and Times New Roman spaces follow half their OS/2 xAvgCharWidth, while BIZ UDGothic, Meiryo and Yu Gothic (xAvgCharWidth 0.84-0.96 em) and BIZ derivatives with only post.isFixedPitch or only the far-east code-page bits changed all stop at a quarter em, rejecting fixed-pitch, code-page and weighted-lowercase-average selectors. A candidate whose last character before trailing closing punctuation is East Asian is admitted only while its natural overflow, measured without that trailing punctuation, is at most half the font size: a final ideograph or half-width kana admits 0.5 em of overflow at 8.5/10.5/16 pt, a final kana followed by a full-width closing parenthesis keeps that limit before the parenthesis (which keeps half its cell at the line end), and a final Latin word has no limit beyond the space floors. characterSpacingControl omitted or doNotCompress and compatibility mode 15 keep natural spaces on mixed lines; lineWrapLikeWord6 ([MS-OE376] §2.1.472) and an omitted compatibility mode are outside the projection. Mode-15 justified mixed lines (Word admits 2.60pt of overflow over four 4.25pt spaces but not 2.65pt) are unexplained and keep natural fitting. No control contains U+3000, whose line-end hanging (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) this observation does not define, so paragraphs holding U+3000 are ineligible for this compression rule; formatting-only source seams are still normalized before ordinary fitting. Two measured inputs the renderer does not reproduce also keep it, paragraph-wide and read on the joined text: §17.3.1.2-3 automatic spacing enabled beside an ideograph or kana (Word adds 2.125pt between it and a Latin letter or digit; the renderer has no autospace), and a compressible closing mark directly followed by U+0020 (Word keeps the full cell; the renderer compresses it under WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL).',
 });
 
 /** Document gate of {@link WORD_COMPRESSED_SPACE_LINE_FIT}: an authored
@@ -607,18 +646,6 @@ export function wordIsOverflowPunctuation(
     return ALL_WORD_OVERFLOW_PUNCTUATION.has(character);
   }
   return parentRunHasLatinText && LATIN_WORD_OVERFLOW_PUNCTUATION.has(character);
-}
-
-/** Compatibility projection governed by {@link WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT}. */
-export function wordCandidateFitWidthPx(input: Readonly<{
-  widthPx: number;
-  trailingSpacePx: number;
-  lineWillJustify: boolean;
-  wrapNarrowed?: boolean;
-}>): number {
-  return input.lineWillJustify && input.wrapNarrowed !== true
-    ? input.widthPx
-    : input.widthPx - input.trailingSpacePx;
 }
 
 export const WORD_RUBY_PARAGRAPH_UNIFORM_LINE_ADVANCE = defineCompatibilityRule({

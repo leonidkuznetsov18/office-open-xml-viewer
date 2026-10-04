@@ -14,7 +14,8 @@ import {
   resolveSectionLayoutContext,
   type ParagraphLayoutContext,
 } from './layout-context.js';
-import type { TextLayoutService } from './layout/text.js';
+import { createTextLayoutService, type TextLayoutService } from './layout/text.js';
+import { createFontResolver } from './layout/font-service.js';
 import type {
   BodyElement,
   CellElement,
@@ -654,6 +655,21 @@ describe('table intrinsic content widths', () => {
     expect(retainedNested.flowBounds.widthPt).toBe(120);
   });
 
+  it.each([undefined, 0, 8, 10, 12])('uses threshold %s in AutoFit intrinsic widths', (kerning) => {
+    const ctx = measuringContext((text) => [...text].length * 10
+      - (ctx.fontKerning === 'normal' && text.includes('AV') ? 2 : 0));
+    const run = { ...textRun('AV'), kerning };
+    const source = paragraph([run]);
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const widths = measureParagraphIntrinsicWidths(source, intrinsicContext(), 200,
+      { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, layoutServices: services, enableOpenTypeFeatures: true,
+        compatibilityMode: 15 });
+    expect(widths).toEqual(kerning === 8 || kerning === 10
+      ? { minWidthPt: 18, maxWidthPt: 18 } : { minWidthPt: 20, maxWidthPt: 20 });
+  });
+
   it('shapes identical formatting across a run seam as one proportional atom', () => {
     const ctx = measuringContext((text) => text === 'AV' ? 15 : [...text].length * 10);
     const source = table([row([cell([
@@ -661,6 +677,78 @@ describe('table intrinsic content widths', () => {
     ])])], [0]);
 
     expect(resolveColumnWidths(source, 200, columnState(ctx))).toEqual([15]);
+  });
+
+  it.each([
+    { parts: ['T', ' i'], kerning: 8, min: 10, max: 20 },
+    { parts: ['T ', 'i'], kerning: 8, min: 10, max: 20 },
+    { parts: ['T', ' ', 'i'], kerning: 8, min: 10, max: 20 },
+    { parts: ['A', 'T', ' i'], kerning: 8, min: 18, max: 28 },
+    { parts: ['T', ' iT', ' i'], kerning: 8, min: 11, max: 40 },
+    { parts: [' ', 'T', ' i', ' '], kerning: 8, min: 10, max: 40 },
+    { parts: ['T', ' i'], kerning: 10, min: 10, max: 20 },
+    { parts: ['T', ' i'], kerning: 10.5, min: 10, max: 21 },
+    { parts: ['T', ' i'], kerning: 0, min: 10, max: 21 },
+  ])('measures trimmed atoms independently of run splits: $parts / kern=$kerning', ({ parts, kerning, min, max }) => {
+    // Independent pair-sensitive metrics expose both the removed T-space pair
+    // and the AT pair inside an unbreakable atom; no font installation needed.
+    const ctx = measuringContext((text) => [...text].reduce((sum, c) => sum + (c === 'i' ? 1 : 10), 0)
+      - (ctx.fontKerning === 'normal'
+        ? (text.match(/T /gu)?.length ?? 0) + 2 * (text.match(/AT/gu)?.length ?? 0) : 0));
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const widths = (texts: string[]) => measureParagraphIntrinsicWidths(
+      paragraph(texts.map((text) => ({ ...textRun(text), kerning }))),
+      intrinsicContext(), 200, { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, compatibilityMode: 15, layoutServices: services },
+    );
+    expect(widths([parts.join('')])).toEqual({ minWidthPt: min, maxWidthPt: max });
+    expect(widths(parts)).toEqual({ minWidthPt: min, maxWidthPt: max });
+  });
+
+  it.each(['font', 'formatting', 'threshold'])('retains a real %s boundary before a source-run space', (boundary) => {
+    const ctx = measuringContext((text) => [...text].reduce((sum, c) => sum + (c === 'i' ? 1 : 10), 0)
+      - (ctx.fontKerning === 'normal' && text.includes('T ') ? 1 : 0));
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const runs = [
+      { ...textRun('T'), kerning: 8 },
+      { ...textRun(' i'), kerning: 8,
+        ...(boundary === 'font' ? { fontFamily: 'sans-serif' }
+          : boundary === 'formatting' ? { bold: true } : { kerning: 10.5 }) },
+    ];
+    expect(measureParagraphIntrinsicWidths(paragraph(runs), intrinsicContext(), 200,
+      { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, compatibilityMode: 15, layoutServices: services },
+    )).toEqual({ minWidthPt: 10, maxWidthPt: 21 });
+  });
+
+  it('removes separator context from a minimum atom when scoped-font ownership prevents merging', () => {
+    const ctx = measuringContext();
+    const base = createLayoutServices(model([]), { measureContext: ctx });
+    // Use the real scope classifier: even excluded Latin ranges retain their
+    // separate full-run contexts and cannot be merged across source runs.
+    const services = Object.freeze({ ...base, text: createTextLayoutService({
+      fonts: createFontResolver([
+        { requestedFamily: 'Scoped Face', resolvedFamily: 'Arabic Substitute',
+          source: 'substitute', script: 'arabic' },
+      ], { scriptScopedFamilies: { 'scoped face': {
+        script: 'arabic', substituteFamilies: ['Arabic Substitute'],
+      } } }),
+      measurer: { fingerprint: 'intrinsic-scoped-space', measure: (request) => ({
+        advancePt: [...request.text].reduce((sum, c) => sum + (c === 'i' ? 1 : 10), 0)
+          - (request.kerning && request.text.includes('T ') ? 1 : 0),
+        ascentPt: 8, descentPt: 2,
+      }) },
+    }) });
+    const widths = (texts: string[]) => measureParagraphIntrinsicWidths(
+      paragraph(texts.map((text) => ({ ...textRun(text), kerning: 8, fontFamily: 'Scoped Face' }))),
+      intrinsicContext(), 200, { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, compatibilityMode: 15, layoutServices: services },
+    );
+    expect(widths(['T i'])).toEqual({ minWidthPt: 10, maxWidthPt: 20 });
+    expect(widths(['T', ' i'])).toEqual({ minWidthPt: 10, maxWidthPt: 20 });
   });
 
   it('retains every rebased punctuation compression across compatible run seams', () => {

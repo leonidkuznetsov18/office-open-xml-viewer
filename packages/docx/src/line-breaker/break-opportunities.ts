@@ -1,5 +1,4 @@
 import { measureFitTextUnit, measureJoinedTextUnit } from './atomic-units.js';
-import { justifiedCandidateFitWidth } from './justify-fit.js';
 import {
   kinsokuAdjustedSplit,
   isGraphemeFillText,
@@ -11,6 +10,7 @@ import { EAST_ASIAN_RE } from '../layout/text.js';
 import {
   wordIsOverflowPunctuation,
   wordIdeographicSpaceLineEndAllowanceCount,
+  wordVisiblePrefixFitWidthPx,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -50,6 +50,7 @@ import { LineGapRejection, type PassOperationState } from './pass-operations.js'
 /** The iterator reads only its declared slice of the explicit pass state. */
 export type BreakOpportunityIteratorContext = Pick<
   PassOperationState,
+  | 'reservePrefixWork'
   | 'breakerState'
   | 'flush'
   | 'baseRtl'
@@ -94,7 +95,7 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'strNaturalAdvance'
   | 'retractCurrentLineForLeadingKinsoku'
   | 'keepLeadingKinsokuWithCurrentLine'
-  | 'externalLinkSyntaxSplit'
+  | 'explicitTextSplit'
   | 'queueEmergencyTail'
   | 'forcedPlacement'
   | 'minimalLegalTextWidth'
@@ -362,16 +363,8 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   const fitWidthFor = (
     widthPx: number,
     trailingSpacePx: number,
-    next: LayoutSeg | undefined,
-  ): number =>
-    justifiedCandidateFitWidth(widthPx, context.baseRtl ? 0 : trailingSpacePx, next, {
-      isJustified,
-      stretchLastLine,
-      lineMaxWidth: breakerState.lineMaxWidth,
-      lineXOffset: breakerState.lineXOffset,
-      maxWidth,
-    });
-  const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW, breakerState.queue.peek());
+  ): number => wordVisiblePrefixFitWidthPx(widthPx, trailingSpacePx, context.baseRtl);
+  const wForFit = fitWidthFor(prospectiveWidth, trailingSpaceW);
   // ECMA-376 §17.3.1.33 does not prescribe a line-breaking tolerance.
   // Word-for-Mac controls with Calibri and Arial, left/center/right aligned
   // 10pt table cells, wrap a trailing Latin word below its natural advance
@@ -404,7 +397,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // stays a pure "this is a non-starter" marker; the atomic-vs-breakable decision lives here. A
   // non-breakable Latin / small-caps lead is genuinely atomic, so the pre-flush
   // (and the over-long-word char-break path below) still applies there.
-  prepareAtomicTextFit(context, { s, w, trailingSpaceW, sDictSea, fitWidthFor });
+  if (prepareAtomicTextFit(context, { s, w, trailingSpaceW, sDictSea, fitWidthFor })) return;
 
   // §17.3.1.21 permits one eligible punctuation character past the text
   // extent. The isolated compatibility predicate owns both the CJK-language
@@ -929,6 +922,15 @@ function fitMixedSpaces(
   return true;
 }
 
+/** Whole-word admission at a CJK boundary precedes any ordinary hyphen
+ * fallback. Evaluate at the word's origin, before a formatting prefix is placed. */
+function prefersWholeWordAtScriptBoundary(context: BreakOpportunityIteratorContext, s: LayoutTextSeg): boolean {
+  const previous = context.breakerState.currentLine.at(-1);
+  const previousChar = previous && 'text' in previous ? [...previous.text].at(-1) : undefined;
+  return s.hyperlink?.kind !== 'external' && previousChar !== undefined
+    && hasCJKBreakOpportunity(previousChar) && !hasCJKBreakOpportunity(s.text);
+}
+
 function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextFitFrame): void {
   const {
     breakerState,
@@ -940,7 +942,7 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     appendQueuedIdeographicSpaceSegment,
     emergencyTextSplit,
     strNaturalAdvance,
-    externalLinkSyntaxSplit,
+    explicitTextSplit,
     queueEmergencyTail,
   } = context;
   const {
@@ -981,9 +983,9 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     // than a full line, fit the widest character prefix (at least one
     // character), draw it, and re-queue the remainder. Segments are already
     // space-delimited, so this cannot bypass an ordinary space opportunity.
-    const semanticSplit = externalLinkSyntaxSplit(s, availW());
+    const semanticSplit = explicitTextSplit(s, availW());
     const split = semanticSplit || emergencyTextSplit(s, availW());
-    // A URL syntax opportunity is a legal break; any other split is forced,
+    // An explicit hyphen/URL opportunity is a legal break; any other split is forced,
     // and so is a retained prefix (even one whole grapheme) wider than the gap.
     if ((semanticSplit === 0 && split < s.text.length)
       || placedAdvanceExceeds(context, s, s.text.slice(0, split))) {
@@ -1013,7 +1015,8 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
       queueEmergencyTail(s, split);
     }
   } else {
-    const semanticSplit = externalLinkSyntaxSplit(s, availW() - breakerState.currentWidth);
+    const semanticSplit = prefersWholeWordAtScriptBoundary(context, s)
+      ? 0 : explicitTextSplit(s, availW() - breakerState.currentWidth);
     if (semanticSplit > 0 && semanticSplit < s.text.length) {
       const prefix = s.text.slice(0, semanticSplit);
       const pw = strNaturalAdvance(s, prefix);
@@ -1096,13 +1099,30 @@ function prepareAtomicTextFit(
     sDictSea: boolean;
     fitWidthFor: (widthPx: number, trailingSpacePx: number, next: LayoutSeg | undefined) => number;
   },
-): void {
+): boolean {
   const { breakerState, flush, availW, segAdvance, strAdvance } = context;
   const { s, w, trailingSpaceW, sDictSea, fitWidthFor } = frame;
+  const preferWholeWord = prefersWholeWordAtScriptBoundary(context, s);
+  const follower = breakerState.queue.peek() as LayoutTextSeg | undefined;
+  // A leader's own internal opportunity ends the admission unit. If its
+  // full segment fits but the next legal follower prefix does not, select
+  // that opportunity before placing the leader; otherwise the tail forces overflow.
+  if (!preferWholeWord && s.explicitBreaks && follower?.joinPrev) {
+    const whole = measureJoinedTextUnit(s, breakerState.queue, context, w, trailingSpaceW, 0, false, 'whole-leader');
+    if (breakerState.currentWidth + fitWidthFor(whole.width, whole.trailingSpace, whole.next) > availW()) {
+      const split = context.explicitTextSplit(s, availW() - breakerState.currentWidth);
+      if (split > 0 && split < s.text.length) {
+        context.queueEmergencyTail(s, split);
+        breakerState.queue.unshift({ ...s, ...RESET_SLICED_TEXT_MEASUREMENT,
+          text: s.text.slice(0, split), ...slicedTextMetadata(s, 0, split) });
+        return true;
+      }
+    }
+  }
   if (
     !s.joinPrev &&
     breakerState.currentLine.length > 0 &&
-    (breakerState.queue.peek() as LayoutTextSeg | undefined)?.joinPrev &&
+    (follower?.joinPrev || preferWholeWord && follower?.explicitBreakBefore) &&
     ((breakerState.queue.peek() as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
       !hasCJKBreakOpportunity(s.text)) &&
     // A SEA (Thai/Lao/Khmer) lead with usable word breaks is NOT atomic — the
@@ -1110,7 +1130,7 @@ function prepareAtomicTextFit(
     ((breakerState.queue.peek() as LayoutTextSeg | undefined)?.hardJoinPrev === true ||
       !(s.seaBreaks && s.seaBreaks.length > 0))
   ) {
-    const group = measureJoinedTextUnit(s, breakerState.queue, context, w, trailingSpaceW);
+    const group = measureJoinedTextUnit(s, breakerState.queue, context, w, trailingSpaceW, 0, false, preferWholeWord ? 'whole-word' : 'prefix');
     const groupFitWidth = fitWidthFor(group.width, group.trailingSpace, group.next);
     if (
       breakerState.currentWidth + groupFitWidth > availW() &&
@@ -1174,6 +1194,7 @@ function prepareAtomicTextFit(
       flush(undefined, false, s.src);
     }
   }
+  return false;
 }
 
 function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextFitFrame): void {

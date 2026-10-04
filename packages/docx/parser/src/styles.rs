@@ -159,10 +159,11 @@ pub struct RunFmt {
     /// ECMA-376 §17.3.2.19 `<w:kern w:val>` — the SMALLEST font size (threshold)
     /// that has automatic font kerning applied; a run whose `sz` is below this
     /// value is not kerned. Stored in POINTS (source is ST_HpsMeasure =
-    /// half-points). Presence itself enables kerning (subject to the threshold);
+    /// half-points). Positive presence enables kerning (subject to the threshold);
     /// `None` = inherit, and "never set in the hierarchy" ⇒ no kerning at all
     /// (Word's default is OFF, unlike Canvas's default `fontKerning='auto'`).
-    /// `Some(0.0)` = kern at every size.
+    /// `Some(0.0)` preserves an explicit override: DOCX layout applies the
+    /// WORD_KERN_THRESHOLD_AUTHORITY zero-disables compatibility extension.
     pub kerning: Option<f64>,
     /// ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — "Horizontal in Vertical
     /// (Rotate Text)" (縦中横 / tate-chū-yoko). When `Some(true)`, in a VERTICAL
@@ -205,6 +206,10 @@ pub struct ParaFmt {
     pub indent_first: Option<f64>, // pt
     pub space_before: Option<f64>, // pt
     pub space_after: Option<f64>,  // pt
+    /// ECMA-376 §17.3.1.33: per-side automatic margin toggles inherit independently;
+    /// an explicit false clears an inherited true without discarding stored twips.
+    pub before_autospacing: Option<bool>,
+    pub after_autospacing: Option<bool>,
     pub line_spacing_val: Option<f64>,
     pub line_spacing_rule: Option<String>,
     /// True when `w:spacing/@w:line` was declared on the paragraph's own pPr
@@ -985,6 +990,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.space_after.is_some() {
         dst.space_after = src.space_after;
     }
+    if src.before_autospacing.is_some() {
+        dst.before_autospacing = src.before_autospacing;
+    }
+    if src.after_autospacing.is_some() {
+        dst.after_autospacing = src.after_autospacing;
+    }
     if src.line_spacing_val.is_some() {
         dst.line_spacing_val = src.line_spacing_val;
     }
@@ -1340,8 +1351,13 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         fmt.alignment = attr_w(jc, "val");
     }
 
-    // Spacing
+    // Spacing. §17.3.1.33 gives an active automatic flag priority over both
+    // absolute and line-unit margins. Inactive beforeLines/afterLines spacing
+    // remains unsupported: retain the existing absolute-value fallback instead
+    // of guessing a line-height conversion here.
     if let Some(sp) = child_w(ppr, "spacing") {
+        fmt.before_autospacing = on_off_attr(sp, "beforeAutospacing");
+        fmt.after_autospacing = on_off_attr(sp, "afterAutospacing");
         if let Some(v) = attr_w(sp, "before") {
             fmt.space_before = Some(twips_to_pt(&v));
         }
@@ -2249,9 +2265,10 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
     }
 
     // Font kerning threshold (ECMA-376 §17.3.2.19 `<w:kern w:val>`). ST_HpsMeasure
-    // (half-points) — the SMALLEST font size that has kerning applied. The mere
-    // presence of the element turns kerning on (subject to the threshold); Word's
-    // hierarchy default is OFF. `w:val="0"` = kern at all sizes. Stored in points.
+    // (half-points) — the SMALLEST font size that has kerning applied. A
+    // positive threshold enables kerning when size qualifies; absence inherits.
+    // Preserve zero, which overrides inheritance; layout owns its compatibility
+    // interpretation (WORD_KERN_THRESHOLD_AUTHORITY). Stored in points.
     if let Some(kern) = child_w(rpr, "kern") {
         if let Some(v) = attr_w(kern, "val") {
             fmt.kerning = half_pt_to_pt(&v);
@@ -3822,8 +3839,7 @@ mod tests {
         // size that gets kerning. Spec example `<w:kern w:val="28"/>` == 14 pt.
         let f = run_fmt_from(r#"<w:kern w:val="28"/>"#);
         assert_eq!(f.kerning, Some(14.0));
-        // val="0" (common in Word documents) = kern at every size — presence,
-        // not absence, so it must be Some(0.0) to keep kerning enabled.
+        // Explicit zero must survive parsing to override an inherited threshold.
         let f = run_fmt_from(r#"<w:kern w:val="0"/>"#);
         assert_eq!(f.kerning, Some(0.0));
         let f = run_fmt_from(r#"<w:kern w:val="12pt"/>"#);

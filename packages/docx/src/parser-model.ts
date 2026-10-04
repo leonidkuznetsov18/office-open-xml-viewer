@@ -1,3 +1,5 @@
+import { resolveAutomaticParagraphMarginsPt } from './layout/paragraph-spacing.js';
+import { wordKerningApplies } from './layout/line-compatibility.js';
 import type {
   BodyElement,
   DocParagraph,
@@ -1369,7 +1371,10 @@ export function numberingMarkerShapeInput(
     complexScript,
     fontHint: facts?.fontHint,
     eastAsiaLanguage: facts?.langEastAsia,
-    kerning: facts?.kerning == null ? undefined : fontSizePt >= facts.kerning,
+    // Marker-specific zero-threshold observations are absent. Preserve its
+    // previous size comparison; the mode-15 content-run extension is not
+    // evidence for generated numbering glyphs.
+    kerning: wordKerningApplies(fontSizePt, facts?.kerning),
   });
 }
 
@@ -1427,7 +1432,8 @@ export function paragraphMarkShapeInput(
     complexScript,
     fontHint: facts.fontHint,
     eastAsiaLanguage: facts.langEastAsia,
-    kerning: facts.kerning == null ? undefined : fontSizePt >= facts.kerning,
+    // Paragraph marks likewise have no measured zero-threshold evidence.
+    kerning: wordKerningApplies(fontSizePt, facts.kerning),
   });
 }
 
@@ -1531,6 +1537,9 @@ export function paragraphAcquisitionInput(
       const internal = run as Partial<InternalMathRun>;
       return Object.freeze({
         type: 'math',
+        // §17.13.5 revision containers also wrap OMML. Resource acquisition
+        // must preserve omission/markup ownership independently of math content.
+        ...(run.revision ? { revision: Object.freeze({ ...run.revision }) } : {}),
         display: run.display,
         fontSize: run.fontSize,
         ...(run.jc === undefined ? {} : { jc: run.jc }),
@@ -1718,10 +1727,23 @@ function normalizeInternalDocumentModelWithOwnership(
           runs.push(run);
           return;
         }
-        const shape = run as InternalShapeRun;
+        let shape = run as Extract<DocRun, { type: 'shape' }> & InternalShapeRun;
+        if (shape.textBlocks?.some(block => block.beforeAutospacing === true || block.afterAutospacing === true)) {
+          const textBlocks = shape.textBlocks.map(block => {
+            const spacing = resolveAutomaticParagraphMarginsPt(
+              block, block.defaultFontSize ?? block.fontSizePt, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true,
+            );
+            return spacing.spaceBefore === block.spaceBefore && spacing.spaceAfter === block.spaceAfter
+              ? block : { ...block, ...spacing };
+          });
+          if (textBlocks.some((block, index) => block !== shape.textBlocks?.[index])) {
+            shape = { ...shape, textBlocks };
+            runsChanged = true;
+          }
+        }
         const content = shape.textBoxContent;
         if (content === undefined) {
-          runs.push(run);
+          runs.push(shape as DocRun);
           return;
         }
         const shapeSource: SourceRef = {
@@ -1747,25 +1769,32 @@ function normalizeInternalDocumentModelWithOwnership(
           textBoxContent[blockIndex] = normalized;
         });
         if (!contentChanged) {
-          runs.push(run);
+          runs.push(shape as DocRun);
           return;
         }
         runsChanged = true;
         if (consumeOwned) {
           shape.textBoxContent = textBoxContent;
-          runs.push(run as DocRun);
+          runs.push(shape as DocRun);
         } else {
-          runs.push({ ...run, textBoxContent } as DocRun);
+          runs.push({ ...shape, textBoxContent } as DocRun);
         }
       });
+      const spacing = resolveAutomaticParagraphMarginsPt(
+        element, element.defaultFontSize ?? 10,
+        doc.settings?.doNotUseHtmlParagraphAutoSpacing === true,
+      );
+      const spacingChanged = spacing.spaceBefore !== element.spaceBefore
+        || spacing.spaceAfter !== element.spaceAfter;
       let paragraph: Extract<BodyElement, { type: 'paragraph' }>;
       if (consumeOwned) {
         if (runsChanged) Object.assign(element, { runs });
+        if (spacingChanged) Object.assign(element, spacing);
         delete (element as InternalDocParagraph).__runRevisions;
         paragraph = element;
-      } else if (runsChanged) {
+      } else if (runsChanged || spacingChanged) {
         const { __runRevisions: _privateRunRevisions, ...publicParagraph } = internalParagraph;
-        paragraph = { ...publicParagraph, runs } as Extract<BodyElement, { type: 'paragraph' }>;
+        paragraph = { ...publicParagraph, ...spacing, runs } as Extract<BodyElement, { type: 'paragraph' }>;
       } else {
         paragraph = element;
       }

@@ -165,6 +165,7 @@ export type ParagraphTextBearingRun =
 
 export type ParagraphMathRun = Readonly<{
   type: 'math';
+  revision?: DeepReadonly<DocRun['revision']>;
   display: boolean;
   fontSize: number;
   jc?: string;
@@ -437,6 +438,9 @@ export interface TextLayoutService {
   readonly localMetrics: Readonly<Record<string, Readonly<ResolvedFontMetric>>>;
   resolve(request: Readonly<TextFontResolveRequest>): FontResolution;
   shape(request: Readonly<TextShapeRequest>): TextShapeResult;
+  /** Per-source script-substitute proof, when configured. A mixed scope stays
+   * a semantic face-selection boundary; plain runs return no scope key. */
+  sourceScopeKey?(request: Readonly<TextShapeRequest>): string | undefined;
 }
 
 export interface TextLayoutServiceInput {
@@ -656,6 +660,8 @@ function scriptSlot(
   else if (codePoint >= 0x1e00 && codePoint <= 0x1eff) {
     tableSlot = hintedEastAsia && chinese ? 'eastAsia' : 'highAnsi';
   } else if (
+    // §17.3.2.26 General Punctuation: U+2014 follows hint, not language
+    // alone. Omitted/default hint selects highAnsi; eastAsia selects eastAsia.
     (codePoint >= 0x2000 && codePoint <= 0x27bf)
     || (codePoint >= 0xe000 && codePoint <= 0xf8ff)
     || (codePoint >= 0xfb00 && codePoint <= 0xfb1c)
@@ -861,6 +867,17 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     fontMetrics,
     localMetrics: fontMetrics,
     resolve,
+    sourceScopeKey(request: Readonly<TextShapeRequest>): string | undefined {
+      if (!SCOPE_SLOTS.some(slot => input.fonts.scopedSubstituteScript?.(
+        requestedFamily(request, slot), request.weight, request.style))) return undefined;
+      const spans = service.shape({ ...request, measure: false, clusterGeometry: false }).spans;
+      const keys = [...new Set(spans.map(span => JSON.stringify([
+        span.fontRoute.fingerprint, span.substituteScope,
+      ])))];
+      // The independent run-scope rule must not borrow Arabic proof from a
+      // neighbouring run. Mixed scopes require their original source context.
+      return keys.length === 1 ? keys[0] : 'mixed';
+    },
     shape(request: Readonly<TextShapeRequest>): TextShapeResult {
       if (!Number.isFinite(request.fontSizePt) || request.fontSizePt < 0) {
         throw new RangeError('fontSizePt must be a finite non-negative number');

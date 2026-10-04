@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  type InternalDocParagraph,
+  type InternalNumberingInfo,
   bodyAcquisitionInputProjections,
   normalizeInternalDocumentModel,
   numberingMarkerShapeInput,
@@ -79,6 +81,21 @@ describe('parser-to-body-acquisition projection capability', () => {
     expect(bodyAcquisitionInputProjections.tableSourceAcquisitionInput).toBe(tableSourceAcquisitionInput);
     expect(bodyAcquisitionInputProjections.tableParticipatesInOrdinaryFlow)
       .toBe(tableParticipatesInOrdinaryFlow);
+  });
+
+  it.each([
+    { threshold: undefined, expected: false },
+    { threshold: 0, expected: true },
+    { threshold: 8, expected: true },
+  ])('preserves unmeasured marker/mark zero semantics with threshold $threshold', ({ threshold, expected }) => {
+    const facts = { fontSize: 10, fontFamily: 'serif', kerning: threshold };
+    const source: InternalDocParagraph = { ...paragraph(), paragraphMarkFontFacts: facts };
+    const numbering: InternalNumberingInfo = {
+      numId: 1, level: 0, format: 'decimal', text: '1.', indentLeft: 0, tab: 0, suff: 'space',
+      fontFacts: facts,
+    };
+    expect(paragraphMarkShapeInput(source)?.kerning).toBe(expected);
+    expect(numberingMarkerShapeInput(numbering, 10)?.kerning).toBe(expected);
   });
 
   it('reuses only one document-scoped paragraph/source parser-fact projection', () => {

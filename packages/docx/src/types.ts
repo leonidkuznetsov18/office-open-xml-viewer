@@ -89,6 +89,8 @@ export interface EmbeddedFontRef {
 }
 
 export interface DocSettings {
+  /** ECMA-376 Part 4 §14.8.3.15 fixed HTML automatic paragraph margins. */
+  doNotUseHtmlParagraphAutoSpacing?: boolean;
   /** §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `undefined`
    *  means the element is absent; the spec default is ON (treated as `true`). */
   kinsoku?: boolean;
@@ -113,7 +115,7 @@ export interface DocSettings {
   /** §17.15.3.31 `w:compat/w:lineWrapLikeWord6` — fit at uncompressed width
    * even when character-level whitespace is compressed for display. */
   lineWrapLikeWord6?: boolean;
-  /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for this compatibility flag. */
+  /** See WORD_KERN_THRESHOLD_AUTHORITY for this compatibility flag. */
   enableOpenTypeFeatures?: boolean;
   /** ECMA-376 Part 4 §14.8.3.50 `w:compat/w:useFELayout` — Far East layout
    * compatibility. */
@@ -496,6 +498,9 @@ export interface DocParagraph {
   indentFirst: number;  // pt
   spaceBefore: number;  // pt
   spaceAfter: number;   // pt
+  /** §17.3.1.33 automatic margin flags resolved through paragraph styles. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   lineSpacing: LineSpacing | null;
   numbering: NumberingInfo | null;
   tabStops: TabStop[];
@@ -1035,6 +1040,8 @@ export interface ShapeTextRun {
 export interface ShapeText {
   text: string;
   fontSizePt: number;
+  /** Paragraph base/mark size; fontSizePt remains the first-run compatibility field. */
+  defaultFontSize?: number;
   color?: string | null;
   /** Resolved paragraph-mark run color used by compatibility rule
    *  `word-numbering-marker-paragraph-mark-fallback` when the numbering level
@@ -1061,6 +1068,9 @@ export interface ShapeText {
   /** ECMA-376 §17.3.1.33 `<w:spacing w:after>` of this text-box paragraph, in
    *  pt — reserved BELOW the paragraph. Absent/0 ⇒ no offset. */
   spaceAfter?: number;
+  /** §17.3.1.33 automatic margins; the compatibility text-box adapter resolves them. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   /** ECMA-376 §17.3.1.33 line spacing value (style-chain resolved). Encoded per
    *  {@link lineSpacingRule}: "auto" ⇒ a MULTIPLIER on the natural line box
    *  (1.15 = 276/240), "exact"/"atLeast" ⇒ pt. Absent ⇒ single (natural). */
@@ -1294,9 +1304,11 @@ export interface DocxTextRun {
    *  Absent ⇒ no shift. */
   position?: number;
   /** ECMA-376 §17.3.2.19 `<w:kern w:val>` — font-kerning threshold in POINTS
-   *  (the smallest font size that is kerned). Presence enables kerning subject
-   *  to the threshold; absent ⇒ kerning off (the hierarchy default). `0` = kern
-   *  at all sizes. */
+   *  (the smallest font size that is kerned). A positive resolved threshold
+   *  enables kerning at or above that size; absence disables it. Zero disables
+   *  content-run kerning only in mode 15 (WORD_KERN_THRESHOLD_AUTHORITY);
+   *  unmeasured modes, numbering glyphs and paragraph marks retain the previous
+   *  zero size comparison. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横 / tate-chū-yoko). `true` means that in a VERTICAL (tbRl) page this

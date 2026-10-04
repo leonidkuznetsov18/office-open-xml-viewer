@@ -1,3 +1,4 @@
+import { textBreakWindow, textBreakOffsets } from '../line-breaker/text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import type { DocTableCell } from '../types.js';
 import type { ParagraphLayoutContext } from '../layout-context.js';
@@ -188,6 +189,7 @@ function compatibleText(left: LayoutTextSeg, right: LayoutTextSeg): boolean {
  * Merge only for the intrinsic probe; retained source/run ownership stays intact. */
 function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[] {
   const merged: LayoutSeg[] = [];
+  let activeBreakOffsets: number[] | undefined;
   for (const segment of segments) {
     const previous = merged.at(-1);
     if (
@@ -208,6 +210,14 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
     ) {
       const previousTextLength = previous.text.length;
       const text = previous.text + segment.text;
+      // One task-local accumulator per compatible sequence. Re-copying all
+      // previous offsets at every word seam makes hyphen-rich text quadratic.
+      if (segment.explicitBreakBefore || segment.explicitBreaks) {
+        activeBreakOffsets ??= [];
+        if (segment.explicitBreakBefore) activeBreakOffsets.push(previousTextLength);
+        for (const offset of textBreakOffsets(segment.explicitBreaks))
+          activeBreakOffsets.push(previousTextLength + offset);
+      }
       const punctuationCompressions = [
         ...(previous.punctuationCompressions ?? []),
         ...(segment.punctuationCompressions ?? []).map((compression) => ({
@@ -218,6 +228,10 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       merged[merged.length - 1] = {
         ...previous,
         text,
+        // Acquisition owns legal boundaries. Preserve them through this
+        // measurement-only join so AutoFit minima use the same text atoms as
+        // actual wrapping, without splitting the maximum-width shaping probe.
+        explicitBreaks: activeBreakOffsets ? textBreakWindow(activeBreakOffsets) : undefined,
         punctuationCompressions: punctuationCompressions.length > 0
           ? punctuationCompressions
           : undefined,
@@ -229,8 +243,12 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       };
       continue;
     }
+    if (activeBreakOffsets) Object.freeze(activeBreakOffsets);
     merged.push({ ...segment });
+    activeBreakOffsets = 'text' in segment && segment.explicitBreaks
+      ? [...textBreakOffsets(segment.explicitBreaks)] : undefined;
   }
+  if (activeBreakOffsets) Object.freeze(activeBreakOffsets);
   return merged;
 }
 
@@ -261,7 +279,18 @@ function measureTextRange(
     );
     pendingSnapBlock = null;
   };
-  for (const piece of pieces) {
+  // Pieces are acquired in source order. Dense hyphens across real format
+  // seams must not rescan the complete joined unit for every small atom.
+  // Locate the first overlap, then visit only this range's contributing pieces;
+  // snap-block folding remains local to the same complete atom as before.
+  let first = 0, stop = pieces.length;
+  while (first < stop) {
+    const middle = Math.floor((first + stop) / 2);
+    if (pieces[middle]!.end <= start) first = middle + 1;
+    else stop = middle;
+  }
+  for (let index = first; index < pieces.length && pieces[index]!.start < end; index++) {
+    const piece = pieces[index]!;
     const overlapStart = Math.max(start, piece.start);
     const overlapEnd = Math.min(end, piece.end);
     if (overlapStart >= overlapEnd) continue;
@@ -423,6 +452,9 @@ function minimumTextAtomWidthPt(
       segmentIndex += 1;
     }
 
+    const explicitBreaks = pieces.flatMap(piece => [...textBreakOffsets(piece.segment.explicitBreaks)]
+      .map(offset => piece.start + offset));
+    let breakIndex = 0;
     let tokenStart = 0;
     for (const token of splitTextForLayout(joinedText)) {
       const trimmed = token.replace(/\s+$/u, '');
@@ -431,17 +463,18 @@ function minimumTextAtomWidthPt(
       tokenStart += token.length;
       if (!trimmed) continue;
       if (!hasCJKBreakOpportunity(trimmed)) {
-        maximumPt = Math.max(
-          maximumPt,
-          measureTextRange(
-            pieces,
-            joinedText,
-            trimmedStart,
-            trimmedEnd,
-            measurer,
-            characterGrid,
-          ),
-        );
+        const ends: number[] = [];
+        while (breakIndex < explicitBreaks.length && explicitBreaks[breakIndex] <= trimmedStart)
+          breakIndex += 1;
+        while (breakIndex < explicitBreaks.length && explicitBreaks[breakIndex] < trimmedEnd)
+          ends.push(explicitBreaks[breakIndex++]);
+        ends.push(trimmedEnd);
+        let atomStart = trimmedStart;
+        for (const atomEnd of ends) {
+          maximumPt = Math.max(maximumPt, measureTextRange(
+            pieces, joinedText, atomStart, atomEnd, measurer, characterGrid));
+          atomStart = atomEnd;
+        }
         continue;
       }
 
